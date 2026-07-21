@@ -17,7 +17,9 @@ CJK strings skip ``unidecode``; off-version matches (remix/live/acoustic vs
 original) are penalised x0.3.
 """
 
+import asyncio
 import logging
+import math
 import re
 import unicodedata
 from collections import Counter, defaultdict
@@ -44,6 +46,7 @@ from services.native.quality_tiers import (
     DEFAULT_QUALITY_MAX,
     DEFAULT_QUALITY_MIN,
     candidate_tier,
+    exceeds_lossless_cap,
     folder_hires_key,
     is_audio,
     is_flac_or_mp3,
@@ -68,6 +71,27 @@ _CJK_RANGES = (
 _JUNK_KEYWORDS = ("various", "unknown album", "untitled", "misc")
 
 logger = logging.getLogger(__name__)
+
+
+def peer_speed_score(speed_bps: float) -> float:
+    """Normalise a peer's reported average upload speed (slskd ``uploadSpeed``,
+    BYTES/second) to 0..1 on a log scale: 0 at <=10 KB/s, ~0.33 at 100 KB/s,
+    ~0.67 at 1 MB/s, 1.0 at >=10 MB/s. The old ``min(1, speed/1000)`` treated the
+    value as KB/s, so any peer above 1 KB/s saturated to 1.0 and speed never
+    actually differentiated candidates - picks looked random w.r.t. peer speed."""
+    if speed_bps <= 10_000:
+        return 0.0
+    return min(1.0, math.log10(speed_bps / 10_000) / 3.0)
+
+
+def peer_availability(files: list[DownloadSearchResult]) -> float:
+    """0..1 peer-availability rank signal: mostly the peer's upload speed, plus a
+    bonus for a free upload slot (a fast peer with a queue still beats a near-dead
+    one with a free slot). Shared by the album scorer and the track matcher; used
+    as a TIEBREAKER within an identity band - never to buy acceptance (D3)."""
+    speed = peer_speed_score(max((f.upload_speed for f in files), default=0))
+    slot = 1.0 if any(f.has_free_slot for f in files) else 0.0
+    return 0.7 * speed + 0.3 * slot
 
 
 def _has_cjk(text: str) -> bool:
@@ -200,10 +224,12 @@ class AlbumPreflightScorer:
         quality_min: str = DEFAULT_QUALITY_MIN,
         quality_max: str = DEFAULT_QUALITY_MAX,
         flac_mp3_only: bool = True,
+        lossless_max_kbps: int = 0,
         policy: SpecPolicy | None = None,
     ):
         self._store = download_store
         self._flac_mp3_only = flac_mp3_only
+        self._lossless_max_kbps = lossless_max_kbps
         # The full spec policy: passed by the composition root (built from
         # DownloadPolicySettings) or derived from the quality kwargs in tests. The size/
         # term/age gates default off, so a quality-only construction is behaviour-unchanged.
@@ -219,6 +245,28 @@ class AlbumPreflightScorer:
         held_tier: str | None = None,
     ) -> list[ScoredCandidate]:
         context = await build_context(self._store, held_tier=held_tier)
+        # Everything below is pure-CPU (rapidfuzz/unidecode over potentially thousands
+        # of results, seconds of work): run it in a worker thread so the event loop -
+        # every other request, SSE stream and poll - keeps breathing while a search's
+        # results are being scored ("the app hangs while something loads").
+        return await asyncio.to_thread(
+            self._rank_sync,
+            target,
+            results,
+            context,
+            auto_accept_threshold=auto_accept_threshold,
+            manual_threshold=manual_threshold,
+        )
+
+    def _rank_sync(
+        self,
+        target: TargetAlbum,
+        results: list[DownloadSearchResult],
+        context,  # noqa: ANN001 - DecisionContext
+        *,
+        auto_accept_threshold: float,
+        manual_threshold: float,
+    ) -> list[ScoredCandidate]:
         policy = self._policy
         # Soulseek quarantine is file-granular (a peer may have just one bad file): apply
         # it as a pool pre-filter via the shared spec, so a quarantined file is dropped
@@ -240,7 +288,7 @@ class AlbumPreflightScorer:
             groups[(result.username, result.parent_directory)].append(result)
 
         scored: list[ScoredCandidate] = []
-        drop_no_audio = drop_codec = 0
+        drop_no_audio = drop_codec = drop_lossless_cap = 0
         pipeline_drops: Counter[RejectCode] = Counter()
         for (username, parent), files in groups.items():
             # A folder search returns the album's sidecars (cover art, cue, log, m3u)
@@ -255,6 +303,13 @@ class AlbumPreflightScorer:
             # disallowed codec before the shared pipeline judges identity + quality range.
             if self._flac_mp3_only and not all(is_flac_or_mp3(f) for f in audio):
                 drop_codec += 1
+                continue
+            # lossless bitrate cap (0 = off): the whole folder is downloaded, so one
+            # over-cap hi-res file (e.g. a 24/192 rip at ~4000 kbps) disqualifies it.
+            if self._lossless_max_kbps and any(
+                exceeds_lossless_cap(f, self._lossless_max_kbps) for f in audio
+            ):
+                drop_lossless_cap += 1
                 continue
             # Shared spec pipeline - the SAME rules as the Usenet path: blocklist (a folder
             # carries no single identity, so it's a no-op here - quarantine was applied
@@ -353,9 +408,7 @@ class AlbumPreflightScorer:
             )
 
         def _availability(c: ScoredCandidate) -> float:
-            speed = min(1.0, max((f.upload_speed for f in c.files), default=0) / 1000.0)
-            slot = 1.0 if any(f.has_free_slot for f in c.files) else 0.0
-            return 0.5 * speed + 0.5 * slot
+            return peer_availability(c.files)
 
         # highest tier first (any decent FLAC beats any MP3), then hi-res before 16/44
         # within the tier (H1), then best match - with availability as a BANDED
@@ -385,6 +438,7 @@ class AlbumPreflightScorer:
                 "groups_total": len(groups),
                 "dropped_no_audio": drop_no_audio,
                 "dropped_codec": drop_codec,
+                "dropped_lossless_cap": drop_lossless_cap,
                 **{f"dropped_{code.value}": n for code, n in pipeline_drops.items()},
             },
         )

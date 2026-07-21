@@ -462,6 +462,69 @@ class LibraryDB(PersistenceBase):
 
         await self._write(operation)
 
+    async def materialize_albums_from_files(self) -> int:
+        """Give every album that has live files but no materialised row a
+        ``library_albums`` row, and refresh ``library_artists.album_count``. The native
+        scan writes only ``library_files``; without this the materialised table (which
+        backs the home/discover listings and per-artist album counts) never learns about
+        scan-discovered albums, so they render as "missing" there.
+
+        Additive and idempotent: existing rows are left untouched (``DO NOTHING``), so
+        richer data from download-import / external sync is preserved, and external
+        albums that have no local files are never touched. Safe to run after every scan.
+        Returns the number of rows inserted. Uses the same minimal row shape as a normal
+        library sync (mbid / artist / title / year / cover_url)."""
+        now = time.time()
+
+        def operation(conn: sqlite3.Connection) -> int:
+            rows = conn.execute(
+                """SELECT release_group_mbid AS mbid,
+                          album_artist_mbid  AS artist_mbid,
+                          album_artist_name  AS artist_name,
+                          album_title        AS title,
+                          MAX(year)          AS year,
+                          COUNT(*)           AS tracks
+                   FROM library_files
+                   WHERE release_group_mbid IS NOT NULL AND deleted_at IS NULL
+                   GROUP BY release_group_mbid"""
+            ).fetchall()
+            inserted = 0
+            for r in rows:
+                mbid = r["mbid"]
+                if not mbid:
+                    continue
+                artist_mbid = r["artist_mbid"] if isinstance(r["artist_mbid"], str) else None
+                raw = {
+                    "mbid": mbid,
+                    "artist_mbid": artist_mbid,
+                    "artist_name": r["artist_name"],
+                    "title": r["title"],
+                    "year": r["year"],
+                    "cover_url": "",
+                }
+                cur = conn.execute(
+                    """INSERT INTO library_albums
+                         (mbid_lower, mbid, artist_mbid, artist_mbid_lower, artist_name,
+                          title, year, cover_url, date_added, raw_json, track_count, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scan')
+                       ON CONFLICT(mbid_lower) DO NOTHING""",
+                    (
+                        _normalize(mbid), mbid, artist_mbid, _normalize(artist_mbid),
+                        r["artist_name"], str(r["title"] or "Unknown Album"), r["year"],
+                        "", now, _encode_json(raw), r["tracks"],
+                    ),
+                )
+                inserted += cur.rowcount
+            # Recompute per-artist album counts from the now-complete album table.
+            conn.execute(
+                """UPDATE library_artists SET album_count = (
+                       SELECT COUNT(*) FROM library_albums la
+                       WHERE la.artist_mbid_lower = library_artists.mbid_lower)"""
+            )
+            return inserted
+
+        return await self._write(operation)
+
     async def get_artists(self, limit: int | None = None) -> list[dict[str, Any]]:
         def operation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             query = "SELECT raw_json FROM library_artists ORDER BY COALESCE(date_added, 0) DESC, name COLLATE NOCASE ASC"
@@ -589,21 +652,22 @@ class LibraryDB(PersistenceBase):
         return await self._read(operation)
 
     async def get_all_album_mbids(self) -> set[str]:
-        # Only return MBIDs that have active (non-deleted) files. The
-        # materialised library_albums table gains rows when downloads are
-        # queued (upsert_album) but isn't cleaned if the download fails or
-        # files are removed without a successful remove_album - so an
-        # unfiltered SELECT returns stale "ghost" MBIDs that make albums
-        # show as in-library with no files to play or remove.
+        # The authoritative "is this album in my library" set: release-group MBIDs with
+        # at least one live (non-deleted) file. Read straight from library_files, NOT
+        # by intersecting the materialised library_albums table: that table is only
+        # maintained by download-import (upsert_album) and the external library sync
+        # (save_library), so a disc-scan-only album never gets a row there. The old
+        # `library_albums EXISTS(files)` intersection therefore dropped every
+        # scan-discovered album, reporting ~half a native library as "missing".
+        # Deriving from files also inherently excludes both stale "ghost" rows (a
+        # library_albums row whose files were removed) and soft-deleted albums, which
+        # is exactly what the intersection was trying to guard against.
         def operation(conn: sqlite3.Connection) -> set[str]:
             rows = conn.execute(
-                "SELECT la.mbid FROM library_albums la "
-                "WHERE EXISTS ("
-                "  SELECT 1 FROM library_files lf "
-                "  WHERE lf.release_group_mbid = la.mbid_lower "
-                "  AND lf.deleted_at IS NULL)"
+                "SELECT DISTINCT release_group_mbid FROM library_files "
+                "WHERE release_group_mbid IS NOT NULL AND deleted_at IS NULL"
             ).fetchall()
-            return {str(row["mbid"]) for row in rows if row["mbid"]}
+            return {str(row["release_group_mbid"]) for row in rows if row["release_group_mbid"]}
 
         return await self._read(operation)
 

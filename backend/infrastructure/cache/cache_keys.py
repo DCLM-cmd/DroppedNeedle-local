@@ -13,6 +13,7 @@ MB_RECORDING_PREFIX = "mb:recording:"
 MB_RECORDING_SEARCH_PREFIX = "mb:recording:search:"
 MB_RECORDING_TO_RG_PREFIX = "mb:recording_to_rg:"
 MB_ARTIST_RELS_PREFIX = "mb:artist_rels:"
+MB_ARTIST_ALIASES_PREFIX = "mb:artist_aliases:"
 MB_ARTISTS_BY_TAG_PREFIX = "mb_artists_by_tag:"
 MB_RG_BY_TAG_PREFIX = "mb_rg_by_tag:"
 

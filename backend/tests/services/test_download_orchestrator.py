@@ -39,6 +39,7 @@ from repositories.protocols.download_client import (
 from services.native.download_orchestrator import (
     _OUT_COMPLETED,
     _OUT_NO_TRANSFER,
+    _OUT_NOT_STARTED,
     _OUT_QUEUED,
     _OUT_STALLED,
     DownloadOrchestrator,
@@ -210,7 +211,8 @@ def _request_record(mbid="rg-1", *, download_task_id=None, status="downloading")
 
 def _build(
     tmp_path: Path, *, client=None, indexer=None, scorer_result=None, track_result=None, fp_result=None,
-    imported_rows=None, library=None, stall_minutes=30.0, queued_minutes=120.0, max_failover=3,
+    imported_rows=None, library=None, stall_minutes=30.0, queued_minutes=120.0,
+    queued_start_seconds=30.0, max_failover=3,
     max_concurrent=3, request_history=None, on_import=None,
     auto_retry_enabled=True, auto_retry_max_attempts=6, auto_retry_base_interval_minutes=15.0,
     soulseek_enabled=True, album_service=None,
@@ -252,6 +254,7 @@ def _build(
         manual_threshold=0.5,
         stall_timeout_minutes=stall_minutes,
         queued_timeout_minutes=queued_minutes,
+        queued_start_timeout_seconds=queued_start_seconds,
         max_failover_attempts=max_failover,
         max_concurrent_downloads=max_concurrent,
         auto_retry_enabled=auto_retry_enabled,
@@ -596,10 +599,62 @@ async def test_poll_returns_queued_timeout_when_stuck_in_remote_queue(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_stall_harvests_succeeded_subset_without_quarantining_missing(tmp_path: Path):
+async def test_poll_returns_not_started_when_queue_never_moves(tmp_path: Path):
+    # A fresh enqueue that materialises a transfer but never leaves the peer's upload
+    # queue (0 bytes, not active) past the short start timeout fails over fast, well
+    # before the (generous) queued window - so a stuck peer can't clog the queue.
+    client = _StubClient(_status("queued", active=False, bytes_=0, matched=1))
+    store, orch, *_ = _build(
+        tmp_path, client=client, queued_start_seconds=0.0, queued_minutes=999.0
+    )
+    task = await _new_task(store, status="downloading", source_username="peer")
+    _write_manifest(orch, task.id, ["peer/01.flac"])
+
+    outcome, _ = await orch._poll_until_done(task, expect_materialization=True)
+    assert outcome == _OUT_NOT_STARTED
+
+
+@pytest.mark.asyncio
+async def test_poll_not_started_only_on_fresh_enqueue(tmp_path: Path):
+    # The start timeout is a fresh-enqueue fast-fail: a resume (expect_materialization
+    # False) must not trip it - its transfers may legitimately be mid-flight. It then
+    # follows the normal queued watchdog instead.
+    client = _StubClient(_status("queued", active=False, bytes_=0, matched=1))
+    store, orch, *_ = _build(
+        tmp_path, client=client, queued_start_seconds=0.0, queued_minutes=0.0
+    )
+    task = await _new_task(store, status="downloading", source_username="peer")
+    _write_manifest(orch, task.id, ["peer/01.flac"])
+
+    outcome, _ = await orch._poll_until_done(task)  # resume: expect_materialization False
+    assert outcome == _OUT_QUEUED
+
+
+@pytest.mark.asyncio
+async def test_poll_start_timeout_ignores_an_active_transfer(tmp_path: Path):
+    # A transfer that is actively moving (has_active_transfer) but hasn't accrued bytes
+    # yet has STARTED - it must follow the stall watchdog, not the start-timeout fast-
+    # fail, so a just-started peer isn't abandoned as "never started".
+    client = _StubClient(_status("downloading", active=True, bytes_=0, matched=1))
+    store, orch, *_ = _build(
+        tmp_path, client=client, queued_start_seconds=0.0, stall_minutes=0.0,
+        queued_minutes=999.0,
+    )
+    task = await _new_task(store, status="downloading", source_username="peer")
+    _write_manifest(orch, task.id, ["peer/01.flac"])
+
+    outcome, _ = await orch._poll_until_done(task, expect_materialization=True)
+    assert outcome == _OUT_STALLED
+
+
+@pytest.mark.asyncio
+async def test_stall_harvests_succeeded_subset_and_quarantines_missing(tmp_path: Path):
     """A peer that delivers 1 of 2 tracks then stalls: the arrived track imports
-    ('partial'), and the never-arrived track is NOT quarantined (it isn't the
-    source's fault). This is the data-loss / bad-quarantine fix."""
+    ('partial') and is NOT quarantined, while the never-arrived track IS quarantined
+    (TTL'd, reason='download_failed') so the auto-retry re-search picks a different
+    source instead of re-grabbing the very peer that just burned the stall window.
+    (Previously nothing was quarantined on a stall, and the same dead release was
+    re-downloaded over and over.)"""
     client = _StubClient(
         _status("downloading", active=True, bytes_=100, files_completed=1,
                 succeeded=["peer/01.flac"])  # 1 of 2 done, then frozen
@@ -616,7 +671,11 @@ async def test_stall_harvests_succeeded_subset_without_quarantining_missing(tmp_
     final = await store.get_task(task.id)
     assert final.status == "partial"                       # kept the 1 track that arrived
     assert len(lib.rows) == 1
-    assert await store.load_quarantine_set() == set()      # missing track NOT quarantined
+    quarantined = await store.load_quarantine_set()
+    # the delivered track must never be blocklisted...
+    assert not any("01.flac" in identity for _source, identity in quarantined)
+    # ...but the never-delivered one is (TTL'd - a wrongful entry self-heals)
+    assert any("02.flac" in identity for _source, identity in quarantined)
 
 
 # ---------------------------------------------------------------------------
@@ -1449,6 +1508,55 @@ async def test_retry_failed_tasks_skips_when_target_already_completed(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_retry_failed_tasks_cancels_when_already_in_library(tmp_path: Path):
+    """A failed task whose album is already held in the library (a rescan picked the
+    files up directly, with no other download task involved) is cancelled instead of
+    retried - the auto-retry sweep must not re-download something already on disk just
+    because it can't see a sibling task for it."""
+    library = _FakeLibrary(rows=[{"file_format": "flac", "bit_rate": 900}])
+    store, orch, *_ = _build(tmp_path, auto_retry_base_interval_minutes=0.01, library=library)
+    orch.dispatch = MagicMock()
+    task = await _new_task(store, status="failed", retry_count=0)
+    await store.update_status(task.id, "failed", completed_at=_t.time() - 999)
+
+    await orch.retry_failed_tasks()
+
+    orch.dispatch.assert_not_called()
+    updated = await store.get_task(task.id)
+    assert updated.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_with_library_cancels_stale_tasks(tmp_path: Path):
+    """The post-scan sweep cancels a failed task whose album is already in the
+    library, clearing it from the download list - even past the normal auto-retry
+    ceiling, since an exhausted retry chain for an already-owned album is exactly the
+    kind of stale entry a rescan should clear."""
+    library = _FakeLibrary(rows=[{"file_format": "flac", "bit_rate": 900}])
+    store, orch, *_ = _build(tmp_path, auto_retry_max_attempts=1, library=library)
+    task = await _new_task(store, status="failed", retry_count=5)
+
+    count = await orch.reconcile_with_library()
+
+    assert count == 1
+    updated = await store.get_task(task.id)
+    assert updated.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_with_library_leaves_unsatisfied_tasks(tmp_path: Path):
+    """A failed task whose album is NOT in the library is untouched by reconcile."""
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, status="failed", retry_count=0)
+
+    count = await orch.reconcile_with_library()
+
+    assert count == 0
+    updated = await store.get_task(task.id)
+    assert updated.status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_retry_failed_tasks_retries_partial(tmp_path: Path):
     """A partial album download is eligible for auto-retry."""
     store, orch, *_ = _build(tmp_path, auto_retry_base_interval_minutes=0.01)
@@ -1486,6 +1594,41 @@ async def test_create_retry_task_increments_retry_count(tmp_path: Path):
     new_task = await store.get_task(new_id)
     assert new_task.retry_count == 3
     assert new_task.status == "queued"
+    orch.dispatch.assert_called_once_with(new_id)
+
+
+@pytest.mark.asyncio
+async def test_create_retry_task_deduped_when_active_exists(tmp_path: Path):
+    """The retry-creation guard that stops the duplicate-download storm: when an album
+    already has an active (queued/downloading) task, retrying a stale failed row for the
+    same album reuses that task instead of spawning a second concurrent download."""
+    store, orch, *_ = _build(tmp_path)
+    orch.dispatch = MagicMock()
+    active = await _new_task(store, status="downloading")            # rg-1 / user-a
+    failed = await _new_task(store, status="failed", retry_count=5)   # same target
+
+    returned = await orch._create_retry_task(failed)
+
+    assert returned == active.id            # reused the active task
+    orch.dispatch.assert_not_called()       # nothing new dispatched
+    remaining = await store.list_tasks_by_status(
+        "user-a", "admin", ["downloading", "failed", "queued"]
+    )
+    assert len(remaining) == 2              # no third row was created
+
+
+@pytest.mark.asyncio
+async def test_create_retry_task_not_deduped_across_users(tmp_path: Path):
+    """The dedup is per-user: one user's active download must not swallow another
+    user's retry of the same album."""
+    store, orch, *_ = _build(tmp_path)
+    orch.dispatch = MagicMock()
+    await _new_task(store, status="downloading", user_id="user-b")   # other user
+    failed = await _new_task(store, status="failed", retry_count=1, user_id="user-a")
+
+    new_id = await orch._create_retry_task(failed)
+
+    assert new_id != failed.id
     orch.dispatch.assert_called_once_with(new_id)
 
 
@@ -1908,3 +2051,41 @@ async def test_coverage_mb_failure_fails_open_to_count_check(tmp_path: Path):
     await orch.process_task(task.id)
 
     assert (await store.get_task(task.id)).status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Multiplexed SSE channel (downloads:all)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_events_are_mirrored_on_the_shared_downloads_channel(tmp_path: Path):
+    """Every per-task event is also published on ``downloads:all`` carrying task_id +
+    user_id, so the frontend can follow ALL downloads over ONE EventSource (browsers
+    cap concurrent connections per origin; one stream per task starved the app)."""
+    client = _StubClient()
+    store, orch, fp, lib = _build(
+        tmp_path, client=client, scorer_result=[_candidate(0.9)],
+        fp_result=ProcessResult(succeeded=[str(tmp_path / "lib" / "a.flac")], failed=[]),
+        imported_rows=[{"file_path": "a"}],
+    )
+    task = await _new_task(store)
+
+    received = []
+
+    async def _collect():
+        async for message in orch._bus.subscribe("downloads:all", keepalive_interval=0.05):
+            if not message["event"]:
+                break  # first keepalive = stream idle, all events drained
+            received.append(message)
+
+    collector = asyncio.create_task(_collect())
+    await orch.process_task(task.id)
+    await collector
+
+    assert received, "no events on downloads:all"
+    complete = [m for m in received if m["event"] == "complete"]
+    assert complete, f"no complete event, got {[m['event'] for m in received]}"
+    assert complete[-1]["data"]["task_id"] == task.id
+    assert complete[-1]["data"]["user_id"] == "user-a"
+    # the per-task channel still works (the task-detail stream keeps using it)
+    assert orch._bus._latest[f"download:{task.id}"]["complete"]["status"] == "completed"

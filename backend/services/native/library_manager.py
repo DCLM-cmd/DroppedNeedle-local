@@ -226,6 +226,13 @@ class LibraryManager(LibraryStub):
         native imports written to ``library_files``."""
         return await self._db.get_library_mbids(include_release_ids=include_release_ids)
 
+    async def materialize_albums(self) -> int:
+        """Refresh the materialised ``library_albums`` table from the scanned files so
+        home/discover listings and per-artist album counts include scan-discovered
+        albums (the scan writes only ``library_files``). Additive and idempotent - safe
+        to call at the end of every scan. Returns the number of rows inserted."""
+        return await self._db.materialize_albums_from_files()
+
     async def get_albums(
         self,
         page: int = 1,

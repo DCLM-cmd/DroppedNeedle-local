@@ -3,7 +3,7 @@
 
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import {
-		clearFinished,
+		clearHistory,
 		retryAllFailed,
 		stopAllRetries
 	} from '$lib/queries/downloads/DownloadMutations.svelte';
@@ -25,7 +25,7 @@
 	const heldQuery = getHeldImportsQuery();
 	const held = $derived(heldQuery.data?.items ?? []);
 
-	const clear = clearFinished();
+	const clear = clearHistory();
 	const stopAll = stopAllRetries();
 	const retryAll = retryAllFailed();
 
@@ -203,9 +203,9 @@
 								class="btn btn-ghost btn-xs text-base-content/60 hover:text-error"
 								onclick={() => clear.mutate()}
 								disabled={clear.isPending}
-								title="Remove completed and cancelled downloads from this list"
+								title="Remove everything from History - completed, cancelled and failed (albums still auto-retrying or downloading are kept)"
 							>
-								<Trash2 class="h-3.5 w-3.5" /> Clear
+								<Trash2 class="h-3.5 w-3.5" /> Clear all
 							</button>
 						</div>
 					{/if}

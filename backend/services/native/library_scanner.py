@@ -105,6 +105,7 @@ class LibraryScanner:
         scan_state_store: "ScanStateStore",
         event_bus: "SSEPublisher",
         invalidate_albums: "Callable[[set[str]], Awaitable[None]] | None" = None,
+        reconcile_downloads: "Callable[[], Awaitable[int]] | None" = None,
     ) -> None:
         self._tagger = audio_tagger
         self._fingerprinter = fingerprinter
@@ -113,6 +114,11 @@ class LibraryScanner:
         self._library = library_manager
         self._state = scan_state_store
         self._events = event_bus
+        # Cancels failed/partial downloads a scan just found already on disk, so
+        # they drop out of the download list instead of sitting there forever
+        # waiting on an auto-retry that would just re-download what's already
+        # there. ``None`` in tests = no-op, mirroring ``invalidate_albums``.
+        self._reconcile_downloads = reconcile_downloads
         self._cancel = asyncio.Event()
         self._running = False
         # Release groups a scan/re-identify re-attributed - their cached album pages are
@@ -504,6 +510,19 @@ class LibraryScanner:
             await self._library.reconcile_with_filesystem(library_paths)
             await self._library.prune_review_for_imported()
             artists_resolved = await self._reconcile_album_artists()
+            # Materialise library_albums from the (now artist-resolved) files so the
+            # home/discover listings and album counts include scan-discovered albums.
+            # A derived cache: never let a materialisation error fail the scan itself.
+            try:
+                await self._library.materialize_albums()
+            except Exception:  # noqa: BLE001
+                logger.warning("Album materialisation after scan failed", exc_info=True)
+            # Same best-effort treatment: a reconcile failure must never fail the scan.
+            if self._reconcile_downloads is not None:
+                try:
+                    await self._reconcile_downloads()
+                except Exception:  # noqa: BLE001
+                    logger.warning("Download-list reconcile after scan failed", exc_info=True)
             await self._state.complete(matched=stats.matched, failed=stats.errored)
             logger.info(
                 "scan.completed",

@@ -240,11 +240,11 @@ def test_response_completed_at_null_and_ladder_empty_by_default():
 
 def test_clear_downloads_returns_count():
     service = AsyncMock()
-    service.clear_finished.return_value = 3
+    service.clear_history.return_value = 3
     response = build_test_client(_app(service)).post("/downloads/clear")
     assert response.status_code == 200
     assert response.json() == {"cleared": 3}
-    service.clear_finished.assert_awaited_once_with("u1", "user")
+    service.clear_history.assert_awaited_once_with("u1", "user")
 
 
 def test_clear_downloads_unauthenticated_401():
@@ -433,3 +433,62 @@ def test_upgrade_track_route_queues():
     assert resp.status_code == 200
     assert resp.json() == {"status": "queued", "task_id": "task-t"}
     assert service.request_upgrade_track.call_args.kwargs["recording_mbid"] == "rec-1"
+
+
+def test_stream_all_declared_before_task_catchall():
+    """GET /downloads/stream must be declared before the /{task_id} routes so the
+    literal path wins (FastAPI matches in declaration order)."""
+    paths = [r.path for r in downloads.router.routes]
+    assert paths.index("/downloads/stream") < paths.index("/downloads/{task_id}")
+    assert paths.index("/downloads/stream") < paths.index("/downloads/{task_id}/stream")
+
+
+def test_stream_all_filters_other_users_events():
+    """The multiplexed stream forwards only the caller's events; another user's event
+    is masked as a keepalive comment (never leaked)."""
+    import asyncio
+
+    from infrastructure.sse_publisher import SSEPublisher
+
+    async def _run():
+        publisher = SSEPublisher()
+        # snapshot semantics: _latest is delivered immediately on subscribe
+        await publisher.publish("downloads:all", "complete",
+                                {"task_id": "t-mine", "user_id": "u1", "status": "completed"})
+        await publisher.publish("downloads:all", "progress",
+                                {"task_id": "t-other", "user_id": "u2", "progress_percent": 5})
+        response = await downloads.stream_all_downloads(
+            current_user=mock_user(role="user", user_id="u1"), publisher=publisher
+        )
+        chunks = []
+        agen = response.body_iterator
+        for _ in range(2):  # both snapshot entries, filtered
+            chunks.append(await asyncio.wait_for(agen.__anext__(), timeout=3))
+        await agen.aclose()
+        return chunks
+
+    chunks = asyncio.run(_run())
+    joined = "".join(chunks)
+    assert "t-mine" in joined            # own event delivered
+    assert "t-other" not in joined       # other user's event filtered
+    assert ": keepalive" in joined       # ...and masked as a keepalive
+
+
+def test_stream_all_admin_sees_all_users_events():
+    import asyncio
+
+    from infrastructure.sse_publisher import SSEPublisher
+
+    async def _run():
+        publisher = SSEPublisher()
+        await publisher.publish("downloads:all", "progress",
+                                {"task_id": "t-other", "user_id": "u2", "progress_percent": 5})
+        response = await downloads.stream_all_downloads(
+            current_user=mock_user(role="admin", user_id="u1"), publisher=publisher
+        )
+        agen = response.body_iterator
+        chunk = await asyncio.wait_for(agen.__anext__(), timeout=3)
+        await agen.aclose()
+        return chunk
+
+    assert "t-other" in asyncio.run(_run())

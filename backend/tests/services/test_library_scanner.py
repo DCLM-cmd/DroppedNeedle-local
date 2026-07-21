@@ -1078,6 +1078,44 @@ async def test_scan_invalidates_changed_albums_but_not_an_unchanged_rescan(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_scan_reconciles_downloads_against_library(tmp_path):
+    """Every scan calls the download-list reconciler once it finishes, so a failed/
+    partial download whose album the scan just found on disk drops out of the
+    download list instead of waiting on the next auto-retry tick."""
+    scanner, _manager, _state, _db = _build(tmp_path)
+    music, _ = _music_dir(tmp_path, "flac_full_01.flac")
+    calls = 0
+
+    async def reconcile():
+        nonlocal calls
+        calls += 1
+        return 0
+
+    scanner._reconcile_downloads = reconcile
+
+    await scanner.scan([music])
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_survives_reconcile_downloads_failure(tmp_path):
+    """A reconciler error must never fail the scan itself - same fail-open treatment
+    as album materialisation right above it."""
+    scanner, _manager, state, _db = _build(tmp_path)
+    music, _ = _music_dir(tmp_path, "flac_full_01.flac")
+
+    async def boom():
+        raise RuntimeError("db is busy")
+
+    scanner._reconcile_downloads = boom
+
+    await scanner.scan([music])  # must not raise
+
+    assert (await state.get_state())["status"] == "idle"
+
+
+@pytest.mark.asyncio
 async def test_weakly_verified_download_rows_are_reidentifiable(tmp_path):
     """P7 (D7): a download import stamped BELOW-sticky confidence stays anchored
     (source='download' resists non-improving churn) but yields to a clearly-better

@@ -75,6 +75,9 @@ class AudioFingerprinter:
         self._rate_limiter = rate_limiter
         # Gate concurrent fpcalc subprocesses so a scan can't fork-bomb the host.
         self._fpcalc_semaphore = asyncio.Semaphore(2)
+        # One loud, actionable ERROR per process for a rejected API key - not a quiet
+        # per-file WARNING storm that hides "verification is effectively off".
+        self._invalid_key_logged = False
 
     async def fingerprint(self, path: Path) -> FingerprintResult:
         api_key = self._api_key_provider()
@@ -101,10 +104,37 @@ class AudioFingerprinter:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            if self._is_invalid_key_response(exc):
+                if not self._invalid_key_logged:
+                    self._invalid_key_logged = True
+                    logger.error(
+                        "AcoustID rejected the configured API key (error code 4: "
+                        "invalid API key). Every fingerprint verification fails until "
+                        "it is replaced - downloads import UNVERIFIED. Create an "
+                        "application key at https://acoustid.org/new-application and "
+                        "save it under Settings -> Library."
+                    )
+                return FingerprintResult(
+                    status=FingerprintStatus.ERROR, error="invalid AcoustID API key"
+                )
             logger.warning("AcoustID lookup failed for %s: %s", path, exc)
             return FingerprintResult(status=FingerprintStatus.ERROR, error=str(exc))
 
         return self._parse_response(payload)
+
+    @staticmethod
+    def _is_invalid_key_response(exc: Exception) -> bool:
+        """True when the lookup failed because AcoustID rejected the API key itself
+        (HTTP 400 with ``{"error": {"code": 4}}``) - a configuration problem, not a
+        per-file one."""
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return False
+        if exc.response.status_code != 400:
+            return False
+        try:
+            return (exc.response.json().get("error") or {}).get("code") == 4
+        except ValueError:
+            return False
 
     async def _run_fpcalc(self, path: Path) -> tuple[str, int]:
         async with self._fpcalc_semaphore:

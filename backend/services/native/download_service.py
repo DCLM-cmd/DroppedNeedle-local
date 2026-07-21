@@ -980,6 +980,16 @@ class DownloadService:
             raise ValidationError(
                 "The held file is no longer available - discard it and re-download the album"
             ) from exc
+        except (ValueError, OSError) as exc:
+            # unreadable/corrupt audio (e.g. a mislabeled or truncated file) or an I/O
+            # failure placing it - the row is left as-is (unlike the FileNotFoundError
+            # case above, the file itself is still there) so the user can inspect it
+            # via the preview stream and decide to discard it themselves.
+            logger.warning("Held import failed for held_id=%s: %s", held_id, exc)
+            raise ValidationError(
+                f"This file couldn't be imported ({exc}) - it may be corrupt or "
+                "mislabeled. Discard it and try another source."
+            ) from exc
         await self._store.resolve_held_import(held_id, "imported")
         try:
             await self._library.reconcile_with_filesystem(targets=[target.parent])
@@ -1014,20 +1024,57 @@ class DownloadService:
             extra={"held_id": held_id, "release_group_mbid": held.release_group_mbid},
         )
 
-    async def clear_finished(self, user_id: str, user_role: str) -> int:
-        """Hard-delete the user's terminal completed + cancelled tasks (the queue's
-        "Clear" bulk action). Active/failed/partial/queued rows are left untouched. A
-        pure status delete - no source needs configuring, so it skips ``_ensure_enabled``
-        like ``cancel_album_retries`` does. Admins clear across all users, mirroring the
-        list endpoint's ownership."""
-        cleared = await self._store.delete_tasks_by_status(
-            user_id, user_role, [DownloadStatus.COMPLETED, DownloadStatus.CANCELLED]
+    @staticmethod
+    def _retry_chain_key(task) -> str:  # noqa: ANN001 - DownloadTask
+        """Group key for a download's retry chain: per-recording for a track, per-
+        release-group for an album, scoped to the owner. Falls back to the task id when
+        there's no identity (a free-text download), so such rows never group together.
+        Mirrors the store's retryable-task grouping and the frontend's collapse key."""
+        identity = task.recording_mbid if task.download_type == "track" else task.release_group_mbid
+        return f"{task.download_type}:{identity or task.id}:{task.user_id}"
+
+    async def clear_history(self, user_id: str, user_role: str) -> int:
+        """Hard-delete everything in the queue's History - the user's terminal
+        completed / cancelled / failed / partial tasks (the "Clear all" bulk action).
+
+        Two sets of albums are left fully intact because they aren't in History: those
+        with a live active task (queued/downloading/processing), and those still on the
+        auto-retry ladder ("Still hunting" - a failed/partial whose newest attempt has a
+        pending ``next_retry_at``). A cleared target's ENTIRE chain is removed together,
+        so deleting a terminal row can never leave an older failed attempt
+        (``retry_count < max``) as the new newest for the auto-retry sweep to silently
+        re-arm. Admins clear across all users, mirroring the list endpoint's ownership.
+        Returns the number of rows deleted."""
+        terminal = await self._store.list_tasks_by_status(
+            user_id, user_role,
+            [DownloadStatus.COMPLETED, DownloadStatus.CANCELLED,
+             DownloadStatus.FAILED, DownloadStatus.PARTIAL],
         )
-        if cleared:
+        if not terminal:
+            return 0
+        active = await self._store.list_tasks_by_status(
+            user_id, user_role,
+            [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.PROCESSING],
+        )
+        # Protected targets survive untouched: any with a live active task, plus any
+        # still scheduled to auto-retry (its newest terminal attempt is "wanted").
+        protected = {self._retry_chain_key(t) for t in active}
+        newest: dict = {}
+        for task in terminal:
+            key = self._retry_chain_key(task)
+            cur = newest.get(key)
+            if cur is None or (task.created_at or 0.0, task.id) > (cur.created_at or 0.0, cur.id):
+                newest[key] = task
+        for key, task in newest.items():
+            if self.next_retry_at(task) is not None:
+                protected.add(key)
+        ids = [t.id for t in terminal if self._retry_chain_key(t) not in protected]
+        deleted = await self._store.delete_tasks_by_ids(ids)
+        if deleted:
             logger.info(
-                "download.cleared_finished", extra={"user_id": user_id, "count": cleared}
+                "download.cleared_history", extra={"user_id": user_id, "count": deleted}
             )
-        return cleared
+        return deleted
 
     async def stop_all_retries(self, user_id: str, user_role: str) -> int:
         """Stop every still-scheduled auto-retry the user has (the "Stop all retries"
@@ -1050,15 +1097,29 @@ class DownloadService:
         """Re-dispatch every terminally-failed task the user has that will NOT auto-retry
         (the "Retry all failed" bulk action): ``status == failed`` AND no pending
         ``next_retry_at`` (auto-retry off, or attempts exhausted). Tasks still scheduled
-        to auto-retry are "wanted" and left for ``stop_all_retries``. Each is retried via
-        the same path as the per-task retry. Returns the number retried."""
+        to auto-retry are "wanted" and left for ``stop_all_retries``.
+
+        Deduped by target: many failed rows for the same album/track are the residue of
+        earlier attempts; retrying each would re-fan them into concurrent duplicate
+        downloads of the same release. Only the newest failed row per target is retried
+        (the list is ordered newest-first). Returns the number retried."""
         tasks = await self._store.list_tasks_by_status(
             user_id, user_role, [DownloadStatus.FAILED]
         )
+        seen: set[tuple[str, str, str, str]] = set()
         retried = 0
         for task in tasks:
             if self.next_retry_at(task) is not None:
                 continue
+            target = (
+                task.download_type,
+                task.recording_mbid or "",
+                task.release_group_mbid or "",
+                task.user_id,
+            )
+            if target in seen:
+                continue
+            seen.add(target)
             await self.retry_task(task.id, user_id, user_role)
             retried += 1
         return retried

@@ -500,11 +500,24 @@ def get_slskd_repository() -> "SlskdRepository":
 
     settings = get_settings()
     dc = get_preferences_service().get_download_client_settings_raw()
+    mount = _mount_with_subpath(settings.slskd_downloads_path, dc.downloads_subpath)
+    # A resolved mount that doesn't exist means EVERY import fails with "files couldn't
+    # be found" - the silent misconfig that reads as "importing is broken". Almost always
+    # a stray downloads-subpath (base mount is fine, subpath points nowhere). Log it loud
+    # and actionable rather than letting each download fail one file at a time.
+    if not mount.exists():
+        logger.error(
+            "slskd downloads mount %s does not exist - every import will fail with "
+            "'files couldn't be found'. Base slskd path %r + downloads subpath %r. "
+            "Clear the subpath in Settings -> Download Client if the base already points "
+            "at slskd's downloads folder.",
+            mount, settings.slskd_downloads_path, dc.downloads_subpath,
+        )
     return SlskdRepository(
         client=get_slskd_client(),
         url=dc.url,
         api_key=dc.api_key,
-        downloads_mount=_mount_with_subpath(settings.slskd_downloads_path, dc.downloads_subpath),
+        downloads_mount=mount,
         concurrent_searches=settings.download_client_concurrent_searches,
         concurrent_enqueues=settings.download_client_concurrent_enqueues,
     )

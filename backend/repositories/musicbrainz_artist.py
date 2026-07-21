@@ -11,7 +11,7 @@ from services.preferences_service import PreferencesService
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.cache_keys import (
     mb_artist_search_key, mb_artist_detail_key,
-    MB_ARTISTS_BY_TAG_PREFIX, MB_ARTIST_RELS_PREFIX,
+    MB_ARTISTS_BY_TAG_PREFIX, MB_ARTIST_RELS_PREFIX, MB_ARTIST_ALIASES_PREFIX,
 )
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
@@ -246,6 +246,42 @@ class MusicBrainzArtistMixin:
             logger.error(f"Failed to fetch artist {mbid}: {e}")
             _record_mb_degradation(f"artist fetch failed: {e}")
             return None
+
+    async def get_artist_aliases(self, mbid: str, limit: int = 5) -> list[str]:
+        """Distinct alias names for an artist (MusicBrainz ``aliases``), primary name
+        excluded - the download search fallback re-queries under these when the primary
+        name finds nothing (e.g. a Latin-script alias for a CJK artist, or vice versa).
+        Best-effort: cache-aside (24h), returns [] on any failure."""
+        if not mbid:
+            return []
+        cache_key = f"{MB_ARTIST_ALIASES_PREFIX}{mbid}:{limit}"
+        cached = await self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            result = await mb_api_get(
+                f"/artist/{mbid}",
+                params={"inc": "aliases"},
+                priority=RequestPriority.BACKGROUND_SYNC,
+            )
+        except Exception as e:  # noqa: BLE001 - alias lookup is an optional extra
+            logger.warning(f"Failed to fetch artist aliases {mbid}: {e}")
+            return []
+        if not result:
+            return []
+        primary = (result.get("name") or "").strip()
+        seen = {primary.lower()}
+        aliases: list[str] = []
+        for alias in result.get("aliases") or []:
+            name = (alias.get("name") or "").strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            aliases.append(name)
+            if len(aliases) >= limit:
+                break
+        await self._cache.set(cache_key, aliases, ttl_seconds=86400)
+        return aliases
 
     async def _warm_release_group_cache(self, release_groups: list[dict[str, Any]]) -> None:
         for rg in release_groups:

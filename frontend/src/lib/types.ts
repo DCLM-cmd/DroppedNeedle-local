@@ -1677,6 +1677,7 @@ export interface DownloadClientConfig {
 	preflight_score_manual_min: number;
 	download_stall_timeout_minutes: number;
 	download_queued_timeout_minutes: number;
+	download_queued_start_timeout_seconds: number;
 	max_failover_attempts: number;
 	max_concurrent_downloads: number;
 }
@@ -1763,11 +1764,13 @@ export interface DownloadPolicySettings {
 	quality_min: string;
 	quality_max: string;
 	flac_mp3_only: boolean;
+	lossless_max_kbps: number;
 	verify_downloads: boolean;
 	preflight_score_auto_accept: number;
 	preflight_score_manual_min: number;
 	download_stall_timeout_minutes: number;
 	download_queued_timeout_minutes: number;
+	download_queued_start_timeout_seconds: number;
 	max_failover_attempts: number;
 	max_concurrent_downloads: number;
 	auto_retry_enabled: boolean;

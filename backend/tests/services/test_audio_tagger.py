@@ -249,3 +249,42 @@ def test_write_album_identity_preserves_descriptive_tags(tagger, tmp_copy, name)
     assert after.title == before.title
     assert after.artist == before.artist
     assert after.genre == "Rock; Jazz"
+
+
+# -- suffix_hint: the atomic-write staging path (.part) has no real extension --
+
+
+def test_write_album_identity_on_dotpart_path_needs_hint(tagger, tmp_path):
+    """Reproduces the production crash: a FLAC ripped with a (non-standard but real-
+    world common) leading ID3v2 tag opens fine as FLAC when the path ends in
+    ``.flac``, but loses that extension bonus on the import pipeline's ``.part``
+    staging path - ``mutagen.File`` then misidentifies it as MP3 from the ID3 header
+    alone and blows up trying to sync MPEG frames against FLAC bytes. Without
+    ``suffix_hint`` this must fail exactly like production did; with it, it must
+    succeed."""
+    import msgspec
+    from mutagen.id3 import ID3, TIT2
+
+    real = tmp_path / "real.flac"
+    shutil.copy(FIXTURES / "flac_full_01.flac", real)
+    id3 = ID3()
+    id3.add(TIT2(encoding=3, text=["whatever"]))
+    id3.save(real, v2_version=3)  # non-standard but common: ID3v2 prepended to FLAC
+
+    # the exact staging name _import_into_library builds: dot-prefixed, hashed, .part
+    staging = tmp_path / ".real.deadbeef.part"
+    shutil.copy(real, staging)
+
+    existing, _ = tagger.read_tags(real)
+    target_tag = msgspec.structs.replace(existing, album="New Album")
+
+    with pytest.raises(ValueError, match="Unsupported or unreadable"):
+        tagger.write_album_identity(staging, target_tag)
+
+    tagger.write_album_identity(staging, target_tag, suffix_hint=".flac")
+    # published under its real name, exactly as ``_import_into_library`` does via
+    # ``os.replace(tmp, target_path)`` - re-reading needs no hint once that's done
+    published = tmp_path / "published.flac"
+    shutil.move(staging, published)
+    after, _ = tagger.read_tags(published)
+    assert after.album == "New Album"

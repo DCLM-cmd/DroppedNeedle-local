@@ -316,3 +316,67 @@ def test_version_mismatch_penalised():
     conf_original = _file_confidence("Song", "Artist", None, original)
     assert conf_remix < conf_original
     assert conf_remix < 0.70  # off-version cannot auto-accept
+
+
+# --- peer availability (upload speed) ---------------------------------------------
+
+
+def test_peer_speed_score_differentiates_real_world_speeds():
+    from services.native.album_preflight_scorer import peer_speed_score
+
+    # slskd uploadSpeed is BYTES/second; the old /1000 normalisation saturated at
+    # 1 KB/s so every real peer scored 1.0 and speed never mattered.
+    dead = peer_speed_score(5_000)          # 5 KB/s
+    slow = peer_speed_score(100_000)        # 100 KB/s
+    fast = peer_speed_score(2_000_000)      # 2 MB/s
+    very_fast = peer_speed_score(20_000_000)  # 20 MB/s
+    assert dead == 0.0
+    assert 0.0 < slow < fast < 1.0
+    assert very_fast == 1.0
+
+
+def test_peer_availability_prefers_fast_peer_even_without_free_slot():
+    from services.native.album_preflight_scorer import peer_availability
+
+    fast_queued = [_mk(_PARENT, "a.flac", speed=5_000_000, free=False)]
+    dead_free = [_mk(_PARENT, "b.flac", speed=2_000, free=True)]
+    assert peer_availability(fast_queued) > peer_availability(dead_free)
+
+
+@pytest.mark.asyncio
+async def test_equal_band_orders_by_peer_speed():
+    # two peers sharing the identical folder: same identity band, so the faster
+    # peer must rank first (availability is the banded tiebreaker, D3)
+    slow = [
+        _mk(_PARENT, f"OK Computer {n:02d}.flac", username="slowpoke", speed=20_000)
+        for n in range(1, 13)
+    ]
+    fast = [
+        _mk(_PARENT, f"OK Computer {n:02d}.flac", username="speedy", speed=8_000_000)
+        for n in range(1, 13)
+    ]
+    scorer = AlbumPreflightScorer(_store())
+    ranked = await scorer.rank(_TARGET, slow + fast)
+    assert ranked[0].username == "speedy"
+    assert ranked[1].username == "slowpoke"
+
+
+# --- lossless bitrate cap -----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lossless_cap_drops_hires_folder():
+    # 120 MB / 240 s = 4000 kbps per file - a 24/192 rip; bitrate unreported (slskd
+    # omits bitRate for lossless), so the cap derives it from size/duration
+    hires = [
+        DownloadSearchResult(
+            username="alice", filename=f"{_PARENT}/OK Computer {n:02d}.flac",
+            parent_directory=_PARENT, size=120_000_000, extension="flac",
+            bitrate=None, duration=240.0,
+        )
+        for n in range(1, 13)
+    ]
+    capped = AlbumPreflightScorer(_store(), lossless_max_kbps=1500)
+    uncapped = AlbumPreflightScorer(_store())
+    assert await capped.rank(_TARGET, hires) == []
+    assert len(await uncapped.rank(_TARGET, hires)) == 1

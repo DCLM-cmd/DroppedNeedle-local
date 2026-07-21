@@ -154,7 +154,64 @@ class SlskdRepository:
         for transfer in transfers:
             if transfer.filename in wanted:
                 ok = await self._client.cancel_transfer(handle.username, transfer.id) and ok
+        # Remove this task's leftover files from the downloads mount (the SABnzbd
+        # path's del_files equivalent). Imported audio was MOVED out of the mount
+        # already, so anything still locatable here is a failed/rejected download
+        # that would otherwise sit on disk forever and fill the filesystem. Scoped
+        # to exactly the files we enqueued, resolved by the same mount-confined
+        # locator the import uses. Off the event loop (bounded filesystem walks).
+        await asyncio.to_thread(
+            self._remove_leftover_files, handle.username, list(handle.filenames)
+        )
         return ok
+
+    def _remove_leftover_files(self, username: str, filenames: list[str]) -> None:
+        """Best-effort delete of this handle's still-present files inside the
+        downloads mount, pruning directories left empty. Never raises."""
+        mount = self._downloads_mount
+        try:
+            mount_resolved = mount.resolve()
+            if not mount.is_dir():
+                return
+        except OSError:
+            return
+        for filename in filenames:
+            try:
+                located = self._locate_file(username, filename)
+                if located is None or not located.is_relative_to(mount_resolved):
+                    continue
+                # Remove the located file AND every slskd collision variant of it in the
+                # same directory (retried downloads of the same track saved as
+                # {stem}_{ticks}{ext}) - otherwise each retry leaves one more copy behind.
+                basename = located.name
+                parts = [p for p in re.split(r"[\\/]", filename) if p]
+                if parts:
+                    basename = parts[-1]
+                matches = self._collision_matcher(basename)
+                removed = 0
+                for entry in list(located.parent.iterdir()):
+                    if entry.is_file() and (entry == located or matches(entry.name)):
+                        entry.unlink(missing_ok=True)
+                        removed += 1
+                if removed:
+                    logger.info(
+                        "Removed %d leftover download file(s) for %s", removed, basename
+                    )
+                self._prune_empty_dirs(located.parent, mount_resolved)
+            except OSError as exc:
+                logger.warning("Could not remove leftover file %r: %s", filename, exc)
+
+    @staticmethod
+    def _prune_empty_dirs(directory: Path, mount: Path) -> None:
+        """Remove now-empty directories from ``directory`` up to (never including)
+        the mount root."""
+        current = directory.resolve()
+        while current != mount and current.is_relative_to(mount):
+            try:
+                current.rmdir()  # fails on non-empty - exactly the stop condition
+            except OSError:
+                return
+            current = current.parent
 
     async def list_completed_files(self, handle: TaskHandle) -> list[Path]:
         """slskd already knows its filenames (from the search/handle), so resolve
@@ -179,6 +236,48 @@ class SlskdRepository:
         return await asyncio.to_thread(
             self._locate_file, handle.username, remote_filename, size
         )
+
+    @staticmethod
+    def _collision_matcher(basename: str):
+        """Predicate matching ``basename`` OR an slskd duplicate-download variant of it.
+
+        When the target filename already exists on disk (a retried/failed-over album
+        re-downloading the same track), slskd saves the new copy as
+        ``{stem}_{ticks}{ext}`` (e.g. ``Song_638196515567596428.flac``). The exact-name
+        locator never matched those, so re-downloads could neither be imported nor
+        cleaned up - they piled up on the mount forever."""
+        stem, dot, ext = basename.rpartition(".")
+        if not dot:
+            stem, ext = basename, ""
+        pattern = re.compile(
+            re.escape(stem) + r"_\d{6,20}" + (re.escape(f".{ext}") if ext else "") + r"\Z",
+            re.IGNORECASE,
+        )
+
+        def matches(name: str) -> bool:
+            return name == basename or pattern.match(name) is not None
+
+        return matches
+
+    def _pick_in_dir(self, directory: Path, basename: str) -> Path | None:
+        """The file for ``basename`` inside ``directory``: the exact name when present,
+        else the NEWEST slskd collision variant (``stem_<ticks>.ext``), else None."""
+        exact = directory / basename
+        try:
+            if exact.exists():
+                return exact
+            if not directory.is_dir():
+                return None
+            matches = self._collision_matcher(basename)
+            variants = [e for e in directory.iterdir() if e.is_file() and matches(e.name)]
+        except OSError:
+            return None
+        if not variants:
+            return None
+        try:
+            return max(variants, key=lambda e: e.stat().st_mtime)
+        except OSError:
+            return variants[0]
 
     def _locate_file(
         self, username: str, remote_filename: str, size: int | None = None
@@ -209,30 +308,37 @@ class SlskdRepository:
                 return None
             return resolved
 
+        name_matches = self._collision_matcher(basename)
         # 1. slskd's common layout: {mount}/{leaf remote folder}/{filename}.
         if len(parts) >= 2:
-            leaf = _within_mount(mount / parts[-2] / basename)
-            if leaf is not None and leaf.exists():
-                return leaf
+            hit = self._pick_in_dir(mount / parts[-2], basename)
+            if hit is not None:
+                leaf = _within_mount(hit)
+                if leaf is not None:
+                    return leaf
         # 2. Flat layout: {mount}/{filename}.
-        flat = _within_mount(mount / basename)
-        if flat is not None and flat.exists():
-            return flat
+        hit = self._pick_in_dir(mount, basename)
+        if hit is not None:
+            flat = _within_mount(hit)
+            if flat is not None:
+                return flat
         # 3. Peers that file by username: walk {mount}/{username}/ at any depth
         # (covers {username}/{file} and {username}/{album}/{file}). Scoped to the
         # peer so a same-named track from a different user can't be picked up.
         user_root = _within_mount(mount / username) if username else None
         if user_root is not None and user_root.is_dir():
-            hit = self._walk_find(user_root, mount, lambda e: e.name == basename)
+            hit = self._walk_find(user_root, mount, lambda e: name_matches(e.name))
             if hit is not None:
                 return hit
         # 4. slskd may have sanitised the folder name - scan one level down for it.
         try:
             for child in sorted(mount.iterdir()):
                 if child.is_dir():
-                    cand = _within_mount(child / basename)
-                    if cand is not None and cand.exists():
-                        return cand
+                    found = self._pick_in_dir(child, basename)
+                    if found is not None:
+                        cand = _within_mount(found)
+                        if cand is not None:
+                            return cand
         except OSError as exc:
             logger.warning("Could not scan downloads mount %s: %s", mount, exc)
         # 5. Last resort: slskd sanitised the FILENAME (illegal chars stripped), so
@@ -255,7 +361,7 @@ class SlskdRepository:
         # a different same-named track - an unscoped size-ONLY walk would cross peers
         # (step 5 stays peer-scoped on purpose). Reached only after every step missed.
         def _name_size_match(entry: Path) -> bool:
-            if entry.name != basename:
+            if not name_matches(entry.name):
                 return False
             if not size:
                 return True

@@ -590,3 +590,118 @@ def test_wildcard_artist_first_letter_and_apostrophe_absorption():
 def test_build_album_query_joins_with_separator():
     query = SlskdRepository._build_album_query("Radiohead", "OK Computer", 1997)
     assert query == "Radiohead OK Computer 1997"
+
+
+# --- cancel: leftover-file cleanup --------------------------------------------------
+
+
+class _CancelFake:
+    """get_downloads returns one matching transfer; cancel_transfer records calls."""
+
+    def __init__(self):
+        self.cancelled = []
+
+    async def get_downloads(self, username):
+        return [
+            SlskdTransfer(id="tr-1", username=username, filename="@@p\\Album\\01.flac")
+        ]
+
+    async def cancel_transfer(self, username, transfer_id):
+        self.cancelled.append((username, transfer_id))
+        return True
+
+
+@pytest.mark.asyncio
+async def test_cancel_deletes_leftover_files_and_prunes_empty_dirs(tmp_path):
+    # A downloaded-but-not-imported file must not sit on the mount forever (the
+    # import MOVES successes out, so anything still locatable here failed).
+    album = tmp_path / "Album"
+    album.mkdir()
+    leftover = album / "01.flac"
+    leftover.write_bytes(b"x")
+    other = tmp_path / "Other" / "keep.flac"
+    other.parent.mkdir()
+    other.write_bytes(b"y")
+
+    repo = SlskdRepository(
+        client=_CancelFake(), url="u", api_key="k", downloads_mount=tmp_path
+    )
+    ok = await repo.cancel(_h("alice", ["@@p\\Album\\01.flac"]))
+
+    assert ok is True
+    assert not leftover.exists()
+    assert not album.exists()          # emptied folder pruned
+    assert other.exists()              # unrelated files untouched
+    assert tmp_path.exists()           # never the mount root itself
+
+
+@pytest.mark.asyncio
+async def test_cancel_leaves_disk_alone_when_nothing_locatable(tmp_path):
+    (tmp_path / "Other").mkdir()
+    (tmp_path / "Other" / "keep.flac").write_bytes(b"y")
+
+    repo = SlskdRepository(
+        client=_CancelFake(), url="u", api_key="k", downloads_mount=tmp_path
+    )
+    await repo.cancel(_h("alice", ["@@p\\Gone\\nope.flac"]))
+
+    assert (tmp_path / "Other" / "keep.flac").exists()
+
+
+def _mount_repo(tmp_path):
+    return SlskdRepository(
+        client=_CancelFake(), url="u", api_key="k", downloads_mount=tmp_path
+    )
+
+
+def test_locate_file_finds_slskd_collision_variant(tmp_path):
+    # slskd saves a re-downloaded track as {stem}_{ticks}{ext}; the locator must
+    # resolve it so retried downloads can be imported and cleaned up.
+    album = tmp_path / "Album"
+    album.mkdir()
+    variant = album / "01 Song_638196515567596428.flac"
+    variant.write_bytes(b"x")
+
+    located = _mount_repo(tmp_path)._locate_file("alice", "@@p\\Album\\01 Song.flac")
+
+    assert located == variant.resolve()
+
+
+def test_locate_file_prefers_exact_name_over_variant(tmp_path):
+    album = tmp_path / "Album"
+    album.mkdir()
+    exact = album / "01 Song.flac"
+    exact.write_bytes(b"x")
+    (album / "01 Song_638196515567596428.flac").write_bytes(b"y")
+
+    located = _mount_repo(tmp_path)._locate_file("alice", "@@p\\Album\\01 Song.flac")
+
+    assert located == exact.resolve()
+
+
+def test_collision_matcher_rejects_lookalikes(tmp_path):
+    album = tmp_path / "Album"
+    album.mkdir()
+    # letters after the underscore, or a different stem, are NOT slskd variants
+    (album / "01 Song_remaster.flac").write_bytes(b"x")
+    (album / "01 Song 2.flac").write_bytes(b"x")
+
+    located = _mount_repo(tmp_path)._locate_file("alice", "@@p\\Album\\01 Song.flac")
+
+    assert located is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_deletes_all_collision_variants(tmp_path):
+    # Every leftover copy of a retried download is removed, not just the newest one.
+    album = tmp_path / "Album"
+    album.mkdir()
+    (album / "01.flac").write_bytes(b"a")
+    (album / "01_638196515567596428.flac").write_bytes(b"b")
+    (album / "01_638196520732045202.flac").write_bytes(b"c")
+
+    repo = _mount_repo(tmp_path)
+    await repo.cancel(_h("alice", ["@@p\\Album\\01.flac"]))
+
+    assert not album.exists()  # all three removed, empty dir pruned
+    assert tmp_path.exists()

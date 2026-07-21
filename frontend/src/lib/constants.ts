@@ -390,6 +390,7 @@ export const API = {
 		},
 		get: (taskId: string) => `/api/v1/downloads/${taskId}`,
 		stream: (taskId: string) => `/api/v1/downloads/${taskId}/stream`,
+		streamAll: () => '/api/v1/downloads/stream',
 		cancel: (taskId: string) => `/api/v1/downloads/${taskId}/cancel`,
 		retry: (taskId: string) => `/api/v1/downloads/${taskId}/retry`,
 		clear: () => '/api/v1/downloads/clear',
