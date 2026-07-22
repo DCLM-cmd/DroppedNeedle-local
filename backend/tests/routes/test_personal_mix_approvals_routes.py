@@ -20,7 +20,7 @@ from core.dependencies import (
 )
 from infrastructure.persistence.user_listening_prefs_store import UserListeningPrefsStore
 from services.personal_mix_service import PersonalMixService
-from tests.helpers import build_test_client, mock_user, override_admin_auth
+from tests.helpers import build_test_client, make_builtin_dispatcher, mock_user, override_admin_auth
 
 
 def _run(coro):
@@ -52,12 +52,13 @@ def ctx(tmp_path: Path):
     _run(store.upsert("user-a", auto_request_personal_mix=True))
     _run(store.upsert_approval("user-a", "pending"))
 
+    download_service = AsyncMock()
     service = PersonalMixService(
         client_factory=AsyncMock(),
         mb_repo=AsyncMock(),
         library_repo=AsyncMock(),
         playlist_service=AsyncMock(),
-        download_service=AsyncMock(),
+        acquisition=make_builtin_dispatcher(lambda: download_service),
         listening_prefs_store=store,
         connections_store=AsyncMock(),
         auth_store=AsyncMock(),

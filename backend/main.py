@@ -66,6 +66,10 @@ from api.v1.routes import auth as auth_routes
 from api.v1.routes import download_client as download_client_routes
 from api.v1.routes import download_clients as download_clients_routes
 from api.v1.routes import indexers as indexers_routes
+from api.v1.routes import lidarr_import as lidarr_import_routes
+from api.v1.routes import import_drop as import_drop_routes
+from api.v1.routes import free_music as free_music_routes
+from api.v1.routes import plugins as plugins_routes
 from api.v1.routes import downloads_search as downloads_search_routes
 from api.v1.routes import downloads as downloads_routes
 from api.v1.routes import tracks as tracks_routes
@@ -323,6 +327,29 @@ async def lifespan(app: FastAPI):
     )
 
     start_download_resume_task(get_download_orchestrator())
+
+    # drop-import housekeeping: jobs whose task died with the process are failed,
+    # and staging dirs with nothing left to review are removed. Never blocks startup.
+    from core.dependencies import get_drop_import_service
+    try:
+        await get_drop_import_service().sweep_stale()
+    except Exception as exc:  # noqa: BLE001 - housekeeping must not block startup
+        logger.warning("startup.drop_import_sweep_failed", extra={"error": str(exc)})
+
+    # Free Music (D24): a task whose coroutine died with the process can never finish.
+    from core.dependencies import get_free_music_service
+    try:
+        await get_free_music_service().sweep_stale()
+    except Exception as exc:  # noqa: BLE001 - housekeeping must not block startup
+        logger.warning("startup.free_music_sweep_failed", extra={"error": str(exc)})
+
+    # plugin host (01b): discover + load admin-enabled plugins. Module imports are
+    # blocking work; a broken plugin is isolated by the host and never blocks startup.
+    from core.dependencies import get_plugin_host
+    try:
+        await asyncio.to_thread(get_plugin_host().load_all)
+    except Exception as exc:  # noqa: BLE001 - plugins must never block startup
+        logger.warning("startup.plugin_load_failed", extra={"error": str(exc)})
     # pass the provider (not an instance) so the watchdog always sweeps the current
     # orchestrator singleton, which is rebuilt when download-client settings are saved
     start_download_watchdog_task(get_download_orchestrator)
@@ -727,6 +754,10 @@ v1_router.include_router(auth_routes.router)
 v1_router.include_router(download_client_routes.router)
 v1_router.include_router(download_clients_routes.router)
 v1_router.include_router(indexers_routes.router)
+v1_router.include_router(lidarr_import_routes.router)
+v1_router.include_router(import_drop_routes.router)
+v1_router.include_router(free_music_routes.router)
+v1_router.include_router(plugins_routes.router)
 v1_router.include_router(downloads_search_routes.router)
 # quarantine + search routers declare literal /downloads/{quarantine,search}/* paths;
 # they MUST be registered before downloads_routes, whose catch-all GET /downloads/{task_id}

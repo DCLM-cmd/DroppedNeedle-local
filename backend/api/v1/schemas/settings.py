@@ -313,6 +313,31 @@ class NewznabIndexerSettings(AppStruct):
         self.url = self.url.rstrip("/")
 
 
+class LidarrImportConnectionSettings(AppStruct):
+    """Read-only Lidarr *import* connection (LidarrImport D5): a single admin-configured
+    Lidarr the monitored-artist importer reads from. NOT a management integration - the old
+    Lidarr surface stays deleted (D8). ``api_key`` is a Fernet-encrypted secret, masked on
+    read, preserved on a masked save."""
+
+    url: str = ""
+    api_key: str = ""
+
+    def __post_init__(self) -> None:
+        # Normalise the base URL to a bare origin we can append /api/v1 to ourselves:
+        # default a scheme-less host to http:// (Lidarr is a plain-http LAN service - do NOT
+        # copy SABnzbd's https-forcing, see 02-lidarr-api.md), strip a trailing '/', then strip
+        # a trailing '/api/v1' or '/api' if the user pasted the full API path. Because this
+        # normalises silently, the Test route needs no "did you mean /api" suggestion.
+        self.url = self.url.strip()
+        if self.url and not self.url.startswith(("http://", "https://")):
+            self.url = f"http://{self.url}"
+        self.url = self.url.rstrip("/")
+        for suffix in ("/api/v1", "/api"):
+            if self.url.endswith(suffix):
+                self.url = self.url[: -len(suffix)].rstrip("/")
+                break
+
+
 class JellyfinConnectionSettings(AppStruct):
     jellyfin_url: str = "http://jellyfin:8096"
     api_key: str = ""
@@ -340,6 +365,7 @@ ACOUSTID_KEY_MASK = "acoustid****"
 DOWNLOAD_CLIENT_API_KEY_MASK = "slskd****"
 INDEXER_API_KEY_MASK = "indexer****"
 SABNZBD_API_KEY_MASK = "sabnzbd****"
+LIDARR_IMPORT_API_KEY_MASK = "lidarr****"
 SPOTIFY_SECRET_MASK = "spotify****"
 
 
@@ -351,6 +377,38 @@ class SpotifySettings(AppStruct):
 
 TICKETMASTER_KEY_MASK = "ticketmaster****"
 SKIDDLE_KEY_MASK = "skiddle****"
+
+
+class PluginConfig(AppStruct):
+    """Per-plugin admin state (phase 01b). ``enabled`` defaults to False on
+    purpose: dropping a folder into the plugins directory must never run code
+    until an admin flips it on (the documented trust model). ``settings`` holds
+    the values for the fields the plugin's manifest declares."""
+
+    enabled: bool = False
+    settings: dict[str, str] = {}
+
+
+class FreeMusicSettings(AppStruct):
+    """Free Music (D24): DroppedNeedle's own lawful download client. Downloads
+    Creative Commons and public-domain music from the Internet Archive, filtered
+    to items carrying an explicit licence. Enabled by default - it costs nothing,
+    needs no signup, and the lawful use it demonstrates is what makes having a
+    download engine defensible at all."""
+
+    enabled: bool = True
+    preferred_format: Literal["flac", "mp3"] = "flac"
+
+
+class GetItSettings(AppStruct):
+    """"Get it" purchase links (phase 01). ``store_region`` feeds the iTunes
+    Search ``country`` storefront parameter. ``support_droppedneedle`` gates
+    the affiliate decorator (D19): on = the app's baked-in tags decorate store
+    links and a disclosure line renders; off = every link is a clean direct
+    URL. No secrets here - affiliate tags are public strings."""
+
+    store_region: Annotated[str, msgspec.Meta(pattern=r"^[A-Za-z]{2}$")] = "US"
+    support_droppedneedle: bool = True
 
 
 class EventsSettings(AppStruct):

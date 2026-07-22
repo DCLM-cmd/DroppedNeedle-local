@@ -5,6 +5,11 @@ import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { PlaylistQueryKeyFactory } from '$lib/queries/playlists/PlaylistQueryKeyFactory';
 import { FollowQueryKeyFactory } from '$lib/queries/following/FollowQueryKeyFactory';
 import { WantedQueryKeyFactory } from '$lib/queries/wanted/WantedQueryKeyFactory';
+import { DropImportQueryKeyFactory } from '$lib/queries/import/DropImportQueryKeyFactory';
+import { FreeMusicQueryKeyFactory } from '$lib/queries/free-music/FreeMusicQueryKeyFactory';
+import { HomeQueryKeyFactory } from '$lib/queries/HomeQueryKeyFactory';
+import { LOCAL_KEYS } from '$lib/queries/local/LocalQueries.svelte';
+import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
 
 // SSEPublisher replays its last payload to every new subscriber, so toasting
 // events arrive again on each reconnect. De-dupe them by id, persisted per
@@ -12,6 +17,7 @@ import { WantedQueryKeyFactory } from '$lib/queries/wanted/WantedQueryKeyFactory
 const SEEN_KEY = 'msr:auto_download_toasts';
 const MIX_SEEN_KEY = 'msr:personal_mix_toasts';
 const WANTED_SEEN_KEY = 'msr:wanted_toasts';
+const REQUEST_IMPORTED_SEEN_KEY = 'msr:request_imported_toasts';
 
 function loadSeen(key: string): Set<string> {
 	try {
@@ -44,6 +50,8 @@ export function createFollowingEvents() {
 	let mixSeen = new Set<string>();
 	// Wanted watcher events toast (auto-dispatch/fulfilled) - same persisted de-dupe.
 	let wantedSeen = new Set<string>();
+	// A curator drop-imported an album this user requested - toasts, so persisted.
+	let requestImportedSeen = new Set<string>();
 
 	function handlePlaylistImported(event: Event): void {
 		let data: Record<string, unknown>;
@@ -176,12 +184,52 @@ export function createFollowingEvents() {
 		(album) => `${album} is now in your library.`
 	);
 
+	// A curator imported an album this user had requested (drop importer, 01c).
+	function handleRequestImported(event: Event): void {
+		let data: Record<string, unknown>;
+		try {
+			data = JSON.parse((event as MessageEvent).data) as Record<string, unknown>;
+		} catch {
+			return;
+		}
+		const eventId = typeof data.event_id === 'string' ? data.event_id : '';
+		if (!eventId || requestImportedSeen.has(eventId)) return;
+		requestImportedSeen.add(eventId);
+		persistSeen(REQUEST_IMPORTED_SEEN_KEY, requestImportedSeen);
+		const album =
+			typeof data.album_title === 'string' && data.album_title ? data.album_title : 'An album';
+		toastStore.show({ message: `${album} is now in your library.`, type: 'success' });
+	}
+
+	// The user's own drop-import job progressed server-side - refresh the lists.
+	function handleDropImportUpdated(): void {
+		void invalidateQueriesWithPersister({ queryKey: DropImportQueryKeyFactory.prefix });
+	}
+
+	// The user's own Free Music task progressed server-side - refresh the queue. A
+	// completed task also landed an album in the library, so sweep those caches too
+	// (cross-domain rule), but not on the once-a-second progress ticks.
+	function handleFreeMusicUpdated(event: Event): void {
+		void invalidateQueriesWithPersister({ queryKey: FreeMusicQueryKeyFactory.prefix });
+		let data: Record<string, unknown>;
+		try {
+			data = JSON.parse((event as MessageEvent).data) as Record<string, unknown>;
+		} catch {
+			return;
+		}
+		if (data.status !== 'completed') return;
+		void invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all });
+		void invalidateQueriesWithPersister({ queryKey: LOCAL_KEYS.root });
+		void invalidateQueriesWithPersister({ queryKey: HomeQueryKeyFactory.prefix });
+	}
+
 	function start(): void {
 		stop();
 		seen = loadSeen(SEEN_KEY);
 		importsSeen = new Set();
 		mixSeen = loadSeen(MIX_SEEN_KEY);
 		wantedSeen = loadSeen(WANTED_SEEN_KEY);
+		requestImportedSeen = loadSeen(REQUEST_IMPORTED_SEEN_KEY);
 		source = new EventSource(API.following.events());
 		source.addEventListener('auto_download_enqueued', handleEnqueued);
 		source.addEventListener('playlist_imported', handlePlaylistImported);
@@ -190,6 +238,9 @@ export function createFollowingEvents() {
 		source.addEventListener('concerts_new', handleConcertsNew);
 		source.addEventListener('wanted_auto_dispatched', handleWantedAutoDispatched);
 		source.addEventListener('wanted_fulfilled', handleWantedFulfilled);
+		source.addEventListener('request_imported', handleRequestImported);
+		source.addEventListener('drop_import_updated', handleDropImportUpdated);
+		source.addEventListener('free_music_updated', handleFreeMusicUpdated);
 	}
 
 	function stop(): void {

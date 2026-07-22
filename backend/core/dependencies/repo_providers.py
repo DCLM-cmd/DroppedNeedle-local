@@ -273,6 +273,46 @@ def get_wanted_store() -> "WantedStore":
 
 
 @singleton
+def get_archive_repository() -> "ArchiveRepository":
+    from infrastructure.http.client import HttpClientFactory
+    from repositories.archive_repository import ArchiveRepository
+
+    # generous timeout: this client streams whole albums, not JSON
+    http = HttpClientFactory.get_client(name="internet-archive", timeout=120.0)
+    return ArchiveRepository(http)
+
+
+@singleton
+def get_free_music_store() -> "FreeMusicStore":
+    from infrastructure.persistence.free_music_store import FreeMusicStore
+
+    from .cache_providers import get_persistence_write_lock
+
+    settings = get_settings()
+    return FreeMusicStore(db_path=settings.library_db_path, write_lock=get_persistence_write_lock())
+
+
+@singleton
+def get_itunes_repository() -> "ITunesRepository":
+    from infrastructure.http.client import HttpClientFactory
+    from repositories.itunes_repository import ITunesRepository
+
+    # dedicated client name: the factory caches clients by name and the first
+    # caller's kwargs win, so a non-default surface gets its own entry
+    http = HttpClientFactory.get_client(name="itunes-search", timeout=10.0)
+    return ITunesRepository(http)
+
+
+@singleton
+def get_drop_import_store() -> "DropImportStore":
+    from infrastructure.persistence.drop_import_store import DropImportStore
+    from .cache_providers import get_persistence_write_lock
+
+    settings = get_settings()
+    return DropImportStore(db_path=settings.library_db_path, write_lock=get_persistence_write_lock())
+
+
+@singleton
 def get_events_store() -> "EventsStore":
     from infrastructure.persistence.events_store import EventsStore
     from .cache_providers import get_persistence_write_lock
@@ -593,6 +633,18 @@ def build_slskd_repository(url: str, api_key: str) -> "SlskdRepository":
         concurrent_searches=settings.download_client_concurrent_searches,
         concurrent_enqueues=settings.download_client_concurrent_enqueues,
     )
+
+
+@singleton
+def get_lidarr_import_repository() -> "LidarrImportRepository":
+    """Read-only Lidarr import client (LidarrImport). Stateless w.r.t. credentials - its
+    methods take url/api_key per call (from submitted creds for Test, from PreferencesService
+    for import), so a connection save needs no cache_clear here. Dedicated client name so the
+    first-caller-wins timeout doesn't leak from another repo."""
+    from repositories.lidarr_import import LidarrImportRepository
+
+    http = HttpClientFactory.get_client(name="lidarr_import", timeout=30.0, connect_timeout=5.0)
+    return LidarrImportRepository(http)
 
 
 @singleton
