@@ -28,7 +28,7 @@
 		getAlbumEditionsQuery,
 		setEditionPin
 	} from '$lib/queries/albums/EditionQueries.svelte';
-	import type { AlbumEditionItem } from '$lib/types';
+	import { editionLabel } from './albumEditionLabel';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';
@@ -172,16 +172,6 @@
 		upgradeQueued = false;
 		acquireQueued = false;
 	});
-
-	function editionLabel(e: AlbumEditionItem): string {
-		const bits = [
-			e.disambiguation,
-			e.date?.slice(0, 4),
-			e.country,
-			`${e.track_count} tracks`
-		].filter(Boolean);
-		return bits.join(' · ') || e.release_mbid.slice(0, 8);
-	}
 
 	async function handlePickEdition(releaseMbid: string | null) {
 		// the DaisyUI dropdown is focus-driven: blur the trigger so the menu
@@ -339,7 +329,7 @@
 							{#if editionsQuery.data?.pinned_release_mbid}
 								<Pin class="h-3 w-3 text-primary" />
 							{/if}
-							Edition: {currentEdition ? editionLabel(currentEdition) : 'automatic'}
+							Edition: {currentEdition ? editionLabel(currentEdition, album.title) : 'automatic'}
 							<ChevronDown class="h-3 w-3" />
 						</button>
 						<ul
@@ -362,7 +352,7 @@
 										class:font-semibold={edition.is_pinned}
 										onclick={() => void handlePickEdition(edition.release_mbid)}
 									>
-										<span class="truncate">{editionLabel(edition)}</span>
+										<span class="truncate">{editionLabel(edition, album.title)}</span>
 										<span class="flex shrink-0 gap-1">
 											{#if edition.is_owned}
 												<span class="badge badge-success badge-xs">owned</span>

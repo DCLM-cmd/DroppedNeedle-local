@@ -68,6 +68,11 @@ from .repo_providers import (  # noqa: F401
     get_sabnzbd_client,
     get_sabnzbd_download_client,
     build_sabnzbd_download_client,
+    get_lidarr_import_repository,
+    get_itunes_repository,
+    get_archive_repository,
+    get_free_music_store,
+    get_drop_import_store,
     get_download_client,
     get_download_client_for_source,
 )
@@ -87,6 +92,11 @@ from .service_providers import (  # noqa: F401
     get_search_enrichment_service,
     get_artist_service,
     get_follow_service,
+    get_lidarr_import_service,
+    get_drop_import_service,
+    get_free_music_service,
+    get_get_it_service,
+    get_plugin_host,
     get_new_release_service,
     get_personal_mix_service,
     get_wanted_watcher_service,
@@ -129,6 +139,7 @@ from .service_providers import (  # noqa: F401
     get_download_manifest_codec,
     get_download_orchestrator,
     get_download_service,
+    get_acquisition_dispatcher,
     get_quota_service,
 )
 

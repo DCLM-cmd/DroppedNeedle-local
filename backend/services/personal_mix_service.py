@@ -84,7 +84,7 @@ class PersonalMixService:
         mb_repo,
         library_repo,
         playlist_service,
-        download_service,
+        acquisition,
         listening_prefs_store,
         connections_store,
         auth_store,
@@ -93,7 +93,9 @@ class PersonalMixService:
         self._mb_repo = mb_repo
         self._library_repo = library_repo
         self._playlists = playlist_service
-        self._downloads = download_service
+        # The dispatcher routes to a user's download client or Free Music; it resolves
+        # both fresh per call, so capturing it in this background loop is safe.
+        self._acquisition = acquisition
         self._prefs = listening_prefs_store
         self._connections_store = connections_store
         self._auth_store = auth_store
@@ -393,7 +395,7 @@ class PersonalMixService:
                 continue
             seen_rgs.add(t.release_group_mbid)
             try:
-                task_id = await self._downloads.request_album(
+                task_id = await self._acquisition.request_album(
                     user_id=user_id,
                     release_group_mbid=t.release_group_mbid,
                     artist_name=t.artist_name,

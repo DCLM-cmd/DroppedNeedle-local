@@ -81,7 +81,7 @@ class NewReleaseService:
         self,
         follow_store: FollowStore,
         mb_repo,
-        download_service,
+        acquisition,
         download_store,
         library_repo,
         sse_publisher,
@@ -89,7 +89,9 @@ class NewReleaseService:
     ) -> None:
         self._store = follow_store
         self._mb = mb_repo
-        self._downloads = download_service
+        # The dispatcher routes to a user's download client or Free Music; it resolves
+        # both fresh per call, so capturing it in this background loop is safe.
+        self._acquisition = acquisition
         self._download_store = download_store
         self._library = library_repo
         self._sse = sse_publisher
@@ -222,7 +224,7 @@ class NewReleaseService:
         owner = followers[0]  # deterministic; the shared library satisfies the rest
         title = rg.get("title") or ""
         try:
-            task_id = await self._downloads.request_album(
+            task_id = await self._acquisition.request_album(
                 user_id=owner,
                 release_group_mbid=rg_id,
                 artist_name=artist.artist_name,

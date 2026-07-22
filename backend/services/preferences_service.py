@@ -31,12 +31,17 @@ from api.v1.schemas.settings import (
     DOWNLOAD_CLIENT_API_KEY_MASK,
     INDEXER_API_KEY_MASK,
     SABNZBD_API_KEY_MASK,
+    LIDARR_IMPORT_API_KEY_MASK,
     DownloadPolicySettings,
+    LidarrImportConnectionSettings,
     NewznabIndexerSettings,
     SabnzbdConnectionSettings,
     SpotifySettings,
     SPOTIFY_SECRET_MASK,
     EventsSettings,
+    FreeMusicSettings,
+    GetItSettings,
+    PluginConfig,
     TICKETMASTER_KEY_MASK,
     SKIDDLE_KEY_MASK,
     DEFAULT_NAMING_TEMPLATE,
@@ -359,6 +364,53 @@ class PreferencesService:
             logger.error("Failed to save SABnzbd settings: %s", e)
             raise ConfigurationError(f"Failed to save SABnzbd settings: {e}")
 
+    # --- Lidarr import connection (LidarrImport D5) - read-only migration aid ------
+
+    def get_lidarr_import_connection(self) -> LidarrImportConnectionSettings:
+        """Lidarr import connection with the ``api_key`` MASKED (safe for API responses)."""
+        data = self._load_config().get("lidarr_import", {})
+        settings = (
+            msgspec.convert(data, type=LidarrImportConnectionSettings)
+            if data
+            else LidarrImportConnectionSettings()
+        )
+        if settings.api_key:
+            settings.api_key = LIDARR_IMPORT_API_KEY_MASK
+        return settings
+
+    def get_lidarr_import_connection_raw(self) -> LidarrImportConnectionSettings:
+        """Lidarr import connection with the ``api_key`` DECRYPTED (for the client)."""
+        data = self._load_config().get("lidarr_import", {})
+        settings = (
+            msgspec.convert(data, type=LidarrImportConnectionSettings)
+            if data
+            else LidarrImportConnectionSettings()
+        )
+        stored = data.get("api_key", "")
+        settings.api_key = decrypt(stored)[0].strip() if stored else ""
+        return settings
+
+    def save_lidarr_import_connection(self, settings: LidarrImportConnectionSettings) -> None:
+        try:
+            config = self._load_config().copy()
+            current = config.get("lidarr_import", {})
+            api_key = settings.api_key.strip()
+            if api_key == LIDARR_IMPORT_API_KEY_MASK:
+                api_key = current.get("api_key", "")  # preserve on masked sentinel
+            elif api_key:
+                api_key = encrypt(api_key)
+            config["lidarr_import"] = {"url": settings.url, "api_key": api_key}
+            self._save_config(config)
+            logger.info("Saved Lidarr import connection settings")
+        except Exception as e:  # noqa: BLE001
+            logger.error("Failed to save Lidarr import settings: %s", e)
+            raise ConfigurationError(f"Failed to save Lidarr import settings: {e}")
+
+    def is_lidarr_import_configured(self) -> bool:
+        """True iff a Lidarr import URL + API key are both stored (the non-admin gate)."""
+        raw = self.get_lidarr_import_connection_raw()
+        return bool(raw.url and raw.api_key)
+
     # --- Newznab indexers (D6) - a list, each with its own encrypted api_key ------
 
     def get_indexers(self) -> list["NewznabIndexerSettings"]:
@@ -461,9 +513,36 @@ class PreferencesService:
         sab = self.get_sabnzbd_connection()
         return sab.enabled and bool(sab.url) and any(i.enabled for i in self.get_indexers())
 
-    def is_download_source_ready(self) -> bool:
-        """At least one acquisition source (Soulseek OR Usenet) is set up."""
+    def is_builtin_download_ready(self) -> bool:
+        """A user-configured download client (Soulseek OR Usenet) is set up.
+        Chooses the dispatcher; dies with those clients in 2.0."""
         return self.is_soulseek_ready() or self.is_usenet_ready()
+
+    def is_download_source_ready(self) -> bool:
+        """At least one acquisition source is set up: Soulseek, Usenet, or Free
+        Music (D24). The single source of truth for "can the user acquire" -
+        after 2.0 this reduces to Free Music alone."""
+        return self.is_builtin_download_ready() or self.get_free_music_settings().enabled
+
+    def get_free_music_settings(self) -> FreeMusicSettings:
+        data = self._load_config().get("free_music", {})
+        fmt = str(data.get("preferred_format") or "flac").lower()
+        return FreeMusicSettings(
+            enabled=bool(data.get("enabled", True)),
+            preferred_format="mp3" if fmt == "mp3" else "flac",
+        )
+
+    def save_free_music_settings(self, settings: FreeMusicSettings) -> None:
+        try:
+            config = self._load_config().copy()
+            config["free_music"] = {
+                "enabled": settings.enabled,
+                "preferred_format": settings.preferred_format,
+            }
+            self._save_config(config)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to save Free Music settings: {e}")
+            raise ConfigurationError("Failed to save Free Music settings")
 
     def get_jellyfin_connection(self) -> JellyfinConnectionSettings:
         config = self._load_config()
@@ -778,6 +857,51 @@ class PreferencesService:
     def is_spotify_enabled(self) -> bool:
         raw = self.get_spotify_settings_raw()
         return raw.enabled and bool(raw.client_id) and bool(raw.client_secret)
+
+    def get_get_it_settings(self) -> GetItSettings:
+        """"Get it" purchase-link settings (no secrets - safe for API responses)."""
+        data = self._load_config().get("get_it", {})
+        return GetItSettings(
+            store_region=(data.get("store_region") or "US").upper(),
+            support_droppedneedle=bool(data.get("support_droppedneedle", True)),
+        )
+
+    def save_get_it_settings(self, settings: GetItSettings) -> None:
+        try:
+            config = self._load_config().copy()
+            config["get_it"] = {
+                "store_region": settings.store_region.upper(),
+                "support_droppedneedle": settings.support_droppedneedle,
+            }
+            self._save_config(config)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to save Get it settings: {e}")
+            raise ConfigurationError("Failed to save Get it settings")
+
+    def get_plugin_config(self, plugin_name: str) -> PluginConfig:
+        """Per-plugin admin state (01b). Unknown plugins get the safe default:
+        disabled, no settings."""
+        section = self._load_config().get("plugins", {})
+        data = section.get(plugin_name, {}) if isinstance(section, dict) else {}
+        raw_settings = data.get("settings", {})
+        settings = {
+            str(k): str(v) for k, v in raw_settings.items()
+        } if isinstance(raw_settings, dict) else {}
+        return PluginConfig(enabled=bool(data.get("enabled", False)), settings=settings)
+
+    def save_plugin_config(self, plugin_name: str, plugin_config: PluginConfig) -> None:
+        try:
+            config = self._load_config().copy()
+            section = dict(config.get("plugins", {}))
+            section[plugin_name] = {
+                "enabled": plugin_config.enabled,
+                "settings": dict(plugin_config.settings),
+            }
+            config["plugins"] = section
+            self._save_config(config)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to save plugin config for {plugin_name}: {e}")
+            raise ConfigurationError("Failed to save plugin settings")
 
     def _events_section_raw(self) -> EventsSettings:
         config = self._load_config()

@@ -148,7 +148,11 @@ export const API = {
 			return `/api/v1/artists/${id}/lastfm?${params.toString()}`;
 		},
 		follow: (id: string) => `/api/v1/artists/${id}/follow`,
-		autoDownload: (id: string) => `/api/v1/artists/${id}/auto-download`
+		autoDownload: (id: string) => `/api/v1/artists/${id}/auto-download`,
+		purchaseOptions: (id: string, artistName: string) => {
+			const params = new URLSearchParams({ name: artistName });
+			return `/api/v1/artists/${id}/purchase-options?${params.toString()}`;
+		}
 	},
 	following: {
 		artists: () => '/api/v1/following/artists',
@@ -168,7 +172,8 @@ export const API = {
 	},
 	album: {
 		basic: (id: string) => `/api/v1/albums/${id}`,
-		tracks: (id: string) => `/api/v1/albums/${id}/tracks`
+		tracks: (id: string) => `/api/v1/albums/${id}/tracks`,
+		purchaseOptions: (id: string) => `/api/v1/albums/${id}/purchase-options`
 	},
 	library: {
 		mbids: () => '/api/v1/library/mbids',
@@ -276,6 +281,8 @@ export const API = {
 	settingsLocalFilesVerify: () => '/api/v1/settings/local-files/verify',
 	settingsMusicbrainz: () => '/api/v1/settings/musicbrainz',
 	settingsMusicbrainzVerify: () => '/api/v1/settings/musicbrainz/verify',
+	settingsGetIt: () => '/api/v1/settings/get-it',
+	settingsFreeMusic: () => '/api/v1/settings/free-music',
 	profile: {
 		get: () => '/api/v1/profile',
 		update: () => '/api/v1/profile',
@@ -359,6 +366,32 @@ export const API = {
 		reorder: () => '/api/v1/indexers/reorder',
 		test: () => '/api/v1/indexers/test'
 	},
+	lidarrImport: {
+		config: () => '/api/v1/lidarr-import/config',
+		test: () => '/api/v1/lidarr-import/test',
+		status: () => '/api/v1/lidarr-import/status',
+		artists: () => '/api/v1/lidarr-import/artists',
+		import: () => '/api/v1/lidarr-import/import'
+	},
+	freeMusic: {
+		tasks: (all: boolean = false) => `/api/v1/free-music/tasks${all ? '?all=true' : ''}`,
+		task: (id: string) => `/api/v1/free-music/tasks/${id}`,
+		cancel: (id: string) => `/api/v1/free-music/tasks/${id}/cancel`,
+		retry: (id: string) => `/api/v1/free-music/tasks/${id}/retry`
+	},
+	plugins: {
+		list: () => '/api/v1/plugins',
+		install: () => '/api/v1/plugins/install',
+		update: (name: string) => `/api/v1/plugins/${name}`,
+		uninstall: (name: string) => `/api/v1/plugins/${name}`
+	},
+	dropImport: {
+		uploads: () => '/api/v1/import/uploads',
+		jobs: (all: boolean = false) => `/api/v1/import/jobs${all ? '?all=true' : ''}`,
+		job: (jobId: string) => `/api/v1/import/jobs/${jobId}`,
+		match: (itemId: number) => `/api/v1/import/items/${itemId}/match`,
+		discard: (itemId: number) => `/api/v1/import/items/${itemId}/discard`
+	},
 	downloadClients: {
 		sabnzbd: () => '/api/v1/download-clients/sabnzbd',
 		sabnzbdTest: () => '/api/v1/download-clients/sabnzbd/test',
@@ -369,7 +402,9 @@ export const API = {
 	connectApps: {
 		settings: () => '/api/v1/connect-apps/settings',
 		appPasswords: () => '/api/v1/connect-apps/app-passwords',
-		appPassword: (id: string) => `/api/v1/connect-apps/app-passwords/${id}`
+		appPassword: (id: string) => `/api/v1/connect-apps/app-passwords/${id}`,
+		adminAppPasswords: () => '/api/v1/connect-apps/admin/app-passwords',
+		adminAppPassword: (id: string) => `/api/v1/connect-apps/admin/app-passwords/${id}`
 	},
 	downloads: {
 		searchAlbum: () => '/api/v1/downloads/search/album',
@@ -419,6 +454,11 @@ export const API = {
 			`/api/v1/requests/auto-download-approvals/${userId}/${mbid}/reject`,
 		revokeAutoDownload: (userId: string, mbid: string) =>
 			`/api/v1/requests/auto-download-approvals/${userId}/${mbid}/revoke`,
+		autoDownloadApprovalBatches: () => '/api/v1/requests/auto-download-approval-batches',
+		approveAutoDownloadBatch: (batchId: string) =>
+			`/api/v1/requests/auto-download-approval-batches/${batchId}/approve`,
+		rejectAutoDownloadBatch: (batchId: string) =>
+			`/api/v1/requests/auto-download-approval-batches/${batchId}/reject`,
 		personalMixApprovals: () => '/api/v1/requests/personal-mix-approvals',
 		approvePersonalMix: (userId: string) =>
 			`/api/v1/requests/personal-mix-approvals/${userId}/approve`,

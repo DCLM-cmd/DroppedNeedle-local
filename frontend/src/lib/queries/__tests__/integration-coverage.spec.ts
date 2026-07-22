@@ -151,7 +151,67 @@ const COVERAGE: Array<[string, string, string]> = [
 	['wanted stop', API.requests.wantedStop('M1'), '/api/v1/requests/wanted/M1/stop'],
 	['wanted resume', API.requests.wantedResume('M1'), '/api/v1/requests/wanted/M1/resume'],
 	['wanted mark seen', API.requests.wantedSeen('M1'), '/api/v1/requests/wanted/M1/seen'],
-	['wanted watcher settings', API.downloadClients.wanted(), '/api/v1/download-clients/wanted']
+	['wanted watcher settings', API.downloadClients.wanted(), '/api/v1/download-clients/wanted'],
+	// Lidarr import (LidarrImport): admin config/test, user status/artists/import
+	['lidarr-import config', API.lidarrImport.config(), '/api/v1/lidarr-import/config'],
+	['lidarr-import test', API.lidarrImport.test(), '/api/v1/lidarr-import/test'],
+	['lidarr-import status', API.lidarrImport.status(), '/api/v1/lidarr-import/status'],
+	['lidarr-import artists', API.lidarrImport.artists(), '/api/v1/lidarr-import/artists'],
+	['lidarr-import import', API.lidarrImport.import(), '/api/v1/lidarr-import/import'],
+	// Get it (phase 01): the lazy Where-to-buy endpoint + the admin settings card
+	['album purchase options', API.album.purchaseOptions('M1'), '/api/v1/albums/M1/purchase-options'],
+	[
+		'artist purchase options',
+		API.artist.purchaseOptions('A1', 'Band'),
+		'/api/v1/artists/A1/purchase-options?name=Band'
+	],
+	['get-it settings', API.settingsGetIt(), '/api/v1/settings/get-it'],
+	['free-music settings', API.settingsFreeMusic(), '/api/v1/settings/free-music'],
+	// Plugin API (phase 01b): admin roster + curator source surfaces
+	['plugins list', API.plugins.list(), '/api/v1/plugins'],
+	['plugin install', API.plugins.install(), '/api/v1/plugins/install'],
+	['plugin update', API.plugins.update('P1'), '/api/v1/plugins/P1'],
+	['plugin uninstall', API.plugins.uninstall('P1'), '/api/v1/plugins/P1'],
+	// Drop importer (Store Sync 01c): curator-gated upload/jobs/match/discard
+	['drop-import uploads', API.dropImport.uploads(), '/api/v1/import/uploads'],
+	['drop-import jobs', API.dropImport.jobs(), '/api/v1/import/jobs'],
+	['drop-import jobs (all)', API.dropImport.jobs(true), '/api/v1/import/jobs?all=true'],
+	['drop-import job', API.dropImport.job('J1'), '/api/v1/import/jobs/J1'],
+	['drop-import match', API.dropImport.match(7), '/api/v1/import/items/7/match'],
+	['drop-import discard', API.dropImport.discard(7), '/api/v1/import/items/7/discard'],
+	// Free Music (D24): the native lawful download client
+	['free-music tasks', API.freeMusic.tasks(), '/api/v1/free-music/tasks'],
+	['free-music tasks (all)', API.freeMusic.tasks(true), '/api/v1/free-music/tasks?all=true'],
+	['free-music task', API.freeMusic.task('T1'), '/api/v1/free-music/tasks/T1'],
+	['free-music cancel', API.freeMusic.cancel('T1'), '/api/v1/free-music/tasks/T1/cancel'],
+	['free-music retry', API.freeMusic.retry('T1'), '/api/v1/free-music/tasks/T1/retry'],
+	// Bulk auto-download approval batches (admin, requests router)
+	[
+		'auto-download approval batches',
+		API.requests.autoDownloadApprovalBatches(),
+		'/api/v1/requests/auto-download-approval-batches'
+	],
+	[
+		'approve approval batch',
+		API.requests.approveAutoDownloadBatch('B1'),
+		'/api/v1/requests/auto-download-approval-batches/B1/approve'
+	],
+	[
+		'reject approval batch',
+		API.requests.rejectAutoDownloadBatch('B1'),
+		'/api/v1/requests/auto-download-approval-batches/B1/reject'
+	],
+	// Connect Apps admin oversight (see/revoke every user's app-passwords)
+	[
+		'admin app-password roster',
+		API.connectApps.adminAppPasswords(),
+		'/api/v1/connect-apps/admin/app-passwords'
+	],
+	[
+		'admin app-password revoke',
+		API.connectApps.adminAppPassword('ap-1'),
+		'/api/v1/connect-apps/admin/app-passwords/ap-1'
+	]
 ];
 
 // Routes whose builder takes query params - assert the path prefix only.

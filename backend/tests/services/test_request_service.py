@@ -5,6 +5,7 @@ import pytest
 
 from core.exceptions import ExternalServiceError
 from services.request_service import RequestService
+from tests.helpers import make_builtin_dispatcher
 
 
 def _make_service() -> tuple[RequestService, MagicMock, MagicMock]:
@@ -20,7 +21,12 @@ def _make_service() -> tuple[RequestService, MagicMock, MagicMock]:
     download_service.request_album = AsyncMock(return_value="task-1")
     download_service.cancel_task = AsyncMock()
 
-    service = RequestService(request_history, download_service)
+    get_ds = lambda: download_service  # noqa: E731
+    service = RequestService(
+        request_history,
+        get_download_service=get_ds,
+        acquisition=make_builtin_dispatcher(get_ds),
+    )
     return service, request_history, download_service
 
 
@@ -237,3 +243,34 @@ async def test_request_album_over_storage_cap_rejected_at_submit():
 
     request_history.async_record_request.assert_not_awaited()
     quota.check_storage_admission.assert_awaited_once_with("u1", "user")
+
+
+@pytest.mark.asyncio
+async def test_request_album_resolves_download_service_per_dispatch():
+    """Regression (stale-scorer bug): a settings save rebuilds the DownloadService
+    singleton, so the request path must resolve it fresh at each dispatch and never
+    capture an instance - else a saved quality change is ignored until restart. Uses
+    DISTINCT mbids so the second call isn't short-circuited by request dedup."""
+    request_history = MagicMock()
+    request_history.async_record_request = AsyncMock()
+    request_history.async_get_record = AsyncMock(return_value=None)
+    request_history.async_update_status = AsyncMock()
+    request_history.async_update_download_task_id = AsyncMock()
+
+    ds_a, ds_b = MagicMock(), MagicMock()
+    ds_a.request_album = AsyncMock(return_value="task-a")
+    ds_b.request_album = AsyncMock(return_value="task-b")
+    current = {"ds": ds_a}
+    get_ds = lambda: current["ds"]  # noqa: E731
+    service = RequestService(
+        request_history,
+        get_download_service=get_ds,
+        acquisition=make_builtin_dispatcher(get_ds),
+    )
+
+    await service.request_album("rg-A", user_role="admin")
+    current["ds"] = ds_b  # a policy save rebuilt the DownloadService singleton
+    await service.request_album("rg-B", user_role="admin")
+
+    ds_a.request_album.assert_awaited_once()  # first dispatch used the original engine
+    ds_b.request_album.assert_awaited_once()  # second used the NEW one (fails if captured)

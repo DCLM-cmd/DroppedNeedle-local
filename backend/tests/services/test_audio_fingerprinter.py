@@ -6,6 +6,7 @@ The real fpcalc binary and the network are never touched.
 """
 
 import asyncio
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -13,6 +14,7 @@ import httpx
 import pytest
 
 from infrastructure.audio.fingerprinter import (
+    _MAX_FPCALC_CONCURRENCY,
     AudioFingerprinter,
     FingerprintStatus,
     split_artist_credit,
@@ -202,6 +204,19 @@ async def test_error_when_fpcalc_nonzero_exit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_nonzero_exit_with_fingerprint_still_passes(monkeypatch):
+    # fpcalc exits non-zero ("End of file") on sub-120s tracks but still emits a
+    # valid FINGERPRINT= line; the emitted fingerprint must be used, not discarded.
+    _patch_fpcalc(monkeypatch, returncode=2, stdout=_FP_OK)
+    http = _http_client(_pass_payload())
+    fp = _make(http)
+    res = await fp.fingerprint(Path("/short.flac"))
+    assert res.status == FingerprintStatus.PASS
+    _, kwargs = http.post.call_args
+    assert kwargs["data"]["fingerprint"] == "AQADtMmSaEkSRYkG"
+
+
+@pytest.mark.asyncio
 async def test_error_when_fpcalc_output_has_no_fingerprint(monkeypatch):
     _patch_fpcalc(monkeypatch, stdout=b"DURATION=100\n")
     fp = _make(_http_client(_pass_payload()))
@@ -260,11 +275,17 @@ async def test_rate_limiter_awaited_before_http(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_semaphore_gates_concurrent_fpcalc(monkeypatch):
+    # fpcalc concurrency is core-scaled (Tier 2a) but capped, so a scan uses more than one
+    # core for fingerprinting without fork-bombing the host. Launch more tasks than the cap
+    # and assert the semaphore never lets more than the cap run at once.
+    expected_cap = min(os.cpu_count() or 2, _MAX_FPCALC_CONCURRENCY)
     concurrency = {"now": 0, "max": 0}
     _patch_fpcalc(monkeypatch, delay=0.02, concurrency=concurrency)
     fp = _make(_http_client(_pass_payload()))
-    await asyncio.gather(*[fp.fingerprint(Path(f"/{i}.flac")) for i in range(5)])
-    assert concurrency["max"] == 2  # Semaphore(2): never more than 2 at once
+    await asyncio.gather(
+        *[fp.fingerprint(Path(f"/{i}.flac")) for i in range(expected_cap + 3)]
+    )
+    assert concurrency["max"] == expected_cap
 
 
 def test_split_artist_credit_semicolon():

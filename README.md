@@ -3,7 +3,7 @@
 <img src="Images/logo_wide.png" alt="DroppedNeedle" width="400" />
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-[![Docker Hub](https://img.shields.io/badge/docker-hub-blue?logo=docker&logoColor=white)](https://hub.docker.com/r/habirabbu/droppedneedle)
+[![Docker Hub](https://img.shields.io/badge/docker-hub-blue?logo=docker&logoColor=white)](https://hub.docker.com/r/droppedneedle/droppedneedle)
 [![Discord](https://img.shields.io/discord/1356702267809808404?label=discord&logo=discord&logoColor=white)](https://discord.gg/B5suDg7gu2)
 [![Docs](https://img.shields.io/badge/docs-droppedneedle.com-blue)](https://www.droppedneedle.com/)
 
@@ -36,12 +36,12 @@ You need Docker, a music library, and a download client. The example below uses 
 
 ### 1. Create a docker-compose.yml
 
-Images are available on [Docker Hub](https://hub.docker.com/r/habirabbu/droppedneedle) (`habirabbu/droppedneedle:latest`).
+Images are available on [Docker Hub](https://hub.docker.com/r/droppedneedle/droppedneedle) (`droppedneedle/droppedneedle:latest`).
 
 ```yaml
 services:
   droppedneedle:
-    image: habirabbu/droppedneedle:latest
+    image: droppedneedle/droppedneedle:latest
     container_name: droppedneedle
     environment:
       - PUID=1000            # Run `id` on your host to find your user/group ID
@@ -54,6 +54,8 @@ services:
     volumes:
       - ./config:/app/config  # Persistent app configuration
       - ./cache:/app/cache    # Cover art and metadata cache
+      - ./plugins:/app/plugins  # Installed plugins (omit and they vanish on recreate)
+      - ./imports:/app/imports  # Drop-importer staging (optional; same filesystem as /music = atomic imports)
       - /path/to/music:/music:rw          # Your music library (read-write: the engine imports into it)
       # REQUIRED for imports: bind-mount slskd's COMPLETED-downloads dir read-write, on
       # the SAME filesystem as /music above. Use the EXACT path from slskd's
@@ -71,7 +73,7 @@ services:
       retries: 3
 ```
 
-> A `:dev` tag (`habirabbu/droppedneedle:dev`) is also available. It's built automatically from `main` on every push and may be unstable. Pin to a specific commit with `:dev-<short-sha>` (e.g. `:dev-a1b2c3d`).
+> A `:dev` tag (`droppedneedle/droppedneedle:dev`) is also available. It's built automatically from `main` on every push and may be unstable. Pin to a specific commit with `:dev-<short-sha>` (e.g. `:dev-a1b2c3d`).
 
 ### 2. Start it
 
@@ -94,6 +96,12 @@ DroppedNeedle replaces Lidarr with a built-in library and download engine. It sc
 ### Legality boundary
 
 The engine talks only to a user-supplied slskd instance over its local HTTP API. It never joins or distributes on the Soulseek/P2P network itself; it issues searches and download requests to slskd and imports the results. The operator supplies, runs, and is responsible for slskd and its shared folders. This is built into the architecture, not just the UI: the engine has no Soulseek protocol code, only an HTTP client for slskd.
+
+DroppedNeedle ships no indexers and no tracker lists. It searches MusicBrainz, an open metadata database that hosts no audio. Every acquisition source it can reach is one you configured yourself: your own slskd instance, or your own Newznab indexers and your own SABnzbd.
+
+Free Music is the one source that ships with the app. It downloads from the Internet Archive, and it offers only items carrying an explicit Creative Commons or public-domain licence, which is shown to you before anything downloads. It needs no account and no API key, it is on by default, and Settings turns it off.
+
+The engine acquires whatever the operator directs it to acquire. It is built for public-domain and Creative Commons recordings, for releases artists distribute themselves through Bandcamp or the Internet Archive's Live Music Archive, for live-taping collections, and for re-acquiring media you already own. Holding the rights to what you download, and to whatever your download client shares back, is your responsibility as the operator.
 
 ### Architecture
 
@@ -234,7 +242,7 @@ Browse or search the MusicBrainz catalogue, open an album, and click **Request**
 
 > **Legality.** DroppedNeedle only orchestrates a user-provided slskd instance over its local HTTP API; it never joins or distributes on the Soulseek/P2P network. You supply, run, and are responsible for slskd and its shared folders.
 >
-> **Share files in slskd.** Soulseek bans leechers. You must configure at least one shared directory in slskd (`slskd.yml` -> `shares.directories`) or you will be unable to download. This is a slskd requirement, not a DroppedNeedle one.
+> **Sharing on Soulseek.** Soulseek is a reciprocal network and slskd will not run as a leech-only client: without at least one shared directory (`slskd.yml` -> `shares.directories`), searches and downloads fail. That is a property of Soulseek and slskd, not a DroppedNeedle requirement. Anything you place in a shared directory is distributed to other users of the network. What you share, and whether you hold the right to distribute it, is your decision and your responsibility.
 
 slskd is one of two download sources DroppedNeedle supports. If you are using Usenet instead, skip this section and go to [Usenet Setup](#usenet-setup).
 
@@ -439,6 +447,28 @@ Browse your native library by artist or album with search, filtering, sorting, a
 
 Jellyfin, Navidrome, Plex, and local file sources each get their own library view with play, shuffle, and queue actions.
 
+### Free Music
+
+Request an album and DroppedNeedle looks for it on the Internet Archive. If it is there under a Creative Commons or public-domain licence, it downloads, gets tagged and organised into your library, and the request is resolved, all without you configuring anything. There is no account to make and no API key to paste. The licence each download is taken under is shown on the task, and linked.
+
+Nothing else is offered. An item with no licence, or an all-rights-reserved one, is never a candidate, so this works for the artists who chose to give their music away and not for anyone else. It is on by default, and one toggle in Settings turns it off.
+
+### Import Your Purchases
+
+Buy music wherever you like - Bandcamp, the Qobuz store, a label's own shop - then hand the zip or the loose files to DroppedNeedle. Drag them onto the card on your home page or the Import tab on the Downloads page, or click either one to browse. Archives are extracted, and every album is identified by the same pipeline the library scanner uses: MusicBrainz tags first, then AcoustID fingerprints. The files are tagged, organised into your library under your naming template, and if anyone had requested that album, their request is resolved and they get a notification.
+
+Anything DroppedNeedle cannot identify waits under "Needs a match", where you search for the right album and assign it, or discard it.
+
+Drop a better-quality copy of an album you already have and it upgrades in place: the old files go to the recycle bin. An equal or worse copy is skipped. Admin and trusted users can import.
+
+### Where to Buy
+
+Album and artist pages show you where to buy the music. Links come from MusicBrainz purchase relationships, with an iTunes fallback (set your region in Settings) and a Bandcamp search behind that, so there is always a way through. Digital, vinyl and CD, and free downloads are listed separately.
+
+Stores are ordered by how fairly they pay artists. Bandcamp comes first, always, and it pays DroppedNeedle nothing.
+
+DroppedNeedle can attach its affiliate tags to Amazon, Apple, and Qobuz links, which earns the project a small commission at no extra cost to you. While that is on, a disclosure line sits under the links. One toggle in Settings turns it off, and every link becomes a plain direct link. Commission never affects the ordering.
+
 ### Scrobbling
 
 Every track you play can be scrobbled to your own ListenBrainz and Last.fm accounts. Each user links their own accounts from their profile and toggles each service on or off independently. While scrobbling is on, your plays are also saved to a local listening history inside DroppedNeedle, which feeds the Recently Played row on your home page. A "now playing" update goes out when a track starts, and a scrobble is submitted when it finishes.
@@ -454,6 +484,18 @@ Playlists are private to you by default. Toggle one to public and it appears rea
 ### Profile
 
 Set a display name and avatar, change your username/email/password, link your own Last.fm and ListenBrainz accounts (with per-user scrobble toggles and a default discovery source), view connected services, and check your library statistics - all from your profile page.
+
+---
+
+## Plugins
+
+Experimental: the plugin API may change until it stabilises.
+
+Third parties can extend DroppedNeedle with scrobblers and purchase-link providers. Install one by pasting a public GitHub repository URL in Settings, or by copying a folder into the plugins directory. No plugin capability downloads music, and DroppedNeedle never calls plugin code to acquire anything.
+
+A plugin is Python running in-process with your server's full privileges, and there is no sandbox. Installing downloads the code and nothing more; the plugin does nothing until an admin enables it. Read the code before you do. DroppedNeedle bundles no plugins and endorses none - a worked example ships in `examples/plugins`.
+
+The full API reference is in [PLUGINS.md](PLUGINS.md).
 
 ---
 
@@ -601,10 +643,12 @@ A note on reliability: YouTube playback depends on the embedded player, which ca
 |-|-|
 | `/app/config` | Application config (`config.json`) |
 | `/app/cache` | Cover art cache, metadata cache, SQLite databases |
+| `/app/plugins` | Installed plugins. Mount it, or plugins you install disappear when the container is recreated |
+| `/app/imports` | Staging for the drop importer (optional). On the **same filesystem** as `/music`, imports are atomic renames rather than byte copies |
 | `/music` | Music library root (read-write: the native engine imports into it) |
 | `/slskd-downloads` | slskd's downloads directory, bind-mounted read-write on the **same filesystem** as `/music` (required for the move-import) |
 
-Map both `/app/config` and `/app/cache` to persistent host directories so they survive container restarts. The `/music` and slskd-downloads mounts must share one filesystem - see [slskd Setup](#slskd-setup).
+Map `/app/config`, `/app/cache`, and `/app/plugins` to persistent host directories so they survive container restarts. The `/music` and slskd-downloads mounts must share one filesystem - see [slskd Setup](#slskd-setup). `/app/imports` is optional, but leave it unmounted and large uploads land on the container's writable layer, while anything waiting for a manual match is lost when the container is recreated.
 
 ---
 
@@ -628,7 +672,7 @@ See the [CONTRIBUTING](CONTRIBUTING.md) guide for instructions on setting up a d
 
 Documentation is at [droppedneedle.com](https://www.droppedneedle.com/).
 
-For questions, help, or just to chat, join the [Discord](https://discord.gg/B5suDg7gu2). Bug reports and feature requests go on [GitHub Issues](https://github.com/HabiRabbu/DroppedNeedle/issues).
+For questions, help, or just to chat, join the [Discord](https://discord.gg/B5suDg7gu2). Bug reports and feature requests go on [GitHub Issues](https://github.com/DroppedNeedle/DroppedNeedle/issues).
 
 If you find DroppedNeedle useful, consider supporting development:
 
@@ -638,6 +682,6 @@ If you find DroppedNeedle useful, consider supporting development:
 
 ## License
 
-DroppedNeedle is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0). Copyright (c) 2025 Harvey Bragg.
+DroppedNeedle is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0). Copyright (c) 2025 Harvey Bragg and contributors.
 
-Commercial licensing options are available from the copyright holder.
+For commercial licensing enquiries, contact the maintainer.
