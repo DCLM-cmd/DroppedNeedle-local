@@ -91,6 +91,7 @@ _OUT_COMPLETED = "completed"   # every transfer terminal and succeeded
 _OUT_TERMINAL = "terminal"     # every transfer terminal, at least one failed
 _OUT_STALLED = "stalled"       # an active transfer stopped making progress
 _OUT_QUEUED = "queued_timeout"  # stuck in the peer's remote upload queue too long
+_OUT_NOT_STARTED = "not_started"  # a fresh transfer never left the peer's queue (0 bytes) fast enough
 _OUT_DEADLINE = "deadline"     # hit the 6-hour absolute ceiling
 _OUT_NO_TRANSFER = "no_transfer"  # a fresh enqueue produced no transfer record
 
@@ -158,6 +159,7 @@ class DownloadOrchestrator:
         manual_threshold: float = 0.50,
         stall_timeout_minutes: float = 30.0,
         queued_timeout_minutes: float = 120.0,
+        queued_start_timeout_seconds: float = 30.0,
         max_failover_attempts: int = 3,
         max_concurrent_downloads: int = 3,
         auto_retry_enabled: bool = True,
@@ -177,6 +179,7 @@ class DownloadOrchestrator:
         usenet_post_processing: int | None = None,
         usenet_min_release_age_minutes: float = 30.0,
         usenet_import_settle_seconds: float = 2.0,
+        artist_alias_resolver=None,  # async (artist_mbid) -> list[str] | None
     ) -> None:
         self._client = client
         self._naming_template = naming_template
@@ -204,6 +207,12 @@ class DownloadOrchestrator:
         # Sitting in a peer's remote upload queue (0 bytes) for this long -> give up
         # on that peer. Deliberately more generous than the stall timeout.
         self._queued_timeout = queued_timeout_minutes * 60.0
+        # A FRESH enqueue that materialises a transfer record but never leaves the peer's
+        # queue (0 bytes, no active transfer) within this long has not started at all:
+        # fail over to the next candidate FAST instead of letting it sit out the full
+        # queued window and clog the queue. Distinct from _queued_timeout, which covers a
+        # transfer that stalls back into the queue after making progress.
+        self._queued_start_timeout = queued_start_timeout_seconds
         self._max_failover = max(1, max_failover_attempts)
         # Caps concurrent actively-transferring downloads so a batch can't flood slskd
         # or starve others; a queued download holds no slot. Per-instance, not module-
@@ -228,6 +237,7 @@ class DownloadOrchestrator:
                 client=client, store=download_store, file_processor=file_processor,
                 staging=self._staging, manifest_codec=manifest_codec,
                 naming_template=naming_template, library=library_manager,
+                alias_resolver=artist_alias_resolver,
             ),
         }
         # Created whenever a SABnzbd client exists (not gated on the indexer), so a Usenet
@@ -245,6 +255,21 @@ class DownloadOrchestrator:
                 min_release_age_seconds=usenet_min_release_age_minutes * 60.0,
                 library=library_manager,
             )
+
+    async def _publish_task_event(
+        self, task_id: str, user_id: str | None, event: str, data: dict
+    ) -> None:
+        """Publish a download event to the per-task channel AND the shared
+        ``downloads:all`` channel. The shared channel lets the frontend follow every
+        active download over ONE EventSource instead of one per task - browsers cap
+        concurrent HTTP/1.1 connections per origin at ~6, so per-task streams starved
+        every other request while downloads were running ("the app hangs while
+        something loads"). The all-channel payload carries ``task_id`` (frontend demux
+        key) and ``user_id`` (the SSE route filters to the subscriber's own tasks)."""
+        await self._bus.publish(f"download:{task_id}", event, data)
+        await self._bus.publish(
+            "downloads:all", event, {**data, "task_id": task_id, "user_id": user_id}
+        )
 
     def dispatch(self, task_id: str) -> "asyncio.Task":
         """Run ``process_task`` for ``task_id`` in the background (AUD-3): wrapped in
@@ -272,8 +297,9 @@ class DownloadOrchestrator:
                     "download.failed",
                     extra={"task_id": task_id, "error_message": user_msg},
                 )
-                await self._bus.publish(
-                    f"download:{task_id}", "complete",
+                failed = await self._store.get_task(task_id)
+                await self._publish_task_event(
+                    task_id, failed.user_id if failed else None, "complete",
                     {"status": DownloadStatus.FAILED, "error": user_msg},
                 )
             except Exception:  # noqa: BLE001
@@ -324,8 +350,8 @@ class DownloadOrchestrator:
             logger.info(
                 "download.failed", extra={"task_id": task_id, "error_message": user_msg}
             )
-            await self._bus.publish(
-                f"download:{task_id}", "complete",
+            await self._publish_task_event(
+                task_id, task.user_id, "complete",
                 {"status": DownloadStatus.FAILED, "error": user_msg},
             )
             await self._sync_request_on_terminal(task, DownloadStatus.FAILED)
@@ -425,8 +451,8 @@ class DownloadOrchestrator:
         if any(c.tier in ("auto", "manual") for c in pooled):
             await self._store.set_search_job_id_and_candidate(task.id, job.id, None)
             await self._store.update_search_job_status(job.id, "completed")
-            await self._bus.publish(
-                f"download:{task.id}", "status",
+            await self._publish_task_event(
+                task.id, task.user_id, "status",
                 {"status": DownloadStatus.AWAITING_REVIEW, "search_job_id": job.id},
             )
             return False
@@ -440,16 +466,17 @@ class DownloadOrchestrator:
                 task.id, DownloadStatus.CANCELLED,
                 error_message="No better copy found", cancelled_at=time.time(),
             )
-            await self._bus.publish(
-                f"download:{task.id}", "complete",
+            await self._publish_task_event(
+                task.id, task.user_id, "complete",
                 {"status": DownloadStatus.CANCELLED, "error": "no better copy found"},
             )
             return False
         await self._store.update_status(
             task.id, DownloadStatus.FAILED, error_message=self._no_match_message()
         )
-        await self._bus.publish(
-            f"download:{task.id}", "complete", {"status": DownloadStatus.FAILED, "error": "no match"}
+        await self._publish_task_event(
+            task.id, task.user_id, "complete",
+            {"status": DownloadStatus.FAILED, "error": "no match"},
         )
         return False
 
@@ -536,8 +563,8 @@ class DownloadOrchestrator:
                             "bytes_downloaded": status.bytes_downloaded,
                         },
                     )
-                await self._bus.publish(
-                    f"download:{task.id}", "progress",
+                await self._publish_task_event(
+                    task.id, task.user_id, "progress",
                     {
                         "bytes_downloaded": status.bytes_downloaded,
                         "bytes_total": status.bytes_total,
@@ -561,6 +588,30 @@ class DownloadOrchestrator:
                     and now - enqueue_time >= _TRANSFER_MATERIALIZE_SECONDS
                 ):
                     return _OUT_NO_TRANSFER, status
+                # Never left the peer's upload queue: the transfer record exists but no
+                # byte has moved and it isn't actively transferring after the start
+                # timeout (the peer has us queued with no slot / 0 upload speed). Don't
+                # let it clog the queue for the full queued window - fail over to the next
+                # candidate now (no auto-retry backoff). Only for a fresh enqueue, and
+                # only while still at 0 bytes, so a peer that started then paused is left
+                # to the stall/queued watchdog instead.
+                if (
+                    expect_materialization
+                    and self._strategy(task.source).applies_queued_timeout
+                    and status.matched_transfers > 0
+                    and status.bytes_downloaded == 0
+                    and not status.has_active_transfer
+                    and now - enqueue_time >= self._queued_start_timeout
+                ):
+                    logger.info(
+                        "download.not_started",
+                        extra={
+                            "task_id": task.id,
+                            "source_username": task.source_username,
+                            "waited_seconds": round(now - enqueue_time, 1),
+                        },
+                    )
+                    return _OUT_NOT_STARTED, status
                 # Non-terminal: run the stall/queued watchdog off real byte progress.
                 if status.bytes_downloaded > last_progress_bytes:
                     last_progress_bytes = status.bytes_downloaded
@@ -634,8 +685,8 @@ class DownloadOrchestrator:
                 if current is not None and current.status == DownloadStatus.CANCELLED:
                     raise _Cancelled()
                 await self._store.update_status(task.id, DownloadStatus.PROCESSING)
-                await self._bus.publish(
-                    f"download:{task.id}", "status", {"status": DownloadStatus.PROCESSING}
+                await self._publish_task_event(
+                    task.id, task.user_id, "status", {"status": DownloadStatus.PROCESSING}
                 )
                 # On an interrupted (stalled/queued/deadline) outcome, import ONLY
                 # the transfers that actually succeeded - files that never arrived
@@ -697,6 +748,21 @@ class DownloadOrchestrator:
                         task, status,
                         completed=outcome == _OUT_COMPLETED, enumerated_any=enumerated > 0,
                     )
+                # A source we ABANDONED (stalled mid-transfer, stuck in the peer's
+                # queue past the timeout, or never materialised a transfer) burned the
+                # whole watchdog window without delivering: blocklist it the source's
+                # way (Soulseek: TTL'd per-file quarantine; Usenet: no-op) so the next
+                # search/auto-retry picks a different source instead of re-grabbing
+                # the same dead one over and over. Local faults are excluded above;
+                # the 6h deadline is not blocklisted (an active-but-slow peer is
+                # making progress, not dead).
+                elif (
+                    not is_complete
+                    and outcome in (_OUT_STALLED, _OUT_QUEUED, _OUT_NO_TRANSFER)
+                    and not local_fault
+                    and not attempt_import_fault
+                ):
+                    await strategy.maybe_blocklist_on_abandon(task, status)
 
                 # A local/environment fault stops the task WITHOUT cleanup: cancel(del_files)
                 # would tell the client to delete data we simply couldn't read (the mount may
@@ -738,8 +804,8 @@ class DownloadOrchestrator:
                 )
                 return
             task = nxt
-            await self._bus.publish(
-                f"download:{task.id}", "status",
+            await self._publish_task_event(
+                task.id, task.user_id, "status",
                 {"status": DownloadStatus.RETRYING, "attempt": attempts},
             )
 
@@ -1079,8 +1145,8 @@ class DownloadOrchestrator:
 
     async def _notify_completion(self, task) -> None:  # noqa: ANN001 - DownloadTask
         final = await self._store.get_task(task.id)
-        await self._bus.publish(
-            f"download:{task.id}", "complete",
+        await self._publish_task_event(
+            task.id, task.user_id, "complete",
             {
                 "status": final.status if final else "unknown",
                 "final_path": final.final_path if final else None,
@@ -1123,8 +1189,8 @@ class DownloadOrchestrator:
                 error_message="Download interrupted - no progress after a restart",
                 completed_at=now,
             )
-            await self._bus.publish(
-                f"download:{task.id}", "complete",
+            await self._publish_task_event(
+                task.id, task.user_id, "complete",
                 {"status": DownloadStatus.FAILED, "error": "download interrupted"},
             )
             await self._sync_request_on_terminal(task, DownloadStatus.FAILED)
@@ -1208,8 +1274,8 @@ class DownloadOrchestrator:
         # Flip the linked request to 'cancelled' too, so a cancelled (or stopped-retrying)
         # download clears the album UI's "retry scheduled" line instead of sitting failed.
         await self._sync_request_on_terminal(task, DownloadStatus.CANCELLED)
-        await self._bus.publish(
-            f"download:{task_id}", "complete", {"status": DownloadStatus.CANCELLED}
+        await self._publish_task_event(
+            task_id, task.user_id, "complete", {"status": DownloadStatus.CANCELLED}
         )
 
     async def retry_task(self, task_id: str, user_id: str, user_role: str) -> str:
@@ -1299,8 +1365,8 @@ class DownloadOrchestrator:
         )
 
         await self._store.update_status(task.id, DownloadStatus.PROCESSING)
-        await self._bus.publish(
-            f"download:{task.id}", "status", {"status": DownloadStatus.PROCESSING}
+        await self._publish_task_event(
+            task.id, task.user_id, "status", {"status": DownloadStatus.PROCESSING}
         )
 
         try:
@@ -1339,10 +1405,45 @@ class DownloadOrchestrator:
 
         return await self._store.get_task(task.id)
 
+    async def _active_task_for_target(self, task):  # noqa: ANN001, ANN201 - DownloadTask | None
+        """The newest active (queued/downloading/processing) task for this task's
+        target - per-recording for a track download, per-release-group for an album,
+        scoped to the same user - or ``None`` when nothing is active. This is the dedup
+        key the auto-retry sweep already applies before retrying; hoisting it here lets
+        every retry-creation path (manual, bulk 'retry all', auto) share one guard."""
+        if task.download_type == "track" and task.recording_mbid:
+            return await self._store.get_active_task_for_track(
+                task.recording_mbid, task.user_id
+            )
+        if task.release_group_mbid:
+            return await self._store.get_active_task_for_album(
+                task.release_group_mbid, task.user_id
+            )
+        return None
+
     async def _create_retry_task(self, task) -> str:  # noqa: ANN001 - DownloadTask
         """Create a fresh queued task carrying ``retry_count + 1`` and dispatch it.
         The original is kept (terminal) for audit. Shared by manual retry and
-        auto-retry."""
+        auto-retry.
+
+        Deduped by target: when an active task already exists for this album (or
+        track + user), that task is reused and NO new one is created. Without this the
+        manual and bulk 'retry all failed' paths spawned one retry per historical failed
+        row, fanning a single album into dozens of concurrent downloads of the same
+        release (the duplicate-download storm). The auto sweep pre-checks this already;
+        the guard here also covers the manual/bulk paths, which did not."""
+        existing = await self._active_task_for_target(task)
+        if existing is not None and existing.id != task.id:
+            logger.info(
+                "download.retry_deduped",
+                extra={
+                    "task_id": task.id,
+                    "existing_task_id": existing.id,
+                    "download_type": task.download_type,
+                    "release_group_mbid": task.release_group_mbid,
+                },
+            )
+            return existing.id
         new_task = await self._store.create_task(
             user_id=task.user_id,
             download_type=task.download_type,
@@ -1424,6 +1525,53 @@ class DownloadOrchestrator:
             return None
         return anchor + self._retry_backoff_seconds(task.retry_count)
 
+    async def _is_already_satisfied(self, task) -> bool:  # noqa: ANN001 - DownloadTask
+        """True when the task's target already has a copy in the library - a track
+        for a track download, any track of the album for an album download (mirrors
+        ``DownloadService._already_satisfied``'s non-upgrade branch: any held copy
+        counts, the quality-cutoff/upgrade decision is a separate, earlier gate).
+        An ``origin='upgrade'`` task is exempt: its whole point is that the library
+        copy exists but isn't good enough, so satisfaction can't be judged by mere
+        presence."""
+        if task.origin == "upgrade":
+            return False
+        if task.download_type == "track" and task.recording_mbid:
+            return await self._library.recording_quality_tier(task.recording_mbid) is not None
+        if task.release_group_mbid:
+            return await self._library.album_quality_tier(task.release_group_mbid) is not None
+        return False
+
+    async def _cancel_satisfied(self, task) -> None:  # noqa: ANN001 - DownloadTask
+        """Cancel a failed/partial task whose target turned out to already be in the
+        library - retrying it would just re-download bytes we already have."""
+        await self._store.update_status(
+            task.id, DownloadStatus.CANCELLED,
+            error_message="Already in library", cancelled_at=time.time(),
+        )
+        await self._sync_request_on_terminal(task, DownloadStatus.CANCELLED)
+        await self._publish_task_event(
+            task.id, task.user_id, "complete", {"status": DownloadStatus.CANCELLED}
+        )
+
+    async def reconcile_with_library(self) -> int:
+        """Cancel every failed/partial download whose target is already in the
+        library - called after a scan so newly-discovered (or newly-materialised)
+        albums drop out of the download list instead of sitting there forever
+        waiting on an auto-retry that would just re-download what's already on disk.
+        Ignores the retry-count ceiling ``list_retryable_tasks`` normally applies:
+        an exhausted retry chain is exactly the kind of stale entry this should
+        clear too. Returns the number cancelled."""
+        candidates = await self._store.list_retryable_tasks(2**31)
+        reconciled = 0
+        for task in candidates:
+            if not await self._is_already_satisfied(task):
+                continue
+            await self._cancel_satisfied(task)
+            reconciled += 1
+        if reconciled:
+            logger.info("download.reconciled_with_library", extra={"count": reconciled})
+        return reconciled
+
     async def retry_failed_tasks(self) -> None:
         """Periodic safety net: re-dispatch ``failed``/``partial`` downloads whose
         per-task exponential backoff has elapsed, up to ``auto_retry_max_attempts``.
@@ -1449,6 +1597,14 @@ class DownloadOrchestrator:
             if await self._store.has_unresolved_held_for_task(task.id):
                 continue
 
+            # Already satisfied by something else since this task failed - a manual
+            # "import anyway", a rescan that picked the files up directly, or a
+            # sibling retry that quietly succeeded. Cancel instead of piling on
+            # another duplicate download.
+            if await self._is_already_satisfied(task):
+                await self._cancel_satisfied(task)
+                continue
+
             # Skip if there's already a newer active task for the same target +
             # user (a manual retry or a new request). The check is per-album for
             # album downloads, per-recording for track downloads.
@@ -1472,8 +1628,8 @@ class DownloadOrchestrator:
                     "release_group_mbid": task.release_group_mbid,
                 },
             )
-            await self._bus.publish(
-                f"download:{task.id}", "auto_retry",
+            await self._publish_task_event(
+                task.id, task.user_id, "auto_retry",
                 {
                     "retry_count": task.retry_count + 1,
                     "max_attempts": self._auto_retry_max_attempts,

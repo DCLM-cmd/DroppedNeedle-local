@@ -95,6 +95,10 @@ class DownloadClientConnectionSettings(AppStruct):
     # sitting in the peer's remote upload queue gets the more generous timeout.
     download_stall_timeout_minutes: int = 30
     download_queued_timeout_minutes: int = 120
+    # Seconds-scale: a fresh Soulseek transfer that never leaves the peer's upload queue
+    # (0 bytes, not transferring) within this long is failed over to the next source
+    # immediately (no auto-retry backoff), so a stuck peer can't clog the queue.
+    download_queued_start_timeout_seconds: int = 30
     max_failover_attempts: int = 3
     max_concurrent_downloads: int = 3
     auto_retry_enabled: bool = True
@@ -113,6 +117,10 @@ class DownloadClientConnectionSettings(AppStruct):
         )
         _validate_range(
             self.download_queued_timeout_minutes, "download_queued_timeout_minutes", 5, 1440
+        )
+        _validate_range(
+            self.download_queued_start_timeout_seconds,
+            "download_queued_start_timeout_seconds", 5, 600,
         )
         _validate_range(self.max_failover_attempts, "max_failover_attempts", 1, 10)
         _validate_range(self.max_concurrent_downloads, "max_concurrent_downloads", 1, 10)
@@ -145,11 +153,20 @@ class DownloadPolicySettings(AppStruct):
     quality_min: str = "mp3_320"
     quality_max: str = "lossless"
     flac_mp3_only: bool = True
+    # Cap on a LOSSLESS file's effective bitrate in kbps (0 = no cap). Lets the quality
+    # slider's FLAC end be bounded: e.g. 1500 accepts CD-quality FLAC (~700-1100 kbps)
+    # but rejects space-hungry 24/96+ hi-res rips (2000-5000+ kbps). Judged from the
+    # reported bitrate or size/duration; files that can't be judged pass.
+    lossless_max_kbps: int = 0
     verify_downloads: bool = True
     preflight_score_auto_accept: float = 0.70
     preflight_score_manual_min: float = 0.50
     download_stall_timeout_minutes: int = 30
     download_queued_timeout_minutes: int = 120
+    # Seconds-scale: a fresh Soulseek transfer that never leaves the peer's upload queue
+    # (0 bytes, not transferring) within this long is failed over to the next source
+    # immediately (no auto-retry backoff), so a stuck peer can't clog the queue.
+    download_queued_start_timeout_seconds: int = 30
     max_failover_attempts: int = 3
     max_concurrent_downloads: int = 3
     auto_retry_enabled: bool = True
@@ -199,11 +216,16 @@ class DownloadPolicySettings(AppStruct):
     def __post_init__(self) -> None:
         _validate_range(self.download_stall_timeout_minutes, "download_stall_timeout_minutes", 2, 240)
         _validate_range(self.download_queued_timeout_minutes, "download_queued_timeout_minutes", 5, 1440)
+        _validate_range(
+            self.download_queued_start_timeout_seconds,
+            "download_queued_start_timeout_seconds", 5, 600,
+        )
         _validate_range(self.max_failover_attempts, "max_failover_attempts", 1, 10)
         _validate_range(self.max_concurrent_downloads, "max_concurrent_downloads", 1, 10)
         _validate_range(self.auto_retry_max_attempts, "auto_retry_max_attempts", 0, 20)
         _validate_range(self.auto_retry_base_interval_minutes, "auto_retry_base_interval_minutes", 1, 1440)
         _validate_range(self.usenet_min_release_age_minutes, "usenet_min_release_age_minutes", 0, 1440)
+        _validate_range(self.lossless_max_kbps, "lossless_max_kbps", 0, 20_000)
         _validate_range(self.max_size_mb, "max_size_mb", 0, 1_000_000)
         _validate_range(self.usenet_retention_days, "usenet_retention_days", 0, 100_000)
         _validate_range(self.recycle_retention_days, "recycle_retention_days", 1, 3650)

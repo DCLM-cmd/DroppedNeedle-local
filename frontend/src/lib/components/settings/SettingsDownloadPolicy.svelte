@@ -20,11 +20,13 @@
 	let upgradeAllowed = $state(false);
 	let backgroundScan = $state(false);
 	let flacMp3Only = $state(true);
+	let losslessMaxKbps = $state(0);
 	let verifyDownloads = $state(true);
 	let autoAccept = $state(0.7);
 	let manualMin = $state(0.5);
 	let maxConcurrent = $state(3);
 	let maxFailover = $state(3);
+	let queuedStartTimeout = $state(30);
 	let autoRetryEnabled = $state(true);
 	let autoRetryMax = $state(6);
 	let usenetMinAge = $state(30);
@@ -39,11 +41,13 @@
 			upgradeAllowed = d.upgrade_allowed;
 			backgroundScan = d.background_upgrade_scan_enabled;
 			flacMp3Only = d.flac_mp3_only;
+			losslessMaxKbps = d.lossless_max_kbps ?? 0;
 			verifyDownloads = d.verify_downloads;
 			autoAccept = d.preflight_score_auto_accept;
 			manualMin = d.preflight_score_manual_min;
 			maxConcurrent = d.max_concurrent_downloads;
 			maxFailover = d.max_failover_attempts;
+			queuedStartTimeout = d.download_queued_start_timeout_seconds;
 			autoRetryEnabled = d.auto_retry_enabled;
 			autoRetryMax = d.auto_retry_max_attempts;
 			usenetMinAge = d.usenet_min_release_age_minutes;
@@ -73,11 +77,13 @@
 			upgrade_allowed: upgradeAllowed,
 			background_upgrade_scan_enabled: backgroundScan,
 			flac_mp3_only: flacMp3Only,
+			lossless_max_kbps: losslessMaxKbps,
 			verify_downloads: verifyDownloads,
 			preflight_score_auto_accept: autoAccept,
 			preflight_score_manual_min: manualMin,
 			max_concurrent_downloads: maxConcurrent,
 			max_failover_attempts: maxFailover,
+			download_queued_start_timeout_seconds: queuedStartTimeout,
 			auto_retry_enabled: autoRetryEnabled,
 			auto_retry_max_attempts: autoRetryMax,
 			usenet_min_release_age_minutes: usenetMinAge
@@ -104,6 +110,30 @@
 			<span class="label-text mb-2">Accepted quality range</span>
 			<QualityRangeSlider bind:minKey={qualityMin} bind:maxKey={qualityMax} />
 		</div>
+
+		{#if qualityMax === 'lossless'}
+			<div class="form-control">
+				<span class="label-text mb-1">
+					FLAC bitrate cap:
+					<span class="font-semibold">
+						{losslessMaxKbps > 0 ? `${losslessMaxKbps} kbps` : 'unlimited'}
+					</span>
+				</span>
+				<input
+					type="range"
+					min="0"
+					max="3000"
+					step="100"
+					class="range range-primary range-sm"
+					bind:value={losslessMaxKbps}
+					aria-label="Maximum lossless bitrate in kbps (0 = unlimited)"
+				/>
+				<p class="mt-1 text-xs text-base-content/60">
+					Skips lossless files above this effective bitrate - e.g. 1500 kbps accepts CD-quality
+					FLAC but rejects space-hungry hi-res (24-bit/96 kHz+) rips. 0 = no cap.
+				</p>
+			</div>
+		{/if}
 
 		<div class="rounded-box flex flex-col gap-2 border border-base-300 bg-base-200/40 p-3">
 			<label class="label cursor-pointer justify-start gap-3 p-0">
@@ -205,6 +235,20 @@
 					class="input input-bordered input-sm"
 					bind:value={maxFailover}
 				/>
+			</label>
+			<label class="form-control">
+				<span class="label-text">Queued-start timeout (sec)</span>
+				<input
+					type="number"
+					min="5"
+					max="600"
+					class="input input-bordered input-sm"
+					bind:value={queuedStartTimeout}
+				/>
+				<span class="mt-1 text-xs text-base-content/60">
+					How long a Soulseek download may sit in a peer's queue without starting before it
+					fails over to another source (no retry wait).
+				</span>
 			</label>
 			<label class="form-control">
 				<span class="label-text">Auto-retry attempts</span>

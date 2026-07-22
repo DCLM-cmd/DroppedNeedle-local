@@ -498,16 +498,76 @@ async def test_cancel_album_retries_returns_count():
     store.cancel_album_auto_retries.assert_awaited_once_with("rg")
 
 
+def _clear_history_service():
+    """_make_service wired so clear_history's two list_tasks_by_status calls
+    (terminal, then active) can be scripted per-status."""
+    service, store, _bus, _client, _scorer, orch = _make_service()
+
+    def set_tasks(terminal, active=()):
+        async def _list(user_id, user_role, statuses):
+            return list(active) if "queued" in statuses else list(terminal)
+        store.list_tasks_by_status.side_effect = _list
+    return service, store, orch, set_tasks
+
+
 @pytest.mark.asyncio
-async def test_clear_finished_deletes_completed_and_cancelled():
-    # The "Clear" bulk action hard-deletes the user's terminal completed+cancelled rows.
-    service, store, *_ = _make_service()
-    store.delete_tasks_by_status.return_value = 3
-    cleared = await service.clear_finished("u1", "user")
+async def test_clear_history_deletes_all_terminal_statuses():
+    # "Clear all" wipes History: completed + cancelled + exhausted failed together.
+    service, store, orch, set_tasks = _clear_history_service()
+    done = DownloadTask(id="c", user_id="u1", status="completed",
+                        release_group_mbid="rg-a", download_type="album")
+    gone = DownloadTask(id="x", user_id="u1", status="cancelled",
+                        release_group_mbid="rg-b", download_type="album")
+    dead = DownloadTask(id="d", user_id="u1", status="failed", retry_count=6,
+                        release_group_mbid="rg-c", download_type="album")
+    set_tasks([done, gone, dead])
+    orch.next_retry_at = lambda task: None
+    store.delete_tasks_by_ids.return_value = 3
+
+    cleared = await service.clear_history("u1", "user")
+
     assert cleared == 3
-    store.delete_tasks_by_status.assert_awaited_once_with(
-        "u1", "user", ["completed", "cancelled"]
-    )
+    assert set(store.delete_tasks_by_ids.await_args.args[0]) == {"c", "x", "d"}
+
+
+@pytest.mark.asyncio
+async def test_clear_history_keeps_wanted_chain():
+    # An album still on the auto-retry ladder ("Still hunting") survives a clear-all -
+    # including its OLDER terminal rows, so the chain stays intact.
+    service, store, orch, set_tasks = _clear_history_service()
+    older = DownloadTask(id="w-old", user_id="u1", status="failed", retry_count=0,
+                         release_group_mbid="rg-w", download_type="album", created_at=1.0)
+    newer = DownloadTask(id="w-new", user_id="u1", status="failed", retry_count=1,
+                         release_group_mbid="rg-w", download_type="album", created_at=2.0)
+    done = DownloadTask(id="c", user_id="u1", status="completed",
+                        release_group_mbid="rg-done", download_type="album")
+    set_tasks([older, newer, done])
+    orch.next_retry_at = lambda task: 123.0 if task.id == "w-new" else None
+    store.delete_tasks_by_ids.return_value = 1
+
+    cleared = await service.clear_history("u1", "user")
+
+    assert cleared == 1
+    store.delete_tasks_by_ids.assert_awaited_once_with(["c"])
+
+
+@pytest.mark.asyncio
+async def test_clear_history_keeps_chain_with_live_active_task():
+    # Terminal residue of an album that is CURRENTLY downloading again is protected:
+    # deleting it mid-flight would orphan the chain the active task belongs to.
+    service, store, orch, set_tasks = _clear_history_service()
+    residue = DownloadTask(id="r", user_id="u1", status="failed", retry_count=2,
+                           release_group_mbid="rg-live", download_type="album")
+    live = DownloadTask(id="a", user_id="u1", status="downloading",
+                        release_group_mbid="rg-live", download_type="album")
+    set_tasks([residue], active=[live])
+    orch.next_retry_at = lambda task: None
+    store.delete_tasks_by_ids.return_value = 0
+
+    cleared = await service.clear_history("u1", "user")
+
+    assert cleared == 0
+    store.delete_tasks_by_ids.assert_awaited_once_with([])
 
 
 @pytest.mark.asyncio
@@ -544,6 +604,27 @@ async def test_retry_all_failed_retries_only_exhausted_failures():
     assert retried == 1
     store.list_tasks_by_status.assert_awaited_once_with("u1", "user", ["failed"])
     assert [c.args[0] for c in orch.retry_task.await_args_list] == ["e"]
+
+
+@pytest.mark.asyncio
+async def test_retry_all_failed_dedupes_per_target():
+    # Multiple exhausted failed rows for the SAME album are the residue of the
+    # duplicate-download storm; retry_all_failed collapses them to a single retry
+    # (the newest per target) instead of re-fanning one download per row.
+    service, store, _bus, _client, _scorer, orch = _make_service()
+    a1 = DownloadTask(id="a1", user_id="u1", status="failed", retry_count=6,
+                      release_group_mbid="rg-x", download_type="album")
+    a2 = DownloadTask(id="a2", user_id="u1", status="failed", retry_count=7,
+                      release_group_mbid="rg-x", download_type="album")
+    b1 = DownloadTask(id="b1", user_id="u1", status="failed", retry_count=6,
+                      release_group_mbid="rg-y", download_type="album")
+    store.list_tasks_by_status.return_value = [a1, a2, b1]  # newest-first per store contract
+    orch.next_retry_at = lambda task: None  # all exhausted
+
+    retried = await service.retry_all_failed("u1", "user")
+
+    assert retried == 2  # one per album (rg-x, rg-y), not 3
+    assert [c.args[0] for c in orch.retry_task.await_args_list] == ["a1", "b1"]
 
 
 @pytest.mark.asyncio
@@ -864,6 +945,35 @@ async def test_import_held_unknown_id_raises_not_found(tmp_path):
     svc = _held_service(store, MagicMock())
     with pytest.raises(ResourceNotFoundError):
         await svc.import_held(999, "user-a", "user")
+
+
+@pytest.mark.asyncio
+async def test_import_held_unreadable_audio_raises_validation_error(tmp_path):
+    """A held file mutagen can't parse (corrupt, or a mislabeled/fake-lossless
+    download) must surface as a clean 4xx, not the unhandled 500 it used to be - and
+    the held row is left in place (unlike the file-missing case) so the user can
+    still preview/discard it themselves."""
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+    fp.place_held_file = AsyncMock(
+        side_effect=ValueError(f"Unsupported or unreadable audio file: {held_file}")
+    )
+    svc = _held_service(store, fp)
+
+    with pytest.raises(ValidationError):
+        await svc.import_held(hid, "user-a", "user")
+
+    # left for review, not silently discarded - the file is still there to inspect
+    remaining = await store.list_held_imports("user-a", "user")
+    assert len(remaining) == 1 and remaining[0].id == hid
 
 
 @pytest.mark.asyncio

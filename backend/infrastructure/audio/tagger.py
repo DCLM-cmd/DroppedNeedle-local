@@ -18,6 +18,8 @@ from mutagen.flac import FLAC, Picture
 from mutagen.id3 import APIC, TALB, TCMP, TCON, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX, UFID
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
+from mutagen.oggopus import OggOpus
+from mutagen.oggvorbis import OggVorbis
 
 from models.audio import AudioInfo, AudioTag
 
@@ -73,6 +75,23 @@ _SUFFIX_FORMATS = {
     ".m4a": "m4a",
     ".m4b": "m4a",
     ".mp4": "m4a",
+}
+
+# Forces the matching mutagen class for a known real extension instead of letting
+# ``mutagen.File`` sniff format from the path it's actually given. Needed for the
+# atomic-write staging file (a ``.part``-suffixed temp path): a FLAC ripped with a
+# (non-standard but common) leading ID3v2 tag scores itself as MP3 once the ``.flac``
+# extension bonus is gone, and then blows up trying to sync MPEG frames against FLAC
+# bytes. See ``AudioTagger._open``.
+_SUFFIX_CLASSES: dict[str, type] = {
+    ".flac": FLAC,
+    ".mp3": MP3,
+    ".ogg": OggVorbis,
+    ".oga": OggVorbis,
+    ".opus": OggOpus,
+    ".m4a": MP4,
+    ".m4b": MP4,
+    ".mp4": MP4,
 }
 
 # Only these report a meaningful bit depth. MP4Info.bits_per_sample is 16 even
@@ -141,11 +160,17 @@ class AudioTagger:
     """Format-dispatching wrapper over mutagen. No state - safe as a singleton."""
 
     @staticmethod
-    def _open(path: Path) -> Any:
+    def _open(path: Path, suffix_hint: str | None = None) -> Any:
         """Load via mutagen, normalising both the ``None`` and corrupt-file
-        (``MutagenError``) cases into a single ``ValueError``."""
+        (``MutagenError``) cases into a single ``ValueError``.
+
+        ``suffix_hint`` (a real extension, e.g. ``.flac``) forces the matching
+        mutagen class instead of letting ``mutagen.File`` sniff format from
+        ``path`` itself - needed when ``path`` is a staging file whose name
+        doesn't carry the real extension (see ``_SUFFIX_CLASSES``)."""
+        cls = _SUFFIX_CLASSES.get(suffix_hint.lower()) if suffix_hint else None
         try:
-            audio = mutagen.File(path)
+            audio = cls(path) if cls is not None else mutagen.File(path)
         except mutagen.MutagenError as exc:
             raise ValueError(f"Unsupported or unreadable audio file: {path}") from exc
         if audio is None:
@@ -176,7 +201,9 @@ class AudioTagger:
             self._write_vorbis(audio, tag)
         audio.save()
 
-    def write_album_identity(self, path: Path, tag: AudioTag) -> None:
+    def write_album_identity(
+        self, path: Path, tag: AudioTag, suffix_hint: str | None = None
+    ) -> None:
         """Stamp only the request-owned album identity - album, album artist, year
         and the release-level MusicBrainz IDs (``_OWNED_MB_FIELDS``) - leaving every
         other existing tag untouched.
@@ -184,8 +211,9 @@ class AudioTagger:
         The import path uses this instead of ``write_mb_tags`` so re-saving a
         download never round-trips the file's own descriptive tags (title, artist,
         genre, the recording/artist IDs) through our single-value model, which would
-        flatten a multi-value genre or artist to its first value."""
-        audio = self._open(path)
+        flatten a multi-value genre or artist to its first value. ``suffix_hint``
+        is passed through to ``_open`` for staging paths without a real extension."""
+        audio = self._open(path, suffix_hint)
         if isinstance(audio, MP4):
             if audio.tags is None:
                 audio.add_tags()

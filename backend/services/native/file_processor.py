@@ -1349,7 +1349,11 @@ class FileProcessor:
                     shutil.copystat(source, tmp)
                 except OSError:
                     logger.debug("copystat skipped for %s (filesystem rejected metadata)", tmp.name)
-            self._tagger.write_album_identity(tmp, target_tag)
+            # tmp's own name ends in .part, not the real extension (deliberately, so a
+            # scan never picks up this in-flight staging file) - hint the real one
+            # through explicitly, or mutagen.File's filename-based format sniffing can
+            # misidentify an ID3v2-tagged FLAC as MP3 and crash on the mismatched frames.
+            self._tagger.write_album_identity(tmp, target_tag, suffix_hint=target_path.suffix)
             os.replace(tmp, target_path)  # atomic publish within the library dir
         except BaseException:
             # same-mount path renamed source into tmp; if tagging/publish then fails,

@@ -68,6 +68,18 @@ async def test_get_all_album_mbids_excludes_ghost(db: LibraryDB):
 
 
 @pytest.mark.asyncio
+async def test_get_all_album_mbids_includes_scan_only_album(db: LibraryDB):
+    """A disc-scan-only album has library_files but NO library_albums row (the native
+    scan never materialises albums). It must still count as in-library - otherwise
+    every scan-discovered album shows as "missing" in the artist discography and the
+    discover surfaces."""
+    await _seed_file(db, "rg-scan-only")
+    # deliberately no upsert_album -> there is no materialised library_albums row
+    assert await db.get_album_by_mbid("rg-scan-only") is None
+    assert "rg-scan-only" in await db.get_all_album_mbids()
+
+
+@pytest.mark.asyncio
 async def test_get_all_album_mbids_excludes_soft_deleted(db: LibraryDB):
     await _seed_file(db, "rg-doomed")
     await db.upsert_album({"mbid": "rg-doomed", "title": "Doomed", "artist_mbid": "art-1"})
@@ -75,6 +87,42 @@ async def test_get_all_album_mbids_excludes_soft_deleted(db: LibraryDB):
 
     await db.soft_delete_album_files("rg-doomed")
     assert "rg-doomed" not in await db.get_all_album_mbids()
+
+
+@pytest.mark.asyncio
+async def test_materialize_albums_from_files_adds_scan_only_rows(db: LibraryDB):
+    """The native scan writes only library_files; materialisation must give every
+    file-backed album a library_albums row (so listings/counts see it), and be
+    idempotent."""
+    await _seed_file(db, "rg-scan-only", track_number=1)
+    await _seed_file(db, "rg-scan-only", track_number=2)
+    assert await db.get_album_by_mbid("rg-scan-only") is None
+
+    inserted = await db.materialize_albums_from_files()
+
+    assert inserted == 1
+    row = await db.get_album_by_mbid("rg-scan-only")
+    assert row is not None and row["mbid"] == "rg-scan-only"
+    # second run is a no-op (rows already materialised)
+    assert await db.materialize_albums_from_files() == 0
+
+
+@pytest.mark.asyncio
+async def test_materialize_albums_preserves_existing_row(db: LibraryDB):
+    """Materialisation is additive: an album already materialised (e.g. by a download
+    import with richer data) is not overwritten."""
+    await _seed_file(db, "rg-real")
+    await db.upsert_album({
+        "mbid": "rg-real", "title": "Rich Title",
+        "artist_mbid": "art-1", "artist_name": "Rich Artist",
+        "cover_url": "http://example/cover.jpg",
+    })
+
+    await db.materialize_albums_from_files()
+
+    row = await db.get_album_by_mbid("rg-real")
+    assert row["title"] == "Rich Title"                  # not clobbered
+    assert row["cover_url"] == "http://example/cover.jpg"
 
 
 def _build_service(db: LibraryDB) -> LibraryService:

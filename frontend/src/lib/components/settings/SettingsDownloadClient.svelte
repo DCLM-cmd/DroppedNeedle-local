@@ -52,6 +52,7 @@
 				preflight_score_manual_min: d.preflight_score_manual_min,
 				download_stall_timeout_minutes: d.download_stall_timeout_minutes,
 				download_queued_timeout_minutes: d.download_queued_timeout_minutes,
+				download_queued_start_timeout_seconds: d.download_queued_start_timeout_seconds,
 				max_failover_attempts: d.max_failover_attempts,
 				max_concurrent_downloads: d.max_concurrent_downloads
 			};

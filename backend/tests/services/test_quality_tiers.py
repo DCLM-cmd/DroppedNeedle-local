@@ -1,5 +1,7 @@
 """Unit tests for the audio quality tier helpers."""
 
+import pytest
+
 from repositories.protocols.download_client import DownloadSearchResult
 from services.native.quality_tiers import (
     candidate_tier,
@@ -97,3 +99,60 @@ def test_should_acquire_upgrades_on_only_below_cutoff():
     assert should_acquire("low", "mp3_320", upgrade_allowed=True) is True
     assert should_acquire("lossless", "lossless", upgrade_allowed=True) is False
     assert should_acquire("mp3_320", "mp3_320", upgrade_allowed=True) is False
+
+
+def test_effective_kbps_prefers_reported_bitrate():
+    from services.native.quality_tiers import effective_kbps
+
+    f = DownloadSearchResult(
+        username="u", filename="a.flac", parent_directory="p",
+        size=30_000_000, extension="flac", bitrate=1000, duration=240.0,
+    )
+    assert effective_kbps(f) == 1000.0
+
+
+def test_effective_kbps_derives_from_size_and_duration():
+    from services.native.quality_tiers import effective_kbps
+
+    # slskd omits bitRate for lossless: 30 MB over 240 s = 1000 kbps
+    f = DownloadSearchResult(
+        username="u", filename="a.flac", parent_directory="p",
+        size=30_000_000, extension="flac", bitrate=None, duration=240.0,
+    )
+    assert effective_kbps(f) == pytest.approx(1000.0)
+
+
+def test_effective_kbps_unknown_returns_none():
+    from services.native.quality_tiers import effective_kbps
+
+    f = DownloadSearchResult(
+        username="u", filename="a.flac", parent_directory="p",
+        size=0, extension="flac", bitrate=None, duration=None,
+    )
+    assert effective_kbps(f) is None
+
+
+def test_exceeds_lossless_cap():
+    from services.native.quality_tiers import exceeds_lossless_cap
+
+    hires = DownloadSearchResult(
+        username="u", filename="a.flac", parent_directory="p",
+        size=120_000_000, extension="flac", bitrate=None, duration=240.0,  # 4000 kbps
+    )
+    cd = DownloadSearchResult(
+        username="u", filename="b.flac", parent_directory="p",
+        size=30_000_000, extension="flac", bitrate=None, duration=240.0,  # 1000 kbps
+    )
+    mp3 = DownloadSearchResult(
+        username="u", filename="c.mp3", parent_directory="p",
+        size=120_000_000, extension="mp3", bitrate=320, duration=240.0,
+    )
+    unknown = DownloadSearchResult(
+        username="u", filename="d.flac", parent_directory="p",
+        size=0, extension="flac", bitrate=None, duration=None,
+    )
+    assert exceeds_lossless_cap(hires, 1500) is True
+    assert exceeds_lossless_cap(cd, 1500) is False
+    assert exceeds_lossless_cap(hires, 0) is False       # 0 = no cap
+    assert exceeds_lossless_cap(mp3, 100) is False       # lossy never capped here
+    assert exceeds_lossless_cap(unknown, 1500) is False  # unjudgeable fails open

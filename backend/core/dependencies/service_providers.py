@@ -118,6 +118,7 @@ def get_library_scanner() -> "LibraryScanner":
         scan_state_store=get_scan_state_store(),
         event_bus=get_sse_publisher(),
         invalidate_albums=_build_scan_invalidation(get_cache(), get_disk_cache()),
+        reconcile_downloads=get_download_orchestrator().reconcile_with_library,
     )
 
 
@@ -917,6 +918,7 @@ def get_album_preflight_scorer() -> "AlbumPreflightScorer":
     return AlbumPreflightScorer(
         get_download_store(),
         flac_mp3_only=policy.flac_mp3_only,
+        lossless_max_kbps=policy.lossless_max_kbps,
         policy=_build_spec_policy(policy),
     )
 
@@ -933,6 +935,7 @@ def get_track_matcher() -> "TrackMatcher":
         quality_min=policy.quality_min,
         quality_max=policy.quality_max,
         flac_mp3_only=policy.flac_mp3_only,
+        lossless_max_kbps=policy.lossless_max_kbps,
     )
 
 
@@ -967,6 +970,7 @@ def get_download_orchestrator() -> "DownloadOrchestrator":
     from .repo_providers import (
         get_download_client_repository,
         get_download_store,
+        get_musicbrainz_repository,
         get_newznab_indexer,
         get_sabnzbd_download_client,
         get_slskd_indexer,
@@ -1000,6 +1004,7 @@ def get_download_orchestrator() -> "DownloadOrchestrator":
         manual_threshold=policy.preflight_score_manual_min,
         stall_timeout_minutes=policy.download_stall_timeout_minutes,
         queued_timeout_minutes=policy.download_queued_timeout_minutes,
+        queued_start_timeout_seconds=policy.download_queued_start_timeout_seconds,
         max_failover_attempts=policy.max_failover_attempts,
         max_concurrent_downloads=policy.max_concurrent_downloads,
         auto_retry_enabled=policy.auto_retry_enabled,
@@ -1020,6 +1025,9 @@ def get_download_orchestrator() -> "DownloadOrchestrator":
         usenet_priority=sab.priority,
         usenet_post_processing=sab.post_processing,
         usenet_min_release_age_minutes=policy.usenet_min_release_age_minutes,
+        # Soulseek search fallback: re-query under the artist's MusicBrainz aliases
+        # when the primary name finds nothing (best-effort, cached in the repository).
+        artist_alias_resolver=get_musicbrainz_repository().get_artist_aliases,
     )
 
 

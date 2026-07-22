@@ -1164,6 +1164,26 @@ class DownloadStore(PersistenceBase):
 
         return await self._write(operation)
 
+    async def delete_tasks_by_ids(self, task_ids: list[str]) -> int:
+        """Hard-delete the given tasks by id (chunked to stay under SQLite's bound-
+        variable limit). Ownership/status scoping is the caller's job - ``clear_failed``
+        resolves the ids from a user-scoped list first. Returns the number removed."""
+        if not task_ids:
+            return 0
+
+        def operation(conn: sqlite3.Connection) -> int:
+            total = 0
+            for start in range(0, len(task_ids), 400):
+                chunk = task_ids[start:start + 400]
+                cur = conn.execute(
+                    f"DELETE FROM download_tasks WHERE id IN ({_in_placeholders(chunk)})",
+                    tuple(chunk),
+                )
+                total += cur.rowcount
+            return total
+
+        return await self._write(operation)
+
     async def cancel_album_auto_retries(self, release_group_mbid: str) -> list[str]:
         """Cancel every ``failed``/``partial`` task for an album so it stops seeding
         auto-retries (a removed-from-library album must not keep re-downloading).

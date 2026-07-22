@@ -255,10 +255,10 @@ async def test_process_downloaded_import_error_is_per_file(tmp_path: Path):
         )
 
     real_write = AudioTagger().write_album_identity
-    def flaky_write(path, tag):
+    def flaky_write(path, tag, suffix_hint=None):
         if tag.title == "Bad Track":
             raise OSError("disk full")
-        return real_write(path, tag)
+        return real_write(path, tag, suffix_hint)
     fp._tagger.write_album_identity = flaky_write
 
     manifest = _manifest(

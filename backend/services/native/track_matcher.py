@@ -16,11 +16,12 @@ from infrastructure.persistence.download_store import DownloadStore
 from models.download import ScoredCandidate, TargetTrack
 from models.download_identity import soulseek_identity
 from repositories.protocols.download_client import DownloadSearchResult
-from services.native.album_preflight_scorer import _file_confidence
+from services.native.album_preflight_scorer import _file_confidence, peer_availability
 from services.native.title_match import artist_evidence
 from services.native.quality_tiers import (
     DEFAULT_QUALITY_MAX,
     DEFAULT_QUALITY_MIN,
+    exceeds_lossless_cap,
     file_tier,
     in_range,
     is_audio,
@@ -37,11 +38,13 @@ class TrackMatcher:
         quality_min: str = DEFAULT_QUALITY_MIN,
         quality_max: str = DEFAULT_QUALITY_MAX,
         flac_mp3_only: bool = True,
+        lossless_max_kbps: int = 0,
     ):
         self._store = download_store
         self._quality_min = quality_min
         self._quality_max = quality_max
         self._flac_mp3_only = flac_mp3_only
+        self._lossless_max_kbps = lossless_max_kbps
 
     async def match(
         self,
@@ -87,6 +90,12 @@ class TrackMatcher:
             for r in filtered
             if in_range(file_tier(r), self._quality_min, self._quality_max)
         ]
+        if self._lossless_max_kbps:
+            # lossless bitrate cap (0 = off): drop over-cap hi-res files
+            filtered = [
+                r for r in filtered
+                if not exceeds_lossless_cap(r, self._lossless_max_kbps)
+            ]
         if held_tier is not None:
             filtered = [
                 r for r in filtered if tier_rank(file_tier(r)) > tier_rank(held_tier)
@@ -103,8 +112,14 @@ class TrackMatcher:
                 strict_title=True,
             )
             scored.append((tier_rank(file_tier(file)), score, file))
-        # prefer the higher tier, then the better match
-        scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        # prefer the higher tier, then the better match - with peer availability
+        # (upload speed / free slot) as a banded tiebreaker, mirroring the album
+        # scorer (D3): within the same 0.05 score band the faster peer wins, but
+        # availability can never outrank a better identity match.
+        scored.sort(
+            key=lambda t: (t[0], int(t[1] / 0.05), peer_availability([t[2]]), t[1]),
+            reverse=True,
+        )
 
         candidates: list[ScoredCandidate] = []
         seen_peers: set[str] = set()
