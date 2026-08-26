@@ -51,13 +51,14 @@ class TargetCatalogWriterService:
         if row is None or row["availability"] != "indexed":
             raise ResourceNotFoundError("Library track not found.")
         if delete_file:
-            path = await self._validated_path(track_id)
-            try:
-                await asyncio.to_thread(path.unlink)
-            except FileNotFoundError:
-                pass
-            except OSError as error:
-                raise ExternalServiceError("Could not remove this file.") from error
+            path = await self._removal_target(track_id)
+            if path is not None:
+                try:
+                    await asyncio.to_thread(path.unlink)
+                except FileNotFoundError:
+                    pass  # ENOENT race: already absent is still idempotent success
+                except OSError as error:
+                    raise ExternalServiceError("Could not remove this file.") from error
         return await self._store.mark_target_tracks_missing(
             [track_id],
             actor_user_id=actor_user_id,
@@ -84,10 +85,11 @@ class TargetCatalogWriterService:
             for row in rows:
                 track_id = str(row["id"])
                 try:
-                    path = await self._validated_path(track_id)
-                    await asyncio.to_thread(path.unlink)
+                    path = await self._removal_target(track_id)
+                    if path is not None:
+                        await asyncio.to_thread(path.unlink)
                 except FileNotFoundError:
-                    pass
+                    pass  # ENOENT race: already absent is still safe to mark
                 except (OSError, ValidationError):
                     failures += 1
                     continue
@@ -158,3 +160,15 @@ class TargetCatalogWriterService:
             raise ValidationError(
                 "The audio file is no longer present on disk."
             ) from error
+
+    async def _removal_target(self, track_id: str) -> Path | None:
+        """F-TARGETCATALOG-01: resolve the file for a delete-file removal.
+
+        Returns None only when the validated path is already absent. Every
+        other failure (outside configured roots, permission, malformed or
+        deleted catalog row) keeps its strict exception so it can never be
+        misread as an idempotent absence."""
+        try:
+            return await self._local_files.resolve_validated_path(track_id)
+        except ResourceNotFoundError:
+            return None

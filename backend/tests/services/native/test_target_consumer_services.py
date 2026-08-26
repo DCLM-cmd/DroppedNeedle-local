@@ -8,7 +8,7 @@ import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 import pytest_asyncio
@@ -30,7 +30,11 @@ from core.dependencies import (
     get_request_service,
     get_target_native_library_service,
 )
-from core.exceptions import ProviderIdentityRequiredError, ResourceNotFoundError
+from core.exceptions import (
+    ExternalServiceError,
+    ProviderIdentityRequiredError,
+    ResourceNotFoundError,
+)
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from infrastructure.persistence.request_history import RequestHistoryStore
 from infrastructure.cache.memory_cache import InMemoryCache
@@ -2354,3 +2358,209 @@ async def test_isolated_target_compat_routes_browse_play_and_write_stable_refere
             "SELECT state FROM library_identification_reviews WHERE id = ?",
             ("missing-final-track-review",),
         ).fetchone() == ("needs_review",)
+
+
+@pytest.mark.asyncio
+async def test_target_removal_writer_handles_already_absent_file_idempotently(
+    target_services, tmp_path: Path
+) -> None:
+    """F-TARGETCATALOG-01: an indexed row whose validated file is already gone
+    removes idempotently - no 404, the row becomes missing, FILE_DELETED audit."""
+    store, _view, _favorites, _history, root = target_services
+    track_id = "20000000-0000-4000-8000-000000000098"
+    album_id = "10000000-0000-4000-8000-000000000098"
+    artist_id = "30000000-0000-4000-8000-000000000098"
+    path = root / "vanished.flac"
+    shutil.copy2(Path(__file__).parents[2] / "fixtures/library/flac_no_tags.flac", path)
+    stat = path.stat()
+    _tag, info = AudioTagger().read_tags(path)
+    membership = _membership(
+        album_id=album_id,
+        track_id=track_id,
+        artist_id=artist_id,
+        root=root,
+        title="Vanished",
+    )
+    membership.tracks[0].file_path = str(path)
+    membership.tracks[0].relative_path = path.name
+    membership.tracks[0].file_size_bytes = stat.st_size
+    membership.tracks[0].file_mtime_ns = stat.st_mtime_ns
+    membership.tracks[0].stat_revision = f"{stat.st_size}:{stat.st_mtime_ns}"
+    membership.tracks[0].file_format = info.file_format
+    membership.tracks[0].duration_seconds = info.duration_seconds
+    await store.create_catalog_membership(membership)
+    preferences = SimpleNamespace(
+        get_typed_library_settings=lambda: SimpleNamespace(
+            library_roots=[SimpleNamespace(path=str(root))]
+        )
+    )
+    local_files = LocalFilesService(
+        TargetLibraryRepository(store), preferences, AsyncMock()
+    )
+    writer = TargetCatalogWriterService(
+        store, local_files, TargetNativeLibraryService(store)
+    )
+    path.unlink()  # the file disappears outside the service
+
+    removed = await writer.remove_track(track_id, actor_user_id="user-1", delete_file=True)
+
+    assert removed == [track_id]
+    assert not path.exists()
+    retained = await store.get_target_track(track_id)
+    assert retained is not None and retained["availability"] == "missing"
+    with sqlite3.connect(store.db_path) as connection:
+        actions = connection.execute(
+            "SELECT action_kind, reason_code FROM library_catalog_actions "
+            "WHERE local_track_id = ?",
+            (track_id,),
+        ).fetchall()
+    assert actions == [("remove_track", "FILE_DELETED")]
+    # Retry: the row is now missing (not indexed), so the existing not-found
+    # contract holds - no second destructive mutation is possible.
+
+
+@pytest.mark.asyncio
+async def test_target_album_removal_marks_mixed_existing_and_absent_tracks(
+    target_services, tmp_path: Path
+) -> None:
+    """F-TARGETCATALOG-01: album removal must not abort at an already-absent
+    path; existing files are unlinked and every safe row becomes missing."""
+    store, _view, _favorites, _history, root = target_services
+    album_id = "10000000-0000-4000-8000-000000000097"
+    existing_id = "20000000-0000-4000-8000-000000000091"
+    absent_id = "20000000-0000-4000-8000-000000000092"
+    existing_path = root / "kept.flac"
+    shutil.copy2(
+        Path(__file__).parents[2] / "fixtures/library/flac_no_tags.flac", existing_path
+    )
+    # One membership holding BOTH album tracks (the store seeds one album).
+    artist_id = "30000000-0000-4000-8000-000000000097"
+    membership = _membership(
+        album_id=album_id,
+        track_id=existing_id,
+        artist_id=artist_id,
+        root=root,
+        title="Mixed",
+    )
+    info = AudioTagger().read_tags(existing_path)[1]
+    existing_track = membership.tracks[0]
+    existing_track.file_path = str(existing_path)
+    existing_track.relative_path = existing_path.name
+    stat = existing_path.stat()
+    existing_track.file_size_bytes = stat.st_size
+    existing_track.file_mtime_ns = stat.st_mtime_ns
+    existing_track.stat_revision = f"{stat.st_size}:{stat.st_mtime_ns}"
+    existing_track.file_format = info.file_format
+    existing_track.duration_seconds = info.duration_seconds
+    absent_track = msgspec.structs.replace(
+        existing_track,
+        id=absent_id,
+        file_path=str(root / "gone.flac"),
+        relative_path="gone.flac",
+        path_hash=f"hash:{absent_id}",
+        title="Mixed Track 2",
+    )
+    membership.tracks.append(absent_track)
+    membership.track_credits[absent_id] = list(membership.track_credits[existing_id])
+    await store.create_catalog_membership(membership)
+    preferences = SimpleNamespace(
+        get_typed_library_settings=lambda: SimpleNamespace(
+            library_roots=[SimpleNamespace(path=str(root))]
+        )
+    )
+    local_files = LocalFilesService(
+        TargetLibraryRepository(store), preferences, AsyncMock()
+    )
+    writer = TargetCatalogWriterService(
+        store, local_files, TargetNativeLibraryService(store)
+    )
+
+    changed = await writer.remove_album(
+        album_id, actor_user_id="user-1", delete_files=True
+    )
+
+    assert set(changed) == {existing_id, absent_id}
+    assert not existing_path.exists()
+    for track_id in (existing_id, absent_id):
+        row = await store.get_target_track(track_id)
+        assert row is not None and row["availability"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_target_album_removal_keeps_partial_failure_reporting(
+    target_services, tmp_path: Path
+) -> None:
+    """F-TARGETCATALOG-01 negative boundary: a non-ENOENT unlink failure keeps
+    its row indexed while safe rows are still marked missing."""
+    store, _view, _favorites, _history, root = target_services
+    album_id = "10000000-0000-4000-8000-000000000096"
+    good_id = "20000000-0000-4000-8000-000000000093"
+    bad_id = "20000000-0000-4000-8000-000000000094"
+    good_path = root / "good.flac"
+    shutil.copy2(
+        Path(__file__).parents[2] / "fixtures/library/flac_no_tags.flac", good_path
+    )
+    bad_path = root / "bad.flac"
+    bad_path.write_bytes(b"fLaC" + b"\0" * 64)
+    # One membership holding BOTH album tracks.
+    artist_id = "30000000-0000-4000-8000-000000000096"
+    membership = _membership(
+        album_id=album_id,
+        track_id=good_id,
+        artist_id=artist_id,
+        root=root,
+        title="Partial",
+    )
+    info = AudioTagger().read_tags(good_path)[1]
+    good_stat = good_path.stat()
+    bad_stat = bad_path.stat()
+    good_track = membership.tracks[0]
+    good_track.file_path = str(good_path)
+    good_track.relative_path = good_path.name
+    good_track.file_size_bytes = good_stat.st_size
+    good_track.file_mtime_ns = good_stat.st_mtime_ns
+    good_track.stat_revision = f"{good_stat.st_size}:{good_stat.st_mtime_ns}"
+    good_track.file_format = info.file_format
+    good_track.duration_seconds = info.duration_seconds
+    bad_track = msgspec.structs.replace(
+        good_track,
+        id=bad_id,
+        file_path=str(bad_path),
+        relative_path=bad_path.name,
+        path_hash=f"hash:{bad_id}",
+        file_size_bytes=bad_stat.st_size,
+        file_mtime_ns=bad_stat.st_mtime_ns,
+        stat_revision=f"{bad_stat.st_size}:{bad_stat.st_mtime_ns}",
+        title="Partial Track 2",
+    )
+    membership.tracks.append(bad_track)
+    membership.track_credits[bad_id] = list(membership.track_credits[good_id])
+    await store.create_catalog_membership(membership)
+    preferences = SimpleNamespace(
+        get_typed_library_settings=lambda: SimpleNamespace(
+            library_roots=[SimpleNamespace(path=str(root))]
+        )
+    )
+    local_files = LocalFilesService(
+        TargetLibraryRepository(store), preferences, AsyncMock()
+    )
+    writer = TargetCatalogWriterService(
+        store, local_files, TargetNativeLibraryService(store)
+    )
+
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if self == bad_path:
+            raise PermissionError(1, "Operation not permitted")
+        return real_unlink(self, *args, **kwargs)
+
+    with patch("pathlib.Path.unlink", failing_unlink):
+        with pytest.raises(ExternalServiceError):
+            await writer.remove_album(album_id, actor_user_id="user-1", delete_files=True)
+
+    good_row = await store.get_target_track(good_id)
+    bad_row = await store.get_target_track(bad_id)
+    assert good_row is not None and good_row["availability"] == "missing"
+    assert bad_row is not None and bad_row["availability"] == "indexed"
+    assert bad_path.exists()  # real failure is not hidden or retried destructively
