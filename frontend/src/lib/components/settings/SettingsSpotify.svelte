@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { api } from '$lib/api/client';
+	import { API } from '$lib/constants';
 	import type { SpotifySettings } from '$lib/types';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
 	import { Copy, ExternalLink } from 'lucide-svelte';
@@ -21,8 +22,8 @@
 	}
 
 	const form = createSettingsForm<SpotifySettings>({
-		loadEndpoint: '/api/v1/settings/spotify',
-		saveEndpoint: '/api/v1/settings/spotify'
+		loadEndpoint: API.settingsSpotify(),
+		saveEndpoint: API.settingsSpotify()
 	});
 
 	let showSecret = $state(false);
@@ -30,9 +31,7 @@
 	onMount(async () => {
 		form.load();
 		try {
-			const data = await api.global.get<{ redirect_uri: string }>(
-				'/api/v1/settings/spotify/redirect-uri'
-			);
+			const data = await api.global.get<{ redirect_uri: string }>(API.settingsSpotifyRedirectUri());
 			redirectUri = data.redirect_uri;
 		} catch {
 			redirectUri = `${window.location.origin}/api/v1/me/connections/spotify/auth/callback`;
@@ -122,6 +121,25 @@
 						{showSecret ? 'Hide' : 'Show'}
 					</button>
 				</div>
+			</label>
+
+			<label class="form-control w-full">
+				<span
+					class="label-text mb-1 text-xs font-semibold uppercase tracking-wider text-base-content/50"
+				>
+					Redirect Origin <span class="normal-case font-normal">(optional)</span>
+				</span>
+				<input
+					type="text"
+					class="input input-soft w-full"
+					bind:value={form.data.spotify_redirect_origin}
+					placeholder="https://music.example.com"
+					autocomplete="off"
+				/>
+				<p class="mt-1 text-xs text-base-content/50">
+					Origin (no path) used to build the redirect URI below. Leave empty to derive it from the
+					incoming request address - set this when a reverse proxy makes that resolve to localhost.
+				</p>
 			</label>
 
 			<label class="flex cursor-pointer items-center gap-3">

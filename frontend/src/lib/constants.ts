@@ -644,6 +644,8 @@ export const API = {
 	settingsLocalFilesVerify: () => '/api/v1/settings/local-files/verify',
 	settingsMusicbrainz: () => '/api/v1/settings/musicbrainz',
 	settingsMusicbrainzVerify: () => '/api/v1/settings/musicbrainz/verify',
+	settingsSpotify: () => '/api/v1/settings/spotify',
+	settingsSpotifyRedirectUri: () => '/api/v1/settings/spotify/redirect-uri',
 	settingsGetIt: () => '/api/v1/settings/get-it',
 	settingsFreeMusic: () => '/api/v1/settings/free-music',
 	profile: {

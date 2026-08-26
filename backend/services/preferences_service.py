@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 from typing import Optional, TypeVar, Type
 from typing import Any
+from urllib.parse import urlsplit
 
 import msgspec
 from api.v1.schemas.settings import (
@@ -67,6 +68,7 @@ from core.exceptions import (
     ConfigurationError,
     ScriptValidationError,
     StaleRevisionError,
+    ValidationError,
 )
 from infrastructure.crypto import decrypt, encrypt
 from infrastructure.file_utils import atomic_write_json, read_json
@@ -75,6 +77,7 @@ from infrastructure.serialization import to_jsonable
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=msgspec.Struct)
+SPOTIFY_CALLBACK_PATH = "/api/v1/me/connections/spotify/auth/callback"
 
 
 class PreferencesService:
@@ -912,6 +915,7 @@ class PreferencesService:
             client_id=data.get("client_id", ""),
             client_secret=SPOTIFY_SECRET_MASK if client_secret else "",
             enabled=data.get("enabled", False),
+            spotify_redirect_origin=data.get("spotify_redirect_origin", ""),
         )
 
     def get_spotify_settings_raw(self) -> SpotifySettings:
@@ -924,9 +928,27 @@ class PreferencesService:
             client_id=data.get("client_id", ""),
             client_secret=client_secret,
             enabled=data.get("enabled", False),
+            spotify_redirect_origin=data.get("spotify_redirect_origin", ""),
         )
 
     def save_spotify_settings(self, settings: SpotifySettings) -> None:
+        # GH-298: an explicit redirect origin must be a bare http(s) origin -
+        # a path/query/fragment here would silently corrupt the value admins
+        # register in the Spotify dashboard. Empty string = dynamic fallback.
+        origin = settings.spotify_redirect_origin.strip()
+        if origin:
+            parts = urlsplit(origin)
+            if (
+                parts.scheme not in ("http", "https")
+                or not parts.netloc
+                or parts.path not in ("", "/")
+                or parts.query
+                or parts.fragment
+            ):
+                raise ValidationError(
+                    "Spotify redirect origin must be an absolute http(s) URL"
+                    " with no path, query, or fragment"
+                )
         try:
             current_raw = self.get_spotify_settings_raw()
             client_secret = settings.client_secret
@@ -937,6 +959,7 @@ class PreferencesService:
                 "client_id": settings.client_id.strip(),
                 "client_secret": encrypt(client_secret) if client_secret else "",
                 "enabled": settings.enabled,
+                "spotify_redirect_origin": origin.rstrip("/"),
             }
             self._save_config(config)
         except Exception as e:  # noqa: BLE001
@@ -946,6 +969,21 @@ class PreferencesService:
     def is_spotify_enabled(self) -> bool:
         raw = self.get_spotify_settings_raw()
         return raw.enabled and bool(raw.client_id) and bool(raw.client_secret)
+
+    def spotify_redirect_uri(self, request_base_url: str) -> str:
+        """Build the Spotify OAuth redirect_uri - the single source of truth (GH-298).
+
+        OAuth requires the authorize-time and token-exchange values to match
+        byte-for-byte what is registered in the Spotify dashboard, so the
+        authorize route, the callback's token exchange, and the admin display
+        endpoint all derive through this one method. An admin-configured
+        ``spotify_redirect_origin`` wins; empty keeps the historical
+        request-derived base (which collapses to localhost behind untrusted
+        proxies).
+        """
+        origin = self.get_spotify_settings_raw().spotify_redirect_origin.strip()
+        base = (origin or request_base_url).rstrip("/")
+        return base + SPOTIFY_CALLBACK_PATH
 
     def get_get_it_settings(self) -> GetItSettings:
         """Return the regional storefront used by purchase-link fallbacks."""

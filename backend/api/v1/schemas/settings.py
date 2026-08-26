@@ -422,9 +422,13 @@ SPOTIFY_SECRET_MASK = "spotify****"
 
 
 class SpotifySettings(AppStruct):
+    # GH-298: optional admin-configured origin (scheme://host[:port]) the OAuth
+    # redirect URI is built from; empty keeps the request.base_url fallback.
+    # Not a secret - returned unmasked like client_id.
     client_id: str = ""
     client_secret: str = ""
     enabled: bool = False
+    spotify_redirect_origin: str = ""
 
 
 TICKETMASTER_KEY_MASK = "ticketmaster****"

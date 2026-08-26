@@ -666,12 +666,13 @@ class SpotifyRedirectUriResponse(AppStruct):
     response_model=SpotifyRedirectUriResponse,
     dependencies=[Depends(_admin_guard)],
 )
-async def get_spotify_redirect_uri(request: Request) -> SpotifyRedirectUriResponse:
-    redirect_uri = (
-        str(request.base_url).rstrip("/")
-        + "/api/v1/me/connections/spotify/auth/callback"
+async def get_spotify_redirect_uri(
+    request: Request,
+    preferences_service: PreferencesService = Depends(get_preferences_service),
+) -> SpotifyRedirectUriResponse:
+    return SpotifyRedirectUriResponse(
+        redirect_uri=preferences_service.spotify_redirect_uri(str(request.base_url))
     )
-    return SpotifyRedirectUriResponse(redirect_uri=redirect_uri)
 
 
 @router.get("/home", response_model=HomeSettings, dependencies=[Depends(_admin_guard)])

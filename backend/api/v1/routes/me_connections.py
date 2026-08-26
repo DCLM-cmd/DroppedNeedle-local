@@ -311,7 +311,7 @@ async def spotify_auth_url(
         raise HTTPException(status_code=400, detail="Spotify is not configured by the administrator")
     state = secrets.token_urlsafe(32)
     await auth_store.store_spotify_state(state, current_user.id)
-    redirect_uri = str(request.base_url).rstrip("/") + "/api/v1/me/connections/spotify/auth/callback"
+    redirect_uri = preferences_service.spotify_redirect_uri(str(request.base_url))
     auth_url = "https://accounts.spotify.com/authorize?" + urlencode({
         "client_id": settings.client_id,
         "response_type": "code",
@@ -340,7 +340,7 @@ async def spotify_auth_callback(
         return fastapi_responses.RedirectResponse("/profile?spotify=error&reason=state")
 
     settings = preferences_service.get_spotify_settings_raw()
-    redirect_uri = str(request.base_url).rstrip("/") + "/api/v1/me/connections/spotify/auth/callback"
+    redirect_uri = preferences_service.spotify_redirect_uri(str(request.base_url))
     basic = base64.b64encode(f"{settings.client_id}:{settings.client_secret}".encode()).decode()
 
     try:

@@ -1164,6 +1164,7 @@ export type SpotifySettings = {
 	client_id: string;
 	client_secret: string;
 	enabled: boolean;
+	spotify_redirect_origin: string;
 };
 
 // mirrors backend api/v1/schemas/settings.py (FreeMusicSettings)
