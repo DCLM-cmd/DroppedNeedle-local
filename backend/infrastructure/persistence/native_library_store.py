@@ -10960,6 +10960,39 @@ class NativeLibraryStore(PersistenceBase):
                 (run_id, root_id, relative_directory, cursor, limit),
             ).fetchall()
             if not tokens:
+                # F-MATCH-06: before leaving the summary phase, disambiguate
+                # distinct grouping tokens that computed the same base key.
+                # The pass runs once over the whole directory in sorted-token
+                # order, so the result is stable across page boundaries,
+                # checkpoint resumes, and process restarts. The first token
+                # keeps the plain base key (mirroring LocalAlbumGrouper's
+                # seen_keys rule); each later token gains a deterministic
+                # ":<ordinal>" suffix. Non-colliding keys are untouched.
+                staged_keys = connection.execute(
+                    "SELECT grouping_token,grouping_key FROM "
+                    "library_scan_grouping_groups WHERE run_id=? AND root_id=? "
+                    "AND relative_directory=? ORDER BY grouping_token",
+                    (run_id, root_id, relative_directory),
+                ).fetchall()
+                key_occurrences: dict[str, int] = {}
+                for staged_row in staged_keys:
+                    base_key = str(staged_row["grouping_key"])
+                    occurrences = key_occurrences.get(base_key, 0) + 1
+                    key_occurrences[base_key] = occurrences
+                    if occurrences == 1:
+                        continue
+                    connection.execute(
+                        "UPDATE library_scan_grouping_groups SET grouping_key=? "
+                        "WHERE run_id=? AND root_id=? AND relative_directory=? "
+                        "AND grouping_token=?",
+                        (
+                            f"{base_key}:{occurrences}",
+                            run_id,
+                            root_id,
+                            relative_directory,
+                            str(staged_row["grouping_token"]),
+                        ),
+                    )
                 connection.execute(
                     "UPDATE library_scan_grouping_contexts SET staging_state='continuity',"
                     "staging_cursor=NULL,row_revision=row_revision+1 WHERE run_id=? "
@@ -11445,6 +11478,32 @@ class NativeLibraryStore(PersistenceBase):
         now: float,
     ) -> None:
         def operation(connection: sqlite3.Connection) -> int:
+            # F-MATCH-06 fail-closed guard (equivalent in effect to
+            # apply_grouping_context's duplicate-target rejection): two distinct
+            # staged groups must never target one new local album ID, and one
+            # grouping key must never appear twice. The summary-phase
+            # disambiguation makes this unreachable for fresh collisions, but a
+            # regression must abort loudly instead of silently merging albums.
+            seen_targets: dict[str, str] = {}
+            seen_keys: set[str] = set()
+            for group in groups:
+                album_id = str(group["local_album_id"])
+                grouping_key = str(group["grouping_key"])
+                previous_key = seen_targets.get(album_id)
+                if previous_key is not None and previous_key != grouping_key:
+                    raise ConflictError(
+                        "Staged grouping produced two distinct groups for one "
+                        "local album."
+                    )
+                if previous_key is None:
+                    seen_targets[album_id] = grouping_key
+                if grouping_key in seen_keys and previous_key is None:
+                    raise ConflictError(
+                        "Staged grouping reused one grouping key for two "
+                        "distinct local albums."
+                    )
+                seen_keys.add(grouping_key)
+
             changed = False
             for group in groups:
                 album_id = str(group["local_album_id"])

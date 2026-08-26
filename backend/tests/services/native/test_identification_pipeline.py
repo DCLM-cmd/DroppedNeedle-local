@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -3236,3 +3237,251 @@ async def test_automatic_worker_defers_local_fingerprint_failure_honestly(
     assert row[0] == "FINGERPRINT_LOCAL_FAILURE"
     # Provider-only sweep leaves the local-failure row's backoff untouched.
     assert await store.reset_provider_identification_deferrals(now=100_000) == 0
+
+
+@pytest.mark.asyncio
+async def test_staged_collision_tokens_stay_two_albums_like_the_small_path(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-MATCH-06: two distinct grouping tokens that resolve to the same
+    directory, normalized consensus title, and artist must remain two local
+    albums on the staged path — matching the small path — and the staged keys
+    must be deterministic across pages, resumes, and repeated runs."""
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD", 4
+    )
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGING_BATCH_SIZE", 2
+    )
+    artist = LocalArtist(
+        id="mixed-artist",
+        display_name="Artist One",
+        folded_name="artist one",
+        normalized_name="artist one",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id="mixed-old-album",
+        root_id="root",
+        grouping_key="mixed-old",
+        title="Mixed Bag",
+        album_artist_id=artist.id,
+        album_artist_name=artist.display_name,
+        created_at=1,
+        updated_at=1,
+    )
+    # 6 tracks > patched threshold of 4. All share the same normalized tag
+    # title/artist; alternating is_compilation splits them into two distinct
+    # grouping tokens (tagged:mixed bag: vs tagged:mixed bag:artist one).
+    tracks = [
+        LocalTrack(
+            id=f"mixed-track-{index:02}",
+            local_album_id=album.id,
+            root_id="root",
+            file_path=f"/music/mixed/{index:02}.flac",
+            relative_path=f"mixed/{index:02}.flac",
+            path_hash=f"mixed-hash-{index:02}",
+            file_size_bytes=100,
+            file_mtime_ns=1,
+            stat_revision=f"100:{index}",
+            tag_revision=f"tag-{index}",
+            title=f"Track {index}",
+            artist_name=artist.display_name,
+            album_title=album.title,
+            album_artist_name=artist.display_name,
+            tag_album_title="Mixed Bag",
+            tag_album_artist_name="Artist One",
+            track_number=index,
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+            applied_policy="automatic",
+            applied_policy_revision="policy-1",
+            is_compilation=index % 2 == 0,
+        )
+        for index in range(1, 7)
+    ]
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=tracks,
+            album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+            track_credits={
+                track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]
+                for track in tracks
+            },
+        )
+    )
+
+    def _run(run_id: str, now: float):
+        return LocalAlbumGroupingService(
+            store, IdentificationQueueService(store)
+        ).regroup_run(run_id, now=now, frozen_policy_revision="policy-1")
+
+    # Staged run first.
+    await store.create_scan_run(
+        ScanRun(id="mixed-staged-run", kind="incremental", trigger="manual", queued_at=1)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id,root_id,relative_directory) "
+            "VALUES ('mixed-staged-run','root','mixed')"
+        )
+    await _run("mixed-staged-run", now=2)
+
+    with sqlite3.connect(db_path) as connection:
+        staged_groups = connection.execute(
+            "SELECT grouping_token,grouping_key,local_album_id FROM "
+            "library_scan_grouping_groups WHERE run_id='mixed-staged-run' "
+            "ORDER BY grouping_token"
+        ).fetchall()
+        staged_track_albums = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT id,local_album_id FROM local_tracks "
+                "WHERE relative_path LIKE 'mixed/%'"
+            ).fetchall()
+        }
+    assert len(staged_groups) == 2
+    first_token, second_token = (
+        str(staged_groups[0][0]),
+        str(staged_groups[1][0]),
+    )
+    first_key, second_key = (
+        str(staged_groups[0][1]),
+        str(staged_groups[1][1]),
+    )
+    first_album, second_album = (
+        str(staged_groups[0][2]),
+        str(staged_groups[1][2]),
+    )
+    assert first_key != second_key
+    assert second_key.startswith(first_key + ":")  # deterministic ordinal suffix
+    assert first_album != second_album
+
+    compilation_tracks = sorted(
+        track.id for track in tracks if track.is_compilation
+    )
+    plain_tracks = sorted(track.id for track in tracks if not track.is_compilation)
+    token_a_tracks = {
+        track_id
+        for track_id, album_id in staged_track_albums.items()
+        if album_id == first_album
+    }
+    assert sorted(token_a_tracks) in (compilation_tracks, plain_tracks)
+    # Disjoint membership covering every input track.
+    assigned = [album_id for _, album_id in staged_track_albums.items()]
+    assert len(set(assigned)) == 2
+
+    # Deterministic across a fresh run of the same input.
+    await store.finish_scan_run("mixed-staged-run") if hasattr(store, "finish_scan_run") else None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_scan_runs SET state='completed' WHERE id='mixed-staged-run'"
+        )
+    await store.create_scan_run(
+        ScanRun(id="mixed-staged-run-2", kind="incremental", trigger="manual", queued_at=2)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id,root_id,relative_directory) "
+            "VALUES ('mixed-staged-run-2','root','mixed')"
+        )
+    await _run("mixed-staged-run-2", now=3)
+    with sqlite3.connect(db_path) as connection:
+        rerun_keys = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT grouping_key FROM library_scan_grouping_groups "
+                "WHERE run_id='mixed-staged-run-2' ORDER BY grouping_token"
+            ).fetchall()
+        ]
+    assert rerun_keys == [first_key, second_key]
+
+    # Small path on a separate run: same group count and disjoint membership.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_scan_runs SET state='completed' WHERE id='mixed-staged-run-2'"
+        )
+    await store.create_scan_run(
+        ScanRun(id="mixed-small-run", kind="incremental", trigger="manual", queued_at=3)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id,root_id,relative_directory) "
+            "VALUES ('mixed-small-run','root','mixed')"
+        )
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD", 50
+    )
+    await _run("mixed-small-run", now=4)
+    with sqlite3.connect(db_path) as connection:
+        small_album_ids = {
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT local_album_id FROM local_tracks "
+                "WHERE relative_path LIKE 'mixed/%'"
+            ).fetchall()
+        }
+    assert len(small_album_ids - {album.id}) >= 2 or len(small_album_ids) >= 2
+
+
+@pytest.mark.asyncio
+async def test_provision_rejects_duplicate_staged_targets_fail_closed() -> None:
+    """F-MATCH-06 guard: provisioning two distinct staged groups onto one new
+    local album ID fails closed instead of silently merging them."""
+    from core.exceptions import ConflictError
+
+    duplicate_groups = [
+        {
+            "grouping_token": "manual:a",
+            "grouping_key": "key-a",
+            "title": "Same",
+            "album_artist_name": "Artist",
+            "reason_code": "AMBIGUOUS_FALLBACK_GROUP",
+            "local_album_id": "album-dup",
+            "local_artist_id": "artist-dup",
+        },
+        {
+            "grouping_token": "manual:b",
+            "grouping_key": "key-b",
+            "title": "Same",
+            "album_artist_name": "Artist",
+            "reason_code": "AMBIGUOUS_FALLBACK_GROUP",
+            "local_album_id": "album-dup",
+            "local_artist_id": "artist-dup",
+        },
+    ]
+
+    class _GuardStore(NativeLibraryStore):
+        recorded: list = []
+
+        async def _write_scan(self, operation):
+            connection = self._connect()
+
+            class _FakeCursor:
+                rowcount = 0
+
+            operation(connection)
+            connection.close()
+            return _FakeCursor()
+
+    tmp = Path(tempfile.mkdtemp())
+    db_file = tmp / "guard.db"
+    with sqlite3.connect(db_file) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO auth_users VALUES ('admin')")
+    guard_store = _GuardStore(db_file, threading.Lock())
+
+    with pytest.raises(ConflictError):
+        await guard_store.provision_staged_grouping_groups(
+            "run-guard", "root", "dir", duplicate_groups, now=5.0
+        )
