@@ -66,6 +66,16 @@ class AlbumCandidateService:
                 return []
             exact.source_kinds = ["embedded_exact_release"]
             return [exact]
+        # F-MATCH-02 (owner-signed): non-exact recall orders deduplicated
+        # cached-fingerprint seeds first (audio truth, mirroring
+        # ``AlbumIdentifier._candidate_release_groups``), then the single
+        # embedded release-group seed, then album-tag and recording-search IDs.
+        ids: list[tuple[str, str]] = [
+            (release_group_id, "cached_fingerprint")
+            for release_group_id in dict.fromkeys(
+                value for value in (cached_fingerprint_release_groups or []) if value
+            )
+        ]
         if len(embedded_groups) == 1:
             ids.append((next(iter(embedded_groups)), "embedded"))
 
@@ -81,7 +91,14 @@ class AlbumCandidateService:
             if checkpoint is not None and not await checkpoint():
                 return []
 
-        if not album or not artist or len(set(identifier for identifier, _ in ids)) < 2:
+        # The recording-search fallback triggers on sparse TEXT evidence, as it
+        # did before F-MATCH-02 reordered the list: fingerprint seeds satisfy
+        # the ordering contract without changing when recordings are searched.
+        if (
+            not album
+            or not artist
+            or len({identifier for identifier, source in ids if source != "cached_fingerprint"}) < 2
+        ):
             samples = sorted(
                 (track for track in tracks if track.title),
                 key=lambda track: (
@@ -104,10 +121,6 @@ class AlbumCandidateService:
                     ids.append((release_group_id, "recording_search"))
                 if checkpoint is not None and not await checkpoint():
                     return []
-
-        for release_group_id in cached_fingerprint_release_groups or []:
-            ids.append((release_group_id, "cached_fingerprint"))
-
         ordered: list[str] = []
         sources: dict[str, list[str]] = {}
         for release_group_id, source in ids:

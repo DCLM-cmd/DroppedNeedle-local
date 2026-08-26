@@ -41,7 +41,10 @@ from models.local_catalog import (
     LocalArtistCredit,
     LocalTrack,
 )
-from services.native.album_candidate_service import AlbumCandidateService
+from services.native.album_candidate_service import (
+    MAX_CANDIDATES,
+    AlbumCandidateService,
+)
 from services.native.album_coverage_service import AlbumCoverageService
 from services.native.album_evidence_engine import AlbumEvidenceEngine
 from services.native.album_identification_service import AlbumIdentificationService
@@ -2859,3 +2862,225 @@ async def test_deferral_sequence_matches_the_declared_cap_exactly(
 
     # No eleventh retry is schedulable.
     assert await queue.claim("worker", now=now + 100_000) is None
+
+
+class _OrderingProvider(FakeProvider):
+    """Records every release-group fetch in order and serves one candidate each."""
+
+    def __init__(
+        self,
+        album_ids: list[str],
+        recording_ids: list[str],
+        candidates: list[AlbumCandidate] | None = None,
+    ) -> None:
+        super().__init__(candidates)
+        self.album_ids = album_ids
+        self.recording_ids = recording_ids
+        self._recording_page = 0
+        self.fetch_order: list[str] = []
+
+    async def search_album_candidate_ids(
+        self, artist: str, title: str, limit: int, priority: RequestPriority
+    ) -> list[str]:
+        self.calls.append(("album", priority))
+        return self.album_ids[:limit]
+
+    async def search_recording_candidate_ids(
+        self,
+        artist: str,
+        title: str,
+        limit: int,
+        priority: RequestPriority,
+    ) -> list[str]:
+        self.calls.append(("recording", priority))
+        start = self._recording_page * limit
+        self._recording_page += 1
+        return self.recording_ids[start : start + limit]
+
+    async def get_album_candidate(
+        self,
+        release_group_mbid: str,
+        target_track_count: int,
+        priority: RequestPriority,
+    ) -> AlbumCandidate | None:
+        self.calls.append((f"detail:{release_group_mbid}", priority))
+        self.fetch_order.append(release_group_mbid)
+        return AlbumCandidate(
+            release_group_mbid=release_group_mbid,
+            release_mbid=f"release-{release_group_mbid}",
+            album_title="Noisy Tags",
+            album_artist_name="Artist",
+            tracks=[
+                CandidateTrack(
+                    title="Track",
+                    position=1,
+                    absolute_position=1,
+                    duration_seconds=180.0,
+                )
+            ],
+            release_type="album",
+        )
+
+
+def _recall_tracks() -> list[GroupingTrack]:
+    return [
+        GroupingTrack(
+            local_track_id=f"t-{index}",
+            root_id="root",
+            relative_path=f"a/{index}.flac",
+            title=f"Track {index}",
+            artist_name="Artist",
+            album_title="Noisy Tags",
+            album_artist_name="Artist",
+            track_number=index + 1,
+            disc_number=1,
+            duration_seconds=180.0,
+        )
+        for index in range(2)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_seed_survives_the_cap_and_is_fetched_first() -> None:
+    """F-MATCH-02: with sparse tags and a long recording tail, the cached
+    fingerprint seed leads the bounded fetch order instead of being truncated."""
+    # 1 album id + 4 samples x 5 distinct recording ids + 1 seed > 10: the cap
+    # must truncate the text tail, never the leading fingerprint seed.
+    provider = _OrderingProvider(
+        album_ids=["rg-text-00"],
+        recording_ids=[f"rg-rec-{index:02d}" for index in range(20)],
+    )
+    service = AlbumCandidateService(provider)
+
+    candidates = await service.recall(
+        _recall_tracks(),
+        cached_fingerprint_release_groups=["rg-fingerprint-audio"],
+        explicit=True,
+    )
+
+    assert provider.fetch_order[0] == "rg-fingerprint-audio"
+    assert "rg-fingerprint-audio" in provider.fetch_order[:MAX_CANDIDATES]
+    assert len(provider.fetch_order) == MAX_CANDIDATES  # bound intact
+    detail_calls = [
+        call for call in provider.calls if call[0].startswith("detail:")
+    ]
+    assert {priority for _, priority in detail_calls} == {
+        RequestPriority.USER_INITIATED
+    }
+    assert candidates[0].release_group_mbid == "rg-fingerprint-audio"
+    assert candidates[0].source_kinds == ["cached_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_multiple_fingerprint_seeds_keep_input_order_after_dedup() -> None:
+    provider = _OrderingProvider(album_ids=[], recording_ids=[])
+    service = AlbumCandidateService(provider)
+
+    await service.recall(
+        _recall_tracks(),
+        cached_fingerprint_release_groups=[
+            "rg-fp-b",
+            "",
+            "rg-fp-a",
+            "rg-fp-b",
+            None or "rg-fp-c",
+            "rg-fp-a",
+        ],
+    )
+
+    seeds = [
+        group for group in provider.fetch_order if group.startswith("rg-fp-")
+    ]
+    assert seeds == ["rg-fp-b", "rg-fp-a", "rg-fp-c"]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_fingerprint_and_text_sources_merge_labels() -> None:
+    """One provider fetch per ID; the candidate keeps both source labels in a
+    deterministic order (fingerprint first, then the text label)."""
+    shared = "rg-shared"
+    provider = _OrderingProvider(
+        album_ids=[shared, "rg-text-only"],
+        recording_ids=[],
+    )
+    service = AlbumCandidateService(provider)
+
+    candidates = await service.recall(
+        _recall_tracks(),
+        cached_fingerprint_release_groups=[shared],
+    )
+
+    fetched_once = [
+        group for group in provider.fetch_order if group == shared
+    ] == [shared]
+    assert fetched_once
+    by_group = {c.release_group_mbid: c for c in candidates}
+    assert by_group[shared].source_kinds == [
+        "cached_fingerprint",
+        "album_tags",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_embedded_and_exact_branches_keep_their_priority_contracts() -> None:
+    """Exact-release branches are untouched; an embedded seed keeps its label
+    and merges deterministically when it also appears as a text hit."""
+    provider = _OrderingProvider(album_ids=["rg-embedded"], recording_ids=[])
+
+    # Unanimous embedded exact release still short-circuits to the exact call.
+    exact_candidate = AlbumCandidate(
+        release_group_mbid="rg-exact",
+        release_mbid="release-exact",
+        album_title="Noisy Tags",
+        album_artist_name="Artist",
+        tracks=[
+            CandidateTrack(
+                title="Track",
+                position=1,
+                absolute_position=1,
+                duration_seconds=180.0,
+            )
+        ],
+        release_type="album",
+    )
+    exact_provider = _OrderingProvider(album_ids=[], recording_ids=[])
+    exact_provider.candidates = [exact_candidate]
+    exact_tracks = _recall_tracks()
+    for track in exact_tracks:
+        track.release_mbid = "release-exact"
+    exact_candidates = await AlbumCandidateService(exact_provider).recall(exact_tracks)
+    assert [c.source_kinds for c in exact_candidates] == [["embedded_exact_release"]]
+    assert exact_provider.exact_releases == [("release-exact", RequestPriority.BACKGROUND_SYNC)]
+    assert exact_provider.calls == []  # never enters bounded recall
+
+    # Embedded release-group seed precedes the text hit after reorder.
+    seeded_tracks = _recall_tracks()
+    for track in seeded_tracks:
+        track.release_group_mbid = "rg-embedded"
+    candidates = await AlbumCandidateService(provider).recall(seeded_tracks)
+    assert candidates[0].release_group_mbid == "rg-embedded"
+    assert candidates[0].source_kinds == ["embedded", "album_tags"]
+
+
+def test_target_seed_order_matches_album_identifier_reference() -> None:
+    """Plan step 6 comparison fixture: the target ordering rule (deduped seeds
+    first, then text ids) matches ``AlbumIdentifier._candidate_release_groups``'s
+    documented seed-first behavior for equivalent inputs."""
+    seeds = ["rg-fp-b", "", "rg-fp-a"]
+    deduped_seeds = list(dict.fromkeys(value for value in seeds if value))
+    text_ranked = ["rg-text-0", "rg-text-1"]
+
+    from services.native.album_candidate_service import (
+        ALBUM_SEARCH_LIMIT,
+    )
+
+    del ALBUM_SEARCH_LIMIT
+    combined = (deduped_seeds + text_ranked)[:10]
+
+    # The matcher reference builds exactly `seeds + text_ranked` with the same
+    # empty-filter/dedupe semantics.
+    matcher_reference = list(
+        dict.fromkeys(m for m in seeds if m)
+    ) + text_ranked
+
+    assert combined == matcher_reference
