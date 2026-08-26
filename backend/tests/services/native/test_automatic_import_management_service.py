@@ -529,6 +529,26 @@ async def test_required_replaygain_failure_holds_automatic_unit(
 
 
 @pytest.mark.asyncio
+async def test_optional_replaygain_failure_defers_and_continues(tmp_path: Path) -> None:
+    _root, source, preferences, store, _settings, policy_revision = _configured(tmp_path)
+    current = preferences.get_library_management_settings()
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID)
+    profile.enrichment.replaygain.enabled = True
+    profile.enrichment.replaygain.mode = "replace"
+    profile.enrichment.replaygain.required = False
+    preferences.save_library_management_settings_if_current(settings, expected_settings_revision=current.settings_revision)
+    _activate(preferences, policy_revision)
+    replaygain = AsyncMock()
+    replaygain.analyze.return_value = ReplayGainAnalysis(status="deferred", reason="Analyzer unavailable.")
+    service, _planner_value = _service(tmp_path, preferences, store, replaygain=replaygain)
+    prepared = await service.prepare(_bundle(tmp_path, source, policy_revision))
+    # Optional failure must not hold, but publish with deferred enrichment
+    assert prepared is not None
+    replaygain.analyze.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_automatic_import_holds_before_staging_when_capacity_is_insufficient(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

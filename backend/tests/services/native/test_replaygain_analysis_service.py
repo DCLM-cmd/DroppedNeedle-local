@@ -172,3 +172,135 @@ async def test_cancellation_reaps_analyzer_before_releasing_concurrency_slot(
         await task
     assert analysis.returncode == -15
     assert not service._semaphore.locked()
+
+@pytest.mark.asyncio
+async def test_heartbeat_advances_while_blocked_stat_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import time as _time
+
+    first = tmp_path / "a.flac"
+    second = tmp_path / "b.flac"
+    first.write_bytes(b"audio")
+    second.write_bytes(b"audio")
+
+    def slow_stat(path: Path):
+        _time.sleep(0.15)
+        return (123, 456)
+
+    monkeypatch.setattr("services.native.replaygain_analysis_service._file_state", slow_stat)
+    monkeypatch.setattr("services.native.replaygain_analysis_service.shutil.which", lambda _v: "/usr/bin/loudgain")
+
+    async def fake_run(cmd, timeout):
+        if "--version" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="loudgain 0.6.8\n", stderr="")
+        n = max(1, len(cmd) - 6)
+        header = "File\tLoudness\tRange\tTrue_Peak\tTrue_Peak_dBTP\tReference\tWill_clip\tClip_prevent\tGain\tNew_Peak\tNew_Peak_dBTP"
+        lines = [header]
+        # cmd[6:] are the source paths
+        for path_str in cmd[6:]:
+            lines.append(f"{path_str}\t-21.75 LUFS\t0.00 dB\t0.125093\t-18.06 dBTP\t-18.00 LUFS\tN\tN\t3.75 dB\t0.192705\t-14.30 dBTP")
+        lines.append("Album\t-23.70 LUFS\t0.00 dB\t0.125093\t-18.06 dBTP\t-18.00 LUFS\tN\tN\t5.70 dB\t0.241150\t-12.35 dBTP")
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(lines) + "\n", stderr="")
+
+    monkeypatch.setattr("services.native.replaygain_analysis_service.ReplayGainAnalysisService._run_command", AsyncMock(side_effect=fake_run))
+    service = ReplayGainAnalysisService()
+    heartbeat = 0
+
+    async def beep():
+        nonlocal heartbeat
+        while True:
+            heartbeat += 1
+            await asyncio.sleep(0.02)
+
+    beeper = asyncio.create_task(beep())
+    try:
+        result = await service.analyze((first, second), album_aware=True)
+        print(f"heartbeat {heartbeat} result {result} reason {getattr(result, 'reason', None)}")
+        assert heartbeat >= 2, f"heartbeat {heartbeat} should advance while stat blocked"
+        assert result.status == "available", f"got {result} reason {getattr(result, 'reason', None)}"
+    finally:
+        beeper.cancel()
+        try:
+            await beeper
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_exactly_two_complete_batches_including_500_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("services.native.replaygain_analysis_service.shutil.which", lambda _v: "/usr/bin/loudgain")
+    calls: list[tuple] = []
+    orig_to_thread = asyncio.to_thread
+
+    async def counting_to_thread(func, *args, **kwargs):
+        calls.append((func, args))
+        return await orig_to_thread(func, *args, **kwargs)
+
+    async def fake_run(cmd, timeout):
+        if "--version" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="loudgain 0.6.8\n", stderr="")
+        header = "File\tLoudness\tRange\tTrue_Peak\tTrue_Peak_dBTP\tReference\tWill_clip\tClip_prevent\tGain\tNew_Peak\tNew_Peak_dBTP"
+        lines = [header]
+        for path_str in cmd[6:]:
+            lines.append(f"{path_str}\t-21.75 LUFS\t0.00 dB\t0.125093\t-18.06 dBTP\t-18.00 LUFS\tN\tN\t3.75 dB\t0.192705\t-14.30 dBTP")
+        lines.append("Album\t-23.70 LUFS\t0.00 dB\t0.125093\t-18.06 dBTP\t-18.00 LUFS\tN\tN\t5.70 dB\t0.241150\t-12.35 dBTP")
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(lines) + "\n", stderr="")
+
+
+
+    monkeypatch.setattr(asyncio, "to_thread", counting_to_thread)
+
+
+    monkeypatch.setattr("services.native.replaygain_analysis_service.ReplayGainAnalysisService._run_command", AsyncMock(side_effect=fake_run))
+    service = ReplayGainAnalysisService()
+    # 1 track -> 2 batches (before+after)
+    p1 = tmp_path / "t1.flac"
+    p1.write_bytes(b"a")
+    calls.clear()
+    await service.analyze((p1,), album_aware=False)
+    assert len([c for c in calls if "tuple" in str(c[0])]) == 2 or len(calls) == 2, f"expected 2 snapshot batches, got {calls}"
+    # 500 tracks -> still 2 batches, not 500 or 1000
+    many = []
+    for i in range(500):
+        p = tmp_path / f"m{i}.flac"
+        p.write_bytes(b"a")
+        many.append(p)
+    calls.clear()
+    result = await service.analyze(tuple(many), album_aware=True)
+    assert result.status == "available"
+    assert len(calls) == 2, f"500 should be 2 batches, got {len(calls)}"
+    # 501 -> deferred before any stat, zero batches
+    over = many + [tmp_path / "extra.flac"]
+    over[-1].write_bytes(b"a")
+    calls.clear()
+    result2 = await service.analyze(tuple(over), album_aware=True)
+    assert result2.status == "deferred"
+    assert result2.reason == "The ReplayGain album size is invalid."
+    assert len(calls) == 0, f"501 should be 0 batches, got {len(calls)}"
+
+
+@pytest.mark.asyncio
+async def test_missing_source_still_deferred_with_offload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("services.native.replaygain_analysis_service.shutil.which", lambda _v: "/usr/bin/loudgain")
+    service = ReplayGainAnalysisService()
+    missing = tmp_path / "missing.flac"
+    result = await service.analyze((missing,), album_aware=False)
+    assert result.status == "deferred"
+    assert result.reason == "A ReplayGain source is unavailable."
+
+
+@pytest.mark.asyncio
+async def test_cancellation_reaps_before_release_with_offload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Ensure offload does not swallow CancelledError and semaphore released only after cleanup
+    source = tmp_path / "track.flac"
+    source.write_bytes(b"audio")
+    monkeypatch.setattr("services.native.replaygain_analysis_service.shutil.which", lambda _v: "/usr/bin/loudgain")
+    # Make _snapshot_file_states slow so cancellation during loudgain still proves semaphore held
+    orig_snapshot = __import__("services.native.replaygain_analysis_service", fromlist=["_snapshot_file_states"])._snapshot_file_states
+
+    async def slow_snapshot(sources):
+        await asyncio.sleep(0.05)
+        return await orig_snapshot(sources)
+
+    monkeypatch.setattr("services.native.replaygain_analysis_service._snapshot_file_states", slow_snapshot)
+    # Reuse existing cancellation test logic but ensure it still passes
+    await test_cancellation_reaps_analyzer_before_releasing_concurrency_slot(tmp_path, monkeypatch)

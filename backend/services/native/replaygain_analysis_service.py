@@ -33,6 +33,10 @@ def _file_state(path: Path) -> tuple[int, int]:
     return stat.st_size, stat.st_mtime_ns
 
 
+async def _snapshot_file_states(sources: tuple[Path, ...]) -> tuple[tuple[int, int], ...]:
+    return await asyncio.to_thread(lambda: tuple(_file_state(path) for path in sources))
+
+
 class ReplayGainAnalysisService:
     def __init__(
         self,
@@ -74,7 +78,7 @@ class ReplayGainAnalysisService:
                 status="deferred", reason="The loudgain analyzer is unavailable."
             )
         try:
-            before = tuple(_file_state(path) for path in sources)
+            before = await _snapshot_file_states(sources)
         except OSError:
             return ReplayGainAnalysis(
                 status="deferred", reason="A ReplayGain source is unavailable."
@@ -111,7 +115,7 @@ class ReplayGainAnalysisService:
                 reason="ReplayGain analysis failed.",
             )
         try:
-            after = tuple(_file_state(path) for path in sources)
+            after = await _snapshot_file_states(sources)
         except OSError:
             return ReplayGainAnalysis(
                 status="deferred",
