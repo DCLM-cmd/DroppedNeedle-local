@@ -38,7 +38,11 @@ from services.native.coverage import match_rows_to_tracks, uncovered_tracks
 
 # The availability-failure prefixes (§4.5). IMPORTED, never copied: the tie-test
 # in tests/services/test_wanted_watcher_service.py fails if either side drifts.
-from services.native.download_orchestrator import _NO_MATCH_MSG, _NO_SOURCE_MSG
+from services.native.download_orchestrator import (
+    _NO_MATCH_MSG,
+    _NO_SOURCE_MSG,
+    _TAG_MISMATCH_MSG,
+)
 from services.native.download_service import ALREADY_IN_LIBRARY
 
 if TYPE_CHECKING:
@@ -604,7 +608,11 @@ class WantedWatcherService:
         if record.status == "incomplete":
             return True
         message = task.error_message or ""
-        return message.startswith(_NO_SOURCE_MSG) or message.startswith(_NO_MATCH_MSG)
+        return (
+            message.startswith(_NO_SOURCE_MSG)
+            or message.startswith(_NO_MATCH_MSG)
+            or message.startswith(_TAG_MISMATCH_MSG)
+        )
 
     async def _first_release_date(
         self, record: "RequestHistoryRecord", provider_available: bool = True, cache: dict[str, str | None] | None = None

@@ -12,17 +12,34 @@ scorers, and the orchestrator agree byte-for-byte on what a row's key means.
 """
 
 import re
+import unicodedata
 
 SOURCE_SOULSEEK = "soulseek"
 SOURCE_USENET = "usenet"
 
-_UNIT = "\x1f"  # ASCII unit separator - never appears in a username/filename/title
+SOULSEEK_ID_SEPARATOR = "\x1f"
+_UNIT = SOULSEEK_ID_SEPARATOR
 _WS = re.compile(r"\s+")
 
 
+def _canonical_soulseek_part(value: str) -> str:
+    return unicodedata.normalize("NFC", value.replace("\\", "/"))
+
+
 def soulseek_identity(username: str, filename: str) -> str:
-    """Identity of a soulseek per-file pick - the old quarantine key, encoded."""
-    return f"{username}{_UNIT}{filename}"
+    """Identity of a Soulseek per-file pick, canonicalized for persistence."""
+    return (
+        f"{_canonical_soulseek_part(username)}{SOULSEEK_ID_SEPARATOR}"
+        f"{_canonical_soulseek_part(filename)}"
+    )
+
+
+def canonical_soulseek_identity(identity: str) -> str:
+    """Canonicalize an encoded Soulseek identity, including legacy rows."""
+    username, separator, filename = identity.partition(SOULSEEK_ID_SEPARATOR)
+    if not separator:
+        return _canonical_soulseek_part(identity)
+    return soulseek_identity(username, filename)
 
 
 def usenet_identity(title: str, size_bytes: int) -> str:

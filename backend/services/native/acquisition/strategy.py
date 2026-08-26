@@ -538,13 +538,21 @@ class SoulseekStrategy:
             manifest, only_filenames=only_filenames
         )
         for failure in result.failed:
-            if failure.reason in QUARANTINE_REASONS:
+            # ``tag_mismatch`` is intentionally kept on the returned ProcessResult so
+            # callers can report the truthful content-verification outcome. The
+            # quarantine table's existing CHECK vocabulary predates this reason, so
+            # persist it as the equivalent ``verify_failed`` source exclusion without
+            # changing the failure surfaced to the orchestrator or held-import UI.
+            quarantine_reason = (
+                "verify_failed" if failure.reason == "tag_mismatch" else failure.reason
+            )
+            if quarantine_reason in QUARANTINE_REASONS:
                 await self._store.record_quarantine(
                     source="soulseek",
                     identity=soulseek_identity(
                         task.source_username or "", failure.filename
                     ),
-                    reason=failure.reason,
+                    reason=quarantine_reason,
                     release_group_mbid=task.release_group_mbid,
                 )
                 logger.info(

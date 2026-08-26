@@ -25,6 +25,7 @@ from services.native.download_orchestrator import (
     _IMPORT_FAILED_MSG,
     _NO_MATCH_MSG,
     _NO_SOURCE_MSG,
+    _TAG_MISMATCH_MSG,
     DownloadOrchestrator,
 )
 from services.native.download_service import ALREADY_IN_LIBRARY, DownloadService
@@ -231,8 +232,8 @@ async def test_library_removal_opt_out_does_not_revive_a_stopped_watch(env):
 
 
 def test_orchestrator_messages_start_with_the_imported_constants(tmp_path):
-    """The tie-test: the classifier prefix-matches _NO_SOURCE_MSG/_NO_MATCH_MSG,
-    so the strings the orchestrator ACTUALLY writes must start with them."""
+    """The tie-test: the classifier prefix-matches the imported availability
+    constants, so the strings the orchestrator ACTUALLY writes must start with them."""
     orch = DownloadOrchestrator(
         client=Mock(),
         indexer=Mock(),
@@ -257,6 +258,7 @@ def test_orchestrator_messages_start_with_the_imported_constants(tmp_path):
         f"{_NO_SOURCE_MSG} on Soulseek",
         f"{_NO_SOURCE_MSG} on Soulseek or Usenet",
         f"{_NO_MATCH_MSG} on Usenet",
+        _TAG_MISMATCH_MSG,
     ],
 )
 async def test_availability_failures_enrol_as_missing(env, message):

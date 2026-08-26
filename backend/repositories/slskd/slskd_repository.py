@@ -17,6 +17,7 @@ stay structurally identical to the protocol for the conformance contract test.
 import asyncio
 import logging
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,6 +39,41 @@ logger = logging.getLogger(__name__)
 _DISC_DIR = re.compile(r"\b(?:Disc|CD)\s*\d+\b", re.IGNORECASE)
 _LOSSLESS_EXT = {"flac", "alac", "wav", "ape", "wv"}
 _NO_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
+_MAX_WALK_ENTRIES = 10_000
+
+
+def _normalised_filename(value: str) -> str:
+    """Return the NFC form used for filename comparisons only."""
+    return unicodedata.normalize("NFC", value)
+
+
+def _exact_transfer_path(value: str) -> str:
+    """Return a transfer path key with separators normalised, but not Unicode."""
+    return value.replace("\\", "/")
+
+
+def _normalised_path(value: str) -> str:
+    """Canonical comparison key for a path reported by slskd."""
+    return _normalised_filename(_exact_transfer_path(value))
+
+
+class _EntryBudget:
+    """Shared cap for all normalized fallback directory entries."""
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, limit: int) -> None:
+        self.remaining = limit
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining <= 0
 
 
 class SlskdRepository:
@@ -153,8 +189,7 @@ class SlskdRepository:
 
     async def get_status(self, handle: TaskHandle) -> DownloadTaskStatus:
         transfers = await self._client.get_downloads(handle.username)
-        wanted = set(handle.filenames)
-        matched = [t for t in transfers if t.filename in wanted]
+        matched = self._match_transfers(handle, transfers)
         return self._aggregate_status(handle, matched)
 
     async def abort(self, handle: TaskHandle) -> bool:
@@ -186,14 +221,13 @@ class SlskdRepository:
 
     async def _remove_transfer_records(self, handle: TaskHandle) -> bool:
         transfers = await self._client.get_downloads(handle.username)
-        wanted = set(handle.filenames)
+        matched = self._match_transfers(handle, transfers)
         ok = True
-        for transfer in transfers:
-            if transfer.filename in wanted:
-                ok = (
-                    await self._client.cancel_transfer(handle.username, transfer.id)
-                    and ok
-                )
+        for transfer in matched:
+            ok = (
+                await self._client.cancel_transfer(handle.username, transfer.id)
+                and ok
+            )
         return ok
 
     def _downloads_mount_healthy(self) -> bool:
@@ -232,29 +266,32 @@ class SlskdRepository:
     def _locate_file(
         self, username: str, remote_filename: str, size: int | None = None
     ) -> Path | None:
-        """Resolve a finished transfer to its on-disk path inside the mounted
-        slskd downloads dir, or ``None`` if it can't be located there. Sync (runs in a
-        worker thread via ``get_file_path``); does only filesystem I/O, no awaits.
+        """Resolve a finished transfer inside the mounted slskd downloads directory.
 
-        slskd's on-disk layout varies by version and by how the peer organised
-        their share: ``{downloads}/{leaf remote folder}/{file}`` (common),
-        ``{downloads}/{username}/{file}`` or ``.../{username}/{album}/{file}``
-        (peers that file by user), or a flat dump. We try the cheap direct paths
-        first, then a username-scoped walk at any depth (scoped so a same-named
-        track from another peer can't be grabbed), and finally an exact byte-size
-        match for when slskd sanitised the on-disk filename and the basename no
-        longer matches. The remote filename is untrusted, so every candidate is
-        confined to the mount."""
-        parts = [
-            p for p in re.split(r"[\\/]", remote_filename) if p and p not in (".", "..")
-        ]
+        Exact spelling is always tried before a normalized alias.  Alias lookup is
+        deliberately bounded and fail-closed: it is confined to the resolved mount,
+        accepts regular files only, checks a positive expected size, and returns a
+        path only when exactly one matching on-disk file exists.
+        """
+        raw_parts = re.split(r"[\\/]", remote_filename)
+        if any(part == ".." for part in raw_parts):
+            return None
+        parts = [part for part in raw_parts if part and part != "."]
         if not parts:
             return None
-        mount = self._downloads_mount.resolve()
+        try:
+            mount = self._downloads_mount.resolve()
+        except (OSError, RuntimeError):
+            return None
         basename = parts[-1]
+        normalised_basename = _normalised_filename(basename)
+        expected_size = size if size is not None and size > 0 else None
 
         def _within_mount(candidate: Path) -> Path | None:
-            resolved = candidate.resolve()
+            try:
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError):
+                return None
             if not resolved.is_relative_to(mount):
                 logger.warning(
                     "slskd path escapes the downloads mount: %r", remote_filename
@@ -262,40 +299,51 @@ class SlskdRepository:
                 return None
             return resolved
 
+        def _find_direct_exact(directory: Path) -> Path | None:
+            candidate = _within_mount(directory / basename)
+            if candidate is not None and candidate.is_file():
+                return candidate
+            return None
+
+        def _name_matches(entry: Path) -> bool:
+            return entry.name == basename
+
         # 1. slskd's common layout: {mount}/{leaf remote folder}/{filename}.
         if len(parts) >= 2:
-            leaf = _within_mount(mount / parts[-2] / basename)
-            if leaf is not None and leaf.exists():
+            leaf = _find_direct_exact(mount / parts[-2])
+            if leaf is not None:
                 return leaf
         # 2. Flat layout: {mount}/{filename}.
-        flat = _within_mount(mount / basename)
-        if flat is not None and flat.exists():
+        flat = _find_direct_exact(mount)
+        if flat is not None:
             return flat
-        # 3. Peers that file by username: walk {mount}/{username}/ at any depth
-        # (covers {username}/{file} and {username}/{album}/{file}). Scoped to the
-        # peer so a same-named track from a different user can't be picked up.
+        # 3. Peers that file by username: walk {mount}/{username}/ at any depth.
+        # (covers {username}/{file} and {username}/{album}/{file}). Scoped so a
+        # same-named track from another peer cannot be picked up.
         user_root = _within_mount(mount / username) if username else None
         if user_root is not None and user_root.is_dir():
-            hit = self._walk_find(user_root, mount, lambda e: e.name == basename)
+            hit = self._walk_find(user_root, mount, _name_matches)
             if hit is not None:
                 return hit
         # 4. slskd may have sanitised the folder name - scan one level down for it.
         try:
-            for child in sorted(mount.iterdir()):
-                if child.is_dir():
-                    cand = _within_mount(child / basename)
-                    if cand is not None and cand.exists():
-                        return cand
-        except OSError as exc:
+            for child in sorted(mount.iterdir(), key=lambda path: path.name):
+                child_root = _within_mount(child)
+                if child_root is None or not child_root.is_dir():
+                    continue
+                cand = _find_direct_exact(child_root)
+                if cand is not None:
+                    return cand
+        except (OSError, RuntimeError) as exc:
             logger.warning("Could not scan downloads mount %s: %s", mount, exc)
-        # 5. Last resort: slskd sanitised the FILENAME (illegal chars stripped), so
-        # the basename no longer matches. An exact byte-size match under the peer's
-        # folder recovers it - size is a strong key and the scope keeps it precise.
-        if size and user_root is not None and user_root.is_dir():
+        # 5. Last resort: slskd may have sanitised the filename.  An exact byte-size
+        # match under the peer's folder recovers it; this pre-existing fallback remains
+        # peer-scoped because a size-only walk across peers is unsafe.
+        if expected_size is not None and user_root is not None and user_root.is_dir():
 
             def _matches_size(entry: Path) -> bool:
                 try:
-                    return entry.stat().st_size == size
+                    return entry.stat().st_size == expected_size
                 except OSError:
                     return False
 
@@ -303,28 +351,129 @@ class SlskdRepository:
             if hit is not None:
                 return hit
 
-        # 6. Whole-mount fallback for a file nested deeper than the cheap steps look,
-        # under a folder that isn't the peer's username (e.g. {downloads}/{artist}/
-        # {album}/{file}). Exact basename match across the mount, validated by byte size
-        # when known: a name+size match is effectively the same file, so this can't grab
-        # a different same-named track - an unscoped size-ONLY walk would cross peers
-        # (step 5 stays peer-scoped on purpose). Reached only after every step missed.
+        # 6. Whole-mount exact-name fallback for a file nested deeper than the cheap
+        # steps look. Validate byte size when known.
         def _name_size_match(entry: Path) -> bool:
-            if entry.name != basename:
+            if not _name_matches(entry):
                 return False
-            if not size:
+            if expected_size is None:
                 return True
             try:
-                return entry.stat().st_size == size
+                return entry.stat().st_size == expected_size
             except OSError:
                 return False
 
         hit = self._walk_find(mount, mount, _name_size_match)
         if hit is not None:
             return hit
+
+        # 7. NFC alias fallback. Every normalized phase shares this one budget. The
+        # peer scope is attempted before the whole mount so an alias cannot cross peers
+        # merely because an unrelated same-sized file happens to be encountered first.
+        budget = _EntryBudget(_MAX_WALK_ENTRIES)
+
+        def _find_normalised_in_directory(
+            directory: Path,
+        ) -> tuple[Path | None, bool]:
+            """Return one immediate normalized alias, or ambiguity/exhaustion."""
+            root = _within_mount(directory)
+            if root is None or not root.is_dir():
+                return None, False
+            matches: set[Path] = set()
+            try:
+                for entry in root.iterdir():
+                    if not budget.take():
+                        return None, True
+                    resolved = _within_mount(entry)
+                    if resolved is None or not resolved.is_file():
+                        continue
+                    if _normalised_filename(entry.name) != normalised_basename:
+                        continue
+                    if expected_size is not None:
+                        try:
+                            if resolved.stat().st_size != expected_size:
+                                continue
+                        except OSError:
+                            continue
+                    matches.add(resolved)
+                    if len(matches) > 1:
+                        return None, True
+            except (OSError, RuntimeError):
+                return None, False
+            return (next(iter(matches)) if matches else None), False
+
+        def _walk_find_normalised(root: Path) -> tuple[Path | None, bool]:
+            """Find one normalized alias under root, confined and loop-safe."""
+            resolved_root = _within_mount(root)
+            if resolved_root is None or not resolved_root.is_dir():
+                return None, False
+            stack = [resolved_root]
+            seen_dirs: set[Path] = set()
+            matches: set[Path] = set()
+            while stack:
+                current = stack.pop()
+                current = _within_mount(current)
+                if current is None or not current.is_dir() or current in seen_dirs:
+                    continue
+                seen_dirs.add(current)
+                try:
+                    entries = current.iterdir()
+                    for entry in entries:
+                        if not budget.take():
+                            return None, True
+                        resolved = _within_mount(entry)
+                        if resolved is None:
+                            continue
+                        if resolved.is_dir():
+                            stack.append(resolved)
+                            continue
+                        if not resolved.is_file():
+                            continue
+                        if _normalised_filename(entry.name) != normalised_basename:
+                            continue
+                        if expected_size is not None:
+                            try:
+                                if resolved.stat().st_size != expected_size:
+                                    continue
+                            except OSError:
+                                continue
+                        matches.add(resolved)
+                        if len(matches) > 1:
+                            return None, True
+                except (OSError, RuntimeError):
+                    continue
+            return (next(iter(matches)) if matches else None), False
+
+        # Keep direct-directory aliases ahead of recursive fallback; these are the
+        # layouts slskd most commonly produces.
+        if len(parts) >= 2:
+            hit, blocked = _find_normalised_in_directory(mount / parts[-2])
+            if hit is not None:
+                return hit
+            if blocked:
+                return None
+        hit, blocked = _find_normalised_in_directory(mount)
+        if hit is not None:
+            return hit
+        if blocked:
+            return None
+
+        if user_root is not None and user_root.is_dir():
+            hit, blocked = _walk_find_normalised(user_root)
+            if hit is not None:
+                return hit
+            if blocked:
+                return None
+
+        hit, blocked = _walk_find_normalised(mount)
+        if hit is not None:
+            return hit
+        if blocked:
+            return None
+
         try:
             top_level = sum(1 for _ in mount.iterdir())
-        except OSError:
+        except (OSError, RuntimeError):
             top_level = -1
         logger.warning(
             "slskd file not locatable on the downloads mount: %s (%s bytes); "
@@ -338,28 +487,45 @@ class SlskdRepository:
 
     @staticmethod
     def _walk_find(root: Path, mount: Path, predicate) -> Path | None:
-        """First file under ``root`` (bounded DFS, exact-name compare so glob
-        metacharacters in filenames are harmless) for which ``predicate`` is true,
-        confined to ``mount``. The entry cap is a backstop against a pathological
-        tree or a symlink loop."""
-        max_entries = 10000
+        """Find the first matching regular file under ``root``.
+
+        Directory traversal is bounded, confined to the resolved mount, and keyed by
+        resolved directory paths so in-mount symlink loops cannot revisit forever.
+        """
         try:
-            stack = [root]
-            seen = 0
+            mount = mount.resolve()
+            root = root.resolve()
+        except (OSError, RuntimeError):
+            return None
+        if not root.is_relative_to(mount) or not root.is_dir():
+            return None
+        stack = [root]
+        seen_dirs: set[Path] = set()
+        seen = 0
+        try:
             while stack:
-                for entry in stack.pop().iterdir():
+                current = stack.pop().resolve()
+                if (
+                    not current.is_relative_to(mount)
+                    or not current.is_dir()
+                    or current in seen_dirs
+                ):
+                    continue
+                seen_dirs.add(current)
+                for entry in current.iterdir():
                     seen += 1
-                    if seen > max_entries:
+                    if seen > _MAX_WALK_ENTRIES:
                         return None
-                    if entry.is_dir():
-                        stack.append(entry)
-                        continue
-                    if not entry.is_file() or not predicate(entry):
-                        continue
                     resolved = entry.resolve()
-                    if resolved.is_relative_to(mount):
-                        return resolved
-        except OSError:
+                    if not resolved.is_relative_to(mount):
+                        continue
+                    if resolved.is_dir():
+                        stack.append(resolved)
+                        continue
+                    if not resolved.is_file() or not predicate(entry):
+                        continue
+                    return resolved
+        except (OSError, RuntimeError):
             return None
         return None
 
@@ -424,18 +590,33 @@ class SlskdRepository:
         hit). An unreadable or wrong-path mount returns False - that is the signal.
         Sync filesystem I/O; the caller offloads it off the event loop."""
         try:
-            stack = [self._downloads_mount]
+            mount = self._downloads_mount.resolve()
+            if not mount.is_dir():
+                return False
+            stack = [mount]
+            seen_dirs: set[Path] = set()
             seen = 0
             while stack:
-                for entry in stack.pop().iterdir():
+                current = stack.pop().resolve()
+                if (
+                    not current.is_relative_to(mount)
+                    or not current.is_dir()
+                    or current in seen_dirs
+                ):
+                    continue
+                seen_dirs.add(current)
+                for entry in current.iterdir():
                     seen += 1
                     if seen > 5000:
                         return True  # clearly not empty
-                    if entry.is_file():
+                    resolved = entry.resolve()
+                    if not resolved.is_relative_to(mount):
+                        continue
+                    if resolved.is_file():
                         return True
-                    if entry.is_dir():
-                        stack.append(entry)
-        except OSError:
+                    if resolved.is_dir():
+                        stack.append(resolved)
+        except (OSError, RuntimeError):
             return False
         return False
 
@@ -646,6 +827,45 @@ class SlskdRepository:
         return _NO_TIMESTAMP
 
     @staticmethod
+    def _match_transfers(
+        handle: TaskHandle,
+        transfers: list[SlskdTransfer],
+    ) -> list[SlskdTransfer]:
+        """Match transfer records to handle filenames without merging spellings.
+
+        Each handle filename claims all records with its exact transfer path key
+        (path separators normalised, Unicode unchanged). If no exact spelling is
+        present, it may claim the NFC-equivalent records only when those records
+        have one distinct exact spelling. A transfer record can be assigned only
+        once when multiple handle filenames overlap.
+        """
+        exact: dict[str, list[int]] = {}
+        nfc: dict[str, dict[str, list[int]]] = {}
+        for index, transfer in enumerate(transfers):
+            exact_key = _exact_transfer_path(transfer.filename)
+            exact.setdefault(exact_key, []).append(index)
+            nfc_key = _normalised_path(transfer.filename)
+            nfc.setdefault(nfc_key, {}).setdefault(exact_key, []).append(index)
+
+        assigned: set[int] = set()
+        for filename in handle.filenames:
+            exact_key = _exact_transfer_path(filename)
+            exact_matches = exact.get(exact_key)
+            if exact_matches is not None:
+                assigned.update(exact_matches)
+
+        for filename in handle.filenames:
+            exact_key = _exact_transfer_path(filename)
+            if exact_key in exact:
+                continue
+            spellings = nfc.get(_normalised_path(filename), {})
+            if len(spellings) == 1:
+                assigned.update(next(iter(spellings.values())))
+
+        return [transfer for index, transfer in enumerate(transfers) if index in assigned]
+
+
+    @staticmethod
     def _latest_transfer_per_file(
         transfers: list[SlskdTransfer],
     ) -> list[SlskdTransfer]:
@@ -654,13 +874,12 @@ class SlskdRepository:
         retried files and let a stale Succeeded row shadow a newer TimedOut/
         Errored one (and vice versa). Highest recency key wins; exact ties -
         including two untimestamped/garbage-stamped records - fall through to
-        list order, where the later record wins. Filenames are keyed with path
-        separators normalised like every comparison in this module; winners keep
-        their original input order.
+        list order, where the later record wins. Filenames use exact transfer
+        path keys; winners keep their original input order.
         """
         best: dict[str, tuple[datetime, int, SlskdTransfer]] = {}
         for index, transfer in enumerate(transfers):
-            key = transfer.filename.replace("\\", "/")
+            key = _exact_transfer_path(transfer.filename)
             recency = SlskdRepository._transfer_recency(transfer)
             incumbent = best.get(key)
             if incumbent is None or recency >= incumbent[0]:

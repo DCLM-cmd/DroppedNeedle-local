@@ -4,8 +4,8 @@ user_id -> auth_users ON DELETE CASCADE foreign key (AUD-6)."""
 
 import sqlite3
 import threading
+import unicodedata
 from pathlib import Path
-
 import pytest
 
 from infrastructure.persistence.download_store import DownloadStore
@@ -322,6 +322,43 @@ async def test_quarantine_set_roundtrip(store):
     quarantine = await store.load_quarantine_set()
     assert ("soulseek", soulseek_identity("peerX", "bad.flac")) in quarantine
     assert isinstance(quarantine, set)
+
+@pytest.mark.asyncio
+async def test_quarantine_soulseek_identity_canonicalizes_writer_and_reader(store):
+    from models.download_identity import soulseek_identity
+
+    username = unicodedata.normalize("NFD", "péer")
+    filename = unicodedata.normalize("NFD", "Album\\01 - Héroes.flac")
+    raw_identity = f"{username}\x1f{filename}"
+    await store.record_quarantine(
+        source="soulseek",
+        identity=raw_identity,
+        reason="verify_failed",
+        release_group_mbid="rg-nfc",
+    )
+
+    canonical = soulseek_identity("péer", "Album/01 - Héroes.flac")
+    assert ("soulseek", canonical) in await store.load_quarantine_set()
+    row = (await store.list_quarantine())[0]
+    assert row["identity"] == canonical
+    assert row["filename"] == "Album/01 - Héroes.flac"
+
+
+@pytest.mark.asyncio
+async def test_quarantine_load_canonicalizes_legacy_encoded_identity(store):
+    from models.download_identity import soulseek_identity
+
+    raw_identity = "peer\x1fAlbum\\01 - He\u0301roes.flac"
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "INSERT INTO download_quarantine "
+            "(source, identity, reason, quarantined_at) VALUES (?, ?, ?, ?)",
+            ("soulseek", raw_identity, "verify_failed", 4_000_000_000.0),
+        )
+        conn.commit()
+
+    canonical = soulseek_identity("peer", "Album/01 - Héroes.flac")
+    assert ("soulseek", canonical) in await store.load_quarantine_set()
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,12 @@ from models.download import (
     SearchJob,
 )
 from models.download_attempt import DownloadAttempt, DownloadCleanupReconciliation
+from models.download_identity import (
+    SOURCE_SOULSEEK,
+    SOULSEEK_ID_SEPARATOR,
+    canonical_soulseek_identity,
+    soulseek_identity,
+)
 from models.held_import import HeldImport
 from repositories.protocols.download_client import TaskHandle
 
@@ -299,10 +305,6 @@ BEGIN
 END;
 """
 
-# ASCII unit separator joining the two halves of a soulseek identity; mirrors
-# ``models.download_identity.soulseek_identity`` so a legacy (username, filename)
-# quarantine row migrates to the same key the scorer will look up.
-_SOULSEEK_ID_SEP = "\x1f"
 
 # Columns on download_tasks that update_status (and friends) may set directly.
 _TASK_UPDATABLE = frozenset(
@@ -602,15 +604,18 @@ class DownloadStore(PersistenceBase):
     def _migrate_quarantine(self, conn: sqlite3.Connection) -> None:
         """Create the quarantine table, rebuilding the old slskd-shaped schema in
         place (D8). SQLite can't ALTER a UNIQUE/CHECK, so a table that still has the
-        old ``username``/``filename`` columns is rebuilt: rename aside, create the new
-        ``(source, identity, …)`` shape, copy each legacy row encoding its
-        ``(username, filename)`` pair as the soulseek identity (so a previously
-        blocklisted source stays blocklisted), then drop the old table."""
+        old ``username``/``filename`` columns is rebuilt. Legacy pairs are encoded
+        through the canonical identity helper so Unicode and path-separator aliases
+        remain blocklisted after the upgrade."""
         cols = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(download_quarantine)").fetchall()
         }
         if "username" in cols:  # legacy slskd-shaped schema -> rebuild
+            legacy_rows = conn.execute(
+                "SELECT username, filename, release_group_mbid, reason "
+                "FROM download_quarantine"
+            ).fetchall()
             conn.execute(
                 "ALTER TABLE download_quarantine RENAME TO download_quarantine_legacy"
             )
@@ -625,14 +630,20 @@ class DownloadStore(PersistenceBase):
             # now self-heals anything older than ``_QUARANTINE_TTL_SECONDS``. Inheriting the old
             # timestamp would silently expire a still-valid blocklist on upgrade (defeating this
             # migration's purpose); a fresh stamp gives each entry one TTL window post-upgrade.
-            conn.execute(
-                """INSERT OR IGNORE INTO download_quarantine
-                   (source, identity, release_group_mbid, reason, quarantined_at)
-                   SELECT 'soulseek', username || ? || filename,
-                          release_group_mbid, reason, ?
-                   FROM download_quarantine_legacy""",
-                (_SOULSEEK_ID_SEP, time.time()),
-            )
+            now = time.time()
+            for row in legacy_rows:
+                conn.execute(
+                    """INSERT OR IGNORE INTO download_quarantine
+                       (source, identity, release_group_mbid, reason, quarantined_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        SOURCE_SOULSEEK,
+                        soulseek_identity(row["username"], row["filename"]),
+                        row["release_group_mbid"],
+                        row["reason"],
+                        now,
+                    ),
+                )
             conn.execute("DROP TABLE download_quarantine_legacy")
         else:
             conn.executescript(_QUARANTINE_DDL)
@@ -1743,10 +1754,10 @@ class DownloadStore(PersistenceBase):
         reason: str,
         release_group_mbid: str | None = None,
     ) -> None:
-        """Blocklist a release by its source identity (D8). ``identity`` encoding is
-        source-specific (``models.download_identity``): soulseek = username+filename,
-        usenet = title+size."""
+        """Blocklist a release by its source identity (D8)."""
 
+        if source == SOURCE_SOULSEEK:
+            identity = canonical_soulseek_identity(identity)
         now = time.time()
 
         def operation(conn: sqlite3.Connection) -> None:
@@ -1762,16 +1773,14 @@ class DownloadStore(PersistenceBase):
                    VALUES (?, ?, ?, ?, ?)""",
                 (source, identity, release_group_mbid, reason, now),
             )
-
         await self._write(operation)
 
     async def load_quarantine_set(self) -> set[tuple[str, str]]:
         """Return ``{(source, identity), ...}`` for fast O(1) scorer lookup.
 
-        Keyed on the global ``(source, identity)`` (M9): a release that failed is excluded
-        from future scoring for any album - but only for ``_QUARANTINE_TTL_SECONDS``, so a
-        wrongful blocklist self-heals. Expired rows are filtered here and pruned on the next
-        ``record_quarantine`` write (keeping this a pure read)."""
+        Soulseek identities are canonicalized while loading as well as when writing, so
+        rows created by older versions (or direct legacy inserts) cannot evade a match.
+        """
         cutoff = time.time() - _QUARANTINE_TTL_SECONDS
 
         def operation(conn: sqlite3.Connection) -> set[tuple[str, str]]:
@@ -1779,7 +1788,15 @@ class DownloadStore(PersistenceBase):
                 "SELECT source, identity FROM download_quarantine WHERE quarantined_at >= ?",
                 (cutoff,),
             ).fetchall()
-            return {(row["source"], row["identity"]) for row in rows}
+            return {
+                (
+                    row["source"],
+                    canonical_soulseek_identity(row["identity"])
+                    if row["source"] == SOURCE_SOULSEEK
+                    else row["identity"],
+                )
+                for row in rows
+            }
 
         return await self._read(operation)
 
@@ -2689,14 +2706,13 @@ _SOURCE_CLIENT_TYPE = {"soulseek": "slskd", "usenet": "sabnzbd"}
 def _quarantine_row_to_admin(row: dict[str, Any]) -> dict[str, Any]:
     """Project a ``(source, identity, …)`` quarantine row onto the legacy admin API
     shape (``client_id``/``username``/``filename``) so the existing admin list +
-    frontend keep working after the table rebuild (D8). A soulseek identity splits
-    back into ``(username, filename)``; a usenet identity (title+size) has no
-    username, so it surfaces under ``filename`` with an empty ``username`` until the
-    quarantine UI gets a source-aware pass."""
-    source = row.get("source", "soulseek")
+    frontend keep working after the table rebuild (D8)."""
+    source = row.get("source", SOURCE_SOULSEEK)
     identity = row.get("identity", "")
-    username, sep, filename = identity.partition(_SOULSEEK_ID_SEP)
-    if source == "soulseek" and sep:
+    if source == SOURCE_SOULSEEK:
+        identity = canonical_soulseek_identity(identity)
+    username, sep, filename = identity.partition(SOULSEEK_ID_SEPARATOR)
+    if source == SOURCE_SOULSEEK and sep:
         username, filename = username, filename
     else:
         username, filename = "", identity

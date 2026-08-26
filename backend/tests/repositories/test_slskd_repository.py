@@ -4,8 +4,9 @@ and (username, filenames) status/cancel correlation."""
 
 import asyncio
 import threading
+import unicodedata
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import httpx
 import pytest
@@ -347,6 +348,83 @@ async def test_get_status_correlates_by_filename(mock_repo):
     assert status.files_total == 1
     assert status.files_completed == 1
     assert status.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_status_keeps_nfc_equivalent_requested_files_separate():
+    client = AsyncMock()
+    base = "dir/café.flac"
+    nfc = unicodedata.normalize("NFC", base)
+    nfd = unicodedata.normalize("NFD", base)
+    client.get_downloads.return_value = [
+        _attempt("nfc", nfc, "Completed, Succeeded"),
+        _attempt("nfd", nfd, "Completed, Succeeded"),
+    ]
+    repo = SlskdRepository(
+        client=client,
+        url="u",
+        api_key="k",
+        downloads_mount=Path("/dl"),
+    )
+
+    status = await repo.get_status(_h("alice", [nfc, nfd]))
+
+    assert status.status == "completed"
+    assert status.files_total == 2
+    assert status.files_completed == 2
+    assert status.files_failed == 0
+    assert status.matched_transfers == 2
+
+
+@pytest.mark.asyncio
+async def test_status_and_abort_prefer_exact_unicode_spelling():
+    client = AsyncMock()
+    base = "dir/café.flac"
+    nfc = unicodedata.normalize("NFC", base)
+    nfd = unicodedata.normalize("NFD", base)
+    client.get_downloads.return_value = [
+        _attempt("nfd", nfd, "Completed, Errored"),
+        _attempt("nfc", nfc, "Completed, Succeeded"),
+    ]
+    client.cancel_transfer.return_value = True
+    repo = SlskdRepository(
+        client=client,
+        url="u",
+        api_key="k",
+        downloads_mount=Path("/dl"),
+    )
+    handle = _h("alice", [nfc])
+
+    status = await repo.get_status(handle)
+    assert status.status == "completed"
+    assert status.files_completed == 1
+    assert status.matched_transfers == 1
+
+    assert await repo.abort(handle) is True
+    assert client.cancel_transfer.await_args_list == [call("alice", "nfc")]
+
+
+@pytest.mark.asyncio
+async def test_status_falls_back_to_lone_alternate_unicode_spelling():
+    client = AsyncMock()
+    base = "dir/café.flac"
+    nfc = unicodedata.normalize("NFC", base)
+    nfd = unicodedata.normalize("NFD", base)
+    client.get_downloads.return_value = [
+        _attempt("nfd", nfd, "Completed, Succeeded"),
+    ]
+    repo = SlskdRepository(
+        client=client,
+        url="u",
+        api_key="k",
+        downloads_mount=Path("/dl"),
+    )
+
+    status = await repo.get_status(_h("alice", [nfc]))
+
+    assert status.status == "completed"
+    assert status.files_completed == 1
+    assert status.matched_transfers == 1
 
 
 def test_status_aggregates_live_queue_position_range():
@@ -697,6 +775,118 @@ async def test_get_file_path_deep_nested_non_username_folder(tmp_path):
         _h("peer1"), "@@p\\Music\\Abbey Road (1969)\\01 - Come Together.flac", size=10
     )
     assert path == f.resolve()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_form", "disk_form"),
+    [("NFC", "NFD"), ("NFD", "NFC")],
+)
+async def test_get_file_path_normalised_nested_alias_returns_real_path(
+    tmp_path, remote_form, disk_form
+):
+    visible_name = "05 - Héroes Del Sábado.flac"
+    remote_name = unicodedata.normalize(remote_form, visible_name)
+    disk_name = unicodedata.normalize(disk_form, visible_name)
+    folder = tmp_path / "Artist" / "Album"
+    folder.mkdir(parents=True)
+    file_path = folder / disk_name
+    file_path.write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), f"@@peer\\Music\\Album\\{remote_name}", size=10
+    )
+
+    assert path == file_path.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_ambiguity_fails_closed(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    remote_name = unicodedata.normalize("NFC", visible_name)
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    for folder_name in ("Artist A", "Artist B"):
+        folder = tmp_path / folder_name
+        folder.mkdir()
+        (folder / disk_name).write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(_h("peer1"), f"Music/{remote_name}", size=10) is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_prefers_peer_scope(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    peer_file = tmp_path / "peer1" / "Album" / disk_name
+    peer_file.parent.mkdir(parents=True)
+    peer_file.write_bytes(b"abcdefghij")
+    other_file = tmp_path / "Other Artist" / disk_name
+    other_file.parent.mkdir()
+    other_file.write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), f"Music/Album/{unicodedata.normalize('NFC', visible_name)}", size=10
+    )
+
+    assert path == peer_file.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_skips_outside_symlink(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / disk_name).write_bytes(b"abcdefghij")
+    (tmp_path / "peer1").mkdir()
+    (tmp_path / "peer1" / "escaped").symlink_to(outside, target_is_directory=True)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer1"),
+            f"Music/Album/{unicodedata.normalize('NFC', visible_name)}",
+            size=10,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_fallback_shares_entry_bound(
+    tmp_path, monkeypatch
+):
+    import repositories.slskd.slskd_repository as slskd_repository
+
+    monkeypatch.setattr(slskd_repository, "_MAX_WALK_ENTRIES", 1)
+    folder = tmp_path / "peer1"
+    folder.mkdir()
+    (folder / "noise.txt").write_bytes(b"x")
+    alias = unicodedata.normalize("NFD", "01 - Héroes.flac")
+    (folder / alias).write_bytes(b"abcdefghij")
+
+    original_iterdir = Path.iterdir
+
+    def _iterdir_in_test_order(path):
+        entries = list(original_iterdir(path))
+        if path == folder:
+            entries.sort(key=lambda entry: entry.name != "noise.txt")
+        return iter(entries)
+
+    monkeypatch.setattr(Path, "iterdir", _iterdir_in_test_order)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer1"),
+            "peer1/01 - Héroes.flac",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

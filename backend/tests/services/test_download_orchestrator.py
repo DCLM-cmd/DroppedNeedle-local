@@ -48,6 +48,7 @@ from services.native.download_orchestrator import (
     _OUT_PREFERRED_QUALITY,
     _OUT_QUEUED,
     _OUT_STALLED,
+    _TAG_MISMATCH_MSG,
     DownloadOrchestrator,
     _Cancelled,
 )
@@ -1070,6 +1071,47 @@ async def test_failover_skips_dead_peer_and_completes_via_next_candidate(
     assert final.status == "completed"
     assert final.source_username == "goodpeer"  # advanced past the dead peer
     assert len(lib.rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_tag_mismatch_failover_uses_fixed_message_without_source_details(
+    tmp_path: Path,
+):
+    """A located file whose tags reject the request is a content failure. Exhausting
+    multiple peers must retain that outcome without echoing peer/path input."""
+    client = _FailoverClient(
+        {"attacker-peer": "complete", "second-attacker-peer": "complete"}
+    )
+    candidates = [
+        _candidate(0.9, username="attacker-peer"),
+        _candidate(0.85, username="second-attacker-peer"),
+    ]
+    store, orch, _fp, _lib = _build(
+        tmp_path,
+        client=client,
+        scorer_result=candidates,
+        fp_result=ProcessResult(
+            succeeded=[],
+            failed=[
+                FileFailure(
+                    filename="attacker/path/secret.flac", reason="tag_mismatch"
+                )
+            ],
+        ),
+        imported_rows=[],
+        max_failover=3,
+    )
+    task = await _new_task(store)
+
+    await orch.process_task(task.id)
+
+    final = await store.get_task(task.id)
+    assert final.status == "failed"
+    assert final.error_message == _TAG_MISMATCH_MSG
+    assert "attacker" not in final.error_message
+    assert "secret.flac" not in final.error_message
+    assert "downloads folder" not in final.error_message
+    assert "No working source" not in final.error_message
 
 
 @pytest.mark.asyncio
@@ -2822,6 +2864,41 @@ async def test_reimport_task_mount_fault_preserves_source_cleanup(tmp_path: Path
     attempts = await store.list_download_attempts(task.id)
     assert attempts[-1].state == "preserved"
     assert attempts[-1].disposition == "preserve"
+
+
+@pytest.mark.asyncio
+async def test_reimport_tag_mismatch_uses_fixed_message_and_persists_exclusion(
+    tmp_path: Path,
+):
+    candidate = _candidate(0.9, username="mismatched-peer")
+    store, orch, _fp, _lib = _build(
+        tmp_path,
+        fp_result=ProcessResult(
+            succeeded=[],
+            failed=[
+                FileFailure(
+                    filename="mismatched-peer/01.flac", reason="tag_mismatch"
+                )
+            ],
+        ),
+        imported_rows=[],
+    )
+    task = await _new_task(store, status="failed", track_count=1)
+    await _link_candidate(store, task.id, candidate)
+
+    result = await orch.reimport_task(task.id)
+
+    assert result.status == "failed"
+    assert result.error_message == _TAG_MISMATCH_MSG
+    identity = soulseek_identity("mismatched-peer", "mismatched-peer/01.flac")
+    assert ("soulseek", identity) in await store.load_quarantine_set()
+    rows = await store.list_quarantine()
+    assert any(
+        row["source"] == "soulseek"
+        and row["identity"] == identity
+        and row["reason"] == "verify_failed"
+        for row in rows
+    )
 
 
 @pytest.mark.asyncio
