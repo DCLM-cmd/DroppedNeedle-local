@@ -447,6 +447,8 @@ export const API = {
 			`/api/v1/library/management/identity-preparations/${encodeURIComponent(jobId)}/apply`,
 		discardIdentityPreparation: (jobId: string) =>
 			`/api/v1/library/management/identity-preparations/${encodeURIComponent(jobId)}/discard`,
+		undoAutomaticEdition: (albumId: string) =>
+			`/api/v1/library/albums/${encodeURIComponent(albumId)}/undo-automatic-edition`,
 		scanDiagnostics: (runId: string) => `/api/v1/library/scan-runs/${runId}/diagnostics`,
 		settings: () => '/api/v1/settings/library',
 		typedSettings: () => '/api/v1/settings/library/roots',

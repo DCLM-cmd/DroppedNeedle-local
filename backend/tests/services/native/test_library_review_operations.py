@@ -137,6 +137,11 @@ class _IdentificationProvider:
             ],
         )
 
+    async def get_album_candidate_editions(
+        self, release_group_mbid, target_track_count, priority, *, max_editions=2
+    ):
+        return []
+
     async def get_exact_release_candidate(self, release_mbid, priority):
         candidate = await self.get_album_candidate("rg-explicit", 1, priority)
         candidate.release_mbid = release_mbid
@@ -3891,6 +3896,11 @@ async def test_leave_unmanaged_works_for_zero_candidate_albums(
         ) -> None:
             return None
 
+        async def get_album_candidate_editions(
+            self, release_group_mbid, target_track_count, priority, *, max_editions=2
+        ):
+            return []
+
     worker = ExplicitReidentificationWorker(
         store,
         AlbumCandidateService(_NoCandidateProvider()),
@@ -6659,6 +6669,7 @@ def _suggestion_evidence(
     release_date: str | None = "2020-01-01",
     album_title: str = "Album 1",
     complete: bool = True,
+    score: float = 0.99,
 ) -> CandidateEvidence:
     return CandidateEvidence(
         release_group_mbid=release_group_mbid,
@@ -6679,6 +6690,7 @@ def _suggestion_evidence(
             )
         ],
         reason_code=reason_code,
+        score=score,
         matcher_version="identification-test",
     )
 
@@ -7663,16 +7675,16 @@ async def test_mixed_precision_dates_rank_more_precise_first(
     """F-EDITION-02: year-only and month-only dates must not outrank a more
     precise date sharing the same known prefix. Chronological ordering holds
     for known months; invalid/empty sorts last without raising."""
-    from services.native.identity_repair_service import _edition_date_key
+    from repositories.edition_policy import edition_date_key
 
     # Unit-level ordering contract (shared with F-EDITION-01 rank tuple).
-    assert _edition_date_key("2024-01-31") < _edition_date_key("2024")
-    assert _edition_date_key("2024-01-31") < _edition_date_key("2024-01")
-    assert _edition_date_key("2024-01") < _edition_date_key("2024-02")
-    assert _edition_date_key("2023-12-31") < _edition_date_key("2024-01")
-    assert _edition_date_key("") > _edition_date_key("2024-02")
-    assert _edition_date_key(None) > _edition_date_key("2024-02")
-    assert _edition_date_key("not-a-date") > _edition_date_key("1999")
+    assert edition_date_key("2024-01-31") < edition_date_key("2024")
+    assert edition_date_key("2024-01-31") < edition_date_key("2024-01")
+    assert edition_date_key("2024-01") < edition_date_key("2024-02")
+    assert edition_date_key("2023-12-31") < edition_date_key("2024-01")
+    assert edition_date_key("") > edition_date_key("2024-02")
+    assert edition_date_key(None) > edition_date_key("2024-02")
+    assert edition_date_key("not-a-date") > edition_date_key("1999")
 
     await _seed_album(store, "1")
     context = await store.get_album_identification_context("album-1")
@@ -7769,9 +7781,7 @@ async def test_invalid_or_empty_dates_sort_last_and_provider_absent_uses_evidenc
     """Provider-absent fallback uses CandidateEvidence.release_date under the
     same policy; an invalid date on a single suggestible candidate still seals
     without raising (nothing to compare against), precision preserved."""
-    from services.native.identity_repair_service import _edition_date_key as _key
-
-    # Unit contract: emptiness/None share the last-sort key; valid beats both.
+    from repositories.edition_policy import edition_date_key as _key
     assert _key("") == _key(None)
     assert _key("1999") < _key("")
     assert _key("2024-02") < _key("")
@@ -7981,3 +7991,654 @@ async def test_deterministic_empty_payload_stays_terminal_first_pass(
         ).fetchone()
     assert row["terminal_code"] == "UNMAPPABLE_PROVIDER_PAYLOAD"
     assert row["reidentification_attempt_count"] == 0
+
+
+# --- D-EDITION-AUTO: automatic exact-edition acceptance (S-1/S-2/S-3). ---
+
+
+def _auto_preparation(
+    store: NativeLibraryStore,
+    provider: object,
+    *,
+    opt_in: bool = True,
+) -> IdentityRepairService:
+    return IdentityRepairService(
+        store,
+        canonical_provider=provider,
+        edition_opt_in=(lambda root_id: opt_in),
+    )
+
+
+async def _run_auto_preparation(
+    store: NativeLibraryStore,
+    provider: object,
+    *,
+    idempotency_key: str,
+    opt_in: bool = True,
+):
+    preparation = _auto_preparation(store, provider, opt_in=opt_in)
+    created = await preparation.create_management_preparation(
+        IdentityPreparationCreateRequest(idempotency_key=idempotency_key),
+        "admin",
+        now=3,
+    )
+    claimed = await store.claim_operation_job(
+        "worker", now=4, lease_seconds=60, kind="repair"
+    )
+    assert claimed is not None
+    ready = await preparation.run_claimed_audit(claimed, "worker", now=5)
+    return preparation, created, ready
+
+
+def _undo_rows(db_path: Path) -> list[sqlite3.Row]:
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(
+            "SELECT * FROM library_automatic_edition_undo"
+        ).fetchall()
+
+
+def _identity_row(db_path: Path, album_id: str) -> sqlite3.Row | None:
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(
+            "SELECT * FROM local_album_external_identities WHERE local_album_id = ?",
+            (album_id,),
+        ).fetchone()
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_off_keeps_single_candidate_suggestion_unchanged(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-auto-off",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            ("evidence-auto-off", _suggestion_evidence(release_mbid="release-one"))
+        ],
+    )
+    provider = _SuggestedEditionProvider()
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key="auto-off", opt_in=False
+    )
+    finding = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_required"
+        )
+    ).items[0]
+    assert finding.finding_code == "exact_release_suggested"
+    assert finding.apply_eligible is True
+    assert provider.calls == []
+    with sqlite3.connect(db_path) as connection:
+        stored = connection.execute(
+            "SELECT suggested_edition_json FROM library_identity_repair_findings "
+            "WHERE id = ?",
+            (finding.id,),
+        ).fetchone()
+    assert stored is not None
+    assert "auto_gate" not in json.loads(stored[0])
+    payload = await preparation.findings(created.id)
+    assert payload.items[0].automatic_undo is None
+    assert _undo_rows(db_path) == []
+    assert _identity_row(db_path, "album-1") is None
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_applies_winning_edition_with_audit_and_undo_snapshot(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    album_revision = int(context["album"]["row_revision"])
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-auto-on",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            (
+                "evidence-auto-on",
+                _suggestion_evidence(release_mbid="release-one", score=0.99),
+            )
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-one": _tie_release(
+                "release-one", status="Official", date="2021-05-01", country="DE"
+            )
+        }
+    )
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key="auto-on", opt_in=True
+    )
+    listing = await preparation.findings(created.id)
+    assert listing.current_counts_by_finding.get("exact_release_auto_accepted") == 1
+    accepted = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_auto_accepted"
+        )
+    ).items[0]
+    assert accepted.finding_code == "exact_release_auto_accepted"
+    assert accepted.reason_code == "EXACT_EDITION_AUTO_ACCEPTED"
+    assert accepted.state == "applied"
+    assert accepted.apply_result == "EDITION_AUTO_ACCEPTED"
+    assert accepted.apply_eligible is False
+    # S-1: automatic identity rows with actor system (NULL user).
+    identity = _identity_row(db_path, "album-1")
+    assert identity is not None
+    assert identity["decision_source"] == "automatic"
+    assert identity["release_mbid"] == "release-one"
+    assert identity["selected_by_user_id"] is None
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        track_identity = connection.execute(
+            "SELECT * FROM local_track_external_identities WHERE local_track_id = ?",
+            ("track-1-1",),
+        ).fetchone()
+        audit = connection.execute(
+            "SELECT * FROM library_catalog_actions "
+            "WHERE action_kind = 'automatic_exact_edition'"
+        ).fetchone()
+    assert track_identity is not None
+    assert track_identity["decision_source"] == "automatic"
+    assert audit is not None
+    assert audit["actor_user_id"] is None
+    assert audit["reason_code"] == "SUPPORTED"
+    after = json.loads(audit["after_json"])
+    assert after["gate_reason"] == "AUTO_ACCEPT"
+    assert after["actor"] == "system"
+    assert after["evidence_id"] == "evidence-auto-on"
+    assert after["ranking_inputs"][0]["release_mbid"] == "release-one"
+    before = json.loads(audit["before_json"])
+    assert before["prior_identity_revision"] is None
+    # S-2 substrate: one live undo snapshot with CAS expectations.
+    rows = _undo_rows(db_path)
+    assert len(rows) == 1
+    snapshot = rows[0]
+    assert snapshot["prior_identity_json"] is None
+    assert snapshot["consumed_at"] is None
+    assert int(snapshot["expected_post_album_revision"]) == album_revision
+    assert int(snapshot["expected_post_identity_revision"]) == 1
+    assert accepted.automatic_undo is not None
+    assert accepted.automatic_undo.expected_album_revision == album_revision
+    assert accepted.automatic_undo.expected_identity_revision == 1
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_prior_manual_identity_snapshot(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store, "2")
+    context = await store.get_album_identification_context("album-2")
+    assert context is not None
+    prior_revision = int(context["album"]["row_revision"])
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id="album-2",
+            release_group_mbid="rg-suggested",
+            # Group-only prior (release MBID still empty) - the exact
+            # F-EDITION-01 scenario where the suggestion path runs.
+            release_mbid=None,
+            decision_source="manual",
+            selected_at=2,
+        ),
+        expected_album_revision=prior_revision,
+    )
+    refreshed = await store.get_album_identification_context("album-2")
+    assert refreshed is not None
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-2",
+        attempt_id="attempt-auto-restore",
+        revisions=album_input_revisions(refreshed["tracks"]),
+        evidence=[
+            (
+                "evidence-auto-restore",
+                _suggestion_evidence(
+                    suffix="2",
+                    release_mbid="release-new", release_group_mbid="rg-suggested"
+                ),
+            )
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-new": _tie_release(
+                "release-new", status="Official", date="2021-05-01", country="US"
+            )
+        }
+    )
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key="auto-restore", opt_in=True
+    )
+    accepted = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_auto_accepted"
+        )
+    ).items[0]
+    assert accepted.automatic_undo is not None
+    result = await store.undo_automatic_edition_acceptance(
+        "album-2",
+        expected_album_revision=accepted.automatic_undo.expected_album_revision,
+        expected_identity_revision=(
+            accepted.automatic_undo.expected_identity_revision
+        ),
+        actor_user_id="admin",
+        now=9,
+    )
+    assert result["outcome"] == "restored"
+    restored = _identity_row(db_path, "album-2")
+    assert restored is not None
+    assert restored["decision_source"] == "manual"
+    assert restored["release_group_mbid"] == "rg-suggested"
+    assert restored["release_mbid"] is None
+    # The restored row advances the identity revision (append-only history).
+    assert int(restored["row_revision"]) == int(
+        accepted.automatic_undo.expected_identity_revision
+    ) + 1
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        consumed = connection.execute(
+            "SELECT consumed_at, consumed_action_id IS NOT NULL AS has_action "
+            "FROM library_automatic_edition_undo WHERE local_album_id = 'album-2'"
+        ).fetchone()
+        undo_audits = connection.execute(
+            "SELECT * FROM library_catalog_actions "
+            "WHERE action_kind = 'undo_automatic_edition'"
+        ).fetchall()
+        reviews = connection.execute(
+            "SELECT state, reason_code FROM library_identification_reviews "
+            "WHERE local_album_id = 'album-2' AND reason_code = "
+            "'AUTOMATIC_EDITION_CLEARED_TO_REVIEW'"
+        ).fetchall()
+    assert consumed is not None and consumed["consumed_at"] == 9
+    assert consumed["has_action"] == 1
+    assert len(undo_audits) == 1
+    assert undo_audits[0]["actor_user_id"] == "admin"
+    assert reviews == []
+
+
+@pytest.mark.asyncio
+async def test_undo_clears_to_review_when_no_prior_existed(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-auto-clear",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            (
+                "evidence-auto-clear",
+                _suggestion_evidence(release_mbid="release-one"),
+            )
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-one": _tie_release(
+                "release-one", status="Official", date="2021-05-01", country="DE"
+            )
+        }
+    )
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key="auto-clear", opt_in=True
+    )
+    accepted = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_auto_accepted"
+        )
+    ).items[0]
+    assert accepted.automatic_undo is not None
+    result = await store.undo_automatic_edition_acceptance(
+        "album-1",
+        expected_album_revision=accepted.automatic_undo.expected_album_revision,
+        expected_identity_revision=(
+            accepted.automatic_undo.expected_identity_revision
+        ),
+        actor_user_id="admin",
+        now=9,
+    )
+    assert result["outcome"] == "cleared_to_review"
+    assert result["review_id"] is not None
+    assert _identity_row(db_path, "album-1") is None
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        review = connection.execute(
+            "SELECT state, reason_code FROM library_identification_reviews "
+            "WHERE id = ?",
+            (result["review_id"],),
+        ).fetchone()
+        audits = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE action_kind = 'undo_automatic_edition'"
+        ).fetchone()[0]
+    assert review is not None
+    assert review["state"] == "needs_review"
+    assert review["reason_code"] == "AUTOMATIC_EDITION_CLEARED_TO_REVIEW"
+    assert audits == 1
+
+
+@pytest.mark.asyncio
+async def test_undo_rejects_stale_identity_revision(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-auto-stale",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            ("evidence-auto-stale", _suggestion_evidence(release_mbid="release-one"))
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-one": _tie_release(
+                "release-one", status="Official", date="2021-05-01", country="DE"
+            )
+        }
+    )
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key="auto-stale", opt_in=True
+    )
+    accepted = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_auto_accepted"
+        )
+    ).items[0]
+    assert accepted.automatic_undo is not None
+    # Someone touches the identity after the auto-accept.
+    current = await store.get_album_identification_context("album-1")
+    assert current is not None
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id="album-1",
+            release_group_mbid="rg-suggested",
+            release_mbid="release-manual-later",
+            decision_source="manual",
+            selected_at=8,
+        ),
+        expected_album_revision=accepted.automatic_undo.expected_album_revision,
+    )
+    with pytest.raises(StaleRevisionError):
+        await store.undo_automatic_edition_acceptance(
+            "album-1",
+            expected_album_revision=(
+                accepted.automatic_undo.expected_album_revision
+            ),
+            expected_identity_revision=(
+                accepted.automatic_undo.expected_identity_revision
+            ),
+            actor_user_id="admin",
+            now=9,
+        )
+
+
+@pytest.mark.parametrize(
+    ("first_score", "second_score", "expected_gate"),
+    [
+        (0.90, None, "BELOW_MIN_SCORE"),
+        (0.99, 0.96, "MARGIN_TOO_NARROW"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_auto_accept_gate_failures_keep_manual_suggestion(
+    store: NativeLibraryStore,
+    db_path: Path,
+    first_score: float,
+    second_score: float | None,
+    expected_gate: str,
+) -> None:
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    evidence = [
+        (
+            "evidence-gate-a",
+            _suggestion_evidence(
+                release_mbid="release-a", score=first_score
+            ),
+        )
+    ]
+    if second_score is not None:
+        evidence.append(
+            (
+                "evidence-gate-b",
+                _suggestion_evidence(
+                    release_mbid="release-b", score=second_score
+                ),
+            )
+        )
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id=f"attempt-gate-{expected_gate}",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=evidence,
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-a": _tie_release(
+                "release-a", status="Official", date="2021-05-01", country="DE"
+            ),
+            "release-b": _tie_release(
+                "release-b", status="Official", date="2022-05-01", country="US"
+            ),
+        }
+    )
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key=f"gate-{expected_gate}", opt_in=True
+    )
+    finding = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_required"
+        )
+    ).items[0]
+    assert finding.finding_code == "exact_release_suggested"
+    assert finding.suggested_edition is not None
+    summary = json.loads(
+        msgspec.json.encode(msgspec.to_builtins(finding.suggested_edition))
+    ) if False else None
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT suggested_edition_json FROM library_identity_repair_findings "
+            "WHERE id = ?",
+            (finding.id,),
+        ).fetchone()
+        identity_count = connection.execute(
+            "SELECT COUNT(*) FROM local_album_external_identities "
+            "WHERE local_album_id = 'album-1'"
+        ).fetchone()[0]
+        undo_count = connection.execute(
+            "SELECT COUNT(*) FROM library_automatic_edition_undo"
+        ).fetchone()[0]
+        auto_audits = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE action_kind = 'automatic_exact_edition'"
+        ).fetchone()[0]
+    assert row is not None
+    stored_summary = json.loads(row[0])
+    assert stored_summary["auto_gate"] == expected_gate
+    assert identity_count == 0
+    assert undo_count == 0
+    assert auto_audits == 0
+    assert provider.calls  # ranking needed the canonical releases
+    assert summary is None
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_key_tie_goes_to_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    # Two stored evidence rows for the SAME release carry identical full sort
+    # keys - indistinguishable under the signed order, so they go to review.
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-gate-tie",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            ("evidence-tie-a", _suggestion_evidence(release_mbid="release-a")),
+            ("evidence-tie-b", _suggestion_evidence(release_mbid="release-a")),
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-a": _tie_release(
+                "release-a", status="Official", date="2021-05-01", country="DE"
+            )
+        }
+    )
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key="gate-tie", opt_in=True
+    )
+    finding = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_required"
+        )
+    ).items[0]
+    assert finding.finding_code == "exact_release_suggested"
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT suggested_edition_json FROM library_identity_repair_findings "
+            "WHERE id = ?",
+            (finding.id,),
+        ).fetchone()
+        undo_count = connection.execute(
+            "SELECT COUNT(*) FROM library_automatic_edition_undo"
+        ).fetchone()[0]
+    assert row is not None
+    assert json.loads(row[0])["auto_gate"] == "TIE"
+    assert undo_count == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_non_qualifying_reason_keeps_manual_suggestion(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-gate-reason",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            (
+                "evidence-reason",
+                _suggestion_evidence(
+                    release_mbid="release-a",
+                    reason_code="ACCEPTED",
+                ),
+            )
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-a": _tie_release(
+                "release-a", status="Official", date="2021-05-01", country="DE"
+            )
+        }
+    )
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key="gate-reason", opt_in=True
+    )
+    finding = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_required"
+        )
+    ).items[0]
+    assert finding.finding_code == "exact_release_suggested"
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT suggested_edition_json FROM library_identity_repair_findings "
+            "WHERE id = ?",
+            (finding.id,),
+        ).fetchone()
+        undo_count = connection.execute(
+            "SELECT COUNT(*) FROM library_automatic_edition_undo"
+        ).fetchone()[0]
+        auto_audits = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE action_kind = 'automatic_exact_edition'"
+        ).fetchone()[0]
+    assert row is not None
+    assert json.loads(row[0])["auto_gate"] == "NON_QUALIFYING_REASON"
+    assert undo_count == 0
+    assert auto_audits == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_rg_filtered_to_empty_stays_exact_release_required(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store, "3")
+    context = await store.get_album_identification_context("album-3")
+    assert context is not None
+    prior_revision = int(context["album"]["row_revision"])
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id="album-3",
+            release_group_mbid="rg-other",
+            release_mbid=None,
+            decision_source="manual",
+            selected_at=2,
+        ),
+        expected_album_revision=prior_revision,
+    )
+    refreshed = await store.get_album_identification_context("album-3")
+    assert refreshed is not None
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-3",
+        attempt_id="attempt-auto-cross-rg",
+        revisions=album_input_revisions(refreshed["tracks"]),
+        evidence=[
+            (
+                "evidence-cross-rg",
+                _suggestion_evidence(
+                    suffix="3",
+                    release_mbid="release-new-3",
+                    release_group_mbid="rg-suggested",
+                ),
+            )
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-new-3": _tie_release(
+                "release-new-3", status="Official", date="2021-05-01", country="DE"
+            )
+        }
+    )
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key="auto-cross-rg", opt_in=True
+    )
+    finding = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_required"
+        )
+    ).items[0]
+    assert finding.finding_code == "exact_release_required"
+    assert finding.reason_code == "EXACT_EDITION_NOT_ACCEPTED"
+    assert _identity_row(db_path, "album-3")["release_mbid"] is None
+    assert _undo_rows(db_path) == []

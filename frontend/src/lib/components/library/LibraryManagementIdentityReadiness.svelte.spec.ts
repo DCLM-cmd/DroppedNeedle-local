@@ -6,6 +6,7 @@ const h = vi.hoisted(() => ({
 	create: vi.fn(),
 	apply: vi.fn(),
 	discard: vi.fn(),
+	undo: vi.fn(),
 	preparations: {
 		data: { pages: [{ items: [] as Array<Record<string, unknown>> }] },
 		isLoading: false,
@@ -74,7 +75,8 @@ vi.mock('$lib/queries/library/LibraryIdentityPreparationQueries.svelte', () => (
 vi.mock('$lib/queries/library/LibraryIdentityPreparationMutations.svelte', () => ({
 	createLibraryIdentityPreparation: () => ({ mutateAsync: h.create, isPending: false }),
 	applyLibraryIdentityPreparation: () => ({ mutateAsync: h.apply, isPending: false }),
-	discardLibraryIdentityPreparation: () => ({ mutateAsync: h.discard, isPending: false })
+	discardLibraryIdentityPreparation: () => ({ mutateAsync: h.discard, isPending: false }),
+	undoLibraryAutomaticEdition: () => ({ mutateAsync: h.undo, isPending: false })
 }));
 vi.mock('$lib/queries/library/LibraryOperationMutations.svelte', () => ({
 	controlLibraryOperation: () => ({ mutateAsync: vi.fn(), isPending: false })
@@ -144,6 +146,7 @@ beforeEach(() => {
 	h.create.mockResolvedValue({});
 	h.apply.mockResolvedValue({});
 	h.discard.mockResolvedValue({});
+	h.undo.mockResolvedValue({});
 	h.preparations = {
 		data: { pages: [{ items: [] }] },
 		isLoading: false,
@@ -385,5 +388,93 @@ describe('LibraryManagementIdentityReadiness', () => {
 		await expect
 			.element(page.getByRole('button', { name: /Accept editions/ }))
 			.not.toBeInTheDocument();
+	});
+
+	it('renders auto-accepted albums distinctly from suggested-pending', async () => {
+		h.preparations = {
+			data: { pages: [{ items: [readyReport()] }] },
+			isLoading: false,
+			isError: false
+		};
+		h.findings.data.pages[0].current_counts_by_finding = {
+			mapping_ready: 0,
+			ready: 0,
+			exact_release_required: 0,
+			exact_release_auto_accepted: 2,
+			needs_review: 0
+		};
+		h.findings.data.pages[0].items[0] = {
+			id: 'finding-auto',
+			local_album_id: 'album-auto',
+			album_title: 'Juturna',
+			album_artist_name: 'Circa Survive',
+			album_year: 2005,
+			cover_available: false,
+			evidence_id: 'evidence-auto',
+			review_id: null,
+			finding_code: 'exact_release_auto_accepted',
+			reason_code: 'EXACT_EDITION_AUTO_ACCEPTED',
+			confidence: 'complete',
+			apply_eligible: false,
+			state: 'applied',
+			apply_result: 'EDITION_AUTO_ACCEPTED',
+			suggested_edition: null,
+			automatic_undo: null,
+			updated_at: 10,
+			row_revision: 3
+		};
+		render(LibraryManagementIdentityReadiness, { roots });
+
+		const tab = page.getByRole('button', { name: /Auto-accepted/ });
+		await expect.element(tab).toHaveTextContent('2');
+		await page.getByRole('button', { name: /Auto-accepted/ }).click();
+		await expect.element(page.getByText('Edition accepted automatically')).toBeVisible();
+		await expect.element(page.getByText('Auto-accepted', { exact: true })).toBeVisible();
+		await expect.element(page.getByRole('button', { name: 'Undo' })).not.toBeInTheDocument();
+	});
+
+	it('shows the undo action on an auto-accepted finding and fires it once', async () => {
+		h.preparations = {
+			data: { pages: [{ items: [readyReport()] }] },
+			isLoading: false,
+			isError: false
+		};
+		h.findings.data.pages[0].items[0] = {
+			id: 'finding-auto',
+			local_album_id: 'album-auto',
+			album_title: 'Juturna',
+			album_artist_name: 'Circa Survive',
+			album_year: 2005,
+			cover_available: false,
+			evidence_id: 'evidence-auto',
+			review_id: null,
+			finding_code: 'exact_release_auto_accepted',
+			reason_code: 'EXACT_EDITION_AUTO_ACCEPTED',
+			confidence: 'complete',
+			apply_eligible: false,
+			state: 'applied',
+			apply_result: 'EDITION_AUTO_ACCEPTED',
+			suggested_edition: null,
+			automatic_undo: {
+				expected_album_revision: 4,
+				expected_identity_revision: 2
+			},
+			updated_at: 10,
+			row_revision: 3
+		};
+		render(LibraryManagementIdentityReadiness, { roots });
+		await page.getByRole('button', { name: /Auto-accepted/ }).click();
+
+		await expect.element(page.getByText('Edition accepted automatically')).toBeVisible();
+		const undo = page.getByRole('button', { name: 'Undo' });
+		await expect.element(undo).toBeVisible();
+		await undo.click();
+
+		expect(h.undo).toHaveBeenCalledTimes(1);
+		expect(h.undo).toHaveBeenCalledWith({
+			albumId: 'album-auto',
+			expectedAlbumRevision: 4,
+			expectedIdentityRevision: 2
+		});
 	});
 });

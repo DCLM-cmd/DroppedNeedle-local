@@ -20,6 +20,7 @@ from api.v1.schemas.library_management import (
     normalize_library_management_settings,
     profile_revision,
     settings_revision,
+    _remove_default_identity_section,
 )
 
 
@@ -169,6 +170,7 @@ def test_default_lyrics_preservation_keeps_pre_field_profile_revision() -> None:
     legacy_payload = msgspec.to_builtins(profile)
     legacy_payload.pop("revision")
     legacy_payload["enrichment"]["lyrics"].pop("preserve_existing")
+    _remove_default_identity_section(legacy_payload)
     legacy_revision = hashlib.sha256(
         json.dumps(
             legacy_payload,
@@ -192,6 +194,7 @@ def test_default_lyrics_preservation_keeps_pre_field_settings_revision() -> None
         profile["enrichment"]["lyrics"].pop("preserve_existing")
         if profile["organization"].get("multi_disc_naming_script_id") is None:
             profile["organization"].pop("multi_disc_naming_script_id")
+        _remove_default_identity_section(profile)
     legacy_revision = hashlib.sha256(
         json.dumps(
             legacy_payload,
@@ -217,6 +220,7 @@ def test_null_multi_disc_field_preserves_standard_only_profile_revision() -> Non
     payload.pop("revision")
     payload["organization"].pop("multi_disc_naming_script_id")
     payload["enrichment"]["lyrics"].pop("preserve_existing")
+    _remove_default_identity_section(payload)
     legacy_revision = hashlib.sha256(
         json.dumps(
             payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True

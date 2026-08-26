@@ -404,6 +404,7 @@ def test_management_identity_preparation_findings_serialize_suggested_edition(
         "date": "2019-03-01",
         "country": "DE",
         "status": "Official",
+        "auto_gate": None,
     }
     assert items[1]["suggested_edition"] is None
 
@@ -510,6 +511,7 @@ def test_target_operation_route_inventory_is_complete() -> None:
         ("POST", "/library/operations/{job_id}/resume"),
         ("POST", "/library/operations/{job_id}/stop"),
         ("POST", "/library/albums/{album_id}/reidentify"),
+        ("POST", "/library/albums/{album_id}/undo-automatic-edition"),
         ("POST", "/library/operations/{job_id}/candidate"),
         ("POST", "/library/albums/{album_id}/split-preview"),
         ("POST", "/library/albums/{album_id}/split"),

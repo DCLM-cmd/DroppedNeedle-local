@@ -1750,6 +1750,18 @@
 							></span
 						></label
 					>
+					<label class="management-master-toggle">
+						<input
+							type="checkbox"
+							class="toggle toggle-sm"
+							bind:checked={draft.identity.automatic_edition_acceptance_enabled}
+						/><span
+							><strong>Automatic exact-edition acceptance</strong><small
+								>During identity checks, accept the best proven MusicBrainz edition automatically
+								(score 0.95+, clear winner). Every acceptance is audited and can be undone.</small
+							></span
+						></label
+					>
 					<details class="management-editor-advanced sm:col-span-2">
 						<summary>
 							<span

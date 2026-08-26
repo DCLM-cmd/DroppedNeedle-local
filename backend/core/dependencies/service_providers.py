@@ -671,6 +671,11 @@ def get_target_identity_repair_service() -> "IdentityRepairService":
         get_musicbrainz_repository(),
         provider_available=get_mb_provider_availability(),
         wal_checkpoint=get_wal_checkpoint_service(),
+        # D-EDITION-AUTO S-3: profile-level opt-in with per-root override.
+        edition_opt_in=(
+            get_library_management_profile_service()
+            .automatic_edition_acceptance_enabled
+        ),
     )
 
 

@@ -12,12 +12,13 @@
 	} from 'lucide-svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import IdentityFindingEditionButton from './IdentityFindingEditionButton.svelte';
-	import { authStore } from '$lib/stores/authStore.svelte';
 	import { controlLibraryOperation } from '$lib/queries/library/LibraryOperationMutations.svelte';
+	import { authStore } from '$lib/stores/authStore.svelte';
 	import {
 		applyLibraryIdentityPreparation,
 		createLibraryIdentityPreparation,
-		discardLibraryIdentityPreparation
+		discardLibraryIdentityPreparation,
+		undoLibraryAutomaticEdition
 	} from '$lib/queries/library/LibraryIdentityPreparationMutations.svelte';
 	import {
 		getLibraryIdentityPreparationEstimateQuery,
@@ -45,7 +46,12 @@
 	let selectedRootIds = $state<string[]>([]);
 	let confirmAction = $state<'apply' | 'discard'>('apply');
 	let activeTab = $state<
-		'ready' | 'mapping_ready' | 'exact_release_required' | 'needs_review' | 'unverifiable'
+		| 'ready'
+		| 'mapping_ready'
+		| 'exact_release_required'
+		| 'exact_release_auto_accepted'
+		| 'needs_review'
+		| 'unverifiable'
 	>('mapping_ready');
 
 	const preparationsQuery = getLibraryIdentityPreparationsQuery(
@@ -66,6 +72,7 @@
 	const createPreparation = createLibraryIdentityPreparation(() => authStore.user?.id);
 	const applyPreparation = applyLibraryIdentityPreparation(() => authStore.user?.id);
 	const discardPreparation = discardLibraryIdentityPreparation(() => authStore.user?.id);
+	const undoEdition = undoLibraryAutomaticEdition(() => authStore.user?.id);
 	const pause = controlLibraryOperation('pause');
 	const resume = controlLibraryOperation('resume');
 	const stop = controlLibraryOperation('stop');
@@ -113,6 +120,7 @@
 		{ id: 'mapping_ready', label: 'Mappings ready' },
 		{ id: 'ready', label: 'Already ready' },
 		{ id: 'exact_release_required', label: 'Choose edition' },
+		{ id: 'exact_release_auto_accepted', label: 'Auto-accepted' },
 		{ id: 'needs_review', label: 'Needs review' },
 		{ id: 'unverifiable', label: 'Try again later' }
 	] as const;
@@ -132,6 +140,15 @@
 		startOpener = null;
 	}
 
+	async function undoAutoAccepted(albumId: string): Promise<void> {
+		const finding = findings.find((item) => item.local_album_id === albumId);
+		if (!finding?.automatic_undo) return;
+		await undoEdition.mutateAsync({
+			albumId,
+			expectedAlbumRevision: finding.automatic_undo.expected_album_revision,
+			expectedIdentityRevision: finding.automatic_undo.expected_identity_revision
+		});
+	}
 	function chooseSelectedRoots(): void {
 		scopeMode = 'selected';
 		if (selectedRootIds.length === 0) {
@@ -202,6 +219,7 @@
 				EXACT_RELEASE_MAPPINGS_PRESENT: 'Exact track map already present',
 				EXACT_EDITION_NOT_ACCEPTED: 'Choose the exact MusicBrainz edition',
 				EXACT_EDITION_SUGGESTED: 'Exact edition suggested',
+				EXACT_EDITION_AUTO_ACCEPTED: 'Edition accepted automatically',
 				SELECTED_RELEASE_UNAVAILABLE: 'Selected edition is unavailable',
 				SELECTED_RELEASE_CONFLICT: 'Selected edition conflicts with the release',
 				CONFLICTING_TRACK_EVIDENCE: 'Track evidence conflicts',
@@ -432,13 +450,33 @@
 										{/if}
 									</div>
 								{/if}
+								{#if finding.suggested_edition?.auto_gate && finding.suggested_edition.auto_gate !== 'AUTO_ACCEPT'}
+									<p class="mt-1 text-xs text-warning">
+										Held for review by the acceptance gate ({finding.suggested_edition.auto_gate
+											.replaceAll('_', ' ')
+											.toLowerCase()})
+									</p>
+								{/if}
 								<p class="mt-1 truncate text-xs text-base-content/45">
 									{findingTitle(finding.reason_code)}
 									<span aria-hidden="true"> · </span>
 									{finding.state === 'stale' ? 'Changed after this report' : finding.confidence}
 								</p>
 							</div>
-							{#if !refreshRequired && activeTab === 'exact_release_required'}
+							{#if !refreshRequired && activeTab === 'exact_release_auto_accepted'}
+								<div class="flex shrink-0 items-center gap-2">
+									<span class="badge badge-success badge-sm shrink-0">Auto-accepted</span>
+									{#if finding.automatic_undo}
+										<button
+											class="btn btn-outline btn-error btn-xs"
+											disabled={undoEdition.isPending}
+											onclick={() => void undoAutoAccepted(finding.local_album_id)}
+										>
+											Undo
+										</button>
+									{/if}
+								</div>
+							{:else if !refreshRequired && activeTab === 'exact_release_required'}
 								<IdentityFindingEditionButton albumId={finding.local_album_id} />
 							{:else if !refreshRequired && activeTab === 'needs_review'}
 								<IdentityFindingEditionButton

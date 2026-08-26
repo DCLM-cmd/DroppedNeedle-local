@@ -9,6 +9,7 @@ from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
 from infrastructure.queue.priority_queue import RequestPriority, get_priority_queue
 from infrastructure.http.deduplication import RequestDeduplicator
 from infrastructure.service_health import report_breaker_health
+from repositories.edition_policy import recall_key
 
 _mb_api_base: str = "https://musicbrainz.org/ws/2"
 
@@ -191,35 +192,28 @@ def select_edition(
     group (F-062): every identification lane must resolve the SAME group to
     the SAME edition MBID.
 
-    Ranking: closest medium track-count to ``target_track_count`` first;
-    Official status before unofficial; earliest release date; stable MBID
-    order last. Editions with zero track-count are skipped CONSISTENTLY -
-    they carry no medium data to match against and previously drifted the
+    Ranking follows the approved NEW-DECISION-02 order
+    (.dev-notes/LibraryAudit/DECISIONS-LIVE.md): evidence score ->
+    Official status -> parsed date with explicit precision -> XW country
+    preference -> release MBID. The evidence-score term is absent here BY
+    CONSTRUCTION: this runs at recall time on release-group metadata,
+    before any candidate release has been fetched and scored, so the
+    shared key (repositories.edition_policy.recall_key) is the signed
+    order minus that term.
+
+    Editions with zero track-count are skipped CONSISTENTLY - they carry
+    no medium data to match against and previously drifted the
     scanner/drop-import lane away from the native pipeline. Returns None
     only when no release carries a usable id or any track data at all.
     """
-    scored: list[tuple[int, int, str, str]] = []
+    scored: list[tuple] = []
     for release in releases:
-        release_id = release.get("id")
-        if not release_id:
-            continue
-        track_count = sum(
-            int(medium.get("track-count") or 0)
-            for medium in release.get("media") or []
-        )
-        if track_count <= 0:
-            continue
-        scored.append(
-            (
-                abs(track_count - target_track_count),
-                0 if release.get("status") == "Official" else 1,
-                release.get("date") or "9999",
-                release_id,
-            )
-        )
+        key = recall_key(release, target_track_count)
+        if key is not None:
+            scored.append(key)
     if not scored:
         return None
-    return min(scored)[3]
+    return min(scored)[4]
 
 
 def dedupe_by_id(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

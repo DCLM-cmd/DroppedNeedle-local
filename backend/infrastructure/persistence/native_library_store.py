@@ -29594,9 +29594,20 @@ class NativeLibraryStore(PersistenceBase):
         finding: RepairFinding,
         attempt: IdentificationAttempt | None = None,
         evidence: list[IdentificationEvidenceRecord] | None = None,
+        auto_accept_edition: bool = False,
         now: float,
-    ) -> None:
-        def operation(connection: sqlite3.Connection) -> None:
+    ) -> str:
+        """Persist one audit finding; optionally auto-apply the suggestion.
+
+        With ``auto_accept_edition`` the just-saved ``exact_release_suggested``
+        finding is applied in this same transaction through
+        ``_apply_suggested_edition_tx`` as actor system with
+        ``decision_source='automatic'`` (D-EDITION-AUTO). The finding row is
+        then flipped to ``exact_release_auto_accepted``; if the apply hit a
+        stale subject instead, the tx already marked it stale. Returns
+        ``"saved"``, ``"auto_applied"`` or ``"auto_stale"``.
+        """
+        def operation(connection: sqlite3.Connection) -> str:
             work = connection.execute(
                 "SELECT * FROM library_operation_work WHERE job_id = ? AND ordinal = ? "
                 "AND state = 'running' AND row_revision = ?",
@@ -29660,10 +29671,94 @@ class NativeLibraryStore(PersistenceBase):
                     now,
                 ),
             )
+            outcome = "saved"
+            result_payload: dict[str, object] = {"finding_id": finding.id}
+            if auto_accept_edition:
+                assert finding.finding_code == "exact_release_suggested"
+                finding_row = connection.execute(
+                    "SELECT * FROM library_identity_repair_findings WHERE id = ?",
+                    (finding.id,),
+                ).fetchone()
+                album = connection.execute(
+                    "SELECT row_revision FROM local_albums WHERE id = ?",
+                    (work["local_album_id"],),
+                ).fetchone()
+                identity = connection.execute(
+                    "SELECT * FROM local_album_external_identities "
+                    "WHERE local_album_id = ?",
+                    (work["local_album_id"],),
+                ).fetchone()
+                evidence_row = (
+                    connection.execute(
+                        "SELECT e.evidence_json, e.attempt_id, e.compacted, "
+                        "a.input_tag_revision, a.input_file_revision, "
+                        "a.input_policy_revision FROM library_identification_evidence e "
+                        "JOIN library_identification_attempts a ON a.id = e.attempt_id "
+                        "WHERE e.id = ?",
+                        (finding.evidence_id,),
+                    ).fetchone()
+                    if finding.evidence_id
+                    else None
+                )
+                track_rows = connection.execute(
+                    "SELECT t.*, ti.recording_mbid, "
+                    "ti.release_mbid AS identity_release_mbid, "
+                    "ti.release_track_mbid, ti.medium_position, "
+                    "ti.release_track_position FROM local_tracks t "
+                    "LEFT JOIN local_track_external_identities ti "
+                    "ON ti.local_track_id = t.id AND ti.provider = 'musicbrainz' "
+                    "WHERE t.local_album_id = ? AND t.availability = 'indexed' "
+                    "ORDER BY t.id",
+                    (work["local_album_id"],),
+                ).fetchall()
+                evidence_candidate = (
+                    msgspec.json.decode(
+                        bytes(evidence_row["evidence_json"]), type=CandidateEvidence
+                    )
+                    if evidence_row is not None
+                    else None
+                )
+                summary_payload = (
+                    json.loads(finding.suggested_edition_json)
+                    if finding.suggested_edition_json
+                    else {}
+                )
+                apply_state, _failure = self._apply_suggested_edition_tx(
+                    connection,
+                    work=work,
+                    finding=finding_row,
+                    album=album,
+                    identity=identity,
+                    evidence_row=evidence_row,
+                    track_rows=track_rows,
+                    evidence=evidence_candidate,
+                    job_id=job_id,
+                    actor_user_id=None,
+                    now=now,
+                    decision_source="automatic",
+                    ranking_inputs=summary_payload.get("auto_ranking"),
+                )
+                if apply_state == "succeeded":
+                    connection.execute(
+                        "UPDATE library_identity_repair_findings SET "
+                        "finding_code = 'exact_release_auto_accepted', "
+                        "reason_code = 'EXACT_EDITION_AUTO_ACCEPTED', "
+                        "confidence = 'complete', apply_eligible = 0, "
+                        "state = 'applied', apply_result = 'EDITION_AUTO_ACCEPTED', "
+                        "updated_at = ?, row_revision = row_revision + 1 WHERE id = ?",
+                        (now, finding.id),
+                    )
+                    outcome = "auto_applied"
+                    result_payload["outcome"] = "EDITION_AUTO_ACCEPTED"
+                else:
+                    # The apply tx already flipped the inserted finding to
+                    # stale; the audit unit itself still completed.
+                    outcome = "auto_stale"
+                    result_payload["outcome"] = "STALE_SUBJECT"
             connection.execute(
                 "UPDATE library_operation_work SET state = 'succeeded', result_json = ?, "
                 "updated_at = ?, row_revision = row_revision + 1 WHERE job_id = ? AND ordinal = ?",
-                (json.dumps({"finding_id": finding.id}), now, job_id, ordinal),
+                (json.dumps(result_payload), now, job_id, ordinal),
             )
             connection.execute(
                 "UPDATE library_operation_jobs SET completed_count = completed_count + 1, "
@@ -29673,8 +29768,239 @@ class NativeLibraryStore(PersistenceBase):
                 (now, job_id, worker_id),
             )
             self._bump_stream(connection, "operation")
+            return outcome
 
-        await self._write_background(operation)
+        return await self._write_background(operation)
+
+    async def get_live_automatic_edition_undo(
+        self, local_album_ids: list[str]
+    ) -> dict[str, tuple[int, int]]:
+        """Map albums to their still-reversible auto-accept CAS revisions."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, tuple[int, int]]:
+            result: dict[str, tuple[int, int]] = {}
+            for local_album_id in local_album_ids:
+                snapshot = connection.execute(
+                    "SELECT expected_post_album_revision, "
+                    "expected_post_identity_revision FROM "
+                    "library_automatic_edition_undo WHERE local_album_id = ? "
+                    "AND consumed_at IS NULL",
+                    (local_album_id,),
+                ).fetchone()
+                if snapshot is None:
+                    continue
+                identity = connection.execute(
+                    "SELECT row_revision FROM local_album_external_identities "
+                    "WHERE local_album_id = ? AND decision_source = 'automatic'",
+                    (local_album_id,),
+                ).fetchone()
+                if (
+                    identity is None
+                    or int(identity["row_revision"])
+                    != int(snapshot["expected_post_identity_revision"])
+                ):
+                    continue
+                album = connection.execute(
+                    "SELECT row_revision FROM local_albums WHERE id = ?",
+                    (local_album_id,),
+                ).fetchone()
+                if album is None or int(album["row_revision"]) != int(
+                    snapshot["expected_post_album_revision"]
+                ):
+                    continue
+                result[local_album_id] = (
+                    int(album["row_revision"]),
+                    int(identity["row_revision"]),
+                )
+            return result
+
+        return await self._read(operation)
+
+    async def undo_automatic_edition_acceptance(
+        self,
+        local_album_id: str,
+        *,
+        expected_album_revision: int,
+        expected_identity_revision: int,
+        actor_user_id: str | None,
+        now: float,
+    ) -> dict[str, Any]:
+        """S-2: one revisioned catalog-identity operation restoring the prior
+        identity snapshot, or clearing the acceptance back to review when no
+        prior existed. Never touches album pins."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            snapshot = connection.execute(
+                "SELECT * FROM library_automatic_edition_undo "
+                "WHERE local_album_id = ? AND consumed_at IS NULL",
+                (local_album_id,),
+            ).fetchone()
+            if snapshot is None:
+                raise ResourceNotFoundError(
+                    "This album has no reversible automatic edition acceptance."
+                )
+            album = connection.execute(
+                "SELECT row_revision FROM local_albums WHERE id = ?",
+                (local_album_id,),
+            ).fetchone()
+            identity = connection.execute(
+                "SELECT * FROM local_album_external_identities WHERE local_album_id = ?",
+                (local_album_id,),
+            ).fetchone()
+            if (
+                album is None
+                or int(album["row_revision"]) != expected_album_revision
+                or identity is None
+                or identity["decision_source"] != "automatic"
+                or int(identity["row_revision"]) != expected_identity_revision
+                or int(snapshot["expected_post_identity_revision"])
+                != int(identity["row_revision"])
+            ):
+                raise StaleRevisionError(
+                    "The album identity changed since the automatic acceptance; "
+                    "undo would restore a stale identity."
+                )
+            current_tracks = connection.execute(
+                "SELECT ti.local_track_id, ti.recording_mbid, ti.release_mbid, "
+                "ti.release_track_mbid, ti.medium_position, "
+                "ti.release_track_position, ti.decision_source "
+                "FROM local_track_external_identities ti JOIN local_tracks t "
+                "ON t.id = ti.local_track_id WHERE t.local_album_id = ? "
+                "AND t.availability = 'indexed' ORDER BY ti.local_track_id",
+                (local_album_id,),
+            ).fetchall()
+            before = {
+                "identity": {
+                    "release_group_mbid": identity["release_group_mbid"],
+                    "release_mbid": identity["release_mbid"],
+                    "decision_source": identity["decision_source"],
+                    "row_revision": int(identity["row_revision"]),
+                },
+                "tracks": [dict(row) for row in current_tracks],
+            }
+            prior_json = snapshot["prior_identity_json"]
+            prior_tracks = json.loads(str(snapshot["prior_track_identities_json"]))
+            review_id = None
+            if prior_json is not None:
+                prior = json.loads(str(prior_json))
+                connection.execute(
+                    "INSERT INTO local_album_external_identities "
+                    "(local_album_id, provider, release_group_mbid, release_mbid, "
+                    "decision_source, matcher_version, attempt_id, "
+                    "selected_by_user_id, selected_at) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(local_album_id, provider) DO UPDATE SET "
+                    "release_group_mbid = excluded.release_group_mbid, "
+                    "release_mbid = excluded.release_mbid, "
+                    "decision_source = excluded.decision_source, "
+                    "matcher_version = excluded.matcher_version, "
+                    "attempt_id = excluded.attempt_id, "
+                    "selected_by_user_id = excluded.selected_by_user_id, "
+                    "selected_at = excluded.selected_at, "
+                    "row_revision = row_revision + 1",
+                    (
+                        local_album_id,
+                        prior["release_group_mbid"],
+                        prior["release_mbid"],
+                        prior["decision_source"],
+                        prior["matcher_version"],
+                        prior["attempt_id"],
+                        prior["selected_by_user_id"],
+                        prior["selected_at"],
+                    ),
+                )
+                outcome = "restored"
+            else:
+                connection.execute(
+                    "DELETE FROM local_album_external_identities "
+                    "WHERE local_album_id = ?",
+                    (local_album_id,),
+                )
+                review_id = str(uuid.uuid4())
+                connection.execute(
+                    "INSERT INTO library_identification_reviews "
+                    "(id, local_album_id, state, reason_code, attempt_id, "
+                    "input_revision, created_at, updated_at) "
+                    "VALUES (?, ?, 'needs_review', "
+                    "'AUTOMATIC_EDITION_CLEARED_TO_REVIEW', ?, ?, ?, ?)",
+                    (
+                        review_id,
+                        local_album_id,
+                        identity["attempt_id"],
+                        f"undo:{snapshot['id']}",
+                        now,
+                        now,
+                    ),
+                )
+                outcome = "cleared_to_review"
+            connection.execute(
+                "DELETE FROM local_track_external_identities WHERE "
+                "local_track_id IN (SELECT id FROM local_tracks "
+                "WHERE local_album_id = ? AND availability = 'indexed')",
+                (local_album_id,),
+            )
+            for track in prior_tracks:
+                connection.execute(
+                    "INSERT INTO local_track_external_identities "
+                    "(local_track_id, provider, recording_mbid, release_mbid, "
+                    "release_track_mbid, medium_position, release_track_position, "
+                    "decision_source, attempt_id, selected_at) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(local_track_id, provider) DO UPDATE SET "
+                    "recording_mbid = excluded.recording_mbid, "
+                    "release_mbid = excluded.release_mbid, "
+                    "release_track_mbid = excluded.release_track_mbid, "
+                    "medium_position = excluded.medium_position, "
+                    "release_track_position = excluded.release_track_position, "
+                    "decision_source = excluded.decision_source, "
+                    "attempt_id = excluded.attempt_id, "
+                    "selected_at = excluded.selected_at, "
+                    "row_revision = row_revision + 1",
+                    (
+                        track["local_track_id"],
+                        track["recording_mbid"],
+                        track["release_mbid"],
+                        track["release_track_mbid"],
+                        track["medium_position"],
+                        track["release_track_position"],
+                        track["decision_source"],
+                        track["attempt_id"],
+                        track["selected_at"],
+                    ),
+                )
+            action_id = str(uuid.uuid4())
+            connection.execute(
+                "UPDATE library_automatic_edition_undo SET consumed_at = ?, "
+                "consumed_action_id = ? WHERE id = ?",
+                (now, action_id, snapshot["id"]),
+            )
+            connection.execute(
+                "INSERT INTO library_catalog_actions "
+                "(id, actor_user_id, action_kind, local_album_id, before_json, "
+                "after_json, reason_code, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    action_id,
+                    actor_user_id,
+                    "undo_automatic_edition",
+                    local_album_id,
+                    json.dumps(before, sort_keys=True),
+                    json.dumps(
+                        {
+                            "outcome": outcome,
+                            "review_id": review_id,
+                            "undo_snapshot_id": snapshot["id"],
+                        },
+                        sort_keys=True,
+                    ),
+                    "AUTOMATIC_EDITION_UNDONE",
+                    now,
+                ),
+            )
+            self._bump_catalog(connection)
+            self._bump_stream(connection, "operation")
+            return {"outcome": outcome, "review_id": review_id}
+
+        return await self._write(operation)
 
     async def mark_repair_ready(
         self, job_id: str, worker_id: str, *, now: float
@@ -30306,8 +30632,19 @@ class NativeLibraryStore(PersistenceBase):
         job_id: str,
         actor_user_id: str,
         now: float,
+        decision_source: str = "manual",
+        ranking_inputs: object | None = None,
     ) -> tuple[str, str | None]:
-        """Seal one accepted suggested edition; mirrors manual candidate accept."""
+        """Seal one accepted suggested edition; mirrors manual candidate accept.
+
+        ``decision_source='automatic'`` (D-EDITION-AUTO) writes
+        ``decision_source='automatic'`` identity rows, a dedicated
+        ``library_catalog_actions`` audit row with source string
+        ``automatic_exact_edition`` carrying reason/ranking inputs/evidence,
+        and an undo snapshot in ``library_automatic_edition_undo`` - all
+        inside this same transaction. The manual default is byte-identical
+        to the pre-D-EDITION-AUTO behavior.
+        """
         mapped = (
             _complete_track_identity_mapping(track_rows, evidence)
             if evidence is not None
@@ -30395,16 +30732,77 @@ class NativeLibraryStore(PersistenceBase):
             if identity is not None
             else {}
         )
+        if decision_source == "automatic":
+            # S-1/S-2: capture the reversible prior-identity snapshot before
+            # any mutation, inside this same transaction.
+            assert album is not None
+            prior_tracks = connection.execute(
+                "SELECT ti.local_track_id, ti.recording_mbid, ti.release_mbid, "
+                "ti.release_track_mbid, ti.medium_position, "
+                "ti.release_track_position, ti.decision_source, ti.attempt_id, "
+                "ti.selected_at FROM local_track_external_identities ti "
+                "JOIN local_tracks t ON t.id = ti.local_track_id "
+                "WHERE t.local_album_id = ? AND t.availability = 'indexed' "
+                "ORDER BY ti.local_track_id",
+                (work["local_album_id"],),
+            ).fetchall()
+            connection.execute(
+                "INSERT INTO library_automatic_edition_undo "
+                "(id, local_album_id, job_id, evidence_id, prior_identity_json, "
+                "prior_track_identities_json, expected_post_album_revision, "
+                "expected_post_identity_revision, reason_code, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(local_album_id) DO UPDATE SET id = excluded.id, "
+                "job_id = excluded.job_id, evidence_id = excluded.evidence_id, "
+                "prior_identity_json = excluded.prior_identity_json, "
+                "prior_track_identities_json = excluded.prior_track_identities_json, "
+                "expected_post_album_revision = excluded.expected_post_album_revision, "
+                "expected_post_identity_revision = "
+                "excluded.expected_post_identity_revision, "
+                "reason_code = excluded.reason_code, created_at = excluded.created_at, "
+                "consumed_at = NULL, consumed_action_id = NULL",
+                (
+                    str(uuid.uuid4()),
+                    work["local_album_id"],
+                    job_id,
+                    finding["evidence_id"],
+                    json.dumps(
+                        {
+                            "release_group_mbid": identity["release_group_mbid"],
+                            "release_mbid": identity["release_mbid"],
+                            "decision_source": identity["decision_source"],
+                            "matcher_version": identity["matcher_version"],
+                            "attempt_id": identity["attempt_id"],
+                            "selected_by_user_id": identity["selected_by_user_id"],
+                            "selected_at": identity["selected_at"],
+                            "row_revision": int(identity["row_revision"]),
+                        },
+                        sort_keys=True,
+                    )
+                    if identity is not None
+                    else None,
+                    json.dumps([dict(row) for row in prior_tracks], sort_keys=True),
+                    int(album["row_revision"]),
+                    (
+                        int(identity["row_revision"]) + 1
+                        if identity is not None
+                        else 1
+                    ),
+                    evidence.reason_code,
+                    now,
+                ),
+            )
         connection.execute(
             "INSERT INTO local_album_external_identities "
             "(local_album_id, provider, release_group_mbid, release_mbid, "
             "decision_source, matcher_version, attempt_id, selected_by_user_id, "
             "selected_at) "
-            "VALUES (?, 'musicbrainz', ?, ?, 'manual', ?, ?, ?, ?) "
+            "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(local_album_id, provider) DO UPDATE SET "
             "release_group_mbid = excluded.release_group_mbid, "
             "release_mbid = excluded.release_mbid, "
-            "decision_source = 'manual', matcher_version = excluded.matcher_version, "
+            "decision_source = excluded.decision_source, "
+            "matcher_version = excluded.matcher_version, "
             "attempt_id = excluded.attempt_id, "
             "selected_by_user_id = excluded.selected_by_user_id, "
             "selected_at = excluded.selected_at, row_revision = row_revision + 1",
@@ -30412,6 +30810,7 @@ class NativeLibraryStore(PersistenceBase):
                 work["local_album_id"],
                 evidence.release_group_mbid,
                 evidence.release_mbid,
+                decision_source,
                 evidence.matcher_version,
                 evidence_row["attempt_id"],
                 actor_user_id,
@@ -30430,7 +30829,7 @@ class NativeLibraryStore(PersistenceBase):
                 "(local_track_id, provider, recording_mbid, release_mbid, "
                 "release_track_mbid, medium_position, release_track_position, "
                 "decision_source, attempt_id, selected_at) "
-                "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, 'manual', ?, ?)",
+                "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item.local_track_id,
                     item.recording_mbid,
@@ -30438,6 +30837,7 @@ class NativeLibraryStore(PersistenceBase):
                     item.release_track_mbid,
                     item.candidate_disc_number,
                     item.candidate_track_position,
+                    decision_source,
                     evidence_row["attempt_id"],
                     now,
                 ),
@@ -30472,23 +30872,64 @@ class NativeLibraryStore(PersistenceBase):
                 for item in mapped
             ],
         }
-        connection.execute(
-            "INSERT INTO library_catalog_actions "
-            "(id, actor_user_id, action_kind, local_album_id, operation_job_id, "
-            "before_json, after_json, reason_code, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                str(uuid.uuid4()),
-                actor_user_id,
-                "accept_suggested_edition",
-                work["local_album_id"],
-                job_id,
-                json.dumps(before, sort_keys=True),
-                json.dumps(after, sort_keys=True),
-                "SUGGESTED_EDITION_ACCEPTED",
-                now,
-            ),
-        )
+        if decision_source == "automatic":
+            # S-1: one dedicated audit row whose source string records the
+            # automatic acceptance with reason, ranking inputs, evidence id,
+            # prior identity revision, and actor=system (NULL user).
+            connection.execute(
+                "INSERT INTO library_catalog_actions "
+                "(id, actor_user_id, action_kind, local_album_id, operation_job_id, "
+                "before_json, after_json, reason_code, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()),
+                    None,
+                    "automatic_exact_edition",
+                    work["local_album_id"],
+                    job_id,
+                    json.dumps(
+                        {
+                            **before,
+                            "prior_identity_revision": (
+                                int(identity["row_revision"])
+                                if identity is not None
+                                else None
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        {
+                            **after,
+                            "evidence_id": finding["evidence_id"],
+                            "gate_reason": "AUTO_ACCEPT",
+                            "ranking_inputs": ranking_inputs,
+                            "actor": "system",
+                        },
+                        sort_keys=True,
+                    ),
+                    evidence.reason_code,
+                    now,
+                ),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO library_catalog_actions "
+                "(id, actor_user_id, action_kind, local_album_id, operation_job_id, "
+                "before_json, after_json, reason_code, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()),
+                    actor_user_id,
+                    "accept_suggested_edition",
+                    work["local_album_id"],
+                    job_id,
+                    json.dumps(before, sort_keys=True),
+                    json.dumps(after, sort_keys=True),
+                    "SUGGESTED_EDITION_ACCEPTED",
+                    now,
+                ),
+            )
         connection.execute(
             "UPDATE library_identity_repair_findings SET state = 'applied', "
             "apply_result = 'EDITION_ACCEPTED', updated_at = ?, "
@@ -30521,11 +30962,22 @@ class NativeLibraryStore(PersistenceBase):
                 params.extend((cursor_updated_at, cursor_updated_at, cursor_id))
             current_filter = ""
             if current_only:
+                # D-EDITION-AUTO: an applied auto-accept stays listed while
+                # its undo snapshot is live, so the readiness UI can offer
+                # the revisioned undo action.
                 current_filter = (
-                    "AND f.state = 'open' "
+                    "AND ("
+                    "(f.state = 'open' "
                     "AND a.row_revision = f.expected_album_revision "
-                    "AND ((f.expected_identity_revision IS NULL AND identity.row_revision IS NULL) "
-                    "OR identity.row_revision = f.expected_identity_revision)"
+                    "AND ((f.expected_identity_revision IS NULL "
+                    "AND identity.row_revision IS NULL) "
+                    "OR identity.row_revision = f.expected_identity_revision))"
+                    " OR (f.finding_code = 'exact_release_auto_accepted' "
+                    "AND f.state = 'applied' "
+                    "AND EXISTS (SELECT 1 FROM library_automatic_edition_undo u "
+                    "WHERE u.local_album_id = f.local_album_id "
+                    "AND u.consumed_at IS NULL))"
+                    ")"
                 )
             rows = connection.execute(
                 "SELECT f.*, a.title AS album_title, "

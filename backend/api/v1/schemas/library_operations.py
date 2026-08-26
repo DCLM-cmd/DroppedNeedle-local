@@ -356,6 +356,9 @@ class SuggestedEditionSummary(AppStruct):
     date: str | None = None
     country: str | None = None
     status: str | None = None
+    # D-EDITION-AUTO: gate outcome for this suggestion ("AUTO_ACCEPT" or a
+    # hold code such as "TIE"); absent on legacy rows.
+    auto_gate: str | None = None
 
 
 class RepairFindingResponse(AppStruct):
@@ -374,6 +377,7 @@ class RepairFindingResponse(AppStruct):
     state: str
     apply_result: str | None = None
     suggested_edition: SuggestedEditionSummary | None = None
+    automatic_undo: AutomaticEditionUndoInfo | None = None
     updated_at: float = 0.0
     row_revision: int = 1
 
@@ -384,3 +388,21 @@ class RepairFindingListResponse(AppStruct):
     has_more: bool = False
     current_counts_by_finding: dict[str, int] = msgspec.field(default_factory=dict)
     refresh_required: bool = False
+
+
+class AutomaticEditionUndoInfo(AppStruct):
+    """CAS revisions an admin must echo to undo one auto-accepted edition."""
+
+    expected_album_revision: int
+    expected_identity_revision: int
+
+
+class AutomaticEditionUndoRequest(AppStruct):
+    expected_album_revision: int
+    expected_identity_revision: int
+
+
+class AutomaticEditionUndoResponse(AppStruct):
+    local_album_id: str
+    outcome: str
+    review_id: str | None = None

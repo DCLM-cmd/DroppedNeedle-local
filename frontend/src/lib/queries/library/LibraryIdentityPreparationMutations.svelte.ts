@@ -9,7 +9,7 @@ import { DiscoverQueryKeyFactory } from '$lib/queries/discover/DiscoverQueryKeyF
 import { HomeQueryKeyFactory } from '$lib/queries/HomeQueryKeyFactory';
 import { createUuid } from '$lib/utils/uuid';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
-import type { OperationResponse } from './LibraryOperationsTypes';
+import type { AutomaticEditionUndoResponse, OperationResponse } from './LibraryOperationsTypes';
 
 async function invalidateIdentityPreparation(
 	userId: string | undefined,
@@ -76,5 +76,28 @@ export function discardLibraryIdentityPreparation(getUserId: () => string | unde
 		},
 		onError: () =>
 			toastStore.show({ message: 'Could not dismiss the identity report', type: 'error' })
+	}));
+}
+
+export function undoLibraryAutomaticEdition(getUserId: () => string | undefined) {
+	return createMutation(() => ({
+		mutationFn: (input: {
+			albumId: string;
+			expectedAlbumRevision: number;
+			expectedIdentityRevision: number;
+		}) =>
+			api.global.post<AutomaticEditionUndoResponse>(
+				API.library.undoAutomaticEdition(input.albumId),
+				{
+					expected_album_revision: input.expectedAlbumRevision,
+					expected_identity_revision: input.expectedIdentityRevision
+				}
+			),
+		onSuccess: async () => {
+			await invalidateIdentityPreparation(getUserId(), true);
+			toastStore.show({ message: 'Automatic edition acceptance undone', type: 'success' });
+		},
+		onError: () =>
+			toastStore.show({ message: 'Could not undo the automatic edition', type: 'error' })
 	}));
 }

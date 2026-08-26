@@ -95,6 +95,7 @@ class FakeProvider:
         self.candidates = candidates or []
         self.calls: list[tuple[str, RequestPriority]] = []
         self.exact_releases: list[tuple[str, RequestPriority]] = []
+        self.edition_calls: list[str] = []
 
     async def search_album_candidate_ids(
         self, artist: str, title: str, limit: int, priority: RequestPriority
@@ -127,6 +128,25 @@ class FakeProvider:
             ),
             None,
         )
+
+    async def get_album_candidate_editions(
+        self,
+        release_group_mbid: str,
+        target_track_count: int,
+        priority: RequestPriority,
+        *,
+        max_editions: int = 2,
+    ) -> list[AlbumCandidate]:
+        self.edition_calls.append(release_group_mbid)
+        top_pick = next(
+            (
+                candidate
+                for candidate in self.candidates
+                if candidate.release_group_mbid == release_group_mbid
+            ),
+            None,
+        )
+        return [] if top_pick is None else [top_pick]
 
     async def get_exact_release_candidate(
         self,
@@ -574,6 +594,175 @@ async def test_candidate_recall_deduplicates_provider_canonical_aliases() -> Non
     assert len(candidates) == 1
     assert candidates[0].release_group_mbid == "canonical-group"
     assert candidates[0].source_kinds == ["album_tags"]
+
+
+def _sibling_edition(group: str) -> AlbumCandidate:
+    return msgspec.structs.replace(
+        _candidate(group=group),
+        release_mbid=f"release-{group}-sibling",
+        tracks=[
+            CandidateTrack(
+                title="Track",
+                position=1,
+                absolute_position=1,
+                duration_seconds=181,
+                recording_mbid="recording-sibling",
+            )
+        ],
+    )
+
+
+class EditionsProvider(FakeProvider):
+    """FakeProvider plus a sibling-edition table for the Phase 2 trial."""
+
+    def __init__(
+        self,
+        candidates: list[AlbumCandidate] | None = None,
+        editions: dict[str, list[AlbumCandidate]] | None = None,
+    ) -> None:
+        super().__init__(candidates)
+        self.editions = editions or {}
+
+    async def get_album_candidate_editions(
+        self,
+        release_group_mbid: str,
+        target_track_count: int,
+        priority: RequestPriority,
+        *,
+        max_editions: int = 2,
+    ) -> list[AlbumCandidate]:
+        self.edition_calls.append(release_group_mbid)
+        return list(self.editions.get(release_group_mbid, []))
+
+
+def _single_album_tracks() -> list[GroupingTrack]:
+    return [
+        GroupingTrack(
+            local_track_id="track-1",
+            root_id="root",
+            relative_path="track.flac",
+            title="Track",
+            artist_name="Artist",
+            album_title="Album",
+            album_artist_name="Artist",
+        )
+    ]
+
+
+def _aborting_checkpoint(fail_on: int) -> tuple[Callable[[], bool], dict]:
+    state = {"calls": 0}
+
+    async def checkpoint() -> bool:
+        state["calls"] += 1
+        return state["calls"] != fail_on
+
+    return checkpoint, state
+
+
+@pytest.mark.asyncio
+async def test_candidate_recall_sibling_trial_appends_editions_in_seed_order() -> None:
+    provider = EditionsProvider(
+        [_candidate(group="rg-a"), _candidate(group="rg-b")],
+        {"rg-b": [_candidate(group="rg-b"), _sibling_edition("rg-b")]},
+    )
+    candidates = await AlbumCandidateService(provider).recall(
+        _single_album_tracks(), sibling_release_group_ids=["rg-b"]
+    )
+
+    assert [candidate.release_mbid for candidate in candidates] == [
+        "release-rg-a",
+        "release-rg-b",
+        "release-rg-b-sibling",
+    ]
+    assert [candidate.source_kinds for candidate in candidates] == [
+        ["album_tags"],
+        ["album_tags"],
+        ["album_tags"],
+    ]
+    assert provider.edition_calls == ["rg-b"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_recall_sibling_duplicate_collapses_into_built_candidate() -> (
+    None
+):
+    provider = EditionsProvider(
+        [_candidate(group="rg-b")],
+        {"rg-b": [_candidate(group="rg-b")]},
+    )
+
+    candidates = await AlbumCandidateService(provider).recall(
+        _single_album_tracks(), sibling_release_group_ids=["rg-b"]
+    )
+
+    assert [candidate.release_mbid for candidate in candidates] == ["release-rg-b"]
+    assert candidates[0].source_kinds == ["album_tags", "recording_search"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_recall_sibling_extras_respect_max_candidates() -> None:
+    groups = [f"rg-{index}" for index in range(9)]
+    provider = EditionsProvider(
+        [_candidate(group=group) for group in groups],
+        {group: [_candidate(group=group), _sibling_edition(group)] for group in groups},
+    )
+
+    candidates = await AlbumCandidateService(provider).recall(
+        _single_album_tracks(), sibling_release_group_ids=groups
+    )
+
+    assert len(candidates) == MAX_CANDIDATES
+    assert [candidate.release_mbid for candidate in candidates] == [
+        mbid
+        for group in groups[:5]
+        for mbid in (f"release-{group}", f"release-{group}-sibling")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fail_on", "expected_edition_calls"),
+    [
+        (5, []),  # pause before the extra fetch: no provider call at all
+        (6, ["rg-a"]),  # pause after the top pick: fetch already spent
+    ],
+)
+async def test_candidate_recall_checkpoint_aborts_around_extra_fetch(
+    fail_on: int, expected_edition_calls: list[str]
+) -> None:
+    provider = EditionsProvider(
+        [],
+        {"rg-a": [_candidate(group="rg-a"), _sibling_edition("rg-a")]},
+    )
+    checkpoint, state = _aborting_checkpoint(fail_on)
+
+    candidates = await AlbumCandidateService(provider).recall(
+        _single_album_tracks(),
+        cached_fingerprint_release_groups=["rg-a"],
+        checkpoint=checkpoint,
+        sibling_release_group_ids=["rg-a"],
+    )
+
+    assert candidates == []
+    assert provider.edition_calls == expected_edition_calls
+    assert state["calls"] == fail_on
+
+
+@pytest.mark.asyncio
+async def test_candidate_recall_default_path_never_touches_editions_endpoint() -> None:
+    """Regression pin: without sibling ids recall is byte-for-byte the
+    historical bounded search - the editions endpoint is never called."""
+    provider = EditionsProvider(
+        [_candidate(group="rg-a"), _candidate(group="rg-b")],
+        {"rg-b": [_sibling_edition("rg-b")]},
+    )
+    candidates = await AlbumCandidateService(provider).recall(_single_album_tracks())
+    assert [candidate.release_mbid for candidate in candidates] == [
+        "release-rg-a",
+        "release-rg-b",
+    ]
+    assert provider.edition_calls == []
+    assert [kind for kind, _ in provider.calls] == ["album", "detail", "detail"]
 
 
 @pytest.mark.asyncio
@@ -1516,6 +1705,175 @@ async def test_pause_at_candidate_and_fingerprint_checkpoints_releases_lease_wit
         ).fetchone()
     assert row[0:3] == ("queued", None, 0)
     assert json.loads(row[3])["phase"] == "fingerprinting"
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_identifies_when_true_edition_shares_the_release_group(
+    store: NativeLibraryStore,
+    db_path: Path,
+) -> None:
+    """EditionsEtc Phase 2: recall picks a live-promo edition whose evidence
+    cannot support the album; ONE bounded retry including ranked siblings
+    surfaces the true edition from the same release group, so the album
+    identifies instead of landing in review."""
+    await _seed_album(store)
+
+    class PromoFirstProvider(FakeProvider):
+        def __init__(
+            self, group: str, promo: AlbumCandidate, true_edition: AlbumCandidate
+        ) -> None:
+            super().__init__([promo])
+            self._group = group
+            self._true_edition = true_edition
+
+        async def get_album_candidate_editions(
+            self,
+            release_group_mbid: str,
+            target_track_count: int,
+            priority: RequestPriority,
+            *,
+            max_editions: int = 2,
+        ) -> list[AlbumCandidate]:
+            self.edition_calls.append(release_group_mbid)
+            if release_group_mbid != self._group:
+                return []
+            return [self.candidates[0], self._true_edition]
+
+    promo = msgspec.structs.replace(
+        _candidate(group="rg-real"),
+        secondary_types=["live"],
+    )
+    true_edition = msgspec.structs.replace(
+        _candidate(group="rg-real", recording="recording-official"),
+        release_mbid="release-rg-real-official",
+    )
+    provider = PromoFirstProvider("rg-real", promo, true_edition)
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    # Exactly one extra editions fetch for the one qualifying group.
+    assert provider.edition_calls == ["rg-real"]
+    with sqlite3.connect(db_path) as connection:
+        identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid FROM "
+            "local_album_external_identities WHERE local_album_id = 'album-1'"
+        ).fetchone()
+    assert identity == ("rg-real", "release-rg-real-official")
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_never_fires_for_identified_outcome(
+    store: NativeLibraryStore,
+) -> None:
+    await _seed_album(store)
+    provider = FakeProvider([_candidate()])
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    assert provider.edition_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_never_fires_for_no_candidate_outcome(
+    store: NativeLibraryStore,
+) -> None:
+    await _seed_album(store)
+    provider = FakeProvider([])
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "no_candidate"
+    assert provider.edition_calls == []
+    assert provider.calls == [
+        ("album", RequestPriority.BACKGROUND_SYNC),
+        ("recording", RequestPriority.BACKGROUND_SYNC),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_never_fires_for_contradictory_outcome(
+    store: NativeLibraryStore,
+) -> None:
+    await _seed_album(store, embedded_recording=EMBEDDED_RECORDING)
+    provider = FakeProvider([_candidate()])
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "contradictory"
+    assert provider.edition_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sibling_trial_respects_queue_pause_between_fetches(
+    store: NativeLibraryStore,
+    db_path: Path,
+) -> None:
+    """Pausing while the trial fetch runs parks the job at the
+    candidate_search checkpoint exactly like any other recall."""
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+
+    class PausingPromoProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    msgspec.structs.replace(
+                        _candidate(group="rg-real"), secondary_types=["live"]
+                    )
+                ]
+            )
+
+        async def get_album_candidate_editions(
+            self,
+            release_group_mbid: str,
+            target_track_count: int,
+            priority: RequestPriority,
+            *,
+            max_editions: int = 2,
+        ) -> list[AlbumCandidate]:
+            await queue.pause("admin", now=3)
+            return []
+
+    provider = PausingPromoProvider()
+    job = await _claimed_job(store)
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "paused"
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT state, lease_owner, checkpoint_json "
+            "FROM library_identification_jobs WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert row[0:2] == ("queued", None)
+    assert json.loads(row[2])["phase"] == "candidate_search"
 
 
 @pytest.mark.asyncio

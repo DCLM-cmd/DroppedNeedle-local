@@ -55,6 +55,12 @@ class _ProviderProbe:
         self.calls += 1
         raise AssertionError("An empty candidate search must not load a candidate.")
 
+    async def get_album_candidate_editions(
+        self, release_group_mbid, target_track_count, priority, *, max_editions=2
+    ):
+        self.calls += 1
+        raise AssertionError("An empty candidate search must not load a candidate.")
+
 
 def _percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)

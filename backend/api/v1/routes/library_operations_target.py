@@ -10,6 +10,8 @@ from fastapi.responses import StreamingResponse
 from api.v1.schemas.library_operations import (
     ArtistMergeApplyRequest,
     ArtistMergePreviewRequest,
+    AutomaticEditionUndoRequest,
+    AutomaticEditionUndoResponse,
     BulkReviewApplyRequest,
     BulkReviewPreviewRequest,
     BulkReviewPreviewResponse,
@@ -358,6 +360,19 @@ async def reidentify_album(
         **{key: row[key] for key in OperationResponse.__struct_fields__ if key in row}
     )
 
+
+@router.post(
+    "/albums/{album_id}/undo-automatic-edition",
+    response_model=AutomaticEditionUndoResponse,
+)
+async def undo_automatic_edition(
+    admin: CurrentAdminDep,
+    album_id: str,
+    service: IdentityRepairServiceDep,
+    body: AutomaticEditionUndoRequest = MsgSpecBody(AutomaticEditionUndoRequest),
+) -> AutomaticEditionUndoResponse:
+    """S-2: revisioned catalog-identity undo of one auto-accepted edition."""
+    return await service.undo_automatic_edition(album_id, body, admin.id)
 
 @router.post(
     "/operations/{job_id}/candidate",

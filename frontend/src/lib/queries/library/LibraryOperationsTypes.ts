@@ -460,6 +460,7 @@ export interface SuggestedEditionSummary {
 	date: string | null;
 	country: string | null;
 	status: string | null;
+	auto_gate: string | null;
 }
 
 export interface RepairFindingResponse {
@@ -478,8 +479,20 @@ export interface RepairFindingResponse {
 	state: string;
 	apply_result: string | null;
 	suggested_edition: SuggestedEditionSummary | null;
+	automatic_undo: AutomaticEditionUndoInfo | null;
 	updated_at: number;
 	row_revision: number;
+}
+
+export interface AutomaticEditionUndoInfo {
+	expected_album_revision: number;
+	expected_identity_revision: number;
+}
+
+export interface AutomaticEditionUndoResponse {
+	local_album_id: string;
+	outcome: string;
+	review_id: string | null;
 }
 
 export interface RepairFindingListResponse {

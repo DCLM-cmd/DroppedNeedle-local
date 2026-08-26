@@ -1198,6 +1198,23 @@ CREATE TABLE IF NOT EXISTS library_catalog_actions (
     CHECK(local_artist_id IS NOT NULL OR local_album_id IS NOT NULL OR local_track_id IS NOT NULL)
 );
 
+CREATE TABLE IF NOT EXISTS library_automatic_edition_undo (
+    id TEXT PRIMARY KEY,
+    local_album_id TEXT NOT NULL UNIQUE REFERENCES local_albums(id) ON DELETE CASCADE,
+    job_id TEXT REFERENCES library_operation_jobs(id) ON DELETE SET NULL,
+    evidence_id TEXT,
+    prior_identity_json TEXT,
+    prior_track_identities_json TEXT NOT NULL DEFAULT '[]',
+    expected_post_album_revision INTEGER NOT NULL
+        CHECK(expected_post_album_revision BETWEEN 1 AND 9223372036854775807),
+    expected_post_identity_revision INTEGER NOT NULL
+        CHECK(expected_post_identity_revision BETWEEN 1 AND 9223372036854775807),
+    reason_code TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    consumed_at REAL,
+    consumed_action_id TEXT
+);
+
 CREATE TABLE IF NOT EXISTS library_policy_state (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     desired_policy_revision TEXT NOT NULL,

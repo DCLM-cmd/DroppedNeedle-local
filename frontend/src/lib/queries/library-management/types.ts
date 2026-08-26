@@ -191,6 +191,9 @@ export interface LibraryManagementProfile {
 	organization: OrganizationManagementSettings;
 	file_behavior: FileBehaviorSettings;
 	enrichment: EnrichmentManagementSettings;
+	identity: {
+		automatic_edition_acceptance_enabled: boolean;
+	};
 	notification: {
 		refresh_external_servers: boolean;
 	};
@@ -218,6 +221,7 @@ export interface LibraryManagementRootOverrides {
 	naming_script_id: string | null;
 	multi_disc_naming_mode: 'inherit' | 'standard' | 'script';
 	multi_disc_naming_script_id: string | null;
+	automatic_edition_acceptance_enabled: boolean | null;
 }
 
 export interface LibraryManagementRootAssignment {

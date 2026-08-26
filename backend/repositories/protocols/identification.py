@@ -36,6 +36,14 @@ class IdentificationProviderProtocol(Protocol):
         target_track_count: int,
         priority: RequestPriority,
     ) -> AlbumCandidate | None: ...
+    async def get_album_candidate_editions(
+        self,
+        release_group_mbid: str,
+        target_track_count: int,
+        priority: RequestPriority,
+        *,
+        max_editions: int = 2,
+    ) -> list[AlbumCandidate]: ...
 
     async def get_exact_release_candidate(
         self,

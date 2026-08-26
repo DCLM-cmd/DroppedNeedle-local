@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Awaitable, Callable
-
+from collections.abc import Awaitable, Callable, Collection
 from infrastructure.queue.priority_queue import RequestPriority
 from models.identification import AlbumCandidate, GroupingTrack
 from repositories.protocols.identification import IdentificationProviderProtocol
@@ -13,6 +12,11 @@ from services.native.album_evidence_engine import MAX_CANDIDATES
 ALBUM_SEARCH_LIMIT = 8
 RECORDING_SEARCH_LIMIT = 5
 TRACK_SAMPLE_LIMIT = 4
+
+
+RECALL_SOURCE_KINDS = frozenset(
+    {"cached_fingerprint", "embedded", "album_tags", "recording_search"}
+)
 
 
 def _consensus(values: list[str]) -> str:
@@ -32,6 +36,7 @@ class AlbumCandidateService:
         exact_release_mbid: str | None = None,
         explicit: bool = False,
         checkpoint: Callable[[], Awaitable[bool]] | None = None,
+        sibling_release_group_ids: Collection[str] | None = None,
     ) -> list[AlbumCandidate]:
         priority = (
             RequestPriority.USER_INITIATED
@@ -130,25 +135,44 @@ class AlbumCandidateService:
             if source not in sources[release_group_id]:
                 sources[release_group_id].append(source)
         candidates: list[AlbumCandidate] = []
-        canonical_candidates: dict[tuple[str, str | None], AlbumCandidate] = {}
+        canonical_candidates: dict[tuple[str, str], AlbumCandidate] = {}
+        sibling_ids = set(sibling_release_group_ids or ())
         for release_group_id in ordered[:MAX_CANDIDATES]:
             if checkpoint is not None and not await checkpoint():
                 return []
-            candidate = await self._provider.get_album_candidate(
-                release_group_id, len(tracks), priority
-            )
-            if candidate is None:
-                continue
-            canonical_key = (candidate.release_group_mbid, candidate.release_mbid)
-            existing = canonical_candidates.get(canonical_key)
-            if existing is not None:
-                existing.source_kinds = list(
-                    dict.fromkeys([*existing.source_kinds, *sources[release_group_id]])
+            if release_group_id in sibling_ids:
+                # EditionsEtc Phase 2 within-group sibling trial: qualifying
+                # groups fetch their ranked top pick plus one sibling edition
+                # in a single call (owner-approved <= 1 extra full-release
+                # fetch per group). Without sibling ids this branch is dead
+                # and recall behaves exactly as before.
+                fetched = await self._provider.get_album_candidate_editions(
+                    release_group_id, len(tracks), priority
                 )
-                continue
-            candidate.source_kinds = sources[release_group_id]
-            canonical_candidates[canonical_key] = candidate
-            candidates.append(candidate)
-            if checkpoint is not None and not await checkpoint():
-                return []
+            else:
+                top_pick = await self._provider.get_album_candidate(
+                    release_group_id, len(tracks), priority
+                )
+                fetched = [] if top_pick is None else [top_pick]
+            for candidate in fetched:
+                canonical_key = (
+                    candidate.release_group_mbid,
+                    (candidate.release_mbid or "").casefold(),
+                )
+                existing = canonical_candidates.get(canonical_key)
+                if existing is not None:
+                    existing.source_kinds = list(
+                        dict.fromkeys(
+                            [*existing.source_kinds, *sources[release_group_id]]
+                        )
+                    )
+                    continue
+                if len(candidates) < MAX_CANDIDATES:
+                    candidate.source_kinds = sources[release_group_id]
+                    canonical_candidates[canonical_key] = candidate
+                    candidates.append(candidate)
+                if checkpoint is not None and not await checkpoint():
+                    return []
+            if len(candidates) >= MAX_CANDIDATES:
+                break
         return candidates

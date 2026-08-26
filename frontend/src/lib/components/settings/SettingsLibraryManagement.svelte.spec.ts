@@ -224,7 +224,8 @@ function baseSettings(): LibraryManagementSettingsResponse {
 					},
 					replaygain: { enabled: false, mode: 'preserve', album_aware: true, required: false }
 				},
-				notification: { refresh_external_servers: false }
+				notification: { refresh_external_servers: false },
+				identity: { automatic_edition_acceptance_enabled: false }
 			}
 		],
 		default_profile_id: profileId,

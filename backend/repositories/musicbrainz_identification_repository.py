@@ -6,9 +6,9 @@ from models.identification import (
     CandidateTrack,
     ReleaseEditionSearchPage,
 )
+from repositories.edition_policy import recall_key
 from repositories.musicbrainz_base import (
     extract_artist_name,
-    select_edition,
 )
 from repositories.musicbrainz_repository import MusicBrainzRepository
 
@@ -117,26 +117,67 @@ class MusicBrainzIdentificationRepository:
         target_track_count: int,
         priority: RequestPriority,
     ) -> AlbumCandidate | None:
+        editions = await self.get_album_candidate_editions(
+            release_group_mbid, target_track_count, priority, max_editions=1
+        )
+        return editions[0] if editions else None
+
+    async def get_album_candidate_editions(
+        self,
+        release_group_mbid: str,
+        target_track_count: int,
+        priority: RequestPriority,
+        *,
+        max_editions: int = 2,
+    ) -> list[AlbumCandidate]:
+        """Fetch up to ``max_editions`` ranked sibling editions of one group.
+
+        Ranking is the shared recall-time policy (F-062 / NEW-DECISION-02):
+        track-count proximity -> Official -> parsed date -> XW -> MBID, so
+        the edition order matches what single-edition selection and the
+        folder/drop-import lane resolve individually. Editions with no
+        usable id or zero track-count are skipped exactly as before. The
+        default of two editions backs the EditionsEtc Phase 2 within-group
+        sibling trial (owner-approved budget: <= 1 extra full-release
+        fetch per qualifying group); callers wanting the historical single
+        pick use plain ``get_album_candidate``.
+        """
         group = await self._musicbrainz.get_release_group_by_id(
             release_group_mbid,
             includes=["artist-credits", "releases", "media"],
             priority=priority,
         )
         if not group:
-            return None
-        # F-062: shared best-edition policy - same helper as the folder/
-        # drop-import lane so both resolve one group to the same edition.
-        release_id = select_edition(group.get("releases") or [], target_track_count)
-        if release_id is None:
-            return None
-        release = await self._musicbrainz.get_release_by_id(
-            release_id,
-            includes=["recordings", "artist-credits"],
-            priority=priority,
-        )
-        if not release:
-            return None
-        return _candidate_from_release(release_group_mbid, group, release, release_id)
+            return []
+        ranked: list[tuple[tuple, str]] = []
+        seen_release_ids: set[str] = set()
+        for release_summary in group.get("releases") or []:
+            key = recall_key(release_summary, target_track_count)
+            if key is None or key[4] in seen_release_ids:
+                continue
+            seen_release_ids.add(key[4])
+            ranked.append((key, key[4]))
+        ranked.sort(key=lambda item: item[0])
+        candidates: list[AlbumCandidate] = []
+        built_release_ids: set[str] = set()
+        for _, release_id in ranked:
+            if len(candidates) >= max_editions:
+                break
+            release = await self._musicbrainz.get_release_by_id(
+                release_id,
+                includes=["recordings", "artist-credits"],
+                priority=priority,
+            )
+            if not release:
+                continue
+            canonical_id = release.get("id") or release_id
+            if canonical_id in built_release_ids:
+                continue
+            built_release_ids.add(canonical_id)
+            candidates.append(
+                _candidate_from_release(release_group_mbid, group, release, release_id)
+            )
+        return candidates
 
     async def get_exact_release_candidate(
         self,

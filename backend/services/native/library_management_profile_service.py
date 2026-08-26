@@ -144,6 +144,12 @@ def _is_restrictive_profile_change(
         ("organization", "remove_empty_directories"),
         ("enrichment", "lyrics", "enabled"),
         ("enrichment", "replaygain", "enabled"),
+        (
+            # D-EDITION-AUTO S-3: disabling automatic acceptance only
+            # narrows automatic scope; enabling it stays destructive.
+            "identity",
+            "automatic_edition_acceptance_enabled",
+        ),
     ):
         _reset_safe_boolean(candidate, old, new, path, safe_from=True, safe_to=False)
     for path in (
@@ -263,6 +269,28 @@ class LibraryManagementProfileService:
 
     def get_settings(self) -> LibraryManagementSettingsResponse:
         return self._preferences.get_library_management_settings()
+
+    def automatic_edition_acceptance_enabled(self, root_id: str) -> bool:
+        """D-EDITION-AUTO S-3: effective profile-level opt-in for one root.
+
+        Roots inherit their assigned (or the default) profile's flag;
+        a per-root override wins when set. Purely a settings read - it
+        neither schedules work nor mutates anything.
+        """
+        settings = self._preferences.get_library_management_settings_raw()
+        assignment = next(
+            (
+                value
+                for value in settings.root_assignments
+                if value.root_id == root_id
+            ),
+            None,
+        )
+        effective = self._effective_profile(
+            settings,
+            assignment or LibraryManagementRootAssignment(root_id=root_id),
+        )
+        return bool(effective.identity.automatic_edition_acceptance_enabled)
 
     def get_profile(self, profile_id: str) -> LibraryManagementProfile:
         return self._find_profile(self.get_settings(), profile_id)
@@ -1009,6 +1037,11 @@ class LibraryManagementProfileService:
             effective.artwork.external_enabled = overrides.external_artwork_enabled
         if overrides.source_cleanup is not None:
             effective.organization.source_cleanup = overrides.source_cleanup
+        # D-EDITION-AUTO S-3: per-root override of the profile-level opt-in.
+        if overrides.automatic_edition_acceptance_enabled is not None:
+            effective.identity.automatic_edition_acceptance_enabled = (
+                overrides.automatic_edition_acceptance_enabled
+            )
         if overrides.naming_script_id is not None:
             effective.organization.naming_script_id = overrides.naming_script_id
         if overrides.multi_disc_naming_mode == "standard":

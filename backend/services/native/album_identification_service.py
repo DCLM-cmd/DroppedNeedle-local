@@ -18,6 +18,7 @@ from infrastructure.degradation import (
 from infrastructure.resilience.retry import CircuitOpenError
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.identification import (
+    AlbumCandidate,
     CandidateEvidence,
     GroupingTrack,
     IdentificationAttempt,
@@ -25,7 +26,10 @@ from models.identification import (
     IdentificationEvidenceRecord,
     TrackEvidence,
 )
-from services.native.album_candidate_service import AlbumCandidateService
+from services.native.album_candidate_service import (
+    RECALL_SOURCE_KINDS,
+    AlbumCandidateService,
+)
 from services.native.album_evidence_engine import MATCHER_VERSION, AlbumEvidenceEngine
 from services.native.conditional_fingerprint_service import (
     FINGERPRINTER_VERSION,
@@ -346,6 +350,48 @@ def _enforce_raw_track_identities(
         decision.selected_candidate_key = None
 
 
+_SIBLING_TRIAL_OUTCOMES = ("ambiguous", "insufficient_evidence")
+
+
+def _sibling_trial_release_groups(
+    decision: IdentificationDecision,
+    recalled: list[AlbumCandidate],
+) -> list[str]:
+    """EditionsEtc Phase 2 within-group sibling trial derivation.
+
+    A group qualifies when its best evidence in this decision is still not
+    SUPPORTED (the recalled edition failed to back the album), its
+    candidates carry at most one distinct release MBID (no sibling edition
+    was present yet), and the attempt actually recalled the group through
+    the bounded search path - never an exact-release fast path, whose
+    identity is pinned rather than evidence-ranked. Empty output means the
+    owner-approved budget of at most one extra full-release fetch per
+    qualifying group is spent nowhere.
+    """
+    best_by_group: dict[str, CandidateEvidence] = {}
+    editions_by_group: dict[str, set[str]] = {}
+    for item in decision.candidates:
+        best = best_by_group.get(item.release_group_mbid)
+        if best is None or item.score > best.score:
+            best_by_group[item.release_group_mbid] = item
+        if item.release_mbid:
+            editions_by_group.setdefault(item.release_group_mbid, set()).add(
+                item.release_mbid.casefold()
+            )
+    recalled_groups = {
+        candidate.release_group_mbid
+        for candidate in recalled
+        if RECALL_SOURCE_KINDS.intersection(candidate.source_kinds)
+    }
+    return [
+        group
+        for group, best in best_by_group.items()
+        if best.reason_code != "SUPPORTED"
+        and len(editions_by_group.get(group, ())) <= 1
+        and group in recalled_groups
+    ]
+
+
 # F-IDENT-02: deterministic payload-shape failures defer under this stable
 # code instead of PROVIDER_TEMPORARILY_UNAVAILABLE. The spelling is part of
 # the persisted contract (last_failure_code / attention_cause) and the API/UI.
@@ -490,9 +536,9 @@ class AlbumIdentificationService:
                     await self._pause(job, worker_id, "candidate_search")
                     return "paused"
                 decision = self._evidence_engine.decide(tracks, recalled)
+                new_release_groups: list[str] = []
                 if decision.outcome in ("ambiguous", "insufficient_evidence"):
                     requested = 0
-                    new_release_groups: list[str] = []
                     for track, row in zip(tracks, raw_tracks, strict=True):
                         supported_recordings = {
                             item.recording_mbid
@@ -566,6 +612,39 @@ class AlbumIdentificationService:
                             ),
                             explicit=bool(job["requested_by_user_id"]),
                             checkpoint=checkpoint,
+                        )
+                        if await self._queue.is_paused():
+                            await self._pause(job, worker_id, "candidate_search")
+                            return "paused"
+                        decision = self._evidence_engine.decide(tracks, recalled)
+                if (
+                    decision.outcome in _SIBLING_TRIAL_OUTCOMES
+                    and not (
+                        degradation.has_deterministic_failure()
+                        and not decision.candidates
+                    )
+                    and not (degradation.degraded_summary() and not decision.candidates)
+                    and (self._provider_available is None or self._provider_available())
+                ):
+                    # EditionsEtc Phase 2 within-group sibling trial: when the
+                    # wrong sibling edition was recalled, evidence stays
+                    # ambiguous/insufficient even though a usable edition
+                    # exists in the same release group. Retry ONCE per attempt,
+                    # including ranked siblings for the qualifying groups only.
+                    sibling_release_groups = _sibling_trial_release_groups(
+                        decision, recalled
+                    )
+                    if sibling_release_groups:
+                        recalled = await self._candidates.recall(
+                            tracks,
+                            cached_fingerprint_release_groups=list(
+                                dict.fromkeys(
+                                    [*cached_release_groups, *new_release_groups]
+                                )
+                            ),
+                            explicit=bool(job["requested_by_user_id"]),
+                            checkpoint=checkpoint,
+                            sibling_release_group_ids=sibling_release_groups,
                         )
                         if await self._queue.is_paused():
                             await self._pause(job, worker_id, "candidate_search")

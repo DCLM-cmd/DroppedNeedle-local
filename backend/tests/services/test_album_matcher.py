@@ -345,17 +345,16 @@ def _santana_repo():
 
 
 @pytest.mark.asyncio
-async def test_identify_picks_standalone_release_over_compilation():
-    identifier = AlbumIdentifier(_santana_repo())
+async def test_identify_sends_album_vs_comp_near_tie_to_review():
+    """EditionsEtc S-4: the folder's tags name the compilation exactly while the debut
+    wins only on release-type ranking (0.101 vs 0.111 - inside WINNER_MARGIN_FLOOR),
+    so a silent min-distance pick would be a coin flip and the folder goes to review."""
+    repo = _santana_repo()
+    identifier = AlbumIdentifier(repo)
     locals_ = _locals(_SANTANA, album="The Woodstock Experience")
-    match = await identifier.identify(locals_)
-    assert match is not None
-    assert match.accepted is True
-    assert match.release_group_mbid == "rg-debut"
-    assert match.release_mbid == "rel-debut"
-    assert len(match.assignments) == 9
-    assert match.artist_mbid == "a1"
-    assert match.artist_name == "Santana"
+    assert await identifier.identify(locals_) is None
+    # Both accepted candidates were scored before deciding.
+    assert repo.get_release_by_id.await_count == 2
 
 
 def test_score_release_omits_artist_for_various_artists():
@@ -691,12 +690,15 @@ async def test_identify_uses_fingerprint_seed_when_tags_find_only_compilation():
 
 @pytest.mark.asyncio
 async def test_seed_release_groups_none_preserves_tag_only_behaviour():
-    # With no seed the matcher behaves exactly as before (the Santana recording-search path).
-    identifier = AlbumIdentifier(_santana_repo())
-    match = await identifier.identify(
-        _locals(_SANTANA, album="The Woodstock Experience")
+    """With or without a fingerprint seed the same candidates are scored, so the
+    tag-only path reaches the SAME verdict as the seeded one (here: review - see
+    test_identify_sends_album_vs_comp_near_tie_to_review)."""
+    locals_ = _locals(_SANTANA, album="The Woodstock Experience")
+    unseeded = await AlbumIdentifier(_santana_repo()).identify(locals_)
+    seeded = await AlbumIdentifier(_santana_repo()).identify(
+        locals_, seed_release_groups=["rg-debut"]
     )
-    assert match is not None and match.release_group_mbid == "rg-debut"
+    assert unseeded is None and seeded is None
 
 
 # -- Phase 3: release-type preference (studio Album > compilation/live/EP) --
@@ -797,3 +799,129 @@ async def test_release_group_type_uses_background_priority():
         repo.get_release_group_by_id.await_args.kwargs["priority"]
         == RequestPriority.BACKGROUND_SYNC
     )
+
+
+# -- Phase 3 (EditionsEtc S-4): winner-margin floor across accepted candidates --
+
+
+def _margin_locals():
+    """Five cleanly-tagged 1969 Santana files."""
+    return [
+        LocalTrack(
+            path=f"/m/{i:02d}.flac",
+            title=t,
+            artist="Santana",
+            album="Santana",
+            track_number=i + 1,
+            duration_seconds=240.0,
+            year=1969,
+        )
+        for i, t in enumerate(_SANTANA[:5])
+    ]
+
+
+def _twin_rg_repo(*, date_b, b_extra_mb_tracks=0):
+    """Two album-search candidates ('rg-a' listed first) with IDENTICAL tracklists.
+    rg-a matches the tags perfectly and scores 0.0; rg-b differs only by release
+    date (and optionally one surplus MB track), so both ACCEPT with a controlled
+    gap: the year term is min(|dY|, 10)/10 at weight 1.0 over a denominator of 20,
+    i.e. a full-decade miss lands exactly on the 0.05 margin floor."""
+    titles_b = _SANTANA[: 5 + b_extra_mb_tracks]
+
+    def rg_detail(mbid, includes=None, priority=None):
+        if mbid == "rg-a":
+            return _rg_detail(
+                "Santana", "Santana", [_release("rel-a", [5], date="1969")]
+            )
+        return _rg_detail(
+            "Santana",
+            "Santana",
+            [_release("rel-b", [len(titles_b)], date=date_b)],
+        )
+
+    async def release(rel_id, includes=None, priority=None):
+        payload = _release_tracks([titles_b if rel_id == "rel-b" else _SANTANA[:5]])
+        payload["date"] = date_b if rel_id == "rel-b" else "1969"
+        return payload
+
+    repo = AsyncMock()
+    repo.search_release_groups = AsyncMock(
+        return_value=[
+            SearchResult(
+                type="album", title="Santana", musicbrainz_id="rg-a", artist="Santana"
+            ),
+            SearchResult(
+                type="album", title="Santana", musicbrainz_id="rg-b", artist="Santana"
+            ),
+        ]
+    )
+    repo.search_recordings = AsyncMock(return_value=[])
+    repo.get_release_group_by_id = AsyncMock(side_effect=rg_detail)
+    repo.get_release_by_id = AsyncMock(side_effect=release)
+    return repo
+
+
+@pytest.mark.asyncio
+async def test_identify_returns_best_when_margin_gap_is_met():
+    """Gap >= WINNER_MARGIN_FLOOR: the clear winner is returned (pinned behaviour)."""
+    # rg-b misses by a decade (distance +0.05) plus one surplus MB track
+    # (missing-track term) -> gap ~0.078, comfortably above the floor.
+    repo = _twin_rg_repo(date_b="1979", b_extra_mb_tracks=1)
+    identifier = AlbumIdentifier(repo)
+    match = await identifier.identify(_margin_locals())
+    assert match is not None
+    assert match.release_group_mbid == "rg-a"
+    assert match.release_mbid == "rel-a"
+    # Both candidates were scored; the clear winner took it outright.
+    assert repo.get_release_by_id.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_identify_boundary_exact_floor_gap_still_wins():
+    """Gap EXACTLY WINNER_MARGIN_FLOOR (floor is exclusive-below): returned."""
+    # A full-decade miss -> year penalty 1.0 at weight 1.0 over denominator 20 ->
+    # rg-b scores exactly 0.05 against rg-a's 0.0.
+    repo = _twin_rg_repo(date_b="1979")
+    identifier = AlbumIdentifier(repo)
+    match = await identifier.identify(_margin_locals())
+    assert match is not None and match.release_group_mbid == "rg-a"
+    # Both candidates were scored before deciding.
+    assert repo.get_release_by_id.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_identify_near_tie_returns_none_for_review():
+    """Gap < WINNER_MARGIN_FLOOR: a silent pick would be a coin flip - unresolved."""
+    # Nine-year miss -> year penalty 0.9 -> rg-b distance 0.045, inside the floor.
+    repo = _twin_rg_repo(date_b="1960")
+    identifier = AlbumIdentifier(repo)
+    assert await identifier.identify(_margin_locals()) is None
+    # Both candidates were actually scored before deciding.
+    assert repo.get_release_by_id.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_identify_exact_tie_returns_none_for_review():
+    """Identical accepted distances: no defensible winner - unresolved."""
+    repo = _twin_rg_repo(date_b="1969")
+    identifier = AlbumIdentifier(repo)
+    assert await identifier.identify(_margin_locals()) is None
+    # The old early-exit-at-0.0 would have stopped after rg-a; both are scored now.
+    assert repo.get_release_by_id.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_identify_single_accepted_candidate_ignores_margin():
+    """With one accepted candidate the floor is vacuous - absolute distance is moot."""
+    repo = _twin_rg_repo(date_b="1960")
+    repo.search_release_groups = AsyncMock(
+        return_value=[
+            SearchResult(
+                type="album", title="Santana", musicbrainz_id="rg-b", artist="Santana"
+            ),
+        ]
+    )
+    identifier = AlbumIdentifier(repo)
+    match = await identifier.identify(_margin_locals())
+    assert match is not None and match.release_group_mbid == "rg-b"
+    assert match.distance == pytest.approx(0.045)

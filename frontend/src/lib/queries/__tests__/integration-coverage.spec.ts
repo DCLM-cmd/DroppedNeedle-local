@@ -554,6 +554,11 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/library/management/identity-preparations/J1/discard'
 	],
 	[
+		'undo automatic edition',
+		API.library.undoAutomaticEdition('A1'),
+		'/api/v1/library/albums/A1/undo-automatic-edition'
+	],
+	[
 		'scan diagnostics',
 		API.library.scanDiagnostics('R1'),
 		'/api/v1/library/scan-runs/R1/diagnostics'

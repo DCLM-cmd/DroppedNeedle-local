@@ -407,6 +407,11 @@ class EnrichmentManagementSettings(AppStruct):
         default_factory=ReplayGainManagementSettings
     )
 
+class IdentityManagementSettings(AppStruct):
+    """Catalog-identity policy (no file writes). D-EDITION-AUTO S-3."""
+
+    automatic_edition_acceptance_enabled: bool = False
+
 
 class ProfileNotificationSettings(AppStruct):
     refresh_droppedneedle: bool = True
@@ -437,6 +442,9 @@ class LibraryManagementProfile(AppStruct):
     )
     enrichment: EnrichmentManagementSettings = msgspec.field(
         default_factory=EnrichmentManagementSettings
+    )
+    identity: IdentityManagementSettings = msgspec.field(
+        default_factory=IdentityManagementSettings
     )
     notification: ProfileNotificationSettings = msgspec.field(
         default_factory=ProfileNotificationSettings
@@ -474,6 +482,7 @@ class LibraryManagementRootOverrides(AppStruct):
     naming_script_id: str | None = None
     multi_disc_naming_mode: Literal["inherit", "standard", "script"] = "inherit"
     multi_disc_naming_script_id: str | None = None
+    automatic_edition_acceptance_enabled: bool | None = None
 
 
 class LibraryManagementRootAssignment(AppStruct):
@@ -588,6 +597,17 @@ def _remove_default_multi_disc_naming(profile: dict[str, object]) -> None:
         organization.pop("multi_disc_naming_script_id", None)
 
 
+def _remove_default_identity_section(profile: dict[str, object]) -> None:
+    # D-EDITION-AUTO S-3: the identity section is new; keep stored profile
+    # and settings revisions stable while it sits at its default (all-off).
+    identity = profile.get("identity")
+    if (
+        isinstance(identity, dict)
+        and identity.get("automatic_edition_acceptance_enabled") is False
+    ):
+        profile.pop("identity")
+
+
 def profile_revision(profile: LibraryManagementProfile) -> str:
     payload = msgspec.to_builtins(profile)
     if not isinstance(payload, dict):
@@ -595,6 +615,7 @@ def profile_revision(profile: LibraryManagementProfile) -> str:
     payload.pop("revision", None)
     _remove_default_lyrics_preservation(payload)
     _remove_default_multi_disc_naming(payload)
+    _remove_default_identity_section(payload)
     return _stable_hash(payload)
 
 
@@ -616,6 +637,7 @@ def settings_revision(settings: LibraryManagementSettings) -> str:
             if isinstance(profile, dict):
                 _remove_default_lyrics_preservation(profile)
                 _remove_default_multi_disc_naming(profile)
+                _remove_default_identity_section(profile)
     return _stable_hash(payload)
 
 

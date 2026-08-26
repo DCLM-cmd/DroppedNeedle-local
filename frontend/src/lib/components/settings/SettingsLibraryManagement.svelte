@@ -315,7 +315,8 @@
 			preserve_timestamps: null,
 			naming_script_id: null,
 			multi_disc_naming_mode: 'inherit',
-			multi_disc_naming_script_id: null
+			multi_disc_naming_script_id: null,
+			automatic_edition_acceptance_enabled: null
 		};
 	}
 

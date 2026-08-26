@@ -210,6 +210,10 @@ class RepairFinding(AppStruct):
     suggested_release_mbid: str | None = None
     suggested_release_group_mbid: str | None = None
     suggested_edition_json: str = "{}"
+    # D-EDITION-AUTO: set by _classify_exact_release_suggestion when the
+    # signed owner gate passed under an active opt-in; consumed by the audit
+    # run loop while persisting the finding. Never serialized to the API.
+    auto_apply_edition: bool = False
 
 
 class ScanInventoryItem(AppStruct):

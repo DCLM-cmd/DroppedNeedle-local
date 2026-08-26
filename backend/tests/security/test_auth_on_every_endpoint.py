@@ -515,6 +515,11 @@ _ADMIN_ENDPOINTS = [
     ("POST", "/api/v1/library/operations/job-1/stop", {"expected_row_revision": 1}),
     (
         "POST",
+        "/api/v1/library/albums/album-1/undo-automatic-edition",
+        {"expected_album_revision": 1, "expected_identity_revision": 2},
+    ),
+    (
+        "POST",
         "/api/v1/library/albums/album-1/reidentify",
         {
             "expected_album_revision": 1,
