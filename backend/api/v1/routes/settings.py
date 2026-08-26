@@ -261,13 +261,14 @@ async def update_advanced_settings(
             )
         preferences_service.save_advanced_settings(backend_settings)
         # F-PERF-08: only HTTP-affecting saves retire client generations.
+        # http_max_keepalive is not exposed on AdvancedSettings (it stays at
+        # its Settings-level default), so it cannot change through this route.
         http_changed = any(
             getattr(previous, field) != getattr(backend_settings, field)
             for field in (
                 "http_timeout",
                 "http_connect_timeout",
                 "http_max_connections",
-                "http_max_keepalive",
             )
         )
         if http_changed:
