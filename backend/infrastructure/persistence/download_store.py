@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import msgspec
 
@@ -725,6 +725,26 @@ class DownloadStore(PersistenceBase):
                 "SELECT * FROM download_tasks WHERE id = ?", (task_id,)
             ).fetchone()
             return _row_to_task(row)
+
+        return await self._read(operation)
+
+    async def get_tasks(self, task_ids: Sequence[str]) -> dict[str, DownloadTask]:
+        """F-PERF-03: batch lookup for the retrying-history pages - one
+        parameterized ``IN`` query per bounded page instead of one
+        ``get_task()`` round trip per linked record. Missing IDs are absent
+        from the mapping; an empty input opens no query."""
+        unique = list(dict.fromkeys(task_ids))
+        if not unique:
+            return {}
+        placeholders = ",".join("?" for _ in unique)
+
+        def operation(conn: sqlite3.Connection) -> dict[str, DownloadTask]:
+            rows = conn.execute(
+                f"SELECT * FROM download_tasks WHERE id IN ({placeholders})",
+                unique,
+            ).fetchall()
+            tasks = (_row_to_task(row) for row in rows)
+            return {task.id: task for task in tasks if task is not None}
 
         return await self._read(operation)
 

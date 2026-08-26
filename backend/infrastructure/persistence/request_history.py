@@ -87,6 +87,10 @@ class RequestHistoryStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_request_history_status_requested_at ON request_history(status, requested_at DESC)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_request_history_retrying_keyset "
+                "ON request_history(status, requested_at DESC, musicbrainz_id_lower DESC)"
+            )
             for col, definition in [
                 ("monitor_artist", "INTEGER NOT NULL DEFAULT 0"),
                 ("auto_download_artist", "INTEGER NOT NULL DEFAULT 0"),
@@ -736,6 +740,64 @@ class RequestHistoryStore:
             ]
             total = int(total_row["count"] if total_row is not None else 0)
             return records, total
+
+        return await self._read(operation)
+
+    async def async_get_retrying_page(
+        self,
+        status_filter: str,
+        page_size: int = 200,
+        cursor: tuple[str, str] | None = None,
+        owner_id: str | None = None,
+    ) -> tuple[list[RequestHistoryRecord], tuple[str, str] | None]:
+        """F-PERF-03: keyset-paged failed/incomplete history for the Wanted
+        retrying paths.
+
+        One bounded SELECT per page - no COUNT, no OFFSET. Ordering is
+        ``requested_at DESC, musicbrainz_id_lower DESC`` so the cursor never
+        duplicates or skips rows on equal timestamps. ``owner_id`` pushes the
+        non-admin scope into SQL; ``None`` keeps the admin all-users behavior.
+        Returns the records plus the next cursor (``None`` on the last page).
+        """
+        safe_page_size = max(page_size, 1)
+
+        def operation(
+            conn: sqlite3.Connection,
+        ) -> tuple[list[RequestHistoryRecord], tuple[str, str] | None]:
+            clauses = ["status = ?"]
+            params: list[object] = [status_filter]
+            if owner_id is not None:
+                clauses.append("user_id = ?")
+                params.append(owner_id)
+            if cursor is not None:
+                last_requested_at, last_mbid = cursor
+                clauses.append(
+                    "(requested_at < ? OR (requested_at = ? "
+                    "AND musicbrainz_id_lower < ?))"
+                )
+                params.extend([last_requested_at, last_requested_at, last_mbid])
+            where_clause = f"WHERE {' AND '.join(clauses)}"
+            rows = conn.execute(
+                f"SELECT * FROM request_history {where_clause} "
+                "ORDER BY requested_at DESC, musicbrainz_id_lower DESC LIMIT ?",
+                (*params, safe_page_size),
+            ).fetchall()
+            if not rows:
+                return [], None
+            next_cursor: tuple[str, str] | None = None
+            if len(rows) == safe_page_size:
+                # Cursor comes from the raw rows so filtered conversions or
+                # trailing taskless rows can never shorten the walk.
+                next_cursor = (
+                    str(rows[-1]["requested_at"]),
+                    str(rows[-1]["musicbrainz_id_lower"]),
+                )
+            records = [
+                record
+                for row in rows
+                if (record := self._row_to_record(row)) is not None
+            ]
+            return records, next_cursor
 
         return await self._read(operation)
 

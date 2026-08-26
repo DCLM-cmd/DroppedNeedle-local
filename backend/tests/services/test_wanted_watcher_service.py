@@ -108,11 +108,23 @@ def env(tmp_path) -> _Env:
     store = WantedStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
     requests = AsyncMock()
     requests.async_get_history.return_value = ([], 0)
+    requests.async_get_retrying_page.return_value = ([], None)
     requests.async_get_record.return_value = None
     download_store = AsyncMock()
     download_store.get_active_task_for_album_any_user.return_value = None
     download_store.has_unresolved_held_for_task.return_value = False
     download_store.get_task.return_value = None
+
+    # F-PERF-03: the service reads linked tasks through the BATCH method.
+    # Default the batch map to whatever the per-test ``get_task`` mock is
+    # configured to return so existing per-test setups keep driving semantics.
+    async def _batched_tasks(task_ids):
+        single = download_store.get_task.return_value
+        if single is None:
+            return {}
+        return {task_id: single for task_id in task_ids}
+
+    download_store.get_tasks = AsyncMock(side_effect=_batched_tasks)
     ds = AsyncMock()
     ds.next_retry_at = Mock(return_value=None)  # sync method on the real service
     ds.scout_album.return_value = []
@@ -160,13 +172,16 @@ def env(tmp_path) -> _Env:
 
 
 def _serve_history(env: _Env, failed=(), incomplete=()):
-    async def history(page=1, page_size=200, status_filter=None):
-        records = {"failed": list(failed), "incomplete": list(incomplete)}.get(
-            status_filter, []
-        )
-        return records, len(records)
+    async def retrying_page(status_filter=None, page_size=200, cursor=None, owner_id=None):
+        by_status = {"failed": list(failed), "incomplete": list(incomplete)}
+        records = [
+            record
+            for record in by_status.get(status_filter, [])
+            if owner_id is None or record.user_id == owner_id
+        ]
+        return records, None
 
-    env.requests.async_get_history.side_effect = history
+    env.requests.async_get_retrying_page.side_effect = retrying_page
 
 
 async def _add_watch(env: _Env, mbid="rg-1", kind="missing", due=True, **overrides):
@@ -1144,3 +1159,77 @@ async def test_duplicate_mbid_differing_years_healthy_provider_returns_none_uses
     d4 = await env.watcher._first_release_date_for_mbid("rg-dup3", 2010, True, cache2)
     assert d4 == "1995-01-01"  # provider date reused, not per-record year
     assert env.mb.get_release_group_by_id.call_count == 2
+
+
+# --- F-PERF-03: batched retrying-history reads -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_retrying_uses_one_task_batch_per_page_never_per_row(env):
+    """250 linked rows across two pages per status: exactly one get_tasks()
+    call per page and ZERO per-row get_task() round trips."""
+    page_one = [
+        _record(mbid=f"rg-{i:03d}", requested_at=f"2026-01-{(i % 28) + 1:02d}T00:00:00+00:00")
+        for i in range(200)
+    ]
+    page_two = [
+        _record(mbid=f"rg-{i:03d}", requested_at="2025-12-01T00:00:00+00:00")
+        for i in range(200, 250)
+    ]
+    batch_sizes: list[int] = []
+
+    async def batch(task_ids):
+        batch_sizes.append(len(task_ids))
+        return {
+            task_id: _task(task_id=task_id)
+            for task_id in task_ids
+            if task_id in {r.download_task_id for r in (*page_one, *page_two)}
+        }
+
+    env.download_store.get_tasks = AsyncMock(side_effect=batch)
+    env.ds.next_retry_at = Mock(return_value=time.time() + 60)
+
+    async def paged(status_filter=None, page_size=200, cursor=None, owner_id=None):
+        if cursor is None:
+            return list(page_one), ("2026-01-01T00:00:00+00:00", "rg-000")
+        return list(page_two), None
+
+    env.requests.async_get_retrying_page.side_effect = paged
+
+    items = await env.watcher.list_retrying_for("admin-1", "admin")
+
+    # one batch per page per status (2 statuses x 2 pages), zero single reads
+    assert env.download_store.get_tasks.await_count == 4
+    assert all(size <= 200 for size in batch_sizes)
+    env.download_store.get_task.assert_not_awaited()
+    assert len(items) == 500  # 250 rows x 2 statuses
+
+
+@pytest.mark.asyncio
+async def test_list_retrying_pushes_owner_scope_into_the_history_query(env):
+    captured: dict[str, object] = {}
+
+    async def paged(status_filter=None, page_size=200, cursor=None, owner_id=None):
+        captured["owner_id"] = owner_id
+        return [], None
+
+    env.requests.async_get_retrying_page.side_effect = paged
+
+    await env.watcher.list_retrying_for("user-a", "user")
+    assert captured["owner_id"] == "user-a"
+
+    await env.watcher.list_retrying_for("admin-1", "admin")
+    assert captured["owner_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_enrol_reuses_batched_task_data_without_single_reads(env):
+    _serve_history(env, failed=[_record(mbid="rg-enrol")])
+    env.download_store.get_task.return_value = _task(error=_NO_SOURCE_MSG)
+    await _add_watch(env, mbid="rg-other")  # unrelated watch keeps sweep busy
+
+    summary = await env.watcher.run_sweep()
+
+    env.download_store.get_task.assert_not_awaited()  # batched, not per row
+    assert env.download_store.get_tasks.await_count >= 1
+    assert summary.enrolled == 1

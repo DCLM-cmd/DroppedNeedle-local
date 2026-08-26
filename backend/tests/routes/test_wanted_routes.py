@@ -51,6 +51,8 @@ def _make_watcher(tmp_path) -> tuple[WantedWatcherService, WantedStore]:
     asyncio.run(_seed())
     request_history = AsyncMock()
     request_history.async_get_history.return_value = ([], 0)
+    # F-PERF-03: the retrying path reads through the keyset page method.
+    request_history.async_get_retrying_page.return_value = ([], None)
     watcher = WantedWatcherService(
         wanted_store=store,
         request_history=request_history,
@@ -248,3 +250,122 @@ def test_seen_clears_the_badge(tmp_path):
     assert client.post(f"/requests/wanted/{VALID_MBID}/seen").status_code == 200
     body = client.get("/requests/wanted").json()
     assert body["items"][0]["new_candidate_count"] == 0
+
+
+# --- F-PERF-03: /requests/wanted over a multi-page real history ---------------
+
+
+def _real_stores_watcher(tmp_path, *, linked_rows: int):
+    """Real RequestHistoryStore + DownloadStore seeded with two users' worth
+    of linked failed rows spanning more than one keyset page."""
+    import sqlite3
+
+    from infrastructure.persistence.download_store import DownloadStore
+    from infrastructure.persistence.request_history import RequestHistoryStore
+    from unittest.mock import AsyncMock as AM
+
+    downloads = tmp_path / "downloads.db"
+    download_store = DownloadStore(db_path=downloads, write_lock=threading.Lock())
+    with sqlite3.connect(downloads) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS auth_users "
+            "(id TEXT PRIMARY KEY, username TEXT, role TEXT)"
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO auth_users (id, username, role) VALUES (?, ?, ?)",
+            [("user-a", "a", "user"), ("user-b", "b", "user")],
+        )
+
+    requests = RequestHistoryStore(db_path=tmp_path / "requests.db")
+    for i in range(linked_rows):
+        mbid = f"{i:08d}-aaaa-bbbb-cccc-dddddddddddd"
+        user = "user-a" if i % 2 == 0 else "user-b"
+        asyncio.run(
+            requests.async_record_request(
+                mbid,
+                f"Artist {i}",
+                f"Album {i}",
+                user_id=user,
+                initial_status="failed",
+            )
+        )
+        task = asyncio.run(
+            download_store.create_task(user_id=user, release_group_mbid=mbid)
+        )
+        with sqlite3.connect(requests.db_path) as conn:
+            conn.execute(
+                "UPDATE request_history SET download_task_id = ? "
+                "WHERE musicbrainz_id_lower = ?",
+                (task.id, mbid.lower()),
+            )
+            conn.commit()
+
+    wanted = WantedStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    ds = AM()
+    ds.auto_retry_max = 6
+    due = time.time() + 900
+    ds.next_retry_at = Mock(return_value=due)
+
+    get_task_calls = {"n": 0}
+    original_get_task = type(download_store).get_task
+
+    async def counting_get_task(store_self, task_id):
+        get_task_calls["n"] += 1
+        return await original_get_task(store_self, task_id)
+
+    type(download_store).get_task = counting_get_task
+
+    watcher = WantedWatcherService(
+        wanted_store=wanted,
+        request_history=requests,
+        download_store=download_store,
+        get_download_service=lambda: ds,
+        library_manager=AM(),
+        album_service=AM(),
+        mb_repo=AM(),
+        sse_publisher=AM(),
+        preferences=Mock(),
+        inter_want_delay=0.0,
+    )
+    return watcher, get_task_calls
+
+
+@pytest.mark.parametrize("role,user_id", [("user", "user-a"), ("admin", "admin-id")])
+def test_wanted_route_over_multipage_history_is_bounded_and_correct(
+    tmp_path, role, user_id
+):
+    app = FastAPI()
+    app.include_router(router)
+    watcher, get_task_calls = _real_stores_watcher(tmp_path, linked_rows=250)
+    app.dependency_overrides[get_wanted_watcher_service] = lambda: watcher
+    auth_store = AsyncMock()
+    auth_store.list_users.return_value = [
+        SimpleNamespace(id="user-a", display_name="A"),
+        SimpleNamespace(id="user-b", display_name="B"),
+    ]
+    app.dependency_overrides[get_auth_store] = lambda: auth_store
+    app.dependency_overrides[_get_current_user] = lambda: mock_user(
+        role=role, user_id=user_id
+    )
+    client = build_test_client(app)
+
+    body = client.get("/requests/wanted").json()
+
+    expected = 125 if role == "user" else 250
+    assert body["count"] == 0
+    assert len(body["retrying"]) == expected
+    if role == "user":
+        assert {row["user_id"] for row in body["retrying"]} == {"user-a"}
+    else:
+        assert {row["user_id"] for row in body["retrying"]} == {"user-a", "user-b"}
+    first = body["retrying"][0]
+    assert set(first) >= {
+        "release_group_mbid",
+        "artist_name",
+        "album_title",
+        "retry_count",
+        "max_attempts",
+        "next_retry_at",
+    }
+    # Bounded reads: zero per-row task round trips on the interactive path.
+    assert get_task_calls["n"] == 0

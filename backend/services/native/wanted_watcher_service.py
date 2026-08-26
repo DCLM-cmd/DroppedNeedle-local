@@ -276,6 +276,30 @@ class WantedWatcherService:
         await self._store.clear_new_candidates(release_group_mbid)
         return await self._owned_watch(release_group_mbid, user_id, user_role)
 
+    async def _retrying_page(
+        self,
+        status: str,
+        cursor: tuple[str, str] | None,
+        owner_id: str | None,
+    ) -> tuple[list["RequestHistoryRecord"], tuple[str, str] | None, dict]:
+        """F-PERF-03 shared bounded page: one keyset history page plus ONE
+        batch task lookup for its linked tasks. ``owner_id=None`` keeps the
+        admin all-users scope; non-admin callers push their owner predicate
+        into SQL instead of filtering broad pages in Python."""
+        records, next_cursor = await self._requests.async_get_retrying_page(
+            status_filter=status,
+            page_size=_ENROL_PAGE_SIZE,
+            cursor=cursor,
+            owner_id=owner_id,
+        )
+        task_ids = [
+            record.download_task_id
+            for record in records
+            if record.download_task_id
+        ]
+        tasks = await self._download_store.get_tasks(task_ids)
+        return records, next_cursor, tasks
+
     async def list_retrying_for(
         self, user_id: str, user_role: str
     ) -> list[WantedRetrying]:
@@ -283,24 +307,20 @@ class WantedWatcherService:
         read-only 'still hunting' rows (owner decision 2026-07-06). Reads the
         SAME rows the enrolment classifier does - a failed/incomplete request
         whose linked task has a pending ``next_retry_at`` - so a row graduates
-        into a real watch the sweep after its ladder exhausts, with no gap."""
+        into a real watch the sweep after its ladder exhausts, with no gap.
+        F-PERF-03: one task BATCH per history page, never one query per row."""
         download_service = self._get_download_service()
         max_attempts = download_service.auto_retry_max
+        owner_id = user_id if user_role != "admin" else None
         items: list[WantedRetrying] = []
         for status in ("failed", "incomplete"):
-            page = 1
+            cursor: tuple[str, str] | None = None
             while True:
-                records, total = await self._requests.async_get_history(
-                    page=page, page_size=_ENROL_PAGE_SIZE, status_filter=status
+                records, next_cursor, tasks = await self._retrying_page(
+                    status, cursor, owner_id
                 )
-                if not records:
-                    break
                 for record in records:
-                    if user_role != "admin" and record.user_id != user_id:
-                        continue
-                    if not record.download_task_id:
-                        continue
-                    task = await self._download_store.get_task(record.download_task_id)
+                    task = tasks.get(record.download_task_id or "")
                     if task is None:
                         continue
                     next_retry_at = download_service.next_retry_at(task)
@@ -320,9 +340,9 @@ class WantedWatcherService:
                             user_id=record.user_id,
                         )
                     )
-                if page * _ENROL_PAGE_SIZE >= total:
+                if next_cursor is None:
                     break
-                page += 1
+                cursor = next_cursor
         items.sort(key=lambda item: item.next_retry_at)
         return items
 
@@ -440,16 +460,21 @@ class WantedWatcherService:
         if not provider_available:
             logger.warning("wanted.enrol_provider_outage", extra={"reason": "circuit_open"})
         for status in statuses:
-            page = 1
+            cursor: tuple[str, str] | None = None
             while True:
-                records, total = await self._requests.async_get_history(
-                    page=page, page_size=_ENROL_PAGE_SIZE, status_filter=status
+                # All-users scope: enrolment must not lose a page because an
+                # unrelated user-owned row was filtered for the Wanted tab.
+                records, next_cursor, tasks = await self._retrying_page(
+                    status, cursor, None
                 )
-                if not records:
-                    break
                 for record in records:
                     try:
-                        if await self._maybe_enrol(record, provider_available, cache):
+                        if await self._maybe_enrol(
+                            record,
+                            provider_available,
+                            cache,
+                            task=tasks.get(record.download_task_id or ""),
+                        ):
                             enrolled += 1
                     except Exception:  # noqa: BLE001 - one bad row must not stop enrolment
                         logger.warning(
@@ -457,13 +482,17 @@ class WantedWatcherService:
                             extra={"release_group_mbid": record.musicbrainz_id},
                             exc_info=True,
                         )
-                if page * _ENROL_PAGE_SIZE >= total:
+                if next_cursor is None:
                     break
-                page += 1
+                cursor = next_cursor
         return enrolled
 
     async def _maybe_enrol(
-        self, record: "RequestHistoryRecord", provider_available: bool, cache: dict[str, str | None]
+        self,
+        record: "RequestHistoryRecord",
+        provider_available: bool,
+        cache: dict[str, str | None],
+        task: "DownloadTask | None" = None,
     ) -> bool:
         existing = await self._store.get_watch(record.musicbrainz_id)
         if existing is not None and existing.state != "fulfilled":
@@ -474,7 +503,7 @@ class WantedWatcherService:
         kind = self._classify_status(record.status)
         if kind is None:
             return False
-        if not await self._task_says_enrol(record):
+        if not await self._task_says_enrol(record, task=task):
             return False
 
         now = time.time()
@@ -529,15 +558,20 @@ class WantedWatcherService:
             return "partial"
         return None
 
-    async def _task_says_enrol(self, record: "RequestHistoryRecord") -> bool:
+    async def _task_says_enrol(
+        self, record: "RequestHistoryRecord", task: "DownloadTask | None" = None
+    ) -> bool:
         """§4.5: the availability signal lives on the linked TASK, not the request.
         No linked task (a dispatch-time failure) cannot be classified and never
         enrols; a task still awaiting its auto-retry isn't dead yet; a 'failed'
         task enrols only when its message prefix-matches an availability constant
-        (local faults - mount/import errors - must NOT enrol)."""
+        (local faults - mount/import errors - must NOT enrol). F-PERF-03 accepts
+        the batched task from the page helper instead of re-reading per row;
+        direct callers still resolve the single task themselves."""
         if not record.download_task_id:
             return False
-        task = await self._download_store.get_task(record.download_task_id)
+        if task is None:
+            task = await self._download_store.get_task(record.download_task_id)
         if task is None or not is_terminal(task.status):
             return False
         if self._get_download_service().next_retry_at(task) is not None:
