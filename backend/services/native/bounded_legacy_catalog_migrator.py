@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import time
 from collections import Counter, defaultdict
@@ -48,6 +47,7 @@ class BoundedMigrationOutcome:
     blocker_reason_counts: dict[str, int] = field(default_factory=dict)
     blocker_details: list[dict[str, str]] = field(default_factory=list)
     skipped_counts: dict[str, int] = field(default_factory=dict)
+    phase_timings_ms: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -61,8 +61,20 @@ class _ProgressReporter:
         self._emit = emit
         self._next: dict[str, int] = {}
         self._last: dict[str, tuple[int, int]] = {}
+        self._started_at: dict[str, float] = {}
+        self._elapsed_ms: dict[str, int] = {}
+        self._open_phase: str | None = None
+        self._current: tuple[str, int, int] | None = None
 
     def start(self, phase: str, total: int) -> None:
+        now = time.monotonic()
+        if self._open_phase is not None:
+            started = self._started_at[self._open_phase]
+            self._elapsed_ms[self._open_phase] = self._elapsed_ms.get(
+                self._open_phase, 0
+            ) + int((now - started) * 1000)
+        self._open_phase = phase
+        self._started_at[phase] = now
         self._next[phase] = 0
         self.update(phase, 0, total, force=True)
 
@@ -81,7 +93,26 @@ class _ProgressReporter:
         percent = 100 if total == 0 else min(100, completed * 100 // total)
         self._emit(f"[upgrade] {phase}: {completed:,}/{total:,} ({percent}%).")
         self._last[phase] = completed, total
+        self._current = (phase, completed, total)
         self._next[phase] = completed + interval
+
+    def timings_ms(self) -> dict[str, int]:
+        """F4/H4: monotonic per-phase durations; an open phase reports its
+        running elapsed time without being closed."""
+        timings = dict(self._elapsed_ms)
+        if self._open_phase is not None:
+            elapsed = time.monotonic() - self._started_at[self._open_phase]
+            timings[self._open_phase] = self._elapsed_ms.get(self._open_phase, 0) + int(
+                elapsed * 1000
+            )
+        return timings
+
+    def snapshot(self) -> dict[str, int] | None:
+        """F4/H4: most recent batch cursor for failure evidence."""
+        if self._current is None:
+            return None
+        phase, completed, total = self._current
+        return {"phase": phase, "completed": completed, "total": total}
 
 
 class BoundedLegacyCatalogMigrator:
@@ -209,6 +240,7 @@ class BoundedLegacyCatalogMigrator:
                 blocker_reason_counts=dict(self._blocker_reason_counts),
                 blocker_details=list(self._blocker_details),
                 skipped_counts=dict(self._skipped),
+                phase_timings_ms=self._progress.timings_ms(),
             )
 
         if self._migrated_source_keys is None:
@@ -262,6 +294,7 @@ class BoundedLegacyCatalogMigrator:
                 blocker_reason_counts=dict(self._blocker_reason_counts),
                 blocker_details=list(self._blocker_details),
                 skipped_counts=dict(self._skipped),
+                phase_timings_ms=self._progress.timings_ms(),
             )
 
         self._progress.message("Validating migrated catalog.")
@@ -307,7 +340,12 @@ class BoundedLegacyCatalogMigrator:
             blocker_count=0,
             invariants=invariants,
             skipped_counts=dict(self._skipped),
+            phase_timings_ms=self._progress.timings_ms(),
         )
+
+    def progress_snapshot(self) -> dict[str, int] | None:
+        """F4/H4: last batch cursor for child failure evidence."""
+        return self._progress.snapshot()
 
     def _ensure_policy_revision(self, policy_revision: str) -> None:
         """F1/H1: a roots/policy save mid-run invalidates the projector this

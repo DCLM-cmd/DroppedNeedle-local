@@ -1129,3 +1129,67 @@ async def test_bounded_migration_chunks_tracks_within_one_review_album(
         3,
     )
     assert await store.row_count("local_tracks") == 5
+
+
+@pytest.mark.asyncio
+async def test_double_migration_converges_catalog_exactly(tmp_path: Path) -> None:
+    """Two full migrate() runs over one seeded mixed legacy database converge:
+    the second run takes the completed-report short-circuit, does no phase
+    work, and leaves every counted table identical to the first run."""
+    root = tmp_path / "Music"
+    compilation = root / "Compilation"
+    compilation.mkdir(parents=True)
+    (compilation / "01.flac").write_bytes(b"a" * 100)
+    (compilation / "02.flac").write_bytes(b"b" * 200)
+    database = tmp_path / "library.db"
+    _create_source(database, root)
+    with sqlite3.connect(database) as connection:
+        _insert_legacy_library_file(
+            connection,
+            file_id="99999999-9999-4999-8999-000000000010",
+            path=root / "Local Only" / "01.flac",
+            title="Local Only Song",
+            track_number=1,
+            release_group_mbid=None,
+        )
+
+    def snapshot() -> dict[str, int]:
+        tables = (
+            "local_albums",
+            "local_tracks",
+            "local_album_aliases",
+            "local_artist_aliases",
+            "library_migration_provenance",
+            "library_user_favorites",
+            "library_play_history",
+            "library_playlist_tracks",
+            "library_identification_reviews",
+        )
+        with sqlite3.connect(database) as connection:
+            return {
+                table: int(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                )
+                for table in tables
+            }
+
+    first_store, first_migrator = _migrator(database, root, [])
+    first = await first_migrator.migrate("double-run", now=100)
+    assert first.report.state == "applied"
+    after_first = snapshot()
+    assert after_first["local_tracks"] > 0
+    assert after_first["library_migration_provenance"] > 0
+
+    second_progress: list[str] = []
+    _, second_migrator = _migrator(database, root, second_progress)
+    second = await second_migrator.migrate("double-run", now=200)
+
+    # Completed-report short-circuit: no phase work, zero blockers/skips.
+    assert second.report == first.report
+    assert second.blocker_count == 0
+    assert second.skipped_counts == {}
+    assert second.phase_timings_ms == {}
+    assert not any(
+        "Checking catalog compatibility" in item for item in second_progress
+    )
+    assert snapshot() == after_first

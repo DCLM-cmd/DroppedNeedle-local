@@ -2047,3 +2047,223 @@ async def test_perform_target_migration_carries_probe_timeout_evidence_and_alway
         blocked.set()
 
 
+
+def _forbidden_work_settings(tmp_path: Path) -> tuple[Settings, Path]:
+    historical_root = tmp_path / "Historical" / "Music"
+    historical_root.mkdir(parents=True)
+    (historical_root / "track.flac").write_bytes(b"a" * 100)
+    database = tmp_path / "cache" / "library.db"
+    database.parent.mkdir(parents=True)
+    from tests.infrastructure.test_legacy_catalog_importer import _create_source
+
+    _create_source(database, historical_root)
+    settings = Settings(
+        root_app_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        library_db_path=database,
+        config_file_path=tmp_path / "config" / "config.json",
+    )
+    settings.config_file_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.config_file_path.write_text("{}", encoding="utf-8")
+    return settings, database
+
+
+def _stub_child_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    database: Path,
+):
+    """Shared stubbing for in-process _perform_target_migration drives."""
+    import threading
+    from unittest.mock import MagicMock
+
+    from api.v1.schemas.library_policies import (
+        LibraryRootSettings,
+        TypedLibrarySettings,
+    )
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
+    from services.native.library_policy_resolver import LibraryPolicyResolver
+
+    monkeypatch.setattr(automatic_upgrade, "get_settings", lambda: settings)
+    monkeypatch.setattr(automatic_upgrade, "migrate_legacy_config", lambda: None)
+    mock_preferences = MagicMock()
+    mock_preferences.get_typed_library_settings.return_value = TypedLibrarySettings(
+        library_roots=[
+            LibraryRootSettings(
+                id="root",
+                path=str(settings.root_app_dir / "Missing" / "Music"),
+                label="Library",
+                policy="automatic",
+            )
+        ],
+        staging_path=str(settings.root_app_dir / "Staging"),
+    )
+    mock_preferences.retarget_library_roots_for_upgrade = MagicMock()
+    monkeypatch.setattr(
+        "core.dependencies.cache_providers.get_preferences_service",
+        lambda: mock_preferences,
+    )
+    test_store = NativeLibraryStore(database, threading.Lock())
+    monkeypatch.setattr(
+        "core.dependencies.cache_providers.get_native_library_store",
+        lambda: test_store,
+    )
+    monkeypatch.setattr(
+        "core.dependencies.service_providers.get_library_policy_resolver",
+        lambda: LibraryPolicyResolver(
+            mock_preferences.get_typed_library_settings.return_value
+        ),
+    )
+    return test_store
+
+
+@pytest.mark.asyncio
+async def test_forbidden_work_abort_writes_failure_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3/H3a: the forbidden-work guard leaves the counters that name the
+    offending guard behind instead of raising bare."""
+    from models.library_migration import MigrationDryRunReport
+    from services.native.bounded_legacy_catalog_migrator import (
+        BoundedMigrationOutcome,
+    )
+
+    class FakeMigrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        async def migrate(self, migration_id: str, now: float | None = None):
+            report = MigrationDryRunReport(
+                migration_id=migration_id,
+                source_revision="src",
+                root_revision="root",
+                state="applied",
+                identified_albums=0,
+                local_only_albums=0,
+                identified_tracks=0,
+                local_only_tracks=0,
+                artists=0,
+                reference_counts=[],
+                network_calls=1,
+                tag_reads=0,
+                fingerprints=0,
+                embedded_art_reads=0,
+            )
+            return BoundedMigrationOutcome(report=report, blocker_count=0)
+
+    settings, database = _forbidden_work_settings(tmp_path)
+    _stub_child_providers(monkeypatch, settings, database)
+    monkeypatch.setattr(
+        "services.native.bounded_legacy_catalog_migrator.BoundedLegacyCatalogMigrator",
+        FakeMigrator,
+    )
+
+    with pytest.raises(AutomaticUpgradeError, match="not allowed during startup"):
+        await automatic_upgrade._perform_target_migration()
+
+    failure = json.loads(
+        (settings.cache_dir / automatic_upgrade._FAILURE_EVIDENCE_FILE).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert failure["reason"] == "forbidden_work"
+    assert failure["network_calls"] == 1
+    assert failure["tag_reads"] == 0
+    assert "path_reconciliation" in failure
+
+
+def test_unrestorable_promotion_failure_is_recorded_truthfully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3/H3c: when the post-promotion restore itself fails, the state record
+    says so explicitly instead of leaving a bare `promoting` stage."""
+    settings = _settings(tmp_path)
+    _write_unmigrated_database(settings.library_db_path)
+
+    def runner(_working: Path) -> dict[str, object]:
+        return {"passed": True}
+
+    def broken_promote(_settings: Settings, _working: Path) -> None:
+        raise RuntimeError("simulated promotion crash")
+
+    def broken_restore(_settings: Settings, _backup: object) -> None:
+        raise OSError("restore volume unavailable")
+
+    monkeypatch.setattr(automatic_upgrade, "promote_working_copy", broken_promote)
+    monkeypatch.setattr(automatic_upgrade, "restore_upgrade_backup", broken_restore)
+
+    with pytest.raises(AutomaticUpgradeError) as error:
+        run_automatic_copy_upgrade(settings, runner=runner)
+
+    message = str(error.value)
+    assert "backup could not be restored" in message
+    assert "Do not start an older image" in message
+    state = json.loads(
+        (settings.cache_dir / f"automatic-upgrade-{UPGRADE_ID}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["stage"] == "promoting"
+    assert state["restore_failed"] is True
+    assert state["restore_error_type"] == "OSError"
+
+
+@pytest.mark.asyncio
+async def test_success_evidence_carries_breakdowns_timings_and_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4/H4: success evidence carries the per-kind provenance breakdown,
+    migrator phase timings, and source/config/image identities."""
+    from unittest.mock import AsyncMock
+
+    import services.native.legacy_path_reconciler as lpr_module
+    from api.v1.schemas.library_policies import (
+        LibraryRootSettings,
+        TypedLibrarySettings,
+    )
+    from services.native.library_policy_resolver import LibraryPolicyResolver
+    from services.native.target_startup_validator import TargetStartupValidator
+
+    settings, database = _forbidden_work_settings(tmp_path)
+    resolvable_roots = TypedLibrarySettings(
+        library_roots=[
+            LibraryRootSettings(
+                id="root",
+                path=str(tmp_path / "Historical" / "Music"),
+                label="Library",
+                policy="automatic",
+            )
+        ],
+        staging_path=str(tmp_path / "Staging"),
+    )
+    # /tmp is a blocked probe prefix in production; relax it exactly like the
+    # reconciler tests so the real reconciler can prove the seeded files.
+    monkeypatch.setattr(lpr_module, "_BLOCKED_ROOTS", (Path("/"),))
+    test_store = _stub_child_providers(monkeypatch, settings, database)
+    monkeypatch.setattr(
+        "core.dependencies.service_providers.get_library_policy_resolver",
+        lambda: LibraryPolicyResolver(resolvable_roots),
+    )
+    monkeypatch.setattr(
+        TargetStartupValidator,
+        "validate",
+        AsyncMock(return_value={"invariants": {}}),
+    )
+    monkeypatch.setenv("COMMIT_TAG", "evidence-test")
+
+    evidence = await automatic_upgrade._perform_target_migration()
+
+    store_counts = await test_store.get_migration_provenance_counts(
+        automatic_upgrade.MIGRATION_ID
+    )
+    assert store_counts
+    assert evidence["reference_counts"] == dict(sorted(store_counts.items()))
+    timings = evidence["phase_timings_ms"]
+    assert timings and all(value >= 0 for value in timings.values())
+    assert "Migrating identified catalog tracks" in timings
+    assert evidence["source_sha256"] == automatic_upgrade._sha256(database)
+    assert evidence["config_sha256"] == automatic_upgrade._sha256(
+        settings.config_file_path
+    )
+    assert evidence["image_version"] == "evidence-test"
+    assert evidence["invariants"] == {}
