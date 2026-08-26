@@ -303,6 +303,12 @@ class LibraryScanCoordinator:
         try:
             return await self._continue_run(run, root_paths)
         except Exception:  # noqa: BLE001 - a crashed worker must leave a terminal durable run
+            logger.exception(
+                "Scan worker failed for run %s during scan state %s",
+                run.id,
+                run.state,
+                extra={"run_id": run.id, "scan_state": run.state},
+            )
             current, _, _ = await self._store.get_scan_run(run.id)
             if current.state in {"pausing", "stopping"}:
                 return await self._settle_pending_control(current.id)

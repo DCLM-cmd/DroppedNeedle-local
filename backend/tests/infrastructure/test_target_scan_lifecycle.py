@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import logging
 import os
 import sqlite3
 import threading
@@ -639,6 +640,104 @@ async def test_scan_worker_exception_becomes_typed_terminal_failure(
     assert failed.terminal_code == "UNEXPECTED_WORKER_FAILURE"
 
 
+@pytest.mark.parametrize("control,expected_state", [("pause", "paused"), ("stop", "cancelled")])
+@pytest.mark.asyncio
+async def test_pending_control_worker_exception_is_logged_and_settles(
+    target_store: NativeLibraryStore, tmp_path: Path, control: str, expected_state: str, caplog
+) -> None:
+    caplog.set_level(logging.ERROR)
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    # Barrier to hold worker until control is persisted
+    proceed = asyncio.Event()
+    reached = asyncio.Event()
+
+    class BarrierInventory(LibraryInventoryScanner):
+        async def discover(self, run, scopes, root_paths, resolver_getter, checkpoint):
+            reached.set()
+            await proceed.wait()
+            raise RuntimeError(f"tag store failed during {control}")
+
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        BarrierInventory(target_store),
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: 20,
+    )
+    requested = await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=20)
+    assert run is not None
+    # Start worker and wait until it reaches barrier
+    worker_task = asyncio.create_task(coordinator.run_once({"root-a": root}))
+    await reached.wait()
+    # Submit control while worker is at barrier - fetch latest revision to avoid StaleRevisionError
+    cur, _, _ = await target_store.get_scan_run(run.id)
+    await coordinator.control(cur.id, control, cur.row_revision)
+    # Verify control was persisted
+    cur, _, _ = await target_store.get_scan_run(run.id)
+    assert cur.state == ("pausing" if control == "pause" else "stopping")
+    # Release worker to raise
+    proceed.set()
+    result = await worker_task
+    assert result is not None and result.state == expected_state
+    # Verify durable state and that the original exception was logged with traceback
+    stored, _, _ = await target_store.get_scan_run(run.id)
+    assert stored.state == expected_state
+    # Check log contains original exception identity and traceback, and run_id/control-state, no file path
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR and "Scan worker failed" in r.getMessage()]
+    assert len(error_records) == 1
+    # Original state should be discovering (the run's state before the worker exception), not pending control
+    assert "during scan state discovering" in error_records[0].getMessage()
+    assert "pending control" not in error_records[0].getMessage().lower()
+    assert run.id in error_records[0].getMessage()
+    # Exception identity and traceback
+    assert error_records[0].exc_info is not None
+    assert error_records[0].exc_info[0] is RuntimeError
+    assert f"tag store failed during {control}" in str(error_records[0].exc_info[1])
+    assert "RuntimeError" in caplog.text
+    assert "track-1.flac" not in caplog.text and "secret" not in caplog.text
+    # Verify stream/invalidation/gate cleanup: run is terminal, so gate should be cleared and no pending
+    assert coordinator._pending_control_run_ids == set()
+    if expected_state == "cancelled":
+        assert len(caplog.records) >= 1  # at least the one exception log
+
+
+@pytest.mark.asyncio
+async def test_active_worker_exception_still_becomes_typed_failure_and_is_reraised(
+    target_store: NativeLibraryStore, tmp_path: Path, caplog
+) -> None:
+    caplog.set_level(logging.ERROR)
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+
+    class BrokenInventory(LibraryInventoryScanner):
+        async def discover(self, *args, **kwargs):
+            raise RuntimeError("injected active failure")
+
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        BrokenInventory(target_store),
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: 20,
+    )
+    requested = await coordinator.request_run(_request(resolver))
+    with pytest.raises(RuntimeError, match="injected active failure"):
+        await coordinator.run_once({"root-a": root})
+    failed, _, _ = await target_store.get_scan_run(requested.run_id)
+    assert failed.state == "failed"
+    assert failed.terminal_code == "UNEXPECTED_WORKER_FAILURE"
+    # Also should have logged the exception with truthful state
+    error_records = [r for r in caplog.records if "Scan worker failed" in r.getMessage()]
+    assert len(error_records) == 1
+    assert "during scan state discovering" in error_records[0].getMessage()
+    assert requested.run_id in error_records[0].getMessage()
+    assert any("injected active failure" in str(r.exc_info[1]) for r in caplog.records if r.exc_info)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["discovering", "indexing", "reconciling"])
 async def test_pause_resume_and_stop_are_idempotent_at_every_phase(
