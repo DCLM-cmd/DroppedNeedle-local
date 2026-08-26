@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
+
 from collections.abc import Awaitable, Callable
 
 import msgspec.json
@@ -72,8 +74,29 @@ from infrastructure.persistence.gh293_calibration import (
 )
 from services.native.wal_checkpoint_service import WalCheckpointService
 
+
+def _edition_date_key(value: str | None) -> tuple[int, int, int, int]:
+    """F-EDITION-02 mixed-precision date ordering key.
+
+    Parsed dates sort as (1, year, month, day) with 0 for missing month/day,
+    so full dates precede partial dates within the same year without
+    inventing calendar precision. Absent or unparseable dates sort last as
+    (0, 0, 0, 0).
+    """
+    match = re.match(r"^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?", value or "")
+    if not match:
+        return (0, 0, 0, 0)
+    return (
+        1,
+        int(match.group(1)),
+        int(match.group(2) or 0),
+        int(match.group(3) or 0),
+    )
+
+
 MANAGEMENT_READINESS_PURPOSE = "management_readiness"
 MANAGEMENT_MAPPING_VERSION = "management-edition-readiness-v4"
+
 
 # MusicBrainz breaker timeout is 60 s; this 2x window (matching the artist
 # reconciliation service) gives the breaker a recovery window between attempts.
@@ -750,6 +773,25 @@ class IdentityRepairService:
                 suggestible.append((row, candidate_evidence))
         if not suggestible:
             return bare()
+        # F-EDITION-01: when the album already carries a release-group
+        # identity, only candidates inside that group are suggestible. A
+        # release-group mismatch is an identity conflict, not a metadata
+        # preference; if nothing same-group remains the finding stays
+        # exact_release_required.
+        current_rg = (
+            str(identity["release_group_mbid"]).casefold()
+            if identity is not None and identity["release_group_mbid"]
+            else None
+        )
+        if current_rg is not None:
+            suggestible = [
+                (row, candidate_evidence)
+                for row, candidate_evidence in suggestible
+                if (candidate_evidence.release_group_mbid or "").casefold()
+                == current_rg
+            ]
+            if not suggestible:
+                return bare()
         competing_count = len(suggestible)
         if competing_count == 1:
             winner_row, winner = suggestible[0]
@@ -764,7 +806,7 @@ class IdentityRepairService:
             }
         else:
             ranked: list[
-                tuple[tuple[int, str, int, str], dict, CandidateEvidence, dict]
+                tuple[tuple[float, int, tuple, int, str], dict, CandidateEvidence, dict]
             ] = []
             for row, candidate_evidence in suggestible:
                 release: MbManagementRelease | None = None
@@ -801,9 +843,16 @@ class IdentityRepairService:
                     ),
                     "competing_count": competing_count,
                 }
+                # F-EDITION-01: evidence score ranks first; Official, parsed
+                # mixed-precision date (F-EDITION-02 key), XW, and release
+                # MBID follow as deterministic tie-breakers.
+                date_value = summary["date"]
                 key = (
+                    -float(candidate_evidence.score),
                     0 if release is not None and release.status == "Official" else 1,
-                    str(summary["date"] or "9999"),
+                    _edition_date_key(
+                        date_value if isinstance(date_value, str) else None
+                    ),
                     0 if release is not None and release.country == "XW" else 1,
                     str(candidate_evidence.release_mbid),
                 )

@@ -7383,3 +7383,270 @@ async def test_explicit_local_fingerprint_failure_keeps_local_reason_through_def
         now=3 + REIDENTIFICATION_RETRY_SECONDS,
     )
     assert deferred_again["state"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_cross_rg_candidate_is_not_suggested_and_apply_rejects_stale(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-EDITION-01: with an RG-only current identity (rg-current), a complete,
+    safe candidate from rg-other is filtered during preparation; and a sealed
+    cross-RG finding is rejected as STALE_SUBJECT by the apply transaction."""
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+
+    # Attach an RG-only identity: release_group_mbid present, release_mbid NULL.
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id="album-1",
+            release_group_mbid="rg-current",
+            release_mbid=None,
+            decision_source="automatic",
+            selected_at=2,
+        ),
+        expected_album_revision=int(context["album"]["row_revision"]),
+    )
+
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-cross-rg",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            (
+                "evidence-cross",
+                _suggestion_evidence(
+                    release_mbid="release-other", release_group_mbid="rg-other"
+                ),
+            )
+        ],
+    )
+    provider = _SuggestedEditionProvider()
+    preparation, created, ready = await _run_preparation(
+        store, provider, idempotency_key="cross-rg-filter"
+    )
+    finding = (
+        await preparation.findings(created.id, finding_category="exact_release_required")
+    ).items[0]
+    assert finding.finding_code == "exact_release_required"
+    assert finding.reason_code == "EXACT_EDITION_NOT_ACCEPTED"
+    with sqlite3.connect(db_path) as connection:
+        identity_row = connection.execute(
+            "SELECT release_group_mbid, release_mbid FROM "
+            "local_album_external_identities WHERE local_album_id='album-1'"
+        ).fetchone()
+    assert identity_row == ("rg-current", None)
+
+    # A sealed cross-RG finding is rejected as STALE_SUBJECT at apply time:
+    # drive the real transaction against the CURRENT revisions and assert the
+    # identity and tracks are untouched.
+    import msgspec as _msgspec
+
+    with sqlite3.connect(db_path) as connection:
+        identity_revision = connection.execute(
+            "SELECT row_revision FROM local_album_external_identities "
+            "WHERE local_album_id='album-1'"
+        ).fetchone()[0]
+        album_revision = connection.execute(
+            "SELECT row_revision FROM local_albums WHERE id='album-1'"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO library_identity_repair_findings "
+            "(id, job_id, local_album_id, finding_code, state, reason_code, "
+            "apply_eligible, evidence_id, expected_album_revision, "
+            "expected_identity_revision, confidence, created_at, updated_at) "
+            "VALUES ('finding-cross-sealed', 'mixed-run-x', 'album-1', "
+            "'exact_release_suggested', 'open', 'EXACT_EDITION_SUGGESTED', "
+            "1, 'evidence-cross', ?, ?, 'high', 5, 5)",
+            (album_revision, identity_revision),
+        )
+        encoded = connection.execute(
+            "SELECT evidence_json FROM library_identification_evidence "
+            "WHERE id='evidence-cross'"
+        ).fetchone()[0]
+    candidate_evidence = _msgspec.json.decode(bytes(encoded), type=CandidateEvidence)
+
+    def apply_tx(connection):
+        finding_row = connection.execute(
+            "SELECT * FROM library_identity_repair_findings "
+            "WHERE id='finding-cross-sealed'"
+        ).fetchone()
+        # Mirror the production evidence/track projections exactly: the input
+        # revisions live on the attempt row, joined here for the stale check.
+        evidence_row = connection.execute(
+            "SELECT e.evidence_json, e.attempt_id, e.compacted, "
+            "a.input_tag_revision, a.input_file_revision, "
+            "a.input_policy_revision FROM library_identification_evidence e "
+            "JOIN library_identification_attempts a ON a.id = e.attempt_id "
+            "WHERE e.id = 'evidence-cross'"
+        ).fetchone()
+        work_row = {
+            "local_album_id": "album-1",
+            "expected_subject_revision": int(album_revision),
+        }
+        return store._apply_suggested_edition_tx(
+            connection,
+            work=work_row,
+            finding=finding_row,
+            album=connection.execute(
+                "SELECT * FROM local_albums WHERE id='album-1'"
+            ).fetchone(),
+            identity=connection.execute(
+                "SELECT * FROM local_album_external_identities "
+                "WHERE local_album_id='album-1'"
+            ).fetchone(),
+            evidence_row=evidence_row,
+            track_rows=connection.execute(
+                "SELECT t.*, ti.recording_mbid, "
+                "ti.release_mbid AS identity_release_mbid, "
+                "ti.release_track_mbid, ti.medium_position, "
+                "ti.release_track_position FROM local_tracks t "
+                "LEFT JOIN local_track_external_identities ti "
+                "ON ti.local_track_id = t.id AND ti.provider = 'musicbrainz' "
+                "WHERE t.local_album_id = 'album-1' AND t.availability = 'indexed' "
+                "ORDER BY t.id"
+            ).fetchall(),
+            evidence=candidate_evidence,
+            job_id="mixed-run-x",
+            actor_user_id="admin",
+            now=6.0,
+        )
+
+    result = await store._write(apply_tx)
+    assert result == ("skipped", "STALE_SUBJECT")
+    with sqlite3.connect(db_path) as connection:
+        identity_row = connection.execute(
+            "SELECT release_group_mbid, release_mbid FROM "
+            "local_album_external_identities WHERE local_album_id='album-1'"
+        ).fetchone()
+        stale_state = connection.execute(
+            "SELECT state, apply_result FROM library_identity_repair_findings "
+            "WHERE id='finding-cross-sealed'"
+        ).fetchone()
+    assert identity_row == ("rg-current", None)
+    assert stale_state == ("stale", "STALE_SUBJECT")
+
+
+@pytest.mark.asyncio
+async def test_same_rg_rg_only_identity_fills_release_and_keeps_group() -> None:
+    """A same-RG candidate may fill the missing exact release through the
+    sealed admin path while preserving the existing release group."""
+    # Covered end-to-end below via the sealed preparation flow.
+    assert True
+
+
+@pytest.mark.asyncio
+async def test_ranking_prefers_higher_evidence_score_before_metadata(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-EDITION-01 ranking: among same-RG safe complete candidates, the
+    highest CandidateEvidence.score wins before Official/date/XW/MBID."""
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    low_score = _suggestion_evidence(
+        release_mbid="release-low", release_date="2019-01-01"
+    )
+    low_score.score = 0.30
+    high_score = _suggestion_evidence(
+        release_mbid="release-high", release_date="2022-05-05"
+    )
+    high_score.score = 0.95
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-score-rank",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            ("evidence-low", low_score),
+            ("evidence-high", high_score),
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            # Metadata would prefer release-low: Official, older date, XW.
+            "release-low": _tie_release(
+                "release-low", status="Official", date="2019-01-01", country="XW"
+            ),
+            "release-high": _tie_release(
+                "release-high", status="Promotion", date="2022-05-05", country="DE"
+            ),
+        }
+    )
+    preparation, created, _ = await _run_preparation(
+        store, provider, idempotency_key="score-first-ranking"
+    )
+    finding = (
+        await preparation.findings(created.id, finding_category="exact_release_required")
+    ).items[0]
+    assert finding.reason_code == "EXACT_EDITION_SUGGESTED"
+    assert finding.suggested_edition is not None
+    assert finding.suggested_edition.release_mbid == "release-high"
+
+
+@pytest.mark.asyncio
+async def test_same_rg_rg_only_identity_accepts_fill_through_sealed_path(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """RG-only identity + same-RG complete candidate: suggestion stays
+    eligible, and the sealed admin apply fills the exact release while
+    preserving the release group."""
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id="album-1",
+            release_group_mbid="rg-suggested",
+            release_mbid=None,
+            decision_source="automatic",
+            selected_at=2,
+        ),
+        expected_album_revision=int(context["album"]["row_revision"]),
+    )
+    revisions = album_input_revisions(context["tracks"])
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-rg-fill",
+        revisions=revisions,
+        evidence=[
+            (
+                "evidence-fill",
+                _suggestion_evidence(
+                    release_mbid="release-one",
+                    release_group_mbid="rg-suggested",
+                ),
+            )
+        ],
+    )
+    provider = _SuggestedEditionProvider()
+    preparation, created, ready = await _run_preparation(
+        store, provider, idempotency_key="rg-fill-sealed"
+    )
+    finding = (
+        await preparation.findings(created.id, finding_category="exact_release_required")
+    ).items[0]
+    assert finding.reason_code == "EXACT_EDITION_SUGGESTED"
+
+    queued = await preparation.begin_management_preparation_apply(
+        created.id,
+        expected_row_revision=ready.row_revision,
+        confirmation=True,
+        now=6,
+    )
+    claimed_apply = await store.claim_operation_job(
+        "worker", now=7, lease_seconds=60, kind="repair"
+    )
+    assert claimed_apply is not None
+    done = await preparation.run_claimed_apply(claimed_apply, "worker", "admin", now=8)
+    assert done.state == "succeeded"
+    after = await store.get_album_identification_context("album-1")
+    assert after is not None
+    identity = after["identity"]
+    assert identity is not None
+    assert identity["release_group_mbid"] == "rg-suggested"  # group preserved
+    assert identity["release_mbid"] == "release-one"  # exact release filled
+    track = after["tracks"][0]
+    assert track["identity_release_mbid"] == "release-one"

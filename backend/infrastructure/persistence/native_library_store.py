@@ -29515,6 +29515,11 @@ class NativeLibraryStore(PersistenceBase):
                     int(identity["row_revision"])
                     != int(finding["expected_identity_revision"])
                     or identity["release_mbid"] is not None
+                    # F-EDITION-01: an existing release group must equal the
+                    # candidate's - a cross-RG write is an identity conflict,
+                    # evaluated in addition to every revision guard above.
+                    or (identity["release_group_mbid"] or "").casefold()
+                    != (evidence.release_group_mbid or "").casefold()
                 )
             )
             or evidence.reason_code not in AUTOMATIC_SAFE_EVIDENCE_REASONS
