@@ -8265,6 +8265,13 @@ class NativeLibraryStore(PersistenceBase):
             queued = next((row for row in rows if row["state"] == "queued"), None)
 
             def covers(row: sqlite3.Row) -> bool:
+                # Signed F-SCAN-02 rule (LibraryAudit DECISIONS-LIVE): only a
+                # queued run may cover a request. A matching request during
+                # active, paused, or stopping work must fall through and create
+                # or expand the one durable queued follow-up instead of being
+                # acknowledged against work that can still fail or be cancelled.
+                if row["state"] != "queued":
+                    return False
                 if row["kind"] != request.kind:
                     return False
                 existing = connection.execute(
