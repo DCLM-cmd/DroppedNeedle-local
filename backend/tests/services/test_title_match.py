@@ -295,3 +295,39 @@ def test_boxset_compound_folds_but_bare_set_stays_an_album_word() -> None:
     assert names_different_album(
         "Led Zeppelin", "Led Zeppelin", "Led Zeppelin - Set"
     ) is True
+
+
+# --- GH-284: digit-bearing artist names earn evidence safely --------------------
+
+
+@pytest.mark.parametrize(
+    ("artist", "path"),
+    [
+        ("deadmau5", "/music/deadmau5/4x4=12/track-1.mp3"),
+        ("deadmau5", "/music/Deadmau5 - For Lack of a Better Name/track-1.mp3"),
+        ("U2", "/music/u2/the-joshua-tree/track-1.mp3"),
+        ("311", "/music/311/greatest-hits/track-1.flac"),
+        ("Matchbox 20", "/music/matchbox 20/yourself or someone like you/track-1.mp3"),
+    ],
+)
+def test_digit_bearing_artists_match_their_own_paths(artist: str, path: str):
+    assert artist_evidence(artist, path) is True
+
+
+@pytest.mark.parametrize(
+    ("artist", "path"),
+    [
+        # a bare year in the path is not the artist "311"
+        ("311", "/music/various/greatest hits of 1994/311 - song.mp3".replace("311 - ", "")),
+        # track ordinal containing the digits is not artist evidence
+        ("311", "/music/various/album 311 disc/track-7.mp3"),
+        # unrelated numeric directory
+        ("311", "/music/1999/backstreet boys/track-1.mp3"),
+        # wrong artist entirely
+        ("deadmau5", "/music/other artist/album/track-1.mp3"),
+        # obfuscated path without the name
+        ("u2", "/music/a---b/c--d/track-1.mp3"),
+    ],
+)
+def test_numeric_looking_paths_stay_negative(artist: str, path: str):
+    assert artist_evidence(artist, path) is False

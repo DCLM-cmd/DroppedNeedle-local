@@ -19,6 +19,8 @@ from models.download import ScoredCandidate, TargetAlbum
 from repositories.protocols.download_client import DownloadSearchResult
 from services.native.acquisition.decision import SpecPolicy
 from services.native.album_preflight_scorer import (
+    _has_artist_evidence,
+
     AlbumPreflightScorer,
     _artist_from_path,
     _file_confidence,
@@ -638,3 +640,77 @@ async def test_fedition03_reissue_folder_rankable_but_sequel_excluded():
         for n in range(1, 10)
     ]
     assert await scorer.rank(target, sequel) == []  # different album excluded
+
+
+# --- GH-284: digit-bearing artists earn evidence from their own paths ----------
+
+
+def _result_for(filename: str) -> DownloadSearchResult:
+    parent, name = filename.rsplit("/", 1)
+    return _mk(parent, name)
+
+
+@pytest.mark.parametrize(
+    ("artist", "filename", "expected"),
+    [
+        # artist directory present in the Soulseek path -> evidence
+        ("deadmau5", "/music/deadmau5/For Lack of a Better Name/track-1.flac", True),
+        ("u2", "/music/u2/the joshua tree/track-1.flac", True),
+        # pure-numeric name matches an exact path segment
+        ("311", "/music/311/greatest hits/track-1.flac", True),
+        ("311", "/music/311/track-1.flac", True),
+        ("Matchbox 20", "/music/matchbox 20/album/track-1.mp3", True),
+    ],
+)
+def test_digit_bearing_artists_earn_evidence_from_their_paths(
+    artist: str, filename: str, expected: bool
+) -> None:
+    target = TargetAlbum(artist_name=artist, album_title="Greatest Hits")
+    assert _has_artist_evidence(target, [_result_for(filename)]) is expected
+
+
+@pytest.mark.parametrize(
+    ("artist", "filename"),
+    [
+        # a bare year directory is not the artist "311"
+        ("311", "/music/1994 greatest hits/track-1.flac"),
+        # a track ordinal carrying the digits is not artist evidence either
+        ("311", "/music/various/album/1994 - track-311.flac"),
+    ],
+)
+def test_numeric_year_and_ordinal_paths_stay_negative(
+    artist: str, filename: str
+) -> None:
+    target = TargetAlbum(artist_name=artist, album_title="Whatever")
+    assert _has_artist_evidence(target, [_result_for(filename)]) is False
+
+
+def test_wrong_artist_stays_negative() -> None:
+    target = TargetAlbum(artist_name="deadmau5", album_title="Whatever")
+    assert (
+        _has_artist_evidence(
+            target,
+            [_result_for("/music/random artist/album/track-1.flac")],
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_high_score_deadmau5_candidate_reaches_auto():
+    """End-to-end rank(): a deadmau5 candidate above threshold with matching
+    artist-path evidence auto-accepts instead of being evidence-capped."""
+    files = [
+        _mk("/music/deadmau5/For Lack of a Better Name", f"track-{n}.flac")
+        for n in (1, 2)
+    ]
+    target = TargetAlbum(
+        artist_name="deadmau5",
+        album_title="For Lack of a Better Name",
+        track_count=2,
+    )
+    scorer = AlbumPreflightScorer(_store())
+    candidates = await scorer.rank(target, files, auto_accept_threshold=0.7)
+    assert candidates
+    top = candidates[0]
+    assert top.tier == "auto"

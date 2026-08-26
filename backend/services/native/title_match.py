@@ -31,6 +31,7 @@ Design (validated against real Newznab/Soulseek result sets):
   the same scene-filename-collision caution that keeps ``part N`` out of the markers.
 """
 
+from pathlib import Path
 import re
 import unicodedata
 
@@ -228,13 +229,32 @@ def artist_evidence(artist_name: str, candidate_path: str) -> bool:
 
     Stopwords are dropped from the artist's words so "The Who" needs "who", not the
     ubiquitous "the" (fallback to all words when the name is entirely stopwords)."""
-    words = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2 and t not in _STOP}
+    # GH-284: digit-bearing names (deadmau5, u2) keep their alphanumeric tokens -
+    # ``isalpha()`` alone dropped them, so no candidate could ever earn evidence.
+    # Pure-numeric names (311) are excluded here: a bare number must match an
+    # exact path SEGMENT (artist directory), not any word in the path.
+    name_tokens = _tokens(artist_name)
+    words = {
+        t
+        for t in name_tokens
+        if len(t) >= 2
+        and (t.isalpha() or (any(c.isdigit() for c in t) and any(c.isalpha() for c in t)))
+        and t not in _STOP
+    }
     if not words:
-        words = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2}
+        words = {t for t in name_tokens if t.isalpha() and len(t) >= 2}
+    pure_numeric = {t for t in name_tokens if t.isdigit() and len(t) >= 2}
     # Soulseek remote paths are backslash-delimited; ``_SEP_RE`` (calibrated for release
     # TITLES) doesn't split on backslash, so normalise to '/' before tokenising or every
     # directory level glues to its neighbour and the artist token is never seen.
-    return _artist_present(_tokens(candidate_path.replace("\\", "/")), words)
+    normalized = candidate_path.replace("\\", "/")
+    if _artist_present(_tokens(normalized), words):
+        return True
+    if pure_numeric:
+        segments = {part.casefold() for part in normalized.split("/") if part}
+        stems = {Path(part).stem.casefold() for part in segments if "." in part}
+        return bool(pure_numeric & (segments | stems))
+    return False
 
 
 def names_different_album(album_title: str, artist_name: str, candidate_title: str) -> bool:
