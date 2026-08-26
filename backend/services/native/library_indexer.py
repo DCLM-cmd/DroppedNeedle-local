@@ -18,7 +18,7 @@ from core.exceptions import AudioFormatError
 from infrastructure.audio.metadata_engine import legacy_audio_projection
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.audio import AudioArtistCredit, AudioInfo, AudioTag
-from models.library_work import ScanRun, ScannedTrackWrite
+from models.library_work import ScanFailureRecord, ScanRun, ScannedTrackWrite
 from models.local_catalog import (
     LocalAlbum,
     LocalArtist,
@@ -95,6 +95,29 @@ class LibraryIndexer:
             asyncio.Task[tuple[AudioTag, AudioInfo, os.stat_result]]
         ] = set()
 
+    def _failure_record(
+        self,
+        run_id: str,
+        position: tuple[str, str],
+        failure_code: str,
+        *,
+        detail: str,
+        error: BaseException | None = None,
+    ) -> ScanFailureRecord:
+        """Safe deterministic detail for an indexing failure: the exception
+        CLASS is recorded, never str(error) or filesystem paths (NEW-SCAN-04)."""
+        class_name = type(error).__name__ if error is not None else None
+        detail_text = f"{detail} (exception class: {class_name})" if class_name else detail
+        root_id, relative_path = position
+        return ScanFailureRecord(
+            root_id=root_id,
+            relative_path=relative_path,
+            failure_code=failure_code,
+            recorded_at=self._clock(),
+            failure_detail=detail_text,
+            phase="indexing",
+        )
+
     async def index(
         self,
         run: ScanRun,
@@ -136,6 +159,9 @@ class LibraryIndexer:
                 "errored": 0,
             }
             writes: list[ScannedTrackWrite] = []
+            # F-SCAN-04/NEW-SCAN-04: indexing failures carry a stable, safe
+            # detail (no raw exception text or paths) through to the store.
+            failures: list[ScanFailureRecord] = []
             states: dict[str, list[tuple[str, str]]] = {
                 "unchanged": [],
                 "excluded": [],
@@ -178,7 +204,15 @@ class LibraryIndexer:
                     if stable[4]:
                         return counts
                     if stable[0] is None or stable[1] is None or stable[2] is None:
-                        failures.append((*key[0], "FILE_CHANGED_DURING_READ"))
+                        failures.append(
+                            self._failure_record(
+                                run.id, key[0], "FILE_CHANGED_DURING_READ",
+                                detail=(
+                                    "The file changed during the stable tag-read "
+                                    "consistency check."
+                                ),
+                            )
+                        )
                         batch_counts["errored"] += 1
                         continue
                     tag, info, stat = stable[:3]
@@ -203,13 +237,56 @@ class LibraryIndexer:
                     elif item["comparison_result"] == "changed":
                         batch_counts["changed"] += 1
                 except _TagReadCapacityExhausted:
-                    failures.append((*key[0], "TAG_READ_DEFERRED"))
+                    failures.append(
+                        self._failure_record(
+                            run.id, key[0], "TAG_READ_DEFERRED",
+                            detail=(
+                                f"The detached tag-read capacity of "
+                                f"{MAX_DETACHED_TAG_READS} was exhausted; the read "
+                                "is deferred for this run."
+                            ),
+                        )
+                    )
                     batch_counts["errored"] += 1
                 except _TagReadTimedOut:
-                    failures.append((*key[0], "TAG_READ_TIMEOUT"))
+                    failures.append(
+                        self._failure_record(
+                            run.id, key[0], "TAG_READ_TIMEOUT",
+                            detail=(
+                                f"The tag read exceeded its "
+                                f"{self._tag_read_timeout_seconds:.1f}s deadline. "
+                                "A kernel-blocked read is bounded by the timeout but "
+                                "the underlying syscall may still be running."
+                            ),
+                        )
+                    )
                     batch_counts["errored"] += 1
-                except (AudioFormatError, OSError, ValueError):
-                    failures.append((*key[0], "TAG_READ_FAILED"))
+                except AudioFormatError as error:
+                    failures.append(
+                        self._failure_record(
+                            run.id, key[0], "TAG_READ_FAILED",
+                            detail="AudioFormatError while reading tags.",
+                            error=error,
+                        )
+                    )
+                    batch_counts["errored"] += 1
+                except OSError as error:
+                    failures.append(
+                        self._failure_record(
+                            run.id, key[0], "TAG_READ_FAILED",
+                            detail="OSError while reading tags.",
+                            error=error,
+                        )
+                    )
+                    batch_counts["errored"] += 1
+                except ValueError as error:
+                    failures.append(
+                        self._failure_record(
+                            run.id, key[0], "TAG_READ_FAILED",
+                            detail="ValueError while reading tags.",
+                            error=error,
+                        )
+                    )
                     batch_counts["errored"] += 1
             if checkpoint is not None and not await checkpoint(
                 run.id, frozen_policy_revision

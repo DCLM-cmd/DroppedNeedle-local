@@ -733,11 +733,25 @@ async def test_commit_scan_index_batch_records_failure_rows(
         ScanRun(id="scan-index", kind="incremental", trigger="manual", queued_at=1)
     )
 
+    # NEW-SCAN-04: indexing failures carry their safe detail through the batch.
     await store.commit_scan_index_batch(
         "scan-index",
         writes=[],
         states={},
-        failures=[("root-1", "broken.flac", "TAG_READ_TIMEOUT")],
+        failures=[
+            ScanFailureRecord(
+                root_id="root-1",
+                relative_path="broken.flac",
+                failure_code="TAG_READ_TIMEOUT",
+                recorded_at=1.5,
+                failure_detail=(
+                    "The tag read exceeded its 30.0s deadline. A kernel-blocked "
+                    "read is bounded by the timeout but the underlying syscall "
+                    "may still be running."
+                ),
+                phase="indexing",
+            )
+        ],
         increments={},
         updated_at=2.0,
     )
@@ -748,7 +762,9 @@ async def test_commit_scan_index_batch_records_failure_rows(
         (item.root_id, item.relative_path, item.failure_code, item.phase)
         for item in items
     ] == [("root-1", "broken.flac", "TAG_READ_TIMEOUT", "indexing")]
-    assert items[0].recorded_at == 2.0
+    assert items[0].recorded_at == 1.5
+    assert "30.0s deadline" in items[0].failure_detail
+    assert "kernel-blocked" in items[0].failure_detail
 
 
 @pytest.mark.asyncio

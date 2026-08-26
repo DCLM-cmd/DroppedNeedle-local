@@ -47,8 +47,10 @@ from models.identification import (
 )
 from models.library_work import (
     ReviewDecision,
+    ScanFailureRecord,
     ScanRequest,
     ScanRequestResult,
+    ScanRun,
     ScanScope,
 )
 from models.local_catalog import (
@@ -7196,3 +7198,56 @@ async def test_management_identity_preparation_apply_skips_stale_suggested_editi
             ).fetchone()[0]
             == 0
         )
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_export_includes_bounded_hashed_failure_rows(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """NEW-SCAN-04: the diagnostic export carries bounded indexing failure rows
+    with hashed paths and safe details - never raw paths or exception text."""
+    await store.create_scan_run(
+        ScanRun(id="run-diag-fail", kind="incremental", trigger="manual", queued_at=1)
+    )
+    await store.record_scan_failures(
+        "run-diag-fail",
+        [
+            ScanFailureRecord(
+                root_id="root-a",
+                relative_path="secret/dir/track.flac",
+                failure_code="TAG_READ_TIMEOUT",
+                recorded_at=5.0,
+                failure_detail=(
+                    "The tag read exceeded its 30.0s deadline. A kernel-blocked "
+                    "read is bounded by the timeout but the underlying syscall "
+                    "may still be running."
+                ),
+                phase="indexing",
+            ),
+            ScanFailureRecord(
+                root_id="root-a",
+                relative_path="secret/dir/other.flac",
+                failure_code="TAG_READ_FAILED",
+                recorded_at=6.0,
+                failure_detail="ValueError while reading tags.",
+                phase="indexing",
+            ),
+        ],
+    )
+
+    service = LibraryDiagnosticsService(store)
+    filename, payload = await service.export("run-diag-fail")
+    decoded = json.loads(payload)
+
+    assert len(decoded["failures"]) == 2
+    assert decoded["failures_truncated"] is False
+    for failure in decoded["failures"]:
+        assert "relative_path" not in failure
+        assert failure["relative_path_hash"]
+        assert "exception class" not in failure["failure_detail"]
+    codes = {failure["failure_code"] for failure in decoded["failures"]}
+    assert codes == {"TAG_READ_TIMEOUT", "TAG_READ_FAILED"}
+    # Raw paths and strerror text stay out of the payload.
+    assert b"secret/dir" not in payload
+    with pytest.raises(ValidationError):
+        await LibraryDiagnosticsService(store).export("../escape")

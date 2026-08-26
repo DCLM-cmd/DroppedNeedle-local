@@ -633,6 +633,38 @@ def test_scan_runs_start_rejects_a_disabled_library_with_the_switch_message(
     assert "disabled" in response.json()["error"]["message"]
 
 
+def test_scan_run_failures_returns_persisted_detail_for_indexing_rows(
+    admin_client, native_store: AsyncMock
+) -> None:
+    """NEW-SCAN-04: the failures endpoint serializes the safe detail recorded by
+    the indexer (timeout deadline, capacity, exception class) for admin eyes."""
+    native_store.list_scan_run_failures.return_value = (
+        [
+            ScanFailureRecord(
+                root_id="root-a",
+                relative_path="hashed/away.flac",
+                failure_code="TAG_READ_TIMEOUT",
+                recorded_at=12.5,
+                failure_detail=(
+                    "The tag read exceeded its 30.0s deadline. A kernel-blocked "
+                    "read is bounded by the timeout but the underlying syscall "
+                    "may still be running."
+                ),
+                phase="indexing",
+            )
+        ],
+        None,
+    )
+
+    resp = admin_client.get("/library/scan-runs/run-1/failures")
+
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+    assert item["failure_code"] == "TAG_READ_TIMEOUT"
+    assert "30.0s deadline" in item["failure_detail"]
+    assert item["phase"] == "indexing"
+
+
 def test_scan_run_failures_returns_snake_case_items(
     admin_client, native_store: AsyncMock
 ) -> None:

@@ -56,6 +56,20 @@ class LibraryDiagnosticsService:
             }
             for item in snapshot["inventory"]
         ]
+        # NEW-SCAN-04: bounded failure rows, path-hashed like scopes/inventory.
+        safe_failures = [
+            {
+                **{
+                    key: value
+                    for key, value in failure.items()
+                    if key != "relative_path"
+                },
+                "relative_path_hash": self._hash_path(
+                    str(failure["relative_path"])
+                ),
+            }
+            for failure in snapshot.get("failures", [])
+        ]
         document = {
             "format": "droppedneedle-library-diagnostic-v1",
             "run": safe_run,
@@ -63,6 +77,8 @@ class LibraryDiagnosticsService:
             "scopes_truncated": snapshot["scopes_truncated"],
             "inventory": safe_inventory,
             "inventory_truncated": snapshot["inventory_truncated"],
+            "failures": safe_failures,
+            "failures_truncated": snapshot["failures_truncated"],
             "exported_row_count": snapshot["exported_row_count"],
             "evidence_storage": snapshot["evidence"],
             "limits": {

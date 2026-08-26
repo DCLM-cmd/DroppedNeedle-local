@@ -20,6 +20,8 @@ from infrastructure.queue.durable_work_wakeup import DurableWorkWakeups
 from models.library_work import ScanRun, ScanRunSnapshot, ScanScope
 from services.compat.target_scan_service import TargetCompatScanService
 from services.native.library_scan_events import LibraryScanEventPublisher
+from infrastructure.persistence.native_library_store import NativeLibraryStore
+from services.native.library_indexer import LibraryIndexer
 from services.native.library_inventory_scanner import (
     INVENTORY_BATCH_SIZE,
     LibraryInventoryScanner,
@@ -44,6 +46,7 @@ from services.native.target_application_runtime import (
     run_target_operation_worker,
     run_target_worker_watchdog,
 )
+from core.exceptions import AudioFormatError
 from infrastructure.resilience.retry import CircuitState
 from services.native.background_workload_gate import BackgroundWorkloadGate
 from services.native.library_filesystem_coordinator import LibraryFilesystemCoordinator
@@ -2425,3 +2428,101 @@ async def test_control_exit_partial_scope_has_no_permission_code(
         state="partially_read",
         error_code=None,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_class"),
+    [
+        (AudioFormatError("bad metadata container"), "AudioFormatError"),
+        (OSError(5, "input/output error"), "OSError"),
+        (ValueError("bad value"), "ValueError"),
+    ],
+)
+async def test_tag_read_failures_persist_safe_class_detail(
+    tmp_path: Path, error: Exception, expected_class: str
+) -> None:
+    """NEW-SCAN-04: TAG_READ_FAILED rows record the safe exception CLASS and a
+    stable operation label - never str(error) or filesystem paths."""
+    import sqlite3 as _sqlite3
+
+    from models.library_work import ScanInventoryItem
+
+    root = tmp_path / "music"
+    root.mkdir()
+    store = NativeLibraryStore(tmp_path / "library.db", threading.Lock())
+    with _sqlite3.connect(store.db_path) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+
+    class FailingTagger:
+        def read_tags(self, path: Path):
+            raise error
+
+    from api.v1.schemas.library_policies import (
+        LibraryRootSettings,
+        TypedLibrarySettings,
+    )
+    from services.native.library_indexer import LibraryIndexer
+    from services.native.library_policy_resolver import LibraryPolicyResolver
+
+    resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(
+                    id="root-a", path=str(root), label="L", policy="automatic"
+                )
+            ]
+        )
+    )
+    indexer = LibraryIndexer(store, FailingTagger())
+
+    await store.create_scan_run(
+        ScanRun(id="run-fail", kind="incremental", trigger="manual", queued_at=1)
+    )
+    run = await store.claim_next_scan_run(now=2)
+    assert run is not None
+    # The batch fetch joins inventory to its scope row; seed the scope the
+    # discovery walk would have created.
+    with _sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_run_scopes "
+            "(run_id, scope_sequence, root_id, relative_path, effective_policy, "
+            "policy_revision, discovery_state, discovery_generation) "
+            "VALUES (?, 0, 'root-a', '.', 'automatic', 'policy', 'completed', 1)",
+            ("run-fail",),
+        )
+    await store.add_scan_inventory_batch(
+        run.id,
+        [
+            ScanInventoryItem(
+                root_id="root-a",
+                relative_path="track-1.flac",
+                absolute_path=str(root / "track-1.flac"),
+                file_size_bytes=10,
+                file_mtime_ns=1,
+                stat_revision="s1",
+                policy_revision="policy",
+                effective_policy="automatic",
+                comparison_result="new",
+            )
+        ],
+        expected_run_revision=run.row_revision,
+        updated_at=2.0,
+    )
+
+    async def checkpoint(_run_id: str, _revision: str) -> bool:
+        return True
+
+    counts = await indexer.index(run, "policy", checkpoint)
+    assert counts["errored"] == 1
+
+    failures, _cursor = await store.list_scan_run_failures(run.id)
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure.failure_code == "TAG_READ_FAILED"
+    assert failure.phase == "indexing"
+    assert expected_class in failure.failure_detail
+    assert "reading tags" in failure.failure_detail
+    if expected_class == "OSError":
+        # Redaction: the raw strerror never enters the persisted row.
+        assert "input/output error" not in failure.failure_detail

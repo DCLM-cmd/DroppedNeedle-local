@@ -102,6 +102,7 @@ def test_scan_reuses_provider_identical_album_artist_for_track_credit() -> None:
         },
         tag,
         info,
+        now=100.0,
     )
 
     assert (
@@ -242,7 +243,7 @@ async def test_scan_persists_native_genres_and_all_known_artist_credits_without_
         "effective_policy": "automatic",
         "comparison_result": "new",
     }
-    write = indexer._prepare_tagged("scan-1", item, tag, info)
+    write = indexer._prepare_tagged("scan-1", item, tag, info, now=100.0)
     increments = {
         "inspected_count": 1,
         "new_count": 1,

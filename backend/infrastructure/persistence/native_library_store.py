@@ -8071,6 +8071,15 @@ class NativeLibraryStore(PersistenceBase):
                 (run_id, inventory_limit + 1),
             ).fetchall()
             exported_inventory = inventory[:inventory_limit]
+            # NEW-SCAN-04: bounded, redacted failure rows join the export so a
+            # stuck tag read or malformed file is distinguishable off-box.
+            failures = connection.execute(
+                "SELECT root_id, relative_path, failure_code, failure_detail, phase, "
+                "recorded_at FROM library_scan_failures WHERE run_id = ? "
+                "ORDER BY recorded_at, root_id, relative_path LIMIT ?",
+                (run_id, row_limit + 1),
+            ).fetchall()
+            exported_failures = failures[:row_limit]
             evidence = connection.execute(
                 "SELECT COUNT(*) rows, COALESCE(SUM(evidence_size_bytes),0) bytes, "
                 "COALESCE(SUM(compacted),0) compacted_rows, MIN(created_at) oldest_at, "
@@ -8106,7 +8115,13 @@ class NativeLibraryStore(PersistenceBase):
                 "scopes_truncated": len(scopes) > row_limit,
                 "inventory": [dict(row) for row in exported_inventory],
                 "inventory_truncated": len(inventory) > inventory_limit,
-                "exported_row_count": len(exported_scopes) + len(exported_inventory),
+                "failures": [dict(row) for row in exported_failures],
+                "failures_truncated": len(failures) > row_limit,
+                "exported_row_count": (
+                    len(exported_scopes)
+                    + len(exported_inventory)
+                    + len(exported_failures)
+                ),
                 "evidence": {
                     **dict(evidence),
                     "protected_rows": int(protected),
@@ -10024,11 +10039,16 @@ class NativeLibraryStore(PersistenceBase):
         *,
         writes: list[ScannedTrackWrite],
         states: dict[str, list[tuple[str, str]]],
-        failures: list[tuple[str, str, str]],
+        failures: list[ScanFailureRecord],
         increments: dict[str, int],
         updated_at: float,
     ) -> ScanRun:
-        """Commit catalog, inventory, counters, heartbeat, and stream atomically."""
+        """Commit catalog, inventory, counters, heartbeat, and stream atomically.
+
+        NEW-SCAN-04: indexing failures arrive as detailed ``ScanFailureRecord``
+        values; the same detail is written to the inventory failure code and the
+        failure-table row in this one transaction."""
+
 
         def operation(connection: sqlite3.Connection) -> ScanRun:
             catalog_changed = False
@@ -10055,17 +10075,25 @@ class NativeLibraryStore(PersistenceBase):
                 "failure_code = ?, row_revision = row_revision + 1 "
                 "WHERE run_id = ? AND root_id = ? AND relative_path = ?",
                 [
-                    (failure_code, run_id, root_id, path)
-                    for root_id, path, failure_code in failures
+                    (record.failure_code, run_id, record.root_id, record.relative_path)
+                    for record in failures
                 ],
             )
             connection.executemany(
                 "INSERT OR IGNORE INTO library_scan_failures "
                 "(run_id, root_id, relative_path, failure_code, failure_detail, "
-                "phase, recorded_at) VALUES (?, ?, ?, ?, '', 'indexing', ?)",
+                "phase, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [
-                    (run_id, root_id, path, failure_code, updated_at)
-                    for root_id, path, failure_code in failures
+                    (
+                        run_id,
+                        record.root_id,
+                        record.relative_path,
+                        record.failure_code,
+                        record.failure_detail,
+                        "indexing",
+                        record.recorded_at,
+                    )
+                    for record in failures
                 ],
             )
             if catalog_changed:
