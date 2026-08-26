@@ -281,13 +281,23 @@ function resolveStreamUrl(sourceType: string, trackSourceId: string): string | u
 export function playlistTrackToQueueItem(track: PlaylistTrack): QueueItem | null {
 	if (!track.track_source_id) return null;
 
-	const sourceType = track.source_type as SourceType;
 	const availableSources: SourceType[] = track.available_sources
 		? (track.available_sources as SourceType[])
-		: [sourceType];
+		: [track.source_type as SourceType];
+
+	// Local-first, mirroring selectBestSource: a resolved local file plays from
+	// the library while sourceIds keeps the imported source for manual switch.
+	const prefersLocal = Boolean(track.library_file_id) && availableSources.includes('local');
+	const sourceType = (prefersLocal ? 'local' : track.source_type) as SourceType;
+	const trackSourceId = prefersLocal ? track.library_file_id! : track.track_source_id;
+
+	const sourceIds: Partial<Record<SourceType, string>> = {
+		[track.source_type as SourceType]: track.track_source_id
+	};
+	if (track.library_file_id) sourceIds.local = track.library_file_id;
 
 	return {
-		trackSourceId: track.track_source_id,
+		trackSourceId,
 		trackName: track.track_name,
 		artistName: track.artist_name,
 		trackNumber: track.track_number ?? track.position,
@@ -297,12 +307,13 @@ export function playlistTrackToQueueItem(track: PlaylistTrack): QueueItem | null
 		coverUrl: track.cover_url,
 		sourceType,
 		artistId: track.artist_id ?? undefined,
-		streamUrl: resolveStreamUrl(sourceType, track.track_source_id),
+		streamUrl: resolveStreamUrl(sourceType, trackSourceId),
 		format: track.format ?? undefined,
 		availableSources,
+		sourceIds,
 		duration: track.duration ?? undefined,
 		playlistTrackId: track.id,
-		plexRatingKey: sourceType === 'plex' ? (track.plex_rating_key ?? undefined) : undefined
+		plexRatingKey: track.source_type === 'plex' ? (track.plex_rating_key ?? undefined) : undefined
 	};
 }
 
@@ -326,17 +337,18 @@ export function buildDiscoveryQueueFromNavidrome(tracks: NavidromeTrackInfo[]): 
 
 export function buildDiscoveryQueueFromLocal(tracks: NativeTrackListItem[]): QueueItem[] {
 	return tracks.map((t) => ({
-		trackSourceId: t.track_file_id,
+		trackSourceId: t.id,
 		trackName: t.title,
 		artistName: t.artist_name,
 		trackNumber: t.track_number,
 		discNumber: normalizeDiscNumber(t.disc_number),
-		albumId: t.album_mbid ?? '',
-		albumName: t.album_name,
-		coverUrl: getCoverUrl(t.cover_url, t.album_mbid ?? ''),
-		coverRemoteUrl: t.cover_url ?? null,
+		albumId: t.album_id,
+		albumName: t.album_title,
+		coverUrl: getCoverUrl(null, t.album_id),
+		coverRemoteUrl: null,
 		sourceType: 'local' as const,
-		streamUrl: API.stream.local(t.track_file_id),
+		artistId: t.artist_id,
+		streamUrl: API.stream.local(t.id),
 		format: (t.format ?? '').toLowerCase(),
 		availableSources: ['local'] as SourceType[],
 		duration: t.duration_seconds ?? undefined

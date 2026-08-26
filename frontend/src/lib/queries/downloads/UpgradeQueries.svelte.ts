@@ -4,6 +4,7 @@ import type { Getter } from 'runed';
 import { api } from '$lib/api/client';
 import { API } from '$lib/constants';
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
+import { authStore } from '$lib/stores/authStore.svelte';
 import type { CutoffUnmetResponse, UpgradeRequestResponse } from '$lib/types';
 
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
@@ -21,7 +22,9 @@ export const getCutoffUnmetQuery = (getEnabled: Getter<boolean> = () => true) =>
 
 async function invalidateAfterUpgrade() {
 	await invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.cutoffUnmet() });
-	await invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.tasks() });
+	await invalidateQueriesWithPersister({
+		queryKey: DownloadQueryKeyFactory.tasks(authStore.user?.id)
+	});
 }
 
 export interface UpgradeAlbumInput {

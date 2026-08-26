@@ -30,13 +30,9 @@ class LibraryStatsResponse(AppStruct):
 
 class AlbumRemoveResponse(AppStruct):
     success: bool
+    album_mbid: str
+    removed_mbids: list[str] = []
     artist_removed: bool = False
-    artist_name: str | None = None
-
-
-class AlbumRemovePreviewResponse(AppStruct):
-    success: bool
-    artist_will_be_removed: bool = False
     artist_name: str | None = None
 
 
@@ -49,6 +45,15 @@ class SyncLibraryResponse(AppStruct):
 class LibraryMbidsResponse(AppStruct):
     mbids: list[str] = []
     requested_mbids: list[str] = []
+
+
+class LibraryMembershipRequest(AppStruct):
+    album_ids: list[str] = []
+
+
+class LibraryMembershipResponse(AppStruct):
+    owned_ids: list[str] = []
+    requested_ids: list[str] = []
 
 
 class LibraryGroupedResponse(AppStruct):

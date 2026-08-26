@@ -2,8 +2,7 @@
 
 Consumes exactly two Lidarr v1 GET endpoints - ``/system/status`` (the Test probe) and
 ``/artist`` (the whole import) - authenticated with the ``X-Api-Key`` header so the key
-never lands in proxy logs. Verified against live Lidarr 3.1.3.4968 (see
-``lidarr_import_API_NOTES.md``).
+never lands in proxy logs. Verified against live Lidarr 3.1.3.4968.
 
 Actionable-failure repository: non-2xx and decode failures raise ``LidarrImportError``
 (handler-mapped to 503); a rejected API key raises ``LidarrImportError(auth=True)`` so the
@@ -58,7 +57,9 @@ class LidarrImportRepository:
         except LidarrImportError:
             raise
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            raise LidarrImportError(f"Lidarr request failed: {type(exc).__name__}") from exc
+            raise LidarrImportError(
+                f"Lidarr request failed: {type(exc).__name__}"
+            ) from exc
 
     @with_retry(
         max_attempts=3,

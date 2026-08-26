@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -52,7 +53,9 @@ async def test_items_both_dialects_albums(compat_env):
     assert legacy["Items"] and modern["Items"]
     assert legacy["Items"][0]["Name"] == modern["Items"][0]["Name"] == "OK Computer"
     assert modern["Items"][0]["Type"] == "MusicAlbum"
-    assert modern["Items"][0]["SortName"]  # every item carries SortName (strict clients)
+    assert modern["Items"][0][
+        "SortName"
+    ]  # every item carries SortName (strict clients)
 
 
 async def test_drilldown_artist_album_track(compat_env):
@@ -60,8 +63,13 @@ async def test_drilldown_artist_album_track(compat_env):
     artist = next(a for a in artists if a["Name"] == "Radiohead")
     assert artist["Type"] == "MusicArtist"
 
-    albums = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum",
-                   AlbumArtistIds=artist["Id"], Recursive="true")["Items"]
+    albums = _jget(
+        compat_env,
+        "/Items",
+        IncludeItemTypes="MusicAlbum",
+        AlbumArtistIds=artist["Id"],
+        Recursive="true",
+    )["Items"]
     assert albums and albums[0]["Name"] == "OK Computer"
     album_id = albums[0]["Id"]
 
@@ -72,6 +80,20 @@ async def test_drilldown_artist_album_track(compat_env):
     assert [t["IndexNumber"] for t in tracks] == [1, 2]
 
 
+async def test_artist_endpoints_keep_all_credits_separate_from_album_artists(
+    compat_env,
+):
+    original = compat_env.view.get_artists
+    compat_env.view.get_artists = AsyncMock(wraps=original)
+
+    _jget(compat_env, "/Artists")
+    _jget(compat_env, "/Artists/AlbumArtists")
+
+    calls = compat_env.view.get_artists.await_args_list
+    assert calls[0].kwargs["scope"] == "all"
+    assert calls[1].kwargs["scope"] == "album"
+
+
 async def test_browse_query_params_are_case_insensitive(compat_env):
     # Real Jellyfin clients (Jellify et al.) send camelCase params - parentId,
     # includeItemTypes, limit - because the production ASP.NET Core server binds query
@@ -80,7 +102,9 @@ async def test_browse_query_params_are_case_insensitive(compat_env):
     audio = _jget(compat_env, "/Items", includeItemTypes="Audio")["Items"]
     assert audio and all(i["Type"] == "Audio" for i in audio)
 
-    album_id = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum")["Items"][0]["Id"]
+    album_id = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum")["Items"][0][
+        "Id"
+    ]
     tracks = _jget(compat_env, "/Items", parentId=album_id)["Items"]
     assert len(tracks) == 2
     assert all(t["Type"] == "Audio" for t in tracks)
@@ -94,7 +118,9 @@ async def test_items_filters_returns_genres_not_404(compat_env):
         assert "Genres" in body and isinstance(body["Genres"], list)
         assert "Alternative Rock" in body["Genres"]
     # a real album id still resolves through the single-item route
-    album_id = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum")["Items"][0]["Id"]
+    album_id = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum")["Items"][0][
+        "Id"
+    ]
     assert _jget(compat_env, f"/Items/{album_id}")["Type"] == "MusicAlbum"
 
 
@@ -105,9 +131,23 @@ async def test_items_carry_jellyfin_always_present_fields(compat_env):
     album = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum")["Items"][0]
     track = _jget(compat_env, "/Items", ParentId=album["Id"])["Items"][0]
     for item in (album, track):
-        for key in ("Id", "Name", "Type", "ServerId", "MediaType", "IsFolder",
-                    "SortName", "ImageTags", "ImageBlurHashes", "LocationType",
-                    "Genres", "DateCreated", "Artists", "ArtistItems", "AlbumArtists"):
+        for key in (
+            "Id",
+            "Name",
+            "Type",
+            "ServerId",
+            "MediaType",
+            "IsFolder",
+            "SortName",
+            "ImageTags",
+            "ImageBlurHashes",
+            "LocationType",
+            "Genres",
+            "DateCreated",
+            "Artists",
+            "ArtistItems",
+            "AlbumArtists",
+        ):
             assert key in item, f"{item['Type']} missing {key}"
         assert item["LocationType"] == "FileSystem"
 
@@ -127,18 +167,29 @@ async def test_music_item_artist_and_genre_fields_never_null():
             return None
 
     b = JellyfinBuilder(_Ids(), _Cover(), "srv")
-    album = await b.album(ViewAlbum(rg_mbid="rg", title="Untagged"))  # everything else null
+    album = await b.album(
+        ViewAlbum(rg_mbid="rg", title="Untagged")
+    )  # everything else null
     assert album.Genres == [] and album.ArtistItems == [] and album.Artists == []
     assert album.AlbumArtists == [] and album.DateCreated is not None
     # Manet rejects whole-second ISO; dates must be .NET round-trip (7 fractional digits + Z)
     import re
-    dated = await b.album(ViewAlbum(rg_mbid="rg2", title="Dated", date_added=1_700_000_000))
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z", dated.DateCreated)
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z", album.DateCreated)
+
+    dated = await b.album(
+        ViewAlbum(rg_mbid="rg2", title="Dated", date_added=1_700_000_000)
+    )
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z", dated.DateCreated
+    )
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z", album.DateCreated
+    )
 
 
 async def test_single_item_both_dialects(compat_env):
-    album_id = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum")["Items"][0]["Id"]
+    album_id = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum")["Items"][0][
+        "Id"
+    ]
     legacy = _jget(compat_env, f"/Users/user-alice/Items/{album_id}")
     modern = _jget(compat_env, f"/Items/{album_id}")
     assert legacy["Name"] == modern["Name"] == "OK Computer"
@@ -153,18 +204,24 @@ async def test_unknown_item_404(compat_env):
 
 async def test_genres(compat_env):
     genres = _jget(compat_env, "/Genres")["Items"]
-    assert any(g["Name"] == "Alternative Rock" and g["Type"] == "MusicGenre" for g in genres)
+    assert any(
+        g["Name"] == "Alternative Rock" and g["Type"] == "MusicGenre" for g in genres
+    )
     # /MusicGenres dialect
     assert _jget(compat_env, "/MusicGenres")["Items"]
 
 
 async def test_search_term(compat_env):
-    res = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum", SearchTerm="OK Comp")
+    res = _jget(
+        compat_env, "/Items", IncludeItemTypes="MusicAlbum", SearchTerm="OK Comp"
+    )
     assert any(a["Name"] == "OK Computer" for a in res["Items"])
 
 
 async def test_paging_total_record_count(compat_env):
-    res = _jget(compat_env, "/Items", IncludeItemTypes="Audio", StartIndex="0", Limit="1")
+    res = _jget(
+        compat_env, "/Items", IncludeItemTypes="Audio", StartIndex="0", Limit="1"
+    )
     assert res["TotalRecordCount"] == 2
     assert len(res["Items"]) == 1
     assert res["StartIndex"] == 0
@@ -174,18 +231,39 @@ async def test_artistids_union_vs_albumartistids_strict(compat_env):
     # a featured-artist track: track artist != album artist (Q23)
     await compat_env.lm.upsert_file(
         Path("/music/feat.flac"),
-        AudioTag(title="Feat Track", artist="Featured Guy", album="Collab",
-                 track_number=1, album_artist="Main Band", year=2020),
-        AudioInfo(duration_seconds=180.0, bitrate=900, sample_rate=44100, channels=2,
-                  file_format="flac", file_size_bytes=1000, bit_depth=16),
-        release_group_mbid="rg-collab-0000000000000000000000", recording_mbid="rec-feat",
+        AudioTag(
+            title="Feat Track",
+            artist="Featured Guy",
+            album="Collab",
+            track_number=1,
+            album_artist="Main Band",
+            year=2020,
+        ),
+        AudioInfo(
+            duration_seconds=180.0,
+            bitrate=900,
+            sample_rate=44100,
+            channels=2,
+            file_format="flac",
+            file_size_bytes=1000,
+            bit_depth=16,
+        ),
+        release_group_mbid="rg-collab-0000000000000000000000",
+        recording_mbid="rec-feat",
         file_mtime=1.0,
     )
-    feat_jf = await compat_env.id_map.to_jf("artist", _synth_artist_mbid("Featured Guy"))
+    feat_jf = await compat_env.id_map.to_jf(
+        "artist", _synth_artist_mbid("Featured Guy")
+    )
     main_jf = await compat_env.id_map.to_jf("artist", _synth_artist_mbid("Main Band"))
 
     def _titles(**params):
-        return {t["Name"] for t in _jget(compat_env, "/Items", IncludeItemTypes="Audio", **params)["Items"]}
+        return {
+            t["Name"]
+            for t in _jget(compat_env, "/Items", IncludeItemTypes="Audio", **params)[
+                "Items"
+            ]
+        }
 
     # ArtistIds (union): both the featured and the album artist match
     assert "Feat Track" in _titles(ArtistIds=feat_jf)

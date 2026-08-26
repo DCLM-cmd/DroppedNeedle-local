@@ -3,7 +3,7 @@ import { api } from '$lib/api/client';
 import { playerStore } from '$lib/stores/player.svelte';
 import { playbackToast } from '$lib/stores/playbackToast.svelte';
 import { buildQueueItemsFromYouTube, type TrackMeta } from '$lib/player/queueHelpers';
-import { openGlobalPlaylistModal } from '$lib/components/AddToPlaylistModal.svelte';
+import { openGlobalPlaylistModal } from '$lib/stores/playlistModal.svelte';
 import { getCoverUrl } from '$lib/utils/errorHandling';
 import type { QueueItem } from '$lib/player/types';
 import type { YouTubeLink, YouTubeTrackLink } from '$lib/types';

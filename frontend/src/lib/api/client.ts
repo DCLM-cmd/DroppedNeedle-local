@@ -30,10 +30,35 @@ export class SessionExpiredError extends ApiError {
 	}
 }
 
+export type TransportErrorCode = 'TRANSPORT_TIMEOUT' | 'TRANSPORT_ABORTED' | 'TRANSPORT_NETWORK';
+
+export class TransportError extends ApiError {
+	readonly method: string;
+	readonly path: string;
+
+	constructor(code: TransportErrorCode, method: string, path: string) {
+		const message =
+			code === 'TRANSPORT_TIMEOUT'
+				? 'The request timed out'
+				: code === 'TRANSPORT_ABORTED'
+					? 'The request was cancelled'
+					: 'The server could not be reached';
+		super(0, message, code, { method, path });
+		this.name = 'TransportError';
+		this.method = method;
+		this.path = path;
+	}
+}
+
 interface RequestOptions extends Omit<RequestInit, 'method' | 'body'> {
 	signal?: AbortSignal;
 	raw?: boolean;
 	cache?: RequestCache;
+	timeoutMs?: number;
+}
+
+interface DeleteRequestOptions extends RequestOptions {
+	body?: unknown;
 }
 
 async function handleResponse<T = void>(res: Response): Promise<T> {
@@ -59,7 +84,7 @@ async function handleResponse<T = void>(res: Response): Promise<T> {
 				message = parsed.detail;
 			}
 		} catch {
-			// text wasn't JSON — use raw text as message
+			// preserve non-JSON error bodies
 		}
 		throw new ApiError(res.status, message, code, details);
 	}
@@ -87,21 +112,39 @@ interface ApiClient {
 	post<T = unknown>(url: string, body?: unknown, opts?: RequestOptions): Promise<T>;
 	put<T = unknown>(url: string, body?: unknown, opts?: RequestOptions): Promise<T>;
 	patch<T = unknown>(url: string, body?: unknown, opts?: RequestOptions): Promise<T>;
-	delete<T = void>(url: string, opts?: RequestOptions): Promise<T>;
+	delete<T = void>(url: string, opts?: DeleteRequestOptions): Promise<T>;
 	head(url: string, opts?: RequestOptions): Promise<Response>;
 	upload<T = unknown>(url: string, body: FormData, opts?: RequestOptions): Promise<T>;
 }
 
 function createClient(fetchFn: FetchFn): ApiClient {
+	function transportPath(url: string): string {
+		try {
+			return new URL(url, 'http://droppedneedle.invalid').pathname;
+		} catch {
+			return url.split('?', 1)[0] ?? url;
+		}
+	}
+
 	async function request<T>(
 		method: string,
 		url: string,
 		body?: unknown,
 		opts?: RequestOptions
 	): Promise<T> {
-		const { raw, ...fetchOpts } = opts ?? {};
+		const { raw, timeoutMs, signal, ...fetchOpts } = opts ?? {};
 		// credentials: 'include' sends the httpOnly session cookie cross-origin (dev proxy)
-		const init: RequestInit = { method, credentials: 'include', ...fetchOpts };
+		const deadlineSignal = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
+		const requestSignal =
+			signal && deadlineSignal
+				? AbortSignal.any([signal, deadlineSignal])
+				: (signal ?? deadlineSignal);
+		const init: RequestInit = {
+			method,
+			credentials: 'include',
+			...fetchOpts,
+			signal: requestSignal
+		};
 
 		if (body !== undefined && body !== null) {
 			if (body instanceof FormData) {
@@ -117,7 +160,21 @@ function createClient(fetchFn: FetchFn): ApiClient {
 
 		const requestUrl = getApiUrl(url);
 
-		const res = await fetchFn(requestUrl, init);
+		let res: Response;
+		try {
+			res = await fetchFn(requestUrl, init);
+		} catch (cause) {
+			const timedOut = deadlineSignal?.aborted === true && signal?.aborted !== true;
+			const aborted =
+				!timedOut &&
+				((cause instanceof DOMException && cause.name === 'AbortError') ||
+					requestSignal?.aborted === true);
+			throw new TransportError(
+				timedOut ? 'TRANSPORT_TIMEOUT' : aborted ? 'TRANSPORT_ABORTED' : 'TRANSPORT_NETWORK',
+				method,
+				transportPath(url)
+			);
+		}
 
 		if (raw) return res as unknown as T;
 		return handleResponse<T>(res);
@@ -132,8 +189,10 @@ function createClient(fetchFn: FetchFn): ApiClient {
 			request<T>('PUT', url, body, opts),
 		patch: <T = unknown>(url: string, body?: unknown, opts?: RequestOptions) =>
 			request<T>('PATCH', url, body, opts),
-		delete: <T = void>(url: string, opts?: RequestOptions) =>
-			request<T>('DELETE', url, undefined, opts),
+		delete: <T = void>(url: string, opts?: DeleteRequestOptions) => {
+			const { body, ...requestOptions } = opts ?? {};
+			return request<T>('DELETE', url, body, requestOptions);
+		},
 		head: (url: string, opts?: RequestOptions) =>
 			request<Response>('HEAD', url, undefined, { ...opts, raw: true }),
 		upload: <T = unknown>(url: string, body: FormData, opts?: RequestOptions) =>

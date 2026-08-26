@@ -1,16 +1,21 @@
 <script lang="ts">
+	import { X } from 'lucide-svelte';
+
+	import { cancelDownload } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { createDownloadStream } from '$lib/queries/downloads/DownloadSSE.svelte';
-	import { derivedDownloadStatus } from '$lib/queries/downloads/downloadStatus';
+	import { canCancel, derivedDownloadStatus } from '$lib/queries/downloads/downloadStatus';
 	import type { DownloadTask } from '$lib/types';
 	import { albumHref, artistHref } from '$lib/utils/entityRoutes';
 
 	import DownloadProgressBar from './DownloadProgressBar.svelte';
+	import DownloadSourceStatus from './DownloadSourceStatus.svelte';
 	import DownloadStatusBadge from './DownloadStatusBadge.svelte';
 	import VinylProgress from './VinylProgress.svelte';
 
 	let { task, showEyebrow = true }: { task: DownloadTask; showEyebrow?: boolean } = $props();
 
 	const stream = createDownloadStream();
+	const cancel = cancelDownload();
 	$effect(() => {
 		if (task.status === 'downloading' || task.status === 'processing') {
 			stream.start(task.id);
@@ -65,6 +70,22 @@
 						filesTotal={progress?.files_total ?? task.files_total}
 					/>
 				</div>
+			{/if}
+			<DownloadSourceStatus
+				{task}
+				live={stream.state.source}
+				bytesDownloaded={progress?.bytes_downloaded ?? task.downloaded_bytes}
+			/>
+			{#if canCancel(task)}
+				<button
+					type="button"
+					class="btn btn-ghost btn-xs mt-2 text-error/70 hover:text-error"
+					onclick={() => cancel.mutate(task.id)}
+					disabled={cancel.isPending}
+					aria-label="Cancel download"
+				>
+					<X class="size-3.5" aria-hidden="true" /> Cancel
+				</button>
 			{/if}
 		</div>
 	</div>

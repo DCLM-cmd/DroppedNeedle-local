@@ -18,37 +18,33 @@ def _user(uid: str):
 def _auth_store(uids: list[str]):
     store = MagicMock()
     # single short page terminates enumeration
-    store.list_users = AsyncMock(side_effect=lambda limit, offset: (
-        [_user(u) for u in uids] if offset == 0 else []
-    ))
+    store.list_users = AsyncMock(
+        side_effect=lambda limit, offset: (
+            [_user(u) for u in uids] if offset == 0 else []
+        )
+    )
     return store
 
 
-def _client_factory(lb_linked: set[str], lfm_linked: set[str]):
-    cf = MagicMock()
-    cf.is_listenbrainz_linked = AsyncMock(side_effect=lambda uid: uid in lb_linked)
-    cf.is_lastfm_linked = AsyncMock(side_effect=lambda uid: uid in lfm_linked)
-    return cf
-
-
 @pytest.mark.asyncio
-async def test_enumerate_keeps_only_music_source_linked_users():
+async def test_enumerate_includes_users_without_a_linked_music_source():
     store = _auth_store(["u1", "u2", "u3"])
-    cf = _client_factory(lb_linked={"u1"}, lfm_linked={"u3"})
 
-    eligible = await T._enumerate_warmer_users(store, cf)
+    eligible = await T._enumerate_warmer_users(store)
 
-    assert eligible == ["u1", "u3"]  # u2 has neither source linked
+    assert eligible == ["u1", "u2", "u3"]
 
 
 @pytest.mark.asyncio
 async def test_pick_due_prefers_never_warmed_then_personalizing_then_stale():
     discover = MagicMock()
     # u_personalizing has a cache and is still personalising; u_stale is old but converged
-    discover.peek_freshness = AsyncMock(side_effect=lambda uid: {
-        "u_personalizing": (True, True),
-        "u_stale": (True, False),
-    }[uid])
+    discover.peek_freshness = AsyncMock(
+        side_effect=lambda uid: {
+            "u_personalizing": (True, True),
+            "u_stale": (True, False),
+        }[uid]
+    )
     now = 10_000.0
     last_warmed = {
         "u_personalizing": now - (T.DISCOVER_WARMER_PERSONALIZING_RETRY + 10),
@@ -102,13 +98,18 @@ async def test_warm_one_user_runs_thorough_build_and_tracks_attempts():
     discover.peek_freshness = AsyncMock(return_value=(True, True))
     home = MagicMock()
     home.warm_cache = AsyncMock()
+    queue = MagicMock()
+    queue.start_build = AsyncMock()
+    queue.wait_for_build = AsyncMock()
     last_warmed: dict = {}
     attempts: dict = {}
 
-    await T._warm_one_user("u1", discover, home, last_warmed, attempts)
+    await T._warm_one_user("u1", discover, home, last_warmed, attempts, queue)
 
     discover.warm_cache_thorough.assert_awaited_once_with("u1")
     home.warm_cache.assert_awaited_once_with("u1")
+    queue.start_build.assert_awaited_once_with("u1")
+    queue.wait_for_build.assert_awaited_once_with("u1")
     assert "u1" in last_warmed
     assert attempts["u1"] == 1
 
@@ -148,14 +149,47 @@ async def test_loop_disabled_kill_switch_warms_nobody_and_still_sleeps():
             raise asyncio.CancelledError()
 
     get_discover = MagicMock()
-    with patch("core.tasks.asyncio.sleep", side_effect=fake_sleep), \
-         patch("core.config.get_settings", return_value=settings):
-        await T.warm_discover_home_periodically(
-            get_discover, MagicMock(), MagicMock(), MagicMock()
-        )
+    with (
+        patch("core.tasks.asyncio.sleep", side_effect=fake_sleep),
+        patch("core.config.get_settings", return_value=settings),
+    ):
+        await T.warm_discover_home_periodically(get_discover, MagicMock(), MagicMock())
 
     assert len(sleeps) >= 2  # slept (startup + loop) despite doing no work
     get_discover.assert_not_called()  # never resolved the service while disabled
+
+
+@pytest.mark.asyncio
+async def test_loop_routes_one_user_unit_through_shared_warmer_gate():
+    gate = MagicMock()
+    gate.wait_until_available = AsyncMock()
+
+    async def run_warmer_unit(operation):
+        await operation()
+
+    gate.run_warmer_unit = AsyncMock(side_effect=run_warmer_unit)
+
+    with (
+        patch("core.tasks.asyncio.sleep", new=AsyncMock()),
+        patch(
+            "core.config.get_settings",
+            return_value=MagicMock(discover_warmer_enabled=True),
+        ),
+        patch(
+            "core.tasks._enumerate_warmer_users",
+            new=AsyncMock(return_value=["u1"]),
+        ),
+        patch("core.tasks._pick_due_warmer_user", new=AsyncMock(return_value="u1")),
+        patch(
+            "core.tasks._warm_one_user",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ),
+    ):
+        await T.warm_discover_home_periodically(
+            MagicMock(), MagicMock(), MagicMock(), workload_gate=gate
+        )
+
+    gate.run_warmer_unit.assert_awaited_once()
 
 
 # the two homepage-service methods the warmer drives
@@ -166,6 +200,7 @@ from services.discover.homepage_service import DiscoverHomepageService  # noqa: 
 def _homepage() -> DiscoverHomepageService:
     svc = DiscoverHomepageService.__new__(DiscoverHomepageService)
     svc._memory_cache = None
+    svc._workload_gate = None
     svc._lfm_repo = MagicMock()
     svc._mbid = MagicMock()
     svc._integration = MagicMock()
@@ -179,9 +214,12 @@ def _homepage() -> DiscoverHomepageService:
 
 def _seeded(svc):
     from types import SimpleNamespace
+
     svc._lb_repo = MagicMock()
     svc._lb_repo.get_artist_top_release_groups = AsyncMock(return_value=[])
-    svc._get_seed_artists = AsyncMock(return_value=[SimpleNamespace(artist_mbids=["seed-1"])])
+    svc._get_seed_artists = AsyncMock(
+        return_value=[SimpleNamespace(artist_mbids=["seed-1"])]
+    )
     return svc
 
 
@@ -193,13 +231,17 @@ async def test_thorough_warm_runs_thorough_and_probes_lb():
     seen: dict = {}
 
     async def fake_warm(uid):
-        seen["thorough"] = discover_build_thorough.get()  # flag in effect DURING the build
+        seen["thorough"] = (
+            discover_build_thorough.get()
+        )  # flag in effect DURING the build
 
     svc.warm_cache = fake_warm
 
     await svc.warm_cache_thorough("u1")
 
-    assert seen["thorough"] is True  # build ran thorough (relaxed budgets + uncapped lookups)
+    assert (
+        seen["thorough"] is True
+    )  # build ran thorough (relaxed budgets + uncapped lookups)
     assert discover_build_thorough.get() is False  # reset afterwards
     svc._lb_repo.get_artist_top_release_groups.assert_awaited_once()  # probed LB to fix the gate
 
@@ -209,7 +251,9 @@ async def test_thorough_warm_survives_a_failing_probe():
     # the probe 500s during the outage (raises ServiceDisabledUpstreamError); its gate side
     # effect already fired, so the warm must proceed regardless
     svc = _seeded(_homepage())
-    svc._lb_repo.get_artist_top_release_groups = AsyncMock(side_effect=RuntimeError("500"))
+    svc._lb_repo.get_artist_top_release_groups = AsyncMock(
+        side_effect=RuntimeError("500")
+    )
     svc.warm_cache = AsyncMock()
 
     await svc.warm_cache_thorough("u1")  # must not raise
@@ -239,7 +283,9 @@ async def test_peek_freshness_degraded_empty_top_picks_still_converging():
     from api.v1.schemas.discover import DiscoverResponse as _DR
 
     svc = _homepage()
-    svc._use_lastfm_for_popularity = MagicMock(return_value=True)  # LB popularity degraded
+    svc._use_lastfm_for_popularity = MagicMock(
+        return_value=True
+    )  # LB popularity degraded
     store = {"discover:u1": _DR(top_picks=None)}
     svc._memory_cache = MagicMock()
     svc._memory_cache.get = AsyncMock(side_effect=lambda k: store.get(k))

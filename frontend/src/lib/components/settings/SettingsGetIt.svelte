@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { ShoppingBag } from 'lucide-svelte';
+	import { Coffee, ExternalLink, Github, ShoppingBag } from 'lucide-svelte';
 	import { API } from '$lib/constants';
 	import type { GetItSettings } from '$lib/types';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
@@ -42,7 +42,6 @@
 		{#if form.loading}
 			<div class="space-y-3 pt-2">
 				<div class="skeleton h-12 w-full rounded-xl"></div>
-				<div class="skeleton h-12 w-full rounded-xl"></div>
 			</div>
 		{:else if form.data}
 			<div class="form-control pt-2">
@@ -61,24 +60,6 @@
 				<p class="mt-1 text-xs text-base-content/50">The storefront iTunes links point to.</p>
 			</div>
 
-			<div class="form-control pt-2">
-				<label class="flex cursor-pointer items-start gap-3">
-					<input
-						type="checkbox"
-						class="toggle toggle-primary"
-						bind:checked={form.data.support_droppedneedle}
-					/>
-					<div>
-						<span class="label-text font-medium">Support DroppedNeedle</span>
-						<p class="text-xs text-base-content/50">
-							When on, store links carry DroppedNeedle's affiliate tags. Purchases earn the project
-							a small commission at no extra cost to the buyer, and a disclosure line appears under
-							the links. Turn it off for clean, direct links.
-						</p>
-					</div>
-				</label>
-			</div>
-
 			<div class="card-actions justify-end pt-2">
 				<button class="btn btn-primary btn-sm" onclick={() => form.save()} disabled={form.saving}>
 					{form.saving ? 'Saving…' : 'Save'}
@@ -91,5 +72,35 @@
 				</p>
 			{/if}
 		{/if}
+
+		<div class="mt-2 border-t border-base-content/10 pt-4">
+			<p class="text-sm font-medium">Support development</p>
+			<p class="mt-1 text-xs text-base-content/50">
+				DroppedNeedle is free to use. If you'd like to help with development, you can donate
+				directly through Ko-fi or GitHub Sponsors.
+			</p>
+			<div class="mt-3 flex flex-wrap gap-2">
+				<a
+					href="https://ko-fi.com/M4M41URGJO"
+					target="_blank"
+					rel="noopener noreferrer"
+					class="btn btn-ghost btn-sm border border-base-content/15"
+				>
+					<Coffee class="h-4 w-4" aria-hidden="true" />
+					Ko-fi
+					<ExternalLink class="h-3.5 w-3.5 opacity-60" aria-hidden="true" />
+				</a>
+				<a
+					href="https://github.com/sponsors/HabiRabbu"
+					target="_blank"
+					rel="noopener noreferrer"
+					class="btn btn-ghost btn-sm border border-base-content/15"
+				>
+					<Github class="h-4 w-4" aria-hidden="true" />
+					GitHub Sponsors
+					<ExternalLink class="h-3.5 w-3.5 opacity-60" aria-hidden="true" />
+				</a>
+			</div>
+		</div>
 	</div>
 </div>

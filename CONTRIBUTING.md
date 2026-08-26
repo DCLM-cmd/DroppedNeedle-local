@@ -43,9 +43,11 @@ pnpm run dev
 ### Running Tests
 
 ```bash
-make backend-test    # backend suite
-make frontend-test   # frontend suite
-make test            # both
+make backend-test          # backend suite
+make frontend-test         # frontend server and browser suites
+make frontend-test-server  # frontend server suite only
+make frontend-test-client  # frontend browser suite only
+make test                  # backend and frontend server suites; excludes browser tests
 ```
 
 Frontend browser tests use Playwright. Install the browser first:

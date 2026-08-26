@@ -66,6 +66,23 @@
 		</p>
 	</fieldset>
 
+	<fieldset class="fieldset">
+		<legend class="fieldset-legend">Prefer Local Cover Art</legend>
+		<label class="label cursor-pointer gap-3">
+			<span class="text-sm">Use cover art from your own files first</span>
+			<input
+				type="checkbox"
+				bind:checked={data.prefer_local_cover_art}
+				class="toggle toggle-primary"
+			/>
+		</label>
+		<p class="label text-base-content/50">
+			When enabled, covers come from folder images (cover.jpg and similar) or art embedded in the
+			audio files before any online source is checked. Local art still works when an image provider
+			is down.
+		</p>
+	</fieldset>
+
 	<SettingsNumberField
 		label="Found Images TTL"
 		description="Default: 168 hours (7 days)"

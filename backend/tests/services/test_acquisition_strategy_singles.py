@@ -15,7 +15,7 @@ import pytest
 
 from models.download import DownloadTask, ScoredCandidate
 from models.download_manifest import ManifestCodec
-from repositories.protocols.download_client import DownloadSearchResult
+from repositories.protocols.download_client import DownloadSearchResult, TaskHandle
 from services.native.acquisition.strategy import SoulseekStrategy
 
 _CANONICAL = 155.556  # "the arrival" (recording 180ceef5...), seconds
@@ -23,17 +23,33 @@ _CANONICAL = 155.556  # "the arrival" (recording 180ceef5...), seconds
 
 def _search_result(username="peer", filename="peer/01.flac", duration=155.0):
     return DownloadSearchResult(
-        username=username, filename=filename, parent_directory="peer",
-        size=100, extension="flac", duration=duration,
+        username=username,
+        filename=filename,
+        parent_directory="peer",
+        size=100,
+        extension="flac",
+        duration=duration,
     )
 
 
 def _single_task(**overrides) -> DownloadTask:
     kwargs = dict(
-        id="t1", user_id="u1", download_type="album", release_group_mbid="rg-1",
-        artist_name="Yan Qing", album_title="the arrival", year=2026, track_count=1,
-        track_title="the arrival", recording_mbid="rec-180ceef5",
-        track_duration_seconds=_CANONICAL, origin="user",
+        id="t1",
+        user_id="u1",
+        download_type="album",
+        release_group_mbid="rg-1",
+        release_mbid="release-1",
+        release_track_mbid="release-track-1",
+        artist_name="Yan Qing",
+        album_title="the arrival",
+        year=2026,
+        track_count=1,
+        track_title="the arrival",
+        recording_mbid="rec-180ceef5",
+        track_number=1,
+        disc_number=1,
+        track_duration_seconds=_CANONICAL,
+        origin="user",
     )
     kwargs.update(overrides)
     return DownloadTask(**kwargs)
@@ -49,11 +65,41 @@ def _strategy(tmp_path: Path):
     scorer.rank = AsyncMock(return_value=[])
     track_matcher = MagicMock()
     track_matcher.rank = AsyncMock(return_value=[])
+    client = AsyncMock()
+    client.enqueue.return_value = TaskHandle(
+        source="soulseek",
+        username="Fabrizio83a",
+        filenames=["peer/02. Arrival in Ashford.flac"],
+    )
+    store = AsyncMock()
+    store.create_download_attempt.return_value = SimpleNamespace(id="attempt-1")
+    album_service = MagicMock()
+    album_service.get_exact_edition_tracks_info = AsyncMock(
+        return_value=SimpleNamespace(
+            tracks=[
+                SimpleNamespace(
+                    position=index,
+                    disc_number=1,
+                    title=f"Track {index}",
+                    recording_id=f"recording-{index}",
+                    release_track_id=f"release-track-{index}",
+                    length=180_000,
+                )
+                for index in range(1, 13)
+            ]
+        )
+    )
     strategy = SoulseekStrategy(
-        indexer=indexer, scorer=scorer, track_matcher=track_matcher,
-        client=AsyncMock(), store=AsyncMock(), file_processor=MagicMock(),
-        staging=tmp_path, manifest_codec=ManifestCodec(),
+        indexer=indexer,
+        scorer=scorer,
+        track_matcher=track_matcher,
+        client=client,
+        store=store,
+        file_processor=MagicMock(),
+        staging=tmp_path,
+        manifest_codec=ManifestCodec(),
         naming_template="{albumartist}/{album}/{title}.{ext}",
+        album_service=album_service,
     )
     return strategy, indexer, scorer, track_matcher
 
@@ -78,14 +124,20 @@ async def test_single_album_task_scores_via_track_matcher(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_single_without_threaded_identity_falls_back_to_folder_scorer(tmp_path: Path):
+async def test_single_without_threaded_identity_falls_back_to_folder_scorer(
+    tmp_path: Path,
+):
     # MusicBrainz was down at request time -> no track_title -> the album path
     # behaves exactly as before (degraded, still covered by the later gates).
     strategy, _indexer, scorer, track_matcher = _strategy(tmp_path)
 
     await strategy.search_and_score(
-        _single_task(track_title=None, recording_mbid=None, track_duration_seconds=None),
-        timeout=30, auto=0.7, manual=0.5,
+        _single_task(
+            track_title=None, recording_mbid=None, track_duration_seconds=None
+        ),
+        timeout=30,
+        auto=0.7,
+        manual=0.5,
     )
 
     scorer.rank.assert_awaited_once()
@@ -98,7 +150,9 @@ async def test_multi_track_album_still_uses_folder_scorer(tmp_path: Path):
 
     await strategy.search_and_score(
         _single_task(track_count=12, track_title=None, track_duration_seconds=None),
-        timeout=30, auto=0.7, manual=0.5,
+        timeout=30,
+        auto=0.7,
+        manual=0.5,
     )
 
     scorer.rank.assert_awaited_once()
@@ -109,11 +163,19 @@ async def test_multi_track_album_still_uses_folder_scorer(tmp_path: Path):
 
 
 def _candidate(duration=137.0):
-    f = _search_result(username="Fabrizio83a", filename="peer/02. Arrival in Ashford.flac",
-                       duration=duration)
+    f = _search_result(
+        username="Fabrizio83a",
+        filename="peer/02. Arrival in Ashford.flac",
+        duration=duration,
+    )
     return ScoredCandidate(
-        username="Fabrizio83a", parent_directory="peer", files=[f],
-        coherence=0.6, file_confidence=0.6, final_score=0.6, tier="manual",
+        username="Fabrizio83a",
+        parent_directory="peer",
+        files=[f],
+        coherence=0.6,
+        file_confidence=0.6,
+        final_score=0.6,
+        tier="manual",
     )
 
 
@@ -137,7 +199,9 @@ async def test_single_enqueue_arms_canonical_duration_gate(tmp_path: Path):
     expected = manifest.expected_tracks[0]
     assert expected.title == "the arrival"
     assert expected.recording_mbid == "rec-180ceef5"
+    assert expected.release_track_mbid == "release-track-1"
     assert expected.duration_seconds == _CANONICAL
+    assert manifest.release_mbid == "release-1"
 
 
 @pytest.mark.asyncio
@@ -151,13 +215,30 @@ async def test_single_enqueue_strict_off_keeps_peer_duration(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_multi_track_album_enqueue_unchanged(tmp_path: Path):
+async def test_multi_track_album_enqueue_carries_complete_exact_track_map(
+    tmp_path: Path,
+):
     manifest = await _enqueue(
         tmp_path,
-        _single_task(track_count=12, track_title=None, recording_mbid=None,
-                     track_duration_seconds=None),
+        _single_task(
+            track_count=12,
+            track_title=None,
+            recording_mbid=None,
+            track_duration_seconds=None,
+        ),
     )
 
     assert manifest.is_track is False
-    assert manifest.expected_tracks == []
+    assert len(manifest.expected_tracks) == 12
+    assert manifest.expected_tracks[0].release_track_mbid == "release-track-1"
+    assert manifest.expected_tracks[-1].recording_mbid == "recording-12"
+    assert (
+        len(
+            {
+                (track.disc_number, track.track_number)
+                for track in manifest.expected_tracks
+            }
+        )
+        == 12
+    )
     assert manifest.target_files[0].duration == 137.0

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import '../../auth.css';
 	import { goto } from '$app/navigation';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { ApiError } from '$lib/api/client';
@@ -34,6 +35,7 @@
 				password
 			});
 			authStore.setUser(toAuthUser(data.user));
+			authStore.setSetupRequired(false);
 			goto('/');
 		} catch (e) {
 			error =

@@ -68,11 +68,22 @@ describe('fetchLyrics', () => {
 		expect(mockGet).not.toHaveBeenCalled();
 	});
 
-	it('returns null for local source type', async () => {
+	it('normalizes local lyrics response', async () => {
+		mockGet.mockResolvedValueOnce({
+			text: 'Local lyrics',
+			is_synced: false,
+			lines: [{ text: 'Local lyrics', start_seconds: null }]
+		});
+
 		const np = makeNowPlaying({ sourceType: 'local' });
 		const result = await fetchLyrics(np, signal);
-		expect(result).toBeNull();
-		expect(mockGet).not.toHaveBeenCalled();
+
+		expect(result).toEqual({
+			text: 'Local lyrics',
+			is_synced: false,
+			lines: [{ text: 'Local lyrics', start_seconds: null }]
+		});
+		expect(mockGet).toHaveBeenCalledWith('/api/v1/local/tracks/track-1/lyrics', { signal });
 	});
 
 	it('normalizes Navidrome response correctly', async () => {
@@ -206,13 +217,43 @@ describe('fetchLyrics', () => {
 
 describe('LyricsQueryKeyFactory', () => {
 	it('generates key with all parameters', () => {
-		const key = LyricsQueryKeyFactory.lyrics('navidrome', 'track-1', 'Artist', 'Song');
-		expect(key).toEqual(['lyrics', 'navidrome', 'track-1', 'Artist', 'Song']);
+		const key = LyricsQueryKeyFactory.lyrics(
+			'alice',
+			'selected-a',
+			'navidrome',
+			'track-1',
+			'Artist',
+			'Song'
+		);
+		expect(key).toEqual([
+			'lyrics',
+			'alice',
+			'selected-a',
+			'navidrome',
+			'track-1',
+			'Artist',
+			'Song'
+		]);
 	});
 
 	it('generates key with undefined parameters', () => {
-		const key = LyricsQueryKeyFactory.lyrics(undefined, undefined, undefined, undefined);
-		expect(key).toEqual(['lyrics', undefined, undefined, undefined, undefined]);
+		const key = LyricsQueryKeyFactory.lyrics(
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined
+		);
+		expect(key).toEqual([
+			'lyrics',
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined
+		]);
 	});
 
 	it('includes prefix', () => {
@@ -220,14 +261,62 @@ describe('LyricsQueryKeyFactory', () => {
 	});
 
 	it('generates different keys for different tracks', () => {
-		const key1 = LyricsQueryKeyFactory.lyrics('navidrome', 'track-1', 'Artist', 'Song A');
-		const key2 = LyricsQueryKeyFactory.lyrics('navidrome', 'track-2', 'Artist', 'Song B');
+		const key1 = LyricsQueryKeyFactory.lyrics(
+			'alice',
+			'selected-a',
+			'navidrome',
+			'track-1',
+			'Artist',
+			'Song A'
+		);
+		const key2 = LyricsQueryKeyFactory.lyrics(
+			'alice',
+			'selected-a',
+			'navidrome',
+			'track-2',
+			'Artist',
+			'Song B'
+		);
 		expect(key1).not.toEqual(key2);
 	});
 
 	it('generates different keys for same track ID but different metadata', () => {
-		const key1 = LyricsQueryKeyFactory.lyrics('navidrome', 'track-1', 'Artist A', 'Song');
-		const key2 = LyricsQueryKeyFactory.lyrics('navidrome', 'track-1', 'Artist B', 'Song');
+		const key1 = LyricsQueryKeyFactory.lyrics(
+			'alice',
+			'selected-a',
+			'navidrome',
+			'track-1',
+			'Artist A',
+			'Song'
+		);
+		const key2 = LyricsQueryKeyFactory.lyrics(
+			'alice',
+			'selected-a',
+			'navidrome',
+			'track-1',
+			'Artist B',
+			'Song'
+		);
 		expect(key1).not.toEqual(key2);
+	});
+
+	it('isolates users and Navidrome folder scopes', () => {
+		const alice = LyricsQueryKeyFactory.lyrics(
+			'alice',
+			'selected-a',
+			'navidrome',
+			'track-1',
+			'Artist',
+			'Song'
+		);
+		const bob = LyricsQueryKeyFactory.lyrics(
+			'bob',
+			'selected-b',
+			'navidrome',
+			'track-1',
+			'Artist',
+			'Song'
+		);
+		expect(alice).not.toEqual(bob);
 	});
 });

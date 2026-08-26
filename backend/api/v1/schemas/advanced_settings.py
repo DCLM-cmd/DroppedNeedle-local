@@ -101,6 +101,7 @@ class AdvancedSettings(AppStruct):
     audiodb_enabled: bool = True
     audiodb_name_search_fallback: bool = False
     direct_remote_images_enabled: bool = True
+    prefer_local_cover_art: bool = True
     audiodb_api_key: str = "123"
     cache_ttl_audiodb_found: int = 604800
     cache_ttl_audiodb_not_found: int = 86400
@@ -286,6 +287,7 @@ class AdvancedSettingsFrontend(AppStruct):
     audiodb_enabled: bool = True
     audiodb_name_search_fallback: bool = False
     direct_remote_images_enabled: bool = True
+    prefer_local_cover_art: bool = True
     audiodb_api_key: str = "123"
     cache_ttl_audiodb_found: int = 168
     cache_ttl_audiodb_not_found: int = 24
@@ -494,6 +496,7 @@ class AdvancedSettingsFrontend(AppStruct):
             audiodb_enabled=settings.audiodb_enabled,
             audiodb_name_search_fallback=settings.audiodb_name_search_fallback,
             direct_remote_images_enabled=settings.direct_remote_images_enabled,
+            prefer_local_cover_art=settings.prefer_local_cover_art,
             audiodb_api_key=_mask_api_key(settings.audiodb_api_key),
             cache_ttl_audiodb_found=settings.cache_ttl_audiodb_found // 3600,
             cache_ttl_audiodb_not_found=settings.cache_ttl_audiodb_not_found // 3600,
@@ -581,6 +584,7 @@ class AdvancedSettingsFrontend(AppStruct):
             audiodb_enabled=self.audiodb_enabled,
             audiodb_name_search_fallback=self.audiodb_name_search_fallback,
             direct_remote_images_enabled=self.direct_remote_images_enabled,
+            prefer_local_cover_art=self.prefer_local_cover_art,
             audiodb_api_key=self.audiodb_api_key,
             cache_ttl_audiodb_found=self.cache_ttl_audiodb_found * 3600,
             cache_ttl_audiodb_not_found=self.cache_ttl_audiodb_not_found * 3600,

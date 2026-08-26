@@ -24,6 +24,7 @@ import {
 	reportPlexStopped
 } from '$lib/player/plexPlaybackApi';
 import { playbackToast } from '$lib/stores/playbackToast.svelte';
+import { radioSession } from '$lib/stores/radioSession.svelte';
 import {
 	getStoredVolume,
 	storeVolume,
@@ -94,6 +95,7 @@ function createPlayerStore() {
 	let shuffleEnabled = $state(false);
 	let shuffleOrder = $state<number[]>([]);
 	let consecutiveErrors = 0;
+	let failedTrackNames: string[] = [];
 	let errorSkipTimeout: ReturnType<typeof setTimeout> | null = null;
 	let lastPersistTime = 0;
 	let beforeUnloadRegistered = false;
@@ -186,6 +188,7 @@ function createPlayerStore() {
 	}
 
 	function applyResetState(): void {
+		radioSession.end();
 		currentSource?.destroy();
 		currentSource = null;
 		nowPlaying = null;
@@ -199,6 +202,7 @@ function createPlayerStore() {
 		shuffleOrder = [];
 		shuffleEnabled = false;
 		consecutiveErrors = 0;
+		failedTrackNames = [];
 		progressReporter.stop();
 		unregisterBeforeUnload();
 		storeSessionData(null);
@@ -319,8 +323,15 @@ function createPlayerStore() {
 		consecutiveErrors++;
 		playbackState = 'error';
 		const trackName = nowPlaying?.trackName ?? 'Unknown track';
+		failedTrackNames.push(trackName);
 		if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-			playbackToast.show('Several tracks failed, so playback stopped.', 'error');
+			const named = failedTrackNames
+				.slice(0, MAX_CONSECUTIVE_ERRORS)
+				.map((n) => `"${n}"`)
+				.join(', ');
+			const extra = failedTrackNames.length - MAX_CONSECUTIVE_ERRORS;
+			const suffix = extra > 0 ? ` +${extra} more` : '';
+			playbackToast.show(`Several tracks failed: ${named}${suffix} - playback stopped.`, 'error');
 			applyResetState();
 			return;
 		}
@@ -351,6 +362,7 @@ function createPlayerStore() {
 			playbackState = state;
 			if (state === 'playing') {
 				consecutiveErrors = 0;
+				failedTrackNames = [];
 				if (getJellyfinItem())
 					progressReporter.start(() => ({
 						jellyfinItem: getJellyfinItem(),
@@ -488,6 +500,7 @@ function createPlayerStore() {
 		},
 
 		playAlbum(source: PlaybackSource, metadata: NowPlaying): void {
+			radioSession.end();
 			void resumeAudioEngine();
 			void stopPreviousSession(getCurrentItem(), progress);
 			currentSource?.destroy();
@@ -508,6 +521,9 @@ function createPlayerStore() {
 
 		playQueue(items: QueueItem[], startIndex: number = 0, shuffle: boolean = false): void {
 			if (items.length === 0) return;
+			if (!items.some((item) => item.playlistTrackId?.startsWith('radio:'))) {
+				radioSession.end();
+			}
 			void resumeAudioEngine();
 			const s = buildPlayQueueState(items, startIndex, shuffle);
 			queue = s.queue;
@@ -692,6 +708,7 @@ function createPlayerStore() {
 		},
 
 		clearQueue(): void {
+			radioSession.end();
 			if (queue.length === 0 || !queue[currentIndex]) {
 				this.stop();
 				return;

@@ -1,5 +1,5 @@
 import { page } from '@vitest/browser/context';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import SearchArtistCard from './SearchArtistCard.svelte';
 import type { Artist, EnrichmentSource } from '$lib/types';
@@ -14,12 +14,17 @@ const baseArtist: Artist = {
 };
 
 function renderComponent(
-	overrides: Partial<{ artist: Artist; enrichmentSource: EnrichmentSource }> = {}
+	overrides: Partial<{
+		artist: Artist;
+		enrichmentSource: EnrichmentSource;
+		onenrichmentrequest: () => void;
+	}> = {}
 ) {
 	return render(SearchArtistCard, {
 		props: {
 			artist: overrides.artist ?? baseArtist,
-			enrichmentSource: overrides.enrichmentSource ?? 'none'
+			enrichmentSource: overrides.enrichmentSource ?? 'none',
+			onenrichmentrequest: overrides.onenrichmentrequest
 		}
 	} as Parameters<typeof render<typeof SearchArtistCard>>[1]);
 }
@@ -90,6 +95,36 @@ describe('SearchArtistCard.svelte', () => {
 	it('should display disambiguation when present', async () => {
 		renderComponent();
 		await expect.element(page.getByText('English rock band')).toBeInTheDocument();
+	});
+
+	it('requests optional enrichment on keyboard focus', async () => {
+		expect.assertions(2);
+		const onenrichmentrequest = vi.fn();
+		renderComponent({ onenrichmentrequest });
+		const artistName = page.getByText('Radiohead');
+		await expect.element(artistName).toBeInTheDocument();
+		onenrichmentrequest.mockClear();
+
+		artistName.element().closest('a')?.focus();
+
+		expect(onenrichmentrequest).toHaveBeenCalledTimes(1);
+	});
+
+	it('does not enrich a local-only artist with a local id', async () => {
+		const onenrichmentrequest = vi.fn();
+		renderComponent({
+			artist: {
+				...baseArtist,
+				musicbrainz_id: 'local-artist-id',
+				local_id: 'local-artist-id',
+				in_library: true
+			},
+			onenrichmentrequest
+		});
+
+		await page.getByText('Radiohead').hover();
+
+		expect(onenrichmentrequest).not.toHaveBeenCalled();
 	});
 
 	it('should singular release for count of 1', async () => {

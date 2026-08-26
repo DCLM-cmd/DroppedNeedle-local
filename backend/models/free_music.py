@@ -24,6 +24,7 @@ class FreeMusicTask(AppStruct):
     status: str
     created_at: float
     updated_at: float
+    track_count: int = 0
     identifier: str = ""  # the archive.org item, once chosen
     licence_url: str = ""
     format: str = ""
@@ -33,6 +34,15 @@ class FreeMusicTask(AppStruct):
     bytes_downloaded: int = 0
     attempts: int = 0
     error: str | None = None
+    origin: str = "user"
+    release_group_mbid: str | None = None
+    release_mbid: str | None = None
+    release_track_mbid: str | None = None
+    recording_mbid: str | None = None
+    duration_seconds: float | None = None
+    album_title: str | None = None
+    track_number: int | None = None
+    disc_number: int | None = None
 
 
 class FreeMusicCandidate(AppStruct):

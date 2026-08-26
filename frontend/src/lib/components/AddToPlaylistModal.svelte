@@ -1,23 +1,5 @@
-<script lang="ts" module>
-	import { browser } from '$app/environment';
-	import type { QueueItem } from '$lib/player/types';
-
-	let _instance: { open: (items: QueueItem[]) => void } | null = null;
-
-	export function registerPlaylistModal(ref: { open: (items: QueueItem[]) => void }): void {
-		if (browser) _instance = ref;
-	}
-
-	export function unregisterPlaylistModal(): void {
-		_instance = null;
-	}
-
-	export function openGlobalPlaylistModal(items: QueueItem[]): void {
-		if (browser && _instance) _instance.open(items);
-	}
-</script>
-
 <script lang="ts">
+	import { browser } from '$app/environment';
 	import { Disc3, Search, Plus, Check, CircleCheck, X } from 'lucide-svelte';
 	import { fly } from 'svelte/transition';
 	import {
@@ -33,6 +15,7 @@
 	import { PlaylistQueryKeyFactory } from '$lib/queries/playlists/PlaylistQueryKeyFactory';
 	import PlaylistMosaic from './PlaylistMosaic.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
+	import type { QueueItem } from '$lib/player/types';
 
 	const reducedMotion = browser && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 

@@ -48,11 +48,6 @@
 					{options.links.length ? 'More on Bandcamp' : 'Search Bandcamp'}
 				</a>
 			{/if}
-			{#if options.disclosure}
-				<span class="text-[11px] text-base-content/40">
-					Some links earn DroppedNeedle a commission at no cost to you.
-				</span>
-			{/if}
 		{/if}
 	</div>
 </section>

@@ -50,14 +50,27 @@ def test_purchase_options_returns_links(albums_client, get_it_service):
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["digital"][0]["store"] == "bandcamp"
-    assert body["bandcamp_search_url"].startswith("https://bandcamp.com/search")
+    assert body == {
+        "digital": [
+            {
+                "store": "bandcamp",
+                "label": "Bandcamp",
+                "url": "https://x.bandcamp.com/album/y",
+                "kind": "digital",
+            }
+        ],
+        "physical": [],
+        "free": [],
+        "bandcamp_search_url": "https://bandcamp.com/search?q=x&item_type=a",
+    }
     get_it_service.get_purchase_options.assert_awaited_once_with(
         "11111111-1111-1111-1111-111111111111"
     )
 
 
-def test_purchase_options_rejects_unknown_mbid_placeholder(albums_client, get_it_service):
+def test_purchase_options_rejects_unknown_mbid_placeholder(
+    albums_client, get_it_service
+):
     response = albums_client.get("/api/v1/albums/unknown_123/purchase-options")
     assert response.status_code == 400
     get_it_service.get_purchase_options.assert_not_awaited()
@@ -66,9 +79,7 @@ def test_purchase_options_rejects_unknown_mbid_placeholder(albums_client, get_it
 @pytest.fixture
 def settings_client():
     prefs = MagicMock()
-    prefs.get_get_it_settings.return_value = GetItSettings(
-        store_region="GB", support_droppedneedle=True
-    )
+    prefs.get_get_it_settings.return_value = GetItSettings(store_region="GB")
     prefs.save_get_it_settings = MagicMock()
     app = FastAPI()
     app.include_router(settings_router)
@@ -82,22 +93,21 @@ def test_get_it_settings_roundtrip(settings_client):
 
     response = client.get("/settings/get-it")
     assert response.status_code == 200
-    assert response.json() == {"store_region": "GB", "support_droppedneedle": True}
+    assert response.json() == {"store_region": "GB"}
 
     response = client.put(
         "/settings/get-it",
-        json={"store_region": "DE", "support_droppedneedle": False},
+        json={"store_region": "DE"},
     )
     assert response.status_code == 200
     saved = prefs.save_get_it_settings.call_args.args[0]
     assert saved.store_region == "DE"
-    assert saved.support_droppedneedle is False
 
 
 def test_get_it_settings_rejects_bad_region(settings_client):
     client, _ = settings_client
     response = client.put(
         "/settings/get-it",
-        json={"store_region": "GBR", "support_droppedneedle": True},
+        json={"store_region": "GBR"},
     )
     assert response.status_code == 422

@@ -7,6 +7,7 @@ import type {
 	AlbumEnrichmentRequest
 } from '$lib/types';
 import { api } from '$lib/api/client';
+import { API } from '$lib/constants';
 
 export function getListenTitle(
 	source: EnrichmentSource,
@@ -26,7 +27,7 @@ export async function fetchEnrichmentBatch(
 
 	try {
 		return await api.post<EnrichmentResponse>(
-			'/api/v1/search/enrich/batch',
+			API.search.enrichment(),
 			{ artists, albums },
 			{ signal }
 		);

@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 
@@ -240,15 +242,12 @@ async def get_pending_approval_count(
     follow_service: FollowService = Depends(get_follow_service),
     personal_mix_service: PersonalMixService = Depends(get_personal_mix_service),
 ):
-    count = await service.get_pending_approval_count()
-    auto_download = await follow_service.list_pending_approvals()
-    batches = await follow_service.list_pending_batches()
-    personal_mix = await personal_mix_service.list_pending_approvals()
-    # Each batch counts as one unit; individual approvals already exclude batched rows
-    # (the batch_id IS NULL filter in list_pending_approvals), so nothing is double-counted.
-    return ActiveCountResponse(
-        count=count + len(auto_download) + len(batches) + len(personal_mix)
+    album_count, auto_download_count, personal_mix_count = await asyncio.gather(
+        service.get_pending_approval_count(),
+        follow_service.count_pending_approval_units(),
+        personal_mix_service.count_pending_approvals(),
     )
+    return ActiveCountResponse(count=album_count + auto_download_count + personal_mix_count)
 
 
 @router.post("/approve/{musicbrainz_id}", response_model=ApprovalActionResponse)

@@ -15,7 +15,20 @@ def _store(quarantine=None):
     return store
 
 
-def _file(filename, parent, *, ext="flac", bitrate=900, duration=284.0, username="alice"):
+def _file(
+    filename,
+    parent,
+    *,
+    ext="flac",
+    bitrate=900,
+    duration=284.0,
+    username="alice",
+    bit_depth=None,
+    sample_rate=None,
+    free=False,
+    queue_length=None,
+    speed=0,
+):
     return DownloadSearchResult(
         username=username,
         filename=filename,
@@ -23,11 +36,18 @@ def _file(filename, parent, *, ext="flac", bitrate=900, duration=284.0, username
         size=20_000_000,
         extension=ext,
         bitrate=bitrate,
+        bit_depth=bit_depth,
+        sample_rate=sample_rate,
         duration=duration,
+        has_free_slot=free,
+        queue_length=queue_length,
+        upload_speed=speed,
     )
 
 
-_TARGET = TargetTrack(artist_name="Radiohead", track_title="Airbag", duration_seconds=284.0)
+_TARGET = TargetTrack(
+    artist_name="Radiohead", track_title="Airbag", duration_seconds=284.0
+)
 
 
 @pytest.mark.asyncio
@@ -52,7 +72,9 @@ async def test_match_excludes_quarantined():
     from models.download_identity import soulseek_identity
 
     results = [_file("Radiohead - OK Computer/Airbag.flac", "Radiohead - OK Computer")]
-    quarantined = {("soulseek", soulseek_identity(results[0].username, results[0].filename))}
+    quarantined = {
+        ("soulseek", soulseek_identity(results[0].username, results[0].filename))
+    }
     matcher = TrackMatcher(_store(quarantine=quarantined))
     assert await matcher.match(_TARGET, results) is None
 
@@ -69,24 +91,102 @@ async def test_match_picks_highest_confidence():
 @pytest.mark.asyncio
 async def test_match_flac_mp3_only_excludes_other_codecs():
     ogg = _file("Artist/Airbag.ogg", "Artist", ext="ogg", bitrate=320)
-    assert await TrackMatcher(_store()).match(_TARGET, [ogg]) is None  # default: flac_mp3_only
-    assert await TrackMatcher(_store(), flac_mp3_only=False).match(_TARGET, [ogg]) is not None
+    assert (
+        await TrackMatcher(_store()).match(_TARGET, [ogg]) is None
+    )  # default: flac_mp3_only
+    assert (
+        await TrackMatcher(_store(), flac_mp3_only=False).match(_TARGET, [ogg])
+        is not None
+    )
 
 
 @pytest.mark.asyncio
 async def test_match_only_lossless_drops_mp3():
-    mp3 = _file("Radiohead - OK Computer/Airbag.mp3", "Radiohead - OK Computer", ext="mp3", bitrate=320)
+    mp3 = _file(
+        "Radiohead - OK Computer/Airbag.mp3",
+        "Radiohead - OK Computer",
+        ext="mp3",
+        bitrate=320,
+    )
     matcher = TrackMatcher(_store(), quality_min="lossless", quality_max="lossless")
     assert await matcher.match(_TARGET, [mp3]) is None
 
 
 @pytest.mark.asyncio
-async def test_match_prefers_flac_over_better_matched_mp3():
-    mp3 = _file("Radiohead - OK Computer/Airbag.mp3", "Radiohead - OK Computer", ext="mp3", bitrate=320)
+async def test_match_prefers_higher_identity_band_before_format():
+    mp3 = _file(
+        "Radiohead - OK Computer/Airbag.mp3",
+        "Radiohead - OK Computer",
+        ext="mp3",
+        bitrate=320,
+    )
     flac = _file("OKC/Airbag.flac", "OKC", ext="flac", username="bob")
     candidate = await TrackMatcher(_store()).match(_TARGET, [mp3, flac])
     assert candidate is not None
-    assert candidate.files[0].username == "bob"  # FLAC tier wins absolutely
+    assert candidate.files[0].username == "alice"
+
+
+@pytest.mark.asyncio
+async def test_match_prefers_hires_lossless_over_free_redbook_peer():
+    queued_hires = _file(
+        "Radiohead - OK Computer/Airbag.flac",
+        "Radiohead - OK Computer",
+        username="queued-hires",
+        bit_depth=24,
+        sample_rate=48_000,
+        free=False,
+        queue_length=2710,
+        speed=500_000,
+    )
+    free_redbook = _file(
+        "Radiohead - OK Computer/Airbag.flac",
+        "Radiohead - OK Computer",
+        username="free-redbook",
+        bit_depth=16,
+        sample_rate=44_100,
+        free=True,
+        queue_length=0,
+        speed=20_000_000,
+    )
+
+    ranked = await TrackMatcher(_store()).rank(_TARGET, [free_redbook, queued_hires])
+
+    assert [candidate.username for candidate in ranked] == [
+        "queued-hires",
+        "free-redbook",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_match_uses_slot_queue_and_speed_within_identical_resolution():
+    def peer(username, *, free, queue_length, speed):
+        return _file(
+            "Radiohead - OK Computer/Airbag.flac",
+            "Radiohead - OK Computer",
+            username=username,
+            bit_depth=24,
+            sample_rate=48_000,
+            free=free,
+            queue_length=queue_length,
+            speed=speed,
+        )
+
+    ranked = await TrackMatcher(_store()).rank(
+        _TARGET,
+        [
+            peer("long-fast", free=False, queue_length=5, speed=20_000_000),
+            peer("short-slow", free=False, queue_length=1, speed=1_000_000),
+            peer("short-fast", free=False, queue_length=1, speed=5_000_000),
+            peer("free-slow", free=True, queue_length=0, speed=500_000),
+        ],
+    )
+
+    assert [candidate.username for candidate in ranked] == [
+        "free-slow",
+        "short-fast",
+        "short-slow",
+        "long-fast",
+    ]
 
 
 @pytest.mark.asyncio

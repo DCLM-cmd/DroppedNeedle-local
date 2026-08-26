@@ -7,7 +7,8 @@ import type {
 	NavidromeAlbumMatch,
 	NavidromeTrackInfo,
 	PlexAlbumMatch,
-	PlexTrackInfo
+	PlexTrackInfo,
+	Track
 } from '$lib/types';
 import type { QueueItem, PlaybackMeta } from '$lib/player/types';
 import type { TrackMeta, TrackSourceData } from '$lib/player/queueHelpers';
@@ -18,6 +19,7 @@ import {
 	buildQueueItemsFromNavidrome,
 	buildQueueItemsFromPlex,
 	compareDiscTrack,
+	getDiscTrackKey,
 	normalizeDiscNumber
 } from '$lib/player/queueHelpers';
 import { getCoverUrl } from '$lib/utils/errorHandling';
@@ -52,10 +54,45 @@ function getTrackMeta(album: AlbumBasicInfo): TrackMeta {
 	};
 }
 
-function playSource<T extends { track_number: number; disc_number?: number | null; title: string }>(
+type SourceTrack = {
+	track_number: number;
+	disc_number?: number | null;
+	title: string;
+};
+
+function withCanonicalTrackTitles<T extends SourceTrack>(
+	tracks: T[],
+	canonicalTracks: Track[]
+): T[] {
+	if (canonicalTracks.length === 0) return tracks;
+
+	const titlesByPosition = new Map(
+		canonicalTracks.map((track) => [getDiscTrackKey(track), track.title] as const)
+	);
+	const sourceKeys = tracks
+		.filter(
+			(track) => Number.isFinite(Number(track.track_number)) && Number(track.track_number) > 0
+		)
+		.map((track) => getDiscTrackKey(track));
+	const numberingIsUnusable =
+		sourceKeys.length < tracks.length || new Set(sourceKeys).size < sourceKeys.length;
+	const orderedCanonicalTracks = [...canonicalTracks].sort(compareDiscTrack);
+
+	return tracks.map((track, index) => {
+		const canonicalTitle =
+			titlesByPosition.get(getDiscTrackKey(track)) ??
+			(numberingIsUnusable ? orderedCanonicalTracks[index]?.title : undefined);
+		return canonicalTitle && canonicalTitle !== track.title
+			? { ...track, title: canonicalTitle }
+			: track;
+	});
+}
+
+function playSource<T extends SourceTrack>(
 	match: { tracks: T[] } | null,
 	launcher: (tracks: T[], startIndex: number, shuffle: boolean, meta: PlaybackMeta) => void,
 	album: AlbumBasicInfo,
+	canonicalTracks: Track[],
 	opts: {
 		startTrack?: number;
 		startDisc?: number;
@@ -64,7 +101,10 @@ function playSource<T extends { track_number: number; disc_number?: number | nul
 	} = {}
 ): void {
 	if (!match?.tracks.length) return;
-	const orderedTracks = [...match.tracks].sort(compareDiscTrack);
+	const orderedTracks = withCanonicalTrackTitles(
+		[...match.tracks].sort(compareDiscTrack),
+		canonicalTracks
+	);
 	let idx = 0;
 	if (opts.startTrack !== undefined) {
 		idx = orderedTracks.findIndex(
@@ -100,13 +140,17 @@ export function playSourceTrack(
 	jellyfinMatch: JellyfinAlbumMatch | null,
 	localMatch: LocalAlbumMatch | null,
 	navidromeMatch: NavidromeAlbumMatch | null,
-	plexMatch: PlexAlbumMatch | null
+	plexMatch: PlexAlbumMatch | null,
+	canonicalTracks: Track[]
 ): void {
 	const opts = { startTrack: trackPosition, startDisc: discNumber, startTitle: title };
-	if (source === 'jellyfin') playSource(jellyfinMatch, launchJellyfinPlayback, album, opts);
-	else if (source === 'local') playSource(localMatch, launchLocalPlayback, album, opts);
-	else if (source === 'plex') playSource(plexMatch, launchPlexPlayback, album, opts);
-	else playSource(navidromeMatch, launchNavidromePlayback, album, opts);
+	if (source === 'jellyfin')
+		playSource(jellyfinMatch, launchJellyfinPlayback, album, canonicalTracks, opts);
+	else if (source === 'local')
+		playSource(localMatch, launchLocalPlayback, album, canonicalTracks, opts);
+	else if (source === 'plex')
+		playSource(plexMatch, launchPlexPlayback, album, canonicalTracks, opts);
+	else playSource(navidromeMatch, launchNavidromePlayback, album, canonicalTracks, opts);
 }
 
 function buildTrackQueueItem(
@@ -195,16 +239,29 @@ function getSourceQueueItems(
 	jellyfinTracks: JellyfinTrackInfo[],
 	localTracks: LocalTrackInfo[],
 	navidromeTracks: NavidromeTrackInfo[],
-	plexTracks: PlexTrackInfo[]
+	plexTracks: PlexTrackInfo[],
+	canonicalTracks: Track[]
 ): QueueItem[] {
 	const meta = getTrackMeta(album);
 	if (source === 'jellyfin')
-		return buildQueueItemsFromJellyfin([...jellyfinTracks].sort(compareDiscTrack), meta);
+		return buildQueueItemsFromJellyfin(
+			withCanonicalTrackTitles([...jellyfinTracks].sort(compareDiscTrack), canonicalTracks),
+			meta
+		);
 	if (source === 'navidrome')
-		return buildQueueItemsFromNavidrome([...navidromeTracks].sort(compareDiscTrack), meta);
+		return buildQueueItemsFromNavidrome(
+			withCanonicalTrackTitles([...navidromeTracks].sort(compareDiscTrack), canonicalTracks),
+			meta
+		);
 	if (source === 'plex')
-		return buildQueueItemsFromPlex([...plexTracks].sort(compareDiscTrack), meta);
-	return buildQueueItemsFromLocal([...localTracks].sort(compareDiscTrack), meta);
+		return buildQueueItemsFromPlex(
+			withCanonicalTrackTitles([...plexTracks].sort(compareDiscTrack), canonicalTracks),
+			meta
+		);
+	return buildQueueItemsFromLocal(
+		withCanonicalTrackTitles([...localTracks].sort(compareDiscTrack), canonicalTracks),
+		meta
+	);
 }
 
 export function buildSourceCallbacks<
@@ -226,16 +283,17 @@ export function buildSourceCallbacks<
 		navidrome: () => NavidromeTrackInfo[];
 		plex: () => PlexTrackInfo[];
 	},
+	canonicalTracksGetter: () => Track[],
 	playlistModalRefGetter: () => { open: (tracks: QueueItem[]) => void } | null
 ): SourceCallbacks {
 	return {
 		onPlayAll: () => {
 			const a = albumGetter();
-			if (a) playSource(matchGetter(), launcher, a);
+			if (a) playSource(matchGetter(), launcher, a, canonicalTracksGetter());
 		},
 		onShuffle: () => {
 			const a = albumGetter();
-			if (a) playSource(matchGetter(), launcher, a, { shuffle: true });
+			if (a) playSource(matchGetter(), launcher, a, canonicalTracksGetter(), { shuffle: true });
 		},
 		onAddAllToQueue: () => {
 			const a = albumGetter();
@@ -246,7 +304,8 @@ export function buildSourceCallbacks<
 				tracksGetters.jellyfin(),
 				tracksGetters.local(),
 				tracksGetters.navidrome(),
-				tracksGetters.plex()
+				tracksGetters.plex(),
+				canonicalTracksGetter()
 			);
 			if (items.length > 0) playerStore.addMultipleToQueue(items);
 		},
@@ -259,7 +318,8 @@ export function buildSourceCallbacks<
 				tracksGetters.jellyfin(),
 				tracksGetters.local(),
 				tracksGetters.navidrome(),
-				tracksGetters.plex()
+				tracksGetters.plex(),
+				canonicalTracksGetter()
 			);
 			if (items.length > 0) playerStore.playMultipleNext(items);
 		},
@@ -272,7 +332,8 @@ export function buildSourceCallbacks<
 				tracksGetters.jellyfin(),
 				tracksGetters.local(),
 				tracksGetters.navidrome(),
-				tracksGetters.plex()
+				tracksGetters.plex(),
+				canonicalTracksGetter()
 			);
 			if (items.length > 0) playlistModalRefGetter()?.open(items);
 		}

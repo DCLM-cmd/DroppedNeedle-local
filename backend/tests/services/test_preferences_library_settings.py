@@ -5,8 +5,18 @@ from pathlib import Path
 
 import pytest
 
-from api.v1.schemas.settings import ACOUSTID_KEY_MASK, LibrarySettings, LibrarySyncSettings
+from api.v1.schemas.library_policies import (
+    LibraryPathPolicyRule,
+    LibraryRootSettings,
+    TypedLibrarySettings,
+)
+from api.v1.schemas.settings import (
+    ACOUSTID_KEY_MASK,
+    LibrarySettings,
+    LibrarySyncSettings,
+)
 from core.config import Settings
+from core.exceptions import ConfigurationError
 from services.preferences_service import PreferencesService
 
 
@@ -63,6 +73,79 @@ def test_mask_on_save_preserves_existing_key(prefs):
     raw = prefs.get_library_settings_raw()
     assert raw.acoustid_api_key == "secret-key"  # secret preserved
     assert raw.library_paths == ["/m2"]  # non-secret fields updated
+
+
+def test_upgrade_retarget_rejects_unknown_root_ids(prefs):
+    prefs.save_library_settings(LibrarySettings(library_paths=["/old/music"]))
+
+    with pytest.raises(ConfigurationError, match="unknown library root"):
+        prefs.retarget_library_roots_for_upgrade({"missing-root": "/elsewhere"})
+    with pytest.raises(ConfigurationError, match="unknown library root"):
+        prefs.retarget_library_roots_for_upgrade({})
+
+
+def test_upgrade_retargets_only_existing_root_paths_and_preserves_secret(prefs):
+    prefs.save_library_settings(
+        LibrarySettings(library_paths=["/old/music"], acoustid_api_key="secret-key")
+    )
+    before = prefs.get_typed_library_settings()
+    root = before.library_roots[0]
+    prefs.save_typed_library_settings(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(
+                    id=root.id,
+                    path=root.path,
+                    label=root.label,
+                    policy="local_metadata",
+                    rules=[
+                        LibraryPathPolicyRule(
+                            id="rule", relative_path="Archive", policy="excluded"
+                        )
+                    ],
+                )
+            ],
+            staging_path=before.staging_path,
+            naming_template=before.naming_template,
+            acoustid_api_key=before.acoustid_api_key,
+        )
+    )
+    before = prefs.get_typed_library_settings()
+
+    prefs.retarget_library_roots_for_upgrade(
+        {before.library_roots[0].id: "/current/music"}
+    )
+
+    after = prefs.get_typed_library_settings()
+    assert after.library_roots[0].id == before.library_roots[0].id
+    assert after.library_roots[0].label == before.library_roots[0].label
+    assert after.library_roots[0].path == "/current/music"
+    assert after.library_roots[0].policy == "local_metadata"
+    assert after.library_roots[0].rules == before.library_roots[0].rules
+    assert prefs.get_typed_library_settings_raw().acoustid_api_key == "secret-key"
+
+
+def test_normal_typed_save_still_rejects_moving_an_existing_root(prefs):
+    current = prefs.get_typed_library_settings()
+    root = current.library_roots[0]
+
+    with pytest.raises(ConfigurationError, match="cannot be moved"):
+        prefs.save_typed_library_settings(
+            TypedLibrarySettings(
+                library_roots=[
+                    LibraryRootSettings(
+                        id=root.id,
+                        path="/different",
+                        label=root.label,
+                        policy=root.policy,
+                        rules=root.rules,
+                    )
+                ],
+                staging_path=current.staging_path,
+                naming_template=current.naming_template,
+                acoustid_api_key=current.acoustid_api_key,
+            )
+        )
 
 
 def test_seeds_library_paths_from_legacy_root(tmp_path: Path):

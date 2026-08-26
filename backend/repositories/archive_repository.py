@@ -3,8 +3,6 @@
 Only surfaces items carrying an explicit Creative Commons or public-domain
 ``licenseurl``. That filter is DroppedNeedle's own editorial rule for its own
 client (D24/D25); it is not imposed on anyone else.
-
-See ``ARCHIVE_API_NOTES.md`` for the live-probed shapes this depends on.
 """
 
 import logging
@@ -102,7 +100,9 @@ class ArchiveRepository:
     def reset_circuit_breaker() -> None:
         _archive_circuit_breaker.reset()
 
-    async def search_audio(self, artist: str, title: str, limit: int = 12) -> list[ArchiveItem]:
+    async def search_audio(
+        self, artist: str, title: str, limit: int = 12
+    ) -> list[ArchiveItem]:
         """Licensed audio items matching artist + title. Absence is ``[]``; a dead
         Archive raises, because Free Music failing is a real failure the user is
         waiting on, not a degradable enrichment."""
@@ -156,20 +156,22 @@ class ArchiveRepository:
                     name=str(name),
                     format=fmt,
                     size_bytes=int(entry.get("size") or 0),
-                    track=int(entry["track"]) if str(entry.get("track") or "").isdigit() else None,
+                    track=int(entry["track"])
+                    if str(entry.get("track") or "").isdigit()
+                    else None,
                     title=str(entry.get("title") or ""),
                 )
             )
         return licence, files
 
-    async def stream_file(
-        self, identifier: str, filename: str
-    ) -> AsyncIterator[bytes]:
+    async def stream_file(self, identifier: str, filename: str) -> AsyncIterator[bytes]:
         """Yield a file's bytes. Raises ``ArchiveError`` on a non-200."""
         url = DOWNLOAD_URL.format(identifier=identifier, filename=quote(filename))
         async with self._client.stream("GET", url, follow_redirects=True) as response:
             if response.status_code == 429:
-                raise RateLimitedError("Internet Archive rate limited", retry_after_seconds=60)
+                raise RateLimitedError(
+                    "Internet Archive rate limited", retry_after_seconds=60
+                )
             if response.status_code != 200:
                 raise ArchiveError(
                     f"Internet Archive returned HTTP {response.status_code} for a file"
@@ -221,7 +223,9 @@ class ArchiveRepository:
         except httpx.HTTPError as exc:
             raise ArchiveError(f"Internet Archive transport error: {exc}") from exc
         if response.status_code == 429:
-            raise RateLimitedError("Internet Archive rate limited", retry_after_seconds=60)
+            raise RateLimitedError(
+                "Internet Archive rate limited", retry_after_seconds=60
+            )
         if response.status_code != 200:
             raise ArchiveError(f"Internet Archive returned HTTP {response.status_code}")
         return response

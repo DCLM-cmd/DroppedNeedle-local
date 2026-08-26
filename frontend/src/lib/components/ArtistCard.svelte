@@ -31,6 +31,7 @@
 			mbid={artist.musicbrainz_id}
 			alt={artist.title}
 			size="full"
+			requestSize={250}
 			remoteUrl={artist.thumb_url ?? null}
 			className="w-full h-full"
 		/>

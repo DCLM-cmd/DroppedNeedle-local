@@ -10,6 +10,7 @@ from core.dependencies import (
     get_jellyfin_library_service,
     get_local_files_service,
     get_navidrome_library_service,
+    get_navidrome_folder_scope_service,
     get_plex_library_service,
     get_playlist_service,
     get_spotify_import_service,
@@ -19,6 +20,8 @@ from core.task_registry import TaskRegistry
 from infrastructure.msgspec_fastapi import AppStruct, MsgSpecBody, MsgSpecRoute
 from middleware import CurrentUserDep
 from services.spotify_import_service import SpotifyImportService, SpotifyNotLinkedError
+from services.local_files_service import LocalFilesService
+from services.playlist_service import PlaylistService
 
 _LINK_SOURCE_PRIORITY = ["local", "jellyfin", "navidrome", "plex"]
 
@@ -55,6 +58,8 @@ async def _background_import(
     spotify_playlist_id: str,
     playlist_id: str,
     current_user: object,
+    playlist_service: PlaylistService,
+    local_service: LocalFilesService,
 ) -> None:
     try:
         await svc.populate_playlist(user_id, spotify_playlist_id, playlist_id)
@@ -64,20 +69,23 @@ async def _background_import(
         )
         return
     try:
-        # Resolve the singleton services inside the try so a getter failure is logged
-        # by the auto-link handler below rather than silently killing the task.
-        playlist_service = get_playlist_service()
         jf_service = get_jellyfin_library_service()
-        local_service = get_local_files_service()
         nd_service = get_navidrome_library_service()
+        folder_resolution = await get_navidrome_folder_scope_service().resolve(user_id)
+        navidrome_folder_ids = (
+            None
+            if folder_resolution.scope.mode == "all"
+            else folder_resolution.scope.folder_ids
+        )
         plex_service = get_plex_library_service()
         sources_map = await playlist_service.resolve_track_sources(
             playlist_id,
-            requesting=None,
+            requesting=current_user,
             jf_service=jf_service,
             local_service=local_service,
             nd_service=nd_service,
             plex_service=plex_service,
+            navidrome_folder_ids=navidrome_folder_ids,
         )
         for track_id, sources in sources_map.items():
             if not sources:
@@ -94,6 +102,7 @@ async def _background_import(
                         local_service=local_service,
                         nd_service=nd_service,
                         plex_service=plex_service,
+                        navidrome_folder_ids=navidrome_folder_ids,
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -110,7 +119,9 @@ async def _background_import(
             {"playlist_id": playlist_id, "event_id": uuid.uuid4().hex},
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Failed to signal Spotify import completion for {playlist_id}: {exc}")
+        logger.warning(
+            f"Failed to signal Spotify import completion for {playlist_id}: {exc}"
+        )
 
 
 @router.get("/playlists", response_model=SpotifyPlaylistListResponse)
@@ -124,7 +135,9 @@ async def list_spotify_playlists(
         raise HTTPException(status_code=400, detail="Spotify account not linked")
     except Exception as exc:  # noqa: BLE001
         logger.error(f"Failed to list Spotify playlists for {current_user.id}: {exc}")
-        raise HTTPException(status_code=502, detail="Failed to fetch playlists from Spotify")
+        raise HTTPException(
+            status_code=502, detail="Failed to fetch playlists from Spotify"
+        )
     return SpotifyPlaylistListResponse(
         playlists=[
             SpotifyPlaylistItem(
@@ -150,6 +163,8 @@ async def import_spotify_playlist(
     body: SpotifyImportRequest = MsgSpecBody(SpotifyImportRequest),
     current_user: CurrentUserDep = None,
     svc: SpotifyImportService = Depends(get_spotify_import_service),
+    playlist_service: PlaylistService = Depends(get_playlist_service),
+    local_service: LocalFilesService = Depends(get_local_files_service),
 ) -> SpotifyImportResponse:
     try:
         playlist_id = await svc.ensure_playlist_record(
@@ -168,7 +183,13 @@ async def import_spotify_playlist(
     if not registry.is_running(task_key):
         task = asyncio.create_task(
             _background_import(
-                svc, current_user.id, spotify_playlist_id, playlist_id, current_user
+                svc,
+                current_user.id,
+                spotify_playlist_id,
+                playlist_id,
+                current_user,
+                playlist_service,
+                local_service,
             )
         )
         try:

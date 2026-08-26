@@ -44,7 +44,6 @@ function options(overrides: Partial<PurchaseOptionsResponse> = {}): PurchaseOpti
 		],
 		free: [],
 		bandcamp_search_url: 'https://bandcamp.com/search?q=x&item_type=a',
-		disclosure: false,
 		...overrides
 	};
 }
@@ -65,7 +64,6 @@ describe('WhereToBuy', () => {
 	it('collapsed row shows stores in fairness order, across every kind', async () => {
 		h.data = options();
 		render(WhereToBuy, { releaseGroupMbid: 'rg-1' });
-		// Bandcamp first (D19); physical links are eligible for the row too
 		await expect.element(page.getByRole('link', { name: 'Bandcamp', exact: true })).toBeVisible();
 		await expect.element(page.getByRole('link', { name: 'Qobuz', exact: true })).toBeVisible();
 		await expect.element(page.getByRole('link', { name: 'Amazon', exact: true })).toBeVisible();
@@ -121,14 +119,5 @@ describe('WhereToBuy', () => {
 		h.data = options({ digital: [], physical: [] });
 		render(WhereToBuy, { releaseGroupMbid: 'rg-1' });
 		await expect.element(page.getByRole('link', { name: 'Search Bandcamp' })).toBeVisible();
-	});
-
-	it('shows the commission disclosure only when the backend says so', async () => {
-		h.data = options({ disclosure: true });
-		render(WhereToBuy, { releaseGroupMbid: 'rg-1' });
-		await page.getByRole('button', { name: 'Details' }).click();
-		await expect
-			.element(page.getByText('Some links earn DroppedNeedle a commission at no cost to you.'))
-			.toBeVisible();
 	});
 });

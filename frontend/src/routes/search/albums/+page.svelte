@@ -11,6 +11,7 @@
 	import { colors } from '$lib/colors';
 	import { searchStore } from '$lib/stores/search';
 	import { fetchEnrichmentBatch, applyAlbumEnrichment } from '$lib/utils/enrichment';
+	import { createSearchEnrichmentBatcher } from '$lib/utils/searchEnrichmentBatcher';
 	import { isAbortError } from '$lib/utils/errorHandling';
 	import { api } from '$lib/api/client';
 	import { Check } from 'lucide-svelte';
@@ -30,7 +31,6 @@
 	let sentinel = $state<HTMLElement>();
 	let showToast = $state(false);
 	let abortController: AbortController | null = null;
-	let enrichmentController: AbortController | null = null;
 	let observer: IntersectionObserver | null = null;
 	let enrichmentSource: EnrichmentSource = $state('none');
 	let lastQuery = $state('');
@@ -54,33 +54,14 @@
 		}, 3000);
 	}
 
-	async function fetchEnrichment(albumsToEnrich: Album[]) {
-		if (albumsToEnrich.length === 0) return;
-
-		if (enrichmentController) {
-			enrichmentController.abort();
-		}
-		enrichmentController = new AbortController();
-
-		const requests = albumsToEnrich.map((a) => ({
-			musicbrainz_id: a.musicbrainz_id,
-			artist_name: a.artist || '',
-			album_name: a.title
-		}));
-
-		try {
-			const enrichment = await fetchEnrichmentBatch([], requests, enrichmentController.signal);
-			if (!enrichment) return;
-
+	const enrichmentBatcher = createSearchEnrichmentBatcher({
+		load: fetchEnrichmentBatch,
+		onresult: (enrichment) => {
 			enrichmentSource = enrichment.source;
 			albums = applyAlbumEnrichment(albums, enrichment);
 			searchStore.setEnrichmentSource(enrichmentSource);
-		} catch (error) {
-			if (isAbortError(error)) {
-				return;
-			}
 		}
-	}
+	});
 
 	async function loadMore() {
 		if (loading || !hasMore || !data.query) return;
@@ -106,25 +87,16 @@
 				hasMore = false;
 			}
 
-			// eslint-disable-next-line svelte/prefer-svelte-reactivity
-			const newMbids = new Set<string>();
 			if (offset === 0 && albums.length > 0) {
 				const existingIds = new Set(albums.map((a) => a.musicbrainz_id));
 				const uniqueNewAlbums = newAlbums.filter((a: Album) => !existingIds.has(a.musicbrainz_id));
 				albums = [...albums, ...uniqueNewAlbums];
 				offset = albums.length;
-				uniqueNewAlbums.forEach((a) => newMbids.add(a.musicbrainz_id));
 			} else {
 				albums = [...albums, ...newAlbums];
 				offset += newAlbums.length;
-				newAlbums.forEach((a) => newMbids.add(a.musicbrainz_id));
 			}
 			searchStore.updateAlbums(albums);
-
-			const toEnrich = albums.filter((a) => newMbids.has(a.musicbrainz_id));
-			if (toEnrich.length > 0) {
-				fetchEnrichment(toEnrich);
-			}
 		} catch (error) {
 			if (isAbortError(error)) {
 				return;
@@ -136,15 +108,11 @@
 	}
 
 	function resetAndLoad() {
+		enrichmentBatcher.reset();
 		if (abortController) {
 			abortController.abort();
 			abortController = null;
 		}
-		if (enrichmentController) {
-			enrichmentController.abort();
-			enrichmentController = null;
-		}
-
 		if (observer) {
 			observer.disconnect();
 			observer = null;
@@ -157,11 +125,6 @@
 			enrichmentSource = cache.enrichmentSource;
 			offset = cache.albums.length;
 			hasMore = cache.albums.length >= limit;
-			const needsEnrichment = albums.filter((a) => a.listen_count == null);
-			if (needsEnrichment.length > 0) {
-				void fetchEnrichment(needsEnrichment);
-			}
-
 			if (searchStore.isStale(cache.timestamp)) {
 				offset = 0;
 				hasMore = true;
@@ -219,10 +182,7 @@
 			abortController.abort();
 			abortController = null;
 		}
-		if (enrichmentController) {
-			enrichmentController.abort();
-			enrichmentController = null;
-		}
+		enrichmentBatcher.dispose();
 	});
 </script>
 
@@ -277,7 +237,12 @@
 				class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4"
 			>
 				{#each topAlbum ? albums.filter((a) => a.musicbrainz_id !== topAlbum?.musicbrainz_id) : albums as album (album.musicbrainz_id)}
-					<AlbumCard {album} {enrichmentSource} onadded={handleAlbumAdded} />
+					<AlbumCard
+						{album}
+						{enrichmentSource}
+						onadded={handleAlbumAdded}
+						onenrichmentrequest={() => enrichmentBatcher.requestAlbum(album)}
+					/>
 				{/each}
 			</div>
 		</div>

@@ -4,6 +4,7 @@ from models.search import SearchResult as SearchResult
 from infrastructure.msgspec_fastapi import AppStruct
 
 EnrichmentSource = Literal["listenbrainz", "lastfm", "none"]
+SearchRemoteStatus = Literal["ok", "partial", "timeout", "error"]
 
 
 class SearchResponse(AppStruct):
@@ -12,6 +13,7 @@ class SearchResponse(AppStruct):
     top_artist: SearchResult | None = None
     top_album: SearchResult | None = None
     service_status: dict[str, str] | None = None
+    bucket_status: dict[str, SearchRemoteStatus] | None = None
 
 
 class SearchBucketResponse(AppStruct):
@@ -20,6 +22,7 @@ class SearchBucketResponse(AppStruct):
     offset: int
     results: list[SearchResult] = []
     top_result: SearchResult | None = None
+    status: SearchRemoteStatus = "ok"
 
 
 class ArtistEnrichment(AppStruct):
@@ -70,3 +73,4 @@ class SuggestResult(AppStruct):
 
 class SuggestResponse(AppStruct):
     results: list[SuggestResult] = []
+    remote_status: SearchRemoteStatus = "ok"

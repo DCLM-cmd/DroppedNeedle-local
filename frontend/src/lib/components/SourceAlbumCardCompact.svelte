@@ -23,6 +23,7 @@
 			customUrl={imageUrl}
 			alt={name}
 			size="full"
+			requestSize={250}
 			rounded="none"
 			className="w-full h-full"
 		/>

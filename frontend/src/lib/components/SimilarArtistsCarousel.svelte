@@ -42,6 +42,7 @@
 								mbid={artist.musicbrainz_id}
 								alt={artist.name}
 								size="full"
+								requestSize={250}
 								className="w-full h-full object-cover"
 							/>
 						</div>

@@ -1,8 +1,10 @@
 import { page, userEvent } from '@vitest/browser/context';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render } from 'vitest-browser-svelte';
-import SearchSuggestions from './SearchSuggestions.svelte';
+import SearchSuggestionsTestHarness from './SearchSuggestionsTestHarness.svelte';
 import type { SuggestResult } from '$lib/types';
+import { authStore } from '$lib/stores/authStore.svelte';
+import { resetQueryCacheForUserSwitch } from '$lib/queries/QueryClient';
 
 const mockResults: SuggestResult[] = [
 	{
@@ -36,15 +38,39 @@ function makeResponse(body: unknown, status = 200): Response {
 }
 
 function mockFetchSuccess(results: SuggestResult[] = mockResults) {
-	return vi.fn().mockImplementation(() => Promise.resolve(makeResponse({ results })));
+	return vi.fn().mockImplementation((input: RequestInfo | URL) => {
+		const url = String(input);
+		if (url.startsWith('/api/v1/search/suggest?')) {
+			return Promise.resolve(makeResponse({ results, remote_status: 'ok' }));
+		}
+		if (url.startsWith('/api/v1/library/artists?')) {
+			return Promise.resolve(
+				makeResponse({ items: [], total: 0, album_artist_total: 0, contributor_total: 0 })
+			);
+		}
+		if (url.startsWith('/api/v1/library/albums?')) {
+			return Promise.resolve(makeResponse({ items: [], total: 0 }));
+		}
+		throw new Error(`Unexpected request: ${url}`);
+	});
 }
 
 function mockFetchError() {
-	return vi
-		.fn()
-		.mockImplementation(() =>
-			Promise.resolve(makeResponse({ error: 'Internal Server Error' }, 500))
-		);
+	return vi.fn().mockImplementation((input: RequestInfo | URL) => {
+		const url = String(input);
+		if (url.startsWith('/api/v1/search/suggest?')) {
+			return Promise.resolve(makeResponse({ error: 'Internal Server Error' }, 500));
+		}
+		if (url.startsWith('/api/v1/library/artists?')) {
+			return Promise.resolve(
+				makeResponse({ items: [], total: 0, album_artist_total: 0, contributor_total: 0 })
+			);
+		}
+		if (url.startsWith('/api/v1/library/albums?')) {
+			return Promise.resolve(makeResponse({ items: [], total: 0 }));
+		}
+		throw new Error(`Unexpected request: ${url}`);
+	});
 }
 
 function renderComponent(props: Record<string, unknown> = {}) {
@@ -52,21 +78,34 @@ function renderComponent(props: Record<string, unknown> = {}) {
 		props: { query: '', onSearch: vi.fn(), onSelect: vi.fn(), ...props }
 	};
 	return render(
-		SearchSuggestions,
-		options as unknown as Parameters<typeof render<typeof SearchSuggestions>>[1]
+		SearchSuggestionsTestHarness,
+		options as unknown as Parameters<typeof render<typeof SearchSuggestionsTestHarness>>[1]
 	);
 }
 
 describe('SearchSuggestions.svelte', () => {
 	let originalFetch: typeof globalThis.fetch;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		originalFetch = globalThis.fetch;
+		await resetQueryCacheForUserSwitch();
+		authStore.setUser({
+			id: 'suggest-user',
+			display_name: 'Suggest User',
+			role: 'admin',
+			email: null,
+			avatar_url: null,
+			username: 'suggest-user',
+			username_display: 'Suggest User',
+			providers: ['local']
+		});
 		vi.useFakeTimers({ shouldAdvanceTime: true });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		globalThis.fetch = originalFetch;
+		await resetQueryCacheForUserSwitch();
+		authStore.clear();
 		vi.useRealTimers();
 	});
 
@@ -91,7 +130,7 @@ describe('SearchSuggestions.svelte', () => {
 
 		const input = page.getByRole('searchbox');
 		await input.fill('mus');
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
 		const listbox = page.getByRole('listbox');
 		await expect.element(listbox).toBeInTheDocument();
@@ -108,7 +147,7 @@ describe('SearchSuggestions.svelte', () => {
 
 		const input = page.getByRole('searchbox');
 		await input.fill('mus');
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
 		const firstOption = page.getByRole('option').first();
 		await firstOption.click();
@@ -134,7 +173,7 @@ describe('SearchSuggestions.svelte', () => {
 
 		const input = page.getByRole('searchbox');
 		await input.fill('mus');
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
 		const listbox = page.getByRole('listbox');
 		await expect.element(listbox).toBeInTheDocument();
@@ -144,17 +183,91 @@ describe('SearchSuggestions.svelte', () => {
 		await expect.element(listbox).not.toBeInTheDocument();
 	});
 
-	it('should hide dropdown on fetch error', async () => {
-		globalThis.fetch = mockFetchError();
+	it('should show an accurate retry state on fetch error', async () => {
+		const fetchSpy = mockFetchError();
+		globalThis.fetch = fetchSpy;
 
 		renderComponent();
 
 		const input = page.getByRole('searchbox');
 		await input.fill('mus');
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
 		const listbox = page.getByRole('listbox');
-		await expect.element(listbox).not.toBeInTheDocument();
+		await expect.element(listbox).toBeInTheDocument();
+		await expect
+			.element(page.getByText('Some MusicBrainz suggestions are unavailable.'))
+			.toBeInTheDocument();
+		const retry = page.getByRole('button', { name: 'Retry' });
+		await expect.element(retry).toBeInTheDocument();
+		await retry.click();
+		await vi.waitFor(() => {
+			const suggestionCalls = fetchSpy.mock.calls.filter(([input]) =>
+				String(input).startsWith('/api/v1/search/suggest?')
+			);
+			expect(suggestionCalls).toHaveLength(2);
+		});
+	});
+
+	it('keeps partial suggestions usable while showing the degraded state', async () => {
+		const fetchSpy = mockFetchSuccess([mockResults[0]]);
+		fetchSpy.mockImplementation((input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.startsWith('/api/v1/search/suggest?')) {
+				return Promise.resolve(
+					makeResponse({ results: [mockResults[0]], remote_status: 'partial' })
+				);
+			}
+			if (url.startsWith('/api/v1/library/artists?')) {
+				return Promise.resolve(
+					makeResponse({ items: [], total: 0, album_artist_total: 0, contributor_total: 0 })
+				);
+			}
+			return Promise.resolve(makeResponse({ items: [], total: 0 }));
+		});
+		globalThis.fetch = fetchSpy;
+
+		renderComponent();
+		const input = page.getByRole('searchbox');
+		await input.fill('mus');
+		await vi.advanceTimersByTimeAsync(400);
+
+		await expect.element(page.getByRole('option').first()).toHaveTextContent('Muse');
+		await expect
+			.element(page.getByText('Some MusicBrainz suggestions are unavailable.'))
+			.toBeInTheDocument();
+	});
+
+	it('refetches a degraded suggestion when the same query is reopened', async () => {
+		let suggestionCalls = 0;
+		const fetchSpy = mockFetchSuccess();
+		fetchSpy.mockImplementation((input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.startsWith('/api/v1/search/suggest?')) {
+				suggestionCalls += 1;
+				return Promise.resolve(
+					makeResponse({ results: [], remote_status: suggestionCalls === 1 ? 'timeout' : 'ok' })
+				);
+			}
+			if (url.startsWith('/api/v1/library/artists?')) {
+				return Promise.resolve(
+					makeResponse({ items: [], total: 0, album_artist_total: 0, contributor_total: 0 })
+				);
+			}
+			return Promise.resolve(makeResponse({ items: [], total: 0 }));
+		});
+		globalThis.fetch = fetchSpy;
+		renderComponent();
+		const input = page.getByRole('searchbox');
+
+		await input.fill('mus');
+		await vi.advanceTimersByTimeAsync(400);
+		await expect.element(page.getByText('MusicBrainz suggestions took too long.')).toBeVisible();
+		await userEvent.keyboard('{Escape}');
+		await input.fill('muse');
+		await vi.advanceTimersByTimeAsync(400);
+
+		await vi.waitFor(() => expect(suggestionCalls).toBe(2));
 	});
 
 	it('should show View all results link', async () => {
@@ -165,7 +278,7 @@ describe('SearchSuggestions.svelte', () => {
 
 		const input = page.getByRole('searchbox');
 		await input.fill('mus');
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
 		const viewAll = page.getByText('View all results');
 		await expect.element(viewAll).toBeInTheDocument();
@@ -186,9 +299,14 @@ describe('SearchSuggestions.svelte', () => {
 		await input.fill('mu');
 		await vi.advanceTimersByTimeAsync(100);
 		await input.fill('mus');
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
-		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() => {
+			const suggestionCalls = fetchSpy.mock.calls.filter(([input]) =>
+				String(input).startsWith('/api/v1/search/suggest?')
+			);
+			expect(suggestionCalls).toHaveLength(1);
+		});
 	});
 
 	it('should use custom id for listbox', async () => {
@@ -198,7 +316,7 @@ describe('SearchSuggestions.svelte', () => {
 
 		const input = page.getByRole('searchbox');
 		await input.fill('mus');
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
 		const listbox = page.getByRole('listbox');
 		await expect.element(listbox).toHaveAttribute('id', 'custom-test-listbox');
@@ -206,7 +324,19 @@ describe('SearchSuggestions.svelte', () => {
 
 	it('should ignore stale responses when a newer request is pending', async () => {
 		let callCount = 0;
-		globalThis.fetch = vi.fn().mockImplementation(() => {
+		globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.startsWith('/api/v1/library/artists?')) {
+				return Promise.resolve(
+					makeResponse({ items: [], total: 0, album_artist_total: 0, contributor_total: 0 })
+				);
+			}
+			if (url.startsWith('/api/v1/library/albums?')) {
+				return Promise.resolve(makeResponse({ items: [], total: 0 }));
+			}
+			if (!url.startsWith('/api/v1/search/suggest?')) {
+				throw new Error(`Unexpected request: ${url}`);
+			}
 			callCount++;
 			const currentCall = callCount;
 			if (currentCall === 1) {
@@ -223,7 +353,8 @@ describe('SearchSuggestions.svelte', () => {
 											in_library: false,
 											score: 50
 										}
-									]
+									],
+									remote_status: 'ok'
 								})
 							),
 						300
@@ -240,7 +371,8 @@ describe('SearchSuggestions.svelte', () => {
 							in_library: false,
 							score: 80
 						}
-					]
+					],
+					remote_status: 'ok'
 				})
 			);
 		});
@@ -250,12 +382,12 @@ describe('SearchSuggestions.svelte', () => {
 		const input = page.getByRole('searchbox');
 
 		await input.fill('ab');
-		await vi.advanceTimersByTimeAsync(600);
+		await vi.advanceTimersByTimeAsync(310);
 
 		await input.fill('abc');
-		await vi.advanceTimersByTimeAsync(600);
+		await vi.advanceTimersByTimeAsync(310);
 
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
 		const stale = page.getByText('StaleResult');
 		await expect.element(stale).not.toBeInTheDocument();
@@ -278,7 +410,7 @@ describe('SearchSuggestions.svelte', () => {
 		await expect.element(input).toHaveAttribute('aria-controls', 'aria-test-listbox');
 
 		await input.fill('mus');
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
 		await expect.element(combobox).toHaveAttribute('aria-expanded', 'true');
 
@@ -293,7 +425,7 @@ describe('SearchSuggestions.svelte', () => {
 
 		const input = page.getByRole('searchbox');
 		await input.fill('mus');
-		await vi.advanceTimersByTimeAsync(700);
+		await vi.advanceTimersByTimeAsync(400);
 
 		const listbox = page.getByRole('listbox');
 		await expect.element(listbox).toBeInTheDocument();

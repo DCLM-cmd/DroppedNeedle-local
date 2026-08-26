@@ -1,6 +1,7 @@
 """Tests that non_breaking_exceptions bypass circuit breaker failure recording."""
 
 import asyncio
+import logging
 
 import pytest
 
@@ -202,3 +203,61 @@ async def test_retry_after_not_clamped_by_max_delay():
 
     assert result == "ok"
     assert elapsed >= 0.25, f"Expected >=0.25s delay from retry_after=0.3, got {elapsed:.3f}s"
+
+
+@pytest.mark.asyncio
+async def test_open_warning_is_rate_limited(caplog):
+    """A hot loop against an open breaker must not flood the logs: at most one
+    OPEN warning per interval, while every call still raises CircuitOpenError."""
+    cb = CircuitBreaker(failure_threshold=1, name="test-open-warning-flood")
+    cb.record_failure()
+    assert cb.state == CircuitState.OPEN
+
+    @with_retry(max_attempts=1, circuit_breaker=cb)
+    async def blocked():
+        return "unreachable"
+
+    with caplog.at_level(logging.WARNING, logger="infrastructure.resilience.retry"):
+        for _ in range(5):
+            with pytest.raises(CircuitOpenError):
+                await blocked()
+
+    warnings = [r for r in caplog.records if "is OPEN" in r.getMessage()]
+    assert len(warnings) == 1
+
+    caplog.clear()
+    cb._last_open_warning = 0.0
+    with caplog.at_level(logging.WARNING, logger="infrastructure.resilience.retry"):
+        with pytest.raises(CircuitOpenError):
+            await blocked()
+    warnings = [r for r in caplog.records if "is OPEN" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_retriable_exception_fails_after_single_attempt():
+    """Deterministic failures skip the retry loop entirely (while non-breaking
+    exceptions without non_retriable are still retried - see above)."""
+    cb = CircuitBreaker(failure_threshold=2, name="test-non-retriable")
+    call_count = 0
+
+    @with_retry(
+        max_attempts=5,
+        base_delay=0.01,
+        max_delay=0.05,
+        circuit_breaker=cb,
+        retriable_exceptions=(_RateLimited, _ServiceDown),
+        non_breaking_exceptions=(_ServiceDown,),
+        non_retriable_exceptions=(_ServiceDown,),
+    )
+    async def doomed():
+        nonlocal call_count
+        call_count += 1
+        raise _ServiceDown("down")
+
+    with pytest.raises(_ServiceDown):
+        await doomed()
+
+    assert call_count == 1
+    assert cb.failure_count == 0
+    assert cb.state == CircuitState.CLOSED

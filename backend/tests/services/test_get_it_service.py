@@ -1,12 +1,10 @@
-"""GetItService: rel extraction (both MB levels), classification, ordering,
-the iTunes fallback, affiliate decoration + disclosure, and caching."""
+"""GetItService: relation extraction, classification, ordering, fallbacks, and caching."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-import services.get_it_service as get_it
 from api.v1.schemas.settings import GetItSettings
 from repositories.itunes_repository import ITunesAlbumResult
 from services.get_it_service import GetItService
@@ -44,20 +42,21 @@ def _service(rg=None, release=None, itunes=None, settings=None):
     mb.get_release_by_id = AsyncMock(return_value=release)
     itunes_repo = AsyncMock()
     itunes_repo.find_album = AsyncMock(return_value=itunes)
-    prefs = SimpleNamespace(
-        get_get_it_settings=lambda: settings or GetItSettings()
-    )
+    prefs = SimpleNamespace(get_get_it_settings=lambda: settings or GetItSettings())
     cache = FakeCache()
-    return GetItService(
-        mb_repo=mb, itunes_repo=itunes_repo, preferences_service=prefs, cache=cache
-    ), mb, itunes_repo, cache
+    return (
+        GetItService(
+            mb_repo=mb, itunes_repo=itunes_repo, preferences_service=prefs, cache=cache
+        ),
+        mb,
+        itunes_repo,
+        cache,
+    )
 
 
 @pytest.mark.asyncio
-async def test_release_level_rels_are_consulted_and_classified(monkeypatch):
-    """Live-probed reality: purchase rels sit on releases, not release groups.
-    Tags are cleared so this test asserts classification, not decoration."""
-    monkeypatch.setattr(get_it, "DN_AMAZON_TAGS", {})
+async def test_release_level_rels_are_consulted_and_classified():
+    """Live-probed reality: purchase rels sit on releases, not release groups."""
     rg = _rg(releases=[{"id": "rel-1", "status": "Official"}])
     release = {
         "relations": [
@@ -77,12 +76,15 @@ async def test_release_level_rels_are_consulted_and_classified(monkeypatch):
     assert [l.kind for l in options.free] == ["free"]
     itunes_repo.find_album.assert_not_awaited()  # digital exists, no fallback
     assert options.bandcamp_search_url.startswith("https://bandcamp.com/search?q=")
-    assert options.disclosure is False
 
 
 @pytest.mark.asyncio
 async def test_ended_rels_are_ignored():
-    rg = _rg(relations=[_rel("purchase for download", "https://x.bandcamp.com/a", ended=True)])
+    rg = _rg(
+        relations=[
+            _rel("purchase for download", "https://x.bandcamp.com/a", ended=True)
+        ]
+    )
     service, _, itunes_repo, _ = _service(rg=rg)
     itunes_repo.find_album = AsyncMock(return_value=None)
 
@@ -111,8 +113,7 @@ async def test_itunes_fallback_when_no_digital_link():
 
 
 @pytest.mark.asyncio
-async def test_ordering_is_artist_fairness_never_commission():
-    """D19: Bandcamp first even at 0% commission."""
+async def test_artist_friendly_store_ordering():
     rg = _rg(
         relations=[
             _rel("purchase for download", "https://www.amazon.co.uk/dp/X"),
@@ -124,135 +125,30 @@ async def test_ordering_is_artist_fairness_never_commission():
     service, _, _, _ = _service(rg=rg)
 
     options = await service.get_purchase_options("rg-1")
-    assert [l.store for l in options.digital] == ["bandcamp", "qobuz", "beatport", "amazon"]
-
-
-@pytest.mark.asyncio
-async def test_decoration_applies_tags_and_sets_disclosure(monkeypatch):
-    monkeypatch.setattr(get_it, "DN_AMAZON_TAGS", {"amazon.com": "droppedneedle-20"})
-    rg = _rg(relations=[_rel("purchase for download", "https://www.amazon.com/dp/X")])
-    service, _, _, _ = _service(rg=rg)
-
-    options = await service.get_purchase_options("rg-1")
-
-    assert options.digital[0].url == "https://www.amazon.com/dp/X?tag=droppedneedle-20"
-    assert options.disclosure is True
-
-
-@pytest.mark.asyncio
-async def test_a_us_tag_is_never_applied_to_another_marketplace(monkeypatch):
-    """Associates tracking IDs are per-marketplace: a .com tag on a .co.uk link
-    earns nothing and breaches the terms. Untagged marketplaces stay clean."""
-    monkeypatch.setattr(get_it, "DN_AMAZON_TAGS", {"amazon.com": "droppedneedle-20"})
-    rg = _rg(
-        relations=[
-            _rel("amazon asin", "https://www.amazon.co.uk/dp/UK"),
-            _rel("amazon asin", "https://www.amazon.de/dp/DE"),
-        ]
-    )
-    service, _, _, _ = _service(rg=rg)
-
-    options = await service.get_purchase_options("rg-1")
-
-    assert [l.url for l in options.physical] == [
-        "https://www.amazon.co.uk/dp/UK",
-        "https://www.amazon.de/dp/DE",
+    assert [l.store for l in options.digital] == [
+        "bandcamp",
+        "qobuz",
+        "beatport",
+        "amazon",
     ]
-    assert options.disclosure is False  # nothing was actually decorated
 
 
 @pytest.mark.asyncio
-async def test_each_marketplace_gets_its_own_tag(monkeypatch):
-    """The shipped map: US and UK are live, everything else stays clean."""
-    monkeypatch.setattr(
-        get_it,
-        "DN_AMAZON_TAGS",
-        {"amazon.com": "droppedneedle-20", "amazon.co.uk": "droppedneedle-21"},
-    )
-    rg = _rg(
-        relations=[
-            _rel("amazon asin", "https://www.amazon.com/dp/US"),
-            _rel("amazon asin", "https://www.amazon.co.uk/dp/UK"),
-            _rel("amazon asin", "https://www.amazon.de/dp/DE"),
-        ]
-    )
+async def test_purchase_urls_are_returned_unchanged():
+    source_url = "https://www.amazon.com/dp/X?ref_=musicbrainz"
+    rg = _rg(relations=[_rel("purchase for download", source_url)])
     service, _, _, _ = _service(rg=rg)
 
     options = await service.get_purchase_options("rg-1")
 
-    urls = [l.url for l in options.physical]
-    assert "https://www.amazon.com/dp/US?tag=droppedneedle-20" in urls
-    assert "https://www.amazon.co.uk/dp/UK?tag=droppedneedle-21" in urls
-    assert "https://www.amazon.de/dp/DE" in urls  # no DE programme yet
-    assert options.disclosure is True
-
-
-@pytest.mark.asyncio
-async def test_shipped_tag_map_pairs_each_id_with_its_own_marketplace():
-    """Guards the constant itself: a -20 (US) id must never sit under a UK host,
-    and vice versa - the mispairing Associates terms actually forbid."""
-    suffix_for_host = {"amazon.com": "-20", "amazon.co.uk": "-21"}
-    for host, tag in get_it.DN_AMAZON_TAGS.items():
-        expected = suffix_for_host.get(host)
-        if expected is not None:
-            assert tag.endswith(expected), f"{host} carries {tag!r}"
-
-
-@pytest.mark.asyncio
-async def test_marketplace_lookup_ignores_www_and_smile_prefixes(monkeypatch):
-    monkeypatch.setattr(get_it, "DN_AMAZON_TAGS", {"amazon.com": "droppedneedle-20"})
-    rg = _rg(relations=[_rel("amazon asin", "https://smile.amazon.com/dp/X")])
-    service, _, _, _ = _service(rg=rg)
-
-    options = await service.get_purchase_options("rg-1")
-    assert options.physical[0].url.endswith("?tag=droppedneedle-20")
-
-
-@pytest.mark.asyncio
-async def test_support_toggle_off_yields_clean_links(monkeypatch):
-    monkeypatch.setattr(get_it, "DN_AMAZON_TAGS", {"amazon.com": "droppedneedle-20"})
-    rg = _rg(relations=[_rel("purchase for download", "https://www.amazon.com/dp/X")])
-    service, _, _, _ = _service(
-        rg=rg, settings=GetItSettings(support_droppedneedle=False)
-    )
-
-    options = await service.get_purchase_options("rg-1")
-
-    assert options.digital[0].url == "https://www.amazon.com/dp/X"
-    assert options.disclosure is False
-
-
-@pytest.mark.asyncio
-async def test_empty_tags_mean_no_disclosure_even_with_toggle_on(monkeypatch):
-    """The shipped state for any store whose programme is not approved yet."""
-    monkeypatch.setattr(get_it, "DN_AMAZON_TAGS", {})
-    rg = _rg(relations=[_rel("purchase for download", "https://www.amazon.com/dp/X")])
-    service, _, _, _ = _service(rg=rg)
-
-    options = await service.get_purchase_options("rg-1")
-    assert options.digital[0].url == "https://www.amazon.com/dp/X"
-    assert options.disclosure is False
-
-
-@pytest.mark.asyncio
-async def test_qobuz_links_wrap_via_awin_when_configured(monkeypatch):
-    monkeypatch.setattr(get_it, "DN_AWIN_PUBLISHER_ID", "12345")
-    monkeypatch.setattr(get_it, "AWIN_QOBUZ_ADVERTISER_ID", "33439")
-    rg = _rg(relations=[_rel("purchase for download", "https://www.qobuz.com/album/x")])
-    service, _, _, _ = _service(rg=rg)
-
-    options = await service.get_purchase_options("rg-1")
-
-    url = options.digital[0].url
-    assert url.startswith("https://www.awin1.com/cread.php?")
-    assert "awinaffid=12345" in url and "awinmid=33439" in url
-    assert "qobuz.com" in url  # deep link survives, encoded
-    assert options.disclosure is True
+    assert options.digital[0].url == source_url
 
 
 @pytest.mark.asyncio
 async def test_second_call_hits_the_cache():
-    rg = _rg(relations=[_rel("purchase for download", "https://x.bandcamp.com/album/y")])
+    rg = _rg(
+        relations=[_rel("purchase for download", "https://x.bandcamp.com/album/y")]
+    )
     service, mb, _, cache = _service(rg=rg)
 
     first = await service.get_purchase_options("rg-1")
@@ -272,20 +168,23 @@ async def test_unknown_release_group_yields_empty_options():
 
 @pytest.mark.asyncio
 async def test_plugin_purchase_links_merge_under_fairness_ordering():
-    """01b purchase_links capability: plugin links join the groups but can
-    never outrank Bandcamp (D19 - plugins don't influence ordering)."""
+    """Plugin purchase links join the groups without changing store ordering."""
     from unittest.mock import MagicMock
 
     from infrastructure.plugins.protocols import PluginPurchaseLink
 
-    rg = _rg(relations=[_rel("purchase for download", "https://artist.bandcamp.com/album/x")])
+    rg = _rg(
+        relations=[_rel("purchase for download", "https://artist.bandcamp.com/album/x")]
+    )
     plugin_host = MagicMock()
     plugin_host.purchase_providers = MagicMock(
         return_value=[SimpleNamespace(manifest=SimpleNamespace(name="shop-plugin"))]
     )
     plugin_host.gather_purchase_links = AsyncMock(
         return_value=[
-            PluginPurchaseLink(label="Some Shop", url="https://someshop.example/a", kind="digital"),
+            PluginPurchaseLink(
+                label="Some Shop", url="https://someshop.example/a", kind="digital"
+            ),
             PluginPurchaseLink(label="Bad", url="javascript:alert(1)", kind="digital"),
         ]
     )
@@ -295,7 +194,9 @@ async def test_plugin_purchase_links_merge_under_fairness_ordering():
     service = GetItService(
         mb_repo=mb,
         itunes_repo=AsyncMock(find_album=AsyncMock(return_value=None)),
-        preferences_service=SimpleNamespace(get_get_it_settings=lambda: GetItSettings()),
+        preferences_service=SimpleNamespace(
+            get_get_it_settings=lambda: GetItSettings()
+        ),
         cache=FakeCache(),
         plugin_host=plugin_host,
     )
@@ -322,7 +223,9 @@ def _artist_service(relations=None, settings=None, raises=False):
     service = GetItService(
         mb_repo=mb,
         itunes_repo=AsyncMock(),
-        preferences_service=SimpleNamespace(get_get_it_settings=lambda: settings or GetItSettings()),
+        preferences_service=SimpleNamespace(
+            get_get_it_settings=lambda: settings or GetItSettings()
+        ),
         cache=cache,
     )
     return service, mb, cache
@@ -342,7 +245,6 @@ async def test_artist_options_surface_storefronts_in_fairness_order():
 
     assert [l.store for l in options.links] == ["bandcamp", "other"]
     assert options.bandcamp_search_url.endswith("item_type=b")
-    assert options.disclosure is False
 
 
 @pytest.mark.asyncio

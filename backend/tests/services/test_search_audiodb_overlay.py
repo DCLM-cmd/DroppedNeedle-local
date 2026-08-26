@@ -31,13 +31,21 @@ NEGATIVE_ALBUM = AudioDBAlbumImages.negative(lookup_source="mbid")
 
 
 def _artist_result(**overrides) -> SearchResult:
-    defaults = dict(type="artist", title="Coldplay", musicbrainz_id=TEST_ARTIST_MBID, score=100)
+    defaults = dict(
+        type="artist", title="Coldplay", musicbrainz_id=TEST_ARTIST_MBID, score=100
+    )
     defaults.update(overrides)
     return SearchResult(**defaults)
 
 
 def _album_result(**overrides) -> SearchResult:
-    defaults = dict(type="album", title="Parachutes", musicbrainz_id=TEST_ALBUM_MBID, artist="Coldplay", score=90)
+    defaults = dict(
+        type="album",
+        title="Parachutes",
+        musicbrainz_id=TEST_ALBUM_MBID,
+        artist="Coldplay",
+        score=90,
+    )
     defaults.update(overrides)
     return SearchResult(**defaults)
 
@@ -190,7 +198,9 @@ class TestSearchAudioDBOverlayMixed:
     @pytest.mark.asyncio
     async def test_exception_in_one_item_does_not_break_others(self):
         audiodb = MagicMock()
-        audiodb.get_cached_artist_images = AsyncMock(side_effect=RuntimeError("db error"))
+        audiodb.get_cached_artist_images = AsyncMock(
+            side_effect=RuntimeError("db error")
+        )
         audiodb.get_cached_album_images = AsyncMock(return_value=ALBUM_IMAGES)
         svc = _search_service(audiodb)
 
@@ -223,12 +233,17 @@ class TestSearchMethodIntegration:
 
         artist = _artist_result()
         album = _album_result()
-        svc._mb_repo.search_grouped = AsyncMock(return_value={"artists": [artist], "albums": [album]})
+        svc._mb_repo.search_grouped = AsyncMock(
+            return_value={"artists": [artist], "albums": [album]}
+        )
 
         result = await svc.search("coldplay")
 
         assert result.artists[0].thumb_url == "https://cdn.example.com/artist_thumb.jpg"
-        assert result.albums[0].album_thumb_url == "https://cdn.example.com/album_thumb.jpg"
+        assert (
+            result.albums[0].album_thumb_url
+            == "https://cdn.example.com/album_thumb.jpg"
+        )
 
     @pytest.mark.asyncio
     async def test_search_bucket_calls_overlay(self):
@@ -239,6 +254,7 @@ class TestSearchMethodIntegration:
         artist = _artist_result()
         svc._mb_repo.search_artists = AsyncMock(return_value=[artist])
 
-        result, _top = await svc.search_bucket("artists", "coldplay")
+        result, _top, status = await svc.search_bucket("artists", "coldplay")
 
         assert result[0].thumb_url == "https://cdn.example.com/artist_thumb.jpg"
+        assert status == "ok"

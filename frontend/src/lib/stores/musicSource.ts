@@ -2,6 +2,11 @@ import { writable, get } from 'svelte/store';
 import { browser } from '$app/environment';
 import { API, PAGE_SOURCE_KEYS } from '$lib/constants';
 import { api } from '$lib/api/client';
+import { authStore } from '$lib/stores/authStore.svelte';
+import { queryClient, setQueryDataWithPersister } from '$lib/queries/QueryClient';
+import { getScrobblePreferencesQueryOptions } from '$lib/queries/scrobble-preferences/ScrobblePreferencesQuery.svelte';
+import { ScrobblePreferencesQueryKeyFactory } from '$lib/queries/scrobble-preferences/ScrobblePreferencesQueryKeyFactory';
+import type { ScrobblePreferences } from '$lib/queries/scrobble-preferences/types';
 
 export type MusicSource = 'listenbrainz' | 'lastfm';
 export type MusicSourcePage = keyof typeof PAGE_SOURCE_KEYS;
@@ -64,6 +69,11 @@ function createMusicSourceStore() {
 		const current = get({ subscribe });
 		if (current.loaded) return;
 		if (loadPromise) return loadPromise;
+		const userId = authStore.user?.id;
+		if (!userId) {
+			update((s) => ({ ...s, loaded: true }));
+			return;
+		}
 		const loadStartedAtVersion = mutationVersion;
 
 		loadPromise = (async () => {
@@ -73,9 +83,7 @@ function createMusicSourceStore() {
 					localStorage.removeItem('discover_source');
 					localStorage.removeItem('artist-discovery_source');
 				}
-				const data = await api.global.get<{ primary_music_source: unknown }>(
-					API.me.scrobblePreferences()
-				);
+				const data = await queryClient.ensureQueryData(getScrobblePreferencesQueryOptions(userId));
 				const fetchedSource = isMusicSource(data.primary_music_source)
 					? data.primary_music_source
 					: DEFAULT_SOURCE;
@@ -97,12 +105,16 @@ function createMusicSourceStore() {
 
 	async function save(source: MusicSource): Promise<boolean> {
 		const saveVersion = ++mutationVersion;
+		const userId = authStore.user?.id;
+		if (!userId) return false;
 		try {
-			await api.global.put(API.me.scrobblePreferences(), { primary_music_source: source });
+			const preferences = await api.global.put<ScrobblePreferences>(API.me.scrobblePreferences(), {
+				primary_music_source: source
+			});
+			if (authStore.user?.id !== userId || mutationVersion !== saveVersion) return true;
+			await setQueryDataWithPersister(ScrobblePreferencesQueryKeyFactory.get(userId), preferences);
 			persistSource(source);
-			if (mutationVersion === saveVersion) {
-				set({ source, loaded: true });
-			}
+			set({ source, loaded: true });
 			return true;
 		} catch {
 			return false;
@@ -110,6 +122,11 @@ function createMusicSourceStore() {
 	}
 
 	function setSource(source: MusicSource): void {
+		const current = get({ subscribe });
+		if (current.loaded && current.source === source) {
+			persistSource(source);
+			return;
+		}
 		mutationVersion += 1;
 		persistSource(source);
 		set({ source, loaded: true });

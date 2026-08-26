@@ -20,6 +20,11 @@ class CircuitState(Enum):
 
 CircuitStateChangeCallback = Callable[["CircuitBreaker", CircuitState, CircuitState, str], None]
 
+# The per-call "breaker is OPEN" warning is rate-limited so a hot retry loop
+# cannot flood the logs while the breaker stays open; the CircuitOpenError
+# raise is unaffected. Best-effort under concurrency is acceptable.
+OPEN_WARNING_INTERVAL_SECONDS = 30.0
+
 
 class CircuitBreaker:
     
@@ -42,6 +47,7 @@ class CircuitBreaker:
         self.success_count = 0
         self.last_failure_time: float = 0
         self.state = CircuitState.CLOSED
+        self._last_open_warning: float = 0.0
 
     def _notify_state_change(
         self,
@@ -70,6 +76,13 @@ class CircuitBreaker:
                 return False
             return True
         return False
+
+    def should_log_open_warning(self) -> bool:
+        now = time.monotonic()
+        if now - self._last_open_warning < OPEN_WARNING_INTERVAL_SECONDS:
+            return False
+        self._last_open_warning = now
+        return True
     
     def record_success(self):
         if self.state == CircuitState.HALF_OPEN:
@@ -123,6 +136,7 @@ class CircuitBreaker:
         self.failure_count = 0
         self.success_count = 0
         self.last_failure_time = 0
+        self._last_open_warning = 0.0
         self._notify_state_change(previous_state, self.state, "manual_reset")
 
     async def arecord_success(self):
@@ -173,6 +187,7 @@ def with_retry(
     circuit_breaker: Optional[CircuitBreaker] = None,
     retriable_exceptions: tuple = (Exception,),
     non_breaking_exceptions: tuple = (),
+    non_retriable_exceptions: tuple = (),
 ):
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
@@ -186,12 +201,12 @@ def with_retry(
             if circuit_breaker:
                 await circuit_breaker.atry_transition()
                 if circuit_breaker.is_open():
-                    error_msg = "Circuit breaker '%s' is OPEN"
-                    logger.warning(
-                        error_msg,
-                        circuit_breaker.name,
-                        extra={"service_name": service_name, "function": func_name}
-                    )
+                    if circuit_breaker.should_log_open_warning():
+                        logger.warning(
+                            "Circuit breaker '%s' is OPEN",
+                            circuit_breaker.name,
+                            extra={"service_name": service_name, "function": func_name}
+                        )
                     raise CircuitOpenError(
                         f"Circuit breaker '{circuit_breaker.name}' is OPEN",
                         breaker_name=circuit_breaker.name,
@@ -210,7 +225,14 @@ def with_retry(
                 
                 except retriable_exceptions as e:
                     last_exception = e
-                    
+
+                    if non_retriable_exceptions and isinstance(
+                        e, non_retriable_exceptions
+                    ):
+                        # deterministic failure (e.g. a payload that can never
+                        # decode); retrying it only wastes provider quota
+                        break
+
                     if attempt >= max_attempts:
                         logger.error(
                             "%s failed after %d attempts: %s",

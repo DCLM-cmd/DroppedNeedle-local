@@ -66,6 +66,7 @@ def ctx(tmp_path: Path):
 
     follow_service = AsyncMock()
     follow_service.list_pending_approvals = AsyncMock(return_value=[])
+    follow_service.count_pending_approval_units = AsyncMock(return_value=0)
 
     app = FastAPI()
     app.include_router(requests_router)

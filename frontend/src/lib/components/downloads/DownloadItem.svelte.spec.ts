@@ -16,12 +16,13 @@ vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
 	cancelDownload: () => ({ mutate: h.cancelMutate, isPending: false }),
 	retryDownload: () => ({ mutate: h.retryMutate, isPending: false }),
 	stopAutoRetry: () => ({ mutate: h.stopRetryMutate, isPending: false }),
-	reimportDownload: () => ({ mutate: h.reimportMutate, isPending: false })
+	reimportDownload: () => ({ mutate: h.reimportMutate, isPending: false }),
+	tryNextSource: () => ({ mutate: vi.fn(), isPending: false })
 }));
 
 vi.mock('$lib/queries/downloads/DownloadSSE.svelte', () => ({
 	createDownloadStream: () => ({
-		state: { progress: null, status: null, done: false },
+		state: { progress: null, status: null, source: null, done: false },
 		start: vi.fn(),
 		stop: vi.fn()
 	})
@@ -45,7 +46,10 @@ function task(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		id: 't',
 		user_id: 'u',
 		download_type: 'album',
+		source: 'soulseek',
 		release_group_mbid: 'rg',
+		release_mbid: null,
+		release_track_mbid: null,
 		recording_mbid: null,
 		artist_name: 'Radiohead',
 		album_title: 'OK Computer',
@@ -71,6 +75,19 @@ function task(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		next_retry_at: null,
 		retry_max: 6,
 		retry_ladder_minutes: [15, 30, 60, 120, 240, 480],
+		acquisition_cleanup_state: 'in_use',
+		quality_format: null,
+		quality_bit_depth: null,
+		quality_sample_rate: null,
+		advertised_queue_depth: null,
+		queue_position_start: null,
+		queue_position_end: null,
+		remote_queued: false,
+		preferred_quality_fallback_at: null,
+		attempt_number: 0,
+		attempt_total: 0,
+		has_next_source: false,
+		held_for_review: false,
 		...overrides
 	};
 }
@@ -93,7 +110,7 @@ describe('DownloadItem.svelte', () => {
 	it('shows the album, a Downloading badge and a Cancel button while downloading', async () => {
 		renderItem(task({ status: 'downloading' }));
 		await expect.element(page.getByText('OK Computer')).toBeVisible();
-		await expect.element(page.getByText('Downloading')).toBeVisible();
+		await expect.element(page.getByText('Downloading', { exact: true })).toBeVisible();
 		await page.getByRole('button', { name: 'Cancel download' }).click();
 		expect(h.cancelMutate).toHaveBeenCalled();
 	});
@@ -113,6 +130,20 @@ describe('DownloadItem.svelte', () => {
 	it('shows a "View in Library" link when completed', async () => {
 		renderItem(task({ status: 'completed' }));
 		await expect.element(page.getByRole('link', { name: 'View in library' })).toBeVisible();
+	});
+
+	it.each([
+		['pending', 'Cleaning source files'],
+		['preserved', 'Source files kept'],
+		['needs_attention', 'Source cleanup needs attention']
+	] as const)('shows the %s cleanup treatment', async (cleanupState, label) => {
+		renderItem(task({ status: 'completed', acquisition_cleanup_state: cleanupState }));
+		await expect.element(page.getByText(label, { exact: true })).toBeVisible();
+	});
+
+	it('keeps ordinary completed cleanup visually quiet', async () => {
+		renderItem(task({ status: 'completed', acquisition_cleanup_state: 'complete' }));
+		await expect.element(page.getByText(/source files|source cleanup/i)).not.toBeInTheDocument();
 	});
 
 	it('offers a "Stop retrying" off-switch for a scheduled auto-retry', async () => {

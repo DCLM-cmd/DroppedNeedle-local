@@ -1,9 +1,24 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 import asyncio
+from types import SimpleNamespace
 
 from api.v1.schemas.search import SearchResult, SuggestResponse
+from infrastructure.degradation import (
+    clear_degradation_context,
+    init_degradation_context,
+)
+from infrastructure.integration_result import IntegrationResult
 from services.search_service import SearchService
+
+
+@pytest.fixture(autouse=True)
+def clear_search_state():
+    SearchService.clear_cached_results()
+    clear_degradation_context()
+    yield
+    SearchService.clear_cached_results()
+    clear_degradation_context()
 
 
 def _make_search_result(
@@ -34,7 +49,13 @@ def _make_preferences(
 ) -> MagicMock:
     prefs = MagicMock()
     prefs.secondary_types = secondary_types or []
-    prefs.primary_types = primary_types or ["album", "single", "ep", "broadcast", "other"]
+    prefs.primary_types = primary_types or [
+        "album",
+        "single",
+        "ep",
+        "broadcast",
+        "other",
+    ]
     return prefs
 
 
@@ -48,7 +69,9 @@ def _make_service(
     if mb_error:
         mb_repo.search_grouped = AsyncMock(side_effect=mb_error)
     else:
-        mb_repo.search_grouped = AsyncMock(return_value=grouped or {"artists": [], "albums": []})
+        mb_repo.search_grouped = AsyncMock(
+            return_value=grouped or {"artists": [], "albums": []}
+        )
 
     library_repo = MagicMock()
     if library_error:
@@ -71,7 +94,9 @@ def _make_service(
 @pytest.mark.asyncio
 async def test_suggest_returns_suggest_response():
     artists = [_make_search_result("artist", "Muse", score=90)]
-    albums = [_make_search_result("album", "Origin of Symmetry", score=85, artist="Muse")]
+    albums = [
+        _make_search_result("album", "Origin of Symmetry", score=85, artist="Muse")
+    ]
     svc = _make_service(grouped={"artists": artists, "albums": albums})
 
     result = await svc.suggest(query="muse", limit=5)
@@ -80,6 +105,24 @@ async def test_suggest_returns_suggest_response():
     assert len(result.results) == 2
     assert result.results[0].title == "Muse"
     assert result.results[1].title == "Origin of Symmetry"
+
+
+@pytest.mark.asyncio
+async def test_target_suggest_projects_only_returned_albums() -> None:
+    album = _make_search_result(
+        "album", "Origin of Symmetry", artist="Muse", musicbrainz_id="rg-1"
+    )
+    service = _make_service(grouped={"artists": [], "albums": [album]})
+    ownership = AsyncMock()
+    ownership.project_albums.return_value = [SimpleNamespace(owned=True)]
+    service._ownership = ownership
+
+    result = await service.suggest(query="muse", limit=5)
+
+    assert result.results[0].in_library is True
+    service._library_repo.get_library_mbids.assert_not_awaited()
+    candidates = ownership.project_albums.await_args.args[0]
+    assert [candidate.release_group_mbid for candidate in candidates] == ["rg-1"]
 
 
 @pytest.mark.asyncio
@@ -140,8 +183,7 @@ async def test_suggest_alphabetical_tiebreak_within_same_type():
 @pytest.mark.asyncio
 async def test_suggest_truncates_to_limit():
     artists = [
-        _make_search_result("artist", f"Artist {i}", score=100 - i)
-        for i in range(3)
+        _make_search_result("artist", f"Artist {i}", score=100 - i) for i in range(3)
     ]
     albums = [
         _make_search_result("album", f"Album {i}", score=99 - i, artist="X")
@@ -158,8 +200,9 @@ async def test_suggest_truncates_to_limit():
 async def test_suggest_library_failure_returns_default_flags():
     artists = [_make_search_result("artist", "Muse", score=90)]
     albums = [
-        _make_search_result("album", "Absolution", score=85, artist="Muse",
-                            musicbrainz_id="album-1"),
+        _make_search_result(
+            "album", "Absolution", score=85, artist="Muse", musicbrainz_id="album-1"
+        ),
     ]
     svc = _make_service(
         grouped={"artists": artists, "albums": albums},
@@ -201,8 +244,9 @@ async def test_suggest_query_normalization():
 @pytest.mark.asyncio
 async def test_suggest_in_library_flag():
     albums = [
-        _make_search_result("album", "Absolution", score=85, artist="Muse",
-                            musicbrainz_id="album-lib-1"),
+        _make_search_result(
+            "album", "Absolution", score=85, artist="Muse", musicbrainz_id="album-lib-1"
+        ),
     ]
     svc = _make_service(
         grouped={"artists": [], "albums": albums},
@@ -294,3 +338,155 @@ async def test_suggest_deduplication_single_mb_call():
     assert call_count == 1
     assert len(r1.results) == 1
     assert len(r2.results) == 1
+
+
+@pytest.mark.asyncio
+async def test_suggest_reports_partial_results_after_one_provider_bucket_fails():
+    artist = _make_search_result("artist", "Muse", score=95)
+    service = _make_service(grouped={"artists": [artist], "albums": []})
+
+    async def partial_search(*args, **kwargs):
+        context = init_degradation_context()
+        context.record(
+            IntegrationResult.error(source="musicbrainz", msg="release search 503")
+        )
+        return {"artists": [artist], "albums": []}
+
+    service._mb_repo.search_grouped = AsyncMock(side_effect=partial_search)
+
+    result = await service.suggest(query="muse", limit=5)
+
+    assert [item.title for item in result.results] == ["Muse"]
+    assert result.remote_status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_suggest_timeout_is_terminal_and_explicit(monkeypatch):
+    service = _make_service()
+
+    async def never_returns(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    service._mb_repo.search_grouped = AsyncMock(side_effect=never_returns)
+    monkeypatch.setattr("services.search_service.SUGGEST_TIMEOUT_SECONDS", 0.01)
+    init_degradation_context()
+
+    result = await service.suggest(query="unfamiliar", limit=5)
+
+    assert result.results == []
+    assert result.remote_status == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_search_bucket_timeout_does_not_return_a_false_empty_state(monkeypatch):
+    service = _make_service()
+
+    async def never_returns(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    service._mb_repo.search_artists = AsyncMock(side_effect=never_returns)
+    monkeypatch.setattr("services.search_service.FULL_SEARCH_TIMEOUT_SECONDS", 0.01)
+    init_degradation_context()
+
+    results, top_result, status = await service.search_bucket(
+        "artists", "unfamiliar", limit=10
+    )
+
+    assert results == []
+    assert top_result is None
+    assert status == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_search_bucket_provider_failure_is_explicit():
+    service = _make_service()
+    service._mb_repo.search_albums = AsyncMock(
+        side_effect=RuntimeError("provider returned 503")
+    )
+    init_degradation_context()
+
+    results, top_result, status = await service.search_bucket(
+        "albums", "unfamiliar", limit=10
+    )
+
+    assert results == []
+    assert top_result is None
+    assert status == "error"
+
+
+@pytest.mark.asyncio
+async def test_search_bucket_preserves_success_when_other_bucket_is_unavailable():
+    service = _make_service()
+    artist = _make_search_result("artist", "Alice Coltrane", score=100)
+    service._mb_repo.search_artists = AsyncMock(return_value=[artist])
+    init_degradation_context()
+
+    results, top_result, status = await service.search_bucket(
+        "artists", "Alice Coltrane", limit=10
+    )
+
+    assert results == [artist]
+    assert top_result == artist
+    assert status == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failed_bucket", "expected_status"),
+    [
+        ("artists", {"artists": "error", "albums": "ok"}),
+        ("albums", {"artists": "ok", "albums": "error"}),
+    ],
+)
+async def test_combined_search_reports_each_bucket_status(
+    failed_bucket: str, expected_status: dict[str, str]
+):
+    artist = _make_search_result("artist", "Alice Coltrane", score=100)
+    album = _make_search_result("album", "Journey in Satchidananda", score=95)
+    service = _make_service()
+    service._mb_repo.search_grouped = AsyncMock(
+        return_value=(
+            {
+                "artists": [] if failed_bucket == "artists" else [artist],
+                "albums": [] if failed_bucket == "albums" else [album],
+            },
+            {failed_bucket},
+        )
+    )
+    init_degradation_context()
+
+    result = await service.search("Alice Coltrane")
+
+    assert result.bucket_status == expected_status
+    assert SearchService._search_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_successful_combined_search_is_cached():
+    artist = _make_search_result("artist", "Alice Coltrane", score=100)
+    service = _make_service(grouped={"artists": [artist], "albums": []})
+
+    first = await service.search("Alice Coltrane")
+    second = await service.search("Alice Coltrane")
+
+    assert first == second
+    service._mb_repo.search_grouped.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_combined_search_is_not_cached(monkeypatch):
+    service = _make_service()
+
+    async def never_returns(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    service._mb_repo.search_grouped = AsyncMock(side_effect=never_returns)
+    monkeypatch.setattr("services.search_service.FULL_SEARCH_TIMEOUT_SECONDS", 0.01)
+    init_degradation_context()
+
+    first = await service.search("unfamiliar")
+    second = await service.search("unfamiliar")
+
+    assert first.bucket_status == {"artists": "timeout", "albums": "timeout"}
+    assert second.bucket_status == {"artists": "timeout", "albums": "timeout"}
+    assert service._mb_repo.search_grouped.await_count == 2

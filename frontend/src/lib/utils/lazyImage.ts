@@ -10,6 +10,7 @@ export function cancelPendingImages() {
 			sharedObserver.unobserve(img);
 		}
 		img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+		img.removeAttribute('srcset');
 	});
 	pendingImages.clear();
 }
@@ -25,6 +26,7 @@ function getSharedObserver(): IntersectionObserver | null {
 						const img = entry.target as HTMLImageElement;
 						const src = img.dataset.src;
 						if (src && img.src !== src) {
+							if (img.dataset.srcset) img.srcset = img.dataset.srcset;
 							img.src = src;
 							sharedObserver?.unobserve(img);
 						}
@@ -61,6 +63,7 @@ export function lazyImage(img: HTMLImageElement) {
 	} else {
 		const src = img.dataset.src;
 		if (src) {
+			if (img.dataset.srcset) img.srcset = img.dataset.srcset;
 			img.src = src;
 			pendingImages.delete(img);
 		}
@@ -91,10 +94,13 @@ export function lazyImage(img: HTMLImageElement) {
 	};
 }
 
-export function resetLazyImage(img: HTMLImageElement, newSrc: string) {
+export function resetLazyImage(img: HTMLImageElement, newSrc: string, newSrcset?: string) {
 	img.classList.add('opacity-0');
 	img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+	img.removeAttribute('srcset');
 	img.dataset.src = newSrc;
+	if (newSrcset) img.dataset.srcset = newSrcset;
+	else delete img.dataset.srcset;
 
 	if (sharedObserver) {
 		sharedObserver.unobserve(img);

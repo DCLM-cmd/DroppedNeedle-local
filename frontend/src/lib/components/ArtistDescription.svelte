@@ -38,7 +38,7 @@
 
 <div class="bg-base-200/50 rounded-box p-4 sm:p-6">
 	{#if loading}
-		<div class="space-y-2">
+		<div class="space-y-2" data-testid="artist-description-skeleton">
 			<div class="skeleton h-4 w-full"></div>
 			<div class="skeleton h-4 w-full"></div>
 			<div class="skeleton h-4 w-3/4"></div>

@@ -1,5 +1,6 @@
 import { errorModal } from '$lib/stores/errorModal';
 import { libraryStore } from '$lib/stores/library';
+import { authStore } from '$lib/stores/authStore.svelte';
 import { api, ApiError } from '$lib/api/client';
 
 export type AlbumRequestResult = {
@@ -36,6 +37,7 @@ export async function requestBatch(
 	items: BatchAlbumItem[],
 	options?: { monitorArtist?: boolean; autoDownloadArtist?: boolean }
 ): Promise<BatchRequestResult> {
+	const initiatingUserId = authStore.user?.id;
 	try {
 		const response = await api.global.post<{
 			success: boolean;
@@ -48,9 +50,19 @@ export async function requestBatch(
 			monitor_artist: options?.monitorArtist ?? false,
 			auto_download_artist: options?.autoDownloadArtist ?? false
 		});
+		if (!initiatingUserId || authStore.user?.id !== initiatingUserId) {
+			return {
+				success: false,
+				requested: response.requested,
+				skipped: response.skipped,
+				overflow: response.overflow
+			};
+		}
 
-		for (const item of items) {
-			libraryStore.addRequested(item.musicbrainz_id);
+		if (response.success) {
+			for (const item of items) {
+				libraryStore.addRequested(item.musicbrainz_id);
+			}
 		}
 
 		return {
@@ -60,6 +72,9 @@ export async function requestBatch(
 			overflow: response.overflow
 		};
 	} catch (e) {
+		if (!initiatingUserId || authStore.user?.id !== initiatingUserId) {
+			return { success: false, requested: 0, skipped: 0, overflow: 0 };
+		}
 		if (e instanceof ApiError) {
 			const errorDetail = e.message || 'Unknown error';
 			errorModal.show('Batch Request Failed', errorDetail, '');
@@ -80,6 +95,7 @@ export async function requestAlbum(
 	musicbrainzId: string,
 	context?: AlbumRequestContext
 ): Promise<AlbumRequestResult> {
+	const initiatingUserId = authStore.user?.id;
 	try {
 		await api.global.post('/api/v1/requests/new', {
 			musicbrainz_id: musicbrainzId,
@@ -90,10 +106,16 @@ export async function requestAlbum(
 			monitor_artist: context?.monitorArtist ?? false,
 			auto_download_artist: context?.autoDownloadArtist ?? false
 		});
+		if (!initiatingUserId || authStore.user?.id !== initiatingUserId) {
+			return { success: false };
+		}
 
 		libraryStore.addRequested(musicbrainzId);
 		return { success: true };
 	} catch (e) {
+		if (!initiatingUserId || authStore.user?.id !== initiatingUserId) {
+			return { success: false };
+		}
 		if (e instanceof ApiError) {
 			const errorDetail = e.message || 'Unknown error';
 			errorModal.show('Request Failed', errorDetail, '');

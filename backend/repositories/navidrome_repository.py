@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 import hashlib
 import logging
 import secrets
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlencode
 
 import httpx
@@ -69,9 +67,11 @@ class NavidromeRepository:
         self,
         http_client: httpx.AsyncClient,
         cache: CacheInterface,
+        cache_scope: str = "shared",
     ) -> None:
         self._client = http_client
         self._cache = cache
+        self._cache_scope = cache_scope
         self._url: str = ""
         self._username: str = ""
         self._password: str = ""
@@ -86,6 +86,32 @@ class NavidromeRepository:
         self._username = username
         self._password = password
         self._configured = bool(self._url and self._username and self._password)
+
+    @property
+    def server_identity(self) -> str:
+        if not self._url:
+            return "unconfigured"
+        return hashlib.sha256(self._url.casefold().encode()).hexdigest()
+
+    @staticmethod
+    def _scope_segment(music_folder_ids: tuple[str, ...] | None) -> str:
+        if music_folder_ids is None:
+            return "all"
+        if not music_folder_ids:
+            return "selected-empty"
+        digest = hashlib.sha256("\0".join(music_folder_ids).encode()).hexdigest()[:20]
+        return f"selected-{digest}"
+
+    @staticmethod
+    def _add_scope(
+        params: dict[str, Any], music_folder_ids: tuple[str, ...] | None
+    ) -> bool:
+        if music_folder_ids is None:
+            return True
+        if not music_folder_ids:
+            return False
+        params["musicFolderId"] = list(music_folder_ids)
+        return True
 
     def is_configured(self) -> bool:
         return self._configured
@@ -221,7 +247,9 @@ class NavidromeRepository:
         max_delay=5.0,
         circuit_breaker=_navidrome_circuit_breaker,
         retriable_exceptions=(httpx.HTTPError, ExternalServiceError),
-        non_breaking_exceptions=(NavidromeSubsonicError,),
+        # auth failures are non-breaking too: with per-user credentials one
+        # user's stale password must not open the circuit for everyone
+        non_breaking_exceptions=(NavidromeSubsonicError, NavidromeAuthError),
     )
     async def _request(
         self,
@@ -274,8 +302,10 @@ class NavidromeRepository:
         genre: str | None = None,
         from_year: int | None = None,
         to_year: int | None = None,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> list[SubsonicAlbum]:
-        cache_key = f"{NAVIDROME_PREFIX}albums:{type}:{size}:{offset}:{genre or ''}:{from_year}:{to_year}"
+        scope = self._scope_segment(music_folder_ids)
+        cache_key = f"{NAVIDROME_PREFIX}albums:scope:{scope}:{type}:{size}:{offset}:{genre or ''}:{from_year}:{to_year}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached
@@ -286,6 +316,8 @@ class NavidromeRepository:
         if type == "byYear":
             params["fromYear"] = from_year if from_year is not None else 0
             params["toYear"] = to_year if to_year is not None else 9999
+        if not self._add_scope(params, music_folder_ids):
+            return []
         resp = await self._request(
             "/rest/getAlbumList2",
             params,
@@ -306,13 +338,19 @@ class NavidromeRepository:
         await self._cache.set(cache_key, album, self._ttl_detail)
         return album
 
-    async def get_artists(self) -> list[SubsonicArtist]:
-        cache_key = "navidrome:artists"
+    async def get_artists(
+        self, music_folder_ids: tuple[str, ...] | None = None
+    ) -> list[SubsonicArtist]:
+        scope = self._scope_segment(music_folder_ids)
+        cache_key = f"{NAVIDROME_PREFIX}artists:scope:{scope}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached
 
-        resp = await self._request("/rest/getArtists")
+        params: dict[str, Any] = {}
+        if not self._add_scope(params, music_folder_ids):
+            return []
+        resp = await self._request("/rest/getArtists", params)
         artists: list[SubsonicArtist] = []
         for index in resp.get("artists", {}).get("index", []):
             for a in index.get("artist", []):
@@ -348,21 +386,23 @@ class NavidromeRepository:
         artist_count: int = 20,
         album_count: int = 20,
         song_count: int = 20,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> SubsonicSearchResult:
-        cache_key = f"{NAVIDROME_PREFIX}search:{query}:{artist_count}:{album_count}:{song_count}"
+        scope = self._scope_segment(music_folder_ids)
+        cache_key = f"{NAVIDROME_PREFIX}search:scope:{scope}:{query}:{artist_count}:{album_count}:{song_count}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached
 
-        resp = await self._request(
-            "/rest/search3",
-            {
+        params: dict[str, Any] = {
                 "query": query,
                 "artistCount": artist_count,
                 "albumCount": album_count,
                 "songCount": song_count,
-            },
-        )
+        }
+        if not self._add_scope(params, music_folder_ids):
+            return SubsonicSearchResult()
+        resp = await self._request("/rest/search3", params)
         sr = resp.get("searchResult3", {})
         result = SubsonicSearchResult(
             artist=[parse_artist(a) for a in sr.get("artist", [])],
@@ -372,13 +412,19 @@ class NavidromeRepository:
         await self._cache.set(cache_key, result, self._ttl_search)
         return result
 
-    async def get_starred(self) -> SubsonicSearchResult:
-        cache_key = "navidrome:starred"
+    async def get_starred(
+        self, music_folder_ids: tuple[str, ...] | None = None
+    ) -> SubsonicSearchResult:
+        scope = self._scope_segment(music_folder_ids)
+        cache_key = f"{NAVIDROME_PREFIX}starred:scope:{scope}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached
 
-        resp = await self._request("/rest/getStarred2")
+        params: dict[str, Any] = {}
+        if not self._add_scope(params, music_folder_ids):
+            return SubsonicSearchResult()
+        resp = await self._request("/rest/getStarred2", params)
         sr = resp.get("starred2", {})
         result = SubsonicSearchResult(
             artist=[parse_artist(a) for a in sr.get("artist", [])],
@@ -400,13 +446,19 @@ class NavidromeRepository:
         await self._cache.set(cache_key, genres, self._ttl_genres)
         return genres
 
-    async def get_artists_index(self) -> list[SubsonicArtistIndex]:
-        cache_key = "navidrome:artists_index"
+    async def get_artists_index(
+        self, music_folder_ids: tuple[str, ...] | None = None
+    ) -> list[SubsonicArtistIndex]:
+        scope = self._scope_segment(music_folder_ids)
+        cache_key = f"{NAVIDROME_PREFIX}artists_index:scope:{scope}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached
 
-        resp = await self._request("/rest/getArtists")
+        params: dict[str, Any] = {}
+        if not self._add_scope(params, music_folder_ids):
+            return []
+        resp = await self._request("/rest/getArtists", params)
         index_data: list[SubsonicArtistIndex] = []
         for idx in resp.get("artists", {}).get("index", []):
             artists = [parse_artist(a) for a in idx.get("artist", [])]
@@ -415,40 +467,53 @@ class NavidromeRepository:
         return index_data
 
     async def get_songs_by_genre(
-        self, genre: str, count: int = 50, offset: int = 0
+        self,
+        genre: str,
+        count: int = 50,
+        offset: int = 0,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> list[SubsonicSong]:
-        cache_key = f"navidrome:songs_by_genre:{genre}:{count}:{offset}"
+        scope = self._scope_segment(music_folder_ids)
+        cache_key = f"{NAVIDROME_PREFIX}songs_by_genre:scope:{scope}:{genre}:{count}:{offset}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached
 
-        resp = await self._request(
-            "/rest/getSongsByGenre",
-            {"genre": genre, "count": count, "offset": offset},
-        )
+        params: dict[str, Any] = {"genre": genre, "count": count, "offset": offset}
+        if not self._add_scope(params, music_folder_ids):
+            return []
+        resp = await self._request("/rest/getSongsByGenre", params)
         raw = resp.get("songsByGenre", {}).get("song", [])
         songs = [parse_song(s) for s in raw]
         await self._cache.set(cache_key, songs, self._ttl_list)
         return songs
 
     async def search_songs(
-        self, query: str = "", count: int = 50, offset: int = 0
+        self,
+        query: str = "",
+        count: int = 50,
+        offset: int = 0,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> list[SubsonicSong]:
-        cache_key = f"{NAVIDROME_PREFIX}songs_browse:{query}:{count}:{offset}"
+        scope = self._scope_segment(music_folder_ids)
+        cache_key = (
+            f"{NAVIDROME_PREFIX}songs_browse:{self._cache_scope}:"
+            f"scope:{scope}:{query}:{count}:{offset}"
+        )
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached
 
-        resp = await self._request(
-            "/rest/search3",
-            {
-                "query": query or '""',
-                "artistCount": 0,
-                "albumCount": 0,
-                "songCount": count,
-                "songOffset": offset,
-            },
-        )
+        params: dict[str, Any] = {
+            "query": query or '""',
+            "artistCount": 0,
+            "albumCount": 0,
+            "songCount": count,
+            "songOffset": offset,
+        }
+        if not self._add_scope(params, music_folder_ids):
+            return []
+        resp = await self._request("/rest/search3", params)
         sr = resp.get("searchResult3", {})
         songs = [parse_song(s) for s in sr.get("song", [])]
         await self._cache.set(cache_key, songs, self._ttl_list)
@@ -470,7 +535,7 @@ class NavidromeRepository:
         return folders
 
     async def get_playlists(self) -> list[SubsonicPlaylist]:
-        cache_key = "navidrome:playlists"
+        cache_key = f"{NAVIDROME_PREFIX}playlists:{self._cache_scope}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached
@@ -485,13 +550,18 @@ class NavidromeRepository:
                     name=p.get("name", ""),
                     songCount=p.get("songCount", 0),
                     duration=p.get("duration", 0),
+                    owner=p.get("owner", ""),
+                    public=p.get("public", False),
+                    created=p.get("created", ""),
+                    changed=p.get("changed", ""),
+                    coverArt=p.get("coverArt", ""),
                 )
             )
         await self._cache.set(cache_key, playlists, self._ttl_list)
         return playlists
 
     async def get_playlist(self, id: str) -> SubsonicPlaylist:
-        cache_key = f"{NAVIDROME_PREFIX}playlist:{id}"
+        cache_key = f"{NAVIDROME_PREFIX}playlist:{self._cache_scope}:{id}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached
@@ -504,6 +574,11 @@ class NavidromeRepository:
             name=raw.get("name", ""),
             songCount=raw.get("songCount", 0),
             duration=raw.get("duration", 0),
+            owner=raw.get("owner", ""),
+            public=raw.get("public", False),
+            created=raw.get("created", ""),
+            changed=raw.get("changed", ""),
+            coverArt=raw.get("coverArt", ""),
             entry=[parse_song(e) for e in entries] if entries else None,
         )
         await self._cache.set(cache_key, playlist, self._ttl_detail)
@@ -513,11 +588,14 @@ class NavidromeRepository:
         self,
         size: int = 20,
         genre: str | None = None,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> list[SubsonicSong]:
         params: dict[str, Any] = {"size": size}
         if genre:
             params["genre"] = genre
 
+        if not self._add_scope(params, music_folder_ids):
+            return []
         resp = await self._request("/rest/getRandomSongs", params)
         raw = resp.get("randomSongs", {}).get("song", [])
         return [parse_song(s) for s in raw]

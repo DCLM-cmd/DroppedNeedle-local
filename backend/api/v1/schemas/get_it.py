@@ -15,9 +15,6 @@ class PurchaseOptionsResponse(AppStruct):
     physical: list[PurchaseLink] = []
     free: list[PurchaseLink] = []
     bandcamp_search_url: str = ""
-    # true only when the support toggle is on AND at least one link actually
-    # carries an affiliate tag - drives the disclosure line (D19)
-    disclosure: bool = False
 
 
 class ArtistPurchaseOptionsResponse(AppStruct):
@@ -27,4 +24,3 @@ class ArtistPurchaseOptionsResponse(AppStruct):
 
     links: list[PurchaseLink] = []
     bandcamp_search_url: str = ""
-    disclosure: bool = False

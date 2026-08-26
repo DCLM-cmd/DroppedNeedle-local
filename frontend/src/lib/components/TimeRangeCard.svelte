@@ -57,6 +57,7 @@
 					mbid={item.mbid || ''}
 					alt={item.name}
 					size="xl"
+					requestSize={250}
 					rounded="none"
 					className="w-full h-full"
 					customUrl={(item as HomeAlbum).image_url || null}
@@ -66,6 +67,7 @@
 					mbid={item.mbid || ''}
 					alt={item.name}
 					size="full"
+					requestSize={250}
 					rounded="none"
 					className="w-full h-full"
 					lazy={false}

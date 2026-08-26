@@ -4,9 +4,11 @@ import { api } from '$lib/api/client';
 import { API } from '$lib/constants';
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
+import { authStore } from '$lib/stores/authStore.svelte';
 import { toastStore } from '$lib/stores/toast';
 import type {
 	CancelDownloadResponse,
+	NextSourceResponse,
 	ReimportDownloadResponse,
 	RequestAccepted,
 	RetryDownloadResponse,
@@ -34,7 +36,9 @@ interface TrackRequestInput {
 }
 
 const invalidateTasks = () =>
-	invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.tasks() });
+	invalidateQueriesWithPersister({
+		queryKey: DownloadQueryKeyFactory.tasks(authStore.user?.id)
+	});
 
 function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
@@ -102,6 +106,31 @@ export function cancelDownload() {
 		},
 		onError: (err: unknown) =>
 			toastStore.show({ message: errorMessage(err, 'Failed to cancel download'), type: 'error' })
+	}));
+}
+
+interface NextSourceInput {
+	id: string;
+	candidateIndex: number;
+}
+
+export function tryNextSource() {
+	return createMutation(() => ({
+		mutationFn: (input: NextSourceInput) =>
+			api.global.post<NextSourceResponse>(API.downloads.nextSource(input.id), {
+				expected_candidate_index: input.candidateIndex
+			}),
+		onSuccess: () => {
+			toastStore.show({ message: 'Trying the next source', type: 'info' });
+			void invalidateTasks();
+		},
+		onError: (err: unknown) => {
+			void invalidateTasks();
+			toastStore.show({
+				message: errorMessage(err, 'Could not switch sources'),
+				type: 'error'
+			});
+		}
 	}));
 }
 
@@ -230,6 +259,61 @@ export function discardHeldTrack() {
 		},
 		onError: (err: unknown) =>
 			toastStore.show({ message: errorMessage(err, 'Failed to discard track'), type: 'error' })
+	}));
+}
+
+interface HeldManagementActionInput {
+	taskId: string;
+	releaseGroupMbid?: string | null;
+}
+
+export function retryHeldManagementUnit() {
+	return createMutation(() => ({
+		mutationFn: (input: HeldManagementActionInput) =>
+			api.global.post<{ status: string; files: number }>(
+				API.downloads.heldManagementRetry(input.taskId),
+				{}
+			),
+		onSuccess: (data: { files: number }, input: HeldManagementActionInput) => {
+			toastStore.show({
+				message: `${data.files} secured ${data.files === 1 ? 'file' : 'files'} organized and imported`,
+				type: 'success'
+			});
+			void invalidateTasks();
+			void invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all });
+			invalidateAlbum(input.releaseGroupMbid);
+		},
+		onError: (err: unknown) => {
+			void invalidateTasks();
+			toastStore.show({
+				message: errorMessage(err, 'File organization still needs attention'),
+				type: 'error'
+			});
+		}
+	}));
+}
+
+export function discardHeldManagementUnit() {
+	return createMutation(() => ({
+		mutationFn: (input: HeldManagementActionInput) =>
+			api.global.post<{ status: string; files: number }>(
+				API.downloads.heldManagementDiscard(input.taskId),
+				{}
+			),
+		onSuccess: (data: { files: number }) => {
+			toastStore.show({
+				message: `${data.files} secured ${data.files === 1 ? 'file' : 'files'} discarded`,
+				type: 'info'
+			});
+			void invalidateTasks();
+		},
+		onError: (err: unknown) => {
+			void invalidateTasks();
+			toastStore.show({
+				message: errorMessage(err, 'Failed to discard secured files'),
+				type: 'error'
+			});
+		}
 	}));
 }
 

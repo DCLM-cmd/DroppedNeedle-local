@@ -28,17 +28,19 @@ class ExpectedFile(AppStruct):
 
 
 class ExpectedTrack(AppStruct):
-    """One track of the MusicBrainz tracklist the Usenet import matches enumerated
-    files against (D18). The unpacked filenames are unknown until after unpack, so
-    Usenet keys the import on ``(disc_number, track_number)`` position validated by
-    ``duration_seconds``, rather than on a pre-known filename. ``recording_mbid`` /
-    ``title`` are tie-breakers when present."""
+    """One track from the task's exact MusicBrainz edition.
+
+    Both acquisition sources map files by ``(disc_number, track_number)`` and use the
+    recording, title, and duration as corroborating evidence. The release-track MBID
+    makes the resulting catalog attribution edition-specific.
+    """
 
     track_number: int
     disc_number: int = 1
     duration_seconds: float | None = None
     recording_mbid: str | None = None
     title: str | None = None
+    release_track_mbid: str | None = None
 
 
 class DownloadManifest(AppStruct):
@@ -60,12 +62,9 @@ class DownloadManifest(AppStruct):
     target_files: list[ExpectedFile]
     source_username: str | None = None
     handle: TaskHandle | None = None
-    # Expected MusicBrainz tracklist. The folder-based Usenet import matches enumerated
-    # files against it (D18). The slskd path keys the import on ``target_files``
-    # filenames instead, but carries the ONE expected track here when the download
-    # targets a single known recording (a track download or a 1-track single) - it arms
-    # the AcoustID title check and the import-time tag verification (2026-07-05
-    # wrong-single incident). Defaulted, so pre-existing on-disk manifests still decode.
+    # Complete selected-edition track map. Usenet matches enumerated extracted files;
+    # slskd correlates transfer filenames and then maps their tags/positions to this
+    # edition. Defaulted so pre-existing on-disk manifests still decode.
     expected_tracks: list[ExpectedTrack] = []
     release_mbid: str | None = None
     artist_mbid: str | None = None
@@ -82,6 +81,12 @@ class DownloadManifest(AppStruct):
     # The owning task's origin ('user' | 'retry' | 'upgrade'). Replace-on-import fires
     # only for 'upgrade' (D18); legacy manifests decode as 'user' (add-only, unchanged).
     origin: str = "user"
+    # Free Music uses a separate task store. Conversion holding therefore carries
+    # the administrator explicitly instead of looking up a built-in download task.
+    requested_by_user_id: str | None = None
+    # Candidate-attempt journal identity. Old manifests decode with ``None`` and are
+    # linked conservatively by their exact client job during startup reconciliation.
+    attempt_id: str | None = None
 
     def __post_init__(self) -> None:
         # In-flight back-fill: a legacy manifest decodes with handle=None and

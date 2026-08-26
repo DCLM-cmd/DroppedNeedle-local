@@ -26,6 +26,7 @@ from api.v1.schemas.download import (
     ClearDownloadsResponse,
     CutoffUnmetItem,
     CutoffUnmetResponse,
+    DownloadActivitySummaryResponse,
     DownloadFileItem,
     DownloadFilesResponse,
     DownloadListResponse,
@@ -33,6 +34,9 @@ from api.v1.schemas.download import (
     HeldActionResponse,
     HeldImportResponse,
     HeldListResponse,
+    HeldManagementActionResponse,
+    NextSourceRequest,
+    NextSourceResponse,
     ReimportDownloadResponse,
     RetryAllResponse,
     RetryDownloadResponse,
@@ -63,6 +67,8 @@ def _to_response(  # noqa: ANN001 - DownloadTask
     next_retry_at: float | None = None,
     retry_max: int = 0,
     retry_ladder_minutes: list[int] | None = None,
+    acquisition_cleanup_state: str = "not_tracked",
+    held_for_review: bool = False,
 ) -> DownloadTaskResponse:
     return DownloadTaskResponse(
         id=task.id,
@@ -70,6 +76,8 @@ def _to_response(  # noqa: ANN001 - DownloadTask
         download_type=task.download_type,
         source=task.source,
         release_group_mbid=task.release_group_mbid,
+        release_mbid=task.release_mbid,
+        release_track_mbid=task.release_track_mbid,
         recording_mbid=task.recording_mbid,
         artist_mbid=task.artist_mbid,
         artist_name=task.artist_name,
@@ -96,6 +104,34 @@ def _to_response(  # noqa: ANN001 - DownloadTask
         next_retry_at=next_retry_at,
         retry_max=retry_max,
         retry_ladder_minutes=retry_ladder_minutes or [],
+        acquisition_cleanup_state=acquisition_cleanup_state,
+        quality_format=task.quality_format,
+        quality_bit_depth=task.quality_bit_depth,
+        quality_sample_rate=task.quality_sample_rate,
+        advertised_queue_depth=task.advertised_queue_depth,
+        queue_position_start=task.queue_position_start,
+        queue_position_end=task.queue_position_end,
+        remote_queued=task.remote_queued,
+        preferred_quality_fallback_at=task.preferred_quality_fallback_at,
+        attempt_number=task.attempt_number,
+        attempt_total=task.attempt_total,
+        has_next_source=task.has_next_source,
+        held_for_review=held_for_review,
+    )
+
+
+@router.get("/activity-summary", response_model=DownloadActivitySummaryResponse)
+async def get_download_activity_summary(
+    current_user: CurrentUserDep,
+    service=Depends(get_download_service),
+):
+    summary = await service.get_activity_summary(current_user.id, current_user.role)
+    return DownloadActivitySummaryResponse(
+        revision=summary.revision,
+        active_count=summary.active_count,
+        held_count=summary.held_count,
+        failed_count=summary.failed_count,
+        landed_release_group_mbids=summary.landed_release_group_mbids,
     )
 
 
@@ -121,6 +157,7 @@ async def list_downloads(
     # Tasks waiting on a held-track review are paused, not scheduled - don't show a
     # countdown that will never fire.
     held_ids = await service.held_task_ids(current_user.id, current_user.role)
+    cleanup_states = await service.cleanup_states([task.id for task in tasks])
     return DownloadListResponse(
         items=[
             _to_response(
@@ -128,6 +165,8 @@ async def list_downloads(
                 next_retry_at=None if t.id in held_ids else service.next_retry_at(t),
                 retry_max=retry_max,
                 retry_ladder_minutes=retry_ladder,
+                acquisition_cleanup_state=cleanup_states.get(t.id, "not_tracked"),
+                held_for_review=t.id in held_ids,
             )
             for t in tasks
         ],
@@ -200,7 +239,9 @@ async def stream_download(
 async def get_download_files(
     task_id: str, current_user: CurrentUserDep, service=Depends(get_download_service)
 ):
-    task, files = await service.get_task_files(task_id, current_user.id, current_user.role)
+    task, files = await service.get_task_files(
+        task_id, current_user.id, current_user.role
+    )
     return DownloadFilesResponse(
         task_id=task.id,
         status=task.status,
@@ -208,7 +249,10 @@ async def get_download_files(
         files_completed=task.files_completed,
         files_failed=task.files_failed,
         progress_percent=task.progress_percent,
-        files=[DownloadFileItem(filename=f.filename, size=f.size, duration=f.duration) for f in files],
+        files=[
+            DownloadFileItem(filename=f.filename, size=f.size, duration=f.duration)
+            for f in files
+        ],
     )
 
 
@@ -218,6 +262,26 @@ async def cancel_download(
 ):
     await service.cancel_task(task_id, current_user.id, current_user.role)
     return CancelDownloadResponse(success=True)
+
+
+@router.post("/{task_id}/next-source", response_model=NextSourceResponse)
+async def try_next_download_source(
+    task_id: str,
+    current_user: CurrentUserDep,
+    body: NextSourceRequest = MsgSpecBody(NextSourceRequest),
+    service=Depends(get_download_service),
+):
+    task = await service.try_next_source(
+        task_id,
+        current_user.id,
+        current_user.role,
+        body.expected_candidate_index,
+    )
+    return NextSourceResponse(
+        success=True,
+        status=task.status,
+        candidate_index=task.candidate_index,
+    )
 
 
 @router.post("/{task_id}/retry", response_model=RetryDownloadResponse)
@@ -261,6 +325,8 @@ def _held_to_response(held) -> HeldImportResponse:  # noqa: ANN001 - HeldImport
     return HeldImportResponse(
         id=held.id,
         release_group_mbid=held.release_group_mbid,
+        release_mbid=held.release_mbid,
+        release_track_mbid=held.release_track_mbid,
         recording_mbid=held.recording_mbid,
         track_number=held.track_number,
         disc_number=held.disc_number,
@@ -272,12 +338,15 @@ def _held_to_response(held) -> HeldImportResponse:  # noqa: ANN001 - HeldImport
         file_format=held.file_format,
         duration_seconds=held.duration_seconds,
         reason=held.reason,
+        reason_detail=held.reason_detail,
         source=held.source,
         source_task_id=held.source_task_id,
         created_at=held.created_at,
         evidence_title=held.evidence_title,
         evidence_artist=held.evidence_artist,
         evidence_score=held.evidence_score,
+        management_retry_count=held.management_retry_count,
+        management_next_retry_at=held.management_next_retry_at,
     )
 
 
@@ -360,8 +429,44 @@ async def list_held(
     service=Depends(get_download_service),
 ):
     """Tracks held for an 'import anyway' review - all of them, or scoped to one album."""
-    held = await service.list_held(current_user.id, current_user.role, release_group_mbid)
+    held = await service.list_held(
+        current_user.id, current_user.role, release_group_mbid
+    )
     return HeldListResponse(items=[_held_to_response(h) for h in held])
+
+
+@router.post(
+    "/held/management/{source_task_id}/retry",
+    response_model=HeldManagementActionResponse,
+)
+async def retry_management_hold(
+    source_task_id: str,
+    current_user: CurrentAdminDep,
+    service=Depends(get_download_service),
+):
+    """Retry a complete secured acquisition through current Library Management rules."""
+
+    paths = await service.retry_management_hold(
+        source_task_id, current_user.id, current_user.role
+    )
+    return HeldManagementActionResponse(status="imported", files=len(paths))
+
+
+@router.post(
+    "/held/management/{source_task_id}/discard",
+    response_model=HeldManagementActionResponse,
+)
+async def discard_management_hold(
+    source_task_id: str,
+    current_user: CurrentAdminDep,
+    service=Depends(get_download_service),
+):
+    """Delete all secured copies belonging to one blocked management unit."""
+
+    count = await service.discard_management_hold(
+        source_task_id, current_user.id, current_user.role
+    )
+    return HeldManagementActionResponse(status="discarded", files=count)
 
 
 @router.post("/held/{held_id}/import", response_model=HeldActionResponse)
@@ -383,8 +488,12 @@ async def discard_held(
 
 
 _AUDIO_MEDIA_TYPES = {
-    ".flac": "audio/flac", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
-    ".ogg": "audio/ogg", ".opus": "audio/opus", ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".wav": "audio/wav",
 }
 
 
@@ -430,9 +539,13 @@ async def get_download(
     task_id: str, current_user: CurrentUserDep, service=Depends(get_download_service)
 ):
     task = await service.get_task(task_id, current_user.id, current_user.role)
+    cleanup_states = await service.cleanup_states([task.id])
+    held_ids = await service.held_task_ids(current_user.id, current_user.role)
     return _to_response(
         task,
         next_retry_at=service.next_retry_at(task),
         retry_max=service.auto_retry_max,
         retry_ladder_minutes=service.retry_ladder_minutes(),
+        acquisition_cleanup_state=cleanup_states.get(task.id, "not_tracked"),
+        held_for_review=task.id in held_ids,
     )

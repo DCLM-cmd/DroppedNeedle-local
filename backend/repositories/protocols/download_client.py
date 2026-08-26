@@ -32,6 +32,9 @@ class DownloadSearchResult(AppStruct):
     duration: float | None = None
     has_free_slot: bool = False
     upload_speed: int = 0
+    # slskd's current queue depth for this peer. Optional so persisted candidate
+    # blobs written before this signal was carried still decode safely.
+    queue_length: int | None = None
 
 
 class DownloadFileRef(AppStruct):
@@ -95,6 +98,28 @@ class DownloadTaskStatus(AppStruct):
     # the orchestrator fail a no-show enqueue over fast instead of waiting out the
     # full queued timeout for a transfer that never existed.
     matched_transfers: int = 0
+    # slskd supplies a per-file ``placeInQueue`` for remotely queued transfers.
+    # A task usually contains several files, so expose the inclusive range instead
+    # of pretending one file's position represents the whole album. Other clients
+    # leave both values absent.
+    queue_position_start: int | None = None
+    queue_position_end: int | None = None
+
+
+class DownloadMaterialization(AppStruct):
+    """Fresh evidence about bytes and client records owned by an attempt.
+
+    SABnzbd supplies one workspace; slskd supplies exact files because parent
+    directories may be shared. Cleanup confines every path before removal.
+    """
+
+    state: str
+    nzo_id: str = ""
+    remote_storage: str = ""
+    mount_root: str = ""
+    workspace_path: str = ""
+    file_paths: list[str] = []
+    mount_healthy: bool = False
 
 
 class MountDiagnosis(AppStruct):
@@ -124,8 +149,9 @@ class DownloadClientProtocol(Protocol):
     """Pluggable download client contract (acquire/track/locate).
 
     Clients enable independently (D2/D3): the old "one active client at a time"
-    assumption is gone. No ``delete_transfer`` method (DEC-1): post-import
-    removal of completed transfer records is done via ``cancel(handle)``.
+    assumption is gone. Aborting active bytes, inspecting completed materialization,
+    and discarding client-owned records are deliberately separate operations so a
+    completed workspace cannot be lost before publication barriers clear.
     """
 
     @property
@@ -139,9 +165,22 @@ class DownloadClientProtocol(Protocol):
 
     async def get_status(self, handle: TaskHandle) -> DownloadTaskStatus: ...
 
-    async def cancel(self, handle: TaskHandle) -> bool:
-        """Cancel an in-flight task AND/OR remove its completed transfer
-        records. Serves both user cancellation and post-import cleanup (DEC-1)."""
+    async def abort(self, handle: TaskHandle) -> bool:
+        """Stop an active job and remove only client-owned incomplete data."""
+        ...
+
+    async def inspect_materialization(
+        self, handle: TaskHandle
+    ) -> DownloadMaterialization:
+        """Resolve current client state and exact local source evidence."""
+        ...
+
+    async def discard_client_artifacts(self, handle: TaskHandle) -> bool:
+        """Remove transfer/history records after local source cleanup is durable.
+
+        Failed SABnzbd jobs may remove their incomplete bytes here. Completed SABnzbd
+        history must use ``del_files=0``; slskd removes only matching transfer records.
+        """
         ...
 
     async def list_completed_files(self, handle: TaskHandle) -> list[Path]:

@@ -3,7 +3,9 @@
 	import { artistHref, albumHref } from '$lib/utils/entityRoutes';
 	import HeroBackdrop from './HeroBackdrop.svelte';
 	import ArtistImage from './ArtistImage.svelte';
-	import { ArrowRight, Disc3 } from 'lucide-svelte';
+	import AlbumImage from './AlbumImage.svelte';
+	import { getApiUrl } from '$lib/api/api-utils';
+	import { ArrowRight } from 'lucide-svelte';
 
 	interface Props {
 		artist?: Artist | null;
@@ -14,10 +16,10 @@
 
 	let imageUrl = $derived.by(() => {
 		if (artist) {
-			return artist.banner_url || artist.fanart_url || artist.thumb_url || null;
+			return getApiUrl(`/api/v1/covers/artist/${artist.musicbrainz_id}?size=250`);
 		}
 		if (album) {
-			return album.cover_url || album.album_thumb_url || null;
+			return getApiUrl(`/api/v1/covers/release-group/${album.musicbrainz_id}?size=250`);
 		}
 		return null;
 	});
@@ -47,7 +49,7 @@
 
 <a
 	{href}
-	class="group relative flex items-end gap-4 overflow-hidden rounded-box p-4 sm:p-6 min-h-30 sm:min-h-35 transition-shadow hover:shadow-lg"
+	class="group relative flex items-end gap-4 overflow-hidden rounded-box p-4 sm:p-6 min-h-44 sm:min-h-56 transition-shadow hover:shadow-lg"
 	style="--hero-glow-color: var(--brand-hero);"
 >
 	<div class="absolute inset-0 bg-base-200"></div>
@@ -66,22 +68,18 @@
 	<div class="relative z-10 flex items-center gap-4 sm:gap-5 w-full">
 		{#if resultType === 'artist' && artist}
 			<div class="shrink-0">
-				<ArtistImage
-					mbid={artist.musicbrainz_id}
-					alt={artist.title}
-					size="lg"
-					remoteUrl={artist.thumb_url ?? null}
-				/>
+				<ArtistImage mbid={artist.musicbrainz_id} alt={artist.title} size="lg" requestSize={250} />
 			</div>
 		{:else if album}
 			<div class="shrink-0 w-16 h-16 sm:w-20 sm:h-20 rounded-lg overflow-hidden shadow-md">
-				{#if album.cover_url}
-					<img src={album.cover_url} alt={album.title} class="w-full h-full object-cover" />
-				{:else}
-					<div class="w-full h-full bg-base-200 flex items-center justify-center">
-						<Disc3 class="h-8 w-8 text-base-content/20" />
-					</div>
-				{/if}
+				<AlbumImage
+					mbid={album.musicbrainz_id}
+					alt={album.title}
+					size="full"
+					requestSize={250}
+					rounded="none"
+					className="w-full h-full"
+				/>
 			</div>
 		{/if}
 

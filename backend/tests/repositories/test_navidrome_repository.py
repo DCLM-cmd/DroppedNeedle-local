@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
-from core.exceptions import ExternalServiceError, NavidromeApiError, NavidromeAuthError, NavidromeSubsonicError
+from core.exceptions import (
+    ExternalServiceError,
+    NavidromeApiError,
+    NavidromeAuthError,
+    NavidromeSubsonicError,
+)
 from repositories.navidrome_repository import _navidrome_circuit_breaker
 from repositories.navidrome_models import (
     SubsonicAlbum,
@@ -21,6 +28,8 @@ from repositories.navidrome_models import (
     parse_subsonic_response,
 )
 from repositories.navidrome_repository import NavidromeRepository
+from infrastructure.cache.memory_cache import InMemoryCache
+from tests.mocks.navidrome_mock import Navidrome062Mock
 
 
 def _make_cache() -> MagicMock:
@@ -31,10 +40,12 @@ def _make_cache() -> MagicMock:
     return cache
 
 
-def _make_repo(configured: bool = True) -> tuple[NavidromeRepository, AsyncMock, MagicMock]:
+def _make_repo(
+    configured: bool = True, cache_scope: str = "shared"
+) -> tuple[NavidromeRepository, AsyncMock, MagicMock]:
     client = AsyncMock(spec=httpx.AsyncClient)
     cache = _make_cache()
-    repo = NavidromeRepository(http_client=client, cache=cache)
+    repo = NavidromeRepository(http_client=client, cache=cache, cache_scope=cache_scope)
     if configured:
         repo.configure("http://navidrome:4533", "admin", "secret")
     return repo, client, cache
@@ -78,6 +89,105 @@ class TestBuildAuthParams:
         repo, _, _ = _make_repo()
         salts = {repo._build_auth_params()["s"] for _ in range(10)}
         assert len(salts) > 1
+
+    def test_server_identity_is_stable_and_does_not_expose_url(self):
+        repo, _, _ = _make_repo()
+        assert repo.server_identity == repo.server_identity
+        assert "navidrome" not in repo.server_identity
+
+
+class TestMusicFolderScope:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "kwargs", "response"),
+        [
+            (
+                "get_album_list",
+                {"type": "newest"},
+                {"albumList2": {"album": []}},
+            ),
+            ("get_artists", {}, {"artists": {"index": []}}),
+            ("search", {"query": "radiohead"}, {"searchResult3": {}}),
+            ("get_starred", {}, {"starred2": {}}),
+            ("get_artists_index", {}, {"artists": {"index": []}}),
+            (
+                "get_songs_by_genre",
+                {"genre": "Rock"},
+                {"songsByGenre": {"song": []}},
+            ),
+            ("search_songs", {}, {"searchResult3": {}}),
+            ("get_random_songs", {}, {"randomSongs": {"song": []}}),
+        ],
+    )
+    async def test_selected_scope_serializes_repeated_folder_ids(
+        self, method, kwargs, response
+    ):
+        repo, _, _ = _make_repo()
+        repo._request = AsyncMock(return_value=response)
+
+        await getattr(repo, method)(**kwargs, music_folder_ids=("folder-a", "folder-b"))
+
+        params = repo._request.await_args.args[1]
+        assert params["musicFolderId"] == ["folder-a", "folder-b"]
+
+    @pytest.mark.asyncio
+    async def test_all_scope_omits_music_folder_parameter(self):
+        repo, _, _ = _make_repo()
+        repo._request = AsyncMock(return_value={"artists": {"index": []}})
+        await repo.get_artists()
+        assert "musicFolderId" not in repo._request.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_empty_selected_scope_fails_closed_without_request(self):
+        repo, _, _ = _make_repo()
+        repo._request = AsyncMock()
+        assert (
+            await repo.search("anything", music_folder_ids=()) == SubsonicSearchResult()
+        )
+        repo._request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_verified_062_asgi_repeats_same_folder_and_ignores_unknown(
+        self,
+    ):
+        mock = Navidrome062Mock()
+        transport = httpx.ASGITransport(app=mock.app)
+        async with httpx.AsyncClient(transport=transport) as client:
+            repo = NavidromeRepository(client, InMemoryCache())
+            repo.configure("http://navidrome.test", "user", "password")
+            folders = await repo.get_music_folders()
+            same = (folders[0].id, folders[0].id)
+            missing = ("missing-folder",)
+
+            assert await repo.get_artists(same)
+            assert await repo.get_album_list(
+                "alphabeticalByName", music_folder_ids=same
+            )
+            assert await repo.search_songs("", music_folder_ids=same)
+            assert await repo.get_songs_by_genre("Genre", music_folder_ids=same)
+            assert await repo.get_random_songs(music_folder_ids=same)
+            assert await repo.get_artists(missing)
+
+        for endpoint in (
+            "getArtists",
+            "getAlbumList2",
+            "search3",
+            "getSongsByGenre",
+            "getRandomSongs",
+        ):
+            assert mock.music_folder_requests[endpoint][0] == [
+                "folder-1",
+                "folder-1",
+            ]
+        assert mock.music_folder_requests["getArtists"][1] == ["missing-folder"]
+
+        fixture_path = (
+            Path(__file__).parents[1]
+            / "fixtures/navidrome/0.62.0/music_folder_observations.json"
+        )
+        observations = json.loads(fixture_path.read_text())
+        assert observations["server_version"].startswith("0.62.0")
+        assert observations["unknown_folder"]["artists"] == "ignored_nonempty"
 
 
 class TestParseSubsonicResponse:
@@ -123,7 +233,13 @@ class TestParseSubsonicResponse:
 
 class TestParseHelpers:
     def test_parse_artist_valid(self):
-        data = {"id": "a1", "name": "Muse", "albumCount": 9, "coverArt": "ca", "musicBrainzId": "mb1"}
+        data = {
+            "id": "a1",
+            "name": "Muse",
+            "albumCount": 9,
+            "coverArt": "ca",
+            "musicBrainzId": "mb1",
+        }
         artist = parse_artist(data)
         assert artist.id == "a1"
         assert artist.name == "Muse"
@@ -138,15 +254,26 @@ class TestParseHelpers:
 
     def test_parse_song_valid(self):
         data = {
-            "id": "s1", "title": "Uprising", "album": "The Resistance",
-            "albumId": "al1", "artist": "Muse", "artistId": "a1",
-            "track": 1, "year": 2009, "duration": 305, "bitRate": 320,
-            "suffix": "mp3", "contentType": "audio/mpeg", "musicBrainzId": "mb-s1",
+            "id": "s1",
+            "title": "Uprising",
+            "album": "The Resistance",
+            "albumId": "al1",
+            "artist": "Muse",
+            "artistId": "a1",
+            "track": 1,
+            "year": 2009,
+            "duration": 305,
+            "bitRate": 320,
+            "suffix": "mp3",
+            "contentType": "audio/mpeg",
+            "coverArt": "cover-1",
+            "musicBrainzId": "mb-s1",
         }
         song = parse_song(data)
         assert song.id == "s1"
         assert song.title == "Uprising"
         assert song.duration == 305
+        assert song.coverArt == "cover-1"
         assert song.musicBrainzId == "mb-s1"
 
     def test_parse_song_empty(self):
@@ -156,9 +283,15 @@ class TestParseHelpers:
 
     def test_parse_album_valid(self):
         data = {
-            "id": "al1", "name": "OK Computer", "artist": "Radiohead",
-            "artistId": "ar1", "year": 1997, "genre": "Rock",
-            "songCount": 12, "duration": 3300, "coverArt": "cover1",
+            "id": "al1",
+            "name": "OK Computer",
+            "artist": "Radiohead",
+            "artistId": "ar1",
+            "year": 1997,
+            "genre": "Rock",
+            "songCount": 12,
+            "duration": 3300,
+            "coverArt": "cover1",
             "musicBrainzId": "mb-al1",
         }
         album = parse_album(data)
@@ -169,8 +302,12 @@ class TestParseHelpers:
 
     def test_parse_album_with_songs(self):
         data = {
-            "id": "al1", "name": "Album",
-            "song": [{"id": "s1", "title": "Track 1"}, {"id": "s2", "title": "Track 2"}],
+            "id": "al1",
+            "name": "Album",
+            "song": [
+                {"id": "s1", "title": "Track 1"},
+                {"id": "s2", "title": "Track 2"},
+            ],
         }
         album = parse_album(data)
         assert album.song is not None
@@ -217,7 +354,9 @@ class TestEndpointWrappers:
     async def test_get_album_calls_correct_endpoint(self):
         repo, client, cache = _make_repo()
         client.get = AsyncMock(
-            return_value=_mock_response(_ok_envelope({"album": {"id": "a1", "name": "Test"}}))
+            return_value=_mock_response(
+                _ok_envelope({"album": {"id": "a1", "name": "Test"}})
+            )
         )
         result = await repo.get_album("a1")
         assert result.id == "a1"
@@ -229,7 +368,12 @@ class TestEndpointWrappers:
         body = {
             "artists": {
                 "index": [
-                    {"artist": [{"id": "a1", "name": "ABBA"}, {"id": "a2", "name": "AC/DC"}]},
+                    {
+                        "artist": [
+                            {"id": "a1", "name": "ABBA"},
+                            {"id": "a2", "name": "AC/DC"},
+                        ]
+                    },
                     {"artist": [{"id": "a3", "name": "Blur"}]},
                 ]
             }
@@ -252,7 +396,9 @@ class TestEndpointWrappers:
     @pytest.mark.asyncio
     async def test_get_genres_calls_correct_endpoint(self):
         repo, client, cache = _make_repo()
-        body = {"genres": {"genre": [{"value": "Rock", "songCount": 5, "albumCount": 1}]}}
+        body = {
+            "genres": {"genre": [{"value": "Rock", "songCount": 5, "albumCount": 1}]}
+        }
         client.get = AsyncMock(return_value=_mock_response(_ok_envelope(body)))
         result = await repo.get_genres()
         assert len(result) == 1
@@ -298,8 +444,13 @@ class TestErrorHandling:
     async def test_timeout_raises_external_service_error(self):
         repo, client, _ = _make_repo()
         client.get = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
-        with pytest.raises(ExternalServiceError, match="timed out"):
-            await repo._request("/rest/ping")
+        with patch(
+            "infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock
+        ) as sleep:
+            with pytest.raises(ExternalServiceError, match="timed out"):
+                await repo._request("/rest/ping")
+        assert client.get.await_count == 3
+        assert sleep.await_count == 2
 
     @pytest.mark.asyncio
     async def test_http_error_raises_external_service_error(self):
@@ -316,6 +467,7 @@ class TestErrorHandling:
         client.get = AsyncMock(return_value=_mock_response({}, status_code=401))
         with pytest.raises(NavidromeAuthError):
             await repo._request("/rest/ping")
+        assert client.get.await_count == 3
 
     @pytest.mark.asyncio
     async def test_500_raises_api_error(self):
@@ -351,28 +503,34 @@ class TestCircuitBreakerNonBreaking:
         }
         client.get = AsyncMock(return_value=_mock_response(error_envelope))
 
-        with patch("infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock):
+        with patch(
+            "infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock
+        ):
             for _ in range(10):
                 with pytest.raises(NavidromeSubsonicError):
                     await repo._request("/rest/getAlbumList2")
 
         from infrastructure.resilience.retry import CircuitState
+
         assert _navidrome_circuit_breaker.state == CircuitState.CLOSED
 
     @pytest.mark.asyncio
-    async def test_auth_error_still_trips_circuit_breaker(self):
-        """Auth errors (NavidromeAuthError) should still record CB failures."""
-        from infrastructure.resilience.retry import CircuitOpenError, CircuitState
+    async def test_auth_error_does_not_trip_circuit_breaker(self):
+        """Auth errors are non-breaking (issue #138, D6): with per-user credentials
+        one user's stale password must not open the shared circuit for everyone."""
+        from infrastructure.resilience.retry import CircuitState
 
         repo, client, _ = _make_repo()
         client.get = AsyncMock(return_value=_mock_response({}, status_code=401))
 
-        with patch("infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock):
+        with patch(
+            "infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock
+        ):
             for _ in range(10):
-                with pytest.raises((NavidromeAuthError, ExternalServiceError, CircuitOpenError)):
+                with pytest.raises(NavidromeAuthError):
                     await repo._request("/rest/ping")
 
-        assert _navidrome_circuit_breaker.state == CircuitState.OPEN
+        assert _navidrome_circuit_breaker.state == CircuitState.CLOSED
 
     @pytest.mark.asyncio
     async def test_connection_error_still_trips_circuit_breaker(self):
@@ -382,7 +540,9 @@ class TestCircuitBreakerNonBreaking:
         repo, client, _ = _make_repo()
         client.get = AsyncMock(side_effect=httpx.ConnectError("refused"))
 
-        with patch("infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock):
+        with patch(
+            "infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock
+        ):
             for _ in range(10):
                 with pytest.raises((ExternalServiceError, CircuitOpenError)):
                     await repo._request("/rest/ping")
@@ -446,3 +606,31 @@ class TestConfigure:
         repo, _, _ = _make_repo(configured=False)
         repo.configure("", "u", "p")
         assert repo.is_configured() is False
+
+
+class TestPlaylistCacheScope:
+    @pytest.mark.asyncio
+    async def test_list_and_detail_keys_include_requesting_user(self):
+        repo, _, cache = _make_repo(cache_scope="user:alice")
+        repo._request = AsyncMock(
+            side_effect=[{"playlists": {"playlist": []}}, {"playlist": {}}]
+        )
+
+        await repo.get_playlists()
+        await repo.get_playlist("playlist-1")
+
+        assert [call.args[0] for call in cache.get.await_args_list] == [
+            "navidrome:playlists:user:alice",
+            "navidrome:playlist:user:alice:playlist-1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_playlist_folder_filter_search_key_includes_requesting_user(self):
+        repo, _, cache = _make_repo(cache_scope="user:alice")
+        repo._request = AsyncMock(return_value={"searchResult3": {"song": []}})
+
+        await repo.search_songs(query="", count=500, offset=0)
+
+        cache.get.assert_awaited_once_with(
+            "navidrome:songs_browse:user:alice:scope:all::500:0"
+        )

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { ChevronDown, Download, RotateCcw, TimerOff, Trash2 } from 'lucide-svelte';
+	import { SvelteMap } from 'svelte/reactivity';
 
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import {
@@ -15,6 +16,7 @@
 
 	import DownloadItem from './DownloadItem.svelte';
 	import HeldTrackCard from './HeldTrackCard.svelte';
+	import ManagementHoldCard from './ManagementHoldCard.svelte';
 	import NowPressingHero from './NowPressingHero.svelte';
 	import QuarantinePanel from './QuarantinePanel.svelte';
 	import WantedCard from './WantedCard.svelte';
@@ -24,6 +26,20 @@
 	const quarantineQuery = getQuarantineQuery(() => isAdmin);
 	const heldQuery = getHeldImportsQuery();
 	const held = $derived(heldQuery.data?.items ?? []);
+	const managementHeld = $derived(held.filter((item) => item.reason.startsWith('management:')));
+	const verificationHeld = $derived(held.filter((item) => !item.reason.startsWith('management:')));
+	const managementGroups = $derived.by(() => {
+		const groups = new SvelteMap<string, typeof managementHeld>();
+		for (const item of managementHeld) {
+			const key =
+				item.source_task_id ?? `${item.release_group_mbid ?? 'unknown'}:${item.created_at}`;
+			groups.set(key, [...(groups.get(key) ?? []), item]);
+		}
+		return [...groups.values()];
+	});
+	const heldTaskIds = $derived(
+		new Set(held.flatMap((item) => (item.source_task_id ? [item.source_task_id] : [])))
+	);
 
 	const clear = clearHistory();
 	const stopAll = stopAllRetries();
@@ -31,7 +47,9 @@
 
 	// collapse auto-retry chains so each album is one row (latest attempt), then group into
 	// the dashboard's stacked sections
-	const tasks = $derived(collapseRetryChains(query.data?.items ?? []));
+	const tasks = $derived(
+		collapseRetryChains(query.data?.items ?? []).filter((task) => !heldTaskIds.has(task.id))
+	);
 	const sections = $derived(bucketSections(tasks));
 
 	const hero = $derived(sections.now_spinning[0] ?? null);
@@ -55,7 +73,8 @@
 			{ n: sections.now_spinning.length, label: 'spinning', cls: 'text-primary' },
 			{ n: sections.wanted.length, label: 'still hunting', cls: 'text-warning' },
 			{ n: sections.needs_you.length, label: 'needs you', cls: 'text-info' },
-			{ n: held.length, label: 'to verify', cls: 'text-warning' },
+			{ n: managementGroups.length, label: 'organizer paused', cls: 'text-warning' },
+			{ n: verificationHeld.length, label: 'to verify', cls: 'text-warning' },
 			{ n: sections.cueing.length, label: 'cueing up', cls: 'text-base-content/70' },
 			{ n: crateCount, label: 'in your crate', cls: 'text-success' }
 		].filter((p) => p.n > 0)
@@ -143,15 +162,29 @@
 			</section>
 		{/if}
 
+		{#if managementGroups.length > 0}
+			<section class="space-y-3">
+				<h2 class="dl-eyebrow">
+					Organizer needs attention <span class="text-base-content/35">· files secured</span>
+					<span class="dl-count">{managementGroups.length}</span>
+				</h2>
+				<div class="space-y-3">
+					{#each managementGroups as items (items[0]?.source_task_id ?? items[0]?.id)}
+						<ManagementHoldCard {items} />
+					{/each}
+				</div>
+			</section>
+		{/if}
+
 		<!-- COULDN'T VERIFY (held for "import anyway" review) -->
-		{#if held.length > 0}
+		{#if verificationHeld.length > 0}
 			<section class="space-y-3">
 				<h2 class="dl-eyebrow">
 					Couldn't verify <span class="text-base-content/35">· your call</span>
-					<span class="dl-count">{held.length}</span>
+					<span class="dl-count">{verificationHeld.length}</span>
 				</h2>
 				<div class="space-y-3">
-					{#each held as item (item.id)}
+					{#each verificationHeld as item (item.id)}
 						<HeldTrackCard held={item} />
 					{/each}
 				</div>

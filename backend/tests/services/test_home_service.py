@@ -72,6 +72,7 @@ def _make_service(
     lb_repo.get_user_genre_activity = AsyncMock(return_value=None)
     lb_repo.get_recommendation_playlists = AsyncMock(return_value=[])
     lb_repo.get_playlist_tracks = AsyncMock(return_value=None)
+    lb_repo.get_recording_release_groups_batch = AsyncMock(return_value={})
     lb_repo.configure = MagicMock()
 
     lfm_repo = AsyncMock()
@@ -167,7 +168,7 @@ class TestHomeServiceSourceSelection:
         download_client_conn.enabled = True
         download_client_conn.url = "http://slskd.local"
         prefs.get_download_client_settings.return_value = download_client_conn
-        service._library_repo.get_library.return_value = [
+        service._library_repo.get_home_albums.return_value = [
             LibraryAlbum(
                 artist="Artist",
                 album="Album",
@@ -175,10 +176,7 @@ class TestHomeServiceSourceSelection:
                 artist_mbid="artist-123",
             )
         ]
-        # album membership now comes from the native get_library_mbids() set (get_library()
-        # is an empty stub on native installs), keyed on release-group mbid
-        service._library_repo.get_library_mbids.return_value = {"rg-123"}
-        service._library_repo.get_artists_from_library.return_value = [{"mbid": "artist-123"}]
+        service._library_repo.get_home_artists.return_value = [{"mbid": "artist-123"}]
         lb_repo.get_sitewide_top_release_groups.return_value = [
             ListenBrainzReleaseGroup(
                 release_group_name="Album",
@@ -242,6 +240,42 @@ class TestHomeServiceSourceSelection:
         assert response.weekly_exploration.source_url == "https://listenbrainz.org/playlist/weekly-123"
         assert len(response.weekly_exploration.tracks) == 1
         assert response.weekly_exploration.tracks[0].release_group_mbid == "release-group-1"
+
+    @pytest.mark.asyncio
+    async def test_weekly_exploration_uses_batched_recording_metadata_before_musicbrainz(self):
+        service, lb_repo, _, _ = _make_service(
+            lb_enabled=True, lfm_enabled=True, primary_source="listenbrainz"
+        )
+        lb_repo.get_recommendation_playlists.return_value = [
+            {
+                "playlist_id": "weekly-123",
+                "source_patch": "weekly-exploration",
+                "identifier": "https://listenbrainz.org/playlist/weekly-123",
+            }
+        ]
+        lb_repo.get_playlist_tracks.return_value = MagicMock(
+            title="Weekly Exploration",
+            date="2026-03-30T00:00:00+00:00",
+            tracks=[
+                MagicMock(
+                    title="Song",
+                    creator="Artist",
+                    album="Album",
+                    recording_mbid="recording-1",
+                    artist_mbids=["artist-1"],
+                    caa_release_mbid="release-1",
+                    duration_ms=123000,
+                )
+            ],
+        )
+        lb_repo.get_recording_release_groups_batch.return_value = {
+            "recording-1": "release-group-1"
+        }
+
+        response = await service.get_home_data("u1")
+
+        assert response.weekly_exploration.tracks[0].release_group_mbid == "release-group-1"
+        service._mb_repo.get_release_group_id_from_release.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_weekly_exploration_builds_even_with_lastfm_primary(self):
@@ -426,4 +460,3 @@ class TestHomeServeFastRevalidate:
 
         assert resp.refreshing is False
         lb_repo.get_sitewide_top_artists.assert_not_awaited()
-

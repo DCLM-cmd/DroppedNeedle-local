@@ -1,0 +1,2879 @@
+import asyncio
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+from pathlib import Path
+from collections.abc import Callable
+from unittest.mock import AsyncMock
+
+import msgspec
+import pytest
+
+from api.v1.schemas.library_management import (
+    LibraryManagementRootAssignment,
+    LibraryManagementRootOverrides,
+    NamingScriptSettings,
+    PICARD_ORGANIZER_PROFILE_ID,
+    profile_revision,
+    settings_revision,
+)
+from api.v1.schemas.library_policies import LibraryRootSettings
+from api.v1.schemas.library_management_preview import (
+    LibraryManagementBaselineRestorePreviewRequest,
+    LibraryManagementSelectionRequest,
+    LibraryManagementUndoPreviewRequest,
+)
+from core.exceptions import (
+    AudioWriteError,
+    AutomaticManagementHoldError,
+    ConflictError,
+    LibraryManagementDestinationConflictError,
+    LibraryManagementPolicyChangedError,
+    StaleRevisionError,
+    ValidationError,
+)
+from infrastructure.audio.metadata_engine import (
+    AudioMetadataEngine,
+    legacy_audio_projection,
+)
+from infrastructure.library_management_blob_store import LibraryManagementBlobStore
+from services.native.audio_write_planning_service import AudioWritePlanningService
+from services.native.library_filesystem_coordinator import LibraryFilesystemCoordinator
+from services.native.library_management_baseline_service import (
+    LibraryManagementBaselineService,
+)
+from services.native.library_management_publisher import (
+    LibraryManagementPublisher,
+    _catalog_tag_projection,
+)
+from services.native.library_management_profile_service import (
+    LibraryManagementProfileService,
+)
+from services.native.library_management_undo_service import LibraryManagementUndoService
+from services.native.library_policy_resolver import LibraryPolicyResolver
+from services.native.identification_revisions import (
+    album_identity_revision,
+    album_input_revisions,
+)
+from services.native.target_import_library_service import TargetImportLibraryService
+from models.audio import AudioTag
+from models.audio_metadata import (
+    AudioWritePolicy,
+    DesiredAudioDocument,
+    DesiredAudioField,
+    SemanticTagSnapshot,
+)
+from models.library_management import (
+    BUNDLE_BLOCKED,
+    MANAGEMENT_RECYCLE_ROOT_ID,
+    PATH_COLLISION_DIFFERENT,
+    POLICY_CHANGED,
+    ROOT_UNAVAILABLE,
+    LibraryManagementImportArtifact,
+    LibraryManagementImportBundle,
+    LibraryManagementImportFile,
+    LibraryManagementJobSnapshot,
+    LibraryManagementMetadataSnapshot,
+)
+from models.edition_management import (
+    EditionConversionJob,
+    EditionConversionLocalFile,
+    EditionConversionTarget,
+)
+from models.library_management_planning import (
+    LibraryManagementSelection,
+    naming_policy_revision,
+    pin_library_management_profile,
+)
+from models.library_work import OperationJob
+from repositories.musicbrainz_management_models import MbManagementRelease
+from tests.services.native.test_library_management_planner import _configured, _planner
+from tests.services.native.test_library_management_planner import (
+    FIXTURES,
+    _ArtworkRepository,
+)
+
+
+def _update_profile(preferences, update: Callable) -> None:
+    current = preferences.get_library_management_settings()
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    update(settings, profile)
+    preferences.save_library_management_settings_if_current(
+        settings, expected_settings_revision=current.settings_revision
+    )
+
+
+def _activate_automatic_acquisitions(preferences, policy_revision: str) -> None:
+    current = preferences.get_library_management_settings()
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    pinned = pin_library_management_profile(settings, profile)
+    settings.root_assignments = [
+        LibraryManagementRootAssignment(
+            root_id="root-1",
+            profile_id=profile.id,
+            enabled=True,
+            automatic_acquisitions=True,
+            activation_profile_revision=profile_revision(profile),
+            activation_policy_revision=policy_revision,
+            activation_settings_revision=current.settings_revision,
+            activation_naming_policy_revision=naming_policy_revision(pinned),
+            activation_preview_token="confirmed",
+            activation_preview_hash="confirmed-hash",
+            activation_confirmed_at=100.0,
+        )
+    ]
+    preferences.save_library_management_settings_if_current(
+        settings, expected_settings_revision=current.settings_revision
+    )
+
+
+def test_restoration_catalog_projection_uses_pinned_values_for_empty_tags() -> None:
+    projected = _catalog_tag_projection(
+        AudioTag(title="", artist="", album="", track_number=0),
+        DesiredAudioDocument(
+            fields=(
+                DesiredAudioField(name="title", action="set", value="Feel It Inside"),
+                DesiredAudioField(name="artist", action="set", value=("Trapeze",)),
+                DesiredAudioField(name="album", action="set", value="Hot Wire"),
+                DesiredAudioField(
+                    name="album_artist", action="set", value=("Trapeze",)
+                ),
+                DesiredAudioField(name="track_number", action="set", value=8),
+                DesiredAudioField(name="disc_number", action="set", value=1),
+                DesiredAudioField(name="date", action="set", value="1974"),
+                DesiredAudioField(name="original_date", action="set", value="1974"),
+                DesiredAudioField(name="artist_sort", action="set", value=("Trapeze",)),
+                DesiredAudioField(
+                    name="album_artist_sort", action="set", value=("Trapeze",)
+                ),
+                DesiredAudioField(
+                    name="musicbrainz_artist_id",
+                    action="set",
+                    value=("artist-mbid",),
+                ),
+            ),
+            artist_display="Trapeze",
+            album_artist_display="Trapeze",
+        ),
+        "Trapeze/Trapeze - Hot Wire/08 Feel It Inside.mp3",
+        native_fields=frozenset(),
+    )
+
+    assert projected.title == "Feel It Inside"
+    assert projected.artist == projected.album_artist == "Trapeze"
+    assert projected.album == "Hot Wire"
+    assert projected.track_number == 8
+    assert projected.disc_number == 1
+    assert projected.year == 1974
+    assert projected.original_release_date == "1974"
+    assert projected.artist_sort == projected.album_artist_sort == "Trapeze"
+    assert projected.musicbrainz_artist_id == "artist-mbid"
+    assert projected.artists[0].musicbrainz_artist_id == "artist-mbid"
+
+
+def test_restoration_catalog_projection_falls_back_to_path() -> None:
+    projected = _catalog_tag_projection(
+        AudioTag(title="", artist="", album="", track_number=0),
+        DesiredAudioDocument(fields=()),
+        "Artist/Album/08 Feel It Inside.mp3",
+        native_fields=frozenset(),
+    )
+
+    assert (
+        projected.title,
+        projected.artist,
+        projected.album,
+        projected.album_artist,
+    ) == (
+        "08 Feel It Inside",
+        "Unknown Artist",
+        "08 Feel It Inside",
+        "Unknown Artist",
+    )
+
+
+def test_restoration_catalog_projection_prefers_explicit_native_defaults() -> None:
+    projected = _catalog_tag_projection(
+        AudioTag(
+            title="Track",
+            artist="Track Artist",
+            album="Album",
+            track_number=1,
+            disc_number=2,
+            compilation=False,
+        ),
+        DesiredAudioDocument(
+            fields=(
+                DesiredAudioField(
+                    name="album_artist", action="set", value=("Album Artist",)
+                ),
+                DesiredAudioField(name="disc_number", action="set", value=1),
+                DesiredAudioField(name="compilation", action="set", value=True),
+            ),
+            artist_display="Track Artist",
+            album_artist_display="Album Artist",
+        ),
+        "Album/02 Track.flac",
+        native_fields=frozenset({"disc_number", "compilation"}),
+    )
+
+    assert projected.album_artist == "Album Artist"
+    assert projected.disc_number == 2
+    assert projected.compilation is False
+
+
+def _import_file(
+    audio: AudioMetadataEngine,
+    source: Path,
+    *,
+    ordinal: int,
+    relative_path: str,
+) -> LibraryManagementImportFile:
+    _existing_tag, info = legacy_audio_projection(audio.read(source))
+    return LibraryManagementImportFile(
+        ordinal=ordinal,
+        input_path=str(source),
+        destination_root_id="root-1",
+        destination_relative_path=relative_path,
+        tag=AudioTag(
+            title=f"Track {ordinal + 1}",
+            artist="Import Artist",
+            album="Import Album",
+            album_artist="Import Artist",
+            track_number=ordinal + 1,
+            year=2026,
+            musicbrainz_release_group_id="import-rg",
+            musicbrainz_release_id="import-release",
+        ),
+        info=info,
+        release_group_mbid="import-rg",
+        release_mbid="import-release",
+        recording_mbid=None,
+        confidence=0.9,
+        source="download",
+        source_path=source.name,
+        download_task_id="task-1",
+    )
+
+
+def _same_path_configuration(_root, preferences, _store) -> None:
+    def update(_settings, profile) -> None:
+        profile.organization.rename_enabled = False
+        profile.organization.move_enabled = False
+        profile.organization.move_sidecars = False
+
+    _update_profile(preferences, update)
+
+
+def _tags_only_configuration(_root, preferences, _store) -> None:
+    def update(_settings, profile) -> None:
+        profile.organization.rename_enabled = False
+        profile.organization.move_enabled = False
+        profile.organization.move_sidecars = False
+        profile.artwork.embedded_enabled = False
+        profile.artwork.external_enabled = False
+
+    _update_profile(preferences, update)
+
+
+def _keep_source_configuration(_root, preferences, _store) -> None:
+    def update(_settings, profile) -> None:
+        profile.organization.move_sidecars = False
+        profile.organization.source_cleanup = "keep"
+
+    _update_profile(preferences, update)
+
+
+def _sidecar_configuration(root: Path, preferences, _store) -> None:
+    (root / "disc.cue").write_text("FILE source.flac", encoding="utf-8")
+
+    def update(_settings, profile) -> None:
+        profile.organization.move_sidecars = True
+
+    _update_profile(preferences, update)
+
+
+def _external_artwork_configuration(_root, preferences, _store) -> None:
+    def update(settings, profile) -> None:
+        script = NamingScriptSettings(
+            id="6e0e3245-8e5c-4202-acd8-41230c4ca09f",
+            name="External artwork",
+            source="{albumartist}/{album}/art-{artwork_type}.{artwork_extension}",
+        )
+        settings.naming_scripts.append(script)
+        profile.artwork.embedded_enabled = False
+        profile.artwork.external_enabled = True
+        profile.artwork.providers = ["cover_art_archive_release"]
+        profile.artwork.external_format = "png"
+        profile.artwork.external_naming_script_id = script.id
+
+    _update_profile(preferences, update)
+
+
+def _add_second_album_track(root: Path, _preferences, store) -> None:
+    source = root / "source2.flac"
+    shutil.copy2(root / "source.flac", source)
+    metadata = source.stat()
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO local_tracks "
+            "(id,local_album_id,root_id,file_path,relative_path,path_hash,"
+            "file_size_bytes,file_mtime_ns,stat_revision,stat_revision_kind,tag_revision,"
+            "title,title_folded,artist_name,artist_name_folded,album_title,"
+            "album_title_folded,album_artist_name,album_artist_name_folded,disc_number,"
+            "track_number,year,genre,genre_folded,file_format,ingest_source,imported_at,"
+            "membership_source) VALUES "
+            "('track-2','album-1','root-1',?,'source2.flac',?,?,?,?,"
+            "'exact','tag-2','Second Track','second track','Alpha','alpha',"
+            "'Management Album','management album','Alpha','alpha',1,2,2024,"
+            "'Electronic','electronic','flac','scan',1,'automatic')",
+            (
+                str(source),
+                hashlib.sha256(b"source2.flac").hexdigest(),
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                f"{metadata.st_size}:{metadata.st_mtime_ns}",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO local_track_external_identities "
+            "(local_track_id,provider,recording_mbid,release_mbid,release_track_mbid,"
+            "medium_position,release_track_position,decision_source,selected_at) "
+            "VALUES ('track-2','musicbrainz','55555555-5555-4555-8555-555555555555',"
+            "'aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b',"
+            "'66666666-6666-4666-8666-666666666666',1,2,'manual',1)"
+        )
+
+
+def _nest_source(root: Path, _preferences, store) -> None:
+    nested = root / "incoming"
+    nested.mkdir()
+    source = nested / "source.flac"
+    (root / "source.flac").replace(source)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET file_path=?,relative_path='incoming/source.flac',"
+            "path_hash=? WHERE id='track-1'",
+            (str(source), hashlib.sha256(b"incoming/source.flac").hexdigest()),
+        )
+
+
+def _case_only_source(root: Path, _preferences, store) -> None:
+    relative = (
+        "Johann Sebastian Bach; Glenn Gould/"
+        "Goldberg Variations, BWV 988 (1982)/01 - ARIA.flac"
+    )
+    source = root / relative
+    source.parent.mkdir(parents=True)
+    (root / "source.flac").replace(source)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET file_path=?,relative_path=?,path_hash=? "
+            "WHERE id='track-1'",
+            (str(source), relative, hashlib.sha256(relative.encode()).hexdigest()),
+        )
+
+
+def _add_second_canonical_track(planner) -> None:
+    payload = json.loads(
+        (FIXTURES / "musicbrainz" / "management_release.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    second = json.loads(json.dumps(payload["media"][0]["tracks"][0]))
+    second["id"] = "66666666-6666-4666-8666-666666666666"
+    second["position"] = 2
+    second["number"] = "A2"
+    second["title"] = "Variation 1"
+    second["recording"]["id"] = "55555555-5555-4555-8555-555555555555"
+    second["recording"]["title"] = "Variation 1"
+    payload["media"][0]["tracks"].append(second)
+    planner._canonical._musicbrainz.get_canonical_release.return_value = (
+        msgspec.json.decode(json.dumps(payload).encode(), type=MbManagementRelease)
+    )
+
+
+async def _ready_apply_operation(
+    tmp_path: Path,
+    *,
+    configure: Callable | None = None,
+    prepare_store: Callable | None = None,
+    customize_planner: Callable | None = None,
+    artwork_repository=None,
+    target_root_id: str | None = None,
+    selection: LibraryManagementSelection | None = None,
+):
+    root, source, preferences, store, _settings_revision, _policy_revision = (
+        _configured(tmp_path)
+    )
+    if configure is not None:
+        configure(root, preferences, store)
+    if prepare_store is not None:
+        prepare_store(root, preferences, store)
+    settings_revision = preferences.get_library_management_settings().settings_revision
+    policy_revision = LibraryPolicyResolver(
+        preferences.get_typed_library_settings_raw()
+    ).policy_revision
+    planner = _planner(
+        tmp_path,
+        store,
+        preferences,
+        artwork_repository=artwork_repository,
+    )
+    if customize_planner is not None:
+        customize_planner(planner)
+    handle = await planner.create_preview(
+        selection=selection
+        or LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key="publisher-preview",
+        target_root_id=target_root_id,
+    )
+    claimed = await store.claim_operation_job(
+        "preview-worker", now=100, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    await planner.run_claimed_preview(claimed, "preview-worker")
+    with sqlite3.connect(tmp_path / "library.db") as connection:
+        connection.execute(
+            "UPDATE library_operation_jobs SET state='running',lease_owner='apply-worker',"
+            "lease_expires_at=200,heartbeat_at=110,expected_work_count=1 WHERE id=?",
+            (handle.job_id,),
+        )
+        connection.execute(
+            "UPDATE library_management_job_snapshots SET mode='apply',phase='applying' "
+            "WHERE job_id=?",
+            (handle.job_id,),
+        )
+        connection.execute(
+            "INSERT INTO library_operation_work "
+            "(job_id,ordinal,local_album_id,expected_subject_revision,"
+            "expected_input_revision,action,idempotency_key,state,updated_at) "
+            "VALUES (?,0,'album-1',1,?,'library_management',?,'running',110)",
+            (handle.job_id, settings_revision, f"{handle.job_id}:bundle:0"),
+        )
+    audio = AudioMetadataEngine()
+    publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        LibraryManagementBlobStore(tmp_path / "blobs", store),
+        LibraryFilesystemCoordinator(),
+        clock=lambda: 110.0,
+    )
+    return root, source, store, audio, publisher, handle.job_id
+
+
+def _import_publication_fixture(tmp_path: Path):
+    root, catalog_source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    audio = AudioMetadataEngine()
+    filesystem = LibraryFilesystemCoordinator()
+    publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        LibraryManagementBlobStore(tmp_path / "import-blobs", store),
+        filesystem,
+        clock=lambda: 110.0,
+    )
+    service = TargetImportLibraryService(
+        store,
+        lambda: LibraryPolicyResolver(preferences.get_typed_library_settings_raw()),
+        AsyncMock(),
+        filesystem_coordinator=filesystem,
+        management_publisher=publisher,
+    )
+    return root, catalog_source, store, audio, publisher, service, policy_revision
+
+
+def test_m4a_staging_mutates_a_local_scratch_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _root, _catalog_source, _store, audio, publisher, _service, _policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    source = tmp_path / "source.m4a"
+    temporary = tmp_path / "destination" / "temporary.m4a"
+    shutil.copy2(FIXTURES / "library" / "management_full.m4a", source)
+    plan = audio.plan(
+        audio.read(source),
+        DesiredAudioDocument(
+            fields=(
+                DesiredAudioField(name="title", action="set", value="Changed title"),
+            )
+        ),
+        AudioWritePolicy(),
+    )
+    applied_paths: list[Path] = []
+    original_apply = audio.apply
+
+    def record_apply(path: Path, write_plan):
+        applied_paths.append(path)
+        return original_apply(path, write_plan)
+
+    monkeypatch.setattr(audio, "apply", record_apply)
+
+    publisher._stage_audio(source, temporary, plan)
+
+    assert len(applied_paths) == 1
+    assert applied_paths[0] != temporary
+    assert not applied_paths[0].exists()
+    assert audio.read(temporary).metadata.value_for("title") == "Changed title"
+
+
+@pytest.mark.asyncio
+async def test_import_bundle_publishes_once_and_commits_catalog_atomically(
+    tmp_path: Path,
+) -> None:
+    root, catalog_source, store, audio, _publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    incoming = tmp_path / "incoming.flac"
+    shutil.copy2(catalog_source, incoming)
+    request = _import_file(
+        audio,
+        incoming,
+        ordinal=0,
+        relative_path="Import Artist/Import Album/01 Track.flac",
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:task-1:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+
+    first = await service.publish_import_bundle(bundle)
+    repeated = await service.publish_import_bundle(bundle)
+
+    destination = root / request.destination_relative_path
+    row = await store.get_target_track_by_path(str(destination))
+    journals = await store.list_library_management_import_journals(first.bundle_id)
+    barriers = await store.list_acquisition_import_bundles_for_download_task("task-1")
+    assert destination.is_file()
+    assert incoming.exists() is False
+    assert row is not None and row["download_task_id"] == "task-1"
+    assert first.paths == repeated.paths == (str(destination),)
+    assert first.local_track_ids == repeated.local_track_ids
+    assert repeated.repeated is True
+    assert [value.state for value in journals] == ["completed"]
+    assert [value.id for value in barriers] == [first.bundle_id]
+
+
+@pytest.mark.asyncio
+async def test_import_catalog_commit_atomically_settles_matching_management_hold(
+    tmp_path: Path,
+) -> None:
+    root, catalog_source, store, audio, _publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    incoming = tmp_path / "held-incoming.flac"
+    shutil.copy2(catalog_source, incoming)
+    request = msgspec.structs.replace(
+        _import_file(
+            audio,
+            incoming,
+            ordinal=0,
+            relative_path="Import Artist/Import Album/01 Track.flac",
+        ),
+        source_path=str(incoming),
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "INSERT INTO held_imports "
+            "(user_id,held_path,reason,source,source_task_id,status,created_at) "
+            "VALUES ('admin',?,'management:TRACK_NOT_MAPPED','soulseek',"
+            "'task-1','held',1)",
+            (str(incoming),),
+        )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:held-atomic:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+
+    result = await service.publish_import_bundle(bundle)
+
+    with sqlite3.connect(store.db_path) as connection:
+        status = connection.execute(
+            "SELECT status FROM held_imports WHERE source_task_id='task-1'"
+        ).fetchone()[0]
+    assert status == "imported"
+    assert (root / request.destination_relative_path).is_file()
+    assert len(result.local_track_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_import_album_catalog_commit_adopts_every_track_in_one_revision(
+    tmp_path: Path,
+) -> None:
+    root, catalog_source, store, audio, _publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    sources = [tmp_path / "album-1.flac", tmp_path / "album-2.flac"]
+    for source in sources:
+        shutil.copy2(catalog_source, source)
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:album-atomic:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=tuple(
+            _import_file(
+                audio,
+                source,
+                ordinal=ordinal,
+                relative_path=f"Import Artist/Import Album/0{ordinal + 1} Track.flac",
+            )
+            for ordinal, source in enumerate(sources)
+        ),
+    )
+    before_revision = await store.get_catalog_revision()
+
+    result = await service.publish_import_bundle(bundle)
+
+    assert len(result.local_track_ids) == 2
+    assert await store.get_catalog_revision() == before_revision + 1
+    assert all(
+        (root / value.destination_relative_path).is_file() for value in bundle.files
+    )
+
+
+@pytest.mark.asyncio
+async def test_automatic_import_commits_identity_baseline_undo_and_history(
+    tmp_path: Path,
+) -> None:
+    root, catalog_source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    _activate_automatic_acquisitions(preferences, policy_revision)
+    audio = AudioMetadataEngine()
+    filesystem = LibraryFilesystemCoordinator()
+    blobs = LibraryManagementBlobStore(tmp_path / "automatic-import-blobs", store)
+    publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        blobs,
+        filesystem,
+        clock=lambda: 110.0,
+    )
+    identification_queue = AsyncMock()
+    service = TargetImportLibraryService(
+        store,
+        lambda: LibraryPolicyResolver(preferences.get_typed_library_settings_raw()),
+        identification_queue,
+        filesystem_coordinator=filesystem,
+        management_publisher=publisher,
+    )
+    incoming = tmp_path / "automatic-incoming.flac"
+    shutil.copy2(catalog_source, incoming)
+    original_snapshot = audio.snapshot(incoming)
+    incoming_sidecar = tmp_path / "album.cue"
+    incoming_sidecar.write_text("FILE original.flac WAVE", encoding="utf-8")
+    sidecar_fingerprint = hashlib.sha256(incoming_sidecar.read_bytes()).hexdigest()
+    artwork_content = b"generated-artwork"
+    request = _import_file(
+        audio,
+        incoming,
+        ordinal=0,
+        relative_path="Managed Artist/Managed Album/01 Managed.flac",
+    )
+    management = preferences.get_library_management_settings_raw()
+    profile = next(
+        value
+        for value in management.profiles
+        if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    pinned = _planner(tmp_path, store, preferences).pin_profile(management, profile)
+    metadata_snapshot = await store.put_management_metadata_snapshot(
+        LibraryManagementMetadataSnapshot(
+            id="automatic-metadata-snapshot",
+            provider="musicbrainz",
+            entity_kind="release",
+            entity_id="import-release",
+            input_hash="a" * 64,
+            canonical_payload_json="{}",
+            payload_sha256=hashlib.sha256(b"{}").hexdigest(),
+            fetched_at=100.0,
+        )
+    )
+    request = msgspec.structs.replace(
+        request,
+        authoritative_mapping=True,
+        recording_mbid="recording-1",
+        release_track_mbid="release-track-1",
+        medium_position=1,
+        release_track_position=1,
+        baseline_relative_path="Incoming/01 Original.flac",
+        desired_document=DesiredAudioDocument(
+            fields=(DesiredAudioField(name="title", action="set", value="Managed"),)
+        ),
+        pinned_profile=pinned,
+        metadata_snapshot_id=metadata_snapshot.id,
+        projection_hash="c" * 64,
+        settings_revision=settings_revision(management),
+        naming_policy_revision=naming_policy_revision(pinned),
+        undo_retention_days=management.undo_retention_days,
+        management_warnings=("genre:listenbrainz",),
+        artifacts=(
+            LibraryManagementImportArtifact(
+                kind="external_art",
+                destination_root_id="root-1",
+                destination_relative_path="Managed Artist/Managed Album/cover.jpg",
+                content=artwork_content,
+                source_fingerprint=hashlib.sha256(artwork_content).hexdigest(),
+            ),
+            LibraryManagementImportArtifact(
+                kind="sidecar",
+                destination_root_id="root-1",
+                destination_relative_path="Managed Artist/Managed Album/album.cue",
+                source_path=str(incoming_sidecar),
+                source_fingerprint=sidecar_fingerprint,
+            ),
+        ),
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:automatic-identity",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+    artwork_blob = await blobs.add_bytes(
+        artwork_content,
+        kind="image",
+        created_at=109.0,
+        media_metadata_json='{"height":534,"mime_type":"image/jpeg","width":599}',
+    )
+    sidecar_blob = await blobs.add_bytes(
+        incoming_sidecar.read_bytes(),
+        kind="sidecar_manifest",
+        created_at=109.0,
+        media_metadata_json='{"source":"existing-snapshot"}',
+    )
+
+    result = await service.publish_import_bundle(bundle)
+
+    track_id = result.local_track_ids[0]
+    baseline = await store.get_management_baseline(track_id)
+    state = await store.get_track_management_state(track_id)
+    identity = await store.get_accepted_library_management_identity(
+        (await store.get_target_track(track_id))["local_album_id"],
+        local_track_ids=(track_id,),
+    )
+    operations = await store.list_library_management_operations(limit=10)
+    operation_snapshot = await store.get_library_management_job_snapshot(
+        str(operations[0]["id"])
+    )
+    before_snapshot = await store.get_management_operation_snapshot(
+        str(operations[0]["id"]), 0, track_id
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        bundle_id = str(
+            connection.execute(
+                "SELECT id FROM library_management_import_bundles "
+                "WHERE idempotency_key=?",
+                (bundle.idempotency_key,),
+            ).fetchone()[0]
+        )
+    journals = await store.list_library_management_import_journals(bundle_id)
+    assert baseline is not None
+    decoded_baseline = msgspec.json.decode(
+        await blobs.read_bytes(baseline.semantic_snapshot_blob_sha256),
+        type=SemanticTagSnapshot,
+    )
+    assert (root / request.destination_relative_path).is_file()
+    assert baseline.image_snapshot_json == "[]"
+    assert before_snapshot is not None
+    assert before_snapshot.image_snapshot_json == "[]"
+    assert [journal.baseline_image_snapshot_json for journal in journals] == ["[]"]
+    assert decoded_baseline.artwork == original_snapshot.artwork
+    assert baseline.original_relative_path == "Incoming/01 Original.flac"
+    ancillary = json.loads(baseline.ancillary_snapshot_json)
+    assert {value["kind"] for value in ancillary} == {"external_art", "sidecar"}
+    assert (
+        root / "Managed Artist/Managed Album/cover.jpg"
+    ).read_bytes() == artwork_content
+    assert (root / "Managed Artist/Managed Album/album.cue").read_text() == (
+        "FILE original.flac WAVE"
+    )
+    assert (
+        await store.get_management_blob(artwork_blob.sha256)
+    ).media_metadata_json == artwork_blob.media_metadata_json
+    assert (
+        await store.get_management_blob(sidecar_blob.sha256)
+    ).media_metadata_json == sidecar_blob.media_metadata_json
+    assert not incoming_sidecar.exists()
+    assert state is not None and state.applied_projection_hash == "c" * 64
+    assert state.applied_naming_script_revision == naming_policy_revision(pinned)
+    assert identity is not None
+    assert identity.release_mbid == "import-release"
+    assert identity.tracks[0].release_track_mbid == "release-track-1"
+    assert operations[0]["management_mode"] == "automatic_apply"
+    assert operations[0]["management_origin"] == "acquisition"
+    assert operation_snapshot is not None
+    assert operation_snapshot.naming_revision == naming_policy_revision(pinned)
+    assert json.loads(operation_snapshot.warnings_json) == ["genre:listenbrainz"]
+    identification_queue.enqueue_album.assert_not_awaited()
+
+    source_job = await store.get_operation_job(str(operations[0]["id"]))
+    assert source_job is not None
+    undo = LibraryManagementUndoService(
+        store,
+        preferences,
+        audio,
+        blobs,
+        filesystem,
+        clock=lambda: 120.0,
+    )
+    undo_preview = await undo.create_preview(
+        str(operations[0]["id"]),
+        LibraryManagementUndoPreviewRequest(
+            expected_operation_row_revision=int(source_job["row_revision"]),
+            idempotency_key="undo-automatic-import-preview",
+        ),
+        "admin",
+    )
+    claimed_preview = await store.claim_operation_job(
+        "undo-preview-worker",
+        now=121.0,
+        lease_seconds=60.0,
+        kind="library_management",
+    )
+    assert claimed_preview is not None
+    await undo.run_claimed_preview(claimed_preview, "undo-preview-worker")
+    ready = await store.get_operation_job(undo_preview.job_id)
+    assert ready is not None and ready["state"] == "ready"
+    await store.begin_library_management_apply(
+        undo_preview.job_id,
+        preview_token_hash=hashlib.sha256(
+            undo_preview.preview_token.encode()
+        ).hexdigest(),
+        expected_job_revision=int(ready["row_revision"]),
+        idempotency_key="undo-automatic-import-apply",
+        now=122.0,
+    )
+    claimed_apply = await store.claim_operation_job(
+        "undo-apply-worker",
+        now=123.0,
+        lease_seconds=60.0,
+        kind="library_management",
+    )
+    assert claimed_apply is not None
+    work = await store.claim_operation_work(
+        undo_preview.job_id, "undo-apply-worker", now=124.0
+    )
+    assert work is not None
+    undo_publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        blobs,
+        filesystem,
+        clock=lambda: 125.0,
+    )
+
+    await undo_publisher.publish_bundle(
+        undo_preview.job_id, int(work["ordinal"]), "undo-apply-worker"
+    )
+
+    restored_path = root / "Incoming/01 Original.flac"
+    restored_track = await store.get_target_track(track_id)
+    assert restored_track is not None
+    assert restored_track["relative_path"] == "Incoming/01 Original.flac"
+    assert restored_path.is_file()
+    assert not (root / request.destination_relative_path).exists()
+    assert audio.snapshot(restored_path).metadata == original_snapshot.metadata
+    assert (root / "Incoming/album.cue").read_text() == "FILE original.flac WAVE"
+    assert not (root / "Managed Artist/Managed Album/cover.jpg").exists()
+    assert not (root / "Managed Artist/Managed Album/album.cue").exists()
+
+
+@pytest.mark.asyncio
+async def test_edition_conversion_apply_and_undo_restore_a_different_track_set(
+    tmp_path: Path,
+) -> None:
+    root, source, preferences, store, _settings_revision, policy_revision = _configured(
+        tmp_path
+    )
+    _add_second_album_track(root, preferences, store)
+    recycle = tmp_path / "managed-recycle"
+    recycle.mkdir()
+    current = preferences.get_library_management_settings()
+    management = preferences.get_library_management_settings_raw()
+    management.recycle_bin_path = str(recycle)
+    saved = preferences.save_library_management_settings_if_current(
+        management, expected_settings_revision=current.settings_revision
+    )
+    management = preferences.get_library_management_settings_raw()
+    profile = next(
+        value
+        for value in management.profiles
+        if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    pinned = pin_library_management_profile(management, profile)
+    naming_revision = naming_policy_revision(pinned)
+    audio = AudioMetadataEngine()
+    filesystem = LibraryFilesystemCoordinator()
+    blobs = LibraryManagementBlobStore(tmp_path / "conversion-blobs", store)
+    publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        blobs,
+        filesystem,
+        clock=lambda: 110.0,
+    )
+    service = TargetImportLibraryService(
+        store,
+        lambda: LibraryPolicyResolver(preferences.get_typed_library_settings_raw()),
+        AsyncMock(),
+        filesystem_coordinator=filesystem,
+        management_publisher=publisher,
+    )
+    metadata_snapshot = await store.put_management_metadata_snapshot(
+        LibraryManagementMetadataSnapshot(
+            id="conversion-metadata-snapshot",
+            provider="musicbrainz",
+            entity_kind="release",
+            entity_id="77777777-7777-4777-8777-777777777777",
+            input_hash="a" * 64,
+            canonical_payload_json="{}",
+            payload_sha256=hashlib.sha256(b"{}").hexdigest(),
+            fetched_at=100.0,
+        )
+    )
+    target_release_group = "dcff25f1-702d-3b5e-b0da-d48172e6e62a"
+    target_release = "77777777-7777-4777-8777-777777777777"
+    target_recordings = (
+        "33333333-3333-4333-8333-333333333333",
+        "88888888-8888-4888-8888-888888888888",
+    )
+    target_release_tracks = (
+        "77777777-7777-4777-8777-000000000001",
+        "77777777-7777-4777-8777-000000000002",
+    )
+
+    def desired_document(position: int) -> DesiredAudioDocument:
+        return DesiredAudioDocument(
+            fields=(
+                DesiredAudioField(
+                    name="title", action="set", value=f"Exact Track {position}"
+                ),
+                DesiredAudioField(name="artist", action="set", value=("Alpha",)),
+                DesiredAudioField(
+                    name="album", action="set", value="Target Exact Edition"
+                ),
+                DesiredAudioField(name="album_artist", action="set", value=("Alpha",)),
+                DesiredAudioField(name="disc_number", action="set", value=1),
+                DesiredAudioField(name="track_number", action="set", value=position),
+                DesiredAudioField(
+                    name="musicbrainz_release_group_id",
+                    action="set",
+                    value=target_release_group,
+                ),
+                DesiredAudioField(
+                    name="musicbrainz_release_id",
+                    action="set",
+                    value=target_release,
+                ),
+                DesiredAudioField(
+                    name="musicbrainz_recording_id",
+                    action="set",
+                    value=target_recordings[position - 1],
+                ),
+                DesiredAudioField(
+                    name="musicbrainz_release_track_id",
+                    action="set",
+                    value=target_release_tracks[position - 1],
+                ),
+            ),
+            artist_display="Alpha",
+            album_artist_display="Alpha",
+        )
+
+    held_retained = tmp_path / "retained-track.flac"
+    held_acquired = tmp_path / "acquired-track.flac"
+    shutil.copy2(source, held_retained)
+    shutil.copy2(source, held_acquired)
+    second_source = root / "source2.flac"
+    target_requests: list[LibraryManagementImportFile] = []
+    for ordinal, held in enumerate((held_retained, held_acquired)):
+        position = ordinal + 1
+        request = _import_file(
+            audio,
+            held,
+            ordinal=ordinal,
+            relative_path=f"Converted/0{position} Exact Track {position}.flac",
+        )
+        target_requests.append(
+            msgspec.structs.replace(
+                request,
+                release_group_mbid=target_release_group,
+                release_mbid=target_release,
+                recording_mbid=target_recordings[ordinal],
+                source="edition_conversion",
+                source_path=str(held),
+                download_task_id=None,
+                replacement_local_track_id="track-1" if ordinal == 0 else None,
+                replacement_root_id="root-1" if ordinal == 0 else None,
+                replacement_relative_path="source.flac" if ordinal == 0 else None,
+                recycle_bin_path=str(recycle) if ordinal == 0 else None,
+                authoritative_mapping=True,
+                release_track_mbid=target_release_tracks[ordinal],
+                medium_position=1,
+                release_track_position=position,
+                baseline_relative_path=("source.flac" if ordinal == 0 else held.name),
+                desired_document=desired_document(position),
+                pinned_profile=pinned,
+                metadata_snapshot_id=metadata_snapshot.id,
+                projection_hash="c" * 64,
+                settings_revision=saved.settings_revision,
+                naming_policy_revision=naming_revision,
+                undo_retention_days=management.undo_retention_days,
+            )
+        )
+    second_tag, second_info = legacy_audio_projection(audio.read(second_source))
+    recycle_request = msgspec.structs.replace(
+        _import_file(
+            audio,
+            second_source,
+            ordinal=2,
+            relative_path="conversion-job/track-2-source2.flac",
+        ),
+        destination_root_id=MANAGEMENT_RECYCLE_ROOT_ID,
+        tag=second_tag,
+        info=second_info,
+        release_group_mbid=None,
+        release_mbid=None,
+        recording_mbid=None,
+        source="edition_conversion",
+        source_path=str(second_source),
+        download_task_id=None,
+        replacement_local_track_id="track-2",
+        replacement_root_id="root-1",
+        replacement_relative_path="source2.flac",
+        recycle_bin_path=str(recycle),
+        baseline_relative_path="source2.flac",
+        desired_document=DesiredAudioDocument(fields=()),
+        pinned_profile=pinned,
+        metadata_snapshot_id=metadata_snapshot.id,
+        projection_hash="c" * 64,
+        settings_revision=saved.settings_revision,
+        naming_policy_revision=naming_revision,
+        undo_retention_days=management.undo_retention_days,
+        conversion_recycle_only=True,
+    )
+    conversion_job_id = "conversion-job"
+    preview_job_id = "conversion-final-preview"
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="edition-conversion:different-track-set",
+        origin="edition_conversion",
+        policy_revision=policy_revision,
+        files=(*target_requests, recycle_request),
+        conversion_job_id=conversion_job_id,
+        conversion_expected_row_revision=1,
+        conversion_local_album_id="album-1",
+        conversion_preview_job_id=preview_job_id,
+        conversion_recycle_bin_path=str(recycle),
+    )
+    bundle_json = msgspec.json.encode(bundle).decode()
+    bundle_hash = hashlib.sha256(bundle_json.encode()).hexdigest()
+    catalog_revision = await store.get_catalog_revision()
+    preview_token = "sealed-conversion-preview"
+    await store.create_library_management_job(
+        OperationJob(
+            id=preview_job_id,
+            kind="library_management",
+            state="ready",
+            requested_by_user_id="admin",
+            input_catalog_revision=catalog_revision,
+            expected_work_count=1,
+            idempotency_key="edition-conversion-preview:different-track-set",
+            created_at=100.0,
+        ),
+        LibraryManagementJobSnapshot(
+            job_id=preview_job_id,
+            mode="preview",
+            origin="manual",
+            phase="ready",
+            selection_json='{"kind":"albums","ids":["album-1"]}',
+            profile_revision=pinned.profile.revision,
+            settings_revision=saved.settings_revision,
+            naming_revision=naming_revision,
+            policy_revision=policy_revision,
+            catalog_revision=catalog_revision,
+            profile_snapshot_json=msgspec.json.encode(pinned).decode(),
+            preview_token_hash=hashlib.sha256(preview_token.encode()).hexdigest(),
+            preview_created_at=100.0,
+            preview_expires_at=1_000.0,
+            target_root_id="root-1",
+            intent_json='{"edition_conversion_job_id":"conversion-job"}',
+            created_at=100.0,
+            updated_at=100.0,
+        ),
+        metadata_snapshot_ids=[metadata_snapshot.id],
+    )
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    tracks = context["tracks"]
+    tracks_by_id = {str(value["id"]): value for value in tracks}
+    await store.create_edition_conversion(
+        EditionConversionJob(
+            id=conversion_job_id,
+            local_album_id="album-1",
+            target_release_group_mbid=target_release_group,
+            target_release_mbid=target_release,
+            target_album_title="Target Exact Edition",
+            target_artist_name="Alpha",
+            state="ready",
+            expected_album_revision=int(context["album"]["row_revision"]),
+            expected_input_revision=":".join(album_input_revisions(tracks)),
+            expected_identity_revision=album_identity_revision(
+                context["identity"], tracks
+            ),
+            preflight_token_hash=hashlib.sha256(b"preflight").hexdigest(),
+            download_source_ready=True,
+            required_temporary_bytes=sum(
+                path.stat().st_size for path in root.glob("*.flac")
+            ),
+            kept_count=1,
+            acquire_count=1,
+            recycle_count=1,
+            staged_count=2,
+            failed_count=0,
+            final_preview_job_id=preview_job_id,
+            final_preview_token_hash=hashlib.sha256(preview_token.encode()).hexdigest(),
+            final_bundle_json=bundle_json,
+            final_bundle_hash=bundle_hash,
+            requested_by_user_id="admin",
+            error_code=None,
+            created_at=100.0,
+            updated_at=100.0,
+        ),
+        (
+            EditionConversionTarget(
+                job_id=conversion_job_id,
+                ordinal=0,
+                disc_number=1,
+                track_number=1,
+                release_track_mbid=target_release_tracks[0],
+                recording_mbid=target_recordings[0],
+                title="Exact Track 1",
+                duration_seconds=None,
+                state="kept",
+                kept_local_track_id="track-1",
+            ),
+            EditionConversionTarget(
+                job_id=conversion_job_id,
+                ordinal=1,
+                disc_number=1,
+                track_number=2,
+                release_track_mbid=target_release_tracks[1],
+                recording_mbid=target_recordings[1],
+                title="Exact Track 2",
+                duration_seconds=None,
+                state="staged",
+                staged_artifact_id="verified-held-artifact",
+            ),
+        ),
+        (
+            EditionConversionLocalFile(
+                job_id=conversion_job_id,
+                local_track_id="track-1",
+                action="keep",
+                target_ordinal=0,
+                evidence_kind="recording",
+                expected_track_revision=int(tracks_by_id["track-1"]["row_revision"]),
+                expected_identity_revision=int(
+                    tracks_by_id["track-1"]["identity_row_revision"]
+                ),
+                expected_stat_revision=str(tracks_by_id["track-1"]["stat_revision"]),
+            ),
+            EditionConversionLocalFile(
+                job_id=conversion_job_id,
+                local_track_id="track-2",
+                action="recycle_extra",
+                target_ordinal=None,
+                evidence_kind="extra",
+                expected_track_revision=int(tracks_by_id["track-2"]["row_revision"]),
+                expected_identity_revision=int(
+                    tracks_by_id["track-2"]["identity_row_revision"]
+                ),
+                expected_stat_revision=str(tracks_by_id["track-2"]["stat_revision"]),
+            ),
+        ),
+    )
+    operation = await store.get_operation_job(preview_job_id)
+    assert operation is not None
+    await store.begin_edition_conversion_apply(
+        conversion_job_id,
+        preview_job_id=preview_job_id,
+        preview_token_hash=hashlib.sha256(preview_token.encode()).hexdigest(),
+        expected_operation_row_revision=int(operation["row_revision"]),
+        apply_idempotency_key="apply-different-track-set",
+        now=105.0,
+    )
+
+    await service.publish_import_bundle(bundle)
+
+    after_apply = await store.get_target_album_tracks(
+        "album-1", include_unavailable=True
+    )
+    acquired_track_id = next(
+        str(value["id"])
+        for value in after_apply
+        if str(value["id"]) not in {"track-1", "track-2"}
+    )
+    assert {
+        str(value["id"]) for value in after_apply if value["availability"] == "indexed"
+    } == {"track-1", acquired_track_id}
+    recycled_extra = next(value for value in after_apply if value["id"] == "track-2")
+    assert recycled_extra["root_id"] == MANAGEMENT_RECYCLE_ROOT_ID
+    assert (recycle / "conversion-job/track-2-source2.flac").is_file()
+    assert not source.exists()
+    assert not second_source.exists()
+    assert (root / "Converted/01 Exact Track 1.flac").is_file()
+    assert (root / "Converted/02 Exact Track 2.flac").is_file()
+    exact_identity = await store.get_accepted_library_management_identity(
+        "album-1", local_track_ids=("track-1", acquired_track_id)
+    )
+    assert exact_identity is not None
+    assert exact_identity.release_mbid == target_release
+    assert {value.release_track_mbid for value in exact_identity.tracks} == set(
+        target_release_tracks
+    )
+    source_snapshot = await store.get_library_management_job_snapshot(preview_job_id)
+    assert source_snapshot is not None
+    assert len(await store.list_management_operation_snapshots(preview_job_id)) == 3
+
+    source_job = await store.get_operation_job(preview_job_id)
+    assert source_job is not None
+    undo = LibraryManagementUndoService(
+        store,
+        preferences,
+        audio,
+        blobs,
+        filesystem,
+        clock=lambda: 120.0,
+    )
+    undo_preview = await undo.create_preview(
+        preview_job_id,
+        LibraryManagementUndoPreviewRequest(
+            expected_operation_row_revision=int(source_job["row_revision"]),
+            idempotency_key="undo-different-track-set-preview",
+        ),
+        "admin",
+    )
+    claimed_preview = await store.claim_operation_job(
+        "conversion-undo-preview-worker",
+        now=121.0,
+        lease_seconds=60.0,
+        kind="library_management",
+    )
+    assert claimed_preview is not None
+    await undo.run_claimed_preview(claimed_preview, "conversion-undo-preview-worker")
+    assert len(await store.list_library_management_plan_items(undo_preview.job_id)) == 3
+    ready = await store.get_operation_job(undo_preview.job_id)
+    assert ready is not None and ready["state"] == "ready"
+    await store.begin_library_management_apply(
+        undo_preview.job_id,
+        preview_token_hash=hashlib.sha256(
+            undo_preview.preview_token.encode()
+        ).hexdigest(),
+        expected_job_revision=int(ready["row_revision"]),
+        idempotency_key="undo-different-track-set-apply",
+        now=122.0,
+    )
+    claimed_apply = await store.claim_operation_job(
+        "conversion-undo-apply-worker",
+        now=123.0,
+        lease_seconds=60.0,
+        kind="library_management",
+    )
+    assert claimed_apply is not None
+    work = await store.claim_operation_work(
+        undo_preview.job_id, "conversion-undo-apply-worker", now=124.0
+    )
+    assert work is not None
+    undo_publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        blobs,
+        filesystem,
+        clock=lambda: 125.0,
+    )
+
+    await undo_publisher.publish_bundle(
+        undo_preview.job_id,
+        int(work["ordinal"]),
+        "conversion-undo-apply-worker",
+    )
+
+    after_undo = await store.get_target_album_tracks(
+        "album-1", include_unavailable=True
+    )
+    assert {
+        str(value["id"]) for value in after_undo if value["availability"] == "indexed"
+    } == {"track-1", "track-2"}
+    assert (
+        next(value for value in after_undo if value["id"] == acquired_track_id)[
+            "availability"
+        ]
+        == "missing"
+    )
+    assert source.is_file()
+    assert second_source.is_file()
+    assert not (root / "Converted/01 Exact Track 1.flac").exists()
+    assert not (root / "Converted/02 Exact Track 2.flac").exists()
+    restored_identity = await store.get_accepted_library_management_identity(
+        "album-1", local_track_ids=("track-1", "track-2")
+    )
+    assert restored_identity is not None
+    assert restored_identity.release_mbid == "aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b"
+    assert {value.release_track_mbid for value in restored_identity.tracks} == {
+        "22222222-2222-4222-8222-222222222222",
+        "66666666-6666-4666-8666-666666666666",
+    }
+
+
+def test_automatic_publication_rejects_a_tampered_pinned_profile(
+    tmp_path: Path,
+) -> None:
+    _root, source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    _activate_automatic_acquisitions(preferences, policy_revision)
+    management = preferences.get_library_management_settings_raw()
+    profile = next(
+        value
+        for value in management.profiles
+        if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    pinned = _planner(tmp_path, store, preferences).pin_profile(management, profile)
+    current_settings_revision = settings_revision(management)
+    pinned.profile.description = "Tampered after preparation"
+    audio = AudioMetadataEngine()
+    request = msgspec.structs.replace(
+        _import_file(
+            audio,
+            source,
+            ordinal=0,
+            relative_path="Managed/01 Track.flac",
+        ),
+        pinned_profile=pinned,
+        settings_revision=current_settings_revision,
+        naming_policy_revision=naming_policy_revision(pinned),
+    )
+    publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        LibraryManagementBlobStore(tmp_path / "tampered-blobs", store),
+        LibraryFilesystemCoordinator(),
+    )
+
+    with pytest.raises(StaleRevisionError, match="activation is stale"):
+        publisher._validate_automatic_import_configuration(
+            LibraryManagementImportBundle(
+                idempotency_key="acquisition:tampered-profile",
+                origin="acquisition",
+                policy_revision=policy_revision,
+                files=(request,),
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
+    tmp_path: Path,
+) -> None:
+    root, original_path, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    _activate_automatic_acquisitions(preferences, policy_revision)
+    audio = AudioMetadataEngine()
+    filesystem = LibraryFilesystemCoordinator()
+    blobs = LibraryManagementBlobStore(tmp_path / "managed-upgrade-blobs", store)
+    publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        blobs,
+        filesystem,
+        clock=lambda: 110.0,
+    )
+    service = TargetImportLibraryService(
+        store,
+        lambda: LibraryPolicyResolver(preferences.get_typed_library_settings_raw()),
+        AsyncMock(),
+        filesystem_coordinator=filesystem,
+        management_publisher=publisher,
+    )
+    original_snapshot = audio.snapshot(original_path)
+    management = preferences.get_library_management_settings_raw()
+    profile = next(
+        value
+        for value in management.profiles
+        if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    pinned = _planner(tmp_path, store, preferences).pin_profile(management, profile)
+    metadata_snapshot = await store.put_management_metadata_snapshot(
+        LibraryManagementMetadataSnapshot(
+            id="managed-upgrade-metadata",
+            provider="musicbrainz",
+            entity_kind="release",
+            entity_id="managed-upgrade-release",
+            input_hash="a" * 64,
+            canonical_payload_json="{}",
+            payload_sha256=hashlib.sha256(b"{}").hexdigest(),
+            fetched_at=100.0,
+        )
+    )
+    recycle_bin = tmp_path / "upgrade-recycle"
+
+    def automatic_request(
+        incoming: Path,
+        *,
+        title: str,
+        projection_hash: str,
+        artifacts: tuple[LibraryManagementImportArtifact, ...] = (),
+    ) -> LibraryManagementImportFile:
+        return msgspec.structs.replace(
+            _import_file(
+                audio,
+                incoming,
+                ordinal=0,
+                relative_path="source.flac",
+            ),
+            authoritative_mapping=True,
+            recording_mbid="recording-1",
+            release_track_mbid="release-track-1",
+            medium_position=1,
+            release_track_position=1,
+            baseline_relative_path="source.flac",
+            desired_document=DesiredAudioDocument(
+                fields=(DesiredAudioField(name="title", action="set", value=title),)
+            ),
+            pinned_profile=pinned,
+            metadata_snapshot_id=metadata_snapshot.id,
+            projection_hash=projection_hash,
+            settings_revision=settings_revision(management),
+            naming_policy_revision=naming_policy_revision(pinned),
+            undo_retention_days=management.undo_retention_days,
+            replacement_local_track_id="track-1",
+            replacement_root_id="root-1",
+            replacement_relative_path="source.flac",
+            recycle_bin_path=str(recycle_bin),
+            artifacts=artifacts,
+        )
+
+    incoming_a = tmp_path / "managed-a.flac"
+    shutil.copy2(original_path, incoming_a)
+    result_a = await service.publish_import_bundle(
+        LibraryManagementImportBundle(
+            idempotency_key="acquisition:managed-upgrade:a",
+            origin="acquisition",
+            policy_revision=policy_revision,
+            files=(
+                automatic_request(
+                    incoming_a,
+                    title="Managed A",
+                    projection_hash="a" * 64,
+                ),
+            ),
+        )
+    )
+    assert result_a.local_track_ids == ("track-1",)
+    baseline_a = await store.get_management_baseline("track-1")
+    state_a = await store.get_track_management_state("track-1")
+    managed_a_snapshot = audio.snapshot(original_path)
+    assert baseline_a is not None and state_a is not None
+
+    incoming_b = tmp_path / "managed-b.flac"
+    shutil.copy2(original_path, incoming_b)
+    incoming_sidecar = tmp_path / "upgrade.cue"
+    incoming_sidecar.write_text("FILE managed-b.flac WAVE", encoding="utf-8")
+    sidecar_hash = hashlib.sha256(incoming_sidecar.read_bytes()).hexdigest()
+    result_b = await service.publish_import_bundle(
+        LibraryManagementImportBundle(
+            idempotency_key="acquisition:managed-upgrade:b",
+            origin="acquisition",
+            policy_revision=policy_revision,
+            files=(
+                automatic_request(
+                    incoming_b,
+                    title="Managed B",
+                    projection_hash="b" * 64,
+                    artifacts=(
+                        LibraryManagementImportArtifact(
+                            kind="sidecar",
+                            destination_root_id="root-1",
+                            destination_relative_path="upgrade.cue",
+                            source_path=str(incoming_sidecar),
+                            source_fingerprint=sidecar_hash,
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+
+    baseline_b = await store.get_management_baseline("track-1")
+    state_b = await store.get_track_management_state("track-1")
+    assert result_b.local_track_ids == ("track-1",)
+    assert baseline_b == baseline_a
+    assert state_b is not None and state_b.last_operation_job_id is not None
+    assert state_b.applied_projection_hash == "b" * 64
+    before_b = await store.get_management_operation_snapshot(
+        state_b.last_operation_job_id, 0, "track-1"
+    )
+    assert before_b is not None
+    before_b_bytes = await blobs.read_bytes(before_b.semantic_snapshot_blob_sha256)
+    before_b_snapshot = msgspec.json.decode(
+        before_b_bytes, type=type(managed_a_snapshot)
+    )
+    assert before_b_snapshot.metadata == managed_a_snapshot.metadata
+    before_b_state = json.loads(before_b.before_management_state_json)
+    assert before_b_state["last_operation_job_id"] == state_a.last_operation_job_id
+    assert before_b_state["applied_projection_hash"] == "a" * 64
+    assert json.loads(before_b.ancillary_snapshot_json)[0]["before_exists"] is False
+    assert (root / "upgrade.cue").is_file()
+    assert not incoming_sidecar.exists()
+
+    source_b = await store.get_operation_job(state_b.last_operation_job_id)
+    assert source_b is not None
+    undo = LibraryManagementUndoService(
+        store,
+        preferences,
+        audio,
+        blobs,
+        filesystem,
+        clock=lambda: 120.0,
+    )
+    undo_preview = await undo.create_preview(
+        state_b.last_operation_job_id,
+        LibraryManagementUndoPreviewRequest(
+            expected_operation_row_revision=int(source_b["row_revision"]),
+            idempotency_key="undo-managed-upgrade-preview",
+        ),
+        "admin",
+    )
+    claimed_undo_preview = await store.claim_operation_job(
+        "undo-managed-upgrade-preview-worker",
+        now=121.0,
+        lease_seconds=60.0,
+        kind="library_management",
+    )
+    assert claimed_undo_preview is not None
+    await undo.run_claimed_preview(
+        claimed_undo_preview, "undo-managed-upgrade-preview-worker"
+    )
+    undo_ready = await store.get_operation_job(undo_preview.job_id)
+    assert undo_ready is not None
+    await store.begin_library_management_apply(
+        undo_preview.job_id,
+        preview_token_hash=hashlib.sha256(
+            undo_preview.preview_token.encode()
+        ).hexdigest(),
+        expected_job_revision=int(undo_ready["row_revision"]),
+        idempotency_key="undo-managed-upgrade-apply",
+        now=122.0,
+    )
+    claimed_undo_apply = await store.claim_operation_job(
+        "undo-managed-upgrade-apply-worker",
+        now=123.0,
+        lease_seconds=60.0,
+        kind="library_management",
+    )
+    assert claimed_undo_apply is not None
+    undo_work = await store.claim_operation_work(
+        undo_preview.job_id, "undo-managed-upgrade-apply-worker", now=124.0
+    )
+    assert undo_work is not None
+    await publisher.publish_bundle(
+        undo_preview.job_id,
+        int(undo_work["ordinal"]),
+        "undo-managed-upgrade-apply-worker",
+    )
+
+    restored_a_state = await store.get_track_management_state("track-1")
+    assert audio.snapshot(original_path).metadata == managed_a_snapshot.metadata
+    assert restored_a_state is not None
+    assert restored_a_state.applied_projection_hash == "a" * 64
+    assert restored_a_state.last_operation_job_id == state_a.last_operation_job_id
+    assert not (root / "upgrade.cue").exists()
+    assert await store.get_management_baseline("track-1") == baseline_a
+
+    baseline_service = LibraryManagementBaselineService(
+        store,
+        preferences,
+        audio,
+        blobs,
+        filesystem,
+        undo,
+        clock=lambda: 130.0,
+    )
+    current_management = preferences.get_library_management_settings()
+    restore_preview = await baseline_service.create_restore_preview(
+        LibraryManagementBaselineRestorePreviewRequest(
+            selection=LibraryManagementSelectionRequest(kind="tracks", ids=["track-1"]),
+            expected_settings_revision=current_management.settings_revision,
+            expected_policy_revision=policy_revision,
+            idempotency_key="managed-upgrade-baseline-preview",
+        ),
+        "admin",
+    )
+    claimed_restore_preview = await store.claim_operation_job(
+        "managed-upgrade-baseline-preview-worker",
+        now=131.0,
+        lease_seconds=60.0,
+        kind="library_management",
+    )
+    assert claimed_restore_preview is not None
+    await baseline_service.run_claimed_preview(
+        claimed_restore_preview, "managed-upgrade-baseline-preview-worker"
+    )
+    restore_ready = await store.get_operation_job(restore_preview.job_id)
+    assert restore_ready is not None
+    await store.begin_library_management_apply(
+        restore_preview.job_id,
+        preview_token_hash=hashlib.sha256(
+            restore_preview.preview_token.encode()
+        ).hexdigest(),
+        expected_job_revision=int(restore_ready["row_revision"]),
+        idempotency_key="managed-upgrade-baseline-apply",
+        now=132.0,
+    )
+    claimed_restore_apply = await store.claim_operation_job(
+        "managed-upgrade-baseline-apply-worker",
+        now=133.0,
+        lease_seconds=60.0,
+        kind="library_management",
+    )
+    assert claimed_restore_apply is not None
+    restore_work = await store.claim_operation_work(
+        restore_preview.job_id, "managed-upgrade-baseline-apply-worker", now=134.0
+    )
+    assert restore_work is not None
+    await publisher.publish_bundle(
+        restore_preview.job_id,
+        int(restore_work["ordinal"]),
+        "managed-upgrade-baseline-apply-worker",
+    )
+
+    final_state = await store.get_track_management_state("track-1")
+    final_baseline = await store.get_management_baseline("track-1")
+    assert audio.snapshot(original_path).metadata == original_snapshot.metadata
+    assert final_state is not None and final_state.last_outcome == "restored"
+    assert final_baseline is not None and final_baseline.restore_status == "restored"
+    assert (
+        msgspec.structs.replace(
+            final_baseline,
+            restore_status=baseline_a.restore_status,
+            last_verified_at=baseline_a.last_verified_at,
+            row_revision=baseline_a.row_revision,
+        )
+        == baseline_a
+    )
+
+
+_IO_WRITE_ERROR = AudioWriteError("staged write failed")
+_IO_WRITE_ERROR.__cause__ = OSError("temporary NFS interruption")
+
+
+@pytest.mark.parametrize(
+    ("publisher_error", "expected_reason"),
+    (
+        (
+            LibraryManagementDestinationConflictError("occupied destination"),
+            PATH_COLLISION_DIFFERENT,
+        ),
+        (
+            LibraryManagementPolicyChangedError("policy changed"),
+            POLICY_CHANGED,
+        ),
+        (StaleRevisionError("journal revision changed"), BUNDLE_BLOCKED),
+        (ConflictError("durable evidence disagrees"), BUNDLE_BLOCKED),
+        (_IO_WRITE_ERROR, ROOT_UNAVAILABLE),
+        (OSError("destination unavailable"), ROOT_UNAVAILABLE),
+        (ValidationError("invalid pinned request"), BUNDLE_BLOCKED),
+    ),
+    ids=(
+        "destination",
+        "policy",
+        "stale-evidence",
+        "conflicting-evidence",
+        "staged-io",
+        "filesystem-io",
+        "invalid-contract",
+    ),
+)
+@pytest.mark.asyncio
+async def test_automatic_import_conflicts_become_truthful_management_holds(
+    tmp_path: Path,
+    publisher_error: Exception,
+    expected_reason: str,
+) -> None:
+    _root, source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    management = preferences.get_library_management_settings_raw()
+    profile = next(
+        value
+        for value in management.profiles
+        if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    request = _import_file(
+        AudioMetadataEngine(),
+        source,
+        ordinal=0,
+        relative_path="Managed/01 Track.flac",
+    )
+    request = msgspec.structs.replace(
+        request,
+        pinned_profile=_planner(tmp_path, store, preferences).pin_profile(
+            management, profile
+        ),
+    )
+    publisher = AsyncMock(spec=LibraryManagementPublisher)
+    publisher.publish_import_bundle.side_effect = publisher_error
+    service = TargetImportLibraryService(
+        store,
+        lambda: LibraryPolicyResolver(preferences.get_typed_library_settings_raw()),
+        AsyncMock(),
+        management_publisher=publisher,
+    )
+
+    with pytest.raises(AutomaticManagementHoldError) as held:
+        await service.publish_import_bundle(
+            LibraryManagementImportBundle(
+                idempotency_key="automatic-collision",
+                origin="acquisition",
+                policy_revision=policy_revision,
+                files=(request,),
+            )
+        )
+
+    assert held.value.reason_code == expected_reason
+    if expected_reason == BUNDLE_BLOCKED:
+        assert str(publisher_error) not in str(held.value)
+
+
+@pytest.mark.asyncio
+async def test_import_bundle_prepares_every_file_before_any_publish(
+    tmp_path: Path,
+) -> None:
+    root, catalog_source, store, audio, _publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    first_source = tmp_path / "incoming-1.flac"
+    second_source = tmp_path / "incoming-2.flac"
+    shutil.copy2(catalog_source, first_source)
+    shutil.copy2(catalog_source, second_source)
+    first = _import_file(
+        audio,
+        first_source,
+        ordinal=0,
+        relative_path="Import Artist/Import Album/01 Track.flac",
+    )
+    second = _import_file(
+        audio,
+        second_source,
+        ordinal=1,
+        relative_path="Import Artist/Import Album/02 Track.flac",
+    )
+    occupied = root / second.destination_relative_path
+    occupied.parent.mkdir(parents=True, exist_ok=True)
+    occupied.write_bytes(b"third-party destination")
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:task-2:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(first, second),
+    )
+
+    with pytest.raises(LibraryManagementDestinationConflictError, match="destination"):
+        await service.publish_import_bundle(bundle)
+
+    with sqlite3.connect(store.db_path) as connection:
+        bundle_id = str(
+            connection.execute(
+                "SELECT id FROM library_management_import_bundles "
+                "WHERE idempotency_key=?",
+                (bundle.idempotency_key,),
+            ).fetchone()[0]
+        )
+    record = await store.get_library_management_import_bundle(bundle_id)
+    journals = await store.list_library_management_import_journals(bundle_id)
+    assert not (root / first.destination_relative_path).exists()
+    assert occupied.read_bytes() == b"third-party destination"
+    assert first_source.is_file() and second_source.is_file()
+    assert record is not None and record.state == "rolled_back"
+    assert [value.state for value in journals] == ["rolled_back", "rolled_back"]
+
+
+@pytest.mark.asyncio
+async def test_import_recovery_skips_a_bundle_owned_by_the_active_publisher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, catalog_source, store, audio, publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    incoming = tmp_path / "active-incoming.flac"
+    shutil.copy2(catalog_source, incoming)
+    request = _import_file(
+        audio,
+        incoming,
+        ordinal=0,
+        relative_path="Import Artist/Import Album/01 Active.flac",
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:active-recovery:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+    entered_preparation = asyncio.Event()
+    release_preparation = asyncio.Event()
+    original = publisher._prepare_import_file
+
+    async def pause_preparation(*args):  # noqa: ANN002, ANN202 - method wrapper
+        entered_preparation.set()
+        await release_preparation.wait()
+        return await original(*args)
+
+    monkeypatch.setattr(publisher, "_prepare_import_file", pause_preparation)
+    publication = asyncio.create_task(service.publish_import_bundle(bundle))
+    await entered_preparation.wait()
+    with sqlite3.connect(store.db_path) as connection:
+        bundle_id = str(
+            connection.execute(
+                "SELECT id FROM library_management_import_bundles "
+                "WHERE idempotency_key=?",
+                (bundle.idempotency_key,),
+            ).fetchone()[0]
+        )
+    record = await store.get_library_management_import_bundle(bundle_id)
+    assert record is not None and record.state == "publishing"
+
+    disposition = await publisher.recover_import_bundle(record)
+    release_preparation.set()
+    result = await publication
+
+    assert disposition == "skipped"
+    assert result.paths == (str(root / request.destination_relative_path),)
+    completed = await store.get_library_management_import_bundle(bundle_id)
+    assert completed is not None and completed.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_import_preparation_failure_rolls_back_the_in_progress_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, catalog_source, store, audio, publisher, _service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    sources = [tmp_path / "prepare-1.flac", tmp_path / "prepare-2.flac"]
+    for source in sources:
+        shutil.copy2(catalog_source, source)
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:prepare-failure:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=tuple(
+            _import_file(
+                audio,
+                source,
+                ordinal=ordinal,
+                relative_path=f"Import Artist/Import Album/0{ordinal + 1} Track.flac",
+            )
+            for ordinal, source in enumerate(sources)
+        ),
+    )
+    original = publisher._stage_audio
+    calls = 0
+
+    def fail_second_stage(*args) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated staging failure")
+        original(*args)
+
+    monkeypatch.setattr(publisher, "_stage_audio", fail_second_stage)
+
+    with pytest.raises(OSError, match="simulated staging failure"):
+        await publisher.publish_import_bundle(bundle, AsyncMock())
+
+    with sqlite3.connect(store.db_path) as connection:
+        bundle_id = str(
+            connection.execute(
+                "SELECT id FROM library_management_import_bundles "
+                "WHERE idempotency_key=?",
+                (bundle.idempotency_key,),
+            ).fetchone()[0]
+        )
+    journals = await store.list_library_management_import_journals(bundle_id)
+    assert [value.state for value in journals] == ["rolled_back", "rolled_back"]
+    assert all(source.is_file() for source in sources)
+    assert list(root.rglob(".droppedneedle-management-*")) == []
+
+
+@pytest.mark.asyncio
+async def test_import_bundle_catalog_failure_restores_every_source(
+    tmp_path: Path,
+) -> None:
+    root, catalog_source, store, audio, publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    sources = [tmp_path / "incoming-1.flac", tmp_path / "incoming-2.flac"]
+    for source in sources:
+        shutil.copy2(catalog_source, source)
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:catalog-failure:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=tuple(
+            _import_file(
+                audio,
+                source,
+                ordinal=ordinal,
+                relative_path=f"Import Artist/Import Album/0{ordinal + 1} Track.flac",
+            )
+            for ordinal, source in enumerate(sources)
+        ),
+    )
+    commit = AsyncMock(side_effect=OSError("simulated sqlite failure"))
+
+    with pytest.raises(OSError, match="simulated sqlite failure"):
+        await publisher.publish_import_bundle(bundle, commit)
+
+    with sqlite3.connect(store.db_path) as connection:
+        bundle_id = str(
+            connection.execute(
+                "SELECT id FROM library_management_import_bundles WHERE idempotency_key=?",
+                (bundle.idempotency_key,),
+            ).fetchone()[0]
+        )
+    record = await store.get_library_management_import_bundle(bundle_id)
+    journals = await store.list_library_management_import_journals(bundle_id)
+    assert all(source.is_file() for source in sources)
+    assert not any(
+        (root / value.destination_relative_path).exists() for value in bundle.files
+    )
+    assert record is not None and record.state == "rolled_back"
+    assert [value.state for value in journals] == ["rolled_back", "rolled_back"]
+
+    retried = await service.publish_import_bundle(bundle)
+    retried_journals = await store.list_library_management_import_journals(bundle_id)
+    assert len(retried.local_track_ids) == 2
+    assert all(
+        (root / value.destination_relative_path).is_file() for value in bundle.files
+    )
+    assert [value.state for value in retried_journals] == ["completed", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_standard_only_request_compensates_after_a_late_settings_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, catalog_source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    _activate_automatic_acquisitions(preferences, policy_revision)
+    current = preferences.get_library_management_settings()
+    standard_only = preferences.get_library_management_settings_raw()
+    assignment = standard_only.root_assignments[0]
+    assignment.overrides = LibraryManagementRootOverrides(
+        multi_disc_naming_mode="standard"
+    )
+    effective = LibraryManagementProfileService._effective_profile(
+        standard_only, assignment
+    )
+    assignment.activation_profile_revision = profile_revision(effective)
+    assignment.activation_naming_policy_revision = None
+    preferences.save_library_management_settings_if_current(
+        standard_only, expected_settings_revision=current.settings_revision
+    )
+    audio = AudioMetadataEngine()
+    filesystem = LibraryFilesystemCoordinator()
+    publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        LibraryManagementBlobStore(tmp_path / "rollback-blobs", store),
+        filesystem,
+        clock=lambda: 110.0,
+    )
+    sources = [
+        tmp_path / "automatic-rollback-1.flac",
+        tmp_path / "automatic-rollback-2.flac",
+    ]
+    for source in sources:
+        shutil.copy2(catalog_source, source)
+    artwork = b"temporary artwork"
+    management = preferences.get_library_management_settings_raw()
+    assignment = management.root_assignments[0]
+    effective = LibraryManagementProfileService._effective_profile(
+        management, assignment
+    )
+    pinned_profile = _planner(tmp_path, store, preferences).pin_profile(
+        management, effective
+    )
+    assert pinned_profile.multi_disc_naming_script is None
+    metadata_snapshot = await store.put_management_metadata_snapshot(
+        LibraryManagementMetadataSnapshot(
+            id="automatic-rollback-snapshot",
+            provider="musicbrainz",
+            entity_kind="release",
+            entity_id="import-release",
+            input_hash="d" * 64,
+            canonical_payload_json="{}",
+            payload_sha256=hashlib.sha256(b"{}").hexdigest(),
+            fetched_at=100.0,
+        )
+    )
+    requests = tuple(
+        msgspec.structs.replace(
+            _import_file(
+                audio,
+                source,
+                ordinal=ordinal,
+                relative_path=f"Managed/0{ordinal + 1} Rollback.flac",
+            ),
+            authoritative_mapping=True,
+            recording_mbid=f"recording-{ordinal + 1}",
+            release_track_mbid=f"release-track-{ordinal + 1}",
+            medium_position=1,
+            release_track_position=ordinal + 1,
+            baseline_relative_path=f"Incoming/0{ordinal + 1} Original.flac",
+            desired_document=DesiredAudioDocument(
+                fields=(
+                    DesiredAudioField(
+                        name="title", action="set", value=f"Managed {ordinal + 1}"
+                    ),
+                )
+            ),
+            pinned_profile=pinned_profile,
+            metadata_snapshot_id=metadata_snapshot.id,
+            projection_hash="d" * 64,
+            settings_revision=settings_revision(management),
+            naming_policy_revision=None,
+            undo_retention_days=management.undo_retention_days,
+            artifacts=(
+                LibraryManagementImportArtifact(
+                    kind="external_art",
+                    destination_root_id="root-1",
+                    destination_relative_path="Managed/cover.jpg",
+                    content=artwork,
+                    source_fingerprint=hashlib.sha256(artwork).hexdigest(),
+                ),
+            )
+            if ordinal == 0
+            else (),
+        )
+        for ordinal, source in enumerate(sources)
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:automatic-rollback",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=requests,
+    )
+    legacy_payload = msgspec.to_builtins(bundle)
+    for request_payload in legacy_payload["files"]:
+        request_payload.pop("naming_policy_revision")
+    bundle = msgspec.convert(legacy_payload, type=LibraryManagementImportBundle)
+    assert all(request.naming_policy_revision is None for request in bundle.files)
+
+    original_project = publisher._published_import_file
+    projection_started = asyncio.Event()
+    resume_projection = asyncio.Event()
+
+    async def paused_project(value):
+        projection_started.set()
+        await resume_projection.wait()
+        return await original_project(value)
+
+    monkeypatch.setattr(publisher, "_published_import_file", paused_project)
+    catalog_commit = AsyncMock()
+    publication = asyncio.create_task(
+        publisher.publish_import_bundle(bundle, catalog_commit)
+    )
+    await projection_started.wait()
+    current = preferences.get_library_management_settings()
+    changed = preferences.get_library_management_settings_raw()
+    changed.root_assignments[0].automatic_acquisitions = False
+    preferences.save_library_management_settings_if_current(
+        changed, expected_settings_revision=current.settings_revision
+    )
+    resume_projection.set()
+    with pytest.raises(StaleRevisionError, match="settings changed"):
+        await publication
+    catalog_commit.assert_not_awaited()
+
+    with sqlite3.connect(store.db_path) as connection:
+        references = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM library_management_blob_references "
+                "WHERE reference_kind='operation_snapshot' AND reference_id LIKE 'import:%'"
+            ).fetchone()[0]
+        )
+        bundle_id = str(
+            connection.execute(
+                "SELECT id FROM library_management_import_bundles "
+                "WHERE idempotency_key=?",
+                (bundle.idempotency_key,),
+            ).fetchone()[0]
+        )
+    journals = await store.list_library_management_import_journals(bundle_id)
+    assert references == 0
+    assert all(source.is_file() for source in sources)
+    assert not any(
+        (root / request.destination_relative_path).exists() for request in requests
+    )
+    assert not (root / "Managed/cover.jpg").exists()
+    assert len(journals) == 2
+    assert all(journal.baseline_blob_sha256 is None for journal in journals)
+    assert all(journal.baseline_ancillary_snapshot_json == "[]" for journal in journals)
+    assert not list(root.rglob(".droppedneedle-management-*"))
+
+
+@pytest.mark.asyncio
+async def test_import_bundle_same_path_upgrade_recycles_original_after_commit(
+    tmp_path: Path,
+) -> None:
+    root, original, store, audio, _publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    original_bytes = original.read_bytes()
+    incoming = tmp_path / "incoming-upgrade.flac"
+    shutil.copy2(original, incoming)
+    recycle_bin = tmp_path / "recycle"
+    request = msgspec.structs.replace(
+        _import_file(
+            audio,
+            incoming,
+            ordinal=0,
+            relative_path="source.flac",
+        ),
+        replacement_local_track_id="track-1",
+        replacement_root_id="root-1",
+        replacement_relative_path="source.flac",
+        recycle_bin_path=str(recycle_bin),
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:same-path-upgrade:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+
+    result = await service.publish_import_bundle(bundle)
+
+    recycled = list(recycle_bin.rglob("*.flac"))
+    written = audio.read(original)
+    assert result.local_track_ids == ("track-1",)
+    assert incoming.exists() is False
+    assert written.metadata.value_for("album") == "Import Album"
+    assert len(recycled) == 1 and recycled[0].read_bytes() == original_bytes
+
+
+@pytest.mark.asyncio
+async def test_import_bundle_resumes_publish_after_process_stops_before_journal_update(
+    tmp_path: Path,
+) -> None:
+    root, catalog_source, store, audio, publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    incoming = tmp_path / "incoming-crash.flac"
+    shutil.copy2(catalog_source, incoming)
+    request = _import_file(
+        audio,
+        incoming,
+        ordinal=0,
+        relative_path="Import Artist/Import Album/01 Crash.flac",
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:publish-boundary:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+
+    class SimulatedProcessStop(BaseException):
+        pass
+
+    publish_file = publisher._publish_import_file
+    rollback = publisher._rollback_import_bundle
+
+    async def stop_after_replace(value, _roots):
+        await asyncio.to_thread(os.replace, value.temporary, value.destination)
+        raise SimulatedProcessStop
+
+    publisher._publish_import_file = stop_after_replace
+    publisher._rollback_import_bundle = AsyncMock(side_effect=SimulatedProcessStop)
+    with pytest.raises(SimulatedProcessStop):
+        await service.publish_import_bundle(bundle)
+    publisher._publish_import_file = publish_file
+    publisher._rollback_import_bundle = rollback
+
+    destination = root / request.destination_relative_path
+    with sqlite3.connect(store.db_path) as connection:
+        bundle_id = str(
+            connection.execute(
+                "SELECT id FROM library_management_import_bundles "
+                "WHERE idempotency_key=?",
+                (bundle.idempotency_key,),
+            ).fetchone()[0]
+        )
+    before = await store.list_library_management_import_journals(bundle_id)
+    resumed = await service.publish_import_bundle(bundle)
+
+    assert destination.is_file()
+    assert incoming.exists() is False
+    assert [value.state for value in before] == ["validated"]
+    assert resumed.paths == (str(destination),)
+
+
+@pytest.mark.asyncio
+async def test_published_import_retry_does_not_restage_artifact_temporaries(
+    tmp_path: Path,
+) -> None:
+    root, catalog_source, store, audio, publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    incoming = tmp_path / "incoming-artwork-crash.flac"
+    shutil.copy2(catalog_source, incoming)
+    artwork = b"published artwork"
+    request = msgspec.structs.replace(
+        _import_file(
+            audio,
+            incoming,
+            ordinal=0,
+            relative_path="Import Artist/Import Album/01 Artwork.flac",
+        ),
+        artifacts=(
+            LibraryManagementImportArtifact(
+                kind="external_art",
+                destination_root_id="root-1",
+                destination_relative_path="Import Artist/Import Album/cover.jpg",
+                content=artwork,
+                source_fingerprint=hashlib.sha256(artwork).hexdigest(),
+            ),
+        ),
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:published-artifact-retry:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+
+    class SimulatedProcessStop(BaseException):
+        pass
+
+    commit = service._commit_published_import_bundle
+    rollback = publisher._rollback_import_bundle
+    service._commit_published_import_bundle = AsyncMock(
+        side_effect=SimulatedProcessStop
+    )
+    publisher._rollback_import_bundle = AsyncMock(side_effect=SimulatedProcessStop)
+    with pytest.raises(SimulatedProcessStop):
+        await service.publish_import_bundle(bundle)
+    service._commit_published_import_bundle = commit
+    publisher._rollback_import_bundle = rollback
+
+    result = await service.publish_import_bundle(bundle)
+
+    assert result.paths == (str(root / request.destination_relative_path),)
+    assert (root / "Import Artist/Import Album/cover.jpg").read_bytes() == artwork
+    assert not list(root.rglob(".droppedneedle-management-*"))
+
+
+@pytest.mark.asyncio
+async def test_publisher_moves_validated_real_audio_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    root, source, store, audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    original_snapshot = audio.snapshot(source)
+
+    result = await publisher.publish_bundle(job_id, 0, "apply-worker")
+    repeated = await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    destination = root / (
+        "Johann Sebastian Bach; Glenn Gould/"
+        "Goldberg Variations, BWV 988 (1982)/01 - Aria.flac"
+    )
+    document = audio.read(destination)
+    row = await store.get_target_track("track-1")
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    baseline = await store.get_management_baseline("track-1")
+    before_snapshot = await store.get_management_operation_snapshot(
+        job_id, 0, "track-1"
+    )
+    assert baseline is not None
+    decoded_baseline = msgspec.json.decode(
+        await publisher._blobs.read_bytes(baseline.semantic_snapshot_blob_sha256),
+        type=SemanticTagSnapshot,
+    )
+    assert result.catalog_revision == repeated.catalog_revision == 1
+    assert source.exists() is False
+    assert destination.is_file()
+    assert document.metadata.value_for("title") == "Aria"
+    assert baseline.image_snapshot_json == "[]"
+    assert before_snapshot is not None
+    assert before_snapshot.image_snapshot_json == "[]"
+    assert decoded_baseline.artwork == original_snapshot.artwork
+    assert row is not None
+    assert row["relative_path"] == destination.relative_to(root).as_posix()
+    assert (
+        journals[0].staged_fingerprint
+        == hashlib.sha256(destination.read_bytes()).hexdigest()
+    )
+    assert [journal.state for journal in journals] == ["completed"]
+    assert not list(root.rglob(".droppedneedle-management-*"))
+
+
+@pytest.mark.asyncio
+async def test_publisher_breaks_hardlinks_without_mutating_the_other_name(
+    tmp_path: Path,
+) -> None:
+    root, source, _store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    sibling = root / "hardlinked-original.flac"
+    os.link(source, sibling)
+    original = sibling.read_bytes()
+    original_inode = sibling.stat().st_ino
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    destination = root / (
+        "Johann Sebastian Bach; Glenn Gould/"
+        "Goldberg Variations, BWV 988 (1982)/01 - Aria.flac"
+    )
+    assert sibling.read_bytes() == original
+    assert sibling.stat().st_ino == original_inode
+    assert destination.stat().st_ino != original_inode
+
+
+@pytest.mark.asyncio
+async def test_publisher_replaces_same_path_through_verified_backup(
+    tmp_path: Path,
+) -> None:
+    root, source, store, audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path, configure=_same_path_configuration
+    )
+    original = source.read_bytes()
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert source.is_file()
+    assert source.read_bytes() != original
+    assert audio.read(source).metadata.value_for("title") == "Aria"
+    assert [journal.state for journal in journals] == ["completed"]
+    assert not list(root.rglob(".droppedneedle-management-*"))
+
+
+@pytest.mark.asyncio
+async def test_publisher_moves_sidecar_and_publishes_external_artwork(
+    tmp_path: Path,
+) -> None:
+    artwork = _ArtworkRepository()
+
+    def configure(root, preferences, store) -> None:
+        _sidecar_configuration(root, preferences, store)
+        _external_artwork_configuration(root, preferences, store)
+
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        configure=configure,
+        artwork_repository=artwork,
+    )
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    album_dir = root / (
+        "Johann Sebastian Bach; Glenn Gould/Goldberg Variations, BWV 988 (1982)"
+    )
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert source.exists() is False
+    assert (root / "disc.cue").exists() is False
+    assert (album_dir / "disc.cue").read_text(encoding="utf-8") == "FILE source.flac"
+    assert (
+        album_dir.parent / "Goldberg Variations, BWV 988/art-front.png"
+    ).read_bytes() == artwork.content
+    assert {journal.subject_kind for journal in journals} == {
+        "audio",
+        "external_art",
+        "sidecar",
+    }
+    assert all(journal.state == "completed" for journal in journals)
+
+
+@pytest.mark.asyncio
+async def test_publisher_supports_explicit_cross_root_move(tmp_path: Path) -> None:
+    destination_root = tmp_path / "organized"
+    destination_root.mkdir()
+
+    def configure(_root, preferences, _store) -> None:
+        settings = preferences.get_typed_library_settings_raw()
+        settings.library_roots.append(
+            LibraryRootSettings(
+                id="root-2",
+                path=str(destination_root),
+                label="Organized",
+                policy="automatic",
+                rules=[],
+            )
+        )
+        preferences.save_typed_library_settings(settings)
+
+    _root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path, configure=configure, target_root_id="root-2"
+    )
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    row = await store.get_target_track("track-1")
+    assert source.exists() is False
+    assert row is not None and row["root_id"] == "root-2"
+    assert (destination_root / str(row["relative_path"])).is_file()
+
+
+@pytest.mark.asyncio
+async def test_publisher_honors_configured_keep_source_mode(tmp_path: Path) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path, configure=_keep_source_configuration
+    )
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    row = await store.get_target_track("track-1")
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert source.is_file()
+    assert row is not None and (root / str(row["relative_path"])).is_file()
+    assert [journal.state for journal in journals] == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_publisher_removes_empty_source_directories_when_enabled(
+    tmp_path: Path,
+) -> None:
+    root, _source, _store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path, prepare_store=_nest_source
+    )
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    assert (root / "incoming").exists() is False
+
+
+@pytest.mark.asyncio
+async def test_publisher_prepares_and_commits_multi_file_album_as_one_bundle(
+    tmp_path: Path,
+) -> None:
+    root, source, store, audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        prepare_store=_add_second_album_track,
+        customize_planner=_add_second_canonical_track,
+        selection=LibraryManagementSelection(kind="albums", ids=("album-1",)),
+    )
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    first = await store.get_target_track("track-1")
+    second = await store.get_target_track("track-2")
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert source.exists() is False
+    assert (root / "source2.flac").exists() is False
+    assert first is not None and second is not None
+    assert (
+        audio.read(root / str(first["relative_path"])).metadata.value_for("title")
+        == "Aria"
+    )
+    assert (
+        audio.read(root / str(second["relative_path"])).metadata.value_for("title")
+        == "Variation 1"
+    )
+    assert len(journals) == 2
+    assert all(journal.state == "completed" for journal in journals)
+
+
+@pytest.mark.asyncio
+async def test_publisher_rejects_tampered_catalog_projection(
+    tmp_path: Path,
+) -> None:
+    _root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_management_plan_items SET catalog_document_hash=? "
+            "WHERE job_id=?",
+            ("0" * 64, job_id),
+        )
+
+    with pytest.raises(ConflictError, match="Pinned catalog metadata changed"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    assert source.is_file()
+
+
+@pytest.mark.asyncio
+async def test_tags_only_selected_siblings_publish_as_one_album_bundle(
+    tmp_path: Path,
+) -> None:
+    _root, _source, store, audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        configure=_tags_only_configuration,
+        prepare_store=_add_second_album_track,
+        customize_planner=_add_second_canonical_track,
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1", "track-2")),
+    )
+    items = await store.list_library_management_plan_items(job_id)
+    assert [item.bundle_ordinal for item in items] == [0, 0]
+
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    first = await store.get_target_track("track-1")
+    second = await store.get_target_track("track-2")
+    assert first is not None and second is not None
+    assert (
+        audio.read(Path(str(first["file_path"]))).metadata.value_for("title") == "Aria"
+    )
+    assert (
+        audio.read(Path(str(second["file_path"]))).metadata.value_for("title")
+        == "Variation 1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_tags_only_selection_rejects_duplicate_sibling_mapping(
+    tmp_path: Path,
+) -> None:
+    def prepare(root, preferences, store) -> None:
+        _add_second_album_track(root, preferences, store)
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                "UPDATE local_track_external_identities SET release_track_mbid="
+                "'22222222-2222-4222-8222-222222222222' WHERE local_track_id='track-2'"
+            )
+
+    _root, _source, store, _audio, _publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        configure=_tags_only_configuration,
+        prepare_store=prepare,
+        customize_planner=_add_second_canonical_track,
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+    )
+
+    items = await store.list_library_management_plan_items(job_id)
+    assert len(items) == 1
+    assert items[0].eligibility == "blocked"
+    assert items[0].reason_code == "TRACK_NOT_MAPPED"
+
+
+@pytest.mark.asyncio
+async def test_publisher_rolls_back_published_move_when_catalog_cas_fails(
+    tmp_path: Path,
+) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    original = source.read_bytes()
+    with sqlite3.connect(tmp_path / "library.db") as connection:
+        connection.execute(
+            "UPDATE library_catalog_revision SET value=1 WHERE singleton=1"
+        )
+
+    with pytest.raises(StaleRevisionError, match="catalog changed"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert source.read_bytes() == original
+    assert not list(root.rglob("01 - Aria.flac"))
+    assert [journal.state for journal in journals] == ["rolled_back"]
+
+
+@pytest.mark.asyncio
+async def test_publisher_preserves_destination_changed_before_immediate_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    item = (await store.list_library_management_plan_items(job_id))[0]
+    destination = root / str(item.destination_relative_path)
+
+    async def fail_commit(*_args, **_kwargs):
+        destination.write_bytes(b"third-party replacement")
+        raise StaleRevisionError("catalog changed")
+
+    monkeypatch.setattr(store, "commit_library_management_bundle", fail_commit)
+
+    with pytest.raises(StaleRevisionError, match="catalog changed"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert source.is_file()
+    assert destination.read_bytes() == b"third-party replacement"
+    assert [journal.state for journal in journals] == ["needs_attention"]
+
+
+@pytest.mark.asyncio
+async def test_publisher_rejects_settings_changed_after_preview(tmp_path: Path) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    current = publisher._preferences.get_library_management_settings()
+    changed = publisher._preferences.get_library_management_settings_raw()
+    changed.undo_retention_days += 1
+    publisher._preferences.save_library_management_settings_if_current(
+        changed, expected_settings_revision=current.settings_revision
+    )
+
+    with pytest.raises(StaleRevisionError, match="settings changed"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    assert source.is_file()
+    assert await store.list_file_mutation_journals_for_bundle(job_id, 0) == []
+    assert not list(root.rglob(".droppedneedle-management-*"))
+
+
+@pytest.mark.asyncio
+async def test_publisher_rejects_identity_changed_after_preview(tmp_path: Path) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    with sqlite3.connect(tmp_path / "library.db") as connection:
+        connection.execute(
+            "UPDATE local_track_external_identities SET row_revision=row_revision+1 "
+            "WHERE local_track_id='track-1'"
+        )
+
+    with pytest.raises(StaleRevisionError, match="mapping changed"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    assert source.is_file()
+    assert not list(root.rglob(".droppedneedle-management-*"))
+
+
+@pytest.mark.asyncio
+async def test_publisher_refuses_destination_created_after_preview_and_records_it(
+    tmp_path: Path,
+) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    item = (await store.list_library_management_plan_items(job_id))[0]
+    destination = root / str(item.destination_relative_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(b"third-party file")
+
+    with pytest.raises(ConflictError, match="created after preview"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    with sqlite3.connect(tmp_path / "library.db") as connection:
+        collision = connection.execute(
+            "SELECT classification FROM library_management_collision_evidence "
+            "WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+    assert source.is_file()
+    assert destination.read_bytes() == b"third-party file"
+    assert collision == ("destination_created_after_preview",)
+
+
+@pytest.mark.asyncio
+async def test_publisher_applies_case_only_rename_of_source(tmp_path: Path) -> None:
+    root, _source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        prepare_store=_case_only_source,
+    )
+    source = root / (
+        "Johann Sebastian Bach; Glenn Gould/"
+        "Goldberg Variations, BWV 988 (1982)/01 - ARIA.flac"
+    )
+    destination = source.with_name("01 - Aria.flac")
+
+    result = await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    assert len(result.committed_journal_ids) == 1
+    assert not source.exists()
+    assert destination.is_file()
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert [journal.state for journal in journals] == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_publisher_never_overwrites_late_external_artwork(
+    tmp_path: Path,
+) -> None:
+    artwork = _ArtworkRepository()
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        configure=_external_artwork_configuration,
+        artwork_repository=artwork,
+    )
+    item = (await store.list_library_management_plan_items(job_id))[0]
+    choice = json.loads(item.artwork_choices_json)[0]
+    destination = root / choice["destination_relative_path"]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(b"late artwork")
+
+    with pytest.raises(ConflictError, match="artwork destination"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    assert source.is_file()
+    assert destination.read_bytes() == b"late artwork"
+
+
+@pytest.mark.asyncio
+async def test_publisher_marks_cleanup_pending_without_rolling_back_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+
+    def fail_cleanup(_value, _roots) -> None:
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr(publisher, "_cleanup_committed_filesystem", fail_cleanup)
+    result = await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    row = await store.get_target_track("track-1")
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert result.catalog_revision == 1
+    assert source.is_file()
+    assert row is not None
+    assert (root / str(row["relative_path"])).is_file()
+    assert [journal.state for journal in journals] == ["cleanup_pending"]
+
+
+@pytest.mark.asyncio
+async def test_publisher_defers_repeated_cancellation_until_publish_is_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    published = asyncio.Event()
+    release = asyncio.Event()
+    original_publish = publisher._publish_one
+
+    async def pause_after_publish(value, roots) -> None:
+        await original_publish(value, roots)
+        published.set()
+        await release.wait()
+
+    monkeypatch.setattr(publisher, "_publish_one", pause_after_publish)
+    task = asyncio.create_task(publisher.publish_bundle(job_id, 0, "apply-worker"))
+    await published.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    row = await store.get_target_track("track-1")
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert source.exists() is False
+    assert row is not None and (root / str(row["relative_path"])).is_file()
+    assert [journal.state for journal in journals] == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_import_publisher_defers_repeated_cancellation_through_catalog_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, catalog_source, store, audio, _publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    incoming = tmp_path / "cancelled-import.flac"
+    shutil.copy2(catalog_source, incoming)
+    request = _import_file(
+        audio,
+        incoming,
+        ordinal=0,
+        relative_path="Import Artist/Import Album/01 Cancelled.flac",
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:repeated-cancellation:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+    original_commit = store.commit_library_management_import_bundle
+
+    async def pause_commit(*args, **kwargs):
+        commit_started.set()
+        await release_commit.wait()
+        return await original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(store, "commit_library_management_import_bundle", pause_commit)
+    task = asyncio.create_task(service.publish_import_bundle(bundle))
+    await commit_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    release_commit.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    destination = root / request.destination_relative_path
+    row = await store.get_target_track_by_path(str(destination))
+    with sqlite3.connect(store.db_path) as connection:
+        bundle_id = str(
+            connection.execute(
+                "SELECT id FROM library_management_import_bundles "
+                "WHERE idempotency_key=?",
+                (bundle.idempotency_key,),
+            ).fetchone()[0]
+        )
+    record = await store.get_library_management_import_bundle(bundle_id)
+    journals = await store.list_library_management_import_journals(bundle_id)
+    assert incoming.exists() is False
+    assert destination.is_file()
+    assert row is not None
+    assert record is not None and record.state == "completed"
+    assert [journal.state for journal in journals] == ["completed"]

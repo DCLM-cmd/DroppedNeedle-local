@@ -12,6 +12,11 @@ from api.v1.schemas.settings import (
     PrimaryMusicSourceSettings,
 )
 from services.search_enrichment_service import SearchEnrichmentService
+from core.exceptions import ClientDisconnectedError
+from infrastructure.degradation import (
+    clear_degradation_context,
+    init_degradation_context,
+)
 
 
 def _make_prefs(
@@ -60,7 +65,6 @@ def _make_service(
     )
 
     service = SearchEnrichmentService(
-        mb_repo=mb_repo,
         lb_repo=lb_repo,
         preferences_service=prefs,
         lastfm_repo=lfm_repo,
@@ -108,7 +112,9 @@ class TestEnrichBatch:
             artists=[ArtistEnrichmentRequest(musicbrainz_id="art-1", name="Muse")],
             albums=[
                 AlbumEnrichmentRequest(
-                    musicbrainz_id="album-1", artist_name="Muse", album_name="Absolution"
+                    musicbrainz_id="album-1",
+                    artist_name="Muse",
+                    album_name="Absolution",
                 )
             ],
         )
@@ -116,7 +122,7 @@ class TestEnrichBatch:
 
         assert result.source == "listenbrainz"
         assert len(result.artists) == 1
-        assert result.artists[0].release_group_count == 5
+        assert result.artists[0].release_group_count is None
         assert len(result.albums) == 1
         assert result.albums[0].listen_count == 1000
         lb_repo.get_release_group_popularity_batch.assert_awaited_once()
@@ -140,7 +146,9 @@ class TestEnrichBatch:
             artists=[ArtistEnrichmentRequest(musicbrainz_id="art-1", name="Muse")],
             albums=[
                 AlbumEnrichmentRequest(
-                    musicbrainz_id="album-1", artist_name="Muse", album_name="Absolution"
+                    musicbrainz_id="album-1",
+                    artist_name="Muse",
+                    album_name="Absolution",
                 )
             ],
         )
@@ -192,7 +200,7 @@ class TestEnrichBatch:
         assert result.albums[0].listen_count == 0
 
     @pytest.mark.asyncio
-    async def test_none_source_returns_release_counts_only(self):
+    async def test_none_source_skips_all_optional_providers(self):
         service, mb_repo, lb_repo, lfm_repo = _make_service(
             lb_enabled=False, lfm_enabled=False
         )
@@ -201,16 +209,107 @@ class TestEnrichBatch:
             artists=[ArtistEnrichmentRequest(musicbrainz_id="art-1", name="Muse")],
             albums=[
                 AlbumEnrichmentRequest(
-                    musicbrainz_id="album-1", artist_name="Muse", album_name="Absolution"
+                    musicbrainz_id="album-1",
+                    artist_name="Muse",
+                    album_name="Absolution",
                 )
             ],
         )
         result = await service.enrich_batch(request)
 
         assert result.source == "none"
-        assert result.artists[0].release_group_count == 5
+        assert result.artists[0].release_group_count is None
         assert result.artists[0].listen_count is None
         assert result.albums[0].listen_count is None
+        mb_repo.get_artist_release_groups.assert_not_awaited()
+        lb_repo.get_artist_top_release_groups.assert_not_awaited()
+        lfm_repo.get_artist_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_six_artists_never_start_musicbrainz_release_count_queries(self):
+        service, mb_repo, lb_repo, _ = _make_service(lb_enabled=True, lfm_enabled=False)
+        request = EnrichmentBatchRequest(
+            artists=[
+                ArtistEnrichmentRequest(musicbrainz_id=f"art-{index}", name="Artist")
+                for index in range(6)
+            ],
+            albums=[],
+        )
+
+        result = await service.enrich_batch(request)
+
+        assert len(result.artists) == 6
+        assert lb_repo.get_artist_top_release_groups.await_count == 6
+        mb_repo.get_artist_release_groups.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_before_first_stage_starts_no_provider_calls(self):
+        service, mb_repo, lb_repo, lfm_repo = _make_service(
+            lb_enabled=True, lfm_enabled=False
+        )
+        is_disconnected = AsyncMock(return_value=True)
+        request = EnrichmentBatchRequest(
+            artists=[ArtistEnrichmentRequest(musicbrainz_id="art-1")],
+            albums=[AlbumEnrichmentRequest(musicbrainz_id="album-1")],
+        )
+
+        with pytest.raises(ClientDisconnectedError):
+            await service.enrich_batch(request, is_disconnected=is_disconnected)
+
+        mb_repo.get_artist_release_groups.assert_not_awaited()
+        lb_repo.get_artist_top_release_groups.assert_not_awaited()
+        lb_repo.get_release_group_popularity_batch.assert_not_awaited()
+        lfm_repo.get_artist_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_between_artist_and_album_stages_stops_batch(self):
+        service, _, lb_repo, _ = _make_service(lb_enabled=True, lfm_enabled=False)
+        is_disconnected = AsyncMock(side_effect=[False, False, True])
+        request = EnrichmentBatchRequest(
+            artists=[ArtistEnrichmentRequest(musicbrainz_id="art-1")],
+            albums=[AlbumEnrichmentRequest(musicbrainz_id="album-1")],
+        )
+
+        with pytest.raises(ClientDisconnectedError):
+            await service.enrich_batch(request, is_disconnected=is_disconnected)
+
+        lb_repo.get_artist_top_release_groups.assert_awaited_once()
+        lb_repo.get_release_group_popularity_batch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_stops_unstarted_artist_popularity_calls(self):
+        service, _, lb_repo, _ = _make_service(lb_enabled=True, lfm_enabled=False)
+        is_disconnected = AsyncMock(side_effect=[False, False, True])
+        request = EnrichmentBatchRequest(
+            artists=[
+                ArtistEnrichmentRequest(musicbrainz_id="art-1"),
+                ArtistEnrichmentRequest(musicbrainz_id="art-2"),
+            ],
+            albums=[],
+        )
+
+        with pytest.raises(ClientDisconnectedError):
+            await service.enrich_batch(request, is_disconnected=is_disconnected)
+
+        lb_repo.get_artist_top_release_groups.assert_awaited_once_with("art-1", count=5)
+
+    @pytest.mark.asyncio
+    async def test_optional_provider_failure_records_degradation(self):
+        service, _, lb_repo, _ = _make_service(lb_enabled=True, lfm_enabled=False)
+        lb_repo.get_artist_top_release_groups.side_effect = RuntimeError("unavailable")
+        degradation = init_degradation_context()
+        try:
+            result = await service.enrich_batch(
+                EnrichmentBatchRequest(
+                    artists=[ArtistEnrichmentRequest(musicbrainz_id="art-1")],
+                    albums=[],
+                )
+            )
+        finally:
+            clear_degradation_context()
+
+        assert result.artists[0].listen_count is None
+        assert degradation.degraded_summary() == {"listenbrainz": "error"}
 
     @pytest.mark.asyncio
     async def test_lastfm_artist_enrichment_without_name_skips_lfm(self):

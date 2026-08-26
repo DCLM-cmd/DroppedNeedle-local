@@ -67,7 +67,7 @@ describe('download search queries', () => {
 		};
 		await m.onSuccess({ task_id: 't' }, { jobId: 'job1', candidate_index: 0 });
 		expect(mockInvalidate).toHaveBeenCalledWith({
-			queryKey: DownloadQueryKeyFactory.searchJob('job1')
+			queryKey: DownloadQueryKeyFactory.searchJob(undefined, 'job1')
 		});
 	});
 
@@ -78,11 +78,16 @@ describe('download search queries', () => {
 		};
 		await m.onSuccess({ status: 'ok', message: '' }, 'job1');
 		expect(mockInvalidate).toHaveBeenCalledWith({
-			queryKey: DownloadQueryKeyFactory.searchJob('job1')
+			queryKey: DownloadQueryKeyFactory.searchJob(undefined, 'job1')
 		});
 	});
 
 	it('key factory builds a stable search-job key', () => {
-		expect(DownloadQueryKeyFactory.searchJob('j')).toEqual(['downloads', 'search', 'j']);
+		expect(DownloadQueryKeyFactory.searchJob('user-1', 'j')).toEqual([
+			'downloads',
+			'search',
+			'user-1',
+			'j'
+		]);
 	});
 });

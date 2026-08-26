@@ -39,6 +39,8 @@ vi.mock('$lib/queries/profile/ProfileMutations.svelte', () => ({
 // Sibling profile cards pull their own query graphs; stub them so the page renders in
 // isolation. ProfileConnectApps is left REAL (its queries are mocked below) so the
 // page↔section wiring is actually exercised.
+vi.mock('$lib/components/profile/MediaServerAccountsCard.svelte', emptyComponent);
+vi.mock('$lib/components/profile/NavidromeMusicFoldersCard.svelte', emptyComponent);
 vi.mock('$lib/components/profile/ScrobblingDiscoveryCard.svelte', emptyComponent);
 vi.mock('$lib/components/profile/SpotifyConnectionCard.svelte', emptyComponent);
 
@@ -65,6 +67,9 @@ vi.mock('$lib/stores/authStore.svelte', () => ({
 		user: { id: 'user-1', role: 'user', username: 'alice', providers: ['local'] }
 	}
 }));
+vi.mock('$lib/stores/player.svelte', () => ({
+	playerStore: { isPlayerVisible: false }
+}));
 vi.mock('$lib/api/client', () => ({ ApiError: class ApiError extends Error {} }));
 vi.mock('$lib/utils/logout', () => ({ logout: vi.fn() }));
 vi.mock('$lib/queries/QueryClient', () => ({ invalidateQueriesWithPersister: vi.fn() }));
@@ -86,6 +91,20 @@ describe('profile route page', () => {
 		await expect
 			.element(page.getByRole('heading', { name: 'Connect Apps', level: 2 }))
 			.toBeInTheDocument();
+	});
+
+	it('lists the visible profile sections in the page navigation', async () => {
+		render(ProfilePage);
+		const navigation = page.getByRole('navigation', { name: 'Page sections' });
+		await expect.element(navigation.getByRole('link', { name: 'Account' })).toBeInTheDocument();
+		await expect
+			.element(navigation.getByRole('link', { name: 'Connected Services' }))
+			.toBeInTheDocument();
+		await expect
+			.element(navigation.getByRole('link', { name: 'Connect Apps' }))
+			.toBeInTheDocument();
+		await expect.element(navigation.getByRole('link', { name: 'Scrobbling' })).toBeInTheDocument();
+		await expect.element(navigation.getByRole('link', { name: 'Spotify' })).toBeInTheDocument();
 	});
 
 	it('scrolls to the #connect-apps anchor on a cold deep-link once profile has rendered', async () => {

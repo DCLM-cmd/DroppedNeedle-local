@@ -7,7 +7,11 @@ from api.v1.schemas.search import (
     EnrichmentBatchRequest,
     SuggestResponse,
 )
-from core.dependencies import get_search_service, get_coverart_repository, get_search_enrichment_service
+from core.dependencies import (
+    get_search_service,
+    get_coverart_repository,
+    get_search_enrichment_service,
+)
 from infrastructure.degradation import try_get_degradation_context
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 
@@ -25,8 +29,10 @@ async def search(
     background_tasks: BackgroundTasks,
     q: str = Query(..., min_length=1, description="Search term"),
     limit_per_bucket: int | None = Query(
-        None, ge=1, le=100,
-        description="Max items per bucket (deprecated, use limit_artists/limit_albums)"
+        None,
+        ge=1,
+        le=100,
+        description="Max items per bucket (deprecated, use limit_artists/limit_albums)",
     ),
     limit_artists: int = Query(10, ge=0, le=100, description="Max artists to return"),
     limit_albums: int = Query(10, ge=0, le=100, description="Max albums to return"),
@@ -34,35 +40,31 @@ async def search(
         None, description="Comma-separated subset: artists,albums"
     ),
     search_service: SearchService = Depends(get_search_service),
-    coverart_repo: CoverArtRepository = Depends(get_coverart_repository)
+    coverart_repo: CoverArtRepository = Depends(get_coverart_repository),
 ):
     if await request.is_disconnected():
         raise ClientDisconnectedError("Client disconnected")
-    
+
     buckets_list = [b.strip().lower() for b in buckets.split(",")] if buckets else None
-    
+
     final_limit_artists = limit_per_bucket if limit_per_bucket else limit_artists
     final_limit_albums = limit_per_bucket if limit_per_bucket else limit_albums
-    
+
     result = await search_service.search(
         query=q,
         limit_artists=final_limit_artists,
         limit_albums=final_limit_albums,
-        buckets=buckets_list
+        buckets=buckets_list,
     )
-    
+
     ctx = try_get_degradation_context()
     if ctx is not None and ctx.has_degradation():
         result = msgspec.structs.replace(result, service_status=ctx.degraded_summary())
-    
+
     album_ids = search_service.schedule_cover_prefetch(result.albums)
     if album_ids:
-        background_tasks.add_task(
-            coverart_repo.batch_prefetch_covers,
-            album_ids,
-            "250"
-        )
-    
+        background_tasks.add_task(coverart_repo.batch_prefetch_covers, album_ids, "250")
+
     return result
 
 
@@ -84,22 +86,29 @@ async def search_bucket(
     q: str = Query(..., min_length=1, description="Search term"),
     limit: int = Query(50, ge=1, le=100, description="Page size"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
-    search_service: SearchService = Depends(get_search_service)
+    search_service: SearchService = Depends(get_search_service),
 ):
-    results, top_result = await search_service.search_bucket(
-        bucket=bucket,
-        query=q,
-        limit=limit,
-        offset=offset
+    results, top_result, status = await search_service.search_bucket(
+        bucket=bucket, query=q, limit=limit, offset=offset
     )
-    return SearchBucketResponse(bucket=bucket, limit=limit, offset=offset, results=results, top_result=top_result)
+    return SearchBucketResponse(
+        bucket=bucket,
+        limit=limit,
+        offset=offset,
+        results=results,
+        top_result=top_result,
+        status=status,
+    )
 
 
 @router.get("/enrich/batch", response_model=EnrichmentResponse)
 async def enrich_search_results(
+    request: Request,
     artist_mbids: str = Query("", description="Comma-separated artist MBIDs"),
     album_mbids: str = Query("", description="Comma-separated album MBIDs"),
-    enrichment_service: SearchEnrichmentService = Depends(get_search_enrichment_service)
+    enrichment_service: SearchEnrichmentService = Depends(
+        get_search_enrichment_service
+    ),
 ):
     artist_list = [m.strip() for m in artist_mbids.split(",") if m.strip()]
     album_list = [m.strip() for m in album_mbids.split(",") if m.strip()]
@@ -107,13 +116,19 @@ async def enrich_search_results(
     return await enrichment_service.enrich(
         artist_mbids=artist_list,
         album_mbids=album_list,
+        is_disconnected=request.is_disconnected,
     )
 
 
 @router.post("/enrich/batch", response_model=EnrichmentResponse)
 async def enrich_search_results_post(
+    request: Request,
     body: EnrichmentBatchRequest = MsgSpecBody(EnrichmentBatchRequest),
-    enrichment_service: SearchEnrichmentService = Depends(get_search_enrichment_service),
+    enrichment_service: SearchEnrichmentService = Depends(
+        get_search_enrichment_service
+    ),
 ):
-    return await enrichment_service.enrich_batch(body)
-
+    return await enrichment_service.enrich_batch(
+        body,
+        is_disconnected=request.is_disconnected,
+    )

@@ -2,6 +2,12 @@ import { page } from '@vitest/browser/context';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 
+type HydrateOptions = {
+	cache: unknown;
+	cacheKey?: string;
+	onHydrate: (value: unknown) => void;
+};
+
 const {
 	mockGoto,
 	mockPageFetch,
@@ -12,7 +18,10 @@ const {
 	mockAlbumLastFmCache,
 	mockAlbumYouTubeCache,
 	mockAlbumSourceMatchCache,
-	mockDownloadsData
+	mockDownloadsData,
+	mockHeldData,
+	mockLibraryStatusData,
+	mockLocalCopiesData
 } = vi.hoisted(() => ({
 	mockGoto: vi.fn(),
 	mockPageFetch: vi.fn(),
@@ -23,7 +32,10 @@ const {
 	mockAlbumLastFmCache: { set: vi.fn() },
 	mockAlbumYouTubeCache: { get: vi.fn(), set: vi.fn() },
 	mockAlbumSourceMatchCache: { get: vi.fn(), set: vi.fn() },
-	mockDownloadsData: { value: undefined as unknown }
+	mockDownloadsData: { value: undefined as unknown },
+	mockHeldData: { value: { items: [] } as unknown },
+	mockLibraryStatusData: { value: undefined as unknown },
+	mockLocalCopiesData: { value: { items: [] } as unknown }
 }));
 
 vi.mock('$app/environment', () => ({ browser: true }));
@@ -94,7 +106,23 @@ vi.mock('$lib/utils/serviceStatus', () => ({
 
 // Stub the library status query so the page renders without a QueryClientProvider.
 vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
-	getLibraryAlbumStatusQuery: () => ({ data: undefined, refetch: vi.fn() })
+	getLibraryAlbumStatusQuery: () => ({
+		get data() {
+			return mockLibraryStatusData.value;
+		},
+		refetch: vi.fn()
+	}),
+	getLibraryAlbumCopiesQuery: () => ({
+		get data() {
+			return mockLocalCopiesData.value;
+		},
+		isLoading: false
+	}),
+	getLibraryAlbumDetailQuery: () => ({
+		data: undefined,
+		isLoading: false,
+		isError: false
+	})
 }));
 
 // Where-to-buy section (Get it): stub so the page renders without a QueryClientProvider
@@ -114,6 +142,7 @@ vi.mock('$lib/queries/downloads/DownloadQueries.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	tryNextSource: () => ({ mutate: vi.fn(), isPending: false }),
 	cancelDownload: () => ({ mutate: vi.fn(), isPending: false }),
 	retryDownload: () => ({ mutate: vi.fn(), isPending: false }),
 	stopAutoRetry: () => ({ mutate: vi.fn(), isPending: false }),
@@ -146,14 +175,14 @@ vi.mock('$lib/queries/downloads/UpgradeQueries.svelte', () => ({
 vi.mock('$lib/queries/downloads/HeldQueries.svelte', () => ({
 	getHeldImportsQuery: () => ({
 		get data() {
-			return { items: [] };
+			return mockHeldData.value;
 		}
 	})
 }));
 
 vi.mock('$lib/queries/downloads/DownloadSSE.svelte', () => ({
 	createDownloadStream: () => ({
-		state: { progress: null, status: null, done: false },
+		state: { progress: null, status: null, source: null, done: false },
 		start: vi.fn(),
 		stop: vi.fn()
 	})
@@ -163,7 +192,6 @@ vi.mock('$lib/queries/downloads/DownloadSSE.svelte', () => ({
 vi.mock('$lib/queries/library/LibraryMutations.svelte', async (importOriginal) => ({
 	...(await importOriginal<typeof import('$lib/queries/library/LibraryMutations.svelte')>()),
 	rescanAlbum: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	reidentifyAlbum: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	// the orphan-review section (P5) creates its removal mutation at init - stub it
 	// so the page renders without a QueryClientProvider
 	removeLibraryTrack: () => ({ mutate: vi.fn(), isPending: false })
@@ -233,11 +261,6 @@ vi.mock('$lib/components/DeleteAlbumModal.svelte', () => {
 	Comp.prototype = {};
 	return { default: Comp };
 });
-vi.mock('$lib/components/ArtistRemovedModal.svelte', () => {
-	const Comp = function () {};
-	Comp.prototype = {};
-	return { default: Comp };
-});
 vi.mock('$lib/components/NowPlayingIndicator.svelte', () => {
 	const Comp = function () {};
 	Comp.prototype = {};
@@ -248,7 +271,7 @@ vi.mock('$lib/player/launchJellyfinPlayback', () => ({ launchJellyfinPlayback: v
 vi.mock('$lib/player/launchLocalPlayback', () => ({ launchLocalPlayback: vi.fn() }));
 vi.mock('$lib/player/launchNavidromePlayback', () => ({ launchNavidromePlayback: vi.fn() }));
 
-import AlbumPage from './+page.svelte';
+import AlbumPage from './ProviderAlbumPage.svelte';
 import type { DownloadTask } from '$lib/types';
 
 const albumId = '3f3a6d95-326e-4384-80b0-0744f20f24ff';
@@ -258,7 +281,10 @@ function makeTask(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		id: 'task-1',
 		user_id: 'user-1',
 		download_type: 'album',
+		source: 'soulseek',
 		release_group_mbid: albumId,
+		release_mbid: null,
+		release_track_mbid: null,
 		recording_mbid: null,
 		artist_name: 'Grimes',
 		album_title: 'Visions',
@@ -284,6 +310,19 @@ function makeTask(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		next_retry_at: null,
 		retry_max: 6,
 		retry_ladder_minutes: [15, 30, 60, 120, 240, 480],
+		acquisition_cleanup_state: 'not_tracked',
+		quality_format: null,
+		quality_bit_depth: null,
+		quality_sample_rate: null,
+		advertised_queue_depth: null,
+		queue_position_start: null,
+		queue_position_end: null,
+		remote_queued: false,
+		preferred_quality_fallback_at: null,
+		attempt_number: 0,
+		attempt_total: 0,
+		has_next_source: false,
+		held_for_review: false,
 		...overrides
 	};
 }
@@ -301,8 +340,10 @@ describe('album detail page track rendering', () => {
 		mockPageFetch.mockReset();
 		mockHydrateDetailCacheEntry.mockReset();
 		mockDownloadsData.value = undefined;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock with generic cache type
-		mockHydrateDetailCacheEntry.mockImplementation(({ cache, onHydrate }: any) => {
+		mockHeldData.value = { items: [] };
+		mockLibraryStatusData.value = undefined;
+		mockLocalCopiesData.value = { items: [] };
+		mockHydrateDetailCacheEntry.mockImplementation(({ cache, onHydrate }: HydrateOptions) => {
 			if (cache === mockAlbumBasicCache) {
 				onHydrate({
 					title: 'Visions',
@@ -515,6 +556,100 @@ describe('album detail page track rendering', () => {
 		});
 	});
 
+	it('lets authoritative library status override stale owned album metadata', async () => {
+		mockLibraryStatusData.value = {
+			in_library: false,
+			track_count: 0,
+			tracks: [],
+			expected_tracks: 4,
+			covered_tracks: 0,
+			matched_file_ids: [],
+			orphans: []
+		};
+
+		render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+
+		await expect.element(page.getByRole('button', { name: 'Add to Library' })).toBeVisible();
+		await expect.element(page.getByText('In Library', { exact: true })).not.toBeInTheDocument();
+	});
+
+	it('keeps every local copy visible on the shared provider route', async () => {
+		const copy = (id: string, title: string) => ({
+			id,
+			title,
+			artist_name: 'Grimes',
+			artist_id: 'local-artist-1',
+			musicbrainz_release_group_id: albumId,
+			musicbrainz_release_id: 'release-1',
+			musicbrainz_artist_id: 'artist-1',
+			album_identity_state: 'release_linked',
+			track_count: 4,
+			total_duration_seconds: 736,
+			total_size_bytes: 4,
+			format: 'flac',
+			year: 2012,
+			is_compilation: false,
+			cover_available: false,
+			date_added: 1,
+			sort_name: null,
+			original_release_date: null
+		});
+		mockLocalCopiesData.value = {
+			items: [
+				copy('local-copy-1', 'Visions, original files'),
+				copy('local-copy-2', 'Visions, remaster')
+			]
+		};
+
+		render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+
+		await expect
+			.element(page.getByRole('heading', { name: 'Copies in your library' }))
+			.toBeVisible();
+		await expect
+			.element(page.getByRole('link', { name: 'Open Visions, original files' }))
+			.toHaveAttribute('href', `/album/${albumId}`);
+		await expect
+			.element(page.getByRole('link', { name: 'Open Visions, remaster' }))
+			.toHaveAttribute('href', `/album/${albumId}`);
+	});
+
+	it('replaces a release alias URL with the canonical release-group URL', async () => {
+		const canonicalId = '886755e5-6c76-4181-9a16-0b167ee7bfc3';
+		const originalHydrator = mockHydrateDetailCacheEntry.getMockImplementation();
+		mockHydrateDetailCacheEntry.mockImplementation(
+			(options: { cache: unknown; onHydrate: (value: unknown) => void }) => {
+				if (options.cache === mockAlbumBasicCache) {
+					options.onHydrate({
+						title: 'Pixie Queen',
+						musicbrainz_id: canonicalId,
+						artist_name: 'Anthony Green',
+						artist_id: 'artist-1',
+						in_library: true,
+						requested: false,
+						cover_url: null
+					});
+					return false;
+				}
+				return originalHydrator?.(options);
+			}
+		);
+
+		render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+
+		await vi.waitFor(() => {
+			expect(mockGoto).toHaveBeenCalledWith(`/album/${canonicalId}`, {
+				replaceState: true
+			});
+		});
+	});
+
 	it('renders visible grouped track rows alongside source bars', async () => {
 		expect.assertions(6);
 		render(AlbumPage, {
@@ -531,8 +666,7 @@ describe('album detail page track rendering', () => {
 
 	it('does not refetch tracks when the tracks cache is fresh but basic metadata is stale', async () => {
 		expect.assertions(2);
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock with generic cache type
-		mockHydrateDetailCacheEntry.mockImplementation(({ cache, onHydrate }: any) => {
+		mockHydrateDetailCacheEntry.mockImplementation(({ cache, onHydrate }: HydrateOptions) => {
 			if (cache === mockAlbumBasicCache) {
 				onHydrate({
 					title: 'Visions',
@@ -587,9 +721,107 @@ describe('album detail page track rendering', () => {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
-		await expect.element(page.getByText('Downloading')).toBeVisible();
+		await expect.element(page.getByText('Downloading', { exact: true })).toBeVisible();
 		// the old broken poller badge is gone for good
 		expect(page.getByText('Checking for sources…').elements()).toHaveLength(0);
+	});
+
+	it('uses the shared Soulseek queue presentation on the album strip', async () => {
+		mockDownloadsData.value = {
+			items: [
+				makeTask({
+					downloaded_bytes: 0,
+					progress_percent: 0,
+					files_completed: 0,
+					quality_format: 'flac',
+					quality_bit_depth: 24,
+					quality_sample_rate: 48_000,
+					advertised_queue_depth: 2710,
+					remote_queued: true,
+					attempt_number: 1,
+					attempt_total: 3,
+					has_next_source: true
+				})
+			],
+			page: 1,
+			page_size: 100
+		};
+
+		render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+
+		await expect.element(page.getByText('24-bit / 48 kHz FLAC')).toBeVisible();
+		await expect.element(page.getByText('Waiting for Soulseek · queue 2,710')).toBeVisible();
+		await expect.element(page.getByText('Trying source 1 of 3')).toBeVisible();
+	});
+
+	it('shows a secured organizer hold instead of historical Soulseek failure telemetry', async () => {
+		mockDownloadsData.value = {
+			items: [
+				makeTask({
+					status: 'failed',
+					held_for_review: true,
+					quality_format: 'flac',
+					quality_bit_depth: 16,
+					quality_sample_rate: 44_100,
+					attempt_number: 3,
+					attempt_total: 3,
+					error_message: 'No working source found on Soulseek'
+				})
+			],
+			page: 1,
+			page_size: 100
+		};
+		mockHeldData.value = {
+			items: [1, 2].map((track) => ({
+				id: track,
+				release_group_mbid: albumId,
+				release_mbid: 'release-1',
+				release_track_mbid: `release-track-${track}`,
+				recording_mbid: `recording-${track}`,
+				track_number: track,
+				disc_number: 1,
+				track_title: `Track ${track}`,
+				artist_name: 'Grimes',
+				album_title: 'Visions',
+				year: 2012,
+				original_filename: `${track}.flac`,
+				file_format: 'flac',
+				duration_seconds: 200,
+				reason: 'management:BUNDLE_BLOCKED',
+				reason_detail:
+					'The durable publication evidence no longer agrees with its journal. Nothing was overwritten.',
+				source: 'soulseek',
+				source_task_id: 'task-1',
+				created_at: track,
+				evidence_title: null,
+				evidence_artist: null,
+				evidence_score: null,
+				management_retry_count: 0,
+				management_next_retry_at: null
+			}))
+		};
+
+		render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+
+		await expect.element(page.getByText('Organizer paused · 2 files secured')).toBeVisible();
+		await expect
+			.element(
+				page.getByText(
+					'The durable publication evidence no longer agrees with its journal. Nothing was overwritten.'
+				)
+			)
+			.toBeVisible();
+		await expect.element(page.getByRole('link', { name: 'Review organizer' })).toBeVisible();
+		await expect.element(page.getByText('16-bit / 44.1 kHz FLAC')).not.toBeInTheDocument();
+		await expect.element(page.getByText('Downloading from Soulseek')).not.toBeInTheDocument();
+		await expect.element(page.getByText('Trying source 3 of 3')).not.toBeInTheDocument();
+		await expect
+			.element(page.getByText('No working source found on Soulseek'))
+			.not.toBeInTheDocument();
 	});
 
 	it('shows no download strip for a settled album with no active download', async () => {
@@ -607,8 +839,7 @@ describe('album detail page track rendering', () => {
 	it('shows the per-track pressing vinyl for a downloading track', async () => {
 		expect.assertions(1);
 		// tracks need a recording_id for the per-track task to match
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock with generic cache type
-		mockHydrateDetailCacheEntry.mockImplementation(({ cache, onHydrate }: any) => {
+		mockHydrateDetailCacheEntry.mockImplementation(({ cache, onHydrate }: HydrateOptions) => {
 			if (cache === mockAlbumBasicCache) {
 				onHydrate({
 					title: 'Visions',

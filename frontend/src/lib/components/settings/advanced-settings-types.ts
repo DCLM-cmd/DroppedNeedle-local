@@ -58,6 +58,7 @@ export interface AdvancedSettingsForm {
 	audiodb_api_key: string;
 	audiodb_name_search_fallback: boolean;
 	direct_remote_images_enabled: boolean;
+	prefer_local_cover_art: boolean;
 	cache_ttl_audiodb_found: number;
 	cache_ttl_audiodb_not_found: number;
 	cache_ttl_audiodb_library: number;

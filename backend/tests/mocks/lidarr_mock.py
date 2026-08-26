@@ -1,6 +1,5 @@
 """Mock Lidarr served via ``httpx.MockTransport`` - the executable record of the live
-behaviour verified against Lidarr 3.1.3.4968 (see
-``repositories/lidarr_import/lidarr_import_API_NOTES.md``). Drop-in for the injected
+behaviour verified against Lidarr 3.1.3.4968. Drop-in for the injected
 ``httpx.AsyncClient`` in ``LidarrImportRepository``.
 
 Endpoints:

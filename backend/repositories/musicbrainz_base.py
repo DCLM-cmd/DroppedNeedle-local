@@ -3,7 +3,7 @@ from typing import Any, TypeVar
 import httpx
 import msgspec
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import ExternalServiceError, InvalidExternalPayloadError
 from infrastructure.resilience.retry import with_retry, CircuitBreaker
 from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
 from infrastructure.queue.priority_queue import RequestPriority, get_priority_queue
@@ -21,6 +21,7 @@ def set_mb_api_base(url: str) -> None:
     global _mb_api_base
     _mb_api_base = url.rstrip("/")
 
+
 mb_circuit_breaker = CircuitBreaker(
     failure_threshold=5,
     success_threshold=2,
@@ -34,7 +35,10 @@ mb_circuit_breaker = CircuitBreaker(
     ),
 )
 
-mb_rate_limiter = TokenBucketRateLimiter(rate=1.0, capacity=6)
+# MusicBrainz requires clients to make no more than one request per second:
+# https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting
+# A larger bucket preserves the average refill rate but still permits a cold-start burst.
+mb_rate_limiter = TokenBucketRateLimiter(rate=1.0, capacity=1)
 
 mb_deduplicator = RequestDeduplicator()
 
@@ -71,6 +75,8 @@ def get_mb_http_client() -> httpx.AsyncClient:
     max_attempts=3,
     circuit_breaker=mb_circuit_breaker,
     retriable_exceptions=(httpx.HTTPError, ExternalServiceError),
+    non_breaking_exceptions=(InvalidExternalPayloadError,),
+    non_retriable_exceptions=(InvalidExternalPayloadError,),
 )
 async def mb_api_get(
     path: str,
@@ -101,8 +107,17 @@ async def mb_api_get(
             if decode_type is not None:
                 return _decode_typed_response(response, decode_type)
             return _decode_json_response(response)
-        except (msgspec.DecodeError, msgspec.ValidationError, TypeError) as exc:
-            raise ExternalServiceError(f"MusicBrainz returned invalid JSON payload for {path}: {exc}") from exc
+        except msgspec.ValidationError as exc:
+            # deterministic per payload (e.g. a field MusicBrainz sends as JSON
+            # null), so it says nothing about service health and never counts
+            # toward the circuit breaker
+            raise InvalidExternalPayloadError(
+                f"MusicBrainz returned an unexpected payload shape for {path}: {exc}"
+            ) from exc
+        except (msgspec.DecodeError, TypeError) as exc:
+            raise ExternalServiceError(
+                f"MusicBrainz returned invalid JSON payload for {path}: {exc}"
+            ) from exc
 
 
 def should_include_release(
@@ -115,10 +130,20 @@ def should_include_release(
         if primary_type not in included_primary_types:
             return False
 
-    secondary_types = set(map(str.lower, release_group.get("secondary-types", []) or []))
+    secondary_types = set(
+        map(str.lower, release_group.get("secondary-types", []) or [])
+    )
 
     if included_secondary_types is None:
-        exclude_types = {"compilation", "live", "remix", "soundtrack", "dj-mix", "mixtape/street", "demo"}
+        exclude_types = {
+            "compilation",
+            "live",
+            "remix",
+            "soundtrack",
+            "dj-mix",
+            "mixtape/street",
+            "demo",
+        }
         return secondary_types.isdisjoint(exclude_types)
 
     if not secondary_types:
@@ -134,7 +159,9 @@ def extract_artist_name(release_group: dict[str, Any]) -> str | None:
 
     first_credit = artist_credit[0]
     if isinstance(first_credit, dict):
-        return first_credit.get("name") or (first_credit.get("artist") or {}).get("name")
+        return first_credit.get("name") or (first_credit.get("artist") or {}).get(
+            "name"
+        )
     return None
 
 
@@ -169,7 +196,47 @@ def _normalize_tag_phrase(tag: str) -> str:
     return " ".join(tag.strip().lower().split())
 
 
-def _escape_lucene_phrase(value: str) -> str:
+_LUCENE_RESERVED = frozenset(r'+-&|!(){}[]^"~*?:\\/')
+
+
+def escape_lucene_phrase(value: str) -> str:
+    """Escape user text before placing it inside a Lucene field phrase."""
+
+    return "".join(
+        f"\\{character}" if character in _LUCENE_RESERVED else character
+        for character in value
+    )
+
+
+def build_release_search_query(title: str, artist: str) -> str:
+    """Build a release query live-verified against MusicBrainz WS/2 on 2026-08-13."""
+
+    clauses = [f'release:"{escape_lucene_phrase(title)}"']
+    if artist:
+        clauses.append(f'artist:"{escape_lucene_phrase(artist)}"')
+    return " AND ".join(clauses)
+
+
+def build_release_group_search_query(title: str, artist: str) -> str:
+    """Build a release-group query live-verified against MusicBrainz WS/2 on 2026-08-13."""
+
+    escaped_title = escape_lucene_phrase(title)
+    query = f'(releasegroup:"{escaped_title}" OR release:"{escaped_title}")'
+    if artist:
+        query += f' AND artist:"{escape_lucene_phrase(artist)}"'
+    return query
+
+
+def build_recording_search_query(title: str, artist: str) -> str:
+    """Build a recording query using the same verified Lucene field escaping."""
+
+    return (
+        f'recording:"{escape_lucene_phrase(title)}" AND '
+        f'artist:"{escape_lucene_phrase(artist)}"'
+    )
+
+
+def _escape_tag_phrase(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
@@ -200,7 +267,7 @@ def build_musicbrainz_tag_query(tag: str) -> str:
 
     clauses = []
     for index, variant in enumerate(variants):
-        escaped = _escape_lucene_phrase(variant)
+        escaped = _escape_tag_phrase(variant)
         boost = "^3" if index == 0 else "^2"
         clauses.append(f'tag:"{escaped}"{boost}')
 

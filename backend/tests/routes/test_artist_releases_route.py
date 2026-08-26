@@ -4,15 +4,16 @@ import tempfile
 os.environ.setdefault("ROOT_APP_DIR", tempfile.mkdtemp())
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from api.v1.routes.artists import router
 from api.v1.schemas.artist import ArtistReleases
 from core.dependencies import get_artist_service, get_artist_discovery_service, get_artist_enrichment_service
+from core.exceptions import ClientDisconnectedError
 from models.artist import ReleaseItem
+from tests.helpers import build_test_client
 
 
 VALID_MBID = "f4a31f0a-51dd-4fa7-986d-3095c40c5ed9"
@@ -55,7 +56,7 @@ def client(mock_artist_service, mock_discovery_service, mock_enrichment_service)
     app.dependency_overrides[get_artist_service] = lambda: mock_artist_service
     app.dependency_overrides[get_artist_discovery_service] = lambda: mock_discovery_service
     app.dependency_overrides[get_artist_enrichment_service] = lambda: mock_enrichment_service
-    return TestClient(app)
+    return build_test_client(app)
 
 
 class TestGetArtistReleasesRoute:
@@ -63,7 +64,9 @@ class TestGetArtistReleasesRoute:
         response = client.get(f"/api/v1/artists/{VALID_MBID}/releases?offset=50&limit=50")
 
         assert response.status_code == 200
-        mock_artist_service.get_artist_releases.assert_awaited_once_with(VALID_MBID, 50, 50)
+        mock_artist_service.get_artist_releases.assert_awaited_once_with(
+            VALID_MBID, 50, 50, is_disconnected=ANY
+        )
 
     def test_new_pagination_fields_propagated(self, client):
         response = client.get(f"/api/v1/artists/{VALID_MBID}/releases?offset=0&limit=50")
@@ -81,7 +84,9 @@ class TestGetArtistReleasesRoute:
         response = client.get(f"/api/v1/artists/{VALID_MBID}/releases")
 
         assert response.status_code == 200
-        mock_artist_service.get_artist_releases.assert_awaited_once_with(VALID_MBID, 0, 50)
+        mock_artist_service.get_artist_releases.assert_awaited_once_with(
+            VALID_MBID, 0, 50, is_disconnected=ANY
+        )
 
     def test_value_error_returns_400(self, client, mock_artist_service):
         mock_artist_service.get_artist_releases = AsyncMock(
@@ -89,3 +94,12 @@ class TestGetArtistReleasesRoute:
         )
         response = client.get(f"/api/v1/artists/{VALID_MBID}/releases")
         assert response.status_code == 400
+
+    def test_disconnect_stops_release_pagination(self, client, mock_artist_service):
+        mock_artist_service.get_artist_releases = AsyncMock(
+            side_effect=ClientDisconnectedError("Client disconnected")
+        )
+
+        response = client.get(f"/api/v1/artists/{VALID_MBID}/releases")
+
+        assert response.status_code == 204

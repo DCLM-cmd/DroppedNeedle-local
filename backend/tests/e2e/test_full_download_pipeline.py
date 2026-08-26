@@ -8,14 +8,17 @@ FileProcessor and DownloadOrchestrator. A real-slskd container variant is includ
 skips unless ``testcontainers`` and a Docker daemon are available.
 """
 
+import hashlib
 import os
 import shutil
 import sqlite3
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgspec
 import pytest
 
 from infrastructure.audio.tagger import AudioTagger
@@ -26,19 +29,27 @@ from models.common import ServiceStatus
 from models.download import DownloadSearchResult
 from models.download_manifest import ManifestCodec
 from repositories.protocols.download_client import (
+    DownloadMaterialization,
     DownloadTaskStatus,
     MountDiagnosis,
     TaskHandle,
 )
 from repositories.protocols.indexer import IndexerResult
 from services.native.album_preflight_scorer import AlbumPreflightScorer
+from services.native.acquisition_cleanup_service import AcquisitionCleanupService
 from services.native.download_orchestrator import DownloadOrchestrator
 from services.native.file_processor import FileProcessor
 from services.native.library_manager import LibraryManager
 from services.native.naming import NamingTemplateEngine
 from services.native.track_matcher import TrackMatcher
+from tests.helpers import make_test_import_publisher
 
-FIXTURE_FLAC = Path(__file__).resolve().parent.parent / "fixtures" / "library" / "flac_full_01.flac"
+FIXTURE_FLAC = (
+    Path(__file__).resolve().parent.parent
+    / "fixtures"
+    / "library"
+    / "flac_full_01.flac"
+)
 _TEMPLATE = "{albumartist}/{album} ({year})/{disc:02d}{track:02d} {title}.{ext}"
 
 
@@ -73,10 +84,14 @@ class _StubIndexer:
     async def health_check(self) -> ServiceStatus:
         return ServiceStatus(status="ok")
 
-    async def search_album(self, artist, album, year=None, track_count=None, *, timeout=30.0):
+    async def search_album(
+        self, artist, album, year=None, track_count=None, *, timeout=30.0
+    ):
         return [IndexerResult(source="soulseek", soulseek=r) for r in self._album]
 
-    async def search_track(self, artist, track, album=None, duration_seconds=None, *, timeout=30.0):
+    async def search_track(
+        self, artist, track, album=None, duration_seconds=None, *, timeout=30.0
+    ):
         return []
 
 
@@ -84,7 +99,7 @@ class _StubClient:
     def __init__(self, downloads_root: Path, status: str = "completed") -> None:
         self._root = downloads_root
         self._status = status
-        self.cancelled: list[TaskHandle] = []
+        self.discarded: list[TaskHandle] = []
 
     @property
     def client_name(self) -> str:
@@ -107,25 +122,82 @@ class _StubClient:
     async def get_status(self, handle: TaskHandle) -> DownloadTaskStatus:
         n = len(handle.filenames)
         return DownloadTaskStatus(
-            task_id="", status=self._status, files_total=n, files_completed=n,
-            bytes_total=0, bytes_downloaded=0, progress_percent=100.0,
+            task_id="",
+            status=self._status,
+            files_total=n,
+            files_completed=n,
+            bytes_total=0,
+            bytes_downloaded=0,
+            progress_percent=100.0,
         )
 
-    async def cancel(self, handle: TaskHandle) -> bool:
-        self.cancelled.append(handle)
+    async def abort(self, handle: TaskHandle) -> bool:
+        return True
+
+    async def inspect_materialization(
+        self, handle: TaskHandle
+    ) -> DownloadMaterialization:
+        return DownloadMaterialization(
+            state="completed",
+            mount_root=str(self._root),
+            file_paths=[
+                str(self._root / value.replace("\\", "/").lstrip("/"))
+                for value in handle.filenames
+            ],
+            mount_healthy=True,
+        )
+
+    async def discard_client_artifacts(self, handle: TaskHandle) -> bool:
+        self.discarded.append(handle)
         return True
 
     async def list_completed_files(self, handle: TaskHandle) -> list[Path]:
         return [self._root / f.replace("\\", "/").lstrip("/") for f in handle.filenames]
 
-    async def get_file_path(self, handle: TaskHandle, remote_filename: str, size: int | None = None):
+    async def get_file_path(
+        self, handle: TaskHandle, remote_filename: str, size: int | None = None
+    ):
         return self._root / remote_filename.replace("\\", "/").lstrip("/")
 
     async def diagnose_downloads_mount(self) -> MountDiagnosis:
         return MountDiagnosis(supported=False)
 
 
-def _place_fixture(downloads_root: Path, rel: str, *, duration: float | None = None) -> DownloadSearchResult:
+class _CleanupLibrary:
+    def __init__(self) -> None:
+        self.record = None
+        self.journals: list[SimpleNamespace] = []
+
+    def capture_bundle(self, bundle) -> None:  # noqa: ANN001
+        request_json = msgspec.json.encode(bundle).decode()
+        self.record = SimpleNamespace(
+            state="completed",
+            request_json=request_json,
+            request_hash=hashlib.sha256(request_json.encode()).hexdigest(),
+        )
+        self.journals = [
+            SimpleNamespace(
+                ordinal=request.ordinal,
+                source_fingerprint=hashlib.sha256(
+                    Path(request.input_path).read_bytes()
+                ).hexdigest(),
+            )
+            for request in bundle.files
+        ]
+
+    async def get_library_management_import_bundle(self, bundle_id: str):
+        return self.record
+
+    async def list_library_management_import_journals(self, bundle_id: str):
+        return self.journals
+
+    async def list_acquisition_import_bundles_for_download_task(self, task_id: str):
+        return []
+
+
+def _place_fixture(
+    downloads_root: Path, rel: str, *, duration: float | None = None
+) -> DownloadSearchResult:
     dest = downloads_root / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(FIXTURE_FLAC, dest)
@@ -152,30 +224,64 @@ def _build(tmp_path: Path, *, album=None, status="completed"):
     db_path = tmp_path / "library.db"
     store = DownloadStore(db_path=db_path, write_lock=threading.Lock())
     _seed_auth_users(db_path)
-    library_db = LibraryDB(db_path=tmp_path / "library_files.db", write_lock=threading.Lock())
+    library_db = LibraryDB(
+        db_path=tmp_path / "library_files.db", write_lock=threading.Lock()
+    )
     manager = LibraryManager(library_db)
     client = _StubClient(downloads, status=status)
     indexer = _StubIndexer(album or [])
+    cleanup_library = _CleanupLibrary()
+    test_publisher = make_test_import_publisher(manager, {"root-a": library})
+
+    async def publish(bundle):  # noqa: ANN001, ANN202
+        cleanup_library.capture_bundle(bundle)
+        return await test_publisher(bundle)
+
     fp = FileProcessor(
-        AudioTagger(), naming_engine=NamingTemplateEngine(), library_manager=manager,
-        library_paths=[library], client=client, slskd_downloads_path=downloads,
-        fingerprinter=None, verify_downloads=False,
+        AudioTagger(),
+        naming_engine=NamingTemplateEngine(),
+        library_manager=manager,
+        library_paths=[library],
+        client=client,
+        slskd_downloads_path=downloads,
+        fingerprinter=None,
+        verify_downloads=False,
+        library_root_ids=["root-a"],
+        publish_import_bundle=publish,
+        policy_revision_getter=lambda: "test-policy",
+    )
+    cleanup = AcquisitionCleanupService(
+        store, cleanup_library, lambda source: client, lambda: downloads
     )
     orch = DownloadOrchestrator(
-        client=client, indexer=indexer, download_store=store, file_processor=fp, library_manager=manager,
+        client=client,
+        indexer=indexer,
+        download_store=store,
+        file_processor=fp,
+        library_manager=manager,
         scorer=AlbumPreflightScorer(store, quality_min="low", flac_mp3_only=False),
         track_matcher=TrackMatcher(store, quality_min="low", flac_mp3_only=False),
-        manifest_codec=ManifestCodec(), event_bus=SSEPublisher(), staging_path=staging,
-        naming_template=_TEMPLATE, poll_interval=0.0,
-        auto_accept_threshold=0.5, manual_threshold=0.1,
+        manifest_codec=ManifestCodec(),
+        event_bus=SSEPublisher(),
+        staging_path=staging,
+        naming_template=_TEMPLATE,
+        poll_interval=0.0,
+        auto_accept_threshold=0.5,
+        manual_threshold=0.1,
+        cleanup_service=cleanup,
     )
     return store, manager, orch, client, library, staging
 
 
 async def _make_task(store, **overrides):
     base = dict(
-        user_id="user-a", download_type="album", release_group_mbid="rg-okc",
-        artist_name="Radiohead", album_title="OK Computer", year=1997, track_count=1,
+        user_id="user-a",
+        download_type="album",
+        release_group_mbid="rg-okc",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+        year=1997,
+        track_count=1,
     )
     base.update(overrides)
     return await store.create_task(**base)
@@ -183,7 +289,11 @@ async def _make_task(store, **overrides):
 
 @pytest.mark.asyncio
 async def test_happy_path_imports_into_library(tmp_path: Path):
-    album = [_place_fixture(tmp_path / "slskd_downloads", "Radiohead - OK Computer/01 Airbag.flac")]
+    album = [
+        _place_fixture(
+            tmp_path / "slskd_downloads", "Radiohead - OK Computer/01 Airbag.flac"
+        )
+    ]
     store, manager, orch, client, library, _staging = _build(tmp_path, album=album)
     task = await _make_task(store)
 
@@ -194,7 +304,7 @@ async def test_happy_path_imports_into_library(tmp_path: Path):
     assert await manager.has_album("rg-okc") is True
     assert len(list(library.rglob("*.flac"))) == 1
     assert await store.list_quarantine(1, 50) == []  # nothing quarantined on success
-    assert len(client.cancelled) == 1  # completed transfer records cleared
+    assert len(client.discarded) == 1
 
 
 @pytest.mark.asyncio
@@ -213,9 +323,13 @@ async def test_no_match_fails_cleanly(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_verification_failure_quarantines_source(tmp_path: Path):
     # A wildly-wrong duration trips the always-on duration check -> duration_mismatch.
-    album = [_place_fixture(
-        tmp_path / "slskd_downloads", "Radiohead - OK Computer/01 Airbag.flac", duration=9999.0
-    )]
+    album = [
+        _place_fixture(
+            tmp_path / "slskd_downloads",
+            "Radiohead - OK Computer/01 Airbag.flac",
+            duration=9999.0,
+        )
+    ]
     store, _manager, orch, _client, library, _staging = _build(tmp_path, album=album)
     task = await _make_task(store)
 

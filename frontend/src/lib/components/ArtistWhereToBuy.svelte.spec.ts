@@ -40,8 +40,7 @@ describe('ArtistWhereToBuy', () => {
 					kind: 'digital'
 				}
 			],
-			bandcamp_search_url: 'https://bandcamp.com/search?q=Test+Artist&item_type=b',
-			disclosure: false
+			bandcamp_search_url: 'https://bandcamp.com/search?q=Test+Artist&item_type=b'
 		};
 		render(ArtistWhereToBuy, props);
 		await expect.element(page.getByText('Support the artist')).toBeVisible();
@@ -52,8 +51,7 @@ describe('ArtistWhereToBuy', () => {
 	it('falls back to a Bandcamp artist search when MusicBrainz knows no store', async () => {
 		h.data = {
 			links: [],
-			bandcamp_search_url: 'https://bandcamp.com/search?q=Test+Artist&item_type=b',
-			disclosure: false
+			bandcamp_search_url: 'https://bandcamp.com/search?q=Test+Artist&item_type=b'
 		};
 		render(ArtistWhereToBuy, props);
 		await expect.element(page.getByRole('link', { name: 'Search Bandcamp' })).toBeVisible();

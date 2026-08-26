@@ -1,0 +1,343 @@
+import sqlite3
+import threading
+from pathlib import Path
+
+import pytest
+
+from infrastructure.persistence.native_library_store import NativeLibraryStore
+from models.edition_management import (
+    EditionConversionJob,
+    EditionConversionLocalFile,
+    EditionConversionTarget,
+)
+from core.exceptions import StaleRevisionError
+
+
+def _seed(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO auth_users(id) VALUES ('admin')")
+    NativeLibraryStore(path, threading.Lock())
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO local_artists "
+            "(id,display_name,folded_name,normalized_name,kind,created_at,updated_at) "
+            "VALUES ('artist','Artist','artist','artist','person',1,1)"
+        )
+        connection.execute(
+            "INSERT INTO local_albums "
+            "(id,root_id,grouping_key,title,title_folded,album_artist_name,"
+            "album_artist_name_folded,album_artist_id,grouping_source,created_at,updated_at) "
+            "VALUES ('album','root','group','Album','album','Artist','artist','artist',"
+            "'automatic',1,1)"
+        )
+        connection.execute(
+            "INSERT INTO local_tracks "
+            "(id,local_album_id,root_id,file_path,relative_path,path_hash,file_size_bytes,"
+            "file_mtime_ns,stat_revision,stat_revision_kind,tag_revision,title,title_folded,"
+            "artist_name,artist_name_folded,album_title,album_title_folded,album_artist_name,"
+            "album_artist_name_folded,disc_number,track_number,file_format,ingest_source,"
+            "imported_at,membership_source) VALUES ('track','album','root','/music/a.flac',"
+            "'a.flac','hash',1,1,'stat','exact','tag','Track','track','Artist','artist',"
+            "'Album','album','Artist','artist',1,1,'flac','scan',1,'automatic')"
+        )
+
+
+@pytest.mark.asyncio
+async def test_edition_conversion_store_is_idempotent_and_round_trips(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "library.db"
+    _seed(path)
+    first = NativeLibraryStore(path, threading.Lock())
+    second = NativeLibraryStore(path, threading.Lock())
+    job = EditionConversionJob(
+        id="job",
+        local_album_id="album",
+        target_release_group_mbid="group-mbid",
+        target_release_mbid="release-mbid",
+        target_album_title="Album",
+        target_artist_name="Artist",
+        state="preflight",
+        expected_album_revision=1,
+        expected_input_revision="input",
+        expected_identity_revision="identity",
+        preflight_token_hash="hash",
+        download_source_ready=True,
+        required_temporary_bytes=1,
+        kept_count=1,
+        acquire_count=0,
+        recycle_count=0,
+        staged_count=0,
+        failed_count=0,
+        final_preview_job_id=None,
+        final_preview_token_hash=None,
+        final_bundle_json=None,
+        final_bundle_hash=None,
+        requested_by_user_id="admin",
+        error_code=None,
+        created_at=1,
+        updated_at=1,
+    )
+    target = EditionConversionTarget(
+        job_id="job",
+        ordinal=0,
+        disc_number=1,
+        track_number=1,
+        release_track_mbid="release-track",
+        recording_mbid="recording",
+        title="Track",
+        duration_seconds=1,
+        state="kept",
+        kept_local_track_id="track",
+    )
+    local = EditionConversionLocalFile(
+        job_id="job",
+        local_track_id="track",
+        action="keep",
+        target_ordinal=0,
+        evidence_kind="recording",
+        expected_track_revision=1,
+        expected_identity_revision=None,
+        expected_stat_revision="stat",
+    )
+
+    created = await first.create_edition_conversion(job, (target,), (local,))
+    loaded = await second.get_edition_conversion(created.id)
+
+    assert loaded == created
+    assert loaded is not None
+    assert loaded.artifacts == ()
+
+
+def test_custom_manifest_rows_are_immutable_across_store_reconstruction(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "library.db"
+    _seed(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO library_custom_edition_manifests "
+            "(id,local_album_id,version,release_group_mbid,album_title,album_artist_name,"
+            "album_metadata_json,source_album_revision,input_revision,content_hash,"
+            "sealed_by_user_id,sealed_at) VALUES "
+            "('manifest','album',1,'group','Album','Artist','{}',1,'input','content',"
+            "'admin',1)"
+        )
+        connection.execute(
+            "INSERT INTO library_custom_edition_tracks "
+            "(manifest_id,ordinal,local_track_id,source_track_revision,stat_revision,"
+            "tag_revision,title,artist_name,album_title,album_artist_name,disc_number,"
+            "track_number) VALUES "
+            "('manifest',0,'track',1,'stat','tag','Track','Artist','Album','Artist',1,1)"
+        )
+    NativeLibraryStore(path, threading.Lock())
+
+    with sqlite3.connect(path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE library_custom_edition_manifests SET album_title='Changed' "
+                "WHERE id='manifest'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "DELETE FROM library_custom_edition_tracks WHERE manifest_id='manifest'"
+            )
+
+
+@pytest.mark.asyncio
+async def test_failed_download_association_can_be_retried_without_poisoning_target(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "library.db"
+    _seed(path)
+    store = NativeLibraryStore(path, threading.Lock())
+    job = EditionConversionJob(
+        id="retry-job",
+        local_album_id="album",
+        target_release_group_mbid="group-mbid",
+        target_release_mbid="release-mbid",
+        target_album_title="Album",
+        target_artist_name="Artist",
+        state="preflight",
+        expected_album_revision=1,
+        expected_input_revision="input",
+        expected_identity_revision="identity",
+        preflight_token_hash="hash",
+        download_source_ready=True,
+        required_temporary_bytes=1,
+        kept_count=0,
+        acquire_count=1,
+        recycle_count=1,
+        staged_count=0,
+        failed_count=0,
+        final_preview_job_id=None,
+        final_preview_token_hash=None,
+        final_bundle_json=None,
+        final_bundle_hash=None,
+        requested_by_user_id="admin",
+        error_code=None,
+        created_at=1,
+        updated_at=1,
+    )
+    target = EditionConversionTarget(
+        job_id=job.id,
+        ordinal=0,
+        disc_number=1,
+        track_number=1,
+        release_track_mbid="release-track",
+        recording_mbid="recording",
+        title="Track",
+        duration_seconds=1,
+        state="pending",
+    )
+    local = EditionConversionLocalFile(
+        job_id=job.id,
+        local_track_id="track",
+        action="recycle_extra",
+        target_ordinal=None,
+        evidence_kind="none",
+        expected_track_revision=1,
+        expected_identity_revision=None,
+        expected_stat_revision="stat",
+    )
+    await store.create_edition_conversion(job, (target,), (local,))
+    started = await store.start_edition_conversion(
+        job.id,
+        expected_row_revision=1,
+        preflight_token_hash="hash",
+        now=2,
+    )
+    await store.associate_edition_conversion_download(
+        job.id, 0, source_kind="download", task_id="first-task", now=3
+    )
+    await store.fail_edition_conversion_target(
+        job.id, 0, code="ACQUISITION_FAILED", now=4
+    )
+    failed = await store.get_edition_conversion(job.id)
+    assert failed is not None
+    retried = await store.reset_edition_conversion_targets(
+        job.id,
+        (0,),
+        expected_row_revision=failed.row_revision,
+        now=5,
+    )
+
+    await store.associate_edition_conversion_download(
+        job.id, 0, source_kind="download", task_id="second-task", now=6
+    )
+    associations = await store.list_edition_conversion_downloads(job.id)
+
+    assert started.state == "acquiring"
+    assert retried.targets[0].state == "pending"
+    assert [(row["task_id"], row["state"]) for row in associations] == [
+        ("first-task", "superseded"),
+        ("second-task", "active"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_conversion_rejects_late_download_association(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "library.db"
+    _seed(path)
+    store = NativeLibraryStore(path, threading.Lock())
+    job = EditionConversionJob(
+        id="cancel-job",
+        local_album_id="album",
+        target_release_group_mbid="group-mbid",
+        target_release_mbid="release-mbid",
+        target_album_title="Album",
+        target_artist_name="Artist",
+        state="preflight",
+        expected_album_revision=1,
+        expected_input_revision="input",
+        expected_identity_revision="identity",
+        preflight_token_hash="hash",
+        download_source_ready=True,
+        required_temporary_bytes=1,
+        kept_count=0,
+        acquire_count=1,
+        recycle_count=1,
+        staged_count=0,
+        failed_count=0,
+        final_preview_job_id=None,
+        final_preview_token_hash=None,
+        final_bundle_json=None,
+        final_bundle_hash=None,
+        requested_by_user_id="admin",
+        error_code=None,
+        created_at=1,
+        updated_at=1,
+    )
+    target = EditionConversionTarget(
+        job_id=job.id,
+        ordinal=0,
+        disc_number=1,
+        track_number=1,
+        release_track_mbid="release-track",
+        recording_mbid="recording",
+        title="Track",
+        duration_seconds=1,
+        state="pending",
+    )
+    local = EditionConversionLocalFile(
+        job_id=job.id,
+        local_track_id="track",
+        action="recycle_extra",
+        target_ordinal=None,
+        evidence_kind="none",
+        expected_track_revision=1,
+        expected_identity_revision=None,
+        expected_stat_revision="stat",
+    )
+    await store.create_edition_conversion(job, (target,), (local,))
+    started = await store.start_edition_conversion(
+        job.id,
+        expected_row_revision=1,
+        preflight_token_hash="hash",
+        now=2,
+    )
+    await store.cancel_edition_conversion(
+        job.id, expected_row_revision=started.row_revision, now=3
+    )
+
+    with pytest.raises(StaleRevisionError):
+        await store.associate_edition_conversion_download(
+            job.id, 0, source_kind="download", task_id="late-task", now=4
+        )
+
+
+def test_store_clears_legacy_plaintext_conversion_preview_tokens(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "library.db"
+    _seed(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "ALTER TABLE library_edition_conversion_jobs "
+            "ADD COLUMN final_preview_token TEXT"
+        )
+        connection.execute(
+            "INSERT INTO library_edition_conversion_jobs "
+            "(id,local_album_id,target_release_group_mbid,target_release_mbid,"
+            "target_album_title,target_artist_name,state,expected_album_revision,"
+            "expected_input_revision,expected_identity_revision,preflight_token_hash,"
+            "download_source_ready,required_temporary_bytes,kept_count,acquire_count,"
+            "recycle_count,staged_count,failed_count,requested_by_user_id,created_at,"
+            "updated_at,final_preview_token) VALUES "
+            "('legacy','album','group','release','Album','Artist','cancelled',1,"
+            "'input','identity','hash',1,1,0,1,1,0,0,'admin',1,1,'plaintext-secret')"
+        )
+
+    NativeLibraryStore(path, threading.Lock())
+
+    with sqlite3.connect(path) as connection:
+        token = connection.execute(
+            "SELECT final_preview_token FROM library_edition_conversion_jobs "
+            "WHERE id='legacy'"
+        ).fetchone()[0]
+    assert token is None

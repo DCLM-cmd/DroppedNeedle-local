@@ -1,10 +1,20 @@
 import type { ActiveRequestsResponse, RequestHistoryResponse } from '$lib/types';
 import { api } from '$lib/api/client';
-import { pendingApprovalCountStore } from '$lib/stores/pendingApprovalCountStore.svelte';
+import { authStore } from '$lib/stores/authStore.svelte';
+import { FollowQueryKeyFactory } from '$lib/queries/following/FollowQueryKeyFactory';
+import {
+	invalidateQueriesWithPersister,
+	setQueryDataWithPersister
+} from '$lib/queries/QueryClient';
 export type { ActiveRequestsResponse, RequestHistoryResponse } from '$lib/types';
 
 export function notifyPendingApprovalCountChanged(count?: number): void {
-	pendingApprovalCountStore.notify(count);
+	const queryKey = FollowQueryKeyFactory.pendingApprovalCount(authStore.user?.id);
+	if (typeof count === 'number') {
+		void setQueryDataWithPersister<{ count: number }>(queryKey, { count });
+		return;
+	}
+	void invalidateQueriesWithPersister({ queryKey, exact: true });
 }
 
 export async function fetchActiveRequests(signal?: AbortSignal): Promise<ActiveRequestsResponse> {

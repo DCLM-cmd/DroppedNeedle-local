@@ -11,7 +11,7 @@
 		fetchAlbumQueueItems,
 		type AlbumCardMeta
 	} from '$lib/utils/albumCardPlayback';
-	import { openGlobalPlaylistModal } from './AddToPlaylistModal.svelte';
+	import { openGlobalPlaylistModal } from '$lib/stores/playlistModal.svelte';
 	import { downloadFile } from '$lib/utils/downloadHelper';
 	import { API } from '$lib/constants';
 

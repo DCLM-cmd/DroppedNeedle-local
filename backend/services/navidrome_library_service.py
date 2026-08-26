@@ -26,6 +26,7 @@ from api.v1.schemas.navidrome import (
     NavidromeNowPlayingEntrySchema,
     NavidromeNowPlayingResponse,
     NavidromePlaylistDetail,
+    NavidromePlaylistCollection,
     NavidromePlaylistSummary,
     NavidromePlaylistTrack,
     NavidromeSearchResponse,
@@ -33,10 +34,16 @@ from api.v1.schemas.navidrome import (
 )
 from infrastructure.cover_urls import prefer_artist_cover_url, prefer_release_group_cover_url
 from infrastructure.validators import clean_lastfm_bio
-from core.exceptions import ExternalServiceError
+from core.exceptions import (
+    ExternalServiceError,
+    MediaAccountRelinkRequiredError,
+    NavidromeAuthError,
+    ResourceNotFoundError,
+)
 from repositories.navidrome_models import SubsonicAlbum, SubsonicSong
 from repositories.protocols import NavidromeRepositoryProtocol
 from services.preferences_service import PreferencesService
+from services.per_user_client_factory import MediaClientResolution, PerUserClientFactory
 
 if TYPE_CHECKING:
     from infrastructure.persistence import LibraryDB, MBIDStore
@@ -61,7 +68,7 @@ def _clean_album_name(name: str) -> str:
     """Strip common suffixes like '(Remastered 2009)', '[Deluxe Edition]', year prefixes, etc."""
     cleaned = name.strip()
     cleaned = re.sub(r'\s*[\(\[][^)\]]*(?:remaster|deluxe|edition|bonus|expanded|mono|stereo|anniversary)[^)\]]*[\)\]]', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'^\d{4}\s*[-–—]\s*', '', cleaned)
+    cleaned = re.sub(r'^\d{4}\s*[-–\u2014]\s*', '', cleaned)
     cleaned = re.sub(r'\s*-\s*EP$', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\s*\[[^\]]*\]\s*$', '', cleaned)
     return cleaned.strip()
@@ -82,11 +89,13 @@ class NavidromeLibraryService:
         preferences_service: PreferencesService,
         library_db: 'LibraryDB | None' = None,
         mbid_store: 'MBIDStore | None' = None,
+        client_factory: PerUserClientFactory | None = None,
     ):
         self._navidrome = navidrome_repo
         self._preferences = preferences_service
         self._library_db = library_db
         self._mbid_store = mbid_store
+        self._client_factory = client_factory
         self._album_mbid_cache: dict[str, str | tuple[None, float]] = {}
         self._artist_mbid_cache: dict[str, str | tuple[None, float]] = {}
         self._mbid_to_navidrome_id: dict[str, str] = {}
@@ -268,21 +277,39 @@ class NavidromeLibraryService:
         genre: str | None = None,
         from_year: int | None = None,
         to_year: int | None = None,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> list[NavidromeAlbumSummary]:
         albums = await self._navidrome.get_album_list(
             type=type, size=size, offset=offset, genre=genre,
             from_year=from_year, to_year=to_year,
+            music_folder_ids=music_folder_ids,
         )
         filtered = [a for a in albums if a.name and a.name != "Unknown"]
         summaries = await asyncio.gather(*(self._album_to_summary(a) for a in filtered))
         return list(summaries)
 
-    async def get_album_detail(self, album_id: str) -> NavidromeAlbumDetail | None:
+    async def get_album_detail(
+        self,
+        album_id: str,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> NavidromeAlbumDetail | None:
         try:
             album = await self._navidrome.get_album(album_id)
         except Exception:  # noqa: BLE001
             logger.warning("Failed to fetch Navidrome album %s", album_id, exc_info=True)
             return None
+        if music_folder_ids is not None:
+            if not music_folder_ids:
+                return None
+            scoped = await self._navidrome.search(
+                album.name,
+                artist_count=0,
+                album_count=500,
+                song_count=0,
+                music_folder_ids=music_folder_ids,
+            )
+            if not any(candidate.id == album_id for candidate in scoped.album):
+                return None
 
         songs = album.song or []
         tracks = self._fix_missing_track_numbers(
@@ -305,8 +332,10 @@ class NavidromeLibraryService:
             tracks=tracks,
         )
 
-    async def get_artists(self) -> list[NavidromeArtistSummary]:
-        artists = await self._navidrome.get_artists()
+    async def get_artists(
+        self, music_folder_ids: tuple[str, ...] | None = None
+    ) -> list[NavidromeArtistSummary]:
+        artists = await self._navidrome.get_artists(music_folder_ids)
         summaries = await asyncio.gather(*(self._build_artist_summary(a) for a in artists))
         return list(summaries)
 
@@ -315,8 +344,9 @@ class NavidromeLibraryService:
         size: int = 48,
         offset: int = 0,
         search: str = "",
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> tuple[list[NavidromeArtistSummary], int]:
-        all_artists = await self._navidrome.get_artists()
+        all_artists = await self._navidrome.get_artists(music_folder_ids)
         if search:
             query = search.lower()
             all_artists = [a for a in all_artists if query in a.name.lower()]
@@ -330,24 +360,50 @@ class NavidromeLibraryService:
         size: int = 48,
         offset: int = 0,
         search: str = "",
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> tuple[list[NavidromeTrackInfo], int]:
         songs = await self._navidrome.search_songs(
-            query=search, count=size, offset=offset
+            query=search,
+            count=size,
+            offset=offset,
+            music_folder_ids=music_folder_ids,
         )
         tracks = [self._song_to_track_info(s) for s in songs]
         try:
-            stats = await self.get_stats()
+            stats = await self.get_stats(music_folder_ids)
             total = stats.total_tracks if len(tracks) >= size else offset + len(tracks)
         except Exception:  # noqa: BLE001
             total = offset + len(tracks) + (1 if len(tracks) >= size else 0)
         return tracks, total
 
-    async def get_artist_detail(self, artist_id: str) -> dict[str, object] | None:
-        try:
-            artist = await self._navidrome.get_artist(artist_id)
-        except Exception:  # noqa: BLE001
-            logger.warning("Failed to fetch Navidrome artist %s", artist_id, exc_info=True)
-            return None
+    async def get_artist_detail(
+        self,
+        artist_id: str,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, object] | None:
+        if music_folder_ids is None:
+            try:
+                artist = await self._navidrome.get_artist(artist_id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Failed to fetch Navidrome artist %s", artist_id, exc_info=True
+                )
+                return None
+        else:
+            if not music_folder_ids:
+                return None
+            artist = next(
+                (
+                    candidate
+                    for candidate in await self._navidrome.get_artists(
+                        music_folder_ids
+                    )
+                    if candidate.id == artist_id
+                ),
+                None,
+            )
+            if artist is None:
+                return None
 
         library_mbid = await self._resolve_artist_mbid(artist.name) if artist.name else None
         mbid = library_mbid or artist.musicBrainzId or None
@@ -364,7 +420,13 @@ class NavidromeLibraryService:
                 except Exception:  # noqa: BLE001
                     return None
 
-        search_result = await self._navidrome.search(artist.name, artist_count=0, album_count=500, song_count=0)
+        search_result = await self._navidrome.search(
+            artist.name,
+            artist_count=0,
+            album_count=500,
+            song_count=0,
+            music_folder_ids=music_folder_ids,
+        )
         artist_album_ids = [a.id for a in search_result.album if a.artistId == artist_id and a.name and a.name != "Unknown"]
 
         if artist_album_ids:
@@ -382,8 +444,12 @@ class NavidromeLibraryService:
             "albums": albums,
         }
 
-    async def search(self, query: str) -> NavidromeSearchResponse:
-        result = await self._navidrome.search(query)
+    async def search(
+        self, query: str, music_folder_ids: tuple[str, ...] | None = None
+    ) -> NavidromeSearchResponse:
+        result = await self._navidrome.search(
+            query, music_folder_ids=music_folder_ids
+        )
         filtered_albums = [a for a in result.album if a.name and a.name != "Unknown"]
         albums_task = asyncio.gather(*(self._album_to_summary(a) for a in filtered_albums))
         artists_task = asyncio.gather(*(self._build_artist_summary(a) for a in result.artist))
@@ -391,14 +457,25 @@ class NavidromeLibraryService:
         tracks = [self._song_to_track_info(s) for s in result.song]
         return NavidromeSearchResponse(albums=list(albums), artists=list(artists), tracks=tracks)
 
-    async def get_recent(self, limit: int = 20) -> list[NavidromeAlbumSummary]:
-        albums = await self._navidrome.get_album_list(type="recent", size=limit, offset=0)
+    async def get_recent(
+        self,
+        limit: int = 20,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> list[NavidromeAlbumSummary]:
+        albums = await self._navidrome.get_album_list(
+            type="recent",
+            size=limit,
+            offset=0,
+            music_folder_ids=music_folder_ids,
+        )
         filtered = [a for a in albums if a.name and a.name != "Unknown"]
         summaries = await asyncio.gather(*(self._album_to_summary(a) for a in filtered))
         return list(summaries)
 
-    async def get_favorites(self) -> NavidromeSearchResponse:
-        starred = await self._navidrome.get_starred()
+    async def get_favorites(
+        self, music_folder_ids: tuple[str, ...] | None = None
+    ) -> NavidromeSearchResponse:
+        starred = await self._navidrome.get_starred(music_folder_ids)
         filtered_albums = [a for a in starred.album if a.name and a.name != "Unknown"]
         albums_task = asyncio.gather(*(self._album_to_summary(a) for a in filtered_albums))
         artists_task = asyncio.gather(*(self._build_artist_summary(a) for a in starred.artist))
@@ -406,12 +483,33 @@ class NavidromeLibraryService:
         tracks = [self._song_to_track_info(s) for s in starred.song]
         return NavidromeSearchResponse(albums=list(albums), artists=list(artists), tracks=tracks)
 
-    async def get_genres(self) -> list[str]:
-        genres = await self._navidrome.get_genres()
-        return [g.name for g in genres if g.name]
+    async def get_genres(
+        self, music_folder_ids: tuple[str, ...] | None = None
+    ) -> list[str]:
+        if music_folder_ids is None:
+            genres = await self._navidrome.get_genres()
+            return [g.name for g in genres if g.name]
+        if not music_folder_ids:
+            return []
+        names: set[str] = set()
+        offset = 0
+        while offset < 100_000:
+            albums = await self._navidrome.get_album_list(
+                type="alphabeticalByName",
+                size=500,
+                offset=offset,
+                music_folder_ids=music_folder_ids,
+            )
+            names.update(album.genre for album in albums if album.genre)
+            if len(albums) < 500:
+                break
+            offset += len(albums)
+        return sorted(names, key=str.casefold)
 
-    async def get_artists_index(self) -> NavidromeArtistIndexResponse:
-        index_data = await self._navidrome.get_artists_index()
+    async def get_artists_index(
+        self, music_folder_ids: tuple[str, ...] | None = None
+    ) -> NavidromeArtistIndexResponse:
+        index_data = await self._navidrome.get_artists_index(music_folder_ids)
         entries: list[NavidromeArtistIndexEntry] = []
         for idx in index_data:
             artists = []
@@ -430,20 +528,38 @@ class NavidromeLibraryService:
         return NavidromeArtistIndexResponse(index=entries)
 
     async def get_songs_by_genre(
-        self, genre: str, count: int = 50, offset: int = 0
+        self,
+        genre: str,
+        count: int = 50,
+        offset: int = 0,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> NavidromeGenreSongsResponse:
-        songs = await self._navidrome.get_songs_by_genre(genre=genre, count=count, offset=offset)
+        songs = await self._navidrome.get_songs_by_genre(
+            genre=genre,
+            count=count,
+            offset=offset,
+            music_folder_ids=music_folder_ids,
+        )
         tracks = [self._song_to_track_info(s) for s in songs]
         return NavidromeGenreSongsResponse(songs=tracks, genre=genre)
 
     async def get_songs_by_genres(
-        self, genres: list[str], count: int = 50, offset: int = 0
+        self,
+        genres: list[str],
+        count: int = 50,
+        offset: int = 0,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> NavidromeGenreSongsResponse:
         import asyncio
         capped = genres[:10]
         per_genre = max(count // len(capped), 10)
         tasks = [
-            self._navidrome.get_songs_by_genre(genre=g, count=per_genre, offset=offset)
+            self._navidrome.get_songs_by_genre(
+                genre=g,
+                count=per_genre,
+                offset=offset,
+                music_folder_ids=music_folder_ids,
+            )
             for g in capped
         ]
         results = await asyncio.gather(*tasks)
@@ -461,18 +577,35 @@ class NavidromeLibraryService:
         folders = await self._navidrome.get_music_folders()
         return [NavidromeMusicFolder(id=f.id, name=f.name) for f in folders]
 
-    async def get_stats(self) -> NavidromeLibraryStats:
-        artists = await self._navidrome.get_artists()
-        first_page = await self._navidrome.get_album_list(type="alphabeticalByName", size=1, offset=0)
+    async def get_stats(
+        self, music_folder_ids: tuple[str, ...] | None = None
+    ) -> NavidromeLibraryStats:
+        artists = await self._navidrome.get_artists(music_folder_ids)
+        first_page = await self._navidrome.get_album_list(
+            type="alphabeticalByName",
+            size=1,
+            offset=0,
+            music_folder_ids=music_folder_ids,
+        )
         total_albums = 0
         all_albums: list = []
         if first_page:
-            all_albums = await self._navidrome.get_album_list(type="alphabeticalByName", size=500, offset=0)
+            all_albums = await self._navidrome.get_album_list(
+                type="alphabeticalByName",
+                size=500,
+                offset=0,
+                music_folder_ids=music_folder_ids,
+            )
             total_albums = len(all_albums)
             if total_albums >= 500:
                 offset = 500
                 while True:
-                    batch = await self._navidrome.get_album_list(type="alphabeticalByName", size=500, offset=offset)
+                    batch = await self._navidrome.get_album_list(
+                        type="alphabeticalByName",
+                        size=500,
+                        offset=offset,
+                        music_folder_ids=music_folder_ids,
+                    )
                     if not batch:
                         break
                     all_albums.extend(batch)
@@ -492,6 +625,7 @@ class NavidromeLibraryService:
         album_id: str,
         album_name: str,
         artist_name: str,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> NavidromeAlbumMatch:
         sem = asyncio.Semaphore(_CONCURRENCY_LIMIT)
 
@@ -501,17 +635,38 @@ class NavidromeLibraryService:
 
         if album_id and album_id in self._mbid_to_navidrome_id:
             nav_id = self._mbid_to_navidrome_id[album_id]
-            detail = await _fetch_detail(nav_id)
-            if detail:
-                return NavidromeAlbumMatch(
-                    found=True,
-                    navidrome_album_id=detail.navidrome_id,
-                    tracks=detail.tracks,
-                )
+            in_scope = music_folder_ids is None
+            if music_folder_ids:
+                offset = 0
+                while offset < 100_000:
+                    batch = await self._navidrome.get_album_list(
+                        type="alphabeticalByName",
+                        size=500,
+                        offset=offset,
+                        music_folder_ids=music_folder_ids,
+                    )
+                    if any(candidate.id == nav_id for candidate in batch):
+                        in_scope = True
+                        break
+                    if len(batch) < 500:
+                        break
+                    offset += len(batch)
+            if in_scope:
+                detail = await _fetch_detail(nav_id)
+                if detail:
+                    return NavidromeAlbumMatch(
+                        found=True,
+                        navidrome_album_id=detail.navidrome_id,
+                        tracks=detail.tracks,
+                    )
 
         if album_id:
             search_result = await self._navidrome.search(
-                album_name, artist_count=0, album_count=50, song_count=0
+                album_name,
+                artist_count=0,
+                album_count=50,
+                song_count=0,
+                music_folder_ids=music_folder_ids,
             )
             for candidate in search_result.album:
                 if candidate.musicBrainzId and candidate.musicBrainzId == album_id:
@@ -528,7 +683,11 @@ class NavidromeLibraryService:
             norm_artist = _normalize(artist_name)
 
             search_result = await self._navidrome.search(
-                album_name, artist_count=0, album_count=50, song_count=0
+                album_name,
+                artist_count=0,
+                album_count=50,
+                song_count=0,
+                music_folder_ids=music_folder_ids,
             )
             for candidate in search_result.album:
                 if (
@@ -545,30 +704,138 @@ class NavidromeLibraryService:
 
         return NavidromeAlbumMatch(found=False)
 
-    async def list_playlists(self, limit: int = 50) -> list[NavidromePlaylistSummary]:
-        raw = await self._navidrome.get_playlists()
+    async def _playlist_resolution(
+        self, user_id: str
+    ) -> MediaClientResolution[NavidromeRepositoryProtocol]:
+        if self._client_factory is not None:
+            linked = await self._client_factory.resolve_navidrome_playlist(user_id)
+            if linked is not None:
+                return linked
+        return MediaClientResolution(
+            repository=self._navidrome,
+            account_mode="shared",
+            account_label="Shared Navidrome account",
+            cache_scope="shared",
+        )
+
+    async def _scoped_song_ids(
+        self,
+        repo: NavidromeRepositoryProtocol,
+        music_folder_ids: tuple[str, ...],
+    ) -> set[str]:
+        if not music_folder_ids:
+            return set()
+        ids: set[str] = set()
+        offset = 0
+        while offset < 100_000:
+            songs = await repo.search_songs(
+                query="",
+                count=500,
+                offset=offset,
+                music_folder_ids=music_folder_ids,
+            )
+            ids.update(song.id for song in songs)
+            if len(songs) < 500:
+                break
+            offset += len(songs)
+        return ids
+
+    async def _list_playlists(
+        self,
+        repo: NavidromeRepositoryProtocol,
+        limit: int = 50,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> list[NavidromePlaylistSummary]:
+        raw = await repo.get_playlists()
+        allowed_ids = (
+            None
+            if music_folder_ids is None
+            else await self._scoped_song_ids(repo, music_folder_ids)
+        )
         summaries = []
         for p in raw[:limit]:
+            song_count = p.songCount
+            duration = p.duration
+            if allowed_ids is not None:
+                detail = await repo.get_playlist(p.id)
+                entries = [
+                    song for song in (detail.entry or []) if song.id in allowed_ids
+                ]
+                song_count = len(entries)
+                duration = sum(song.duration for song in entries)
             summaries.append(NavidromePlaylistSummary(
                 id=p.id,
                 name=p.name,
-                track_count=p.songCount,
-                duration_seconds=p.duration,
-                cover_url=f"/api/v1/navidrome/cover/{p.id}" if p.id else "",
+                track_count=song_count,
+                duration_seconds=duration,
+                cover_url=(
+                    f"/api/v1/navidrome/playlist-cover/{p.id}/{p.coverArt or p.id}"
+                    if p.id
+                    else ""
+                ),
                 owner=p.owner,
                 is_public=p.public,
                 updated_at=p.changed,
             ))
         return summaries
 
-    async def get_playlist_detail(self, playlist_id: str) -> NavidromePlaylistDetail:
-        raw = await self._navidrome.get_playlist(playlist_id)
-        if raw is None:
-            from core.exceptions import ResourceNotFoundError
-            raise ResourceNotFoundError(f"Navidrome playlist {playlist_id} not found")
+    async def list_playlists(
+        self,
+        limit: int = 50,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> list[NavidromePlaylistSummary]:
+        return await self._list_playlists(
+            self._navidrome, limit, music_folder_ids
+        )
 
+    async def list_user_playlists(
+        self,
+        requesting: 'UserRecord',
+        playlist_service: 'PlaylistService',
+        limit: int = 50,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> NavidromePlaylistCollection:
+        resolution = await self._playlist_resolution(requesting.id)
+        try:
+            playlists = await self._list_playlists(
+                resolution.repository, limit, music_folder_ids
+            )
+        except NavidromeAuthError as exc:
+            if resolution.account_mode == "linked":
+                raise MediaAccountRelinkRequiredError(
+                    "Reconnect Navidrome to check your playlists"
+                ) from exc
+            raise
+        imported_ids = await playlist_service.get_imported_source_ids(
+            "navidrome:", user_id=requesting.id
+        )
+        for playlist in playlists:
+            playlist.is_imported = playlist.id in imported_ids
+        return NavidromePlaylistCollection(
+            account_mode=resolution.account_mode,
+            account_label=resolution.account_label,
+            playlists=playlists,
+        )
+
+    async def _get_playlist_detail(
+        self,
+        repo: NavidromeRepositoryProtocol,
+        playlist_id: str,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> NavidromePlaylistDetail:
+        visible = await repo.get_playlists()
+        if not any(playlist.id == playlist_id for playlist in visible):
+            raise ResourceNotFoundError("Navidrome playlist not found")
+        raw = await repo.get_playlist(playlist_id)
+        if raw is None:
+            raise ResourceNotFoundError("Navidrome playlist not found")
+
+        entries = raw.entry or []
+        if music_folder_ids is not None:
+            allowed_ids = await self._scoped_song_ids(repo, music_folder_ids)
+            entries = [song for song in entries if song.id in allowed_ids]
         tracks = []
-        for s in raw.entry or []:
+        for s in entries:
             tracks.append(NavidromePlaylistTrack(
                 id=s.id,
                 track_name=s.title,
@@ -579,23 +846,92 @@ class NavidromeLibraryService:
                 duration_seconds=s.duration,
                 track_number=s.track,
                 disc_number=s.discNumber,
-                cover_url=f"/api/v1/navidrome/cover/{s.albumId}" if s.albumId else "",
+                cover_url=(
+                    f"/api/v1/navidrome/playlist-cover/{playlist_id}/"
+                    f"{s.coverArt or s.albumId}"
+                    if (s.coverArt or s.albumId)
+                    else ""
+                ),
             ))
 
         return NavidromePlaylistDetail(
             id=raw.id,
             name=raw.name,
-            track_count=raw.songCount,
-            duration_seconds=raw.duration,
-            cover_url=f"/api/v1/navidrome/cover/{raw.id}" if raw.id else "",
+            track_count=len(tracks),
+            duration_seconds=sum(track.duration_seconds for track in tracks),
+            cover_url=(
+                f"/api/v1/navidrome/playlist-cover/{raw.id}/{raw.coverArt or raw.id}"
+                if raw.id
+                else ""
+            ),
             tracks=tracks,
         )
+
+    async def get_playlist_detail(
+        self,
+        playlist_id: str,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> NavidromePlaylistDetail:
+        return await self._get_playlist_detail(
+            self._navidrome, playlist_id, music_folder_ids
+        )
+
+    async def get_user_playlist_detail(
+        self,
+        playlist_id: str,
+        requesting: 'UserRecord',
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> NavidromePlaylistDetail:
+        resolution = await self._playlist_resolution(requesting.id)
+        try:
+            return await self._get_playlist_detail(
+                resolution.repository, playlist_id, music_folder_ids
+            )
+        except NavidromeAuthError as exc:
+            if resolution.account_mode == "linked":
+                raise MediaAccountRelinkRequiredError(
+                    "Reconnect Navidrome to check your playlists"
+                ) from exc
+            raise
+
+    async def get_playlist_cover(
+        self,
+        playlist_id: str,
+        cover_art_id: str,
+        requesting: 'UserRecord',
+        size: int,
+    ) -> tuple[bytes, str]:
+        resolution = await self._playlist_resolution(requesting.id)
+        repo = resolution.repository
+        try:
+            visible = await repo.get_playlists()
+            summary = next(
+                (playlist for playlist in visible if playlist.id == playlist_id),
+                None,
+            )
+            if summary is None:
+                raise ResourceNotFoundError("Navidrome playlist cover not found")
+            detail = await repo.get_playlist(playlist_id)
+            allowed = {playlist_id, summary.coverArt, detail.coverArt}
+            for item in detail.entry or []:
+                allowed.update((item.id, item.albumId, item.coverArt))
+            allowed.discard("")
+            if cover_art_id not in allowed:
+                raise ResourceNotFoundError("Navidrome playlist cover not found")
+            return await repo.get_cover_art(cover_art_id, size)
+        except NavidromeAuthError as exc:
+            if resolution.account_mode == "linked":
+                raise MediaAccountRelinkRequiredError(
+                    "Reconnect Navidrome to check your playlists"
+                ) from exc
+            raise
 
     async def import_playlist(
         self,
         playlist_id: str,
         playlist_service: 'PlaylistService',
         requesting: 'UserRecord',
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> NavidromeImportResult:
         source_ref = f"navidrome:{playlist_id}"
         existing = await playlist_service.get_by_source_ref(source_ref, user_id=requesting.id)
@@ -605,7 +941,9 @@ class NavidromeLibraryService:
                 already_imported=True,
             )
 
-        detail = await self.get_playlist_detail(playlist_id)
+        detail = await self.get_user_playlist_detail(
+            playlist_id, requesting, music_folder_ids
+        )
         try:
             created = await playlist_service.create_playlist(
                 detail.name, source_ref=source_ref, user_id=requesting.id,
@@ -654,9 +992,14 @@ class NavidromeLibraryService:
         self,
         size: int = 20,
         genre: str | None = None,
+        music_folder_ids: tuple[str, ...] | None = None,
     ) -> list[NavidromeTrackInfo]:
         try:
-            songs = await self._navidrome.get_random_songs(size=size, genre=genre)
+            songs = await self._navidrome.get_random_songs(
+                size=size,
+                genre=genre,
+                music_folder_ids=music_folder_ids,
+            )
             return [self._song_to_track_info(s) for s in songs]
         except Exception:  # noqa: BLE001
             logger.warning("get_random_songs failed", exc_info=True)
@@ -687,16 +1030,29 @@ class NavidromeLibraryService:
             logger.warning("get_now_playing failed", exc_info=True)
             return NavidromeNowPlayingResponse(entries=[])
 
-    async def get_hub_data(self) -> NavidromeHubResponse:
+    async def get_hub_data(
+        self, music_folder_ids: tuple[str, ...] | None = None
+    ) -> NavidromeHubResponse:
         _HUB_TIMEOUT = 10
 
         results = await asyncio.gather(
-            asyncio.wait_for(self.get_recent(limit=20), timeout=_HUB_TIMEOUT),
-            asyncio.wait_for(self.get_favorites(), timeout=_HUB_TIMEOUT),
-            asyncio.wait_for(self.get_albums(size=12), timeout=_HUB_TIMEOUT),
-            asyncio.wait_for(self.get_stats(), timeout=_HUB_TIMEOUT),
-            asyncio.wait_for(self.list_playlists(limit=20), timeout=_HUB_TIMEOUT),
-            asyncio.wait_for(self.get_genres(), timeout=_HUB_TIMEOUT),
+            asyncio.wait_for(
+                self.get_recent(limit=20, music_folder_ids=music_folder_ids),
+                timeout=_HUB_TIMEOUT,
+            ),
+            asyncio.wait_for(
+                self.get_favorites(music_folder_ids), timeout=_HUB_TIMEOUT
+            ),
+            asyncio.wait_for(
+                self.get_albums(size=12, music_folder_ids=music_folder_ids),
+                timeout=_HUB_TIMEOUT,
+            ),
+            asyncio.wait_for(
+                self.get_stats(music_folder_ids), timeout=_HUB_TIMEOUT
+            ),
+            asyncio.wait_for(
+                self.get_genres(music_folder_ids), timeout=_HUB_TIMEOUT
+            ),
             return_exceptions=True,
         )
 
@@ -727,13 +1083,9 @@ class NavidromeLibraryService:
         if isinstance(results[3], BaseException):
             logger.warning("Hub: get_stats failed: %s", results[3])
 
-        playlists = results[4] if not isinstance(results[4], BaseException) else []
+        genres = results[4] if not isinstance(results[4], BaseException) else []
         if isinstance(results[4], BaseException):
-            logger.warning("Hub: list_playlists failed: %s", results[4])
-
-        genres = results[5] if not isinstance(results[5], BaseException) else []
-        if isinstance(results[5], BaseException):
-            logger.warning("Hub: get_genres failed: %s", results[5])
+            logger.warning("Hub: get_genres failed: %s", results[4])
 
         return NavidromeHubResponse(
             stats=stats,
@@ -742,7 +1094,6 @@ class NavidromeLibraryService:
             favorite_artists=favorite_artists,
             favorite_tracks=favorite_tracks,
             all_albums_preview=all_albums_preview,
-            playlists=playlists,
             genres=genres,
         )
 
@@ -886,7 +1237,14 @@ class NavidromeLibraryService:
             if mbid:
                 self._mbid_to_navidrome_id[mbid] = album.id
 
-    async def get_top_songs(self, artist_name: str, count: int = 20) -> list[NavidromeTrackInfo]:
+    async def get_top_songs(
+        self,
+        artist_name: str,
+        count: int = 20,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> list[NavidromeTrackInfo]:
+        if music_folder_ids is not None:
+            return []
         try:
             songs = await self._navidrome.get_top_songs(artist_name, count=count)
             return [
@@ -905,7 +1263,14 @@ class NavidromeLibraryService:
             logger.debug("Top songs unavailable for %s (Last.fm may not be configured)", artist_name)
             return []
 
-    async def get_similar_songs(self, song_id: str, count: int = 20) -> list[NavidromeTrackInfo]:
+    async def get_similar_songs(
+        self,
+        song_id: str,
+        count: int = 20,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> list[NavidromeTrackInfo]:
+        if music_folder_ids is not None:
+            return []
         try:
             songs = await self._navidrome.get_similar_songs(song_id, count=count)
             return [
@@ -924,8 +1289,22 @@ class NavidromeLibraryService:
             logger.debug("Similar songs unavailable for %s (Last.fm may not be configured)", song_id)
             return []
 
-    async def get_artist_info(self, artist_id: str) -> NavidromeArtistInfoSchema | None:
+    async def get_artist_info(
+        self,
+        artist_id: str,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> NavidromeArtistInfoSchema | None:
         try:
+            allowed_artist_ids: set[str] | None = None
+            if music_folder_ids is not None:
+                allowed_artist_ids = {
+                    artist.id
+                    for artist in await self._navidrome.get_artists(
+                        music_folder_ids
+                    )
+                }
+                if artist_id not in allowed_artist_ids:
+                    return None
             info = await self._navidrome.get_artist_info(artist_id)
             if info is None:
                 return None
@@ -937,6 +1316,7 @@ class NavidromeLibraryService:
                     name=a.name,
                 )
                 for a in info.similarArtist
+                if allowed_artist_ids is None or a.id in allowed_artist_ids
             ]
             image = ""
             if info.largeImageUrl:
@@ -956,8 +1336,17 @@ class NavidromeLibraryService:
             logger.debug("Artist info unavailable for %s (Last.fm may not be configured)", artist_id)
             return None
 
-    async def get_album_info(self, album_id: str) -> NavidromeAlbumInfoSchema | None:
+    async def get_album_info(
+        self,
+        album_id: str,
+        music_folder_ids: tuple[str, ...] | None = None,
+    ) -> NavidromeAlbumInfoSchema | None:
         try:
+            if (
+                music_folder_ids is not None
+                and await self.get_album_detail(album_id, music_folder_ids) is None
+            ):
+                return None
             info = await self._navidrome.get_album_info(album_id)
             if info is None:
                 return None

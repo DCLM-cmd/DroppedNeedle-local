@@ -69,6 +69,7 @@
 						customUrl={album.image_url}
 						alt={album.name}
 						size="full"
+						requestSize={250}
 						rounded="none"
 						className="h-full w-full"
 					/>

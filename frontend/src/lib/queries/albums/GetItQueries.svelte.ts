@@ -9,19 +9,23 @@ import type { ArtistPurchaseOptionsResponse, PurchaseOptionsResponse } from '$li
 // section fetches this, with its own skeleton - the album page's load path
 // never pays for the cold MB/iTunes lookups. Not user-dependent (links come
 // from global admin settings), so no userId key segment.
-export const purchaseOptionsKey = (mbid: string) => ['albums', 'purchase-options', mbid] as const;
+export const purchaseOptionsKey = (mbid: string) =>
+	['albums', 'purchase-options', 'v2', mbid] as const;
 
-export const getPurchaseOptionsQuery = (mbid: Getter<string>) =>
+export const getPurchaseOptionsQuery = (
+	mbid: Getter<string>,
+	enabled: Getter<boolean> = () => true
+) =>
 	createQuery(() => ({
 		queryKey: purchaseOptionsKey(mbid()),
-		enabled: !!mbid(),
+		enabled: enabled() && !!mbid(),
 		staleTime: 24 * 60 * 60 * 1000, // the backend caches for 7 days anyway
 		queryFn: ({ signal }) =>
 			api.global.get<PurchaseOptionsResponse>(API.album.purchaseOptions(mbid()), { signal })
 	}));
 
 export const artistPurchaseOptionsKey = (mbid: string) =>
-	['artists', 'purchase-options', mbid] as const;
+	['artists', 'purchase-options', 'v2', mbid] as const;
 
 // The artist's own storefronts (their Bandcamp page, merch shop) - not one album.
 export const getArtistPurchaseOptionsQuery = (mbid: Getter<string>, name: Getter<string>) =>

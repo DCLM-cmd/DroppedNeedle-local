@@ -1,34 +1,37 @@
 import { browser } from '$app/environment';
-import { api } from '$lib/api/client';
+import { ApiError, api } from '$lib/api/client';
 import { API, AUTH_FREE_PATHS } from '$lib/constants';
-import { resetQueryCacheForUserSwitch } from '$lib/queries/QueryClient';
+import { queryClient, resetQueryCacheForUserSwitch } from '$lib/queries/QueryClient';
+import { getScrobblePreferencesQueryOptions } from '$lib/queries/scrobble-preferences/ScrobblePreferencesQuery.svelte';
 import { DEFAULT_SOURCE, isMusicSource, musicSourceStore } from '$lib/stores/musicSource';
 import { scrobbleManager } from '$lib/stores/scrobble.svelte';
 import { authStore, LAST_USER_ID_KEY } from '$lib/stores/authStore.svelte';
 import { clearUserScopedLocalCaches } from '$lib/utils/userScopedCaches';
-import { redirect } from '@sveltejs/kit';
+import { error, redirect } from '@sveltejs/kit';
 import type { LayoutLoad } from './$types';
 
 export const ssr = false;
 export const prerender = false;
 
+const BOOTSTRAP_TIMEOUT_MS = 10_000;
+const BUSY_MESSAGE = 'The server is busy. Your session is safe - try again shortly.';
+
 export const load: LayoutLoad = async ({ url }) => {
 	const path = url.pathname;
 	const isAuthFree = AUTH_FREE_PATHS.some((p) => path.startsWith(p));
 
-	let setupRequired = false;
-	try {
-		const status = await api.global.get<{ required: boolean }>('/api/v1/auth/setup/status');
-		setupRequired = status.required;
-	} catch {
-		// backend unreachable, let the page handle it
-	}
-
-	if (setupRequired && !isAuthFree) {
-		throw redirect(302, '/setup');
-	}
-
+	let setupRequired = authStore.setupRequired;
 	if (!authStore.initialized) {
+		try {
+			const status = await api.global.get<{ required: boolean }>(API.auth.setupStatus(), {
+				timeoutMs: BOOTSTRAP_TIMEOUT_MS
+			});
+			setupRequired = status.required;
+			authStore.setSetupRequired(setupRequired);
+		} catch {
+			throw error(503, BUSY_MESSAGE);
+		}
+
 		try {
 			const user = await api.global.get<{
 				id: string;
@@ -39,7 +42,7 @@ export const load: LayoutLoad = async ({ url }) => {
 				username: string | null;
 				username_display: string | null;
 				providers: string[];
-			}>('/api/v1/auth/me');
+			}>(API.auth.me(), { timeoutMs: BOOTSTRAP_TIMEOUT_MS });
 			authStore.setUser({
 				id: user.id,
 				display_name: user.display_name,
@@ -50,33 +53,38 @@ export const load: LayoutLoad = async ({ url }) => {
 				username_display: user.username_display,
 				providers: user.providers ?? []
 			});
-		} catch {
-			// no valid session; if a user was previously signed in here their session
-			// just ended (expiry/revoke), so clear the persisted cache too (AMU-5)
-			if (browser && localStorage.getItem(LAST_USER_ID_KEY)) {
-				await resetQueryCacheForUserSwitch();
-				clearUserScopedLocalCaches();
-				musicSourceStore.reset();
-				scrobbleManager.reset();
-				localStorage.removeItem(LAST_USER_ID_KEY);
+		} catch (cause) {
+			if (cause instanceof ApiError && cause.status === 401) {
+				if (browser && localStorage.getItem(LAST_USER_ID_KEY)) {
+					await resetQueryCacheForUserSwitch();
+					clearUserScopedLocalCaches();
+					musicSourceStore.reset();
+					scrobbleManager.reset();
+					localStorage.removeItem(LAST_USER_ID_KEY);
+				}
+				authStore.clear();
+			} else {
+				throw error(503, BUSY_MESSAGE);
 			}
-			authStore.clear();
 		}
 		authStore.markInitialized();
 	}
 
-	// AMU-5: reconcile the active user on every load, not just first hydration.
-	// `authStore.initialized` stays true after a warm in-app login (no reload), so a
-	// cold-load-only check would miss an account switch and leak the previous user's
-	// browser-wide cache (home/discover are not yet userId-keyed). Same-user reload
-	// keeps its cache (ids match).
+	if (setupRequired && !isAuthFree) {
+		throw redirect(302, '/setup');
+	}
+	if (!setupRequired && path.startsWith('/setup')) {
+		throw redirect(302, authStore.isAuthenticated ? '/' : '/login');
+	}
+
+	// initialized stays true after in-app login; reset persisted caches on account switches
 	if (browser && authStore.user) {
 		const lastId = localStorage.getItem(LAST_USER_ID_KEY);
 		if (lastId && lastId !== authStore.user.id) {
 			await resetQueryCacheForUserSwitch();
 			clearUserScopedLocalCaches();
 			musicSourceStore.reset();
-			await scrobbleManager.refreshSettings();
+			scrobbleManager.reset();
 		}
 		localStorage.setItem(LAST_USER_ID_KEY, authStore.user.id);
 	}
@@ -85,17 +93,21 @@ export const load: LayoutLoad = async ({ url }) => {
 		throw redirect(302, '/login');
 	}
 
-	// per-user primary source (F6/M2): read the requesting user's prefs, not the
-	// global admin default; falls back to DEFAULT_SOURCE on missing prefs / error
+	// the primary source is user-specific; connection defaults are global
 	let primarySource = DEFAULT_SOURCE;
-	try {
-		const data = await api.global.get<{ primary_music_source: unknown }>(
-			API.me.scrobblePreferences()
-		);
-		if (isMusicSource(data.primary_music_source)) primarySource = data.primary_music_source;
-	} catch {
-		/* keep DEFAULT_SOURCE fallback */
+	if (authStore.isAuthenticated) {
+		try {
+			const data = await queryClient.ensureQueryData(
+				getScrobblePreferencesQueryOptions(authStore.user?.id)
+			);
+			if (isMusicSource(data.primary_music_source)) {
+				primarySource = data.primary_music_source;
+				musicSourceStore.setSource(primarySource);
+			}
+		} catch {
+			primarySource = DEFAULT_SOURCE;
+		}
 	}
 
-	return { primarySource };
+	return { primarySource, user: authStore.user };
 };

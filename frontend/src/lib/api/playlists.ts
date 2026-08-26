@@ -20,6 +20,7 @@ export interface PlaylistTrack {
 	duration: number | null;
 	created_at: string;
 	plex_rating_key: string | null;
+	library_file_id: string | null;
 }
 
 export interface PlaylistSummary {

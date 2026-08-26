@@ -1,7 +1,7 @@
 from typing import Literal
 
-from api.v1.schemas.home import HomeAlbum, HomeSection, ServicePrompt
-from api.v1.schemas.common import GenreArtistMap, IntegrationStatus
+from api.v1.schemas.home import GenreArtwork, HomeAlbum, HomeSection, ServicePrompt
+from api.v1.schemas.common import IntegrationStatus
 from api.v1.schemas.weekly_exploration import WeeklyExplorationSection
 from models.youtube import YouTubeQuotaResponse as YouTubeQuotaResponse
 from infrastructure.msgspec_fastapi import AppStruct
@@ -136,6 +136,7 @@ class RadioSeedItem(AppStruct):
     artist_mbid: str
     artist_name: str = ""
     album_mbid: str | None = None
+    album_name: str = ""
 
 
 class RadioPlanRequest(AppStruct):
@@ -145,8 +146,7 @@ class RadioPlanRequest(AppStruct):
     mode: Literal["library", "hybrid"] = "hybrid"
     count: int = 30
     exclude_recording_mbids: list[str] = []
-    # fast=True expands only the seed itself (+ library pool) so first audio
-    # lands within the <=5s budget; the client follows up with fast=False
+    # Accepted for compatibility with the former two-stage client. Plans are complete.
     fast: bool = False
 
 
@@ -248,8 +248,8 @@ class DiscoverResponse(AppStruct):
     weekly_exploration: WeeklyExplorationSection | None = None
     integration_status: DiscoverIntegrationStatus | None = None
     service_prompts: list[ServicePrompt] = []
-    genre_artists: GenreArtistMap = {}
-    genre_artist_images: GenreArtistMap = {}
+    genre_artwork: dict[str, GenreArtwork] = {}
+    genre_artwork_schema_version: str = "v2"
     lastfm_weekly_artist_chart: HomeSection | None = None
     lastfm_weekly_album_chart: HomeSection | None = None
     lastfm_recent_scrobbles: HomeSection | None = None
@@ -260,5 +260,8 @@ class DiscoverResponse(AppStruct):
     anniversaries: HomeSection | None = None
     new_from_followed: HomeSection | None = None
     unexplored_genres: HomeSection | None = None
+    generated_at: float | None = None
+    refresh_started_at: float | None = None
+    section_status: dict[str, str] = {}
     refreshing: bool = False
     service_status: dict[str, str] | None = None

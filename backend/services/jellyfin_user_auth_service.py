@@ -12,6 +12,9 @@ from infrastructure.persistence.auth_store import AuthStore, UserRecord, _derive
 
 logger = logging.getLogger(__name__)
 
+# Sent as `Authorization`, not the legacy `X-Emby-Authorization` header Jellyfin
+# 10.11 removed alongside X-Emby-Token (issue #151); both spellings of the value
+# are accepted by older servers.
 _EMBY_AUTH_HEADER = (
     'MediaBrowser Client="DroppedNeedle", Device="DroppedNeedle", DeviceId="{client_id}", Version="1.4.0"'
 )
@@ -23,10 +26,14 @@ class JellyfinUserAuthService:
         auth_store: AuthStore,
         jellyfin_repository,
         preferences_service,
+        connections_store=None,
+        cache=None,
     ) -> None:
         self._store = auth_store
         self._jellyfin_repo = jellyfin_repository
         self._prefs = preferences_service
+        self._connections_store = connections_store
+        self._cache = cache
 
     async def login(
         self,
@@ -42,6 +49,10 @@ class JellyfinUserAuthService:
 
         user = await self._find_or_create_user(profile)
 
+        # auto-link the per-user media connection (D4): the login just handed us a
+        # fresh user-scoped token, so playback attribution works with zero setup
+        await self._auto_link_connection(user.id, profile)
+
         raw_token, token_hash = self._store.issue_token()
         await self._store.store_token(
             id = str(uuid.uuid4()),
@@ -54,6 +65,38 @@ class JellyfinUserAuthService:
         logger.info(f"Jellyfin login: {user.display_name} ({user.id[:8]}')")
         return user, raw_token
 
+    async def authenticate_credentials(self, username: str, password: str) -> dict:
+        """Validate a Jellyfin username/password and return the auth profile
+        (jellyfin_user_id / username / access_token) without any DroppedNeedle
+        login side effects. Used by the per-user connection link flow."""
+        if not self._jellyfin_repo.is_configured():
+            raise AuthenticationError("Jellyfin is not configured on this server")
+        return await self._authenticate_with_jellyfin(username, password)
+
+    async def _auto_link_connection(self, user_id: str, profile: dict) -> None:
+        if self._connections_store is None:
+            return
+        try:
+            await self._connections_store.upsert(
+                user_id,
+                "jellyfin",
+                {
+                    "access_token": profile["access_token"],
+                    "jellyfin_user_id": profile["jellyfin_user_id"],
+                    "username": profile["username"],
+                },
+            )
+            if self._cache is not None:
+                from services.media_playlist_cache import invalidate_media_playlist_cache
+
+                await invalidate_media_playlist_cache(
+                    self._cache, user_id, "jellyfin"
+                )
+        except Exception:  # noqa: BLE001 - a failed auto-link must never fail the login
+            logger.warning(
+                "Failed to auto-link Jellyfin connection for user %s", user_id[:8], exc_info=True
+            )
+
     async def _authenticate_with_jellyfin(self, username: str, password: str) -> dict:
         client_id = self._prefs.get_or_create_setting(
             "droppedneedle_device_id", lambda: str(uuid.uuid4())
@@ -64,7 +107,7 @@ class JellyfinUserAuthService:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "X-Emby-Authorization": _EMBY_AUTH_HEADER.format(client_id = client_id),
+            "Authorization": _EMBY_AUTH_HEADER.format(client_id = client_id),
         }
         body = {"Username": username, "Pw": password}
 

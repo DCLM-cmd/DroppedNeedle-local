@@ -6,12 +6,14 @@ to manual."""
 import asyncio
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from api.v1.schemas.settings import LibraryScanScheduleSettings
 from core import tasks
+from infrastructure.queue.priority_queue import RequestPriority
+from services.native.background_workload_gate import BackgroundWorkloadGate
 
 
 class _Prefs:
@@ -27,8 +29,8 @@ class _Prefs:
     def save_library_scan_schedule(self, schedule) -> None:
         self.saved.append(schedule)
 
-    def get_library_settings_raw(self):
-        return SimpleNamespace(library_paths=["/music"])
+    def get_typed_library_settings_raw(self):
+        return SimpleNamespace(library_roots=[SimpleNamespace(path="/music")])
 
 
 def _break_after(n: int):
@@ -57,6 +59,138 @@ def _scan_state(started_at=None, status="idle"):
     return state, get_state, scan
 
 
+@pytest.mark.asyncio
+async def test_artist_cache_warmer_resolves_rebuilt_service_each_cycle(monkeypatch):
+    sleeps = 0
+
+    async def stop_after_first_cycle(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise asyncio.CancelledError
+
+    service = SimpleNamespace(precache_artist_discovery=AsyncMock())
+    service_getter = MagicMock(return_value=service)
+    gate = MagicMock()
+    gate.wait_until_available = AsyncMock()
+
+    async def run_warmer_unit(operation):
+        await operation()
+
+    gate.run_warmer_unit = AsyncMock(side_effect=run_warmer_unit)
+    first_mbid = "60000000-0000-4000-8000-000000000001"
+    second_mbid = "60000000-0000-4000-8000-000000000002"
+    library = SimpleNamespace(
+        get_artist_mbid_page=AsyncMock(return_value=[first_mbid, second_mbid])
+    )
+    monkeypatch.setattr(tasks.asyncio, "sleep", stop_after_first_cycle)
+
+    await tasks.warm_artist_discovery_cache_periodically(
+        service_getter, library, interval=10, delay=0, workload_gate=gate
+    )
+
+    assert service_getter.call_count == 2
+    assert [
+        awaited.args[0] for awaited in service.precache_artist_discovery.await_args_list
+    ] == [[first_mbid], [second_mbid]]
+    assert gate.run_warmer_unit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_artist_cache_warmer_filters_local_ids_before_upstream_calls(monkeypatch):
+    sleeps = 0
+
+    async def stop_after_empty_cycle(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise asyncio.CancelledError
+
+    service_getter = MagicMock()
+    library = SimpleNamespace(
+        get_artist_mbid_page=AsyncMock(
+            return_value=[
+                "f110a324f991fab25548b41e2efeb1bf",
+                "unknown_artist",
+            ]
+        )
+    )
+    monkeypatch.setattr(tasks.asyncio, "sleep", stop_after_empty_cycle)
+
+    await tasks.warm_artist_discovery_cache_periodically(
+        service_getter, library, interval=10, delay=0
+    )
+
+    service_getter.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_library_cache_warmer_uses_background_musicbrainz_priority(monkeypatch):
+    monkeypatch.setattr(tasks.asyncio, "sleep", AsyncMock())
+    album_service = MagicMock()
+    album_service.is_album_cached = AsyncMock(return_value=False)
+    album_service.get_album_info = AsyncMock()
+    library_db = MagicMock()
+    library_db.get_recent_albums = AsyncMock(
+        return_value=[{"mbid": "11111111-1111-1111-1111-111111111111"}]
+    )
+
+    await tasks.warm_library_cache(MagicMock(), album_service, library_db)
+
+    album_service.get_album_info.assert_awaited_once_with(
+        "11111111-1111-1111-1111-111111111111",
+        priority=RequestPriority.BACKGROUND_SYNC,
+    )
+    library_db.get_recent_albums.assert_awaited_once_with(limit=30)
+
+
+@pytest.mark.asyncio
+async def test_discover_warmer_rechecks_gate_between_units() -> None:
+    gate = BackgroundWorkloadGate()
+    discover_finished = asyncio.Event()
+    home_finished = asyncio.Event()
+
+    async def warm_discover(_user_id: str) -> None:
+        gate.set_scan_active(True)
+        discover_finished.set()
+
+    async def warm_home(_user_id: str) -> None:
+        gate.set_scan_active(True)
+        home_finished.set()
+
+    discover = SimpleNamespace(
+        warm_cache_thorough=warm_discover,
+        peek_freshness=AsyncMock(return_value=(True, False)),
+    )
+    home = SimpleNamespace(warm_cache=warm_home)
+    queue = SimpleNamespace(
+        start_build=AsyncMock(), wait_for_build=AsyncMock(return_value=None)
+    )
+    worker = asyncio.create_task(
+        tasks._warm_one_user(
+            "gate-test-user",
+            discover,
+            home,
+            {},
+            {},
+            queue,
+            gate,
+        )
+    )
+
+    await discover_finished.wait()
+    await asyncio.sleep(0)
+    assert not home_finished.is_set()
+    gate.set_scan_active(False)
+    await home_finished.wait()
+    await asyncio.sleep(0)
+    queue.start_build.assert_not_awaited()
+    gate.set_scan_active(False)
+    await worker
+
+    queue.start_build.assert_awaited_once_with("gate-test-user")
+
+
 def test_interval_overdue_runs_immediately():
     now = datetime(2026, 6, 22, 12, 0, 0)
     last = now.timestamp() - 2 * 3600  # two intervals ago -> overdue
@@ -66,7 +200,9 @@ def test_interval_overdue_runs_immediately():
 def test_interval_future_waits_remaining_gap():
     now = datetime(2026, 6, 22, 12, 0, 0)
     last = now.timestamp() - 600  # 10 min into a 1hr interval
-    assert tasks._seconds_until_next_scan("1hr", "03:00", last, now) == pytest.approx(3000.0)
+    assert tasks._seconds_until_next_scan("1hr", "03:00", last, now) == pytest.approx(
+        3000.0
+    )
 
 
 def test_interval_never_scanned_runs_immediately():
@@ -89,7 +225,10 @@ def test_daily_after_target_unscanned_runs_immediately():
 def test_daily_after_target_already_scanned_waits_until_tomorrow():
     now = datetime(2026, 6, 22, 9, 0, 0)
     scanned_today = datetime(2026, 6, 22, 3, 0, 5).timestamp()
-    assert tasks._seconds_until_next_scan("daily", "03:00", scanned_today, now) == 18 * 3600
+    assert (
+        tasks._seconds_until_next_scan("daily", "03:00", scanned_today, now)
+        == 18 * 3600
+    )
 
 
 def test_parse_daily_time_falls_back_on_garbage():
@@ -122,7 +261,9 @@ async def test_auto_scan_skips_when_already_scanning(monkeypatch):
     _, fake_sleep = _break_after(2)
     monkeypatch.setattr(tasks.asyncio, "sleep", fake_sleep)
     scanner = SimpleNamespace(scan=AsyncMock())
-    scan_state = SimpleNamespace(get_state=AsyncMock(return_value={"status": "scanning"}))
+    scan_state = SimpleNamespace(
+        get_state=AsyncMock(return_value={"status": "scanning"})
+    )
     prefs = _Prefs("30min")
 
     await tasks.auto_scan_library_periodically(scanner, scan_state, prefs)

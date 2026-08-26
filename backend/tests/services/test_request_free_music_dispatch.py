@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from infrastructure.queue.priority_queue import RequestPriority
 from services.request_service import RequestService
 
 
@@ -38,11 +39,18 @@ async def test_single_request_delegates_to_the_dispatcher():
 
     result = await service.request_album(
         "d0484284-1ee7-4157-951a-50f003cbcfb4",
-        artist="Brad Sucks", album="Guess Who's a Mess", user_id="u1", user_role="admin",
+        artist="Brad Sucks",
+        album="Guess Who's a Mess",
+        user_id="u1",
+        user_role="admin",
     )
 
     assert result.success is True
     acquisition.request_album.assert_awaited_once()
+    assert (
+        acquisition.request_album.await_args.kwargs["track_count_priority"]
+        is RequestPriority.USER_INITIATED
+    )
     history.async_update_download_task_id.assert_awaited_once()
     assert history.async_update_download_task_id.await_args.args[1] == "task-1"
 
@@ -59,6 +67,10 @@ async def test_batch_delegates_each_item_to_the_dispatcher():
 
     assert result.success is True
     assert acquisition.request_album.await_count == 2
+    assert all(
+        call.kwargs["track_count_priority"] is RequestPriority.USER_INITIATED
+        for call in acquisition.request_album.await_args_list
+    )
 
 
 @pytest.mark.asyncio

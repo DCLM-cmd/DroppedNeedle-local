@@ -6,7 +6,7 @@ vi.mock('$env/dynamic/public', () => ({
 	env: { PUBLIC_API_URL: '' }
 }));
 
-const { deckMock, samplerStart, requestAlbum } = vi.hoisted(() => {
+const { apiGet, deckMock, samplerStart, requestAlbum } = vi.hoisted(() => {
 	const items = [
 		{
 			release_group_mbid: 'rg-1',
@@ -42,6 +42,7 @@ const { deckMock, samplerStart, requestAlbum } = vi.hoisted(() => {
 		}
 	];
 	return {
+		apiGet: vi.fn(),
 		deckMock: {
 			phase: 'ready' as string,
 			queue: items,
@@ -109,12 +110,13 @@ vi.mock('$lib/stores/integration', async () => {
 vi.mock('$lib/api/client', () => ({
 	api: {
 		global: {
-			get: vi.fn().mockResolvedValue({ used: 0, limit: 100, remaining: 100 }),
+			get: apiGet,
 			post: vi.fn().mockResolvedValue({})
 		}
 	}
 }));
 
+import { API } from '$lib/constants';
 import DiscoverQueueDeck from './DiscoverQueueDeck.svelte';
 
 describe('DiscoverQueueDeck', () => {
@@ -122,10 +124,11 @@ describe('DiscoverQueueDeck', () => {
 		deckMock.phase = 'ready';
 		deckMock.currentIndex = 0;
 		vi.clearAllMocks();
+		apiGet.mockResolvedValue({ used: 0, limit: 100, remaining: 100 });
 	});
 
 	it('renders the current item with reason, links, meta and tags', async () => {
-		render(DiscoverQueueDeck);
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
 
 		await expect.element(page.getByText('Similar to Radiohead')).toBeVisible();
 		const albumLink = page.getByRole('link', { name: 'The Bends', exact: true });
@@ -135,24 +138,30 @@ describe('DiscoverQueueDeck', () => {
 		await expect.element(page.getByText('1995')).toBeVisible();
 		await expect.element(page.getByRole('link', { name: 'alt-rock' })).toBeVisible();
 		await expect.element(page.getByText('1 / 2')).toBeVisible();
+		await expect
+			.element(page.getByTestId('discover-primary-cover'))
+			.toHaveAttribute(
+				'srcset',
+				'/api/v1/covers/release-group/rg-1?size=250 250w, /api/v1/covers/release-group/rg-1?size=500 500w'
+			);
 	});
 
 	it('Next advances the deck', async () => {
-		render(DiscoverQueueDeck);
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
 
 		await page.getByRole('button', { name: /^Next$/ }).click();
 		expect(deckMock.next).toHaveBeenCalledTimes(1);
 	});
 
 	it('Not for me ignores the current item', async () => {
-		render(DiscoverQueueDeck);
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
 
 		await page.getByRole('button', { name: /Not for me/ }).click();
 		expect(deckMock.ignoreCurrent).toHaveBeenCalledTimes(1);
 	});
 
 	it('Request files an album request and marks it', async () => {
-		render(DiscoverQueueDeck);
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
 
 		await page.getByRole('button', { name: /^Request$/ }).click();
 		await vi.waitFor(() => {
@@ -166,14 +175,14 @@ describe('DiscoverQueueDeck', () => {
 	});
 
 	it('Sample album starts the sampler for the current item', async () => {
-		render(DiscoverQueueDeck);
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
 
 		await page.getByRole('button', { name: /Sample album/ }).click();
 		expect(samplerStart).toHaveBeenCalledWith('rg-1', 'The Verve', 'The Bends');
 	});
 
 	it('filmstrip jump navigates to the clicked item', async () => {
-		render(DiscoverQueueDeck);
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
 
 		await page.getByRole('tab', { name: /Urban Hymns/ }).click();
 		expect(deckMock.jumpTo).toHaveBeenCalledWith(1);
@@ -181,7 +190,7 @@ describe('DiscoverQueueDeck', () => {
 
 	it('building phase shows the equalizer state', async () => {
 		deckMock.phase = 'building';
-		render(DiscoverQueueDeck);
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
 
 		await expect.element(page.getByText('Building your personalised queue…')).toBeVisible();
 		await expect.element(page.getByRole('button', { name: /Build now instead/ })).toBeVisible();
@@ -189,9 +198,70 @@ describe('DiscoverQueueDeck', () => {
 
 	it('error phase offers retry', async () => {
 		deckMock.phase = 'error';
-		render(DiscoverQueueDeck);
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
 
 		await page.getByRole('button', { name: /Retry/ }).click();
 		expect(deckMock.retryBuild).toHaveBeenCalled();
+	});
+
+	it('does not request quota when YouTube is disabled', async () => {
+		render(DiscoverQueueDeck, { youtubeEnabled: false });
+
+		await vi.waitFor(() => expect(deckMock.init).toHaveBeenCalled());
+		expect(apiGet).not.toHaveBeenCalled();
+		await expect
+			.element(page.getByRole('button', { name: 'Play music video' }))
+			.not.toBeInTheDocument();
+	});
+
+	it('requests quota when YouTube is configured', async () => {
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
+
+		await vi.waitFor(() => {
+			expect(apiGet).toHaveBeenCalledWith(API.discoverQueueYoutubeQuota());
+		});
+	});
+
+	it('suppresses provider lookup when quota is exhausted', async () => {
+		apiGet.mockResolvedValueOnce({ used: 100, limit: 100, remaining: 0 });
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
+
+		await vi.waitFor(() => expect(apiGet).toHaveBeenCalledTimes(1));
+		await expect
+			.element(page.getByRole('button', { name: 'Play music video' }))
+			.not.toBeInTheDocument();
+	});
+
+	it('keeps an enriched direct video available when the integration is disabled', async () => {
+		const enrichment = deckMock.queue[0].enrichment as { youtube_url: string | null };
+		enrichment.youtube_url = 'https://www.youtube-nocookie.com/embed/direct-video';
+
+		try {
+			render(DiscoverQueueDeck, { youtubeEnabled: false });
+
+			await expect.element(page.getByRole('button', { name: 'Play music video' })).toBeVisible();
+			expect(apiGet).not.toHaveBeenCalled();
+		} finally {
+			enrichment.youtube_url = null;
+		}
+	});
+
+	it('refreshes quota after a configured provider search', async () => {
+		apiGet.mockImplementation(async (url: string) => {
+			if (url === API.discoverQueueYoutubeQuota()) {
+				return { used: 0, limit: 100, remaining: 100 };
+			}
+			return { embed_url: 'https://www.youtube-nocookie.com/embed/search-video', error: null };
+		});
+		render(DiscoverQueueDeck, { youtubeEnabled: true });
+
+		await vi.waitFor(() => expect(apiGet).toHaveBeenCalledTimes(1));
+		await page.getByRole('button', { name: 'Play music video' }).click();
+		await vi.waitFor(() => {
+			const quotaCalls = apiGet.mock.calls.filter(
+				([url]) => url === API.discoverQueueYoutubeQuota()
+			);
+			expect(quotaCalls).toHaveLength(2);
+		});
 	});
 });

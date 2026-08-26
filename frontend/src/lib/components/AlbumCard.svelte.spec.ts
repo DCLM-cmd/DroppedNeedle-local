@@ -1,5 +1,5 @@
 import { page } from '@vitest/browser/context';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import AlbumCard from './AlbumCard.svelte';
 import type { Album, EnrichmentSource } from '$lib/types';
@@ -14,12 +14,17 @@ const baseAlbum: Album = {
 };
 
 function renderComponent(
-	overrides: Partial<{ album: Album; enrichmentSource: EnrichmentSource }> = {}
+	overrides: Partial<{
+		album: Album;
+		enrichmentSource: EnrichmentSource;
+		onenrichmentrequest: () => void;
+	}> = {}
 ) {
 	return render(AlbumCard, {
 		props: {
 			album: overrides.album ?? baseAlbum,
-			enrichmentSource: overrides.enrichmentSource ?? 'none'
+			enrichmentSource: overrides.enrichmentSource ?? 'none',
+			onenrichmentrequest: overrides.onenrichmentrequest
 		}
 	} as Parameters<typeof render<typeof AlbumCard>>[1]);
 }
@@ -86,6 +91,33 @@ describe('AlbumCard.svelte', () => {
 		renderComponent({ enrichmentSource: 'listenbrainz' });
 
 		await expect.element(page.getByText('LB 1.2M')).toBeInTheDocument();
+	});
+
+	it('requests optional enrichment on pointer intent', async () => {
+		expect.assertions(1);
+		const onenrichmentrequest = vi.fn();
+		renderComponent({ onenrichmentrequest });
+
+		await page.getByRole('link', { name: 'Open OK Computer' }).hover();
+
+		expect(onenrichmentrequest).toHaveBeenCalledTimes(1);
+	});
+
+	it('does not enrich a local-only album with a local id', async () => {
+		const onenrichmentrequest = vi.fn();
+		renderComponent({
+			album: {
+				...baseAlbum,
+				musicbrainz_id: 'local-album-id',
+				local_id: 'local-album-id',
+				in_library: true
+			},
+			onenrichmentrequest
+		});
+
+		await page.getByRole('link', { name: 'Open OK Computer' }).hover();
+
+		expect(onenrichmentrequest).not.toHaveBeenCalled();
 	});
 
 	it('should use album-specific title for lastfm source', async () => {

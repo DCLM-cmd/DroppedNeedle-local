@@ -26,7 +26,7 @@ interface AlbumSearchInput {
 export const getSearchJobQueryOptions = (jobId: string) =>
 	queryOptions({
 		staleTime: 0,
-		queryKey: DownloadQueryKeyFactory.searchJob(jobId),
+		queryKey: DownloadQueryKeyFactory.searchJob(authStore.user?.id, jobId),
 		queryFn: ({ signal }) =>
 			api.global.get<SearchJobView>(API.downloads.searchJob(jobId), { signal })
 	});
@@ -48,7 +48,9 @@ export function pickSearchCandidate() {
 				candidate_index: input.candidate_index
 			}),
 		onSuccess: (_data: PickResponse, input: { jobId: string; candidate_index: number }) =>
-			invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.searchJob(input.jobId) })
+			invalidateQueriesWithPersister({
+				queryKey: DownloadQueryKeyFactory.searchJob(authStore.user?.id, input.jobId)
+			})
 	}));
 }
 
@@ -65,10 +67,12 @@ export function dismissReview() {
 				type: 'success'
 			});
 			void invalidateQueriesWithPersister({
-				queryKey: DownloadQueryKeyFactory.searchJob(jobId)
+				queryKey: DownloadQueryKeyFactory.searchJob(authStore.user?.id, jobId)
 			});
 			// the parked task just went terminal, and a watch row appeared
-			void invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.tasks() });
+			void invalidateQueriesWithPersister({
+				queryKey: DownloadQueryKeyFactory.tasks(authStore.user?.id)
+			});
 			void invalidateQueriesWithPersister({
 				queryKey: WantedQueryKeyFactory.list(authStore.user?.id)
 			});
@@ -84,6 +88,8 @@ export function cancelSearch() {
 		mutationFn: (jobId: string) =>
 			api.global.post<{ status: string; message: string }>(API.downloads.cancelSearch(jobId), {}),
 		onSuccess: (_data: { status: string; message: string }, jobId: string) =>
-			invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.searchJob(jobId) })
+			invalidateQueriesWithPersister({
+				queryKey: DownloadQueryKeyFactory.searchJob(authStore.user?.id, jobId)
+			})
 	}));
 }

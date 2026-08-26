@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from repositories.playlist_repository import PlaylistRecord, PlaylistTrackRecord
+from core.exceptions import SourceResolutionError
 from services.playlist_service import PlaylistService
 
 
@@ -89,21 +90,67 @@ class TestResolveAlbumSourcesPassesMetadata:
         )
 
         nd.get_album_match.assert_called_once_with(
-            album_id="mbid-abc", album_name="Sheet Music", artist_name="10cc",
+            album_id="mbid-abc",
+            album_name="Sheet Music",
+            artist_name="10cc",
+            music_folder_ids=None,
         )
-        assert True
 
-    @pytest.mark.asyncio
-    async def test_passes_empty_strings_when_not_provided(self, tmp_path):
-        service, _ = _make_service(tmp_path)
-        nd = _make_nd_service()
 
-        await service._resolve_album_sources("mbid-abc", None, None, nd)
+@pytest.mark.asyncio
+async def test_selected_folder_scope_removes_unverified_stored_navidrome_source(tmp_path):
+    service, repo = _make_service(tmp_path)
+    repo.get_tracks.return_value = [
+        _make_track(available_sources=["local", "navidrome"])
+    ]
+    nd = _make_nd_service(found=False, tracks=[])
 
-        nd.get_album_match.assert_called_once_with(
-            album_id="mbid-abc", album_name="", artist_name="",
+    result = await service.resolve_track_sources(
+        "p-1",
+        requesting=_OWNER,
+        nd_service=nd,
+        navidrome_folder_ids=("folder-a",),
+    )
+
+    assert result == {"t-1": []}
+    repo.batch_update_available_sources.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_same_navidrome_source_is_revalidated_for_selected_scope(tmp_path):
+    service, repo = _make_service(tmp_path)
+    repo.get_track.return_value = _make_track()
+    service._resolve_new_source_id = AsyncMock(
+        side_effect=SourceResolutionError("outside selected folders")
+    )
+
+    with pytest.raises(SourceResolutionError, match="outside selected folders"):
+        await service.update_track_source(
+            "p-1",
+            _OWNER,
+            "t-1",
+            source_type="navidrome",
+            nd_service=AsyncMock(),
+            navidrome_folder_ids=("folder-a",),
         )
-        assert True
+
+    service._resolve_new_source_id.assert_awaited_once()
+    repo.update_track_source.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_passes_empty_strings_when_not_provided(tmp_path):
+    service, _ = _make_service(tmp_path)
+    nd = _make_nd_service()
+
+    await service._resolve_album_sources("mbid-abc", None, None, nd)
+
+    nd.get_album_match.assert_called_once_with(
+        album_id="mbid-abc",
+        album_name="",
+        artist_name="",
+        music_folder_ids=None,
+    )
 
 
 class TestResolveTrackSourcesDiscovery:
@@ -137,7 +184,10 @@ class TestResolveTrackSourcesDiscovery:
         await service.resolve_track_sources("p-1", nd_service=nd)
 
         nd.get_album_match.assert_called_once_with(
-            album_id="mbid-abc", album_name="Sheet Music", artist_name="10cc",
+            album_id="mbid-abc",
+            album_name="Sheet Music",
+            artist_name="10cc",
+            music_folder_ids=None,
         )
         assert True
 
@@ -199,6 +249,48 @@ class TestResolveTrackSourcesPersistence:
         await service.resolve_track_sources("p-1", local_service=local, nd_service=nd)
 
         repo.batch_update_available_sources.assert_not_called()
+
+
+class TestResolveLinksLibraryFiles:
+    """A local match must also persist library_file_id so the compat shims can
+    stream the entry (issue #181 - imported playlists showed empty in clients)."""
+
+    @pytest.mark.asyncio
+    async def test_links_unlinked_entry_on_local_match(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        track = _make_track(available_sources=["navidrome"])
+        repo.get_tracks = MagicMock(return_value=[track])
+
+        await service.resolve_track_sources(
+            "p-1", local_service=_make_local_service(), nd_service=_make_nd_service(),
+        )
+
+        repo.batch_link_library_files.assert_called_once_with("p-1", {"t-1": "789"})
+
+    @pytest.mark.asyncio
+    async def test_existing_link_left_alone(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        track = _make_track(available_sources=["navidrome"])
+        track.library_file_id = "already"
+        repo.get_tracks = MagicMock(return_value=[track])
+
+        await service.resolve_track_sources(
+            "p-1", local_service=_make_local_service(), nd_service=_make_nd_service(),
+        )
+
+        repo.batch_link_library_files.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_local_match_no_link(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        repo.get_tracks = MagicMock(return_value=[_make_track()])
+
+        await service.resolve_track_sources(
+            "p-1", local_service=_make_local_service(found=False),
+            nd_service=_make_nd_service(),
+        )
+
+        repo.batch_link_library_files.assert_not_called()
 
 
 class TestStringTrackNumberRegression:
@@ -271,7 +363,11 @@ class TestStringTrackNumberRegression:
             {"6": ("Speed Kills", "2608"), "1": ("Johnny", "2601")},
             {6: ("Speed Kills", "nd-456"), 1: ("Johnny", "nd-401")},
         )
-        await cache.set("source_resolution:mbid-abc", stale_data, ttl_seconds=3600)
+        await cache.set(
+            "source_resolution:user:global:scope:all:mbid-abc",
+            stale_data,
+            ttl_seconds=3600,
+        )
 
         jf, local, nd, plex = await service._resolve_album_sources(
             "mbid-abc", None, None, None,
@@ -303,7 +399,9 @@ class TestResolveTrackSourcesConcurrency:
         in_flight = 0
         max_in_flight = 0
 
-        async def _slow_match(album_id, album_name, artist_name):
+        async def _slow_match(
+            album_id, album_name, artist_name, music_folder_ids
+        ):
             nonlocal in_flight, max_in_flight
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
@@ -382,3 +480,70 @@ class TestResolveTrackSourcesConcurrency:
 
         assert sorted(result["t-a"]) == ["navidrome"]
         assert sorted(result["t-b"]) == ["navidrome"]
+
+
+class TestGuidAlbumIdFallback:
+    """Pre-fix Jellyfin imports stored the Jellyfin album GUID as album_id, which
+    the MBID-keyed matchers can never hit. Resolution re-keys the GUID to the
+    album's MusicBrainz id via Jellyfin provider ids (no migration, #150)."""
+
+    @pytest.mark.asyncio
+    async def test_guid_album_id_resolves_local_source(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        track = _make_track(
+            album_id="jf-guid-1",
+            source_type="jellyfin",
+            available_sources=["jellyfin"],
+        )
+        repo.get_tracks = MagicMock(return_value=[track])
+
+        jf = _make_jf_service(found=False)
+        jf.resolve_album_mbid = AsyncMock(return_value="mbid-abc")
+        local = _make_local_service()
+
+        result = await service.resolve_track_sources(
+            "p-1", jf_service=jf, local_service=local,
+        )
+
+        local.match_album_by_mbid.assert_called_once_with("mbid-abc")
+        assert sorted(result["t-1"]) == ["jellyfin", "local"]
+        repo.batch_link_library_files.assert_called_once_with("p-1", {"t-1": "789"})
+        updates = repo.batch_update_available_sources.call_args[0][1]
+        assert sorted(updates["t-1"]) == ["jellyfin", "local"]
+
+    @pytest.mark.asyncio
+    async def test_guid_fallback_does_not_poison_mbid_cache_key(self, tmp_path):
+        cache = AsyncMock()
+        cache.get = AsyncMock(return_value=None)
+        repo = MagicMock()
+        service = PlaylistService(repo=repo, cache_dir=tmp_path, cache=cache)
+        jf = _make_jf_service(found=False)
+        jf.resolve_album_mbid = AsyncMock(return_value="mbid-abc")
+
+        await service._resolve_album_sources("jf-guid-1", jf, None)
+
+        set_key = cache.set.call_args[0][0]
+        assert "jf-guid-1" in set_key
+        assert "mbid-abc" not in set_key
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_mbid_match_found(self, tmp_path):
+        service, _ = _make_service(tmp_path)
+        jf = _make_jf_service(found=False)
+        jf.match_album_by_mbid = AsyncMock(
+            return_value=SimpleNamespace(
+                found=True,
+                tracks=[
+                    SimpleNamespace(
+                        track_number=1, title="Wall Street Shuffle", jellyfin_id="jf-9"
+                    )
+                ],
+            )
+        )
+        jf.resolve_album_mbid = AsyncMock(return_value="mbid-other")
+        local = _make_local_service()
+
+        await service._resolve_album_sources("mbid-abc", jf, local)
+
+        jf.resolve_album_mbid.assert_not_called()
+        local.match_album_by_mbid.assert_called_once_with("mbid-abc")

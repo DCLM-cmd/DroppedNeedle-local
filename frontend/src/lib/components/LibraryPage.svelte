@@ -101,6 +101,7 @@
 								customUrl={a.getAlbumImageUrl(album)}
 								alt={a.getAlbumName(album)}
 								size="full"
+								requestSize={250}
 								rounded="none"
 								className="w-full h-full"
 							/>
@@ -131,6 +132,7 @@
 								customUrl={a.getAlbumImageUrl(album)}
 								alt={a.getAlbumName(album)}
 								size="full"
+								requestSize={250}
 								rounded="none"
 								className="w-full h-full"
 							/>
@@ -214,6 +216,7 @@
 							customUrl={a.getAlbumImageUrl(album)}
 							alt={a.getAlbumName(album)}
 							size="full"
+							requestSize={250}
 							rounded="none"
 							className="w-full h-full"
 						/>

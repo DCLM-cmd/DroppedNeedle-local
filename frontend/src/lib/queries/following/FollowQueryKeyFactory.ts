@@ -36,5 +36,12 @@ export const FollowQueryKeyFactory = {
 	// bulk "Lidarr Import" approval cards, nested under admin-approvals so its prefix
 	// invalidation sweeps both (LidarrImport D3)
 	adminApprovalBatches: () =>
-		[...FollowQueryKeyFactory.followingPrefix, 'admin-approvals', 'batches'] as const
+		[...FollowQueryKeyFactory.followingPrefix, 'admin-approvals', 'batches'] as const,
+	pendingApprovalCount: (userId: string | undefined) =>
+		[
+			...FollowQueryKeyFactory.followingPrefix,
+			'admin-approvals',
+			'count',
+			userId ?? 'anon'
+		] as const
 };

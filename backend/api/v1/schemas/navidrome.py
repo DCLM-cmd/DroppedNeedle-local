@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from infrastructure.msgspec_fastapi import AppStruct
 
 
@@ -77,6 +79,12 @@ class NavidromePlaylistSummary(AppStruct):
     is_imported: bool = False
 
 
+class NavidromePlaylistCollection(AppStruct):
+    account_mode: Literal["linked", "shared"]
+    account_label: str
+    playlists: list[NavidromePlaylistSummary] = []
+
+
 class NavidromeHubResponse(AppStruct):
     stats: NavidromeLibraryStats | None = None
     recently_played: list[NavidromeAlbumSummary] = []
@@ -85,7 +93,6 @@ class NavidromeHubResponse(AppStruct):
     favorite_tracks: list[NavidromeTrackInfo] = []
     all_albums_preview: list[NavidromeAlbumSummary] = []
     genres: list[str] = []
-    playlists: list[NavidromePlaylistSummary] = []
 
 
 class NavidromeAlbumPage(AppStruct):
@@ -197,3 +204,17 @@ class NavidromeGenreSongsResponse(AppStruct):
 class NavidromeMusicFolder(AppStruct):
     id: str = ""
     name: str = ""
+
+
+class NavidromeFolderPreferenceUpdate(AppStruct):
+    mode: str
+    selected_folder_ids: list[str] = []
+
+
+class NavidromeFolderPreferenceResponse(AppStruct):
+    mode: str
+    selected_folder_ids: list[str] = []
+    available_folders: list[NavidromeMusicFolder] = []
+    stale_folder_ids: list[str] = []
+    source_available: bool = True
+    scope_revision: str = "all"

@@ -129,6 +129,7 @@
 										mbid={release.release_group_mbid}
 										alt={release.title}
 										size="full"
+										requestSize={250}
 										className="h-full w-full"
 										rounded="xl"
 									/>

@@ -251,7 +251,8 @@
 					!heldMeta &&
 					!!track.recording_id &&
 					$integrationStore.download_client}
-				{@const upgradeRecordingId = track.recording_id ?? libMeta?.recording_mbid ?? null}
+				{@const upgradeRecordingId =
+					track.recording_id ?? libMeta?.musicbrainz_recording_id ?? null}
 				{@const showUpgrade =
 					!!libMeta?.below_cutoff &&
 					authStore.isTrusted &&
@@ -278,7 +279,7 @@
 
 						{#if libMeta}
 							<div class="shrink-0">
-								<LibraryFormatBadge format={libMeta.file_format} size="badge-xs" />
+								<LibraryFormatBadge format={libMeta.format} size="badge-xs" />
 							</div>
 						{/if}
 
@@ -463,7 +464,7 @@
 				</li>
 				{#if libMeta && expandedRows.has(row.globalIndex)}
 					<li class="list-row p-0">
-						<LibraryTrackRow meta={libMeta} {releaseGroupMbid} />
+						<LibraryTrackRow meta={libMeta} />
 					</li>
 				{/if}
 				{#if heldMeta && heldOpen.has(row.globalIndex)}

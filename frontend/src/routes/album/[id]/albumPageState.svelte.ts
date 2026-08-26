@@ -71,6 +71,8 @@ import { getLibraryAlbumStatusQuery } from '$lib/queries/library/LibraryQueries.
 import { getAlbumDownloadsQuery } from '$lib/queries/downloads/DownloadQueries.svelte';
 import { getHeldImportsQuery } from '$lib/queries/downloads/HeldQueries.svelte';
 import { isActiveDownloadStatus } from '$lib/queries/downloads/downloadStatus';
+import { authStore } from '$lib/stores/authStore.svelte';
+import { getNavidromeFolderScopeRevision } from '$lib/utils/navidromeLibraryCache';
 
 export interface SourceCallbacks {
 	onPlayAll: () => void;
@@ -81,6 +83,14 @@ export interface SourceCallbacks {
 }
 
 export function createAlbumPageState(albumIdGetter: () => string) {
+	const sourceCacheKey = (albumId: string) =>
+		[
+			authStore.user?.id ?? 'anonymous',
+			getNavidromeFolderScopeRevision(authStore.user?.id ?? ''),
+			albumId
+		]
+			.map(encodeURIComponent)
+			.join(':');
 	let album = $state<AlbumBasicInfo | null>(null);
 	let tracksInfo = $state<AlbumTracksInfo | null>(null);
 	let error = $state<string | null>(null);
@@ -92,8 +102,6 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	let toastType = $state<'success' | 'error' | 'info' | 'warning'>('success');
 	let requesting = $state(false);
 	let showDeleteModal = $state(false);
-	let showArtistRemovedModal = $state(false);
-	let removedArtistName = $state('');
 	let moreByArtist = $state<MoreByArtistResponse | null>(null);
 	let similarAlbums = $state<SimilarAlbumsResponse | null>(null);
 	let loadingDiscovery = $state(true);
@@ -196,7 +204,8 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	const navidromeTrackMap = $derived(buildSortedTrackMap(navidromeMatch?.tracks ?? []));
 	const plexTrackMap = $derived(buildSortedTrackMap(plexMatch?.tracks ?? []));
 	const inLibrary = $derived(
-		libraryStore.isInLibrary(album?.musicbrainz_id) || album?.in_library || false
+		libraryStatus?.in_library ??
+			(libraryStore.isInLibrary(album?.musicbrainz_id) || album?.in_library || false)
 	);
 	const isRequested = $derived(
 		!!(album && !inLibrary && (album.requested || libraryStore.isRequested(album.musicbrainz_id)))
@@ -204,7 +213,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	const libraryTracksByRecording = $derived.by(() => {
 		const m = new SvelteMap<string, LibraryFileMeta>();
 		for (const t of libraryStatus?.tracks ?? []) {
-			if (t.recording_mbid) m.set(t.recording_mbid, t);
+			if (t.musicbrainz_recording_id) m.set(t.musicbrainz_recording_id, t);
 		}
 		return m;
 	});
@@ -219,9 +228,17 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	// tracks this album downloaded but couldn't auto-verify (held for "import anyway"),
 	// keyed both ways so a track row can find its held candidate the same way owned files match
 	const heldImportsQuery = getHeldImportsQuery(albumIdGetter, () => downloadClientConfigured);
+	const headerManagementHeld = $derived.by(() => {
+		if (!headerDownloadTask) return [];
+		return (heldImportsQuery.data?.items ?? []).filter(
+			(item) =>
+				item.source_task_id === headerDownloadTask?.id && item.reason.startsWith('management:')
+		);
+	});
 	const heldByRecording = $derived.by(() => {
 		const m = new SvelteMap<string, HeldImport>();
 		for (const h of heldImportsQuery.data?.items ?? []) {
+			if (h.reason.startsWith('management:')) continue;
 			if (h.recording_mbid) m.set(h.recording_mbid, h);
 		}
 		return m;
@@ -229,6 +246,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	const heldByPosition = $derived.by(() => {
 		const m = new SvelteMap<string, HeldImport>();
 		for (const h of heldImportsQuery.data?.items ?? []) {
+			if (h.reason.startsWith('management:')) continue;
 			m.set(getDiscTrackKey({ disc_number: h.disc_number, track_number: h.track_number }), h);
 		}
 		return m;
@@ -331,7 +349,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 			}
 		});
 		const refreshSourceMatch = (() => {
-			const cached = albumSourceMatchCache.get(albumId);
+			const cached = albumSourceMatchCache.get(sourceCacheKey(albumId));
 			if (cached && !albumSourceMatchCache.isStale(cached.timestamp)) {
 				jellyfinMatch = cached.data.jellyfin;
 				localMatch = cached.data.local;
@@ -431,13 +449,14 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		try {
 			const result = await fetcher();
 			setter(result);
-			const existing = albumSourceMatchCache.get(albumId)?.data ?? {
+			const cacheKey = sourceCacheKey(albumId);
+			const existing = albumSourceMatchCache.get(cacheKey)?.data ?? {
 				jellyfin: null,
 				local: null,
 				navidrome: null,
 				plex: null
 			};
-			albumSourceMatchCache.set({ ...existing, [cacheField]: result }, albumId);
+			albumSourceMatchCache.set({ ...existing, [cacheField]: result }, cacheKey);
 		} catch (e) {
 			if (isAbortError(e)) return;
 		} finally {
@@ -547,22 +566,31 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		if (abortController) abortController.abort();
 		abortController = new AbortController();
 		const signal = abortController.signal;
+		let tracksPromise: Promise<void> | null = null;
 
 		if (refreshSourceMatch) void fetchMbidSourceMatches(albumId, signal);
 
 		if (refreshBasic) {
-			if (refreshTracks) void doFetchTracks(albumId, signal);
+			if (refreshTracks) tracksPromise = doFetchTracks(albumId, signal);
 			void doFetchYouTube(albumId, signal);
 			await doFetchBasic(albumId, signal);
 		} else {
 			void doFetchBasic(albumId, signal);
 		}
 		if (signal.aborted || !album) return;
-		if (refreshTracks && !refreshBasic) void doFetchTracks(albumId, signal);
-		if (refreshDiscovery) void doFetchDiscovery(albumId, signal);
+		if (refreshTracks && !refreshBasic) tracksPromise = doFetchTracks(albumId, signal);
 		if (!refreshBasic) void doFetchYouTube(albumId, signal);
 		if (refreshLastfm) void doFetchLastFm(albumId, signal);
 		if (refreshSourceMatch) void fetchNamedSourceMatches(albumId, signal);
+		if (refreshDiscovery) {
+			if (tracksPromise) {
+				void tracksPromise.then(() => {
+					if (!signal.aborted) void doFetchDiscovery(albumId, signal);
+				});
+			} else {
+				void doFetchDiscovery(albumId, signal);
+			}
+		}
 	}
 
 	function clearExternalRecheck() {
@@ -574,7 +602,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		const albumId = albumIdGetter();
 		const signal = abortController?.signal;
 		if (!albumId || !signal || signal.aborted) return;
-		albumSourceMatchCache.remove(albumId);
+		albumSourceMatchCache.remove(sourceCacheKey(albumId));
 		void fetchMbidSourceMatches(albumId, signal);
 		void fetchNamedSourceMatches(albumId, signal);
 	}
@@ -600,7 +628,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 	async function forceLoadAlbum(albumId: string): Promise<void> {
 		albumBasicCache.remove(albumId);
 		albumTracksCache.remove(albumId);
-		albumSourceMatchCache.remove(albumId);
+		albumSourceMatchCache.remove(sourceCacheKey(albumId));
 
 		if (abortController) abortController.abort();
 		abortController = new AbortController();
@@ -633,23 +661,17 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		}
 	}
 
-	// Removal succeeded server-side (files + library rows gone; removeAlbum already cleared
-	// libraryStore + invalidated the TanStack trees). Reload the page so the In-Library
-	// badge, the Remove control and the owned play buttons all reflect it without a manual
-	// refresh, and surface the artist-removed modal when this was the artist's last album.
-	async function handleDeleted(result: {
-		artist_removed: boolean;
-		artist_name?: string | null;
-	}): Promise<void> {
+	function handleDeleted(): void {
 		showDeleteModal = false;
+		if (album) {
+			album = { ...album, in_library: false, requested: false };
+			albumBasicCache.set(album, albumIdGetter());
+		}
+		localMatch = null;
+		albumSourceMatchCache.remove(sourceCacheKey(albumIdGetter()));
 		toastMessage = 'Removed from Library';
 		toastType = 'success';
 		showToast = true;
-		if (result.artist_removed && result.artist_name) {
-			removedArtistName = result.artist_name;
-			showArtistRemovedModal = true;
-		}
-		await refreshAll();
 	}
 
 	$effect(() => {
@@ -680,15 +702,13 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		setRequesting: (v) => (requesting = v),
 		getRequesting: () => requesting,
 		setShowDeleteModal: (v) => (showDeleteModal = v),
-		setShowArtistRemovedModal: (v) => (showArtistRemovedModal = v),
-		setRemovedArtistName: (v) => (removedArtistName = v),
 		setToast: (msg, type) => {
 			toastMessage = msg;
 			toastType = type;
 		},
 		setShowToast: (v) => (showToast = v),
 		onRequestSuccess: () => {
-			albumSourceMatchCache.remove(albumIdGetter());
+			albumSourceMatchCache.remove(sourceCacheKey(albumIdGetter()));
 			// pick up the freshly-created download task so the header strip + polling kick in
 			void downloadsQuery.refetch();
 		}
@@ -737,9 +757,10 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 			title,
 			album,
 			jellyfinMatch,
-			localMatch,
+			localMatchForPlayback,
 			navidromeMatch,
-			plexMatch
+			plexMatch,
+			tracksInfo?.tracks ?? []
 		);
 	}
 
@@ -777,6 +798,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		'jellyfin',
 		albumGetter,
 		tracksGetters,
+		() => tracksInfo?.tracks ?? [],
 		playlistRefGetter
 	);
 	const localCallbacks: SourceCallbacks = buildSourceCallbacks(
@@ -785,6 +807,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		'local',
 		albumGetter,
 		tracksGetters,
+		() => tracksInfo?.tracks ?? [],
 		playlistRefGetter
 	);
 	const navidromeCallbacks: SourceCallbacks = buildSourceCallbacks(
@@ -793,6 +816,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		'navidrome',
 		albumGetter,
 		tracksGetters,
+		() => tracksInfo?.tracks ?? [],
 		playlistRefGetter
 	);
 	const plexCallbacks: SourceCallbacks = buildSourceCallbacks(
@@ -801,6 +825,7 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		'plex',
 		albumGetter,
 		tracksGetters,
+		() => tracksInfo?.tracks ?? [],
 		playlistRefGetter
 	);
 
@@ -843,15 +868,6 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		},
 		set showDeleteModal(v: boolean) {
 			showDeleteModal = v;
-		},
-		get showArtistRemovedModal() {
-			return showArtistRemovedModal;
-		},
-		set showArtistRemovedModal(v: boolean) {
-			showArtistRemovedModal = v;
-		},
-		get removedArtistName() {
-			return removedArtistName;
 		},
 		get moreByArtist() {
 			return moreByArtist;
@@ -979,6 +995,9 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		get headerDownloadTask() {
 			return headerDownloadTask;
 		},
+		get headerManagementHeld() {
+			return headerManagementHeld;
+		},
 		get trackDownloadTasks() {
 			return trackDownloadTasks;
 		},
@@ -990,7 +1009,9 @@ export function createAlbumPageState(albumIdGetter: () => string) {
 		},
 		jellyfinCallbacks,
 		localCallbacks,
-		localDownloadCallback,
+		get localDownloadCallback() {
+			return localDownloadCallback;
+		},
 		navidromeCallbacks,
 		plexCallbacks,
 		...eventHandlers,

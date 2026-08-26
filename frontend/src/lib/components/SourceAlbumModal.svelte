@@ -542,6 +542,7 @@
 								customUrl={coverUrl || null}
 								alt={albumName}
 								size="xl"
+								requestSize={250}
 								rounded="none"
 								className="w-36 h-36"
 							/>
@@ -553,6 +554,7 @@
 								customUrl={coverUrl || null}
 								alt={albumName}
 								size="xl"
+								requestSize={250}
 								rounded="none"
 								className="w-36 h-36"
 							/>

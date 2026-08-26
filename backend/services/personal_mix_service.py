@@ -24,6 +24,7 @@ import msgspec
 
 from core.exceptions import ConfigurationError
 from infrastructure.cover_urls import release_group_cover_url
+from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.persistence.user_listening_prefs_store import PersonalMixApproval
 from repositories.listenbrainz_models import ListenBrainzArtist
 from services.discover.mbid_resolution_service import MbidResolutionService
@@ -37,7 +38,9 @@ logger = logging.getLogger(__name__)
 
 _PLAYLIST_NAME = "Your Weekly Mix"
 _SOURCE_REF_PREFIX = "personal-mix:"
-_REFRESH_MIN_INTERVAL = timedelta(days=6)  # LB refreshes weekly-jams/-exploration weekly
+_REFRESH_MIN_INTERVAL = timedelta(
+    days=6
+)  # LB refreshes weekly-jams/-exploration weekly
 _RECOMMENDATION_PATCHES = ("weekly-jams", "weekly-exploration")
 _MAX_SEED_ARTISTS = 8
 _SIMILAR_LIMIT = 10
@@ -104,26 +107,38 @@ class PersonalMixService:
         # dies on the (user_id, source_ref) unique index. Single-process invariant.
         self._build_locks: dict[str, asyncio.Lock] = {}
 
-    async def build_for_user(self, user_id: str, *, force: bool = False) -> PersonalMixResult:
+    async def build_for_user(
+        self, user_id: str, *, force: bool = False
+    ) -> PersonalMixResult:
         lock = self._build_locks.setdefault(user_id, asyncio.Lock())
         async with lock:
             return await self._build_for_user_locked(user_id, force=force)
 
-    async def _build_for_user_locked(self, user_id: str, *, force: bool) -> PersonalMixResult:
+    async def _build_for_user_locked(
+        self, user_id: str, *, force: bool
+    ) -> PersonalMixResult:
         lb_repo = await self._client_factory.resolve_listenbrainz(user_id)
         if lb_repo is None:
-            return PersonalMixResult(user_id=user_id, skipped=True, reason="listenbrainz_not_linked")
+            return PersonalMixResult(
+                user_id=user_id, skipped=True, reason="listenbrainz_not_linked"
+            )
 
         username = await self._client_factory.resolve_listenbrainz_username(user_id)
         source_ref = f"{_SOURCE_REF_PREFIX}{user_id}"
         existing = await self._playlists.get_by_source_ref(source_ref, user_id)
         if not force and existing is not None and self._is_fresh(existing.updated_at):
             return PersonalMixResult(
-                user_id=user_id, skipped=True, reason="fresh", playlist_id=existing.id,
+                user_id=user_id,
+                skipped=True,
+                reason="fresh",
+                playlist_id=existing.id,
             )
 
         owned = {
-            m.lower() for m in await self._library_repo.get_library_mbids(include_release_ids=False)
+            m.lower()
+            for m in await self._library_repo.get_library_mbids(
+                include_release_ids=False
+            )
         }
 
         lb_tracks = await self._from_recommendation_playlists(lb_repo, username, owned)
@@ -131,20 +146,27 @@ class PersonalMixService:
         expansion_tracks: list[_MixTrack] = []
         if seed_artists and len(lb_tracks) < _TRACK_CAP:
             expansion_tracks = await self._from_similar_artists(
-                lb_repo, seed_artists, owned, needed=_TRACK_CAP - len(lb_tracks),
+                lb_repo,
+                seed_artists,
+                owned,
+                needed=_TRACK_CAP - len(lb_tracks),
             )
 
         mix = (lb_tracks + expansion_tracks)[:_TRACK_CAP]
         if not mix:
             return PersonalMixResult(
-                user_id=user_id, skipped=True, reason="no_tracks",
+                user_id=user_id,
+                skipped=True,
+                reason="no_tracks",
                 playlist_id=existing.id if existing else None,
             )
         mix = await self._match_library_files(mix)
 
         owner = await self._auth_store.get_user_by_id(user_id)
         if owner is None:
-            return PersonalMixResult(user_id=user_id, skipped=True, reason="user_not_found")
+            return PersonalMixResult(
+                user_id=user_id, skipped=True, reason="user_not_found"
+            )
 
         playlist_id = await self._upsert_playlist(existing, source_ref, owner, mix)
 
@@ -156,17 +178,24 @@ class PersonalMixService:
             requested = await self._auto_request_missing(user_id, mix)
 
         return PersonalMixResult(
-            user_id=user_id, playlist_id=playlist_id, track_count=len(mix), requested_albums=requested,
+            user_id=user_id,
+            playlist_id=playlist_id,
+            track_count=len(mix),
+            requested_albums=requested,
         )
 
     async def run_for_all_users(self) -> PersonalMixSummary:
-        user_ids = await self._connections_store.list_user_ids_for_service("listenbrainz")
+        user_ids = await self._connections_store.list_user_ids_for_service(
+            "listenbrainz"
+        )
         built = skipped = errors = 0
         for user_id in user_ids:
             try:
                 result = await self.build_for_user(user_id)
             except Exception:  # noqa: BLE001 - one user must never kill the run
-                logger.error("Personal mix build failed for user %s", user_id, exc_info=True)
+                logger.error(
+                    "Personal mix build failed for user %s", user_id, exc_info=True
+                )
                 errors += 1
                 continue
             if result.skipped:
@@ -174,7 +203,10 @@ class PersonalMixService:
             else:
                 built += 1
         summary = PersonalMixSummary(
-            users_considered=len(user_ids), built=built, skipped=skipped, errors=errors,
+            users_considered=len(user_ids),
+            built=built,
+            skipped=skipped,
+            errors=errors,
         )
         logger.info("Personal mix refresh complete: %s", summary)
         return summary
@@ -192,12 +224,18 @@ class PersonalMixService:
         return datetime.now(timezone.utc) - ts < _REFRESH_MIN_INTERVAL
 
     async def _from_recommendation_playlists(
-        self, lb_repo, username: str | None, owned: set[str],
+        self,
+        lb_repo,
+        username: str | None,
+        owned: set[str],
     ) -> list[_MixTrack]:
         try:
             playlists = await lb_repo.get_recommendation_playlists(username)
         except Exception:  # noqa: BLE001
-            logger.warning("Personal mix: failed to fetch LB recommendation playlists", exc_info=True)
+            logger.warning(
+                "Personal mix: failed to fetch LB recommendation playlists",
+                exc_info=True,
+            )
             return []
         if not playlists:
             return []
@@ -205,7 +243,11 @@ class PersonalMixService:
         wanted = []
         for patch in _RECOMMENDATION_PATCHES:
             match = next(
-                (p for p in playlists if p.get("source_patch") == patch and p.get("playlist_id")),
+                (
+                    p
+                    for p in playlists
+                    if p.get("source_patch") == patch and p.get("playlist_id")
+                ),
                 None,
             )
             if match:
@@ -218,21 +260,27 @@ class PersonalMixService:
                 playlist = await lb_repo.get_playlist_tracks(entry["playlist_id"])
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "Personal mix: failed to fetch playlist %s", entry.get("playlist_id"), exc_info=True,
+                    "Personal mix: failed to fetch playlist %s",
+                    entry.get("playlist_id"),
+                    exc_info=True,
                 )
                 continue
             if not playlist or not playlist.tracks:
                 continue
 
-            unique_release_ids = list({
-                t.caa_release_mbid for t in playlist.tracks if t.caa_release_mbid
-            })
+            unique_release_ids = list(
+                {t.caa_release_mbid for t in playlist.tracks if t.caa_release_mbid}
+            )
             rg_results = await asyncio.gather(
-                *(self._mb_repo.get_release_group_id_from_release(rid) for rid in unique_release_ids),
+                *(
+                    self._mb_repo.get_release_group_id_from_release(rid)
+                    for rid in unique_release_ids
+                ),
                 return_exceptions=True,
             )
             release_to_rg = {
-                rid: rg for rid, rg in zip(unique_release_ids, rg_results)
+                rid: rg
+                for rid, rg in zip(unique_release_ids, rg_results)
                 if isinstance(rg, str) and rg
             }
 
@@ -247,15 +295,17 @@ class PersonalMixService:
                     if t.recording_mbid in seen_recordings:
                         continue
                     seen_recordings.add(t.recording_mbid)
-                tracks.append(_MixTrack(
-                    track_name=t.title,
-                    artist_name=t.creator,
-                    album_name=t.album,
-                    release_group_mbid=rg_mbid,
-                    artist_mbid=t.artist_mbids[0] if t.artist_mbids else None,
-                    recording_mbid=t.recording_mbid,
-                    in_library=rg_mbid in owned,
-                ))
+                tracks.append(
+                    _MixTrack(
+                        track_name=t.title,
+                        artist_name=t.creator,
+                        album_name=t.album,
+                        release_group_mbid=rg_mbid,
+                        artist_mbid=t.artist_mbids[0] if t.artist_mbids else None,
+                        recording_mbid=t.recording_mbid,
+                        in_library=rg_mbid in owned,
+                    )
+                )
         return tracks[:_TRACK_CAP]
 
     async def _match_library_files(self, mix: list[_MixTrack]) -> list[_MixTrack]:
@@ -271,7 +321,11 @@ class PersonalMixService:
         by_rg_recording: dict[tuple[str, str], Any] = {}
         for rg, album_tracks in zip(rg_mbids, results):
             if isinstance(album_tracks, BaseException):
-                logger.debug("Personal mix: library lookup failed for %s", rg, exc_info=album_tracks)
+                logger.debug(
+                    "Personal mix: library lookup failed for %s",
+                    rg,
+                    exc_info=album_tracks,
+                )
                 continue
             for lt in album_tracks:
                 if lt.recording_mbid:
@@ -279,13 +333,22 @@ class PersonalMixService:
 
         matched: list[_MixTrack] = []
         for t in mix:
-            lt = by_rg_recording.get((t.release_group_mbid, t.recording_mbid)) if t.recording_mbid else None
+            lt = (
+                by_rg_recording.get((t.release_group_mbid, t.recording_mbid))
+                if t.recording_mbid
+                else None
+            )
             if lt is None:
                 matched.append(t)
                 continue
-            matched.append(msgspec.structs.replace(
-                t, library_file_id=lt.id, track_number=lt.track_number, disc_number=lt.disc_number,
-            ))
+            matched.append(
+                msgspec.structs.replace(
+                    t,
+                    library_file_id=lt.id,
+                    track_number=lt.track_number,
+                    disc_number=lt.disc_number,
+                )
+            )
         return matched
 
     @staticmethod
@@ -300,10 +363,16 @@ class PersonalMixService:
         return list(seen.items())
 
     async def _from_similar_artists(
-        self, lb_repo, seed_artists: list[tuple[str, str]], owned: set[str], needed: int,
+        self,
+        lb_repo,
+        seed_artists: list[tuple[str, str]],
+        owned: set[str],
+        needed: int,
     ) -> list[_MixTrack]:
         mbid_svc = MbidResolutionService(
-            musicbrainz_repo=self._mb_repo, library_repo=self._library_repo, listenbrainz_repo=lb_repo,
+            musicbrainz_repo=self._mb_repo,
+            library_repo=self._library_repo,
+            listenbrainz_repo=lb_repo,
         )
         # the name rides along into the pool items' "Similar to <name>" reason
         seeds = [
@@ -320,7 +389,9 @@ class PersonalMixService:
                 mbid_svc=mbid_svc,
             )
         except Exception:  # noqa: BLE001
-            logger.warning("Personal mix: similar-artist expansion failed", exc_info=True)
+            logger.warning(
+                "Personal mix: similar-artist expansion failed", exc_info=True
+            )
             return []
 
         # extra headroom: some candidate artists won't have a top-recording hit below
@@ -334,28 +405,36 @@ class PersonalMixService:
             artist_mbid = item.artist_mbid
             if artist_mbid not in top_track_cache:
                 try:
-                    recordings = await lb_repo.get_artist_top_recordings(artist_mbid, count=1)
+                    recordings = await lb_repo.get_artist_top_recordings(
+                        artist_mbid, count=1
+                    )
                 except Exception:  # noqa: BLE001
                     recordings = []
                 top_track_cache[artist_mbid] = recordings[0] if recordings else None
             recording = top_track_cache[artist_mbid]
             if recording is None:
                 continue
-            tracks.append(_MixTrack(
-                track_name=recording.track_name,
-                artist_name=item.artist_name,
-                album_name=item.album_name,
-                release_group_mbid=item.release_group_mbid,
-                artist_mbid=artist_mbid,
-                recording_mbid=recording.recording_mbid,
-                in_library=False,  # excluded_mbids already filtered owned albums out of the pool
-            ))
+            tracks.append(
+                _MixTrack(
+                    track_name=recording.track_name,
+                    artist_name=item.artist_name,
+                    album_name=item.album_name,
+                    release_group_mbid=item.release_group_mbid,
+                    artist_mbid=artist_mbid,
+                    recording_mbid=recording.recording_mbid,
+                    in_library=False,  # excluded_mbids already filtered owned albums out of the pool
+                )
+            )
         return tracks
 
-    async def _upsert_playlist(self, existing, source_ref: str, owner, mix: list[_MixTrack]) -> str:
+    async def _upsert_playlist(
+        self, existing, source_ref: str, owner, mix: list[_MixTrack]
+    ) -> str:
         if existing is None:
             playlist = await self._playlists.create_playlist(
-                _PLAYLIST_NAME, source_ref=source_ref, user_id=owner.id,
+                _PLAYLIST_NAME,
+                source_ref=source_ref,
+                user_id=owner.id,
             )
             playlist_id = playlist.id
         else:
@@ -363,7 +442,9 @@ class PersonalMixService:
             current_tracks = await self._playlists.get_tracks(playlist_id)
             if current_tracks:
                 await self._playlists.remove_tracks(
-                    playlist_id, owner, [t.id for t in current_tracks],
+                    playlist_id,
+                    owner,
+                    [t.id for t in current_tracks],
                 )
 
         track_dicts = [
@@ -402,15 +483,19 @@ class PersonalMixService:
                     album_title=t.album_name,
                     artist_mbid=t.artist_mbid,
                     origin="user",
+                    track_count_priority=RequestPriority.BACKGROUND_SYNC,
                 )
             except ConfigurationError:
                 logger.info(
-                    "Personal mix: download client disabled; not auto-requesting for %s", user_id,
+                    "Personal mix: download client disabled; not auto-requesting for %s",
+                    user_id,
                 )
                 break  # disabled globally - further attempts this run would fail identically
             except Exception:  # noqa: BLE001 - one failed request must not abort the rest
                 logger.error(
-                    "Personal mix: failed to auto-request %s", t.release_group_mbid, exc_info=True,
+                    "Personal mix: failed to auto-request %s",
+                    t.release_group_mbid,
+                    exc_info=True,
                 )
                 continue
             if task_id and task_id != ALREADY_IN_LIBRARY:
@@ -441,7 +526,9 @@ class PersonalMixService:
             return approval_state
         return "none"
 
-    async def on_auto_request_toggled(self, user_id: str, role: str, enabled: bool) -> None:
+    async def on_auto_request_toggled(
+        self, user_id: str, role: str, enabled: bool
+    ) -> None:
         """Grant bookkeeping after the intent flag itself was persisted: a non-admin
         enabling re-enters the pending queue (matching follows, where re-enabling
         re-queues even over a prior grant); disabling leaves the row intact."""
@@ -451,17 +538,26 @@ class PersonalMixService:
     async def list_pending_approvals(self) -> list[PersonalMixApproval]:
         return await self._prefs.list_pending_approvals()
 
-    async def approve_auto_request(self, user_id: str, reviewer: tuple[str, str | None]) -> bool:
+    async def count_pending_approvals(self) -> int:
+        return await self._prefs.count_pending_approvals()
+
+    async def approve_auto_request(
+        self, user_id: str, reviewer: tuple[str, str | None]
+    ) -> bool:
         return await self._prefs.set_approval_state(user_id, "approved", reviewer)
 
-    async def reject_auto_request(self, user_id: str, reviewer: tuple[str, str | None]) -> bool:
+    async def reject_auto_request(
+        self, user_id: str, reviewer: tuple[str, str | None]
+    ) -> bool:
         # deny and flip intent off, mirroring FollowService.reject
         updated = await self._prefs.set_approval_state(user_id, "rejected", reviewer)
         if updated:
             await self._prefs.upsert(user_id, auto_request_personal_mix=False)
         return updated
 
-    async def revoke_auto_request(self, user_id: str, reviewer: tuple[str, str | None]) -> bool:
+    async def revoke_auto_request(
+        self, user_id: str, reviewer: tuple[str, str | None]
+    ) -> bool:
         # revoke a prior grant and flip intent off, mirroring FollowService.revoke
         updated = await self._prefs.set_approval_state(user_id, "revoked", reviewer)
         if updated:

@@ -1,8 +1,8 @@
-"""HeldImport - a downloaded file that matched a track but failed the AcoustID
-recording-identity check, copied aside for a human "import anyway" / "discard"
-decision. The download-side counterpart to the scan's manual_review_queue: here the
-target track IS known (we matched it by duration), only the identity backstop
-disagreed - usually because MusicBrainz's crowd metadata for that recording is wrong."""
+"""A downloaded file kept in app-owned storage until its blocked import is resolved.
+
+Identity holds are reviewed per track. Library Management holds keep the complete
+acquisition unit together and are retried or discarded as one album-level action.
+"""
 
 from infrastructure.msgspec_fastapi import AppStruct
 
@@ -15,8 +15,10 @@ class HeldImport(AppStruct):
     source: str
     status: str
     created_at: float
+    reason_detail: str | None = None
     release_group_mbid: str | None = None
     release_mbid: str | None = None
+    release_track_mbid: str | None = None
     recording_mbid: str | None = None
     track_number: int | None = None
     disc_number: int | None = None
@@ -40,4 +42,6 @@ class HeldImport(AppStruct):
     # the naming template the rest of the album imported under, so "import anyway" places
     # this track consistently with its siblings even if the setting later changes
     naming_template: str | None = None
+    management_retry_count: int = 0
+    management_next_retry_at: float | None = None
     resolved_at: float | None = None

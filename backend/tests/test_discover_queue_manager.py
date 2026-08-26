@@ -1,13 +1,19 @@
 """Tests for DiscoverQueueManager background queue building."""
 
 import asyncio
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from api.v1.schemas.discover import DiscoverQueueEnrichment, DiscoverQueueItemLight, DiscoverQueueResponse
+from api.v1.schemas.discover import (
+    DiscoverQueueEnrichment,
+    DiscoverQueueItemLight,
+    DiscoverQueueResponse,
+)
 from services.discover_queue_manager import DiscoverQueueManager, QueueBuildStatus
+from infrastructure.persistence.discovery_snapshot_store import DiscoverySnapshotStore
 
 _UID = "u1"
 
@@ -33,6 +39,7 @@ def _make_manager(
     queue: DiscoverQueueResponse | None = None,
     build_error: Exception | None = None,
     ttl: int = 86400,
+    snapshot_store: DiscoverySnapshotStore | None = None,
 ) -> DiscoverQueueManager:
     discover = AsyncMock()
     if build_error:
@@ -46,7 +53,7 @@ def _make_manager(
     adv.discover_queue_ttl = ttl
     prefs.get_advanced_settings.return_value = adv
 
-    return DiscoverQueueManager(discover, prefs)
+    return DiscoverQueueManager(discover, prefs, snapshot_store=snapshot_store)
 
 
 @pytest.mark.asyncio
@@ -72,7 +79,7 @@ async def test_build_produces_ready_queue():
     queue = _make_queue(5)
     mgr = _make_manager(queue=queue)
     await mgr.start_build(_UID)
-    await asyncio.sleep(0.1)
+    await mgr.wait_for_build(_UID)
 
     status = mgr.get_status(_UID)
     assert status.status == "ready"
@@ -80,6 +87,50 @@ async def test_build_produces_ready_queue():
     built_queue = mgr.get_queue(_UID)
     assert built_queue is not None
     assert all(item.enrichment is not None for item in built_queue.items)
+
+
+@pytest.mark.asyncio
+async def test_ready_queue_survives_manager_restart(tmp_path):
+    snapshot_store = DiscoverySnapshotStore(tmp_path / "library.db", threading.Lock())
+    first = _make_manager(snapshot_store=snapshot_store)
+    await first.start_build(_UID)
+    await first.wait_for_build(_UID)
+
+    restarted = _make_manager(snapshot_store=snapshot_store)
+    await restarted.ensure_loaded(_UID)
+
+    assert restarted.get_status(_UID).status == "ready"
+    queue = await restarted.consume_queue(_UID)
+    assert queue is not None
+    assert queue.queue_id == "test-queue-id"
+
+
+@pytest.mark.asyncio
+async def test_in_memory_shutdown_cleanup_keeps_durable_queue(tmp_path):
+    snapshot_store = DiscoverySnapshotStore(tmp_path / "library.db", threading.Lock())
+    first = _make_manager(snapshot_store=snapshot_store)
+    await first.start_build(_UID)
+    await first.wait_for_build(_UID)
+    first.invalidate()
+
+    restarted = _make_manager(snapshot_store=snapshot_store)
+    await restarted.ensure_loaded(_UID)
+
+    assert restarted.get_status(_UID).status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_persisted_invalidation_marks_queue_stale(tmp_path):
+    snapshot_store = DiscoverySnapshotStore(tmp_path / "library.db", threading.Lock())
+    first = _make_manager(snapshot_store=snapshot_store)
+    await first.start_build(_UID)
+    await first.wait_for_build(_UID)
+    await snapshot_store.mark_discover_stale()
+
+    restarted = _make_manager(snapshot_store=snapshot_store)
+    await restarted.ensure_loaded(_UID)
+
+    assert restarted.get_status(_UID).stale is True
 
 
 @pytest.mark.asyncio
@@ -248,7 +299,9 @@ async def test_build_prewarms_covers():
     expect_assertions = True
     queue = _make_queue(3)
     cover_repo = AsyncMock()
-    cover_repo.get_release_group_cover = AsyncMock(return_value=(b"img", "image/jpeg", "caa"))
+    cover_repo.get_release_group_cover = AsyncMock(
+        return_value=(b"img", "image/jpeg", "caa")
+    )
 
     discover = AsyncMock()
     discover.build_queue.return_value = queue
@@ -268,6 +321,10 @@ async def test_build_prewarms_covers():
         call.args[0] for call in cover_repo.get_release_group_cover.call_args_list
     )
     assert called_mbids == ["mbid-0", "mbid-1", "mbid-2"]
+    assert all(
+        call.kwargs["size"] == "250"
+        for call in cover_repo.get_release_group_cover.call_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -285,7 +342,9 @@ async def test_build_prewarm_failure_does_not_break_queue():
     expect_assertions = True
     queue = _make_queue(2)
     cover_repo = AsyncMock()
-    cover_repo.get_release_group_cover = AsyncMock(side_effect=RuntimeError("fetch failed"))
+    cover_repo.get_release_group_cover = AsyncMock(
+        side_effect=RuntimeError("fetch failed")
+    )
 
     discover = AsyncMock()
     discover.build_queue.return_value = queue

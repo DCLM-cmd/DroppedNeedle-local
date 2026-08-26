@@ -20,6 +20,7 @@ class PlaylistTrackResponse(AppStruct):
     duration: int | None = None
     created_at: str = ""
     plex_rating_key: str | None = None
+    library_file_id: str | None = None
 
 
 class PlaylistSummaryResponse(AppStruct):

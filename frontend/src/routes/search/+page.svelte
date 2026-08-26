@@ -1,8 +1,5 @@
 <script lang="ts">
-	import { run } from 'svelte/legacy';
-
-	import { onMount, onDestroy } from 'svelte';
-	import { browser } from '$app/environment';
+	import { onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
 	import SearchArtistCard from '$lib/components/SearchArtistCard.svelte';
@@ -10,7 +7,7 @@
 	import ViewMoreArtistCard from '$lib/components/ViewMoreArtistCard.svelte';
 	import ArtistCardSkeleton from '$lib/components/ArtistCardSkeleton.svelte';
 	import AlbumCardSkeleton from '$lib/components/AlbumCardSkeleton.svelte';
-	import type { Artist, Album, EnrichmentSource } from '$lib/types';
+	import type { EnrichmentResponse, EnrichmentSource, SearchRemoteStatus } from '$lib/types';
 	import { colors } from '$lib/colors';
 	import { searchStore } from '$lib/stores/search';
 	import {
@@ -18,9 +15,16 @@
 		applyArtistEnrichment,
 		applyAlbumEnrichment
 	} from '$lib/utils/enrichment';
-	import { isAbortError } from '$lib/utils/errorHandling';
-	import { api } from '$lib/api/client';
-	import { Check, ArrowRight } from 'lucide-svelte';
+	import { createSearchEnrichmentBatcher } from '$lib/utils/searchEnrichmentBatcher';
+	import {
+		getLocalAlbumSearchQuery,
+		getLocalArtistSearchQuery,
+		getRemoteAlbumSearchQuery,
+		getRemoteArtistSearchQuery,
+		mergeSearchAlbums,
+		mergeSearchArtists
+	} from '$lib/queries/search/SearchQueries.svelte';
+	import { Check, ArrowRight, RefreshCw } from 'lucide-svelte';
 	import SearchTopResult from '$lib/components/SearchTopResult.svelte';
 
 	interface Props {
@@ -29,23 +33,61 @@
 
 	let { data }: Props = $props();
 
-	let artists: Artist[] = $state([]);
-	let albums: Album[] = $state([]);
-	let topArtist: Artist | null = $state(null);
-	let topAlbum: Album | null = $state(null);
-	let loadingArtists = $state(false);
-	let loadingAlbums = $state(false);
-	let hasSearched = $state(false);
 	let showToast = $state(false);
-	let abortController: AbortController | null = null;
-	let enrichmentController: AbortController | null = null;
 	let enrichmentSource: EnrichmentSource = $state('none');
+	let enrichment: EnrichmentResponse | null = $state(null);
+	let enrichmentQuery = $state('');
 
-	let isSearching = $derived(loadingArtists || loadingAlbums);
-	let hasResults = $derived(artists.length > 0 || albums.length > 0);
+	let normalizedQuery = $derived(data.query.trim());
+	const localArtistQuery = getLocalArtistSearchQuery(() => normalizedQuery);
+	const localAlbumQuery = getLocalAlbumSearchQuery(() => normalizedQuery);
+	const artistQuery = getRemoteArtistSearchQuery(() => normalizedQuery);
+	const albumQuery = getRemoteAlbumSearchQuery(() => normalizedQuery);
+
+	let baseArtists = $derived(
+		mergeSearchArtists(localArtistQuery.data?.items ?? [], artistQuery.data?.results ?? [])
+	);
+	let baseAlbums = $derived(
+		mergeSearchAlbums(localAlbumQuery.data?.items ?? [], albumQuery.data?.results ?? [])
+	);
+	let artists = $derived(enrichment ? applyArtistEnrichment(baseArtists, enrichment) : baseArtists);
+	let albums = $derived(enrichment ? applyAlbumEnrichment(baseAlbums, enrichment) : baseAlbums);
+	let topArtist = $derived(
+		artists.find(
+			(artist) => artist.musicbrainz_id === artistQuery.data?.top_result?.musicbrainz_id
+		) ?? null
+	);
+	let topAlbum = $derived(
+		albums.find((album) => album.musicbrainz_id === albumQuery.data?.top_result?.musicbrainz_id) ??
+			null
+	);
+	let artistStatus: SearchRemoteStatus = $derived(
+		artistQuery.isError ? 'error' : (artistQuery.data?.status ?? 'ok')
+	);
+	let albumStatus: SearchRemoteStatus = $derived(
+		albumQuery.isError ? 'error' : (albumQuery.data?.status ?? 'ok')
+	);
+	let loadingArtists = $derived(
+		(artistQuery.isPending || localArtistQuery.isPending) && artists.length === 0
+	);
+	let loadingAlbums = $derived(
+		(albumQuery.isPending || localAlbumQuery.isPending) && albums.length === 0
+	);
+	let hasSearched = $derived(normalizedQuery.length >= 2);
+
+	let isSearching = $derived(
+		localArtistQuery.isFetching ||
+			localAlbumQuery.isFetching ||
+			artistQuery.isFetching ||
+			albumQuery.isFetching
+	);
 	let hasTopResult = $derived(topArtist != null || topAlbum != null);
 	let displayedArtists = $derived(
 		topArtist ? artists.filter((a) => a.musicbrainz_id !== topArtist?.musicbrainz_id) : artists
+	);
+	let artistCards = $derived(displayedArtists.slice(0, 5));
+	let artistPlaceholderCount = $derived(
+		artistQuery.isFetching ? Math.max(0, 5 - artistCards.length) : 0
 	);
 	let displayedAlbums = $derived(
 		topAlbum ? albums.filter((a) => a.musicbrainz_id !== topAlbum?.musicbrainz_id) : albums
@@ -64,166 +106,45 @@
 		}, 3000);
 	}
 
-	async function fetchEnrichment() {
-		if (artists.length === 0 && albums.length === 0) return;
-
-		if (enrichmentController) {
-			enrichmentController.abort();
-		}
-		enrichmentController = new AbortController();
-
-		const artistRequests = artists.map((a) => ({
-			musicbrainz_id: a.musicbrainz_id,
-			name: a.title
-		}));
-		const albumRequests = albums.map((a) => ({
-			musicbrainz_id: a.musicbrainz_id,
-			artist_name: a.artist || '',
-			album_name: a.title
-		}));
-
-		try {
-			const enrichment = await fetchEnrichmentBatch(
-				artistRequests,
-				albumRequests,
-				enrichmentController.signal
-			);
-			if (!enrichment) return;
-
-			enrichmentSource = enrichment.source;
-			artists = applyArtistEnrichment(artists, enrichment);
-			albums = applyAlbumEnrichment(albums, enrichment);
+	const enrichmentBatcher = createSearchEnrichmentBatcher({
+		load: fetchEnrichmentBatch,
+		onresult: (result) => {
+			enrichmentSource = result.source;
+			enrichment = result;
 			searchStore.setEnrichmentSource(enrichmentSource);
-		} catch (error) {
-			if (isAbortError(error)) {
-				return;
-			}
-		}
-	}
-
-	async function performSearch(q: string) {
-		const normalizedQuery = q.trim();
-		const cached = searchStore.getCache(normalizedQuery, { allowStale: true });
-		const hasCachedResults = !!cached;
-		const shouldRefresh = !cached || searchStore.isStale(cached.timestamp);
-
-		if (cached) {
-			hasSearched = true;
-			artists = cached.artists;
-			albums = cached.albums;
-			topArtist = cached.topArtist ?? null;
-			topAlbum = cached.topAlbum ?? null;
-			enrichmentSource = cached.enrichmentSource;
-			loadingArtists = false;
-			loadingAlbums = false;
-		}
-
-		if (abortController) {
-			abortController.abort();
-		}
-		if (enrichmentController) {
-			enrichmentController.abort();
-		}
-
-		if (!normalizedQuery) {
-			artists = [];
-			albums = [];
-			topArtist = null;
-			topAlbum = null;
-			hasSearched = false;
-			enrichmentSource = 'none';
-			searchStore.clear();
-			return;
-		}
-
-		if (!shouldRefresh) {
-			return;
-		}
-
-		abortController = new AbortController();
-		hasSearched = true;
-		if (!hasCachedResults) {
-			artists = [];
-			albums = [];
-			enrichmentSource = 'none';
-		}
-		loadingArtists = true;
-		loadingAlbums = true;
-
-		try {
-			const responseData = await api.get<{
-				artists?: Artist[];
-				albums?: Album[];
-				top_artist?: Artist | null;
-				top_album?: Album | null;
-			}>(
-				`/api/v1/search?q=${encodeURIComponent(normalizedQuery)}&limit_artists=6&limit_albums=24`,
-				{ signal: abortController.signal }
-			);
-			artists = responseData.artists || [];
-			albums = responseData.albums || [];
-			topArtist = responseData.top_artist ?? null;
-			topAlbum = responseData.top_album ?? null;
-		} catch (e) {
-			if (isAbortError(e)) {
-				return;
-			}
-			artists = [];
-			albums = [];
-			topArtist = null;
-			topAlbum = null;
-		} finally {
-			loadingArtists = false;
-			loadingAlbums = false;
-		}
-
-		searchStore.setResults(normalizedQuery, artists, albums, enrichmentSource, topArtist, topAlbum);
-
-		void fetchEnrichment();
-	}
-
-	let lastQuery = $state('');
-
-	run(() => {
-		if (browser && data.query && data.query !== lastQuery) {
-			lastQuery = data.query;
-			performSearch(data.query);
-		} else if (browser && !data.query) {
-			artists = [];
-			albums = [];
-			topArtist = null;
-			topAlbum = null;
-			hasSearched = false;
-			lastQuery = '';
-			searchStore.clear();
 		}
 	});
 
-	onMount(() => {
-		if (browser) {
-			const handleRefresh = () => {
-				if (data.query) {
-					performSearch(data.query);
-				}
-			};
-			window.addEventListener('search-refresh', handleRefresh);
+	$effect(() => {
+		if (normalizedQuery === enrichmentQuery) return;
+		enrichmentQuery = normalizedQuery;
+		enrichmentBatcher.reset();
+		enrichment = null;
+		enrichmentSource = 'none';
+	});
 
-			return () => {
-				window.removeEventListener('search-refresh', handleRefresh);
-			};
-		}
+	$effect(() => {
+		const handleRefresh = () => {
+			void Promise.all([
+				localArtistQuery.refetch(),
+				localAlbumQuery.refetch(),
+				artistQuery.refetch(),
+				albumQuery.refetch()
+			]);
+		};
+		window.addEventListener('search-refresh', handleRefresh);
+		return () => window.removeEventListener('search-refresh', handleRefresh);
 	});
 
 	onDestroy(() => {
-		if (abortController) {
-			abortController.abort();
-			abortController = null;
-		}
-		if (enrichmentController) {
-			enrichmentController.abort();
-			enrichmentController = null;
-		}
+		enrichmentBatcher.dispose();
 	});
+
+	function statusMessage(status: SearchRemoteStatus, bucket: 'artists' | 'albums'): string {
+		if (status === 'timeout') return `MusicBrainz ${bucket} took too long to respond.`;
+		if (status === 'partial') return `Some MusicBrainz ${bucket} could not be loaded.`;
+		return `MusicBrainz ${bucket} are temporarily unavailable.`;
+	}
 </script>
 
 {#if hasSearched || isSearching}
@@ -253,40 +174,20 @@
 	</div>
 {/if}
 
-{#if isSearching && !hasResults}
+{#if hasSearched}
 	<section class="px-8 py-4 space-y-8">
-		<div>
-			<h2 class="text-xl font-bold mb-4">Artists</h2>
-			<div class="bg-base-200 rounded-box p-4">
-				<div
-					class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4"
-				>
-					{#each Array(6) as _, i (`artist-skeleton-${i}`)}
-						<ArtistCardSkeleton variant="detailed" />
-					{/each}
-				</div>
+		{#if isSearching}
+			<div
+				class="grid grid-flow-col auto-cols-[85%] gap-3 overflow-x-auto sm:grid-flow-row sm:auto-cols-auto sm:grid-cols-2 sm:overflow-visible"
+				aria-label="Loading top search results"
+			>
+				<div class="skeleton skeleton-shimmer min-h-44 sm:min-h-56 rounded-box"></div>
+				<div class="skeleton skeleton-shimmer min-h-44 sm:min-h-56 rounded-box"></div>
 			</div>
-		</div>
-
-		<div>
-			<div class="flex items-center justify-between mb-4">
-				<h2 class="text-xl font-bold">Albums</h2>
-			</div>
-			<div class="bg-base-200 rounded-box p-4">
-				<div
-					class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4"
-				>
-					{#each Array(6) as _, i (`album-skeleton-${i}`)}
-						<AlbumCardSkeleton />
-					{/each}
-				</div>
-			</div>
-		</div>
-	</section>
-{:else if hasSearched}
-	<section class="px-8 py-4 space-y-8">
-		{#if hasTopResult && !isSearching}
-			<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+		{:else if hasTopResult}
+			<div
+				class="grid grid-flow-col auto-cols-[85%] gap-3 overflow-x-auto sm:grid-flow-row sm:auto-cols-auto sm:grid-cols-2 sm:overflow-visible"
+			>
 				{#if topArtist}
 					<SearchTopResult artist={topArtist} />
 				{/if}
@@ -298,6 +199,16 @@
 
 		<div>
 			<h2 class="text-xl font-bold mb-4">Artists</h2>
+			{#if artistStatus !== 'ok'}
+				<div class="alert alert-warning mb-3" role="status">
+					<span
+						>{statusMessage(artistStatus, 'artists')} Local and cached results remain available.</span
+					>
+					<button class="btn btn-sm" onclick={() => artistQuery.refetch()}>
+						<RefreshCw class="h-4 w-4" /> Retry
+					</button>
+				</div>
+			{/if}
 			{#if loadingArtists}
 				<div class="bg-base-200 rounded-box p-4">
 					<div
@@ -312,10 +223,19 @@
 				<div class="bg-base-200 rounded-box p-4 overflow-hidden">
 					<div
 						class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4"
+						aria-label="Artist search results"
+						aria-busy={artistQuery.isFetching}
 					>
 						<ViewMoreArtistCard />
-						{#each displayedArtists.slice(0, 5) as artist (artist.musicbrainz_id)}
-							<SearchArtistCard {artist} {enrichmentSource} />
+						{#each artistCards as artist (artist.musicbrainz_id)}
+							<SearchArtistCard
+								{artist}
+								{enrichmentSource}
+								onenrichmentrequest={() => enrichmentBatcher.requestArtist(artist)}
+							/>
+						{/each}
+						{#each Array(artistPlaceholderCount) as _, i (`artist-pending-${i}`)}
+							<ArtistCardSkeleton variant="detailed" />
 						{/each}
 					</div>
 				</div>
@@ -336,6 +256,16 @@
 					</a>
 				{/if}
 			</div>
+			{#if albumStatus !== 'ok'}
+				<div class="alert alert-warning mb-3" role="status">
+					<span
+						>{statusMessage(albumStatus, 'albums')} Local and cached results remain available.</span
+					>
+					<button class="btn btn-sm" onclick={() => albumQuery.refetch()}>
+						<RefreshCw class="h-4 w-4" /> Retry
+					</button>
+				</div>
+			{/if}
 			{#if loadingAlbums}
 				<div class="bg-base-200 rounded-box p-4">
 					<div
@@ -353,7 +283,12 @@
 					>
 						<ViewMoreAlbumCard />
 						{#each displayedAlbums as album (album.musicbrainz_id)}
-							<AlbumCard {album} {enrichmentSource} onadded={handleAlbumAdded} />
+							<AlbumCard
+								{album}
+								{enrichmentSource}
+								onadded={handleAlbumAdded}
+								onenrichmentrequest={() => enrichmentBatcher.requestAlbum(album)}
+							/>
 						{/each}
 					</div>
 				</div>

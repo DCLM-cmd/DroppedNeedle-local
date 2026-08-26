@@ -28,6 +28,7 @@ _PUBLIC_PATHS: frozenset[str] = frozenset({
     "/api/v1/auth/setup",
     "/api/v1/auth/providers",
     "/api/v1/auth/login",
+    "/api/v1/auth/password-recovery/reset",
     # Logout is public so an expired session can still clear the cookie
     "/api/v1/auth/logout",
     # Third-party login flows
@@ -42,6 +43,8 @@ _PUBLIC_PATHS: frozenset[str] = frozenset({
     # cookie or a bearer-token client then lands on the graceful /profile?spotify=error
     # redirect instead of a raw 401.
     "/api/v1/me/connections/spotify/auth/callback",
+    # MusicBrainz returns with a one-time token; only this exact callback is public.
+    "/api/v1/library/contributions/musicbrainz/callback",
     # OpenAPI spec (single file)
     "/api/v1/openapi.json",
 })
@@ -52,6 +55,11 @@ _PUBLIC_PREFIXES: tuple[str, ...] = (
     "/api/v1/redoc",
     "/api/v1/wrapped",
 )
+
+_NON_INTERACTIVE_API_PATHS: frozenset[str] = frozenset({
+    "/api/v1/following/events",
+    "/api/v1/now-playing/events",
+})
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -187,8 +195,30 @@ class AuthMiddleware(BaseHTTPMiddleware):
         user, token = result
         request.state.user = user
         request.state.token = token
- 
-        return await call_next(request)
+
+        workload_gate = None
+        if self._tracks_interactive_activity(path):
+            from core.dependencies.service_providers import (
+                get_background_workload_gate,
+            )
+
+            workload_gate = get_background_workload_gate()
+            workload_gate.begin_interactive_request()
+
+        try:
+            return await call_next(request)
+        finally:
+            if workload_gate is not None:
+                workload_gate.end_interactive_request()
+
+    @staticmethod
+    def _tracks_interactive_activity(path: str) -> bool:
+        """Exclude long-lived media and SSE connections from activity tracking."""
+        if path in _NON_INTERACTIVE_API_PATHS:
+            return False
+        if path.startswith("/api/v1/stream/") or "/held-audio/" in path:
+            return False
+        return not path.endswith("/stream")
 
     @staticmethod
     def _is_public(path: str) -> bool:

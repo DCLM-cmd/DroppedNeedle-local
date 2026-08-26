@@ -157,18 +157,18 @@ describe('Player.svelte lyrics button', () => {
 		await expect.element(page.getByLabelText('Toggle lyrics')).not.toBeInTheDocument();
 	});
 
-	it('hides lyrics button for local source', async () => {
+	it('shows lyrics button for local source when embedded lyrics exist', async () => {
 		mockQueryState = {
-			isSuccess: false,
+			isSuccess: true,
 			isError: false,
 			isLoading: false,
 			isFetching: false,
-			data: undefined
+			data: { text: 'Embedded lyrics', is_synced: false, lines: [] }
 		};
 
 		playerStore.playQueue([makeTrack('local')]);
 		render(Player);
 
-		await expect.element(page.getByLabelText('Toggle lyrics')).not.toBeInTheDocument();
+		await expect.element(page.getByLabelText('Toggle lyrics')).toBeInTheDocument();
 	});
 });

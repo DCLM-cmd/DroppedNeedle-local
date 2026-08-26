@@ -24,6 +24,7 @@ from infrastructure.persistence.follow_store import (
     FollowStore,
     NewReleaseInput,
 )
+from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
 from services.native.download_service import ALREADY_IN_LIBRARY
 
@@ -117,7 +118,9 @@ class NewReleaseService:
                 asyncio.TimeoutError,
             ) as exc:
                 # skip without advancing the known-set; retried next run (DD6)
-                await self._store.update_cursor(artist.artist_mbid_lower, "error", str(exc))
+                await self._store.update_cursor(
+                    artist.artist_mbid_lower, "error", str(exc)
+                )
                 logger.warning(
                     "Follow poll: MusicBrainz unavailable for %s: %s",
                     artist.artist_mbid_lower,
@@ -161,7 +164,9 @@ class NewReleaseService:
             ),
             timeout=_MB_FETCH_TIMEOUT,
         )
-        candidates = [rg for rg in release_groups if rg.get("id") and _is_wanted_type(rg)]
+        candidates = [
+            rg for rg in release_groups if rg.get("id") and _is_wanted_type(rg)
+        ]
 
         if not await self._store.has_cursor(artist.artist_mbid_lower):
             # DD2 baseline: record current discography and emit nothing
@@ -184,7 +189,9 @@ class NewReleaseService:
         # future-dated releases stay OUT of the known set so a later poll
         # on/after release can still detect + enqueue them (DD4)
         known_lowers = [rg["id"].lower() for rg in fresh if not _is_future(rg, today)]
-        await self._store.record_new_releases(artist.artist_mbid_lower, feed_rows, known_lowers)
+        await self._store.record_new_releases(
+            artist.artist_mbid_lower, feed_rows, known_lowers
+        )
 
         enqueued = 0
         for rg in fresh:
@@ -216,9 +223,14 @@ class NewReleaseService:
             return False  # DD4: not out yet -> Wanted only
         if rg_lower in owned:
             return False  # already in the library
-        if await self._download_store.get_active_task_for_album_any_user(rg_id) is not None:
+        if (
+            await self._download_store.get_active_task_for_album_any_user(rg_id)
+            is not None
+        ):
             return False  # already downloading for some user (DD5)
-        followers = await self._store.list_auto_download_followers(artist.artist_mbid_lower)
+        followers = await self._store.list_auto_download_followers(
+            artist.artist_mbid_lower
+        )
         if not followers:
             return False  # nobody approved -> Wanted only
         owner = followers[0]  # deterministic; the shared library satisfies the rest
@@ -231,14 +243,18 @@ class NewReleaseService:
                 album_title=title,
                 artist_mbid=artist.artist_mbid,
                 origin="user",
+                track_count_priority=RequestPriority.BACKGROUND_SYNC,
             )
         except ConfigurationError:
             logger.info(
-                "Follow poll: download client disabled; not auto-downloading %s", rg_lower
+                "Follow poll: download client disabled; not auto-downloading %s",
+                rg_lower,
             )
             return False
         except Exception as exc:  # noqa: BLE001 - one enqueue failure must not abort the artist
-            logger.error("Follow poll: failed to enqueue %s: %s", rg_lower, exc, exc_info=True)
+            logger.error(
+                "Follow poll: failed to enqueue %s: %s", rg_lower, exc, exc_info=True
+            )
             return False
         if not task_id or task_id == ALREADY_IN_LIBRARY:
             return False

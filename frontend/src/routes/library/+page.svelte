@@ -1,16 +1,17 @@
 <script lang="ts">
+	import { page } from '$app/state';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import LibraryDashboard from '$lib/components/library/LibraryDashboard.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { Headphones, SlidersHorizontal, Waypoints, X } from 'lucide-svelte';
+	import { Headphones, LockKeyhole, SlidersHorizontal, Waypoints, X } from 'lucide-svelte';
 
-	// admins land on the server-setup toggles; everyone else on their self-service Profile
-	const CONNECT_APPS_HREF = $derived(
-		authStore.isAdmin ? '/settings?tab=connect-apps' : '/profile#connect-apps'
-	);
+	const CONNECT_APPS_HREF = '/profile#connect-apps';
 	const BANNER_KEY = 'droppedneedle_connect_apps_banner_dismissed';
 
 	let bannerDismissed = $state(true); // assume dismissed until we read storage (no SSR flash)
+	const musicBrainzCallbackFailed = $derived(
+		page.url.searchParams.get('musicbrainz') === 'callback-error'
+	);
 
 	$effect(() => {
 		if (typeof localStorage !== 'undefined') {
@@ -23,12 +24,6 @@
 		if (typeof localStorage !== 'undefined') {
 			localStorage.setItem(BANNER_KEY, '1');
 		}
-	}
-
-	function scrollToControls() {
-		document
-			.getElementById('library-controls')
-			?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 	}
 </script>
 
@@ -53,19 +48,40 @@
 				<span>Connect Apps</span>
 			</a>
 			{#if authStore.isAdmin}
-				<button
-					onclick={scrollToControls}
+				<a
+					href="/library/management"
 					class="group btn btn-sm gap-2 rounded-full border border-base-content/15 bg-base-100/50 text-base-content backdrop-blur transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/40 hover:bg-base-100/80 sm:btn-md"
 				>
 					<SlidersHorizontal
 						class="h-4 w-4 transition-transform duration-200 group-hover:rotate-12"
 					/>
 					<span>Controls</span>
+				</a>
+			{:else}
+				<button
+					type="button"
+					aria-disabled="true"
+					aria-describedby="library-controls-admin-only"
+					class="btn btn-sm cursor-not-allowed gap-2 rounded-full border border-base-content/10 bg-base-200/35 text-base-content/35 shadow-none sm:btn-md"
+				>
+					<LockKeyhole class="h-4 w-4" aria-hidden="true" />
+					<span>Controls</span>
 				</button>
+				<span id="library-controls-admin-only" class="sr-only">
+					Library controls require administrator access.
+				</span>
 			{/if}
 		{/snippet}
 	</PageHeader>
 	<div class="space-y-10 px-4 pb-12 sm:space-y-12 sm:px-6 lg:px-8">
+		{#if musicBrainzCallbackFailed}
+			<div class="alert alert-warning" role="alert">
+				<p>
+					MusicBrainz couldn't return you to the contribution. Reopen it and paste the submitted
+					release URL to verify it.
+				</p>
+			</div>
+		{/if}
 		{#if !bannerDismissed}
 			<div
 				class="flex items-center gap-3 rounded-box border border-accent/25 bg-base-200 p-4"

@@ -51,12 +51,15 @@ vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
 	retryAllFailed: () => ({ mutate: vi.fn(), isPending: false }),
 	importHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),
 	discardHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),
-	reimportDownload: () => ({ mutate: vi.fn(), isPending: false })
+	retryHeldManagementUnit: () => ({ mutate: vi.fn(), isPending: false }),
+	discardHeldManagementUnit: () => ({ mutate: vi.fn(), isPending: false }),
+	reimportDownload: () => ({ mutate: vi.fn(), isPending: false }),
+	tryNextSource: () => ({ mutate: vi.fn(), isPending: false })
 }));
 
 vi.mock('$lib/queries/downloads/DownloadSSE.svelte', () => ({
 	createDownloadStream: () => ({
-		state: { progress: null, status: null, done: false },
+		state: { progress: null, status: null, source: null, done: false },
 		start: vi.fn(),
 		stop: vi.fn()
 	})
@@ -80,7 +83,10 @@ function task(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		id: 't',
 		user_id: 'u',
 		download_type: 'album',
+		source: 'soulseek',
 		release_group_mbid: 'rg',
+		release_mbid: null,
+		release_track_mbid: null,
 		recording_mbid: null,
 		artist_name: 'Radiohead',
 		album_title: 'OK Computer',
@@ -106,6 +112,19 @@ function task(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		next_retry_at: null,
 		retry_max: 6,
 		retry_ladder_minutes: [15, 30, 60, 120, 240, 480],
+		acquisition_cleanup_state: 'not_tracked',
+		quality_format: null,
+		quality_bit_depth: null,
+		quality_sample_rate: null,
+		advertised_queue_depth: null,
+		queue_position_start: null,
+		queue_position_end: null,
+		remote_queued: false,
+		preferred_quality_fallback_at: null,
+		attempt_number: 0,
+		attempt_total: 0,
+		has_next_source: false,
+		held_for_review: false,
 		...overrides
 	};
 }
@@ -141,6 +160,30 @@ describe('DownloadQueue.svelte', () => {
 		render(DownloadQueue);
 		await expect.element(page.getByRole('heading', { name: /Now spinning/ })).toBeVisible();
 		await expect.element(page.getByText('In Rainbows').first()).toBeVisible();
+	});
+
+	it('shows queued Soulseek quality and source details on the Downloads page', async () => {
+		h.items = [
+			task({
+				downloaded_bytes: 0,
+				progress_percent: 0,
+				quality_format: 'flac',
+				quality_bit_depth: 24,
+				quality_sample_rate: 48_000,
+				advertised_queue_depth: 2710,
+				remote_queued: true,
+				attempt_number: 1,
+				attempt_total: 3,
+				has_next_source: true
+			})
+		];
+		render(DownloadQueue);
+
+		await expect.element(page.getByText('24-bit / 48 kHz FLAC').first()).toBeVisible();
+		await expect
+			.element(page.getByText('Waiting for Soulseek · queue 2,710').first())
+			.toBeVisible();
+		await expect.element(page.getByText('Trying source 1 of 3').first()).toBeVisible();
 	});
 
 	it('shows a scheduled-retry album in the Still hunting section with its ladder and countdown', async () => {
@@ -185,10 +228,13 @@ describe('DownloadQueue.svelte', () => {
 	});
 
 	it('surfaces held tracks in a "Couldn\'t verify" section', async () => {
+		h.items = [task({ id: 't', status: 'failed', held_for_review: true })];
 		h.held = [
 			{
 				id: 1,
 				release_group_mbid: 'rg-1',
+				release_mbid: null,
+				release_track_mbid: null,
 				recording_mbid: 'rec-3',
 				track_number: 3,
 				disc_number: 1,
@@ -200,16 +246,74 @@ describe('DownloadQueue.svelte', () => {
 				file_format: 'flac',
 				duration_seconds: 388,
 				reason: 'fingerprint_mismatch',
+				reason_detail: null,
 				source: 'usenet',
 				source_task_id: 't',
 				created_at: 0,
 				evidence_title: "Nobody's Fault but Mine",
 				evidence_artist: 'Led Zeppelin',
-				evidence_score: 0.99
+				evidence_score: 0.99,
+				management_retry_count: 0,
+				management_next_retry_at: null
 			}
 		];
 		render(DownloadQueue);
 		await expect.element(page.getByRole('heading', { name: /Couldn't verify/ })).toBeVisible();
 		await expect.element(page.getByText(/You Shook Me/).first()).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Retry download' }))
+			.not.toBeInTheDocument();
+	});
+
+	it('groups a Library Management hold as one secured album instead of verification failures', async () => {
+		h.isAdmin = true;
+		h.items = [
+			task({
+				id: 'managed-task',
+				status: 'failed',
+				held_for_review: true,
+				error_message: 'Download complete. The files are secured.'
+			})
+		];
+		h.held = [1, 2].map((track) => ({
+			id: track,
+			release_group_mbid: 'rg',
+			release_mbid: null,
+			release_track_mbid: null,
+			recording_mbid: `rec-${track}`,
+			track_number: track,
+			disc_number: 1,
+			track_title: `Track ${track}`,
+			artist_name: 'Radiohead',
+			album_title: 'OK Computer',
+			year: 1997,
+			original_filename: `${track}.flac`,
+			file_format: 'flac',
+			duration_seconds: 200,
+			reason: 'management:PROFILE_CHANGED',
+			reason_detail: 'The active profile changed during preparation.',
+			source: 'soulseek',
+			source_task_id: 'managed-task',
+			created_at: track,
+			evidence_title: null,
+			evidence_artist: null,
+			evidence_score: null,
+			management_retry_count: 0,
+			management_next_retry_at: null
+		}));
+
+		render(DownloadQueue);
+
+		await expect
+			.element(page.getByRole('heading', { name: /Organizer needs attention/ }))
+			.toBeVisible();
+		await expect.element(page.getByText('2 files safely held')).toBeVisible();
+		await expect.element(page.getByRole('button', { name: 'Retry organizer' })).toBeVisible();
+		await expect
+			.element(page.getByRole('heading', { name: /Couldn't verify/ }))
+			.not.toBeInTheDocument();
+		await expect
+			.element(page.getByRole('button', { name: 'Retry download' }))
+			.not.toBeInTheDocument();
 	});
 });

@@ -4,6 +4,7 @@ import type { Getter } from 'runed';
 import { api } from '$lib/api/client';
 import { DownloadQueryKeyFactory } from '$lib/queries/downloads/DownloadQueryKeyFactory';
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
+import { authStore } from '$lib/stores/authStore.svelte';
 import type { AlbumEditionsResponse, EditionAcquireResponse } from '$lib/types';
 
 // Album edition selection (CollectionManagement Feature E). The picker is an
@@ -42,6 +43,9 @@ export function acquireEdition() {
 			api.global.post<EditionAcquireResponse>(`${pinUrl(mbid)}/acquire`, {}),
 		// the acquire fans out into download tasks - surface them in the queue now,
 		// not on the next poll
-		onSuccess: () => invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.tasks() })
+		onSuccess: () =>
+			invalidateQueriesWithPersister({
+				queryKey: DownloadQueryKeyFactory.tasks(authStore.user?.id)
+			})
 	}));
 }

@@ -16,13 +16,13 @@ from infrastructure.persistence.download_store import DownloadStore
 from models.download import ScoredCandidate, TargetTrack
 from models.download_identity import soulseek_identity
 from repositories.protocols.download_client import DownloadSearchResult
-from services.native.album_preflight_scorer import _file_confidence, peer_availability
+from services.native.album_preflight_scorer import _file_confidence
 from services.native.title_match import artist_evidence
 from services.native.quality_tiers import (
     DEFAULT_QUALITY_MAX,
     DEFAULT_QUALITY_MIN,
-    exceeds_lossless_cap,
     file_tier,
+    folder_hires_key,
     in_range,
     is_audio,
     is_flac_or_mp3,
@@ -38,13 +38,11 @@ class TrackMatcher:
         quality_min: str = DEFAULT_QUALITY_MIN,
         quality_max: str = DEFAULT_QUALITY_MAX,
         flac_mp3_only: bool = True,
-        lossless_max_kbps: int = 0,
     ):
         self._store = download_store
         self._quality_min = quality_min
         self._quality_max = quality_max
         self._flac_mp3_only = flac_mp3_only
-        self._lossless_max_kbps = lossless_max_kbps
 
     async def match(
         self,
@@ -55,7 +53,8 @@ class TrackMatcher:
         manual_threshold: float = 0.50,
     ) -> ScoredCandidate | None:
         ranked = await self.rank(
-            target, results,
+            target,
+            results,
             auto_accept_threshold=auto_accept_threshold,
             manual_threshold=manual_threshold,
         )
@@ -78,8 +77,10 @@ class TrackMatcher:
         the recording's best held copy (D12; the track path has no spec pipeline)."""
         quarantined = await self._store.load_quarantine_set()
         filtered = [
-            r for r in results
-            if ("soulseek", soulseek_identity(r.username, r.filename)) not in quarantined
+            r
+            for r in results
+            if ("soulseek", soulseek_identity(r.username, r.filename))
+            not in quarantined
         ]
         # drop the art/cue/log sidecars a folder search returns alongside the tracks
         filtered = [r for r in filtered if is_audio(r)]
@@ -90,12 +91,6 @@ class TrackMatcher:
             for r in filtered
             if in_range(file_tier(r), self._quality_min, self._quality_max)
         ]
-        if self._lossless_max_kbps:
-            # lossless bitrate cap (0 = off): drop over-cap hi-res files
-            filtered = [
-                r for r in filtered
-                if not exceeds_lossless_cap(r, self._lossless_max_kbps)
-            ]
         if held_tier is not None:
             filtered = [
                 r for r in filtered if tier_rank(file_tier(r)) > tier_rank(held_tier)
@@ -103,27 +98,47 @@ class TrackMatcher:
         if not filtered:
             return []
 
-        scored: list[tuple[int, float, DownloadSearchResult]] = []
+        scored: list[
+            tuple[tuple[int | float, ...], float, str, DownloadSearchResult]
+        ] = []
         for file in filtered:
             # strict_title: a track title is directly comparable to a filename, so the
             # containment metric applies (unlike the album path's title-vs-album noise).
             score = _file_confidence(
-                target.track_title, target.artist_name, target.duration_seconds, file,
+                target.track_title,
+                target.artist_name,
+                target.duration_seconds,
+                file,
                 strict_title=True,
             )
-            scored.append((tier_rank(file_tier(file)), score, file))
-        # prefer the higher tier, then the better match - with peer availability
-        # (upload speed / free slot) as a banded tiebreaker, mirroring the album
-        # scorer (D3): within the same 0.05 score band the faster peer wins, but
-        # availability can never outrank a better identity match.
-        scored.sort(
-            key=lambda t: (t[0], int(t[1] / 0.05), peer_availability([t[2]]), t[1]),
-            reverse=True,
-        )
+            if score >= auto_accept_threshold and artist_evidence(
+                target.artist_name, file.filename
+            ):
+                acceptance = "auto"
+            elif score >= manual_threshold:
+                acceptance = "manual"
+            else:
+                acceptance = "rejected"
+            bit_depth, sample_rate = folder_hires_key([file])
+            queue_known = file.queue_length is not None
+            rank_key = (
+                {"rejected": 0, "manual": 1, "auto": 2}[acceptance],
+                tier_rank(file_tier(file)),
+                bit_depth,
+                sample_rate,
+                int(file.has_free_slot),
+                int(queue_known),
+                -(file.queue_length if file.queue_length is not None else 2**31 - 1),
+                file.upload_speed,
+                -file.size,
+                score,
+            )
+            scored.append((rank_key, score, acceptance, file))
+        scored.sort(key=lambda item: item[0], reverse=True)
 
         candidates: list[ScoredCandidate] = []
         seen_peers: set[str] = set()
-        for _rank, score, file in scored:
+        for _rank, score, acceptance, file in scored:
             if file.username in seen_peers:
                 continue  # one candidate per peer - failover skips same-peer anyway
             seen_peers.add(file.username)
@@ -132,14 +147,6 @@ class TrackMatcher:
             # plausible duration clears 0.70 on score alone, so a candidate whose
             # full remote path never names the requested artist caps at 'manual'
             # (one human click in Review) instead of downloading silently.
-            if score >= auto_accept_threshold and artist_evidence(
-                target.artist_name, file.filename
-            ):
-                tier = "auto"
-            elif score >= manual_threshold:
-                tier = "manual"
-            else:
-                tier = "rejected"
             candidates.append(
                 ScoredCandidate(
                     username=file.username,
@@ -148,7 +155,7 @@ class TrackMatcher:
                     coherence=score,
                     file_confidence=score,
                     final_score=score,
-                    tier=tier,
+                    tier=acceptance,
                 )
             )
             if len(candidates) >= limit:

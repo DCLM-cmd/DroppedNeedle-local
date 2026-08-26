@@ -1,4 +1,5 @@
 <script lang="ts">
+	import '../../../auth.css';
 	import { page } from '$app/state';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { ApiError } from '$lib/api/client';

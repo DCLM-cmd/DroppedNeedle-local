@@ -52,11 +52,30 @@ describe('library route page', () => {
 			.toHaveAttribute('href', '/profile#connect-apps');
 	});
 
-	it('points an admin to the server-setup tab for Connect Apps', async () => {
+	it('points an admin to their Profile for Connect Apps', async () => {
 		authStore.setUser(user('admin'));
 		render(LibraryPage);
 		await expect
 			.element(page.getByRole('link', { name: 'Connect Apps' }))
-			.toHaveAttribute('href', '/settings?tab=connect-apps');
+			.toHaveAttribute('href', '/profile#connect-apps');
+	});
+
+	it('links Controls to Library Management for administrators', async () => {
+		authStore.setUser(user('admin'));
+		render(LibraryPage);
+		await expect
+			.element(page.getByRole('link', { name: 'Controls' }))
+			.toHaveAttribute('href', '/library/management');
+	});
+
+	it('keeps Controls visible but locked for non-administrators', async () => {
+		authStore.setUser(user('user'));
+		render(LibraryPage);
+		const controls = page.getByRole('button', { name: 'Controls' });
+		await expect.element(controls).toHaveAttribute('aria-disabled', 'true');
+		await expect
+			.element(page.getByText('Library controls require administrator access.'))
+			.toBeInTheDocument();
+		await expect.element(page.getByRole('link', { name: 'Controls' })).not.toBeInTheDocument();
 	});
 });

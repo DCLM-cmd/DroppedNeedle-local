@@ -1,5 +1,6 @@
 <script lang="ts">
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
+	import { getCoverUrl } from '$lib/utils/errorHandling';
 
 	interface AlbumSummary {
 		name: string;
@@ -58,7 +59,7 @@
 		>
 			{#if hero.image_url}
 				<img
-					src={hero.image_url}
+					src={getCoverUrl(hero.image_url, hero.musicbrainz_id ?? getId(hero))}
 					alt=""
 					aria-hidden="true"
 					crossorigin="anonymous"
@@ -91,6 +92,7 @@
 							customUrl={hero.image_url}
 							alt={hero.name}
 							size="full"
+							requestSize={250}
 							rounded="none"
 							className="h-full w-full"
 						/>
@@ -130,6 +132,7 @@
 								customUrl={album.image_url}
 								alt={album.name}
 								size="full"
+								requestSize={250}
 								rounded="none"
 								className="h-full w-full"
 							/>

@@ -27,10 +27,16 @@
 	{:else}
 		<div class="absolute inset-0 overflow-hidden">
 			<img
-				src="/img/artist_bg.png?v=2"
+				data-testid="view-more-artist-background"
+				src="/img/artist_bg-250.webp"
+				srcset="/img/artist_bg-250.webp 250w, /img/artist_bg-500.webp 500w"
+				sizes="200px"
+				width="500"
+				height="500"
 				alt=""
 				class="w-full h-full object-cover"
 				style="filter: blur(8px);"
+				decoding="async"
 				onerror={handleError}
 			/>
 		</div>

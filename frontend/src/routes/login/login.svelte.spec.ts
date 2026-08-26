@@ -49,6 +49,19 @@ beforeEach(() => {
 });
 
 describe('login local tab uses a username field', () => {
+	it('keeps the auth-only theme and component styles active', async () => {
+		render(Login);
+		const heading = page.getByRole('heading', { name: 'DroppedNeedle' });
+		const submit = page.getByRole('button', { name: 'Sign in' });
+		await expect.element(heading).toBeVisible();
+		await expect.element(submit).toBeVisible();
+		const wrapper = heading.element().parentElement?.parentElement?.parentElement;
+		expect(wrapper).toBeInstanceOf(HTMLElement);
+		expect(getComputedStyle(heading.element()).fontFamily).toContain('Space Grotesk');
+		expect(getComputedStyle(wrapper as HTMLElement).backgroundImage).not.toBe('none');
+		expect(getComputedStyle(submit.element()).backgroundColor).not.toBe('rgba(0, 0, 0, 0)');
+	});
+
 	it('renders a text username input (autocomplete=username), not an email input', async () => {
 		render(Login);
 		const input = page.getByPlaceholder('Username');
@@ -63,6 +76,13 @@ describe('login local tab uses a username field', () => {
 	it('labels the local tab "Username"', async () => {
 		render(Login);
 		await expect.element(page.getByRole('button', { name: 'Username' })).toBeInTheDocument();
+	});
+
+	it('offers local-account recovery from the password field', async () => {
+		render(Login);
+		await expect
+			.element(page.getByRole('link', { name: 'Forgot password?' }))
+			.toHaveAttribute('href', '/recover-password');
 	});
 
 	it('submits the mixed-case username + password to the local login mutation', async () => {

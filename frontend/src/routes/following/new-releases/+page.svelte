@@ -103,6 +103,7 @@
 							mbid={item.release_group_mbid}
 							alt={item.title}
 							size="full"
+							requestSize={250}
 							rounded="xl"
 							className="h-full w-full transition-transform duration-300 group-hover:scale-105"
 						/>

@@ -2,7 +2,10 @@
 	import { Disc3, Users, Music2, ArrowUpRight } from 'lucide-svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
-	import { getLibraryArtistThumbsQuery } from '$lib/queries/library/LibraryQueries.svelte';
+	import {
+		getLibraryArtistThumbsQuery,
+		getLibraryRecentlyAddedQuery
+	} from '$lib/queries/library/LibraryQueries.svelte';
 	import type { LibraryStats } from '$lib/types';
 
 	interface Props {
@@ -15,28 +18,29 @@
 		mbid: string;
 		remoteUrl: string | null;
 		type: 'album' | 'artist';
+		available: boolean;
 	}
 
 	const artistThumbsQuery = getLibraryArtistThumbsQuery();
+	const recentlyAddedQuery = getLibraryRecentlyAddedQuery();
 
 	const albumArt = $derived<Art[]>(
-		(stats.recently_added ?? []).slice(0, 9).map((a) => ({
-			key: a.release_group_mbid,
-			mbid: a.release_group_mbid,
-			remoteUrl: a.cover_url,
-			type: 'album'
+		(recentlyAddedQuery.data?.items ?? []).slice(0, 9).map((a) => ({
+			key: a.id,
+			mbid: a.id,
+			remoteUrl: null,
+			type: 'album',
+			available: a.cover_available
 		}))
 	);
 	const artistArt = $derived<Art[]>(
-		(artistThumbsQuery.data?.items ?? [])
-			.filter((a) => a.artist_mbid)
-			.slice(0, 9)
-			.map((a) => ({
-				key: a.artist_mbid as string,
-				mbid: a.artist_mbid as string,
-				remoteUrl: null,
-				type: 'artist'
-			}))
+		(artistThumbsQuery.data?.items ?? []).slice(0, 9).map((a) => ({
+			key: a.id,
+			mbid: a.id,
+			remoteUrl: null,
+			type: 'artist',
+			available: a.musicbrainz_artist_id !== null
+		}))
 	);
 	// rotate the reused album pool so the tracks fan never mirrors the albums fan in a small library
 	const trackArt = $derived<Art[]>(
@@ -53,14 +57,22 @@
 	// one shared heartbeat advances every deck; per-deck offsets stagger them
 	let cycle = $state(0);
 	let reduced = $state(false);
+	let wide = $state(false);
 
 	// mirrors actions/tilt.ts so flipping the preference mid-session stops the deck instead of hard-snapping
 	$effect(() => {
 		const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+		const wideMq = window.matchMedia('(min-width: 640px)');
 		reduced = mq.matches;
+		wide = wideMq.matches;
 		const onChange = (e: MediaQueryListEvent) => (reduced = e.matches);
+		const onWideChange = (e: MediaQueryListEvent) => (wide = e.matches);
 		mq.addEventListener('change', onChange);
-		return () => mq.removeEventListener('change', onChange);
+		wideMq.addEventListener('change', onWideChange);
+		return () => {
+			mq.removeEventListener('change', onChange);
+			wideMq.removeEventListener('change', onWideChange);
+		};
 	});
 
 	$effect(() => {
@@ -79,8 +91,14 @@
 		return (((cycle + base) % n) + n) % n;
 	}
 
-	function position(i: number, base: number, n: number): number {
-		return (((i - startIndex(base, n)) % n) + n) % n;
+	function visibleSlots(art: Art[], base: number): Array<{ item: Art; position: number }> {
+		const n = art.length;
+		const win = visibleWindow(n);
+		const start = startIndex(base, n);
+		return Array.from({ length: win }, (_, position) => ({
+			item: art[(start + position) % n]!,
+			position
+		}));
 	}
 
 	// playing-card fan: outer cards rotate from a low pivot, dim and drop back; anything past the window parks off the nearest edge and fades
@@ -109,28 +127,41 @@
 		{#if art.length}
 			{@const n = art.length}
 			{@const win = visibleWindow(n)}
-			{#each art as item, i (item.key)}
+			{#each visibleSlots(art, base) as slot (slot.item.key)}
 				<div
+					data-testid="library-fan-card"
+					data-fan-key={slot.item.key}
+					data-request-size="250"
 					class="fan-card absolute top-1/2 left-1/2 aspect-square overflow-hidden rounded-2xl shadow-xl ring-1 ring-base-content/10 {hero
 						? 'w-40 sm:w-48'
 						: 'w-20 sm:w-[5.5rem]'}"
-					style={slotStyle(position(i, base, n), win, hero, n)}
+					style={slotStyle(slot.position, win, hero, n)}
 				>
-					{#if item.type === 'album'}
+					{#if slot.item.type === 'album'}
 						<AlbumImage
-							mbid={item.mbid}
-							remoteUrl={item.remoteUrl}
+							mbid={slot.item.mbid}
+							source="local"
+							available={slot.item.available}
+							remoteUrl={slot.item.remoteUrl}
 							alt=""
 							size="full"
+							requestSize={250}
+							responsiveSizes={hero ? '(max-width: 639px) 160px, 192px' : undefined}
+							testId="library-fan-image"
 							rounded="none"
 							className="h-full w-full object-cover"
 						/>
 					{:else}
 						<ArtistImage
-							mbid={item.mbid}
-							remoteUrl={item.remoteUrl}
+							mbid={slot.item.mbid}
+							source="local"
+							available={slot.item.available}
+							remoteUrl={slot.item.remoteUrl}
 							alt=""
 							size="full"
+							requestSize={250}
+							responsiveSizes={hero ? '(max-width: 639px) 160px, 192px' : undefined}
+							testId="library-fan-image"
 							rounded="none"
 							className="h-full w-full object-cover"
 						/>
@@ -230,9 +261,11 @@
 			class="pointer-events-none absolute inset-0 opacity-[0.035]"
 			style="background-image:url('data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><filter id=%22n%22><feTurbulence type=%22fractalNoise%22 baseFrequency=%220.9%22 numOctaves=%224%22 stitchTiles=%22stitch%22/></filter><rect width=%22100%25%22 height=%22100%25%22 filter=%22url(%23n)%22 opacity=%220.5%22/></svg>');background-size:200px;"
 		></div>
-		<div class="relative hidden h-28 w-52 shrink-0 sm:block">
-			{@render fan(trackArt, 5, false, Music2)}
-		</div>
+		{#if wide}
+			<div class="relative h-28 w-52 shrink-0">
+				{@render fan(trackArt, 5, false, Music2)}
+			</div>
+		{/if}
 		<div class="relative min-w-0 flex-1">
 			<div class="text-4xl leading-none font-black tabular-nums sm:text-5xl">
 				{stats.total_tracks.toLocaleString()}

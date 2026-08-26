@@ -13,6 +13,17 @@ class LocalTrackInfo(AppStruct):
     date_added: str | None = None
 
 
+class LocalLyricLine(AppStruct):
+    text: str = ""
+    start_seconds: float | None = None
+
+
+class LocalLyricsResponse(AppStruct):
+    text: str = ""
+    is_synced: bool = False
+    lines: list[LocalLyricLine] = []
+
+
 class LocalAlbumMatch(AppStruct):
     found: bool
     musicbrainz_id: str | None = None

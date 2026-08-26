@@ -1,5 +1,11 @@
 <script lang="ts">
-	import type { AlbumBasicInfo, AlbumTracksInfo, DownloadTask } from '$lib/types';
+	import type {
+		AlbumBasicInfo,
+		AlbumTracksInfo,
+		DownloadTask,
+		HeldImport,
+		LibraryAlbumSummary
+	} from '$lib/types';
 	import { getApiUrl } from '$lib/api/api-utils';
 	import { colors } from '$lib/colors';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
@@ -12,7 +18,6 @@
 		Clock,
 		Plus,
 		RefreshCw,
-		ScanSearch,
 		Disc3,
 		Square,
 		TrendingUp,
@@ -20,7 +25,7 @@
 		ChevronDown,
 		Pin
 	} from 'lucide-svelte';
-	import { rescanAlbum, reidentifyAlbum } from '$lib/queries/library/LibraryMutations.svelte';
+	import { rescanAlbum } from '$lib/queries/library/LibraryMutations.svelte';
 	import { requestUpgradeAlbum } from '$lib/queries/downloads/UpgradeQueries.svelte';
 	import {
 		acquireEdition,
@@ -28,10 +33,11 @@
 		getAlbumEditionsQuery,
 		setEditionPin
 	} from '$lib/queries/albums/EditionQueries.svelte';
-	import { editionLabel } from './albumEditionLabel';
+	import type { AlbumEditionItem } from '$lib/types';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';
+	import LocalAlbumIdentificationControl from './LocalAlbumIdentificationControl.svelte';
 
 	interface Props {
 		album: AlbumBasicInfo;
@@ -42,6 +48,7 @@
 		requesting: boolean;
 		refreshing: boolean;
 		headerDownloadTask: DownloadTask | null;
+		managementHeld?: HeldImport[];
 		downloadClientConfigured: boolean;
 
 		libraryInLibrary?: boolean;
@@ -51,6 +58,7 @@
 		coverageExpected?: number;
 		coverageCovered?: number;
 		releaseGroupMbid?: string;
+		localCopies?: LibraryAlbumSummary[];
 		onrequest: () => void;
 		ondelete: () => void;
 		onrefresh: () => void;
@@ -66,6 +74,7 @@
 		requesting,
 		refreshing,
 		headerDownloadTask,
+		managementHeld = [],
 		downloadClientConfigured,
 		libraryInLibrary = false,
 		libraryTrackCount = 0,
@@ -74,6 +83,7 @@
 		coverageExpected = 0,
 		coverageCovered = 0,
 		releaseGroupMbid = '',
+		localCopies = [],
 		onrequest,
 		ondelete,
 		onrefresh,
@@ -155,11 +165,33 @@
 	const editionsMbid = $derived(releaseGroupMbid || album.musicbrainz_id);
 	const editionsQuery = getAlbumEditionsQuery(
 		() => editionsMbid,
-		() => authStore.isTrusted && downloadClientConfigured
+		() => authStore.isTrusted && downloadClientConfigured && !loadingTracks
 	);
 	const editions = $derived(editionsQuery.data?.items ?? []);
+	const pinnedEdition = $derived(editions.find((edition) => edition.is_pinned) ?? null);
 	const currentEdition = $derived(
-		editions.find((e) => e.is_pinned) ?? editions.find((e) => e.is_owned) ?? null
+		pinnedEdition ??
+			editions.find(
+				(edition) =>
+					edition.release_mbid ===
+					(tracksInfo?.selected_release_mbid ?? editionsQuery.data?.selected_release_mbid)
+			) ??
+			null
+	);
+	const hasEffectivePin = $derived(pinnedEdition !== null);
+	const editionActionLabel = $derived(
+		!libraryInLibrary
+			? 'Acquire this edition'
+			: libraryComplete
+				? 'Upgrade this edition'
+				: 'Complete this edition'
+	);
+	const editionActionTitle = $derived(
+		!libraryInLibrary
+			? "Request this edition's tracks"
+			: libraryComplete
+				? "Upgrade this edition's below-cutoff tracks"
+				: "Request this edition's missing tracks and upgrade its below-cutoff ones"
 	);
 	const pinMutation = setEditionPin();
 	const clearPinMutation = clearEditionPin();
@@ -172,6 +204,16 @@
 		upgradeQueued = false;
 		acquireQueued = false;
 	});
+
+	function editionLabel(e: AlbumEditionItem): string {
+		const bits = [
+			e.disambiguation,
+			e.date?.slice(0, 4),
+			e.country,
+			`${e.track_count} tracks`
+		].filter(Boolean);
+		return bits.join(' · ') || e.release_mbid.slice(0, 8);
+	}
 
 	async function handlePickEdition(releaseMbid: string | null) {
 		// the DaisyUI dropdown is focus-driven: blur the trigger so the menu
@@ -222,27 +264,10 @@
 		}
 	}
 
-	const reidentify = reidentifyAlbum();
-	// Re-decide which album these files are (correction path), vs Rescan which only
-	// refreshes their tags. Non-destructive - it re-attributes, never deletes.
-	async function handleReidentify() {
-		try {
-			await reidentify.mutateAsync(releaseGroupMbid);
-			toastStore.show({ message: 'Re-identify started.', type: 'success' });
-		} catch (e) {
-			toastStore.show({
-				message: e instanceof Error ? e.message : 'Re-identify failed',
-				type: 'error'
-			});
-		}
-	}
-
 	let backdropUrl = $derived(
-		album.cover_url ||
-			album.album_thumb_url ||
-			(album.musicbrainz_id
-				? getApiUrl(`/api/v1/covers/release-group/${album.musicbrainz_id}?size=250`)
-				: null)
+		album.musicbrainz_id
+			? getApiUrl(`/api/v1/covers/release-group/${album.musicbrainz_id}?size=500`)
+			: album.cover_url || album.album_thumb_url || null
 	);
 </script>
 
@@ -326,10 +351,16 @@
 				<div class="flex flex-wrap items-center gap-2">
 					<div class="dropdown">
 						<button type="button" class="btn btn-ghost btn-xs gap-1" tabindex="0">
-							{#if editionsQuery.data?.pinned_release_mbid}
+							{#if hasEffectivePin}
 								<Pin class="h-3 w-3 text-primary" />
 							{/if}
-							Edition: {currentEdition ? editionLabel(currentEdition, album.title) : 'automatic'}
+							Edition: {hasEffectivePin
+								? currentEdition
+									? editionLabel(currentEdition)
+									: 'Automatic'
+								: currentEdition
+									? `Automatic · ${editionLabel(currentEdition)}`
+									: 'Automatic'}
 							<ChevronDown class="h-3 w-3" />
 						</button>
 						<ul
@@ -338,10 +369,10 @@
 							<li>
 								<button
 									type="button"
-									class:font-semibold={!editionsQuery.data?.pinned_release_mbid}
+									class:font-semibold={!hasEffectivePin}
 									onclick={() => void handlePickEdition(null)}
 								>
-									Automatic (follow the owned edition)
+									Automatic (best match for this library)
 								</button>
 							</li>
 							{#each editions as edition (edition.release_mbid)}
@@ -352,10 +383,13 @@
 										class:font-semibold={edition.is_pinned}
 										onclick={() => void handlePickEdition(edition.release_mbid)}
 									>
-										<span class="truncate">{editionLabel(edition, album.title)}</span>
+										<span class="truncate">{editionLabel(edition)}</span>
 										<span class="flex shrink-0 gap-1">
 											{#if edition.is_owned}
 												<span class="badge badge-success badge-xs">owned</span>
+											{/if}
+											{#if !hasEffectivePin && edition.release_mbid === editionsQuery.data?.selected_release_mbid}
+												<span class="badge badge-info badge-xs">automatic</span>
 											{/if}
 											{#if edition.is_pinned}
 												<span class="badge badge-primary badge-xs">pinned</span>
@@ -367,23 +401,33 @@
 						</ul>
 					</div>
 					{#if currentEdition}
-						<button
-							class="btn btn-ghost btn-xs gap-1 {acquireQueued ? 'text-success' : 'text-primary'}"
-							onclick={handleAcquireEdition}
-							disabled={acquireMutation.isPending || acquireQueued}
-							title="Request this edition's missing tracks and upgrade its below-cutoff ones"
-						>
-							{#if acquireMutation.isPending}
-								<span class="loading loading-spinner loading-xs"></span>
-								Acquiring...
-							{:else if acquireQueued}
+						{#if libraryComplete && !libraryBelowCutoff}
+							<span
+								class="inline-flex h-6 items-center gap-1 px-2 text-xs font-medium text-success"
+								title="This edition is complete and meets your quality cutoff"
+							>
 								<Check class="h-3.5 w-3.5" />
-								Acquisition queued
-							{:else}
-								<Plus class="h-3.5 w-3.5" />
-								Acquire this edition
-							{/if}
-						</button>
+								Edition complete
+							</span>
+						{:else}
+							<button
+								class="btn btn-ghost btn-xs gap-1 {acquireQueued ? 'text-success' : 'text-primary'}"
+								onclick={handleAcquireEdition}
+								disabled={acquireMutation.isPending || acquireQueued}
+								title={editionActionTitle}
+							>
+								{#if acquireMutation.isPending}
+									<span class="loading loading-spinner loading-xs"></span>
+									Acquiring...
+								{:else if acquireQueued}
+									<Check class="h-3.5 w-3.5" />
+									Acquisition queued
+								{:else}
+									<Plus class="h-3.5 w-3.5" />
+									{editionActionLabel}
+								{/if}
+							</button>
+						{/if}
 					{/if}
 				</div>
 			{/if}
@@ -415,15 +459,34 @@
 							<RefreshCw class="h-3.5 w-3.5 {rescan.isPending ? 'animate-spin' : ''}" />
 							Rescan
 						</button>
-						<button
-							class="btn btn-ghost btn-xs gap-1"
-							onclick={handleReidentify}
-							disabled={reidentify.isPending}
-							title="Re-match this album's files from scratch (fixes a wrong release)"
-						>
-							<ScanSearch class="h-3.5 w-3.5 {reidentify.isPending ? 'animate-spin' : ''}" />
-							Re-identify
-						</button>
+						{#if localCopies.length === 1}
+							<LocalAlbumIdentificationControl album={localCopies[0]} />
+						{:else if localCopies.length > 1}
+							<details class="dropdown dropdown-end">
+								<summary class="btn btn-ghost btn-xs gap-1">
+									<RefreshCw class="h-3.5 w-3.5" /> Re-identify copy...
+									<ChevronDown class="h-3.5 w-3.5" />
+								</summary>
+								<div
+									class="dropdown-content z-20 mt-2 w-72 rounded-box border border-base-content/10 bg-base-100 p-2 shadow-xl"
+								>
+									<p class="px-2 py-1 text-xs font-semibold text-base-content/55">
+										Choose a local copy
+									</p>
+									{#each localCopies as localCopy (localCopy.id)}
+										<div class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-base-200">
+											<div class="min-w-0 flex-1">
+												<p class="truncate text-sm font-medium">{localCopy.title}</p>
+												<p class="truncate text-xs text-base-content/55">
+													{localCopy.artist_name} · {localCopy.track_count} tracks
+												</p>
+											</div>
+											<LocalAlbumIdentificationControl album={localCopy} />
+										</div>
+									{/each}
+								</div>
+							</details>
+						{/if}
 					{/if}
 					{#if authStore.isTrusted && libraryBelowCutoff && downloadClientConfigured}
 						<button
@@ -463,7 +526,7 @@
 			{#if downloadClientConfigured}
 				<div class="pt-4 flex flex-col gap-3">
 					{#if headerDownloadTask}
-						<AlbumDownloadStatus task={headerDownloadTask} />
+						<AlbumDownloadStatus task={headerDownloadTask} {managementHeld} />
 					{/if}
 					<div class="flex flex-wrap items-start gap-3">
 						{#if inLibrary || libraryInLibrary}

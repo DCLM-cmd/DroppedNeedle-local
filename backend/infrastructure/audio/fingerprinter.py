@@ -14,6 +14,7 @@ Tier 3, queue for manual review". Fingerprinting never raises into the scan.
 
 import asyncio
 import logging
+import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -26,10 +27,17 @@ from models.audio import FingerprintResult
 
 logger = logging.getLogger(__name__)
 
-# AcoustID recommends >=120s of audio; ``-length`` caps fpcalc at min(120, dur),
-# so short files need no special handling and duration never has to be pre-read.
+# AcoustID recommends >=120s of audio, so ``-length`` caps the fingerprint window at
+# 120s. On files SHORTER than this, fpcalc reads to EOF and exits non-zero
+# ("Error decoding audio frame (End of file)") *after* emitting a valid FINGERPRINT=
+# line - see ``_run_fpcalc``, which tolerates that exit rather than pre-reading duration.
 _FPCALC_LENGTH = "120"
 _FPCALC_TIMEOUT = 30.0
+# Upper bound on concurrent fpcalc subprocesses, core-scaled below. fpcalc is an external
+# subprocess (escapes the GIL), so more cores => genuinely more parallel fingerprinting; the
+# cap keeps a many-core host from a wide subprocess fan-out, and the downstream AcoustID HTTP
+# limiter (3/s) bounds end-to-end throughput regardless. 4 matches the signed core-scaled default.
+_MAX_FPCALC_CONCURRENCY = 4
 # A best result below this AcoustID score is not a confident match.
 _ACOUSTID_MIN_SCORE = 0.70
 # Separators that delimit multiple artists in an AcoustID credit string.
@@ -73,23 +81,41 @@ class AudioFingerprinter:
         self._http = http
         self._api_key_provider = api_key_provider
         self._rate_limiter = rate_limiter
-        # Gate concurrent fpcalc subprocesses so a scan can't fork-bomb the host.
-        self._fpcalc_semaphore = asyncio.Semaphore(2)
-        # One loud, actionable ERROR per process for a rejected API key - not a quiet
-        # per-file WARNING storm that hides "verification is effectively off".
-        self._invalid_key_logged = False
+        # Gate concurrent fpcalc subprocesses so a scan can't fork-bomb the host; core-scaled
+        # (see _MAX_FPCALC_CONCURRENCY).
+        self._fpcalc_semaphore = asyncio.Semaphore(
+            min(os.cpu_count() or 2, _MAX_FPCALC_CONCURRENCY)
+        )
 
     async def fingerprint(self, path: Path) -> FingerprintResult:
-        api_key = self._api_key_provider()
-        if not api_key:
+        if not self.is_enabled():
             return FingerprintResult(status=FingerprintStatus.DISABLED)
 
         try:
-            fingerprint, duration = await self._run_fpcalc(path)
-        except (OSError, subprocess.SubprocessError, asyncio.TimeoutError, ValueError) as exc:
+            fingerprint, duration = await self.generate_fingerprint(path)
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            asyncio.TimeoutError,
+            ValueError,
+        ) as exc:
             logger.warning("fpcalc failed for %s: %s", path, exc)
             return FingerprintResult(status=FingerprintStatus.ERROR, error=str(exc))
 
+        return await self.lookup_fingerprint(fingerprint, duration)
+
+    def is_enabled(self) -> bool:
+        return bool(self._api_key_provider())
+
+    async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+        return await self._run_fpcalc(path)
+
+    async def lookup_fingerprint(
+        self, fingerprint: str, duration: int
+    ) -> FingerprintResult:
+        api_key = self._api_key_provider()
+        if not api_key:
+            return FingerprintResult(status=FingerprintStatus.DISABLED)
         await self._rate_limiter.acquire()
         try:
             response = await self._http.post(
@@ -104,37 +130,10 @@ class AudioFingerprinter:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            if self._is_invalid_key_response(exc):
-                if not self._invalid_key_logged:
-                    self._invalid_key_logged = True
-                    logger.error(
-                        "AcoustID rejected the configured API key (error code 4: "
-                        "invalid API key). Every fingerprint verification fails until "
-                        "it is replaced - downloads import UNVERIFIED. Create an "
-                        "application key at https://acoustid.org/new-application and "
-                        "save it under Settings -> Library."
-                    )
-                return FingerprintResult(
-                    status=FingerprintStatus.ERROR, error="invalid AcoustID API key"
-                )
-            logger.warning("AcoustID lookup failed for %s: %s", path, exc)
+            logger.warning("AcoustID lookup failed: %s", exc)
             return FingerprintResult(status=FingerprintStatus.ERROR, error=str(exc))
 
         return self._parse_response(payload)
-
-    @staticmethod
-    def _is_invalid_key_response(exc: Exception) -> bool:
-        """True when the lookup failed because AcoustID rejected the API key itself
-        (HTTP 400 with ``{"error": {"code": 4}}``) - a configuration problem, not a
-        per-file one."""
-        if not isinstance(exc, httpx.HTTPStatusError):
-            return False
-        if exc.response.status_code != 400:
-            return False
-        try:
-            return (exc.response.json().get("error") or {}).get("code") == 4
-        except ValueError:
-            return False
 
     async def _run_fpcalc(self, path: Path) -> tuple[str, int]:
         async with self._fpcalc_semaphore:
@@ -142,7 +141,10 @@ class AudioFingerprinter:
             # fingerprint that plain fpcalc emits. ``-raw`` emits comma-separated integers,
             # which the API rejects with HTTP 400 (every lookup was silently failing).
             proc = await asyncio.create_subprocess_exec(
-                "fpcalc", "-length", _FPCALC_LENGTH, str(path),
+                "fpcalc",
+                "-length",
+                _FPCALC_LENGTH,
+                str(path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -154,11 +156,27 @@ class AudioFingerprinter:
                 proc.kill()
                 await proc.wait()
                 raise
+            output = stdout.decode("utf-8", "ignore")
+            # fpcalc exits non-zero ("Error decoding audio frame (End of file)") on tracks
+            # shorter than ``-length`` seconds, but still writes a valid FINGERPRINT= line to
+            # stdout. Only treat a non-zero exit as a real failure when NO fingerprint was
+            # produced; otherwise use the fingerprint it emitted so sub-120s tracks still match.
             if proc.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    proc.returncode or -1, "fpcalc", stderr=stderr.decode("utf-8", "ignore")
+                stderr_text = stderr.decode("utf-8", "ignore").strip()
+                if "FINGERPRINT=" not in output:
+                    raise subprocess.CalledProcessError(
+                        proc.returncode or -1, "fpcalc", stderr=stderr_text
+                    )
+                # Tolerated non-zero exit (typically the sub-120s EOF case). Preserve
+                # fpcalc's stderr so a changed/unexpected error is still visible, and
+                # record that a short-track fingerprint was used for observability.
+                logger.warning(
+                    "fpcalc exited %s but emitted a fingerprint for %s; using it (stderr: %s)",
+                    proc.returncode,
+                    path,
+                    stderr_text or "<empty>",
                 )
-            return self._parse_fpcalc_output(stdout.decode("utf-8", "ignore"))
+            return self._parse_fpcalc_output(output)
 
     @staticmethod
     def _parse_fpcalc_output(output: str) -> tuple[str, int]:

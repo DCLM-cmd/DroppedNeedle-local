@@ -8,6 +8,7 @@ real-audio fixtures with the real tagger.
 """
 
 import asyncio
+import shutil
 import threading
 import zipfile
 from pathlib import Path
@@ -19,14 +20,17 @@ import pytest
 from infrastructure.persistence.drop_import_store import DropImportStore
 from models.audio import AudioInfo, AudioTag
 from models.drop_import import ItemStatus, JobStatus
-from services.native.album_matcher import MBTrack, _ReleaseMeta
+from models.library_management import LibraryManagementImportResult
+from services.native.album_matcher import AlbumIdentifier, MBTrack, _ReleaseMeta
 from services.native.drop_import_service import DropImportService
 from services.native.naming import NamingTemplateEngine
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "library"
 
 
-def _tag(title: str, track: int, artist: str = "Test Artist", album: str = "Test Album") -> AudioTag:
+def _tag(
+    title: str, track: int, artist: str = "Test Artist", album: str = "Test Album"
+) -> AudioTag:
     return AudioTag(
         title=title, artist=artist, album=album, track_number=track, year=2020
     )
@@ -57,19 +61,30 @@ def _meta(rg: str = "rg-1") -> _ReleaseMeta:
 
 def _tracks() -> list[MBTrack]:
     return [
-        MBTrack(title="Song One", position=1, disc=1, absolute_position=1,
-                length_ms=200_000, recording_mbid="rec-1"),
-        MBTrack(title="Song Two", position=2, disc=1, absolute_position=2,
-                length_ms=200_000, recording_mbid="rec-2"),
+        MBTrack(
+            title="Song One",
+            position=1,
+            disc=1,
+            absolute_position=1,
+            length_ms=200_000,
+            recording_mbid="rec-1",
+        ),
+        MBTrack(
+            title="Song Two",
+            position=2,
+            disc=1,
+            absolute_position=2,
+            length_ms=200_000,
+            recording_mbid="rec-2",
+        ),
     ]
 
 
 class FakeTagger:
-    """Serves canned (tag, info) per file NAME; records album-identity stamps."""
+    """Serve canned tag and technical metadata by filename."""
 
     def __init__(self, by_name: dict) -> None:
         self.by_name = by_name
-        self.stamped: list[str] = []
 
     def read_tags(self, path: Path):
         entry = self.by_name.get(Path(path).name)
@@ -77,18 +92,54 @@ class FakeTagger:
             raise ValueError(f"unreadable: {path}")
         return entry
 
-    def write_album_identity(self, path: Path, tag: AudioTag) -> None:
-        self.stamped.append(tag.album)
+
+def _write_fixture_tag(path: Path, tag: AudioTag) -> None:
+    """Seed real FLAC fixtures with raw mutagen; fake audio remains opaque."""
+    import mutagen
+    from mutagen.flac import FLAC
+
+    try:
+        audio = FLAC(path)
+    except mutagen.MutagenError:
+        return
+    values = {
+        "TITLE": tag.title,
+        "ARTIST": tag.artist,
+        "ALBUM": tag.album,
+        "ALBUMARTIST": tag.album_artist,
+        "TRACKNUMBER": str(tag.track_number) if tag.track_number is not None else None,
+        "DISCNUMBER": str(tag.disc_number) if tag.disc_number is not None else None,
+        "DATE": str(tag.year) if tag.year is not None else None,
+        "MUSICBRAINZ_RELEASEGROUPID": tag.musicbrainz_release_group_id,
+        "MUSICBRAINZ_ALBUMID": tag.musicbrainz_release_id,
+        "MUSICBRAINZ_TRACKID": tag.musicbrainz_recording_id,
+        "MUSICBRAINZ_ALBUMARTISTID": tag.musicbrainz_album_artist_id,
+    }
+    for key, value in values.items():
+        if value is None:
+            audio.pop(key, None)
+        else:
+            audio[key] = value
+    audio.save()
 
 
-def _build_service(tmp_path, tagger, *, identifier=None, fingerprinter=None, prefs=None):
+def _build_service(
+    tmp_path,
+    tagger,
+    *,
+    identifier=None,
+    fingerprinter=None,
+    prefs=None,
+    publisher=None,
+):
     store = DropImportStore(tmp_path / "library.db", threading.Lock())
     library_root = tmp_path / "library"
     library_root.mkdir(exist_ok=True)
     if prefs is None:
         prefs = SimpleNamespace(
-            get_library_settings_raw=lambda: SimpleNamespace(
-                library_paths=[str(library_root)], naming_template=None
+            get_typed_library_settings_raw=lambda: SimpleNamespace(
+                library_roots=[SimpleNamespace(id="root-a", path=str(library_root))],
+                naming_template=None,
             ),
             get_download_policy=lambda: SimpleNamespace(recycle_bin_path=""),
         )
@@ -102,6 +153,46 @@ def _build_service(tmp_path, tagger, *, identifier=None, fingerprinter=None, pre
     library.get_file_at_position = AsyncMock(return_value=None)
     library.upsert_file = AsyncMock(return_value="file-1")
     library.soft_delete_file = AsyncMock()
+    if publisher is None:
+
+        async def publisher(bundle):
+            paths: list[str] = []
+            local_track_ids: list[str] = []
+            for request in bundle.files:
+                source = Path(request.input_path)
+                destination = library_root / request.destination_relative_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if request.replacement_relative_path is not None:
+                    replacement = library_root / request.replacement_relative_path
+                    recycle_root = Path(str(request.recycle_bin_path))
+                    recycle_target = (
+                        recycle_root / f"test-{request.ordinal}" / replacement.name
+                    )
+                    recycle_target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(replacement), str(recycle_target))
+                    await library.soft_delete_file(str(replacement))
+                shutil.move(str(source), str(destination))
+                _write_fixture_tag(destination, request.tag)
+                local_track_ids.append(
+                    await library.upsert_file(
+                        destination,
+                        request.tag,
+                        request.info,
+                        release_group_mbid=request.release_group_mbid,
+                        release_mbid=request.release_mbid,
+                        recording_mbid=request.recording_mbid,
+                        confidence=request.confidence,
+                        source=request.source,
+                        source_path=request.source_path,
+                    )
+                )
+                paths.append(str(destination))
+            return LibraryManagementImportResult(
+                bundle_id="test-drop-bundle",
+                paths=tuple(paths),
+                local_track_ids=tuple(local_track_ids),
+            )
+
     service = DropImportService(
         store=store,
         tagger=tagger,
@@ -116,6 +207,8 @@ def _build_service(tmp_path, tagger, *, identifier=None, fingerprinter=None, pre
         sse_publisher=AsyncMock(),
         on_import=AsyncMock(),
         staging_root=tmp_path / "imports",
+        publish_import_bundle=publisher,
+        policy_revision_getter=lambda: "policy-1",
     )
     return service, store, library, library_root
 
@@ -141,8 +234,11 @@ def _accepted_match(rg: str = "rg-1"):
     from services.native.album_matcher import AlbumMatch
 
     return AlbumMatch(
-        accepted=True, distance=0.05, release_group_mbid=rg,
-        release_mbid="rel-1", assignments={},
+        accepted=True,
+        distance=0.05,
+        release_group_mbid=rg,
+        release_mbid="rel-1",
+        assignments={},
     )
 
 
@@ -187,10 +283,12 @@ def test_extract_groups_loose_files_and_folders(tmp_path):
 @pytest.mark.asyncio
 async def test_a_corrupt_archive_alongside_a_good_one_is_reported(tmp_path):
     """The good zip imports; the bad one must not vanish silently."""
-    tagger = FakeTagger({
-        "01 Song One.flac": (_tag("Song One", 1), _info()),
-        "02 Song Two.flac": (_tag("Song Two", 2), _info()),
-    })
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
     identifier = AsyncMock()
     identifier.identify = AsyncMock(return_value=_accepted_match())
     identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
@@ -201,7 +299,9 @@ async def test_a_corrupt_archive_alongside_a_good_one_is_reported(tmp_path):
     bad.write_bytes(b"PK\x03\x04" + b"\x00" * 20)
 
     job = await service.create_job(
-        user_id="user-1", user_name="Harvey", uploads=[("good.zip", good), ("bad.zip", bad)]
+        user_id="user-1",
+        user_name="Harvey",
+        uploads=[("good.zip", good), ("bad.zip", bad)],
     )
     done = await _wait_job(store, job.id)
 
@@ -229,10 +329,12 @@ def test_corrupt_zip_is_noted_not_fatal(tmp_path):
 
 @pytest.mark.asyncio
 async def test_zip_drop_imports_album_end_to_end(tmp_path):
-    tagger = FakeTagger({
-        "01 Song One.flac": (_tag("Song One", 1), _info()),
-        "02 Song Two.flac": (_tag("Song Two", 2), _info()),
-    })
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
     identifier = AsyncMock()
     identifier.identify = AsyncMock(return_value=_accepted_match())
     identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
@@ -268,15 +370,134 @@ async def test_zip_drop_imports_album_end_to_end(tmp_path):
     kwargs = library.upsert_file.await_args_list[0].kwargs
     assert kwargs["source"] == "drop"
     assert kwargs["release_group_mbid"] == "rg-1"
-    assert tagger.stamped == ["Test Album", "Test Album"]
+
+
+@pytest.mark.asyncio
+async def test_drop_import_uses_musicbrainz_album_artist_for_tag_and_path(tmp_path):
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
+    repo = AsyncMock()
+
+    async def release_group(_mbid, includes=None, priority=None):
+        detail = {
+            "title": "Test Album",
+            "primary-type": "Album",
+            "secondary-types": [],
+            "artist-credit": [
+                {
+                    "name": "Test Artist",
+                    "artist": {"id": "artist-1", "name": "Test Artist"},
+                }
+            ],
+            "releases": [
+                {
+                    "id": "rel-1",
+                    "status": "Official",
+                    "date": "2020",
+                    "media": [{"track-count": 2}],
+                }
+            ],
+        }
+        if "artist-credits" not in (includes or []):
+            detail.pop("artist-credit")
+        return detail
+
+    repo.get_release_group_by_id = AsyncMock(side_effect=release_group)
+    repo.get_release_by_id = AsyncMock(
+        return_value={
+            "date": "2020",
+            "media": [
+                {
+                    "position": 1,
+                    "tracks": [
+                        {
+                            "title": "Song One",
+                            "position": 1,
+                            "recording": {"id": "rec-1", "title": "Song One"},
+                        },
+                        {
+                            "title": "Song Two",
+                            "position": 2,
+                            "recording": {"id": "rec-2", "title": "Song Two"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    identifier = AlbumIdentifier(repo)
+    identifier.identify = AsyncMock(return_value=_accepted_match())
+    service, store, library, library_root = _build_service(
+        tmp_path, tagger, identifier=identifier
+    )
+
+    upload = _zip_album(tmp_path / "upload.zip")
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    assert done.status == JobStatus.COMPLETED
+    assert (library_root / "Test Artist" / "Test Album (2020)").is_dir()
+    target_tag = library.upsert_file.await_args_list[0].args[1]
+    assert target_tag.album_artist == "Test Artist"
+    assert target_tag.musicbrainz_album_artist_id == "artist-1"
+    assert target_tag.compilation is False
+
+
+@pytest.mark.asyncio
+async def test_drop_album_uses_one_shared_publication_bundle(tmp_path):
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    identifier.identify = AsyncMock(return_value=_accepted_match())
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+
+    async def publish(bundle):
+        return LibraryManagementImportResult(
+            bundle_id="drop-bundle",
+            paths=tuple(value.input_path for value in bundle.files),
+            local_track_ids=("track-1", "track-2"),
+        )
+
+    publisher = AsyncMock(side_effect=publish)
+    service, store, library, _root = _build_service(
+        tmp_path, tagger, identifier=identifier, publisher=publisher
+    )
+    upload = tmp_path / "upload.zip"
+    _zip_album(upload)
+
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    bundle = publisher.await_args.args[0]
+    assert done.status == JobStatus.COMPLETED
+    assert done.items[0].files_imported == 2
+    assert bundle.origin == "drop_import"
+    assert bundle.policy_revision == "policy-1"
+    assert len(bundle.files) == 2
+    assert [value.recording_mbid for value in bundle.files] == ["rec-1", "rec-2"]
+    library.upsert_file.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_import_resolves_open_request_and_notifies_requester(tmp_path):
-    tagger = FakeTagger({
-        "01 Song One.flac": (_tag("Song One", 1), _info()),
-        "02 Song Two.flac": (_tag("Song Two", 2), _info()),
-    })
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
     identifier = AsyncMock()
     identifier.identify = AsyncMock(return_value=_accepted_match())
     identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
@@ -299,7 +520,8 @@ async def test_import_resolves_open_request_and_notifies_requester(tmp_path):
     events = [c.args[1] for c in service._sse.publish.await_args_list]
     assert "request_imported" in events
     channel = [
-        c.args[0] for c in service._sse.publish.await_args_list
+        c.args[0]
+        for c in service._sse.publish.await_args_list
         if c.args[1] == "request_imported"
     ][0]
     assert channel == "user:requester-9"
@@ -311,10 +533,12 @@ async def test_import_resolves_open_request_and_notifies_requester(tmp_path):
 
 @pytest.mark.asyncio
 async def test_equal_quality_duplicate_is_skipped(tmp_path):
-    tagger = FakeTagger({
-        "01 Song One.flac": (_tag("Song One", 1), _info()),
-        "02 Song Two.flac": (_tag("Song Two", 2), _info()),
-    })
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
     identifier = AsyncMock()
     identifier.identify = AsyncMock(return_value=_accepted_match())
     identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
@@ -344,10 +568,12 @@ async def test_equal_quality_duplicate_is_skipped(tmp_path):
 
 @pytest.mark.asyncio
 async def test_strictly_better_quality_upgrades_and_recycles(tmp_path):
-    tagger = FakeTagger({
-        "01 Song One.flac": (_tag("Song One", 1), _info("flac")),
-        "02 Song Two.flac": (_tag("Song Two", 2), _info("flac")),
-    })
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info("flac")),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info("flac")),
+        }
+    )
     identifier = AsyncMock()
     identifier.identify = AsyncMock(return_value=_accepted_match())
     identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
@@ -361,7 +587,10 @@ async def test_strictly_better_quality_upgrades_and_recycles(tmp_path):
         old_files.append(old)
     library.get_file_at_position = AsyncMock(
         side_effect=lambda rg, disc, pos: {
+            "id": f"old-{pos}",
             "file_path": str(old_files[pos - 1]),
+            "root_id": "root-a",
+            "relative_path": old_files[pos - 1].name,
             "recording_mbid": f"rec-{pos}",
             "file_format": "mp3",
             "bit_rate": 320,
@@ -392,10 +621,12 @@ async def test_strictly_better_quality_upgrades_and_recycles(tmp_path):
 
 @pytest.mark.asyncio
 async def test_unidentified_drop_needs_review_then_manual_match(tmp_path):
-    tagger = FakeTagger({
-        "01 Song One.flac": (_tag("Song One", 1), _info()),
-        "02 Song Two.flac": (_tag("Song Two", 2), _info()),
-    })
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
     identifier = AsyncMock()
     identifier.identify = AsyncMock(return_value=None)  # nothing identifies
     identifier.release_tracks = AsyncMock(return_value=(_meta("rg-manual"), _tracks()))
@@ -422,16 +653,55 @@ async def test_unidentified_drop_needs_review_then_manual_match(tmp_path):
     assert matched.release_group_mbid == "rg-manual"
     assert library.upsert_file.await_count == 2
     assert (library_root / "Test Artist" / "Test Album (2020)").exists()
+    assert not Path(job.staging_dir).exists()
+
+
+@pytest.mark.asyncio
+async def test_automatic_management_failure_keeps_drop_staging_for_retry(tmp_path):
+    from core.exceptions import AutomaticManagementHoldError
+
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    identifier.identify = AsyncMock(return_value=_accepted_match())
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    publisher = AsyncMock(
+        side_effect=AutomaticManagementHoldError(
+            "PROFILE_CHANGED", "The activated profile changed."
+        )
+    )
+    service, store, library, _library_root = _build_service(
+        tmp_path, tagger, identifier=identifier, publisher=publisher
+    )
+    upload = _zip_album(tmp_path / "held.zip")
+
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("held.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    item = done.items[0]
+    assert item.status == ItemStatus.NEEDS_REVIEW
+    assert "PROFILE_CHANGED" in (item.detail or "")
+    assert item.staging_paths
+    assert all(Path(path).is_file() for path in item.staging_paths)
+    library.upsert_file.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_match_item_rejects_wrong_status_and_non_owner(tmp_path):
     from core.exceptions import ResourceNotFoundError, ValidationError
 
-    tagger = FakeTagger({
-        "01 Song One.flac": (_tag("Song One", 1), _info()),
-        "02 Song Two.flac": (_tag("Song Two", 2), _info()),
-    })
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
     identifier = AsyncMock()
     identifier.identify = AsyncMock(return_value=_accepted_match())
     identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
@@ -448,15 +718,19 @@ async def test_match_item_rejects_wrong_status_and_non_owner(tmp_path):
     with pytest.raises(ValidationError):
         await service.match_item(item.id, "rg-x", user_id="user-1", is_admin=False)
     with pytest.raises(ResourceNotFoundError):
-        await service.match_item(item.id, "rg-x", user_id="someone-else", is_admin=False)
+        await service.match_item(
+            item.id, "rg-x", user_id="someone-else", is_admin=False
+        )
 
 
 @pytest.mark.asyncio
 async def test_discard_removes_staged_files(tmp_path):
-    tagger = FakeTagger({
-        "01 Song One.flac": (_tag("Song One", 1), _info()),
-        "02 Song Two.flac": (_tag("Song Two", 2), _info()),
-    })
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
     identifier = AsyncMock()
     identifier.identify = AsyncMock(return_value=None)
     identifier.release_tracks = AsyncMock(return_value=None)
@@ -475,6 +749,7 @@ async def test_discard_removes_staged_files(tmp_path):
     discarded = await service.discard_item(item.id, user_id="user-1", is_admin=False)
     assert discarded.status == ItemStatus.DISCARDED
     assert all(not p.exists() for p in staged)
+    assert not Path(job.staging_dir).exists()
 
 
 # -- single files and loose drops --
@@ -537,8 +812,8 @@ async def test_create_job_requires_library_path(tmp_path):
 
     tagger = FakeTagger({})
     prefs = SimpleNamespace(
-        get_library_settings_raw=lambda: SimpleNamespace(
-            library_paths=[], naming_template=None
+        get_typed_library_settings_raw=lambda: SimpleNamespace(
+            library_roots=[], naming_template=None
         ),
         get_download_policy=lambda: SimpleNamespace(recycle_bin_path=""),
     )
@@ -581,12 +856,22 @@ async def test_real_fixture_import_stamps_album_identity(tmp_path):
         year=tag1.year,
     )
     tracks = [
-        MBTrack(title=tag1.title or "One", position=tag1.track_number or 1, disc=1,
-                absolute_position=1, length_ms=int(info1.duration_seconds * 1000),
-                recording_mbid="rec-1"),
-        MBTrack(title=tag2.title or "Two", position=tag2.track_number or 2, disc=1,
-                absolute_position=2, length_ms=int(info1.duration_seconds * 1000),
-                recording_mbid="rec-2"),
+        MBTrack(
+            title=tag1.title or "One",
+            position=tag1.track_number or 1,
+            disc=1,
+            absolute_position=1,
+            length_ms=int(info1.duration_seconds * 1000),
+            recording_mbid="rec-1",
+        ),
+        MBTrack(
+            title=tag2.title or "Two",
+            position=tag2.track_number or 2,
+            disc=1,
+            absolute_position=2,
+            length_ms=int(info1.duration_seconds * 1000),
+            recording_mbid="rec-2",
+        ),
     ]
     identifier.release_tracks = AsyncMock(return_value=(meta, tracks))
     service, store, _, library_root = _build_service(
@@ -608,5 +893,7 @@ async def test_real_fixture_import_stamps_album_identity(tmp_path):
     imported = sorted(library_root.rglob("*.flac"))
     assert len(imported) == 2
     stamped, _ = tagger.read_tags(imported[0])
-    assert stamped.musicbrainz_release_group_id == "11111111-1111-1111-1111-111111111111"
+    assert (
+        stamped.musicbrainz_release_group_id == "11111111-1111-1111-1111-111111111111"
+    )
     assert stamped.album == meta.album_title

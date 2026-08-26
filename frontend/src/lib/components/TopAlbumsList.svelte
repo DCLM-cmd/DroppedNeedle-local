@@ -109,6 +109,7 @@
 								mbid={album.release_group_mbid}
 								alt={album.title}
 								size="full"
+								requestSize={250}
 								className="w-12 h-12 rounded"
 							/>
 							{#if isInLibrary(album)}

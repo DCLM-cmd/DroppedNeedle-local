@@ -8,6 +8,7 @@ export type DerivedDownloadStatus = 'searching' | 'awaiting_review' | DownloadSt
 export type DownloadTab = 'active' | 'review' | 'completed' | 'failed' | 'quarantine';
 
 export function derivedDownloadStatus(task: DownloadTask): DerivedDownloadStatus {
+	if (task.held_for_review) return 'awaiting_review';
 	if (task.status === 'queued') {
 		if (!task.search_job_id) return 'searching';
 		if (task.candidate_index === null || task.candidate_index === undefined) {
@@ -62,11 +63,13 @@ export function canCancel(task: DownloadTask): boolean {
 }
 
 export function canRetry(task: DownloadTask): boolean {
+	if (task.held_for_review) return false;
 	return task.status === 'failed' || task.status === 'cancelled' || task.status === 'partial';
 }
 
 export function canReimport(task: DownloadTask): boolean {
 	return (
+		!task.held_for_review &&
 		(task.status === 'failed' || task.status === 'partial') &&
 		task.search_job_id != null &&
 		task.candidate_index != null &&
@@ -88,6 +91,7 @@ export function retryDisplay(
 	task: DownloadTask,
 	nowSeconds: number = Date.now() / 1000
 ): RetryDisplay {
+	if (task.held_for_review) return null;
 	// No auto-retry configured (retry_max 0): no retry treatment at all - a failed task is
 	// just "Failed" and a manual re-run shows its normal status, never "attempt N/0".
 	if (task.retry_max <= 0) return null;

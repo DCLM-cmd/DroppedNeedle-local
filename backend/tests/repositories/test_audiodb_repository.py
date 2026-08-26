@@ -26,12 +26,14 @@ def _make_repo(enabled: bool = True, api_key: str = "test_key", premium: bool = 
     client = AsyncMock(spec=httpx.AsyncClient)
     prefs = MagicMock()
     prefs.get_advanced_settings.return_value = _make_advanced_settings(enabled, api_key)
-    return AudioDBRepository(
+    repository = AudioDBRepository(
         http_client=client,
         preferences_service=prefs,
         api_key=api_key,
         premium=premium,
     )
+    repository._rate_limiter.acquire = AsyncMock()
+    return repository
 
 
 def _mock_response(status_code: int = 200, json_data: dict | None = None) -> httpx.Response:

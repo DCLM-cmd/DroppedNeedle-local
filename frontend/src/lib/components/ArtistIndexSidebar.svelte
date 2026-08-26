@@ -83,6 +83,7 @@
 										remoteUrl={artist.image_url}
 										alt={artist.name}
 										size="full"
+										requestSize={250}
 									/>
 								</div>
 								<div class="min-w-0">

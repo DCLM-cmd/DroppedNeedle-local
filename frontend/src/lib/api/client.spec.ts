@@ -16,7 +16,7 @@ vi.mock('$lib/stores/authStore.svelte', () => ({
 	}
 }));
 
-import { api, ApiError, SessionExpiredError } from './client';
+import { api, ApiError, SessionExpiredError, TransportError } from './client';
 import { pageFetch } from '$lib/utils/navigationAbort';
 
 const mockPageFetch = vi.mocked(pageFetch);
@@ -83,6 +83,19 @@ describe('api client', () => {
 				'/api/v1/test',
 				expect.objectContaining({ signal: controller.signal })
 			);
+		});
+
+		it('combines caller cancellation with a request deadline', async () => {
+			const controller = new AbortController();
+			mockPageFetch.mockResolvedValue(jsonResponse({ ok: true }));
+
+			await api.get('/api/v1/test', { signal: controller.signal, timeoutMs: 10_000 });
+
+			const init = mockPageFetch.mock.calls[0]![1]!;
+			expect(init).not.toHaveProperty('timeoutMs');
+			expect(init.signal).not.toBe(controller.signal);
+			controller.abort();
+			expect(init.signal?.aborted).toBe(true);
 		});
 
 		it('passes cache option through', async () => {
@@ -180,6 +193,20 @@ describe('api client', () => {
 				'/api/v1/items/1'
 			);
 			expect(data).toEqual({ success: true, artist_removed: true });
+		});
+
+		it('supports an explicit JSON body for revision-guarded deletes', async () => {
+			mockPageFetch.mockResolvedValue(jsonResponse({ deleted: true }));
+			await api.delete('/api/v1/items/1', {
+				body: { expected_revision: 'revision-1' }
+			});
+			expect(mockPageFetch).toHaveBeenCalledWith(
+				'/api/v1/items/1',
+				expect.objectContaining({
+					method: 'DELETE',
+					body: JSON.stringify({ expected_revision: 'revision-1' })
+				})
+			);
 		});
 	});
 
@@ -334,6 +361,47 @@ describe('api client', () => {
 		});
 	});
 
+	describe('transport failures', () => {
+		it('classifies a network failure with the request method and path', async () => {
+			authMock.isAuthenticated = true;
+			mockGlobalFetch.mockRejectedValue(new TypeError('Failed to fetch'));
+
+			await expect(
+				api.global.post('/api/v1/library/reviews/bulk-apply?token=secret', {})
+			).rejects.toMatchObject({
+				name: 'TransportError',
+				code: 'TRANSPORT_NETWORK',
+				method: 'POST',
+				path: '/api/v1/library/reviews/bulk-apply',
+				details: { method: 'POST', path: '/api/v1/library/reviews/bulk-apply' }
+			});
+			expect(authMock.clear).not.toHaveBeenCalled();
+		});
+
+		it('uses the timeout transport code without clearing the session', async () => {
+			authMock.isAuthenticated = true;
+			mockGlobalFetch.mockImplementation(
+				(_url, init) =>
+					new Promise((_resolve, reject) => {
+						init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+					})
+			);
+
+			try {
+				await api.global.get('/api/v1/slow', { timeoutMs: 1 });
+				expect.unreachable('should have timed out');
+			} catch (cause) {
+				expect(cause).toBeInstanceOf(TransportError);
+				expect(cause).toMatchObject({
+					code: 'TRANSPORT_TIMEOUT',
+					method: 'GET',
+					path: '/api/v1/slow'
+				});
+			}
+			expect(authMock.clear).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('session expiry (401)', () => {
 		it('throws SessionExpiredError, clears the store, and redirects when authenticated', async () => {
 			authMock.isAuthenticated = true;
@@ -349,7 +417,7 @@ describe('api client', () => {
 				expect((e as SessionExpiredError).status).toBe(401);
 				expect((e as SessionExpiredError).code).toBe('session_expired');
 			}
-			// Never returns undefined — the Promise<T> contract is honoured by throwing.
+			// the Promise<T> contract is preserved by throwing
 			expect(authMock.clear).toHaveBeenCalledOnce();
 			expect(win.location.href).toBe('/login');
 		});

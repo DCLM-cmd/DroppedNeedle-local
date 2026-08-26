@@ -6,7 +6,7 @@ class DroppedNeedleException(Exception):
         self.message = message
         self.details = details
         super().__init__(message)
-    
+
     def __str__(self) -> str:
         if self.details:
             return f"{self.message}: {self.details}"
@@ -36,6 +36,16 @@ class ServiceDisabledUpstreamError(DroppedNeedleException):
     provider's endpoints are healthy)."""
 
 
+class InvalidExternalPayloadError(ExternalServiceError):
+    """A provider answered successfully but its payload violates the verified
+    response schema (e.g. a MusicBrainz field that arrives as JSON null but was
+    modelled as required). Deterministic per payload: it must not count as a
+    service-health failure on the shared circuit breaker (pass through
+    ``non_breaking_exceptions`` at the ``with_retry`` call site) - the service is
+    healthy, the schema expectation was wrong. Stays an ExternalServiceError so
+    callers degrade through their normal paths."""
+
+
 class ResourceNotFoundError(DroppedNeedleException):
     pass
 
@@ -44,14 +54,93 @@ class ValidationError(DroppedNeedleException):
     pass
 
 
+class ArtworkProcessingError(ValidationError):
+    """Artwork bytes cannot be admitted or transformed safely."""
+
+    pass
+
+
+class AudioFormatError(ValidationError):
+    """An admitted audio path cannot be represented by a verified adapter."""
+
+    pass
+
+
+class AudioFormatMismatchError(AudioFormatError):
+    pass
+
+
+class UnsupportedAudioFormatError(AudioFormatError):
+    pass
+
+
+class AudioWriteError(AudioFormatError):
+    """A staged audio mutation or validation failed before publication."""
+
+    pass
+
+
+class ScriptValidationError(ValidationError):
+    """A bounded management script failed syntax or runtime validation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        script_name: str,
+        line: int,
+        column: int,
+    ) -> None:
+        self.script_name = script_name
+        self.line = line
+        self.column = column
+        super().__init__(f"{script_name}:{line}:{column}: {message}")
+
+
+class PathLimitExceededError(ScriptValidationError):
+    """A rendered management path exceeded an enabled length limit."""
+
+
+class ProviderIdentityRequiredError(ValidationError):
+    error_code = "PROVIDER_IDENTITY_REQUIRED"
+
+
+class ExactReleaseMappingIncompleteError(ValidationError):
+    error_code = "EXACT_RELEASE_MAPPING_INCOMPLETE"
+
+
+class CustomEditionNotSealableError(ValidationError):
+    error_code = "CUSTOM_EDITION_NOT_SEALABLE"
+
+
+class RangeNotSatisfiableError(ValidationError):
+    def __init__(self, file_size: int):
+        super().__init__("Requested byte range is not satisfiable")
+        self.file_size = file_size
+
+
 class PermissionDeniedError(DroppedNeedleException):
     """Ownership/authorization violation. Mapped to HTTP 403 by the registered handler."""
+
     pass
 
 
 class ConflictError(DroppedNeedleException):
     """Duplicate active request/download. Mapped to HTTP 409 by the registered handler."""
+
     pass
+
+
+class LibraryManagementDestinationConflictError(ConflictError):
+    """A staged Library Management destination is occupied or aliases another path."""
+
+    pass
+
+
+class MediaAccountRelinkRequiredError(ConflictError):
+    """A linked media-server account exists but cannot be used safely."""
+
+    error_code = "MEDIA_ACCOUNT_RELINK_REQUIRED"
 
 
 class PlaylistNotFoundError(ResourceNotFoundError):
@@ -67,6 +156,64 @@ class SourceResolutionError(ValidationError):
 
 
 class ConfigurationError(DroppedNeedleException):
+    pass
+
+
+class StaleRevisionError(ConflictError):
+    pass
+
+
+class LibraryManagementPolicyChangedError(StaleRevisionError):
+    """The Library Management policy or root projection changed during publication."""
+
+    pass
+
+
+class AutomaticManagementHoldError(DroppedNeedleException):
+    """A verified import unit must remain intact until management can be retried."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+class ContributionStateError(ConflictError):
+    error_code = "CONTRIBUTION_STATE_CONFLICT"
+
+
+class ContributionProviderExpiredError(ConflictError):
+    error_code = "CONTRIBUTION_PROVIDER_EXPIRED"
+
+
+class ContributionDuplicateCheckRequiredError(ConflictError):
+    error_code = "CONTRIBUTION_DUPLICATE_CHECK_REQUIRED"
+
+
+class ContributionExactDuplicateError(ConflictError):
+    error_code = "CONTRIBUTION_EXACT_DUPLICATE"
+
+
+class ContributionResultMismatchError(ConflictError):
+    error_code = "CONTRIBUTION_RESULT_MISMATCH"
+
+
+class ContributionDataError(DroppedNeedleException):
+    """A persisted contribution document cannot be decoded safely."""
+
+    pass
+
+
+class DiscogsApiError(ExternalServiceError):
+    """Discogs returned an unusable response for optional contribution metadata."""
+
+    pass
+
+
+class RevisionOverflowError(DroppedNeedleException):
+    pass
+
+
+class TargetStartupInvariantError(DroppedNeedleException):
     pass
 
 
@@ -90,6 +237,16 @@ class PlexApiError(ExternalServiceError):
 
 
 class PlexAuthError(PlexApiError):
+    pass
+
+
+class JellyfinAuthError(ExternalServiceError):
+    """Outbound Jellyfin rejected our credential (401).
+
+    Non-breaking for the shared circuit breaker: with per-user access tokens a
+    single revoked/stale token must not open the circuit for every user.
+    """
+
     pass
 
 
@@ -166,6 +323,7 @@ class NewznabApiError(ExternalServiceError):
 
 class NewznabAuthError(NewznabApiError):
     """Newznab auth failure (error code 100-199, or a missing/invalid API key)."""
+
     pass
 
 
@@ -177,7 +335,9 @@ class LidarrImportError(ExternalServiceError):
     (``auth`` flags a rejected API key), never a leaked exception body (5xx bodies stay
     generic)."""
 
-    def __init__(self, message: str, details: Any = None, *, auth: bool = False) -> None:
+    def __init__(
+        self, message: str, details: Any = None, *, auth: bool = False
+    ) -> None:
         super().__init__(message, details)
         self.auth = auth
 
@@ -187,6 +347,7 @@ class TicketmasterApiError(ExternalServiceError):
 
     Mapped to HTTP 503 by the registered ``ExternalServiceError`` handler.
     """
+
     pass
 
 
@@ -195,6 +356,13 @@ class SkiddleApiError(ExternalServiceError):
 
     Mapped to HTTP 503 by the registered ``ExternalServiceError`` handler.
     """
+
+    pass
+
+
+class LrclibApiError(ExternalServiceError):
+    """Transport, HTTP, or decode failure from the LRCLIB lyrics service."""
+
     pass
 
 
@@ -203,6 +371,7 @@ class GeocodingApiError(ExternalServiceError):
     (the events city picker). Mapped to HTTP 503 - a failed city search must
     surface as 'geocoding unavailable', never as an empty result list.
     """
+
     pass
 
 

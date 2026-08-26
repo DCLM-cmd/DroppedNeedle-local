@@ -10,6 +10,7 @@ from infrastructure.cache.cache_keys import (
     MB_ARTIST_DETAIL_PREFIX,
     MB_ARTIST_SEARCH_PREFIX,
     MB_RELEASE_DETAIL_PREFIX,
+    MB_RELEASE_EDITION_SEARCH_PREFIX,
     MB_RG_DETAIL_PREFIX,
     PREFERENCES_PREFIX,
     WIKIDATA_IMAGE_PREFIX,
@@ -28,6 +29,7 @@ from infrastructure.cache.cache_keys import (
     mb_artist_detail_key,
     mb_artist_search_key,
     mb_release_group_key,
+    mb_release_edition_search_key,
     mb_release_key,
     preferences_key,
     wikidata_artist_image_key,
@@ -44,6 +46,10 @@ from infrastructure.cache.cache_keys import (
         (mb_album_search_key("test", 10, 0), MB_ALBUM_SEARCH_PREFIX),
         (mb_release_group_key("abc"), MB_RG_DETAIL_PREFIX),
         (mb_release_key("abc"), MB_RELEASE_DETAIL_PREFIX),
+        (
+            mb_release_edition_search_key("Album", "Artist", 12, 0),
+            MB_RELEASE_EDITION_SEARCH_PREFIX,
+        ),
         (library_albums_key(), LIBRARY_PREFIX),
         (library_albums_key(include_unmonitored=True), LIBRARY_PREFIX),
         (library_artists_key(), LIBRARY_PREFIX),
@@ -57,7 +63,7 @@ from infrastructure.cache.cache_keys import (
         (wikidata_url_key("artist-1"), WIKIDATA_URL_PREFIX),
         (wikipedia_extract_key("https://en.wikipedia.org/wiki/Test"), WIKIPEDIA_PREFIX),
         (preferences_key(), PREFERENCES_PREFIX),
-        (getit_options_key("rg-1", "GB", True), GETIT_OPTIONS_PREFIX),
+        (getit_options_key("rg-1", "GB"), GETIT_OPTIONS_PREFIX),
     ],
     ids=[
         "mb_artist_search",
@@ -65,6 +71,7 @@ from infrastructure.cache.cache_keys import (
         "mb_album_search",
         "mb_release_group",
         "mb_release",
+        "mb_release_edition_search",
         "library_albums_monitored",
         "library_albums_all",
         "library_artists",
@@ -82,8 +89,19 @@ from infrastructure.cache.cache_keys import (
     ],
 )
 def test_key_starts_with_prefix(generated_key: str, expected_prefix: str):
-    assert generated_key.startswith(expected_prefix), (
-        f"Key {generated_key!r} does not start with prefix {expected_prefix!r}"
+    assert generated_key.startswith(
+        expected_prefix
+    ), f"Key {generated_key!r} does not start with prefix {expected_prefix!r}"
+
+
+def test_release_edition_cache_key_keeps_artist_and_title_boundaries() -> None:
+    clairo_originals = mb_release_edition_search_key("Originals", "Clairo", 12, 0)
+
+    assert clairo_originals != mb_release_edition_search_key(
+        "Clairo", "Originals", 12, 0
+    )
+    assert clairo_originals == mb_release_edition_search_key(
+        "  originals ", "CLAIRO", 12, 0
     )
 
 
@@ -104,6 +122,6 @@ def test_invalidation_groups_return_list_of_strings(group_fn: str):
     result = fn()
     assert isinstance(result, list)
     assert len(result) > 0, f"{group_fn}() returned an empty list"
-    assert all(isinstance(p, str) for p in result), (
-        f"{group_fn}() contains non-string entries"
-    )
+    assert all(
+        isinstance(p, str) for p in result
+    ), f"{group_fn}() contains non-string entries"

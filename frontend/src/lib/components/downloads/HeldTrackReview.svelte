@@ -27,6 +27,15 @@
 	// without this a fast second click re-POSTs an already-consumed held id
 	let done = $state(false);
 	const busy = $derived(importMut.isPending || discardMut.isPending || done);
+	// server-side failure reason (e.g. no library root configured) shown inline so the
+	// review card itself says what to fix - the toast alone disappears too fast
+	const actionError = $derived.by(() => {
+		const err = importMut.error ?? discardMut.error;
+		if (!err) return null;
+		return typeof err === 'object' && 'message' in err && typeof err.message === 'string'
+			? err.message
+			: null;
+	});
 
 	// what the rejecting check SAW - the reason we couldn't auto-confirm it, so the human
 	// decides informed. The evidence source depends on the hold reason: AcoustID's
@@ -166,6 +175,9 @@
 			<X class="h-3.5 w-3.5" /> Discard
 		</button>
 	</div>
+	{#if actionError}
+		<p class="text-xs text-error" role="alert">{actionError}</p>
+	{/if}
 </div>
 
 <style>

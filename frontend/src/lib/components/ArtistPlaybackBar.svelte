@@ -3,7 +3,7 @@
 	import { PersistedState } from 'runed';
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import type { MenuItem } from '$lib/components/ContextMenu.svelte';
-	import { openGlobalPlaylistModal } from '$lib/components/AddToPlaylistModal.svelte';
+	import { openGlobalPlaylistModal } from '$lib/stores/playlistModal.svelte';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import LocalFilesIcon from '$lib/components/LocalFilesIcon.svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';

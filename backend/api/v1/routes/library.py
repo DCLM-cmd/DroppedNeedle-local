@@ -6,9 +6,10 @@ from api.v1.schemas.library import (
     LibraryResponse,
     RecentlyAddedResponse,
     AlbumRemoveResponse,
-    AlbumRemovePreviewResponse,
     SyncLibraryResponse,
     LibraryMbidsResponse,
+    LibraryMembershipRequest,
+    LibraryMembershipResponse,
     LibraryGroupedResponse,
     TrackResolveRequest,
     TrackResolveResponse,
@@ -19,7 +20,6 @@ from api.v1.schemas.library import (
     NativeLibraryStatsResponse,
     LibraryAlbumStatusResponse,
     LibraryTrackResponse,
-    TrackTagUpdateRequest,
 )
 from core.dependencies import (
     get_album_service,
@@ -28,8 +28,10 @@ from core.dependencies import (
     get_library_manager,
     get_library_scanner,
     get_preferences_service,
+    get_wanted_watcher_service,
+    RequestHistoryStoreDep,
 )
-from core.exceptions import ExternalServiceError
+from core.exceptions import ExternalServiceError, ValidationError
 from infrastructure.msgspec_fastapi import MsgSpecRoute, MsgSpecBody
 from middleware import CurrentAdminDep, CurrentCuratorDep, CurrentUserDep
 from models.audio import AudioTag
@@ -44,9 +46,7 @@ router = APIRouter(route_class=MsgSpecRoute, prefix="/library", tags=["library"]
 
 
 @router.get("/", response_model=LibraryResponse)
-async def get_library(
-    library_service: LibraryService = Depends(get_library_service)
-):
+async def get_library(library_service: LibraryService = Depends(get_library_service)):
     library = await library_service.get_library()
     return LibraryResponse(library=library)
 
@@ -117,8 +117,7 @@ async def get_library_tracks(
 
 @router.get("/recently-added", response_model=RecentlyAddedResponse)
 async def get_recently_added(
-    limit: int = 20,
-    library_service: LibraryService = Depends(get_library_service)
+    limit: int = 20, library_service: LibraryService = Depends(get_library_service)
 ):
     albums = await library_service.get_recently_added(limit=limit)
     return RecentlyAddedResponse(albums=albums, artists=[])
@@ -126,14 +125,19 @@ async def get_recently_added(
 
 @router.post("/sync", response_model=SyncLibraryResponse)
 async def sync_library(
-    force_full: bool = Query(default=False, description="Clear resume checkpoint and start a full sync from scratch"),
-    library_service: LibraryService = Depends(get_library_service)
+    force_full: bool = Query(
+        default=False,
+        description="Clear resume checkpoint and start a full sync from scratch",
+    ),
+    library_service: LibraryService = Depends(get_library_service),
 ):
     try:
         return await library_service.sync_library(is_manual=True, force_full=force_full)
     except ExternalServiceError as e:
         if "cooldown" in str(e).lower():
-            raise HTTPException(status_code=429, detail="Sync is on cooldown, please wait")
+            raise HTTPException(
+                status_code=429, detail="Sync is on cooldown, please wait"
+            )
         raise
 
 
@@ -147,7 +151,7 @@ async def get_library_stats(
 
 @router.get("/mbids", response_model=LibraryMbidsResponse)
 async def get_library_mbids(
-    library_service: LibraryService = Depends(get_library_service)
+    library_service: LibraryService = Depends(get_library_service),
 ):
     mbids, requested = await asyncio.gather(
         library_service.get_library_mbids(),
@@ -156,25 +160,35 @@ async def get_library_mbids(
     return LibraryMbidsResponse(mbids=mbids, requested_mbids=requested)
 
 
+@router.post("/membership", response_model=LibraryMembershipResponse)
+async def get_library_membership(
+    _user: CurrentUserDep,
+    request_history: RequestHistoryStoreDep,
+    body: LibraryMembershipRequest = MsgSpecBody(LibraryMembershipRequest),
+    library_service: LibraryService = Depends(get_library_service),
+) -> LibraryMembershipResponse:
+    album_ids = list(
+        dict.fromkeys(
+            value.strip().casefold() for value in body.album_ids if value.strip()
+        )
+    )
+    if len(album_ids) > 500:
+        raise ValidationError("Library membership accepts at most 500 album IDs.")
+    owned, requested = await asyncio.gather(
+        library_service.get_membership(album_ids),
+        request_history.async_existing_requested_mbids(album_ids),
+    )
+    return LibraryMembershipResponse(
+        owned_ids=sorted(owned), requested_ids=sorted(requested)
+    )
+
+
 @router.get("/grouped", response_model=LibraryGroupedResponse)
 async def get_library_grouped(
-    library_service: LibraryService = Depends(get_library_service)
+    library_service: LibraryService = Depends(get_library_service),
 ):
     grouped = await library_service.get_library_grouped()
     return LibraryGroupedResponse(library=grouped)
-
-
-@router.get("/album/{album_mbid}/removal-preview", response_model=AlbumRemovePreviewResponse)
-async def get_album_removal_preview(
-    _admin: CurrentAdminDep,
-    album_mbid: str,
-    library_service: LibraryService = Depends(get_library_service)
-):
-    try:
-        return await library_service.get_album_removal_preview(album_mbid)
-    except ExternalServiceError as e:
-        logger.error(f"Failed to get album removal preview: {e}")
-        raise HTTPException(status_code=500, detail="Failed to load removal preview")
 
 
 @router.delete("/album/{album_mbid}", response_model=AlbumRemoveResponse)
@@ -182,11 +196,15 @@ async def remove_album(
     _admin: CurrentAdminDep,
     album_mbid: str,
     delete_files: bool = False,
+    stop_wanted: bool = True,
     library_service: LibraryService = Depends(get_library_service),
     download_service=Depends(get_download_service),
+    wanted=Depends(get_wanted_watcher_service),
 ):
     try:
-        result = await library_service.remove_album(album_mbid, delete_files=delete_files)
+        result = await library_service.remove_album(
+            album_mbid, delete_files=delete_files
+        )
     except ExternalServiceError as e:
         logger.error(f"Couldn't remove album {album_mbid}: {e}")
         raise HTTPException(status_code=500, detail="Couldn't remove this album")
@@ -195,18 +213,28 @@ async def remove_album(
     # tracks (rows + files), and blocklist entries. Best-effort: a failure here must not
     # fail the removal the user already confirmed.
     try:
-        await download_service.purge_album_downloads(album_mbid)
+        await download_service.purge_album_downloads(result.album_mbid)
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"Album {album_mbid} removed but download-state cleanup failed: {e}")
+        logger.warning(
+            f"Album {album_mbid} removed but download-state cleanup failed: {e}"
+        )
+    try:
+        if stop_wanted:
+            await wanted.stop_after_library_removal(result.album_mbid)
+        else:
+            await wanted.continue_after_library_removal(result.album_mbid)
+    except Exception:  # noqa: BLE001 - removal already succeeded
+        logger.warning("Album removal wanted-state cleanup failed")
     return result
 
 
 @router.post("/resolve-tracks", response_model=TrackResolveResponse)
 async def resolve_tracks(
+    current_user: CurrentUserDep,
     body: TrackResolveRequest = MsgSpecBody(TrackResolveRequest),
     library_service: LibraryService = Depends(get_library_service),
 ):
-    return await library_service.resolve_tracks_batch(body.items)
+    return await library_service.resolve_tracks_batch(body.items, current_user.id)
 
 
 @router.get("/albums/{mbid}/tracks", response_model=NativeTracksResponse)
@@ -260,37 +288,14 @@ async def get_track_tags(
     return await scanner.read_track_tags(file_id)
 
 
-@router.post("/tracks/{file_id}", response_model=LibraryTrackResponse)
-async def update_track_tags(
-    file_id: str,
-    current_user: CurrentAdminDep,
-    body: TrackTagUpdateRequest = MsgSpecBody(TrackTagUpdateRequest),
-    scanner: LibraryScanner = Depends(get_library_scanner),
-):
-    new_tag = AudioTag(
-        title=body.title,
-        artist=body.artist,
-        album=body.album,
-        track_number=body.track_number,
-        album_artist=body.album_artist,
-        disc_number=body.disc_number,
-        year=body.year,
-        genre=body.genre,
-        musicbrainz_release_group_id=body.musicbrainz_release_group_id,
-        musicbrainz_release_id=body.musicbrainz_release_id,
-        musicbrainz_recording_id=body.musicbrainz_recording_id,
-        musicbrainz_artist_id=body.musicbrainz_artist_id,
-        musicbrainz_album_artist_id=body.musicbrainz_album_artist_id,
-    )
-    return await scanner.update_track_tags(file_id, new_tag)
-
-
 def _log_rescan_exception(task: asyncio.Task) -> None:
     if not task.cancelled() and task.exception() is not None:
         logger.error("Album rescan task failed: %s", task.exception())
 
 
-@router.post("/albums/{mbid}/rescan", status_code=202, response_model=StatusMessageResponse)
+@router.post(
+    "/albums/{mbid}/rescan", status_code=202, response_model=StatusMessageResponse
+)
 async def rescan_native_album(
     mbid: str,
     current_user: CurrentAdminDep,
@@ -304,7 +309,9 @@ async def rescan_native_album(
     except RuntimeError:
         # rescan already running; idempotent no-op
         task.cancel()
-        return StatusMessageResponse(status="accepted", message="Album rescan already running")
+        return StatusMessageResponse(
+            status="accepted", message="Album rescan already running"
+        )
     task.add_done_callback(_log_rescan_exception)
     return StatusMessageResponse(status="accepted", message="Album rescan started")
 

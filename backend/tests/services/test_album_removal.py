@@ -5,12 +5,15 @@ Drives a REAL LibraryDB + LibraryManager with on-disk temp files so the disk
 unlink and the soft-delete are genuinely exercised, not mocked.
 """
 
+import os
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from core.exceptions import ExternalServiceError
+from infrastructure.cache.cache_keys import ALBUM_TRACKS_INFO_PREFIX
 from infrastructure.persistence.library_db import LibraryDB
 from models.audio import AudioInfo, AudioTag
 from services.library_service import LibraryService
@@ -38,6 +41,7 @@ async def _seed(
     artist: str = "Artist",
     album: str = "Album",
     track: int = 1,
+    release_mbid: str | None = None,
 ) -> None:
     path.write_bytes(b"x")
     tag = AudioTag(
@@ -51,7 +55,12 @@ async def _seed(
         musicbrainz_album_artist_id=artist_mbid,
     )
     await manager.upsert_file(
-        path, tag, _info(), release_group_mbid=rg, recording_mbid=f"{rg}-rec{track}"
+        path,
+        tag,
+        _info(),
+        release_group_mbid=rg,
+        release_mbid=release_mbid,
+        recording_mbid=f"{rg}-rec{track}",
     )
 
 
@@ -115,57 +124,67 @@ async def test_remove_album_keeps_artist_with_other_albums(db, tmp_path):
 
 @pytest.mark.asyncio
 async def test_remove_unknown_album_is_idempotent(db):
-    # No files and no materialised row: a no-op success, not an error -
-    # consistent with the removal preview, which also returns success for
-    # unknown albums so users can clear ghost entries without failing on a
-    # missing-files edge case.
+    # Unknown albums succeed so stale UI entries can still be cleared.
     resp = await _service(db).remove_album("does-not-exist")
     assert resp.success is True
 
 
 @pytest.mark.asyncio
-async def test_removal_preview_flags_sole_album_artist(db, tmp_path):
+async def test_remove_album_resolves_release_mbid_alias(db, tmp_path):
     manager = LibraryManager(db)
-    await _seed(manager, tmp_path / "a.flac", rg="rg-1", artist_mbid="art-1")
-
-    preview = await _service(db).get_album_removal_preview("rg-1")
-
-    assert preview.artist_will_be_removed is True
-    assert preview.artist_name == "Artist"
-
-
-@pytest.mark.asyncio
-async def test_removal_preview_other_albums_keep_artist(db, tmp_path):
-    manager = LibraryManager(db)
-    await _seed(manager, tmp_path / "a.flac", rg="rg-1", artist_mbid="art-1")
-    await _seed(manager, tmp_path / "b.flac", rg="rg-2", artist_mbid="art-1")
-
-    preview = await _service(db).get_album_removal_preview("rg-1")
-
-    assert preview.artist_will_be_removed is False
-    assert preview.artist_name is None
-
-
-@pytest.mark.asyncio
-async def test_removal_preview_unknown_album_is_noop(db):
-    preview = await _service(db).get_album_removal_preview("does-not-exist")
-
-    assert preview.success is True
-    assert preview.artist_will_be_removed is False
-
-
-@pytest.mark.asyncio
-async def test_count_artist_albums_matches_by_name_when_no_mbid(db, tmp_path):
-    manager = LibraryManager(db)
-    await _seed(manager, tmp_path / "a.flac", rg="rg-1", artist_mbid="", artist="NoMBID")
-
-    by_name = await db.count_artist_albums(artist_mbid=None, artist_name="NoMBID")
-    excluded = await db.count_artist_albums(
-        artist_mbid=None, artist_name="NoMBID", exclude_release_group_mbid="rg-1"
+    path = tmp_path / "a.flac"
+    await _seed(
+        manager,
+        path,
+        rg="rg-1",
+        release_mbid="release-1",
+        artist_mbid="art-1",
     )
 
-    assert by_name == 1
-    assert excluded == 0
+    result = await _service(db).remove_album("RELEASE-1", delete_files=True)
+
+    assert result.album_mbid == "rg-1"
+    assert result.removed_mbids == ["release-1", "rg-1"]
+    assert not path.exists()
+    assert await manager.has_album("rg-1") is False
+
+
+@pytest.mark.asyncio
+async def test_remove_album_partial_unlink_stays_visible_and_retryable(
+    db, tmp_path, monkeypatch
+):
+    manager = LibraryManager(db)
+    removed = tmp_path / "removed.flac"
+    blocked = tmp_path / "blocked.flac"
+    await _seed(manager, removed, rg="rg-1", artist_mbid="art-1", track=1)
+    await _seed(manager, blocked, rg="rg-1", artist_mbid="art-1", track=2)
+    await db.upsert_album({"mbid": "rg-1", "title": "Album", "artist_mbid": "art-1"})
+    real_remove = os.remove
+
+    def fail_one(path):
+        if str(path) == str(blocked):
+            raise PermissionError("blocked")
+        real_remove(path)
+
+    monkeypatch.setattr(os, "remove", fail_one)
+
+    with pytest.raises(ExternalServiceError, match="Couldn't remove this album"):
+        await _service(db).remove_album("rg-1", delete_files=True)
+
+    assert not removed.exists()
+    assert blocked.exists()
+    assert [
+        row["file_path"] for row in await db.get_library_files_for_album("rg-1")
+    ] == [str(blocked)]
+    assert await db.get_album_by_mbid("rg-1") is not None
+
+    monkeypatch.setattr(os, "remove", real_remove)
+    result = await _service(db).remove_album("rg-1", delete_files=True)
+
+    assert result.success is True
+    assert not blocked.exists()
+    assert await db.get_library_files_for_album("rg-1") == []
+    assert await db.get_album_by_mbid("rg-1") is None
 
 
 @pytest.mark.asyncio
@@ -229,8 +248,8 @@ async def test_remove_file_soft_deletes_row_and_unlinks(db, tmp_path):
     result = await service.remove_file(orphan_id)
 
     assert result.status == "ok"
-    assert not orphan.exists()                       # audio unlinked
-    assert keep.exists()                             # sibling untouched
+    assert not orphan.exists()  # audio unlinked
+    assert keep.exists()  # sibling untouched
     remaining = await db.get_library_files_for_album("rg-1")
     assert [r["file_path"] for r in remaining] == [str(keep)]
     # soft-deleted, not hard-deleted (recoverable via re-import)
@@ -247,7 +266,12 @@ async def test_remove_file_last_file_drops_ghost_album_row(db, tmp_path):
     only = tmp_path / "only.flac"
     await _seed(manager, only, rg="rg-solo", artist_mbid="am-2")
     await db.upsert_album(
-        {"mbid": "rg-solo", "artist_mbid": "am-2", "artist_name": "Artist", "title": "Album"}
+        {
+            "mbid": "rg-solo",
+            "artist_mbid": "am-2",
+            "artist_name": "Artist",
+            "title": "Album",
+        }
     )
     rows = await db.get_library_files_for_album("rg-solo")
     service = _service(db)
@@ -265,3 +289,24 @@ async def test_remove_file_unknown_id_raises_not_found(db):
     service = _service(db)
     with pytest.raises(ResourceNotFoundError):
         await service.remove_file("no-such-file")
+
+
+@pytest.mark.asyncio
+async def test_removal_clears_native_track_cache(db):
+    memory_cache = MagicMock()
+    memory_cache.delete = AsyncMock()
+    memory_cache.clear_prefix = AsyncMock()
+    disk_cache = MagicMock()
+    disk_cache.delete_album = AsyncMock()
+    service = LibraryService(
+        library_repo=LibraryManager(db),
+        library_db=db,
+        cover_repo=None,
+        preferences_service=MagicMock(),
+        memory_cache=memory_cache,
+        disk_cache=disk_cache,
+    )
+
+    await service._invalidate_caches_after_removal("release-group-1", None)
+
+    memory_cache.delete.assert_any_await(f"{ALBUM_TRACKS_INFO_PREFIX}release-group-1")

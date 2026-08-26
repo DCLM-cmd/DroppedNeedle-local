@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, RefreshCw } from 'lucide-svelte';
+	import { Check, Mic2, RefreshCw } from 'lucide-svelte';
 	import type { ArtistInfo } from '$lib/types';
 	import { extractDominantColor, DEFAULT_GRADIENT } from '$lib/utils/colors';
 	import { imageSettingsStore } from '$lib/stores/imageSettings';
@@ -40,7 +40,7 @@
 
 	function onHeroImageLoad() {
 		heroImageLoaded = true;
-		extractDominantColor(getApiUrl(`/api/v1/covers/artist/${artist.musicbrainz_id}?size=250`)).then(
+		extractDominantColor(getApiUrl(`/api/v1/covers/artist/${artist.musicbrainz_id}?size=500`)).then(
 			(gradient) => (heroGradient = gradient)
 		);
 	}
@@ -100,6 +100,11 @@
 							<div class="absolute -bottom-2 -right-2 badge badge-success badge-lg gap-1 shadow-lg">
 								<Check class="h-4 w-4" />
 								In Library
+							</div>
+						{:else if artist.appears_in_library}
+							<div class="absolute -bottom-2 -right-2 badge badge-accent badge-lg gap-1 shadow-lg">
+								<Mic2 class="h-4 w-4" />
+								Appears in library
 							</div>
 						{/if}
 					</div>

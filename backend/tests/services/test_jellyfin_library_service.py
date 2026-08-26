@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -216,3 +217,145 @@ class TestGetFavoritesExpanded:
         result = await service.get_favorites_expanded(limit=10)
         assert len(result.artists) == 1
         assert result.artists[0].play_count == 77
+
+
+class TestImportPlaylistMapsAlbumMbids:
+    """import_playlist stores the MusicBrainz MBID as album_id, not the
+    Jellyfin album GUID, so the MBID-keyed local catalog can match (#150)."""
+
+    @staticmethod
+    def _requesting():
+        return SimpleNamespace(id="u1")
+
+    @staticmethod
+    def _playlist_service():
+        ps = MagicMock()
+        ps.get_by_source_ref = AsyncMock(return_value=None)
+        ps.create_playlist = AsyncMock(return_value=SimpleNamespace(id="dn-pl-1"))
+        ps.add_tracks = AsyncMock()
+        return ps
+
+    @staticmethod
+    def _track_item(id: str, album_id: str, track_number: int = 1) -> JellyfinItem:
+        return JellyfinItem(
+            id=id,
+            name=f"Song {id}",
+            type="Audio",
+            artist_name="Artist",
+            album_name="Album",
+            album_id=album_id,
+            artist_id="artist-1",
+            index_number=track_number,
+            parent_index_number=1,
+            duration_ticks=200 * 10_000_000,
+        )
+
+    def _wire_playlist(self, repo, track_items):
+        repo.get_playlists = AsyncMock(
+            return_value=[_item(id="pl-1", name="Mix", type="Playlist")]
+        )
+        repo.get_playlist = AsyncMock(
+            return_value=_item(id="pl-1", name="Mix", type="Playlist")
+        )
+        repo.get_playlist_items = AsyncMock(return_value=track_items)
+
+    @pytest.mark.asyncio
+    async def test_stores_release_group_mbid_as_album_id(self):
+        service, repo = _make_service()
+        self._wire_playlist(repo, [self._track_item("t1", "guid-a")])
+        repo.get_album_detail = AsyncMock(
+            return_value=_item(
+                id="guid-a",
+                provider_ids={
+                    "MusicBrainzReleaseGroup": "rg-123",
+                    "MusicBrainzAlbum": "rel-456",
+                },
+            )
+        )
+        ps = self._playlist_service()
+
+        await service.import_playlist("pl-1", ps, self._requesting())
+
+        track_dicts = ps.add_tracks.call_args[0][2]
+        assert track_dicts[0]["album_id"] == "rg-123"
+        assert track_dicts[0]["track_source_id"] == "t1"
+        assert track_dicts[0]["source_type"] == "jellyfin"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_musicbrainz_album_provider_id(self):
+        service, repo = _make_service()
+        self._wire_playlist(repo, [self._track_item("t1", "guid-a")])
+        repo.get_album_detail = AsyncMock(
+            return_value=_item(id="guid-a", provider_ids={"MusicBrainzAlbum": "rel-456"})
+        )
+        ps = self._playlist_service()
+
+        await service.import_playlist("pl-1", ps, self._requesting())
+
+        track_dicts = ps.add_tracks.call_args[0][2]
+        assert track_dicts[0]["album_id"] == "rel-456"
+
+    @pytest.mark.asyncio
+    async def test_keeps_guid_when_album_detail_missing(self):
+        service, repo = _make_service()
+        self._wire_playlist(repo, [self._track_item("t1", "guid-a")])
+        repo.get_album_detail = AsyncMock(return_value=None)
+        ps = self._playlist_service()
+
+        await service.import_playlist("pl-1", ps, self._requesting())
+
+        track_dicts = ps.add_tracks.call_args[0][2]
+        assert track_dicts[0]["album_id"] == "guid-a"
+
+    @pytest.mark.asyncio
+    async def test_keeps_guid_when_no_provider_ids(self):
+        service, repo = _make_service()
+        self._wire_playlist(repo, [self._track_item("t1", "guid-a")])
+        repo.get_album_detail = AsyncMock(return_value=_item(id="guid-a"))
+        ps = self._playlist_service()
+
+        await service.import_playlist("pl-1", ps, self._requesting())
+
+        track_dicts = ps.add_tracks.call_args[0][2]
+        assert track_dicts[0]["album_id"] == "guid-a"
+
+    @pytest.mark.asyncio
+    async def test_fetches_each_distinct_album_once(self):
+        service, repo = _make_service()
+        self._wire_playlist(
+            repo,
+            [
+                self._track_item("t1", "guid-a", track_number=1),
+                self._track_item("t2", "guid-a", track_number=2),
+                self._track_item("t3", "guid-b", track_number=1),
+            ],
+        )
+        repo.get_album_detail = AsyncMock(
+            side_effect=lambda guid: _item(
+                id=guid, provider_ids={"MusicBrainzReleaseGroup": f"rg-{guid}"}
+            )
+        )
+        ps = self._playlist_service()
+
+        await service.import_playlist("pl-1", ps, self._requesting())
+
+        assert repo.get_album_detail.await_count == 2
+        awaited = {c.args[0] for c in repo.get_album_detail.await_args_list}
+        assert awaited == {"guid-a", "guid-b"}
+        track_dicts = ps.add_tracks.call_args[0][2]
+        assert [t["album_id"] for t in track_dicts] == [
+            "rg-guid-a",
+            "rg-guid-a",
+            "rg-guid-b",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_already_imported_skips_album_fetches(self):
+        service, repo = _make_service()
+        ps = self._playlist_service()
+        ps.get_by_source_ref = AsyncMock(return_value=SimpleNamespace(id="dn-pl-1"))
+
+        result = await service.import_playlist("pl-1", ps, self._requesting())
+
+        assert result.already_imported is True
+        repo.get_album_detail.assert_not_called()

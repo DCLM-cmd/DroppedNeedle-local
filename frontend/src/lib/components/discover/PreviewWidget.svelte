@@ -59,6 +59,7 @@
 						mbid={entry.albumMbid}
 						alt={entry.title}
 						size="full"
+						requestSize={250}
 						rounded="none"
 						className="block h-full w-full object-cover"
 						customUrl={entry.coverUrl || null}

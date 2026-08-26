@@ -1,7 +1,7 @@
 """Lidarr wire models (third-party shapes).
 
-Verified against a live Lidarr **3.1.3.4968** (see ``lidarr_import_API_NOTES.md``) plus
-Lidarr's committed ``openapi.json`` / ``ArtistResource.cs``. Tolerant defaults so absent
+Verified against a live Lidarr **3.1.3.4968** plus Lidarr's committed
+``openapi.json`` / ``ArtistResource.cs``. Tolerant defaults so absent
 or unknown fields never break decode (CLAUDE.md third-party-shape rule). Decode failures
 re-raise as ``LidarrImportError`` in the repository, never as raw msgspec errors.
 """

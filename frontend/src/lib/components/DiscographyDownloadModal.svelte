@@ -4,6 +4,7 @@
 	import { batchDownloadStore } from '$lib/stores/batchDownloadStatus.svelte';
 	import { requestBatch, type BatchAlbumItem } from '$lib/utils/albumRequest';
 	import { toastStore } from '$lib/stores/toast';
+	import { authStore } from '$lib/stores/authStore.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 
 	let dialogEl: HTMLDialogElement | undefined = $state();
@@ -66,29 +67,36 @@
 
 	async function handleDownload() {
 		if (filteredReleases.length === 0) return;
+		const initiatingUserId = authStore.user?.id;
+		if (!initiatingUserId) return;
+		const artistName = discographyDownloadStore.artistName;
+		const artistId = discographyDownloadStore.artistId;
 		submitting = true;
 
 		const items: BatchAlbumItem[] = filteredReleases.map((r) => ({
 			musicbrainz_id: r.id,
-			artist_name: discographyDownloadStore.artistName,
+			artist_name: artistName,
 			album_title: r.title,
 			year: r.year ?? undefined,
-			artist_mbid: discographyDownloadStore.artistId
+			artist_mbid: artistId
 		}));
 
 		const result = await requestBatch(items, {
 			monitorArtist,
 			autoDownloadArtist: autoDownload
 		});
+		if (authStore.user?.id !== initiatingUserId) {
+			return;
+		}
 
 		if (result.success) {
 			batchDownloadStore.addJob(
-				discographyDownloadStore.artistName,
-				discographyDownloadStore.artistId,
+				artistName,
+				artistId,
 				items.map((i) => i.musicbrainz_id)
 			);
 			toastStore.show({
-				message: `Requested ${result.requested} album${result.requested !== 1 ? 's' : ''} for ${discographyDownloadStore.artistName}`,
+				message: `Requested ${result.requested} album${result.requested !== 1 ? 's' : ''} for ${artistName}`,
 				type: 'success'
 			});
 			handleClose();

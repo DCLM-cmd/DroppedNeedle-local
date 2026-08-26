@@ -2,7 +2,7 @@ import { api } from '$lib/api/client';
 import { createMutation } from '@tanstack/svelte-query';
 import { toastStore } from '$lib/stores/toast';
 import { authStore } from '$lib/stores/authStore.svelte';
-import { invalidateQueriesWithPersister } from '../QueryClient';
+import { invalidateQueriesWithPersister, setQueryDataWithPersister } from '../QueryClient';
 import { ScrobblePreferencesQueryKeyFactory } from './ScrobblePreferencesQueryKeyFactory';
 import { SCROBBLE_PREFERENCES_ENDPOINTS } from './endpoints';
 import { notifyPendingApprovalCountChanged } from '$lib/utils/requestsApi';
@@ -12,16 +12,22 @@ import type {
 	ScrobblePreferences,
 	ScrobblePreferencesUpdate
 } from './types';
+import { isMusicSource, musicSourceStore } from '$lib/stores/musicSource';
 
 // invalidate so the card + (Phase 5) home/discover re-read the new primary source
 export const createUpdateScrobblePreferencesMutation = () =>
 	createMutation(() => ({
 		mutationFn: (vars: ScrobblePreferencesUpdate) =>
 			api.global.put<ScrobblePreferences>(SCROBBLE_PREFERENCES_ENDPOINTS.update, vars),
-		onSuccess: () =>
-			invalidateQueriesWithPersister({
-				queryKey: ScrobblePreferencesQueryKeyFactory.get(authStore.user?.id)
-			})
+		onMutate: () => ({ userId: authStore.user?.id }),
+		onSuccess: async (preferences, _vars, context) => {
+			const userId = context.userId;
+			if (!userId || authStore.user?.id !== userId) return;
+			if (isMusicSource(preferences.primary_music_source)) {
+				musicSourceStore.setSource(preferences.primary_music_source);
+			}
+			await setQueryDataWithPersister(ScrobblePreferencesQueryKeyFactory.get(userId), preferences);
+		}
 	}));
 
 // kicks off a background build; playlist queries are invalidated by the

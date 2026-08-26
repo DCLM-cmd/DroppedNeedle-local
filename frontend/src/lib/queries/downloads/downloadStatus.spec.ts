@@ -27,6 +27,8 @@ function task(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		user_id: 'u',
 		download_type: 'album',
 		release_group_mbid: 'rg',
+		release_mbid: null,
+		release_track_mbid: null,
 		recording_mbid: null,
 		artist_name: 'A',
 		album_title: 'B',
@@ -52,6 +54,19 @@ function task(overrides: Partial<DownloadTask> = {}): DownloadTask {
 		next_retry_at: null,
 		retry_max: 6,
 		retry_ladder_minutes: [15, 30, 60, 120, 240, 480],
+		acquisition_cleanup_state: 'not_tracked',
+		quality_format: null,
+		quality_bit_depth: null,
+		quality_sample_rate: null,
+		advertised_queue_depth: null,
+		queue_position_start: null,
+		queue_position_end: null,
+		remote_queued: false,
+		preferred_quality_fallback_at: null,
+		attempt_number: 0,
+		attempt_total: 0,
+		has_next_source: false,
+		held_for_review: false,
 		...overrides
 	};
 }
@@ -78,6 +93,14 @@ describe('derivedDownloadStatus', () => {
 	it('passes non-queued statuses through unchanged', () => {
 		expect(derivedDownloadStatus(task({ status: 'downloading' }))).toBe('downloading');
 		expect(derivedDownloadStatus(task({ status: 'completed' }))).toBe('completed');
+	});
+
+	it('treats a secured management hold as review and never offers source retry', () => {
+		const held = task({ status: 'failed', held_for_review: true });
+		expect(derivedDownloadStatus(held)).toBe('awaiting_review');
+		expect(canRetry(held)).toBe(false);
+		expect(canReimport(held)).toBe(false);
+		expect(retryDisplay(held)).toBeNull();
 	});
 });
 

@@ -14,18 +14,21 @@ import type {
 	AlbumTracksInfo,
 	ArtistSort,
 	LibraryAlbumStatus,
+	LibraryAlbumDetail,
 	LibraryAlbumSummary,
 	LibraryArtistSummary,
+	LibraryArtistAppearancesResponse,
+	LibraryArtistScope,
 	LibraryScanSchedule,
-	LibraryScanStatus,
-	LibrarySettings,
 	LibraryStats,
-	LibraryUnmatchedResponse,
+	LibraryMembershipResponse,
 	NativeAlbumsResponse,
 	NativeArtistsResponse,
 	NativeTrackListItem,
 	NativeTrackPage
 } from '$lib/types';
+import { authStore } from '$lib/stores/authStore.svelte';
+import { setQueryDataWithPersister } from '../QueryClient';
 
 export interface LibraryAlbumsParams {
 	page: number;
@@ -34,9 +37,45 @@ export interface LibraryAlbumsParams {
 	format: string;
 }
 
+export const getLibraryMembershipQueryOptions = (
+	userId: string | undefined,
+	identifiers: string[]
+) => {
+	const albumIds = identifiers
+		.map((id) => id.trim().toLowerCase())
+		.filter((id, index, allIds) => Boolean(id) && allIds.indexOf(id) === index)
+		.sort();
+	return queryOptions({
+		enabled: Boolean(userId && albumIds.length),
+		staleTime: 30_000,
+		queryKey: LibraryQueryKeyFactory.membership(userId, albumIds),
+		queryFn: async ({ signal }) => {
+			let ownedIds: string[] = [];
+			let requestedIds: string[] = [];
+			for (let offset = 0; offset < albumIds.length; offset += 500) {
+				const membership = await api.global.post<LibraryMembershipResponse>(
+					API.library.membership(),
+					{ album_ids: albumIds.slice(offset, offset + 500) },
+					{ signal }
+				);
+				ownedIds = ownedIds.concat(membership.owned_ids ?? []);
+				requestedIds = requestedIds.concat(membership.requested_ids ?? []);
+			}
+			return {
+				owned_ids: ownedIds.sort(),
+				requested_ids: requestedIds.sort()
+			};
+		}
+	});
+};
+
+export const getLibraryMembershipQuery = (getAlbumIds: Getter<string[]>) =>
+	createQuery(() => getLibraryMembershipQueryOptions(authStore.user?.id, getAlbumIds()));
+
 export const getLibraryAlbumsQueryOptions = ({ page, sort, q, format }: LibraryAlbumsParams) =>
 	queryOptions({
 		staleTime: CACHE_TTL.LIBRARY_NATIVE,
+		placeholderData: keepPreviousData,
 		queryKey: LibraryQueryKeyFactory.albums(page, sort, q, format),
 		queryFn: ({ signal }) =>
 			api.global.get<NativeAlbumsResponse>(
@@ -52,20 +91,28 @@ export interface LibraryArtistsParams {
 	sortBy: ArtistSort;
 	sortOrder: 'asc' | 'desc';
 	q: string;
+	scope: LibraryArtistScope;
 }
 
 const ARTISTS_PAGE_SIZE = 48;
 
 export const getLibraryArtistsInfiniteQuery = (getParams: Getter<LibraryArtistsParams>) =>
 	createInfiniteQuery(() => {
-		const { sortBy, sortOrder, q } = getParams();
+		const { sortBy, sortOrder, q, scope } = getParams();
 		return {
 			staleTime: CACHE_TTL.LIBRARY_NATIVE,
-			queryKey: LibraryQueryKeyFactory.artists(sortBy, sortOrder, q),
+			queryKey: LibraryQueryKeyFactory.artists(scope, sortBy, sortOrder, q),
 			initialPageParam: 0,
 			queryFn: ({ pageParam = 0, signal }) =>
 				api.global.get<NativeArtistsResponse>(
-					API.library.artists(ARTISTS_PAGE_SIZE, pageParam, sortBy, sortOrder, q || undefined),
+					API.library.artists(
+						ARTISTS_PAGE_SIZE,
+						pageParam,
+						sortBy,
+						sortOrder,
+						q || undefined,
+						scope
+					),
 					{ signal }
 				),
 			getNextPageParam: (lastPage: NativeArtistsResponse, allPages: NativeArtistsResponse[]) => {
@@ -98,6 +145,114 @@ export const getLibraryStatsQueryOptions = () =>
 
 export const getLibraryStatsQuery = () => createQuery(() => getLibraryStatsQueryOptions());
 
+export const getLibraryRecentlyAddedQuery = () =>
+	createQuery(() => ({
+		staleTime: CACHE_TTL.LIBRARY_NATIVE,
+		queryKey: LibraryQueryKeyFactory.recentlyAdded(),
+		queryFn: ({ signal }) =>
+			api.global.get<NativeAlbumsResponse>(API.library.recentlyAdded(20), { signal })
+	}));
+
+export const getLibraryAlbumDetailQuery = (getAlbumId: Getter<string>) =>
+	createQuery(() => {
+		const albumId = getAlbumId();
+		return {
+			enabled: !!albumId,
+			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			queryKey: LibraryQueryKeyFactory.albumDetail(albumId),
+			queryFn: ({ signal }) =>
+				api.global.get<LibraryAlbumDetail>(API.library.albumDetail(albumId), { signal })
+		};
+	});
+
+export const cacheCanonicalLibraryAlbumDetail = (album: LibraryAlbumDetail) =>
+	setQueryDataWithPersister<LibraryAlbumDetail>(
+		LibraryQueryKeyFactory.albumDetail(album.id),
+		album
+	);
+
+export const getLibraryAlbumCopiesQuery = (
+	getAlbumId: Getter<string>,
+	getEnabled: Getter<boolean> = () => true
+) =>
+	createQuery(() => {
+		const albumId = getAlbumId();
+		return {
+			enabled: getEnabled() && !!albumId,
+			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			queryKey: LibraryQueryKeyFactory.albumCopies(albumId),
+			queryFn: ({ signal }) =>
+				api.global.get<NativeAlbumsResponse>(API.library.albumCopies(albumId), { signal })
+		};
+	});
+
+export const getLibraryAlbumTracksQuery = (getAlbumId: Getter<string>) =>
+	createQuery(() => {
+		const albumId = getAlbumId();
+		return {
+			enabled: !!albumId,
+			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			queryKey: LibraryQueryKeyFactory.albumTracks(albumId),
+			queryFn: ({ signal }) =>
+				api.global.get<NativeTrackPage>(API.library.albumTracks(albumId), { signal })
+		};
+	});
+
+export const getLibraryArtistDetailQuery = (getArtistId: Getter<string>) =>
+	createQuery(() => {
+		const artistId = getArtistId();
+		return {
+			enabled: !!artistId,
+			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			queryKey: LibraryQueryKeyFactory.artistDetail(artistId),
+			queryFn: ({ signal }) =>
+				api.global.get<LibraryArtistSummary>(API.library.artistDetail(artistId), { signal })
+		};
+	});
+
+export const cacheCanonicalLibraryArtistDetail = (artist: LibraryArtistSummary) =>
+	setQueryDataWithPersister<LibraryArtistSummary>(
+		LibraryQueryKeyFactory.artistDetail(artist.id),
+		artist
+	);
+
+export const getLibraryArtistAlbumsQuery = (getArtistId: Getter<string>) =>
+	createQuery(() => {
+		const artistId = getArtistId();
+		return {
+			enabled: !!artistId,
+			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			queryKey: LibraryQueryKeyFactory.artistAlbums(artistId),
+			queryFn: ({ signal }) =>
+				api.global.get<NativeAlbumsResponse>(API.library.artistAlbums(artistId), { signal })
+		};
+	});
+
+const ARTIST_APPEARANCES_PAGE_SIZE = 20;
+
+export const getLibraryArtistAppearancesQuery = (getArtistId: Getter<string>) =>
+	createInfiniteQuery(() => {
+		const artistId = getArtistId();
+		return {
+			enabled: !!artistId,
+			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			queryKey: LibraryQueryKeyFactory.artistAppearances(artistId),
+			initialPageParam: 0,
+			queryFn: ({ pageParam = 0, signal }) =>
+				api.global.get<LibraryArtistAppearancesResponse>(
+					API.library.artistAppearances(artistId, ARTIST_APPEARANCES_PAGE_SIZE, pageParam),
+					{ signal }
+				),
+			getNextPageParam: (
+				lastPage: LibraryArtistAppearancesResponse,
+				allPages: LibraryArtistAppearancesResponse[]
+			) => {
+				const loaded = allPages.reduce((total, page) => total + page.items.length, 0);
+				return loaded < lastPage.total ? loaded : undefined;
+			}
+		};
+	});
+
 // schedule route is admin-gated; pass `enabled` to keep it off for non-admins
 export const getLibraryScanScheduleQuery = (enabled: () => boolean = () => true) =>
 	createQuery(() => ({
@@ -117,26 +272,6 @@ export const getLibraryAlbumStatusQueryOptions = (mbid: string) =>
 
 export const getLibraryAlbumStatusQuery = (getMbid: Getter<string>) =>
 	createQuery(() => getLibraryAlbumStatusQueryOptions(getMbid()));
-
-// fast-poll only while scanning; when idle keep a lazy poll so a scheduled or
-// external scan still surfaces without hammering scan/status every 2s. An
-// in-page scan stays instant: the scan mutation invalidates and re-fetches this.
-export const getLibraryScanStatusQuery = () =>
-	createQuery(() => ({
-		staleTime: CACHE_TTL.SCAN_STATUS,
-		refetchInterval: (query: { state: { data?: LibraryScanStatus | undefined } }) =>
-			query.state.data?.status === 'scanning' ? CACHE_TTL.SCAN_STATUS : CACHE_TTL.SCAN_STATUS_IDLE,
-		queryKey: LibraryQueryKeyFactory.scanStatus(),
-		queryFn: ({ signal }) => api.global.get<LibraryScanStatus>(API.library.scanStatus(), { signal })
-	}));
-
-export const getLibraryUnmatchedQuery = () =>
-	createQuery(() => ({
-		staleTime: CACHE_TTL.LIBRARY_NATIVE,
-		queryKey: LibraryQueryKeyFactory.unmatched(),
-		queryFn: ({ signal }) =>
-			api.global.get<LibraryUnmatchedResponse>(API.library.unmatched(), { signal })
-	}));
 
 interface LibrarySearchResults {
 	albums: LibraryAlbumSummary[];
@@ -202,12 +337,3 @@ export const getAlbumTracksQuery = (getMbid: Getter<string | null>) =>
 				api.global.get<AlbumTracksInfo>(API.album.tracks(mbid ?? ''), { signal })
 		};
 	});
-
-// GET /settings/library is admin-gated; pass `enabled` to keep it off for non-admins so it never fires a 403
-export const getLibrarySettingsQuery = (enabled: () => boolean = () => true) =>
-	createQuery(() => ({
-		staleTime: CACHE_TTL.LIBRARY_NATIVE,
-		enabled: enabled(),
-		queryKey: LibraryQueryKeyFactory.settings(),
-		queryFn: ({ signal }) => api.global.get<LibrarySettings>(API.library.settings(), { signal })
-	}));

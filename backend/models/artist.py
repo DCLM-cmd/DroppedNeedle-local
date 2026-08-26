@@ -9,7 +9,9 @@ class ExternalLink(AppStruct):
 
     def __post_init__(self) -> None:
         if isinstance(self.label, list):
-            object.__setattr__(self, "label", self.label[0] if self.label else self.type)
+            object.__setattr__(
+                self, "label", self.label[0] if self.label else self.type
+            )
 
 
 class LifeSpan(AppStruct):
@@ -51,6 +53,7 @@ class ArtistInfo(AppStruct):
     aliases: list[str] = []
     external_links: list[ExternalLink] = []
     in_library: bool = False
+    appears_in_library: bool = False
     # Per-user follow state. The artist page reads it from the dedicated
     # /artists/{mbid}/follow endpoint, so these stay at their defaults in the
     # globally-cached struct.

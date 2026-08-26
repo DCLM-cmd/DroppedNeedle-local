@@ -217,3 +217,27 @@ class TestSyncSettingsRoundTrip:
         frontend = AdvancedSettingsFrontend()
         assert getattr(backend, field) == default_val
         assert getattr(frontend, field) == default_val
+
+
+class TestPreferLocalCoverArtRoundTrip:
+    def test_default_value_is_true(self) -> None:
+        settings = AdvancedSettings()
+        assert settings.prefer_local_cover_art is True
+
+    def test_frontend_default_is_true(self) -> None:
+        frontend = AdvancedSettingsFrontend()
+        assert frontend.prefer_local_cover_art is True
+
+    def test_roundtrip_preserves_true(self) -> None:
+        backend = AdvancedSettings(prefer_local_cover_art=True)
+        frontend = AdvancedSettingsFrontend.from_backend(backend)
+        assert frontend.prefer_local_cover_art is True
+        restored = frontend.to_backend()
+        assert restored.prefer_local_cover_art is True
+
+    def test_roundtrip_preserves_false(self) -> None:
+        backend = AdvancedSettings(prefer_local_cover_art=False)
+        frontend = AdvancedSettingsFrontend.from_backend(backend)
+        assert frontend.prefer_local_cover_art is False
+        restored = frontend.to_backend()
+        assert restored.prefer_local_cover_art is False

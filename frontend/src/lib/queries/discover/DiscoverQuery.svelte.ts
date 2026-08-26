@@ -7,28 +7,33 @@ import { createQuery, queryOptions } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 import { DiscoverQueryKeyFactory } from './DiscoverQueryKeyFactory';
 
-// Re-check the backend on visits so a stale cache gets revalidated promptly; the actual
-// rebuild cadence is bounded server-side (STALE_REVALIDATE_SECONDS), so this stays cheap.
+// the server bounds rebuild frequency, so visits can revalidate the persisted cache
 const DISCOVER_REVALIDATE_MS = 10_000;
 
-// Client-side stale-while-revalidate: while the backend is still building (an empty,
-// `refreshing` response), keep showing the last good recommendations instead of dropping
-// the user back to the build screen. The last good copy survives a backend redeploy via
-// the IndexedDB persister, so a restart no longer re-shows "Building...".
+// keep the persisted recommendations while the server finishes its SWR rebuild
 async function fetchDiscover(
 	userId: string | null | undefined,
 	signal?: AbortSignal
 ): Promise<DiscoverResponse> {
-	const fresh = await api.global.get<DiscoverResponse>(API.discover(), { signal });
+	const fresh = await api.global.get<DiscoverResponse>(API.discover(), {
+		signal,
+		timeoutMs: 15_000
+	});
 	if (!discoverHasContent(fresh) && fresh.refreshing) {
-		// lazy import: keep the browser-only QueryClient module out of the module graph
-		// at load time (server-side unit tests mock @tanstack/svelte-query)
+		// keep the browser-only QueryClient out of the server test module graph
 		const { queryClient } = await import('$lib/queries/QueryClient');
 		const prev = queryClient.getQueryData<DiscoverResponse>(
 			DiscoverQueryKeyFactory.discover(userId)
 		);
-		if (discoverHasContent(prev)) {
-			return { ...prev, refreshing: true } as DiscoverResponse;
+		if (prev && discoverHasContent(prev)) {
+			return {
+				...prev,
+				refreshing: true,
+				refresh_started_at: fresh.refresh_started_at,
+				section_status: Object.fromEntries(
+					Object.keys(prev.section_status ?? {}).map((section) => [section, 'updating'])
+				)
+			} as DiscoverResponse;
 		}
 	}
 	return fresh;
@@ -47,10 +52,12 @@ export const getDiscoverQuery = () =>
 		queryKey: DiscoverQueryKeyFactory.discover(authStore.user?.id),
 		queryFn: ({ signal }) => fetchDiscover(authStore.user?.id, signal),
 		refetchInterval: (query: { state: { data?: DiscoverResponse | undefined } }) =>
-			query.state.data?.refreshing ? 3000 : false
+			query.state.data?.refreshing ? 10_000 : false
 	}));
 
-export const getRadioQuery = (getParams: Getter<{ seedType: string; seedId: string }>) =>
+export const getRadioQuery = (
+	getParams: Getter<{ seedType: string; seedId: string; enabled?: boolean }>
+) =>
 	createQuery(() => ({
 		staleTime: CACHE_TTL.DISCOVER,
 		queryKey: DiscoverQueryKeyFactory.radio(
@@ -67,7 +74,7 @@ export const getRadioQuery = (getParams: Getter<{ seedType: string; seedId: stri
 				},
 				{ signal }
 			),
-		enabled: !!getParams().seedId
+		enabled: (getParams().enabled ?? true) && !!getParams().seedId
 	}));
 
 export const getPlaylistSuggestionsQuery = (

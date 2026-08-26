@@ -1,17 +1,22 @@
-import asyncio
 import logging
 from typing import Optional
+
 from api.v1.schemas.search import (
-    ArtistEnrichment,
     AlbumEnrichment,
+    AlbumEnrichmentRequest,
+    ArtistEnrichment,
+    ArtistEnrichmentRequest,
     EnrichmentBatchRequest,
     EnrichmentResponse,
     EnrichmentSource,
 )
+from core.exceptions import ClientDisconnectedError
+from infrastructure.degradation import try_get_degradation_context
+from infrastructure.http.disconnect import DisconnectCallable, check_disconnected
+from infrastructure.integration_result import IntegrationResult
 from repositories.protocols import (
-    MusicBrainzRepositoryProtocol,
-    ListenBrainzRepositoryProtocol,
     LastFmRepositoryProtocol,
+    ListenBrainzRepositoryProtocol,
 )
 from services.preferences_service import PreferencesService
 
@@ -20,15 +25,24 @@ logger = logging.getLogger(__name__)
 MAX_ENRICHMENT = 10
 
 
+def _record_optional_degradation(source: str) -> None:
+    ctx = try_get_degradation_context()
+    if ctx is not None:
+        ctx.record(
+            IntegrationResult.error(
+                source=source,
+                msg=f"{source} search popularity is temporarily unavailable",
+            )
+        )
+
+
 class SearchEnrichmentService:
     def __init__(
         self,
-        mb_repo: MusicBrainzRepositoryProtocol,
         lb_repo: ListenBrainzRepositoryProtocol,
         preferences_service: PreferencesService,
         lastfm_repo: Optional[LastFmRepositoryProtocol] = None,
     ):
-        self._mb_repo = mb_repo
         self._lb_repo = lb_repo
         self._preferences_service = preferences_service
         self._lastfm_repo = lastfm_repo
@@ -71,169 +85,161 @@ class SearchEnrichmentService:
         self,
         artist_mbids: list[str],
         album_mbids: list[str],
+        *,
+        is_disconnected: DisconnectCallable | None = None,
     ) -> EnrichmentResponse:
-        source = self._get_enrichment_source()
-
-        artist_mbids = artist_mbids[:MAX_ENRICHMENT]
-        album_mbids = album_mbids[:MAX_ENRICHMENT]
-
-        artist_tasks = [
-            self._enrich_artist(mbid, source)
-            for mbid in artist_mbids
-        ]
-
-        album_listen_counts: dict[str, int] = {}
-        if source == "listenbrainz" and album_mbids:
-            try:
-                album_listen_counts = await self._lb_repo.get_release_group_popularity_batch(
-                    album_mbids
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Failed to get album popularity batch: {e}")
-
-        artist_results = await asyncio.gather(*artist_tasks, return_exceptions=True)
-
-        artists: list[ArtistEnrichment] = []
-        for result in artist_results:
-            if isinstance(result, Exception):
-                logger.debug(f"Artist enrichment failed: {result}")
-                continue
-            if result:
-                artists.append(result)
-
-        albums: list[AlbumEnrichment] = []
-        for mbid in album_mbids:
-            albums.append(AlbumEnrichment(
-                musicbrainz_id=mbid,
-                track_count=None,
-                listen_count=album_listen_counts.get(mbid),
-            ))
-
-        return EnrichmentResponse(
-            artists=artists,
-            albums=albums,
-            source=source,
+        return await self.enrich_batch(
+            EnrichmentBatchRequest(
+                artists=[
+                    ArtistEnrichmentRequest(musicbrainz_id=mbid)
+                    for mbid in artist_mbids
+                ],
+                albums=[
+                    AlbumEnrichmentRequest(musicbrainz_id=mbid) for mbid in album_mbids
+                ],
+            ),
+            is_disconnected=is_disconnected,
         )
 
-    async def enrich_batch(self, request: EnrichmentBatchRequest) -> EnrichmentResponse:
+    async def enrich_batch(
+        self,
+        request: EnrichmentBatchRequest,
+        *,
+        is_disconnected: DisconnectCallable | None = None,
+    ) -> EnrichmentResponse:
         source = self._get_enrichment_source()
-
         artist_requests = request.artists[:MAX_ENRICHMENT]
         album_requests = request.albums[:MAX_ENRICHMENT]
 
-        artist_tasks = [
-            self._enrich_artist(req.musicbrainz_id, source, name=req.name)
-            for req in artist_requests
-        ]
+        await check_disconnected(is_disconnected)
+        if source == "none":
+            artists = [
+                ArtistEnrichment(musicbrainz_id=req.musicbrainz_id)
+                for req in artist_requests
+            ]
+        else:
+            artists = []
+            for req in artist_requests:
+                artists.append(
+                    await self._enrich_artist(
+                        req.musicbrainz_id,
+                        source,
+                        name=req.name,
+                        is_disconnected=is_disconnected,
+                    )
+                )
 
-        album_tasks: list[asyncio.Task[AlbumEnrichment]] = []
-        album_listen_counts: dict[str, int] = {}
-
+        await check_disconnected(is_disconnected)
+        albums: list[AlbumEnrichment]
         if source == "listenbrainz" and album_requests:
-            mbids = [r.musicbrainz_id for r in album_requests]
+            mbids = [req.musicbrainz_id for req in album_requests]
             try:
-                album_listen_counts = await self._lb_repo.get_release_group_popularity_batch(mbids)
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Failed to get album popularity batch: {e}")
+                album_listen_counts = (
+                    await self._lb_repo.get_release_group_popularity_batch(mbids)
+                )
+            except Exception as e:  # noqa: BLE001 - optional popularity degrades
+                logger.debug(
+                    "ListenBrainz search album enrichment failed (%s)",
+                    type(e).__name__,
+                )
+                _record_optional_degradation("listenbrainz")
+                album_listen_counts = {}
+            albums = [
+                AlbumEnrichment(
+                    musicbrainz_id=req.musicbrainz_id,
+                    listen_count=album_listen_counts.get(req.musicbrainz_id),
+                )
+                for req in album_requests
+            ]
         elif source == "lastfm" and album_requests and self._lastfm_repo:
-            album_tasks = [
-                self._enrich_album_lastfm(req.musicbrainz_id, req.artist_name, req.album_name)
+            albums = []
+            for req in album_requests:
+                albums.append(
+                    await self._enrich_album_lastfm(
+                        req.musicbrainz_id,
+                        req.artist_name,
+                        req.album_name,
+                        is_disconnected=is_disconnected,
+                    )
+                )
+        else:
+            albums = [
+                AlbumEnrichment(musicbrainz_id=req.musicbrainz_id)
                 for req in album_requests
             ]
 
-        artist_results = await asyncio.gather(*artist_tasks, return_exceptions=True)
-
-        artists: list[ArtistEnrichment] = []
-        for result in artist_results:
-            if isinstance(result, Exception):
-                logger.debug(f"Artist enrichment failed: {result}")
-                continue
-            if result:
-                artists.append(result)
-
-        albums: list[AlbumEnrichment] = []
-        if album_tasks:
-            album_results = await asyncio.gather(*album_tasks, return_exceptions=True)
-            for result in album_results:
-                if isinstance(result, Exception):
-                    logger.debug(f"Album enrichment failed: {result}")
-                    continue
-                if result:
-                    albums.append(result)
-        else:
-            for req in album_requests:
-                albums.append(AlbumEnrichment(
-                    musicbrainz_id=req.musicbrainz_id,
-                    track_count=None,
-                    listen_count=album_listen_counts.get(req.musicbrainz_id),
-                ))
-
-        return EnrichmentResponse(
-            artists=artists,
-            albums=albums,
-            source=source,
-        )
+        await check_disconnected(is_disconnected)
+        return EnrichmentResponse(artists=artists, albums=albums, source=source)
 
     async def _enrich_artist(
         self,
         mbid: str,
         source: EnrichmentSource,
         name: str = "",
-    ) -> Optional[ArtistEnrichment]:
-        release_count: Optional[int] = None
+        *,
+        is_disconnected: DisconnectCallable | None = None,
+    ) -> ArtistEnrichment:
         listen_count: Optional[int] = None
 
-        try:
-            _, total_count = await self._mb_repo.get_artist_release_groups(
-                artist_mbid=mbid,
-                offset=0,
-                limit=1,
-            )
-            release_count = total_count
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Failed to get release count for artist {mbid}: {e}")
-
+        await check_disconnected(is_disconnected)
         if source == "listenbrainz":
             try:
-                top_releases = await self._lb_repo.get_artist_top_release_groups(mbid, count=5)
+                top_releases = await self._lb_repo.get_artist_top_release_groups(
+                    mbid, count=5
+                )
                 if top_releases:
-                    listen_count = sum(r.listen_count for r in top_releases)
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Failed to get LB popularity for artist {mbid}: {e}")
+                    listen_count = sum(release.listen_count for release in top_releases)
+            except ClientDisconnectedError:
+                raise
+            except Exception as e:  # noqa: BLE001 - optional popularity degrades
+                logger.debug(
+                    "ListenBrainz search artist enrichment failed (%s)",
+                    type(e).__name__,
+                )
+                _record_optional_degradation("listenbrainz")
         elif source == "lastfm" and self._lastfm_repo and name:
             try:
                 info = await self._lastfm_repo.get_artist_info(artist=name, mbid=mbid)
                 if info and info.listeners is not None:
                     listen_count = info.listeners
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Failed to get Last.fm info for artist {name}: {e}")
+            except ClientDisconnectedError:
+                raise
+            except Exception as e:  # noqa: BLE001 - optional popularity degrades
+                logger.debug(
+                    "Last.fm search artist enrichment failed (%s)",
+                    type(e).__name__,
+                )
+                _record_optional_degradation("lastfm")
 
-        return ArtistEnrichment(
-            musicbrainz_id=mbid,
-            release_group_count=release_count,
-            listen_count=listen_count,
-        )
+        return ArtistEnrichment(musicbrainz_id=mbid, listen_count=listen_count)
 
     async def _enrich_album_lastfm(
         self,
         mbid: str,
         artist_name: str,
         album_name: str,
+        *,
+        is_disconnected: DisconnectCallable | None = None,
     ) -> AlbumEnrichment:
         listen_count: Optional[int] = None
 
         if self._lastfm_repo and artist_name and album_name:
+            await check_disconnected(is_disconnected)
             try:
                 info = await self._lastfm_repo.get_album_info(
-                    artist=artist_name, album=album_name, mbid=mbid
+                    artist=artist_name,
+                    album=album_name,
+                    mbid=mbid,
                 )
                 if info and info.playcount is not None:
                     listen_count = info.playcount
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Failed to get Last.fm info for album {album_name}: {e}")
+            except ClientDisconnectedError:
+                raise
+            except Exception as e:  # noqa: BLE001 - optional popularity degrades
+                logger.debug(
+                    "Last.fm search album enrichment failed (%s)",
+                    type(e).__name__,
+                )
+                _record_optional_degradation("lastfm")
 
-        return AlbumEnrichment(
-            musicbrainz_id=mbid,
-            track_count=None,
-            listen_count=listen_count,
-        )
+        return AlbumEnrichment(musicbrainz_id=mbid, listen_count=listen_count)

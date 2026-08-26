@@ -11,6 +11,7 @@ export type Artist = {
 	release_group_count?: number | null;
 	listen_count?: number | null;
 	score?: number;
+	local_id?: string | null;
 };
 
 export type Album = {
@@ -34,7 +35,15 @@ export type Album = {
 	track_count?: number | null;
 	listen_count?: number | null;
 	score?: number;
+	selected_release_mbid?: string | null;
+	local_id?: string | null;
+	cover_available?: boolean;
 };
+
+export interface LibraryMembershipResponse {
+	owned_ids: string[];
+	requested_ids: string[];
+}
 
 export type SuggestResult = {
 	type: 'artist' | 'album';
@@ -46,6 +55,23 @@ export type SuggestResult = {
 	requested?: boolean;
 	disambiguation?: string | null;
 	score: number;
+	local_id?: string | null;
+};
+
+export type SearchRemoteStatus = 'ok' | 'partial' | 'timeout' | 'error';
+
+export type SearchBucketResponse<T extends Artist | Album> = {
+	bucket: 'artists' | 'albums';
+	limit: number;
+	offset: number;
+	results: T[];
+	top_result?: T | null;
+	status: SearchRemoteStatus;
+};
+
+export type SearchSuggestResponse = {
+	results: SuggestResult[];
+	remote_status: SearchRemoteStatus;
 };
 
 export type EnrichmentSource = 'listenbrainz' | 'lastfm' | 'none';
@@ -121,6 +147,7 @@ export type ArtistInfoBasic = {
 	aliases: string[];
 	external_links: ExternalLink[];
 	in_library: boolean;
+	appears_in_library: boolean;
 	// per-user follow state; artist page reads it from the dedicated /follow query
 	followed?: boolean;
 	auto_download?: boolean;
@@ -164,6 +191,7 @@ export type Track = {
 	title: string;
 	length?: number | null;
 	recording_id?: string | null;
+	release_track_id?: string | null;
 };
 
 export type AlbumBasicInfo = {
@@ -188,6 +216,7 @@ export type AlbumTracksInfo = {
 	label?: string | null;
 	barcode?: string | null;
 	country?: string | null;
+	selected_release_mbid?: string | null;
 };
 
 export type JellyfinConnectionSettings = {
@@ -209,6 +238,7 @@ export type OIDCConnectionSettings = {
 
 export type HomeArtist = {
 	mbid: string | null;
+	local_id?: string | null;
 	name: string;
 	image_url: string | null;
 	listen_count: number | null;
@@ -217,6 +247,7 @@ export type HomeArtist = {
 
 export type HomeAlbum = {
 	mbid: string | null;
+	local_id?: string | null;
 	name: string;
 	artist_name: string | null;
 	artist_mbid: string | null;
@@ -295,8 +326,8 @@ export type HomeResponse = {
 	weekly_exploration: WeeklyExplorationSection | null;
 	service_prompts: ServicePrompt[];
 	integration_status: Record<string, boolean>;
-	genre_artists: Record<string, string | null>;
-	genre_artist_images: Record<string, string | null>;
+	genre_artwork: Record<string, GenreArtwork>;
+	genre_artwork_schema_version: 'v2';
 	discover_preview: DiscoverPreview | null;
 };
 
@@ -370,8 +401,11 @@ export type DiscoverResponse = {
 	anniversaries: HomeSection | null;
 	new_from_followed: HomeSection | null;
 	unexplored_genres: HomeSection | null;
-	genre_artists: Record<string, string | null>;
-	genre_artist_images: Record<string, string | null>;
+	generated_at: number | null;
+	refresh_started_at: number | null;
+	section_status: Record<string, string>;
+	genre_artwork: Record<string, GenreArtwork>;
+	genre_artwork_schema_version: 'v2';
 	integration_status: Record<string, boolean>;
 	service_prompts: ServicePrompt[];
 	refreshing: boolean;
@@ -406,10 +440,24 @@ export type GenrePopularSection = {
 
 export type GenreDetailResponse = {
 	genre: string;
+	genre_artwork: GenreArtwork;
 	library: GenreLibrarySection | null;
 	popular: GenrePopularSection | null;
 	artists: HomeArtist[];
 	total_count: number | null;
+};
+
+export type GenreArtworkAlbum = {
+	album_id: string;
+	album_title: string;
+	album_artist_name: string | null;
+	cover_version: number;
+};
+
+export type GenreArtwork = {
+	kind: 'collage' | 'gradient';
+	albums: GenreArtworkAlbum[];
+	version: string;
 };
 
 export type SimilarArtist = {
@@ -821,6 +869,27 @@ export type NavidromeLibraryStats = {
 	total_artists: number;
 };
 
+export type NavidromeMusicFolder = {
+	id: string;
+	name: string;
+};
+
+export type NavidromeFolderPreferenceMode = 'all' | 'selected';
+
+export type NavidromeFolderPreference = {
+	mode: NavidromeFolderPreferenceMode;
+	selected_folder_ids: string[];
+	available_folders: NavidromeMusicFolder[];
+	stale_folder_ids: string[];
+	source_available: boolean;
+	scope_revision: string;
+};
+
+export type NavidromeFolderPreferenceUpdate = {
+	mode: NavidromeFolderPreferenceMode;
+	selected_folder_ids: string[];
+};
+
 export type NavidromePaginatedResponse = {
 	items: NavidromeAlbumSummary[];
 	total: number;
@@ -953,7 +1022,6 @@ export type PlexHubResponse = {
 	recently_played: PlexAlbumSummary[];
 	recently_added: PlexAlbumSummary[];
 	all_albums_preview: PlexAlbumSummary[];
-	playlists: SourcePlaylistSummary[];
 	genres: string[];
 };
 
@@ -982,7 +1050,6 @@ export type NavidromeHubResponse = {
 	favorite_artists: NavidromeArtistSummary[];
 	favorite_tracks: NavidromeTrackInfo[];
 	all_albums_preview: NavidromeAlbumSummary[];
-	playlists: SourcePlaylistSummary[];
 	genres: string[];
 };
 
@@ -994,7 +1061,6 @@ export type JellyfinHubResponse = {
 	most_played_artists: JellyfinArtistSummary[];
 	most_played_albums: JellyfinAlbumSummary[];
 	all_albums_preview: JellyfinAlbumSummary[];
-	playlists: SourcePlaylistSummary[];
 	genres: string[];
 };
 
@@ -1109,7 +1175,6 @@ export type FreeMusicSettings = {
 // mirrors backend api/v1/schemas/settings.py (GetItSettings)
 export type GetItSettings = {
 	store_region: string; // ISO 3166-1 alpha-2, feeds the iTunes storefront
-	support_droppedneedle: boolean; // D19 affiliate toggle
 };
 
 // mirrors backend api/v1/schemas/get_it.py
@@ -1125,13 +1190,11 @@ export type PurchaseOptionsResponse = {
 	physical: PurchaseLink[];
 	free: PurchaseLink[];
 	bandcamp_search_url: string;
-	disclosure: boolean;
 };
 
 export type ArtistPurchaseOptionsResponse = {
 	links: PurchaseLink[];
 	bandcamp_search_url: string;
-	disclosure: boolean;
 };
 
 // mirrors backend api/v1/schemas/settings.py (EventsSettings)
@@ -1170,6 +1233,7 @@ export type SpotifyImportResponse = {
 export type ScrobbleSettings = {
 	scrobble_to_lastfm: boolean;
 	scrobble_to_listenbrainz: boolean;
+	navidrome_handles_external_scrobbles: boolean;
 };
 
 export type NowPlayingSubmission = {
@@ -1178,6 +1242,7 @@ export type NowPlayingSubmission = {
 	album_name: string;
 	duration_ms: number;
 	mbid?: string;
+	source?: string;
 };
 
 export type ScrobbleSubmission = {
@@ -1187,6 +1252,7 @@ export type ScrobbleSubmission = {
 	timestamp: number;
 	duration_ms: number;
 	mbid?: string;
+	source?: string;
 };
 
 export type ServiceResult = {
@@ -1241,6 +1307,14 @@ export type SourcePlaylistSummary = {
 	is_public?: boolean;
 	updated_at?: string;
 	created_at?: string;
+};
+
+export type SourcePlaylistSource = 'jellyfin' | 'navidrome' | 'plex';
+
+export type SourcePlaylistCollection = {
+	account_mode: 'linked' | 'shared';
+	account_label: string;
+	playlists: SourcePlaylistSummary[];
 };
 
 export type SourcePlaylistTrack = {
@@ -1415,6 +1489,12 @@ export type NavidromeLyricsResponse = {
 	lines: LyricLine[];
 };
 
+export type LocalLyricsResponse = {
+	text: string;
+	is_synced: boolean;
+	lines: LyricLine[];
+};
+
 export type JellyfinLyricsLine = {
 	text: string;
 	start_seconds: number | null;
@@ -1441,18 +1521,45 @@ export type AlbumSort = 'recent' | 'title' | 'artist';
 
 export type TrackSort = 'recent' | 'title' | 'artist' | 'album';
 
-export type NativeTrackListItem = {
-	track_file_id: string;
+export type AlbumIdentityState =
+	| 'local_only'
+	| 'release_group_linked'
+	| 'release_linked'
+	| 'custom_edition';
+
+export type ArtistIdentityState = 'local_only' | 'musicbrainz_linked';
+
+export interface TargetNativeTrack {
+	id: string;
 	title: string;
-	album_name: string;
+	album_id: string;
+	album_title: string;
+	artist_id: string;
 	artist_name: string;
-	album_mbid?: string | null;
-	cover_url?: string | null;
-	format: string;
-	track_number: number;
+	album_artist_id: string;
+	album_artist_name: string;
+	musicbrainz_recording_id: string | null;
+	musicbrainz_release_group_id: string | null;
+	musicbrainz_artist_id: string | null;
+	musicbrainz_album_artist_id: string | null;
 	disc_number: number;
-	duration_seconds?: number | null;
-};
+	track_number: number;
+	year: number | null;
+	genre: string | null;
+	duration_seconds: number;
+	format: string;
+	bit_rate: number | null;
+	sample_rate: number | null;
+	bit_depth: number | null;
+	channels: number | null;
+	file_size_bytes: number;
+	date_added: number | null;
+	cover_available: boolean;
+	current_tier: string | null;
+	below_cutoff: boolean;
+}
+
+export type NativeTrackListItem = TargetNativeTrack;
 
 export type NativeTrackPage = {
 	items: NativeTrackListItem[];
@@ -1462,16 +1569,327 @@ export type NativeTrackPage = {
 };
 
 export interface LibraryAlbumSummary {
-	release_group_mbid: string;
-	album_title: string;
-	album_artist_name: string | null;
+	id: string;
+	title: string;
+	artist_name: string;
+	artist_id: string;
+	musicbrainz_release_group_id: string | null;
+	musicbrainz_release_id: string | null;
+	musicbrainz_artist_id: string | null;
+	album_identity_state: AlbumIdentityState;
 	track_count: number;
+	total_duration_seconds: number;
 	total_size_bytes: number;
-	quality_format: string | null;
+	format: string | null;
 	year: number | null;
 	is_compilation: boolean;
-	cover_url: string | null;
-	last_imported_at: number | null;
+	cover_available: boolean;
+	date_added: number | null;
+	sort_name: string | null;
+	original_release_date: string | null;
+	contribution_id: string | null;
+	contribution_state: ContributionState | null;
+}
+
+export interface LibraryAlbumDetail extends LibraryAlbumSummary {
+	row_revision: number;
+	input_revision: string;
+	identification_status:
+		| 'identified'
+		| 'needs_review'
+		| 'keep_tagged'
+		| 'local_metadata'
+		| 'manual_identity_needs_review';
+	review_id: string | null;
+	review_revision: number | null;
+	management_identity_readiness:
+		| 'not_applicable'
+		| 'exact_release_required'
+		| 'track_mapping_required'
+		| 'custom_manifest_stale'
+		| 'ready';
+	mapped_track_count: number;
+	management_identity_kind: 'exact_release' | 'custom_edition' | null;
+	custom_manifest_id: string | null;
+	custom_manifest_version: number | null;
+	custom_manifest_track_count: number;
+	custom_manifest_recognized_track_count: number;
+	custom_manifest_stale: boolean;
+	management_excluded: boolean;
+	management_exclusion_revision: number | null;
+	management_excluded_at: number | null;
+	active_edition_conversion: {
+		job_id: string;
+		release_mbid: string;
+		state: 'preflight' | 'acquiring' | 'ready' | 'needs_recheck';
+		kept_count: number;
+		acquire_count: number;
+		staged_count: number;
+		failed_count: number;
+		recycle_count: number;
+		row_revision: number;
+		final_preview_job_id: string | null;
+	} | null;
+}
+
+export type ContributionState =
+	| 'draft'
+	| 'ready'
+	| 'seeded'
+	| 'verifying'
+	| 'linked'
+	| 'needs_review'
+	| 'stale'
+	| 'cancelled';
+
+export type ContributionNextAction =
+	| 'edit_draft'
+	| 'refresh_discogs'
+	| 'run_duplicate_check'
+	| 'attach_existing'
+	| 'seed_musicbrainz'
+	| 'retry_verification'
+	| 'rebuild'
+	| 'cancel';
+
+export type ContributionFieldSource = 'local' | 'discogs' | 'entered_here';
+
+export interface ReleaseTextField {
+	value: string | null;
+	source: ContributionFieldSource;
+}
+
+export interface ReleaseTrackSnapshot {
+	local_track_id: string;
+	disc_number: number;
+	track_number: number;
+	title: string;
+	artist_name: string | null;
+	duration_seconds: number | null;
+	duration_reliable: boolean;
+}
+
+export interface ReleaseMediumSnapshot {
+	position: number;
+	title: string | null;
+	tracks: ReleaseTrackSnapshot[];
+}
+
+export interface LocalReleaseSnapshot {
+	schema_version: number;
+	local_album_id: string;
+	local_artist_id: string;
+	album_row_revision: number;
+	input_revision: string;
+	title: string;
+	album_artist_name: string;
+	artist_kind: string;
+	musicbrainz_artist_id: string | null;
+	musicbrainz_release_group_id: string | null;
+	musicbrainz_release_id: string | null;
+	release_date: string | null;
+	year: number | null;
+	is_compilation: boolean;
+	captured_at: number;
+	media: ReleaseMediumSnapshot[];
+}
+
+export interface ReleaseTrackDraft {
+	local_track_id: string;
+	disc_number: number;
+	track_number: number;
+	title: ReleaseTextField;
+	artist_name: ReleaseTextField;
+	duration_seconds: number | null;
+}
+
+export interface ReleaseMediumDraft {
+	position: number;
+	title: ReleaseTextField;
+	format: ReleaseTextField;
+	tracks: ReleaseTrackDraft[];
+}
+
+export interface ReleaseDraft {
+	schema_version: number;
+	title: ReleaseTextField;
+	artist_credit: ReleaseTextField;
+	release_date: ReleaseTextField;
+	country: ReleaseTextField;
+	label: ReleaseTextField;
+	catalogue_number: ReleaseTextField;
+	barcode: ReleaseTextField;
+	packaging: ReleaseTextField;
+	media: ReleaseMediumDraft[];
+}
+
+export interface ContributionSourceReference {
+	provider: string;
+	entity_type: string;
+	external_id: string;
+	canonical_url: string;
+	fetched_at: number | null;
+}
+
+export interface ContributionTrackAlignment {
+	local_track_id: string;
+	provider_position: string | null;
+	classification: 'exact' | 'partial' | 'conflicting' | 'unmatched';
+}
+
+export interface ContributionSourceSelection {
+	schema_version: number;
+	sources: ContributionSourceReference[];
+	alignments: ContributionTrackAlignment[];
+}
+
+export interface DiscogsReleaseCandidate {
+	release_id: string;
+	title: string;
+	artist_name: string;
+	canonical_url: string;
+	year: number | null;
+	country: string | null;
+	label: string | null;
+	catalogue_number: string | null;
+	format_summary: string | null;
+	track_count: number | null;
+	master_id: string | null;
+	fetched_at: number;
+}
+
+export interface DiscogsArtistCredit {
+	name: string;
+	credited_name: string | null;
+	join_phrase: string;
+	artist_id: string | null;
+	canonical_url: string | null;
+}
+
+export interface DiscogsLabel {
+	name: string;
+	catalogue_number: string | null;
+	label_id: string | null;
+	canonical_url: string | null;
+}
+
+export interface DiscogsIdentifier {
+	type: string;
+	value: string;
+	description: string | null;
+}
+
+export interface DiscogsFormat {
+	name: string;
+	quantity: number | null;
+	descriptions: string[];
+	text: string | null;
+}
+
+export interface DiscogsTrack {
+	source_position: string | null;
+	number: number | null;
+	title: string;
+	duration_seconds: number | null;
+	heading: boolean;
+	artists: DiscogsArtistCredit[];
+}
+
+export interface DiscogsMedium {
+	position: number;
+	title: string | null;
+	format: string | null;
+	tracks: DiscogsTrack[];
+}
+
+export interface DiscogsRelease {
+	release_id: string;
+	master_id: string | null;
+	canonical_release_url: string;
+	canonical_master_url: string | null;
+	title: string;
+	artist_name: string;
+	artists: DiscogsArtistCredit[];
+	released_date: string | null;
+	year: number | null;
+	country: string | null;
+	labels: DiscogsLabel[];
+	identifiers: DiscogsIdentifier[];
+	barcode: string | null;
+	formats: DiscogsFormat[];
+	media: DiscogsMedium[];
+	source_fetched_at: number;
+}
+
+export interface DiscogsSourceView {
+	release: DiscogsRelease | null;
+	expired: boolean;
+	expires_at: number | null;
+}
+
+export interface ContributionDuplicateCandidate {
+	release_mbid: string | null;
+	release_group_mbid: string | null;
+	title: string;
+	artist_name: string;
+	evidence_kind: 'exact_discogs_url' | 'release_group' | 'barcode' | 'similar';
+	exact: boolean;
+	differences: string[];
+}
+
+export interface ContributionDuplicateResult {
+	schema_version: number;
+	checked_at: number;
+	input_revision: string;
+	candidates: ContributionDuplicateCandidate[];
+	different_edition_confirmed: boolean;
+}
+
+export interface MusicBrainzSeedField {
+	name: string;
+	value: string;
+}
+
+export interface MusicBrainzSeed {
+	action_url: string;
+	method: 'POST';
+	fields: MusicBrainzSeedField[];
+	contribution_revision: number;
+	expires_at: number;
+}
+
+export interface ContributionValidationIssue {
+	code: string;
+	field: string;
+	message: string;
+}
+
+export interface LibraryContribution {
+	id: string;
+	local_album_id: string;
+	created_by_user_id: string | null;
+	updated_by_user_id: string | null;
+	state: ContributionState;
+	album_row_revision: number;
+	input_revision: string;
+	local_snapshot: LocalReleaseSnapshot;
+	draft: ReleaseDraft;
+	source_selection: ContributionSourceSelection;
+	provider_snapshot_expires_at: number | null;
+	discogs_source: DiscogsSourceView | null;
+	duplicate_result: ContributionDuplicateResult | null;
+	duplicate_checked_at: number | null;
+	result_release_mbid: string | null;
+	result_source: 'callback' | 'manual' | null;
+	result_received_at: number | null;
+	seeded_at: number | null;
+	terminal_at: number | null;
+	created_at: number;
+	updated_at: number;
+	row_revision: number;
+	input_is_current: boolean;
+	validation: ContributionValidationIssue[];
+	next_actions: ContributionNextAction[];
 }
 
 export interface NativeAlbumsResponse {
@@ -1479,19 +1897,42 @@ export interface NativeAlbumsResponse {
 	total: number;
 }
 
-export type ArtistSort = 'name' | 'album_count' | 'date_added';
+export type ArtistSort = 'name' | 'album_count' | 'appearance_count' | 'date_added';
+export type LibraryArtistScope = 'album' | 'contributors';
+export type LibraryArtistRelationship = 'album_artist' | 'contributor' | 'both';
 
 export interface LibraryArtistSummary {
-	artist_name: string;
-	artist_mbid: string | null;
+	id: string;
+	name: string;
+	musicbrainz_artist_id: string | null;
+	artist_identity_state: ArtistIdentityState;
 	album_count: number;
 	track_count: number;
+	appearance_release_count: number;
+	appearance_track_count: number;
+	library_relationship: LibraryArtistRelationship;
 	date_added: number | null;
+	row_revision: number;
 }
 
 export interface NativeArtistsResponse {
 	items: LibraryArtistSummary[];
 	total: number;
+	album_artist_total: number;
+	contributor_total: number;
+}
+
+export interface LibraryArtistAppearance {
+	album: LibraryAlbumSummary;
+	tracks: NativeTrackListItem[];
+}
+
+export interface LibraryArtistAppearancesResponse {
+	items: LibraryArtistAppearance[];
+	total: number;
+	total_tracks: number;
+	offset: number;
+	limit: number;
 }
 
 export interface LibraryTrack {
@@ -1512,19 +1953,34 @@ export interface LibraryTrack {
 	below_cutoff: boolean;
 }
 
-export type LibraryFileMeta = LibraryTrack;
+export type LibraryFileMeta = TargetNativeTrack;
 
 export interface LibraryAlbumStatus {
 	in_library: boolean;
+	album_id: string;
 	track_count: number;
-	tracks: LibraryTrack[];
+	tracks: TargetNativeTrack[];
 	// Coverage vs the release's MB tracklist (P5): expected_tracks === 0 means the
 	// tracklist was unavailable and the UI falls back to the presence-only reading.
-	expected_tracks: number;
-	covered_tracks: number;
-	matched_file_ids: string[];
+	expected_tracks?: number;
+	covered_tracks?: number;
+	matched_file_ids?: string[];
 	// held files that match NONE of the album's expected tracks ("doesn't match")
-	orphans: LibraryTrack[];
+	orphans?: LibraryTrack[];
+}
+
+export interface AlbumRemoveResponse {
+	success: boolean;
+	album_mbid: string;
+	removed_mbids: string[];
+	artist_removed: boolean;
+	artist_name: string | null;
+}
+
+export interface TargetCatalogRemovalResponse {
+	success: boolean;
+	id: string;
+	removed_track_ids: string[];
 }
 
 export interface AlbumEditionItem {
@@ -1544,6 +2000,7 @@ export interface AlbumEditionsResponse {
 	items: AlbumEditionItem[];
 	pinned_release_mbid: string | null;
 	owned_release_mbid: string | null;
+	selected_release_mbid: string | null;
 }
 
 export interface EditionAcquireResponse {
@@ -1581,67 +2038,9 @@ export interface LibraryStats {
 	total_tracks: number;
 	total_size_bytes: number;
 	format_breakdown: Record<string, number>;
-	unmatched_count: number;
+	review_count: number;
+	local_only_count: number;
 	last_scan_at: number | null;
-	recently_added: LibraryAlbumSummary[];
-}
-
-export interface ManualReviewEntry {
-	id: number;
-	file_path: string;
-	extracted_title: string | null;
-	extracted_artist: string | null;
-	extracted_album: string | null;
-	extracted_year: number | null;
-	track_number: number | null;
-	disc_number: number | null;
-	file_format: string | null;
-	duration: number | null;
-	file_size: number | null;
-	fingerprint: string | null;
-	fingerprint_score: number | null;
-	candidate_mbids: string[];
-	source: string;
-	created_at: number | null;
-}
-
-export interface LibraryUnmatchedResponse {
-	items: ManualReviewEntry[];
-	total: number;
-}
-
-export interface UnmatchedBatchItem {
-	review_id: number;
-	recording_mbid: string | null;
-}
-
-export interface UnmatchedBatchResolveRequest {
-	release_group_mbid: string;
-	items: UnmatchedBatchItem[];
-}
-
-export interface UnmatchedBatchResolveResponse {
-	resolved: number;
-	failed: { review_id: number; error: string }[];
-}
-
-export type ScanStatus = 'idle' | 'scanning' | 'complete' | 'cancelled' | 'failed';
-
-export interface LibraryScanStatus {
-	status: ScanStatus;
-	total_files: number;
-	processed_files: number;
-	matched_files: number;
-	failed_files: number;
-	started_at: number | null;
-	updated_at: number | null;
-}
-
-export interface LibrarySettings {
-	library_paths: string[];
-	staging_path: string;
-	naming_template: string;
-	acoustid_api_key: string;
 }
 
 export type ScanFrequency =
@@ -1666,24 +2065,6 @@ export interface LibraryScanSchedule {
 	/** Server timezone label for the daily-time caption; present on reads only. */
 	server_timezone?: string;
 }
-
-export interface TrackTagUpdate {
-	title: string;
-	artist: string;
-	album: string;
-	track_number: number;
-	album_artist: string | null;
-	disc_number: number;
-	year: number | null;
-	genre: string | null;
-	musicbrainz_release_group_id: string | null;
-	musicbrainz_release_id: string | null;
-	musicbrainz_recording_id: string | null;
-	musicbrainz_artist_id: string | null;
-	musicbrainz_album_artist_id: string | null;
-}
-
-export type UnmatchedResolution = 'accept' | 'reject' | 'manual_id';
 
 export interface LibraryActionResponse {
 	status: string;
@@ -1711,13 +2092,14 @@ export interface DownloadClientConfig {
 	preflight_score_manual_min: number;
 	download_stall_timeout_minutes: number;
 	download_queued_timeout_minutes: number;
-	download_queued_start_timeout_seconds: number;
+	preferred_quality_wait_minutes: number;
 	max_failover_attempts: number;
 	max_concurrent_downloads: number;
 }
 
 export interface DownloadsMountStatus {
 	ok: boolean;
+	move_supported: boolean;
 	reason: string;
 	path: string;
 }
@@ -1734,6 +2116,19 @@ export interface DownloadClientStatus {
 	mount: DownloadsMountStatus;
 	mount_advisory?: string | null;
 	slskd_downloads_dir?: string | null;
+}
+
+export interface HomeIntegrationStatus {
+	listenbrainz: boolean;
+	jellyfin: boolean;
+	download_client: boolean;
+	youtube: boolean;
+	lastfm: boolean;
+	navidrome: boolean;
+	youtube_api: boolean;
+	plex: boolean;
+	library: boolean;
+	localfiles: boolean;
 }
 
 export interface TestConnectionResult {
@@ -1798,13 +2193,12 @@ export interface DownloadPolicySettings {
 	quality_min: string;
 	quality_max: string;
 	flac_mp3_only: boolean;
-	lossless_max_kbps: number;
 	verify_downloads: boolean;
 	preflight_score_auto_accept: number;
 	preflight_score_manual_min: number;
 	download_stall_timeout_minutes: number;
 	download_queued_timeout_minutes: number;
-	download_queued_start_timeout_seconds: number;
+	preferred_quality_wait_minutes: number;
 	max_failover_attempts: number;
 	max_concurrent_downloads: number;
 	auto_retry_enabled: boolean;
@@ -1843,6 +2237,7 @@ export interface DownloadSearchResultFile {
 	duration?: number | null;
 	has_free_slot: boolean;
 	upload_speed: number;
+	queue_length?: number | null;
 }
 
 export type CandidateTier = 'auto' | 'manual' | 'rejected';
@@ -1872,6 +2267,7 @@ export interface ScoredCandidate {
 	file_confidence: number;
 	final_score: number;
 	tier: CandidateTier;
+	candidate_index?: number | null;
 }
 
 export interface SearchAlbumResponse {
@@ -1918,6 +2314,8 @@ export interface DownloadTask {
 	// Optional for backward-compat with cached/older responses.
 	source?: string;
 	release_group_mbid: string;
+	release_mbid: string | null;
+	release_track_mbid: string | null;
 	recording_mbid: string | null;
 	// Backfilled from the release group at request time; older tasks predating the
 	// backfill (or one MusicBrainz couldn't resolve) have no artist link.
@@ -1948,6 +2346,25 @@ export interface DownloadTask {
 	// The full auto-retry backoff schedule in minutes for this task's max attempts, e.g.
 	// [15, 30, 60, 120, 240, 480]. Empty when auto-retry is off. Drives the Wanted ladder.
 	retry_ladder_minutes: number[];
+	acquisition_cleanup_state:
+		| 'not_tracked'
+		| 'in_use'
+		| 'pending'
+		| 'complete'
+		| 'preserved'
+		| 'needs_attention';
+	quality_format: string | null;
+	quality_bit_depth: number | null;
+	quality_sample_rate: number | null;
+	advertised_queue_depth: number | null;
+	queue_position_start: number | null;
+	queue_position_end: number | null;
+	remote_queued: boolean;
+	preferred_quality_fallback_at: number | null;
+	attempt_number: number;
+	attempt_total: number;
+	has_next_source: boolean;
+	held_for_review: boolean;
 }
 
 export interface DownloadListResponse {
@@ -1956,12 +2373,23 @@ export interface DownloadListResponse {
 	page_size: number;
 }
 
+// mirrors backend DownloadActivitySummaryResponse (api/v1/schemas/download.py)
+export interface DownloadActivitySummary {
+	revision: number;
+	active_count: number;
+	held_count: number;
+	failed_count: number;
+	landed_release_group_mbids: string[];
+}
+
 // A downloaded track that matched by duration but failed the AcoustID recording-identity
 // check (usually wrong MusicBrainz metadata). Held for a human "import anyway" / "discard"
 // decision instead of being dropped. `evidence_*` is what AcoustID heard.
 export interface HeldImport {
 	id: number;
 	release_group_mbid: string | null;
+	release_mbid: string | null;
+	release_track_mbid: string | null;
 	recording_mbid: string | null;
 	track_number: number | null;
 	disc_number: number | null;
@@ -1973,20 +2401,39 @@ export interface HeldImport {
 	file_format: string | null;
 	duration_seconds: number | null;
 	reason: string;
+	reason_detail: string | null;
 	source: string;
 	source_task_id: string | null;
 	created_at: number;
 	evidence_title: string | null;
 	evidence_artist: string | null;
 	evidence_score: number | null;
+	management_retry_count: number;
+	management_next_retry_at: number | null;
 }
 
 export interface HeldListResponse {
 	items: HeldImport[];
 }
 
+export interface DownloadSourceUpdate {
+	candidate_index: number | null;
+	source: string | null;
+	quality_format: string | null;
+	quality_bit_depth: number | null;
+	quality_sample_rate: number | null;
+	advertised_queue_depth: number | null;
+	queue_position_start: number | null;
+	queue_position_end: number | null;
+	remote_queued: boolean;
+	preferred_quality_fallback_at: number | null;
+	attempt_number: number;
+	attempt_total: number;
+	has_next_source: boolean;
+}
+
 // SSE payload on the `download:{task_id}` channel `progress` event
-export interface DownloadProgress {
+export interface DownloadProgress extends DownloadSourceUpdate {
 	bytes_downloaded: number;
 	bytes_total: number;
 	files_completed: number;
@@ -2011,6 +2458,12 @@ export interface TrackRequestResponse {
 export interface CancelDownloadResponse {
 	success: boolean;
 	status?: string;
+}
+
+export interface NextSourceResponse {
+	success: boolean;
+	status: string;
+	candidate_index: number;
 }
 
 export interface RetryDownloadResponse {
@@ -2104,7 +2557,7 @@ export interface SectionPrefsResponse {
 }
 
 export interface SectionPrefsUpdate {
-	page: 'home' | 'discover';
+	page: 'home' | 'discover' | 'sidebar';
 	sections: { key: string; enabled: boolean }[];
 }
 
@@ -2132,6 +2585,7 @@ export interface RadioSeedItem {
 	artist_mbid: string;
 	artist_name?: string;
 	album_mbid?: string | null;
+	album_name?: string;
 }
 
 export interface RadioPlanRequest {

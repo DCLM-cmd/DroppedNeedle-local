@@ -1,6 +1,25 @@
 #!/bin/sh
 set -e
-umask 027
+
+# A bind mount over /app shadows the image's application code with the user's
+# data directory; fail fast here instead of emitting confusing writability or
+# runtime errors against the shadowing mount later. /app is always present in
+# the image, so a missing /app means we are outside the container (e.g. tests
+# or a hand-run shell) and the check is skipped.
+if [ -d /app ] && { [ ! -f /app/main.py ] || [ ! -f /app/.droppedneedle-source-revision ] || [ ! -f /app/maintenance/automatic_upgrade.py ]; }; then
+    echo "[init] FATAL: /app does not contain the DroppedNeedle application code."
+    echo "[init]   A bind mount over /app hides the application with your data."
+    echo "[init]   Mount data subdirectories only: /app/config, /app/cache, /app/plugins, /app/imports."
+    echo "[init]   Remove the /app bind mount and restart."
+    exit 1
+fi
+
+REQUESTED_UMASK=${UMASK:-027}
+case "$REQUESTED_UMASK" in
+    [0-7][0-7][0-7]|0[0-7][0-7][0-7]) ;;
+    *) echo "[init] FATAL: UMASK='$REQUESTED_UMASK' must be three or four octal digits."; exit 1;;
+esac
+umask "$REQUESTED_UMASK"
 
 PUID=${PUID:-1000}
 PGID=${PGID:-1000}

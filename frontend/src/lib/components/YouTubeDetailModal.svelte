@@ -28,7 +28,7 @@
 		normalizeDiscNumber,
 		type TrackMeta
 	} from '$lib/player/queueHelpers';
-	import { openGlobalPlaylistModal } from '$lib/components/AddToPlaylistModal.svelte';
+	import { openGlobalPlaylistModal } from '$lib/stores/playlistModal.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
@@ -315,6 +315,7 @@
 								customUrl={link.cover_url}
 								alt={link.album_name}
 								size="xl"
+								requestSize={250}
 								rounded="none"
 								className="w-52 h-52"
 							/>
@@ -326,6 +327,7 @@
 								customUrl={link.cover_url}
 								alt={link.album_name}
 								size="xl"
+								requestSize={250}
 								rounded="none"
 								className="w-52 h-52"
 							/>

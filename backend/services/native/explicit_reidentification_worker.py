@@ -1,0 +1,440 @@
+"""Bounded explicit re-identification evaluation and candidate selection."""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+
+from core.exceptions import ExternalServiceError
+from infrastructure.degradation import (
+    clear_degradation_context,
+    init_degradation_context,
+)
+from infrastructure.persistence.native_library_store import NativeLibraryStore
+from models.identification import (
+    IdentificationAttempt,
+    IdentificationEvidenceRecord,
+)
+from services.native.album_candidate_service import AlbumCandidateService
+from services.native.album_evidence_engine import MATCHER_VERSION, AlbumEvidenceEngine
+from services.native.album_identification_service import (
+    MAX_NEW_FINGERPRINTS_PER_ATTEMPT,
+    _candidate_key,
+    _embedded_decision,
+    _embedded_release_decision,
+    _enforce_existing_album_identity,
+    _enforce_raw_track_identities,
+    _stored_track_identity_decision,
+    _to_grouping_track,
+)
+from services.native.background_workload_gate import BackgroundWorkloadGate
+from services.native.conditional_fingerprint_service import (
+    FINGERPRINTER_VERSION,
+    ConditionalFingerprintService,
+)
+from services.native.identification_revisions import (
+    album_identity_revision,
+    album_input_revisions,
+)
+from services.native.library_operation_service import LibraryOperationService
+
+logger = logging.getLogger(__name__)
+
+
+class ExplicitReidentificationWorker:
+    def __init__(
+        self,
+        store: NativeLibraryStore,
+        candidates: AlbumCandidateService,
+        evidence: AlbumEvidenceEngine,
+        fingerprints: ConditionalFingerprintService | None = None,
+        workload_gate: BackgroundWorkloadGate | None = None,
+        on_identified: Callable[[str, str], Awaitable[object]] | None = None,
+    ) -> None:
+        self._store = store
+        self._candidates = candidates
+        self._evidence = evidence
+        self._fingerprints = fingerprints
+        self._workload_gate = workload_gate
+        self._on_identified = on_identified
+
+    async def run_claimed(
+        self,
+        job: dict,
+        worker_id: str,
+        *,
+        now: float | None = None,
+    ) -> dict:
+        timestamp = time.time() if now is None else now
+        work = await self._store.claim_operation_work(
+            str(job["id"]), worker_id, now=timestamp
+        )
+        if work is None:
+            return await self._store.finish_operation_job(
+                str(job["id"]),
+                worker_id,
+                state="failed",
+                terminal_code="MISSING_WORK",
+                now=timestamp,
+            )
+        context = await self._store.get_album_identification_context(
+            str(work["local_album_id"])
+        )
+        if context is None:
+            return await self._store.finish_operation_job(
+                str(job["id"]),
+                worker_id,
+                state="failed",
+                terminal_code="SUBJECT_NOT_AVAILABLE",
+                now=timestamp,
+            )
+        raw_tracks = [
+            row for row in context["tracks"] if row["availability"] == "indexed"
+        ]
+        if not raw_tracks:
+            return await self._store.finish_operation_job(
+                str(job["id"]),
+                worker_id,
+                state="failed",
+                terminal_code="SUBJECT_NOT_AVAILABLE",
+                now=timestamp,
+            )
+        revisions = album_input_revisions(raw_tracks)
+        if ":".join(revisions) != str(work["expected_input_revision"]):
+            return await self._store.finish_operation_job(
+                str(job["id"]),
+                worker_id,
+                state="failed",
+                terminal_code="STALE_INPUT",
+                now=timestamp,
+            )
+        operation = await self._store.get_operation_snapshot(str(job["id"]))
+        snapshot = operation["snapshot"] if operation is not None else None
+        if snapshot is None:
+            return await self._store.finish_operation_job(
+                str(job["id"]),
+                worker_id,
+                state="failed",
+                terminal_code="MISSING_SNAPSHOT",
+                now=timestamp,
+            )
+        identity_revision = album_identity_revision(context["identity"], raw_tracks)
+        if identity_revision != str(snapshot["expected_identity_revision"]):
+            return await self._store.finish_operation_job(
+                str(job["id"]),
+                worker_id,
+                state="failed",
+                terminal_code="STALE_INPUT",
+                now=timestamp,
+            )
+        requested_release_mbid = snapshot["requested_release_mbid"]
+
+        async def checkpoint() -> bool:
+            if self._workload_gate is not None and self._workload_gate.scan_active:
+                return False
+            current = await self._store.get_operation_job(str(job["id"]))
+            return (
+                current is not None
+                and current["control_request"] == "none"
+                and (self._workload_gate is None or not self._workload_gate.scan_active)
+            )
+
+        async def halt() -> dict:
+            if self._workload_gate is not None and self._workload_gate.scan_active:
+                return await self._store.defer_explicit_operation_for_scan(
+                    str(job["id"]), worker_id, now=timestamp
+                )
+            paused = await self._store.checkpoint_operation_control(
+                str(job["id"]), worker_id, now=timestamp
+            )
+            return paused or job
+
+        degradation = init_degradation_context()
+        try:
+            tracks = [_to_grouping_track(row) for row in raw_tracks]
+            embedded_decision = _embedded_decision(tracks, raw_tracks)
+            stored_identity_decision = _stored_track_identity_decision(raw_tracks)
+            album_identity = context["identity"]
+            legacy_release_mbid = (
+                str(album_identity["release_mbid"])
+                if album_identity is not None
+                and album_identity["decision_source"] == "legacy_import"
+                and album_identity["release_mbid"]
+                else None
+            )
+            cached_release_groups: list[str] = (
+                [str(album_identity["release_group_mbid"])]
+                if legacy_release_mbid is not None
+                and album_identity["release_group_mbid"]
+                else []
+            )
+            for track, row in zip(tracks, raw_tracks, strict=True):
+                if not track.recording_mbid and row["recording_mbid"]:
+                    track.recording_mbid = str(row["recording_mbid"])
+                cached = await self._store.get_fingerprint_outcome(
+                    track.local_track_id,
+                    str(row["stat_revision"]),
+                    FINGERPRINTER_VERSION,
+                )
+                if cached is not None:
+                    cached_release_groups.extend(cached.release_group_ids)
+                    if (
+                        not track.recording_mbid
+                        and cached.state == "matched"
+                        and cached.recording_mbid
+                    ):
+                        track.recording_mbid = cached.recording_mbid
+            release_decision = _embedded_release_decision(tracks)
+            if requested_release_mbid is not None:
+                candidates = await self._candidates.recall(
+                    tracks,
+                    exact_release_mbid=str(requested_release_mbid),
+                    explicit=True,
+                    checkpoint=checkpoint,
+                )
+                decision = self._evidence.decide(tracks, candidates)
+                candidates_by_key = {
+                    _candidate_key(candidate): candidate for candidate in candidates
+                }
+                for candidate_evidence in decision.candidates:
+                    provider_candidate = candidates_by_key.get(
+                        _candidate_key(candidate_evidence)
+                    )
+                    if provider_candidate is not None:
+                        self._evidence.complete_administrator_exact_release_mapping(
+                            tracks, provider_candidate, candidate_evidence
+                        )
+                _enforce_raw_track_identities(decision, raw_tracks)
+                requested_reason = next(
+                    (
+                        conflict.reason_code
+                        for conflict in (
+                            stored_identity_decision,
+                            release_decision,
+                            embedded_decision,
+                        )
+                        if conflict is not None
+                        and conflict.outcome
+                        in {"contradictory", "insufficient_evidence"}
+                    ),
+                    "MANUAL_EXACT_RELEASE_REQUEST",
+                )
+                for candidate in decision.candidates:
+                    if candidate.reason_code == "SUPPORTED":
+                        candidate.reason_code = requested_reason
+                if decision.candidates:
+                    if decision.reason_code == "SUPPORTED":
+                        decision.reason_code = requested_reason
+                    decision.outcome = "contradictory"
+                    decision.selected_candidate_key = None
+            elif stored_identity_decision is not None:
+                candidates = []
+                decision = stored_identity_decision
+            elif release_decision is not None:
+                candidates = []
+                decision = release_decision
+            elif embedded_decision is not None and embedded_decision.outcome in (
+                "contradictory",
+                "insufficient_evidence",
+            ):
+                candidates = []
+                decision = embedded_decision
+            else:
+                candidates = await self._candidates.recall(
+                    tracks,
+                    cached_fingerprint_release_groups=list(
+                        dict.fromkeys(cached_release_groups)
+                    ),
+                    explicit=True,
+                    checkpoint=checkpoint,
+                )
+                decision = self._evidence.decide(tracks, candidates)
+            if not await checkpoint():
+                return await halt()
+            if (
+                stored_identity_decision is None
+                and release_decision is None
+                and requested_release_mbid is None
+                and self._fingerprints is not None
+                and decision.outcome
+                in (
+                    "ambiguous",
+                    "contradictory",
+                    "insufficient_evidence",
+                )
+            ):
+                new_release_groups: list[str] = []
+                requested = 0
+                for track, row in zip(tracks, raw_tracks, strict=True):
+                    if requested >= MAX_NEW_FINGERPRINTS_PER_ATTEMPT:
+                        break
+                    supported_recordings = {
+                        item.recording_mbid
+                        for candidate in decision.candidates
+                        for item in candidate.track_evidence
+                        if item.local_track_id == track.local_track_id
+                        and item.classification == "supported"
+                        and item.recording_mbid
+                    }
+                    needed = not track.recording_mbid and len(supported_recordings) != 1
+                    outcome = await self._fingerprints.fingerprint_if_needed(
+                        local_track_id=track.local_track_id,
+                        path=Path(str(row["file_path"])),
+                        stat_revision=str(row["stat_revision"]),
+                        needed=needed,
+                        now=timestamp,
+                        checkpoint=checkpoint,
+                    )
+                    if not needed:
+                        continue
+                    requested += 1
+                    if not await checkpoint():
+                        return await halt()
+                    if outcome is not None and outcome.state == "failed":
+                        raise ExternalServiceError(
+                            "Fingerprint evidence is temporarily unavailable."
+                        )
+                    if outcome is not None and outcome.recording_mbid:
+                        track.recording_mbid = outcome.recording_mbid
+                        new_release_groups.extend(outcome.release_group_ids)
+                if new_release_groups:
+                    candidates = await self._candidates.recall(
+                        tracks,
+                        cached_fingerprint_release_groups=list(
+                            dict.fromkeys([*cached_release_groups, *new_release_groups])
+                        ),
+                        explicit=True,
+                        checkpoint=checkpoint,
+                    )
+                    if not await checkpoint():
+                        return await halt()
+                    decision = self._evidence.decide(tracks, candidates)
+            _enforce_raw_track_identities(decision, raw_tracks)
+            _enforce_existing_album_identity(decision, album_identity, raw_tracks)
+            attempt_id = str(uuid.uuid4())
+            records = [
+                IdentificationEvidenceRecord(
+                    id=str(uuid.uuid4()),
+                    attempt_id=attempt_id,
+                    candidate_key=_candidate_key(candidate),
+                    evidence=candidate,
+                    created_at=timestamp,
+                )
+                for candidate in decision.candidates
+            ]
+            degraded = degradation.degraded_summary()
+            attempt = IdentificationAttempt(
+                id=attempt_id,
+                local_album_id=str(work["local_album_id"]),
+                trigger="explicit_reidentification",
+                requested_by_user_id=job["requested_by_user_id"],
+                input_tag_revision=revisions[0],
+                input_file_revision=revisions[1],
+                input_policy_revision=revisions[2],
+                input_identity_revision=identity_revision,
+                matcher_version=MATCHER_VERSION,
+                state=decision.outcome,
+                terminal_reason_code=(
+                    "PROVIDER_TEMPORARILY_UNAVAILABLE"
+                    if degraded and not records
+                    else decision.reason_code
+                ),
+                candidate_count=len(records),
+                degradation_flags=[
+                    f"{source}:{status}" for source, status in sorted(degraded.items())
+                ],
+                started_at=timestamp,
+                completed_at=timestamp,
+            )
+            return await self._store.finish_reidentification_evaluation(
+                str(job["id"]),
+                int(work["ordinal"]),
+                worker_id=worker_id,
+                expected_work_revision=int(work["row_revision"]),
+                expected_album_revision=int(context["album"]["row_revision"]),
+                attempt=attempt,
+                evidence=records,
+                now=timestamp,
+            )
+        except ExternalServiceError:
+            attempt = IdentificationAttempt(
+                id=str(uuid.uuid4()),
+                local_album_id=str(work["local_album_id"]),
+                trigger="explicit_reidentification",
+                requested_by_user_id=job["requested_by_user_id"],
+                input_tag_revision=revisions[0],
+                input_file_revision=revisions[1],
+                input_policy_revision=revisions[2],
+                input_identity_revision=identity_revision,
+                matcher_version=MATCHER_VERSION,
+                state="provider_deferred",
+                terminal_reason_code="PROVIDER_TEMPORARILY_UNAVAILABLE",
+                started_at=timestamp,
+                completed_at=timestamp,
+            )
+            return await self._store.finish_reidentification_evaluation(
+                str(job["id"]),
+                int(work["ordinal"]),
+                worker_id=worker_id,
+                expected_work_revision=int(work["row_revision"]),
+                expected_album_revision=int(context["album"]["row_revision"]),
+                attempt=attempt,
+                evidence=[],
+                now=timestamp,
+            )
+        finally:
+            clear_degradation_context()
+
+    async def select_candidate(
+        self,
+        job_id: str,
+        *,
+        expected_job_revision: int,
+        candidate_key: str,
+        confirmation: bool,
+        actor_user_id: str,
+        decision_mode: str = "exact_release",
+        now: float | None = None,
+    ) -> dict:
+        result = await self._store.accept_reidentification_candidate(
+            job_id,
+            expected_job_revision=expected_job_revision,
+            candidate_key=candidate_key,
+            confirmation=confirmation,
+            decision_mode=decision_mode,
+            actor_user_id=actor_user_id,
+            now=time.time() if now is None else now,
+        )
+        if result["state"] == "succeeded" and decision_mode != "leave_unmanaged":
+            snapshot = await self._store.get_operation_snapshot(job_id)
+            if snapshot is not None and snapshot["snapshot"] is not None:
+                local_album_id = str(snapshot["snapshot"]["local_album_id"])
+                await self._schedule_scan_management(local_album_id)
+        return result
+
+    async def _schedule_scan_management(self, local_album_id: str) -> None:
+        if self._on_identified is None:
+            return
+        context = await self._store.get_album_identification_context(local_album_id)
+        if context is None:
+            return
+        tracks = [
+            track for track in context["tracks"] if track["availability"] == "indexed"
+        ]
+        if not tracks:
+            return
+        input_policy_revision = album_input_revisions(tracks)[2]
+        try:
+            await self._on_identified(local_album_id, input_policy_revision)
+        except Exception:  # noqa: BLE001 - candidate acceptance is already committed
+            logger.warning(
+                "Automatic scan-discovered management scheduling failed",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def response(row: dict):
+        return LibraryOperationService._response(row)

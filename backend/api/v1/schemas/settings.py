@@ -34,7 +34,9 @@ class LastFmConnectionSettingsResponse(AppStruct):
     enabled: bool = False
 
     @classmethod
-    def from_settings(cls, settings: LastFmConnectionSettings) -> "LastFmConnectionSettingsResponse":
+    def from_settings(
+        cls, settings: LastFmConnectionSettings
+    ) -> "LastFmConnectionSettingsResponse":
         return cls(
             api_key=settings.api_key,
             shared_secret=_mask_secret(settings.shared_secret),
@@ -65,7 +67,9 @@ class LastFmAuthSessionResponse(AppStruct):
 
 
 class UserPreferences(AppStruct):
-    primary_types: list[str] = msgspec.field(default_factory=lambda: ["album", "ep", "single"])
+    primary_types: list[str] = msgspec.field(
+        default_factory=lambda: ["album", "ep", "single"]
+    )
     secondary_types: list[str] = msgspec.field(default_factory=lambda: ["studio"])
 
 
@@ -75,6 +79,7 @@ class DownloadClientConnectionSettings(AppStruct):
     api_key is a Fernet-encrypted secret, masked on read, preserved on save when
     the masked sentinel comes back unchanged.
     """
+
     enabled: bool = False
     client_type: str = "slskd"
     url: str = ""
@@ -95,10 +100,7 @@ class DownloadClientConnectionSettings(AppStruct):
     # sitting in the peer's remote upload queue gets the more generous timeout.
     download_stall_timeout_minutes: int = 30
     download_queued_timeout_minutes: int = 120
-    # Seconds-scale: a fresh Soulseek transfer that never leaves the peer's upload queue
-    # (0 bytes, not transferring) within this long is failed over to the next source
-    # immediately (no auto-retry backoff), so a stuck peer can't clog the queue.
-    download_queued_start_timeout_seconds: int = 30
+    preferred_quality_wait_minutes: int = 15
     max_failover_attempts: int = 3
     max_concurrent_downloads: int = 3
     auto_retry_enabled: bool = True
@@ -113,23 +115,39 @@ class DownloadClientConnectionSettings(AppStruct):
             self.url = f"https://{self.url}"
         self.url = self.url.rstrip("/")
         _validate_range(
-            self.download_stall_timeout_minutes, "download_stall_timeout_minutes", 2, 240
+            self.download_stall_timeout_minutes,
+            "download_stall_timeout_minutes",
+            2,
+            240,
         )
         _validate_range(
-            self.download_queued_timeout_minutes, "download_queued_timeout_minutes", 5, 1440
+            self.download_queued_timeout_minutes,
+            "download_queued_timeout_minutes",
+            5,
+            1440,
         )
         _validate_range(
-            self.download_queued_start_timeout_seconds,
-            "download_queued_start_timeout_seconds", 5, 600,
+            self.preferred_quality_wait_minutes,
+            "preferred_quality_wait_minutes",
+            1,
+            1440,
         )
         _validate_range(self.max_failover_attempts, "max_failover_attempts", 1, 10)
-        _validate_range(self.max_concurrent_downloads, "max_concurrent_downloads", 1, 10)
+        _validate_range(
+            self.max_concurrent_downloads, "max_concurrent_downloads", 1, 10
+        )
         _validate_range(self.auto_retry_max_attempts, "auto_retry_max_attempts", 0, 20)
         _validate_range(
-            self.auto_retry_base_interval_minutes, "auto_retry_base_interval_minutes", 1, 1440
+            self.auto_retry_base_interval_minutes,
+            "auto_retry_base_interval_minutes",
+            1,
+            1440,
         )
         # mirrors services.native.quality_tiers.TIER_KEYS (best -> worst); keep in sync
-        _rank = {k: r for r, k in enumerate(("low", "mp3_192", "mp3_256", "mp3_320", "lossless"))}
+        _rank = {
+            k: r
+            for r, k in enumerate(("low", "mp3_192", "mp3_256", "mp3_320", "lossless"))
+        }
         if self.quality_min not in _rank:
             self.quality_min = "mp3_320"
         if self.quality_max not in _rank:
@@ -139,7 +157,8 @@ class DownloadClientConnectionSettings(AppStruct):
         # keep only safe, relative path components - the subpath joins onto the mount, so
         # drop "", ".", ".." and any leading slashes so it can never escape it
         self.downloads_subpath = "/".join(
-            p for p in re.split(r"[\\/]", self.downloads_subpath.strip())
+            p
+            for p in re.split(r"[\\/]", self.downloads_subpath.strip())
             if p and p not in (".", "..")
         )
 
@@ -153,20 +172,14 @@ class DownloadPolicySettings(AppStruct):
     quality_min: str = "mp3_320"
     quality_max: str = "lossless"
     flac_mp3_only: bool = True
-    # Cap on a LOSSLESS file's effective bitrate in kbps (0 = no cap). Lets the quality
-    # slider's FLAC end be bounded: e.g. 1500 accepts CD-quality FLAC (~700-1100 kbps)
-    # but rejects space-hungry 24/96+ hi-res rips (2000-5000+ kbps). Judged from the
-    # reported bitrate or size/duration; files that can't be judged pass.
-    lossless_max_kbps: int = 0
     verify_downloads: bool = True
     preflight_score_auto_accept: float = 0.70
     preflight_score_manual_min: float = 0.50
     download_stall_timeout_minutes: int = 30
     download_queued_timeout_minutes: int = 120
-    # Seconds-scale: a fresh Soulseek transfer that never leaves the peer's upload queue
-    # (0 bytes, not transferring) within this long is failed over to the next source
-    # immediately (no auto-retry backoff), so a stuck peer can't clog the queue.
-    download_queued_start_timeout_seconds: int = 30
+    # A higher-ranked Soulseek quality/resolution pool gets this shared zero-byte
+    # queue window before failover may step down within the accepted quality range.
+    preferred_quality_wait_minutes: int = 15
     max_failover_attempts: int = 3
     max_concurrent_downloads: int = 3
     auto_retry_enabled: bool = True
@@ -214,31 +227,70 @@ class DownloadPolicySettings(AppStruct):
     background_upgrade_max_per_run: int = 3
 
     def __post_init__(self) -> None:
-        _validate_range(self.download_stall_timeout_minutes, "download_stall_timeout_minutes", 2, 240)
-        _validate_range(self.download_queued_timeout_minutes, "download_queued_timeout_minutes", 5, 1440)
         _validate_range(
-            self.download_queued_start_timeout_seconds,
-            "download_queued_start_timeout_seconds", 5, 600,
+            self.download_stall_timeout_minutes,
+            "download_stall_timeout_minutes",
+            2,
+            240,
+        )
+        _validate_range(
+            self.download_queued_timeout_minutes,
+            "download_queued_timeout_minutes",
+            5,
+            1440,
+        )
+        _validate_range(
+            self.preferred_quality_wait_minutes,
+            "preferred_quality_wait_minutes",
+            1,
+            1440,
         )
         _validate_range(self.max_failover_attempts, "max_failover_attempts", 1, 10)
-        _validate_range(self.max_concurrent_downloads, "max_concurrent_downloads", 1, 10)
+        _validate_range(
+            self.max_concurrent_downloads, "max_concurrent_downloads", 1, 10
+        )
         _validate_range(self.auto_retry_max_attempts, "auto_retry_max_attempts", 0, 20)
-        _validate_range(self.auto_retry_base_interval_minutes, "auto_retry_base_interval_minutes", 1, 1440)
-        _validate_range(self.usenet_min_release_age_minutes, "usenet_min_release_age_minutes", 0, 1440)
-        _validate_range(self.lossless_max_kbps, "lossless_max_kbps", 0, 20_000)
+        _validate_range(
+            self.auto_retry_base_interval_minutes,
+            "auto_retry_base_interval_minutes",
+            1,
+            1440,
+        )
+        _validate_range(
+            self.usenet_min_release_age_minutes,
+            "usenet_min_release_age_minutes",
+            0,
+            1440,
+        )
         _validate_range(self.max_size_mb, "max_size_mb", 0, 1_000_000)
         _validate_range(self.usenet_retention_days, "usenet_retention_days", 0, 100_000)
         _validate_range(self.recycle_retention_days, "recycle_retention_days", 1, 3650)
         _validate_range(self.max_library_size_gb, "max_library_size_gb", 0, 1_000_000)
-        _validate_range(self.default_request_quota_count, "default_request_quota_count", 0, 100_000)
-        _validate_range(self.default_request_quota_days, "default_request_quota_days", 1, 3650)
-        _validate_range(self.default_storage_quota_gb, "default_storage_quota_gb", 0, 1_000_000)
+        _validate_range(
+            self.default_request_quota_count, "default_request_quota_count", 0, 100_000
+        )
+        _validate_range(
+            self.default_request_quota_days, "default_request_quota_days", 1, 3650
+        )
+        _validate_range(
+            self.default_storage_quota_gb, "default_storage_quota_gb", 0, 1_000_000
+        )
         _validate_range(
             self.background_upgrade_scan_interval_hours,
-            "background_upgrade_scan_interval_hours", 1, 720,
+            "background_upgrade_scan_interval_hours",
+            1,
+            720,
         )
-        _validate_range(self.background_upgrade_max_per_run, "background_upgrade_max_per_run", 1, 100)
-        _rank = {k: r for r, k in enumerate(("low", "mp3_192", "mp3_256", "mp3_320", "lossless"))}
+        _validate_range(
+            self.background_upgrade_max_per_run,
+            "background_upgrade_max_per_run",
+            1,
+            100,
+        )
+        _rank = {
+            k: r
+            for r, k in enumerate(("low", "mp3_192", "mp3_256", "mp3_320", "lossless"))
+        }
         if self.quality_min not in _rank:
             self.quality_min = "mp3_320"
         if self.quality_max not in _rank:
@@ -259,9 +311,9 @@ class WantedWatcherSettings(AppStruct):
     """The wanted watcher (Wanted plan §5.4): granular opt-out toggles, no secrets.
     Cadence stays code constants on purpose - fewer knobs."""
 
-    enabled: bool = True                 # master switch (rollback lever, read per sweep)
-    auto_download_on_find: bool = True   # D2; off = badge-only even for auto-tier finds
-    watch_partial_albums: bool = True    # D6
+    enabled: bool = True  # master switch (rollback lever, read per sweep)
+    auto_download_on_find: bool = True  # D2; off = badge-only even for auto-tier finds
+    watch_partial_albums: bool = True  # D6
     max_checks_per_sweep: int = 3
     dormant_after_days: int = 365
 
@@ -401,14 +453,10 @@ class FreeMusicSettings(AppStruct):
 
 
 class GetItSettings(AppStruct):
-    """"Get it" purchase links (phase 01). ``store_region`` feeds the iTunes
-    Search ``country`` storefront parameter. ``support_droppedneedle`` gates
-    the affiliate decorator (D19): on = the app's baked-in tags decorate store
-    links and a disclosure line renders; off = every link is a clean direct
-    URL. No secrets here - affiliate tags are public strings."""
+    """ "Get it" purchase links (phase 01). ``store_region`` feeds the iTunes
+    Search ``country`` storefront parameter."""
 
     store_region: Annotated[str, msgspec.Meta(pattern=r"^[A-Za-z]{2}$")] = "US"
-    support_droppedneedle: bool = True
 
 
 class EventsSettings(AppStruct):
@@ -422,13 +470,18 @@ class EventsSettings(AppStruct):
     ticketmaster_api_key: str = ""
     skiddle_enabled: bool = False
     skiddle_api_key: str = ""
-    poll_time: Annotated[str, msgspec.Meta(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")] = "06:00"
+    poll_time: Annotated[str, msgspec.Meta(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")] = (
+        "06:00"
+    )
     # 'followed' sweeps the distinct followed artists; 'library' additionally
     # sweeps every artist in the library index (and shows those events to all)
     sweep_scope: Literal["followed", "library"] = "followed"
 
+
 # keep in sync with NamingTemplateEngine.DEFAULT (services/native/naming.py)
-DEFAULT_NAMING_TEMPLATE = "{albumartist}/{album} ({year})/{disc:02d}{track:02d} {title}.{ext}"
+DEFAULT_NAMING_TEMPLATE = (
+    "{albumartist}/{album} ({year})/{disc:02d}{track:02d} {title}.{ext}"
+)
 
 
 class LibrarySettings(AppStruct):
@@ -455,7 +508,9 @@ class NavidromeConnectionSettings(AppStruct):
     enabled: bool = False
 
     def __post_init__(self) -> None:
-        self.navidrome_url = self.navidrome_url.rstrip("/") if self.navidrome_url else ""
+        self.navidrome_url = (
+            self.navidrome_url.rstrip("/") if self.navidrome_url else ""
+        )
 
 
 class PlexConnectionSettings(AppStruct):
@@ -512,7 +567,9 @@ class YouTubeConnectionSettings(AppStruct):
 
     def __post_init__(self) -> None:
         if self.daily_quota_limit < 1 or self.daily_quota_limit > 10000:
-            raise msgspec.ValidationError("daily_quota_limit must be between 1 and 10000")
+            raise msgspec.ValidationError(
+                "daily_quota_limit must be between 1 and 10000"
+            )
 
     def has_valid_api_key(self) -> bool:
         return bool(self.api_key and self.api_key.strip())
@@ -528,9 +585,13 @@ class HomeSettings(AppStruct):
 
     def __post_init__(self) -> None:
         if self.cache_ttl_trending < 300 or self.cache_ttl_trending > 86400:
-            raise msgspec.ValidationError("cache_ttl_trending must be between 300 and 86400")
+            raise msgspec.ValidationError(
+                "cache_ttl_trending must be between 300 and 86400"
+            )
         if self.cache_ttl_personal < 60 or self.cache_ttl_personal > 3600:
-            raise msgspec.ValidationError("cache_ttl_personal must be between 60 and 3600")
+            raise msgspec.ValidationError(
+                "cache_ttl_personal must be between 60 and 3600"
+            )
 
 
 class LocalFilesConnectionSettings(AppStruct):
@@ -540,7 +601,9 @@ class LocalFilesConnectionSettings(AppStruct):
 
 
 class LibrarySyncSettings(AppStruct):
-    sync_frequency: Literal["manual", "5min", "10min", "30min", "1hr", "6hr", "12hr", "24hr", "3d", "7d"] = "24hr"
+    sync_frequency: Literal[
+        "manual", "5min", "10min", "30min", "1hr", "6hr", "12hr", "24hr", "3d", "7d"
+    ] = "24hr"
     last_sync: int | None = None
     last_sync_success: bool = True
 
@@ -551,8 +614,22 @@ class LibraryScanScheduleSettings(AppStruct):
     daily_scan_time (server-local HH:MM); the interval values run on a rolling gap
     since the last scan."""
 
-    scan_frequency: Literal["manual", "5min", "10min", "30min", "1hr", "6hr", "12hr", "24hr", "3d", "7d", "daily"] = "24hr"
-    daily_scan_time: Annotated[str, msgspec.Meta(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")] = "03:00"
+    scan_frequency: Literal[
+        "manual",
+        "5min",
+        "10min",
+        "30min",
+        "1hr",
+        "6hr",
+        "12hr",
+        "24hr",
+        "3d",
+        "7d",
+        "daily",
+    ] = "24hr"
+    daily_scan_time: Annotated[
+        str, msgspec.Meta(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    ] = "03:00"
     last_scan: int | None = None
     last_scan_success: bool = True
 
@@ -580,6 +657,7 @@ _OFFICIAL_MB_CONCURRENT_SEARCHES = 6
 
 def is_official_musicbrainz(url: str) -> bool:
     from urllib.parse import urlparse
+
     try:
         parsed = urlparse(url.strip().rstrip("/"))
         hostname = (parsed.hostname or "").lower()
@@ -594,7 +672,7 @@ class SecuritySettings(AppStruct):
     hibp_local_path: str = ""
 
     # HSTS: only enable when serving over HTTPS
-    hsts_max_age: int = 0            # seconds; 0 = disabled
+    hsts_max_age: int = 0  # seconds; 0 = disabled
     hsts_include_subdomains: bool = False
     hsts_preload: bool = False
 
@@ -611,11 +689,15 @@ class MusicBrainzConnectionSettings(AppStruct):
         self.api_url = self.api_url.rstrip("/")
         if is_official_musicbrainz(self.api_url):
             self.rate_limit = min(self.rate_limit, _OFFICIAL_MB_RATE_LIMIT)
-            self.concurrent_searches = min(self.concurrent_searches, _OFFICIAL_MB_CONCURRENT_SEARCHES)
+            self.concurrent_searches = min(
+                self.concurrent_searches, _OFFICIAL_MB_CONCURRENT_SEARCHES
+            )
         if self.rate_limit < 0.1 or self.rate_limit > 50.0:
             raise msgspec.ValidationError("rate_limit must be between 0.1 and 50.0")
         if self.concurrent_searches < 1 or self.concurrent_searches > 30:
-            raise msgspec.ValidationError("concurrent_searches must be between 1 and 30")
+            raise msgspec.ValidationError(
+                "concurrent_searches must be between 1 and 30"
+            )
 
 
 class ConnectAppsSettings(AppStruct):
@@ -629,10 +711,15 @@ class ConnectAppsSettings(AppStruct):
     transcode_max_bitrate_kbps: int = 320
     advertise_server_name: str = "DroppedNeedle"
     advertise_server_version: str = "10.10.6"
-    discover_mode: Literal["local-only", "lazy-mb", "use-scrobble-targets"] = "local-only"
+    discover_mode: Literal["local-only", "lazy-mb", "use-scrobble-targets"] = (
+        "local-only"
+    )
 
     def __post_init__(self) -> None:
-        if self.transcode_max_bitrate_kbps < 32 or self.transcode_max_bitrate_kbps > 1411:
+        if (
+            self.transcode_max_bitrate_kbps < 32
+            or self.transcode_max_bitrate_kbps > 1411
+        ):
             raise msgspec.ValidationError(
                 "transcode_max_bitrate_kbps must be between 32 and 1411"
             )

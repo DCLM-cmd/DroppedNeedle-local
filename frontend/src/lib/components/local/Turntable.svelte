@@ -3,8 +3,12 @@
 	import { eqStore } from '$lib/stores/eq.svelte';
 	import { scrobbleManager } from '$lib/stores/scrobble.svelte';
 	import EqPanel from '$lib/components/EqPanel.svelte';
+	import LyricsPanel from '$lib/components/LyricsPanel.svelte';
 	import AudioQualityBadge from '$lib/components/AudioQualityBadge.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
+	import { getLyricsQuery } from '$lib/queries/lyrics/LyricsQuery.svelte';
+	import { authStore } from '$lib/stores/authStore.svelte';
+	import { getNavidromeFolderScopeRevision } from '$lib/utils/navidromeLibraryCache';
 	import type { CrateTrack, LocalAlbumSummary } from '$lib/types';
 	import {
 		Play,
@@ -21,6 +25,7 @@
 		Volume2,
 		VolumeX,
 		SlidersHorizontal,
+		Music2,
 		Check,
 		CircleX
 	} from 'lucide-svelte';
@@ -45,6 +50,19 @@
 
 	let dragOver = $state(false);
 	let eqPanelOpen = $state(false);
+	let lyricsPanelOpen = $state(false);
+
+	const lyricsQuery = getLyricsQuery(
+		() => playerStore.nowPlaying,
+		() => authStore.user?.id,
+		() => getNavidromeFolderScopeRevision(authStore.user?.id ?? '')
+	);
+	const supportsLyrics = $derived(lyricsQuery.isSuccess && lyricsQuery.data !== null);
+
+	$effect(() => {
+		void playerStore.nowPlaying;
+		lyricsPanelOpen = false;
+	});
 
 	function onVolume(e: Event) {
 		playerStore.setVolume(Number((e.currentTarget as HTMLInputElement).value));
@@ -151,6 +169,8 @@
 						customUrl={np.coverUrl}
 						alt={np.albumName ?? 'Album'}
 						size="full"
+						requestSize={250}
+						responsiveSizes="(max-width: 639px) 30vw, 190px"
 						lazy={false}
 						rounded="none"
 						className="h-full w-full object-cover"
@@ -319,6 +339,19 @@
 						class="range range-xs range-accent w-20 sm:w-24"
 					/>
 				</div>
+				{#if supportsLyrics}
+					<div class="tooltip tooltip-top" data-tip="Lyrics">
+						<button
+							class="btn btn-circle btn-ghost btn-sm"
+							class:text-accent={lyricsPanelOpen}
+							onclick={() => (lyricsPanelOpen = !lyricsPanelOpen)}
+							aria-expanded={lyricsPanelOpen}
+							aria-label="Toggle lyrics"
+						>
+							<Music2 class="h-4 w-4" />
+						</button>
+					</div>
+				{/if}
 				<div
 					class="tooltip tooltip-top"
 					data-tip={isYouTube ? 'EQ unavailable for YouTube' : 'Equalizer'}
@@ -371,3 +404,15 @@
 </div>
 
 <EqPanel bind:open={eqPanelOpen} onclose={() => (eqPanelOpen = false)} />
+<LyricsPanel
+	bind:open={lyricsPanelOpen}
+	lyricsText={lyricsQuery.data?.text ?? ''}
+	lines={lyricsQuery.data?.lines ?? []}
+	isSynced={lyricsQuery.data?.is_synced ?? false}
+	isLoading={lyricsQuery.isFetching}
+	hasError={lyricsQuery.isError}
+	currentTime={playerStore.progress}
+	trackName={playerStore.nowPlaying?.trackName ?? ''}
+	artistName={playerStore.nowPlaying?.artistName ?? ''}
+	onclose={() => (lyricsPanelOpen = false)}
+/>

@@ -25,7 +25,14 @@
 		{/if}
 		<figure class="aspect-square p-3">
 			{#if mbid}
-				<ArtistImage {mbid} alt={name} size="full" remoteUrl={imageUrl} className="w-full h-full" />
+				<ArtistImage
+					{mbid}
+					alt={name}
+					size="full"
+					requestSize={250}
+					remoteUrl={imageUrl}
+					className="w-full h-full"
+				/>
 			{:else if imageUrl}
 				<img
 					src={imageUrl}
@@ -52,7 +59,14 @@
 	<div class="card bg-base-100 w-full shadow-sm shrink-0">
 		<figure class="aspect-square p-3">
 			{#if mbid}
-				<ArtistImage {mbid} alt={name} size="full" remoteUrl={imageUrl} className="w-full h-full" />
+				<ArtistImage
+					{mbid}
+					alt={name}
+					size="full"
+					requestSize={250}
+					remoteUrl={imageUrl}
+					className="w-full h-full"
+				/>
 			{:else if imageUrl}
 				<img
 					src={imageUrl}

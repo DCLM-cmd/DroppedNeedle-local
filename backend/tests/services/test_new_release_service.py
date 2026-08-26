@@ -11,6 +11,7 @@ import pytest
 
 from core.exceptions import ConfigurationError, ExternalServiceError
 from infrastructure.persistence.follow_store import FollowStore
+from infrastructure.queue.priority_queue import RequestPriority
 from services.native.download_service import ALREADY_IN_LIBRARY
 from services.native.new_release_service import NewReleaseService
 from tests.helpers import make_builtin_dispatcher
@@ -28,7 +29,11 @@ def _seed_auth_users(db_path: Path) -> None:
         )
         conn.executemany(
             "INSERT OR IGNORE INTO auth_users (id, display_name, role) VALUES (?, ?, ?)",
-            [("user-a", "Alice", "user"), ("user-b", "Bob", "user"), ("admin-1", "Admin", "admin")],
+            [
+                ("user-a", "Alice", "user"),
+                ("user-b", "Bob", "user"),
+                ("admin-1", "Admin", "admin"),
+            ],
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS library_files "
@@ -40,7 +45,12 @@ def _seed_auth_users(db_path: Path) -> None:
 
 
 def _rg(mbid: str, title: str, *, primary="Album", secondary=None, date="2020-01-01"):
-    d = {"id": mbid, "title": title, "primary-type": primary, "first-release-date": date}
+    d = {
+        "id": mbid,
+        "title": title,
+        "primary-type": primary,
+        "first-release-date": date,
+    }
     if secondary is not None:
         d["secondary-types"] = secondary
     return d
@@ -72,8 +82,14 @@ def svc(tmp_path: Path):
         inter_artist_delay=0.0,
     )
     return SimpleNamespace(
-        service=service, store=store, mb=mb, downloads=downloads,
-        download_store=download_store, library=library, sse=sse, db=db,
+        service=service,
+        store=store,
+        mb=mb,
+        downloads=downloads,
+        download_store=download_store,
+        library=library,
+        sse=sse,
+        db=db,
     )
 
 
@@ -103,6 +119,8 @@ async def test_first_poll_seeds_baseline_and_enqueues_nothing(svc):
 
 @pytest.mark.asyncio
 async def test_second_poll_detects_and_enqueues_for_approved(svc):
+    dispatch = svc.service._acquisition.request_album
+    svc.service._acquisition.request_album = AsyncMock(wraps=dispatch)
     await _follow_with_auto(svc.store, "user-a")
     await svc.store.seed_baseline(ARTIST_LOWER, ["rg1"])
     svc.mb.get_artist_release_groups_or_raise.return_value = (
@@ -116,6 +134,10 @@ async def test_second_poll_detects_and_enqueues_for_approved(svc):
     kwargs = svc.downloads.request_album.await_args.kwargs
     assert kwargs["user_id"] == "user-a"
     assert kwargs["release_group_mbid"] == "RG2"
+    assert (
+        svc.service._acquisition.request_album.await_args.kwargs["track_count_priority"]
+        is RequestPriority.BACKGROUND_SYNC
+    )
     svc.sse.publish.assert_awaited_once()
     items, total = await svc.store.list_new_releases_for_user("user-a", 50, 0)
     assert total == 1 and items[0].release_group_mbid == "RG2"
@@ -195,14 +217,18 @@ async def test_two_followers_enqueue_once(svc):
     summary = await svc.service.run_poll()
     assert summary.enqueued == 1
     svc.downloads.request_album.assert_awaited_once()  # DD5: one task across followers
-    assert svc.downloads.request_album.await_args.kwargs["user_id"] == "user-a"  # deterministic
+    assert (
+        svc.downloads.request_album.await_args.kwargs["user_id"] == "user-a"
+    )  # deterministic
 
 
 @pytest.mark.asyncio
 async def test_active_task_any_user_blocks_enqueue(svc):
     await _follow_with_auto(svc.store, "user-a")
     await svc.store.seed_baseline(ARTIST_LOWER, ["rg1"])
-    svc.download_store.get_active_task_for_album_any_user.return_value = object()  # in flight
+    svc.download_store.get_active_task_for_album_any_user.return_value = (
+        object()
+    )  # in flight
     svc.mb.get_artist_release_groups_or_raise.return_value = (
         [_rg("RG1", "Old"), _rg("RG2", "New")],
         2,
@@ -231,7 +257,9 @@ async def test_already_in_library_sentinel_skips_sse(svc):
 async def test_config_error_does_not_crash(svc):
     await _follow_with_auto(svc.store, "user-a")
     await svc.store.seed_baseline(ARTIST_LOWER, ["rg1"])
-    svc.downloads.request_album.side_effect = ConfigurationError("download client disabled")
+    svc.downloads.request_album.side_effect = ConfigurationError(
+        "download client disabled"
+    )
     svc.mb.get_artist_release_groups_or_raise.return_value = (
         [_rg("RG1", "Old"), _rg("RG2", "New")],
         2,
@@ -244,7 +272,9 @@ async def test_config_error_does_not_crash(svc):
 @pytest.mark.asyncio
 async def test_mb_error_does_not_advance_baseline(svc):
     await _follow_with_auto(svc.store, "user-a")
-    svc.mb.get_artist_release_groups_or_raise.side_effect = ExternalServiceError("MB down")
+    svc.mb.get_artist_release_groups_or_raise.side_effect = ExternalServiceError(
+        "MB down"
+    )
     summary = await svc.service.run_poll()
     assert summary.errors == 1
     assert summary.baselined == 0
@@ -256,7 +286,12 @@ async def test_mb_error_does_not_advance_baseline(svc):
 async def test_mb_error_after_baseline_preserves_known_set(svc):
     await _follow_with_auto(svc.store, "user-a")
     await svc.store.seed_baseline(ARTIST_LOWER, ["rg1", "rg2"])
-    svc.mb.get_artist_release_groups_or_raise.side_effect = ExternalServiceError("MB down")
+    svc.mb.get_artist_release_groups_or_raise.side_effect = ExternalServiceError(
+        "MB down"
+    )
     summary = await svc.service.run_poll()
     assert summary.errors == 1
-    assert await svc.store.known_release_set(ARTIST_LOWER) == {"rg1", "rg2"}  # unchanged
+    assert await svc.store.known_release_set(ARTIST_LOWER) == {
+        "rg1",
+        "rg2",
+    }  # unchanged

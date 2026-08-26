@@ -60,6 +60,9 @@ class LibraryAlbumSummary(AppStruct):
     is_compilation: bool = False
     cover_url: str | None = None
     last_imported_at: float | None = None
+    album_artist_mbid: str | None = None
+    album_sort_name: str | None = None
+    original_release_date: str | None = None
 
 
 class LibraryTrack(AppStruct):
@@ -99,6 +102,18 @@ class LibraryTrackListItem(AppStruct):
     track_number: int = 0
     disc_number: int = 1
     duration_seconds: float | None = None
+    recording_mbid: str | None = None
+    artist_mbid: str | None = None
+    album_artist_name: str | None = None
+    album_artist_mbid: str | None = None
+    year: int | None = None
+    genre: str | None = None
+    bit_rate: int | None = None
+    sample_rate: int | None = None
+    bit_depth: int | None = None
+    channels: int | None = None
+    file_size_bytes: int = 0
+    created_at: float | None = None
 
 
 class LibraryArtistSummary(AppStruct):
@@ -226,12 +241,11 @@ class LibraryManager(LibraryStub):
         native imports written to ``library_files``."""
         return await self._db.get_library_mbids(include_release_ids=include_release_ids)
 
-    async def materialize_albums(self) -> int:
-        """Refresh the materialised ``library_albums`` table from the scanned files so
-        home/discover listings and per-artist album counts include scan-discovered
-        albums (the scan writes only ``library_files``). Additive and idempotent - safe
-        to call at the end of every scan. Returns the number of rows inserted."""
-        return await self._db.materialize_albums_from_files()
+    async def existing_album_mbids(self, identifiers: list[str]) -> set[str]:
+        return await self._db.existing_library_mbids(identifiers)
+
+    async def existing_artist_mbids(self, identifiers: list[str]) -> set[str]:
+        return await self._db.existing_library_artist_mbids(identifiers)
 
     async def get_albums(
         self,
@@ -262,6 +276,41 @@ class LibraryManager(LibraryStub):
             limit=page_size, offset=offset, sort=sort, q=q, file_format=file_format, decade=decade
         )
         return [self._to_summary(row) for row in rows], total
+
+    async def get_albums_offset(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        sort: str = "recent",
+        q: str | None = None,
+        from_year: int | None = None,
+        to_year: int | None = None,
+        genre: str | None = None,
+    ) -> tuple[list[LibraryAlbumSummary], int]:
+        rows, total = await self._db.get_albums_aggregated(
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            q=q,
+            from_year=from_year,
+            to_year=to_year,
+            genre=genre,
+        )
+        return [self._to_summary(row) for row in rows], total
+
+    async def get_albums_by_ids(
+        self, release_group_mbids: list[str]
+    ) -> list[LibraryAlbumSummary]:
+        if not release_group_mbids:
+            return []
+        rows, _ = await self._db.get_albums_aggregated(
+            limit=len(release_group_mbids),
+            offset=0,
+            release_group_mbids=release_group_mbids,
+        )
+        by_id = {row["release_group_mbid"]: self._to_summary(row) for row in rows}
+        return [by_id[mbid] for mbid in release_group_mbids if mbid in by_id]
 
     async def get_tracks_page(
         self,
@@ -652,6 +701,16 @@ class LibraryManager(LibraryStub):
             "year": tag.year,
             "genre": tag.genre,
             "channels": info.channels,
+            "track_sort_name": tag.title_sort,
+            "artist_sort_name": tag.artist_sort,
+            "album_sort_name": tag.album_sort,
+            "album_artist_sort_name": tag.album_artist_sort,
+            "disc_subtitle": tag.disc_subtitle,
+            "original_release_date": tag.original_release_date,
+            "replaygain_track_gain": tag.replaygain_track_gain,
+            "replaygain_album_gain": tag.replaygain_album_gain,
+            "replaygain_track_peak": tag.replaygain_track_peak,
+            "replaygain_album_peak": tag.replaygain_album_peak,
             "file_path": str(audio_path),
             "source_path": source_path,
             "file_size_bytes": info.file_size_bytes,
@@ -693,6 +752,9 @@ class LibraryManager(LibraryStub):
             is_compilation=bool(row.get("is_compilation")),
             cover_url=row.get("cover_url"),
             last_imported_at=row.get("last_imported_at"),
+            album_artist_mbid=row.get("album_artist_mbid"),
+            album_sort_name=row.get("album_sort_name"),
+            original_release_date=row.get("original_release_date"),
         )
 
     @staticmethod
@@ -747,4 +809,16 @@ class LibraryManager(LibraryStub):
             track_number=int(row.get("track_number") or 0),
             disc_number=int(row.get("disc_number") or 1),
             duration_seconds=row.get("duration_seconds"),
+            recording_mbid=row.get("recording_mbid"),
+            artist_mbid=row.get("artist_mbid"),
+            album_artist_name=row.get("album_artist_name"),
+            album_artist_mbid=row.get("album_artist_mbid"),
+            year=row.get("year"),
+            genre=row.get("genre"),
+            bit_rate=row.get("bit_rate"),
+            sample_rate=row.get("sample_rate"),
+            bit_depth=row.get("bit_depth"),
+            channels=row.get("channels"),
+            file_size_bytes=int(row.get("file_size_bytes") or 0),
+            created_at=row.get("imported_at"),
         )

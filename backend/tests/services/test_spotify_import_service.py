@@ -90,6 +90,21 @@ async def test_populate_playlist_with_no_tracks_writes_empty():
     svc._async_repo.add_tracks.assert_awaited_once_with("int-1", [])
 
 
+@pytest.mark.asyncio
+async def test_album_fallback_searches_artist_and_release_title_separately():
+    svc = _service(AsyncMock())
+    svc._mb_repo.search_release_groups.return_value = [
+        SimpleNamespace(musicbrainz_id="clairo-originals-rg")
+    ]
+
+    result = await svc._resolve_mbid(None, "Clairo", "Originals")
+
+    assert result == "clairo-originals-rg"
+    svc._mb_repo.search_release_groups.assert_awaited_once_with(
+        "Clairo", "Originals", limit=3, include_all_types=False
+    )
+
+
 def test_best_image_url_prefers_smallest_at_or_above_min():
     images = [
         {"url": "tiny", "width": 64},

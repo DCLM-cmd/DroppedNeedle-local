@@ -50,7 +50,9 @@ def _ext_from_filename(filename: str) -> str:
 
 def effective_extension(file: DownloadSearchResult) -> str:
     """slskd's ``extension`` can be empty (C6a); fall back to the filename."""
-    return file.extension.lower() if file.extension else _ext_from_filename(file.filename)
+    return (
+        file.extension.lower() if file.extension else _ext_from_filename(file.filename)
+    )
 
 
 def tier_for(ext: str, bitrate: int | None) -> str:
@@ -117,7 +119,9 @@ def in_range(tier_key: str, quality_min: str, quality_max: str) -> bool:
     return tier_rank(quality_min) <= tier_rank(tier_key) <= tier_rank(quality_max)
 
 
-def should_acquire(held_tier: str | None, quality_cutoff: str, upgrade_allowed: bool) -> bool:
+def should_acquire(
+    held_tier: str | None, quality_cutoff: str, upgrade_allowed: bool
+) -> bool:
     """Whether to (re)acquire an album given the quality the library already holds (the WORST
     held tier, or ``None`` if absent) - the tier-aware replacement for the binary "has_album"
     gate (step 8). ``None`` held → acquire. With upgrades OFF (the default) any held copy
@@ -135,6 +139,9 @@ def folder_hires_key(files: list[DownloadSearchResult]) -> tuple[int, int]:
     (parsing finding H1: these are captured per file but no sort/score path ever read them,
     so a 24/96 rip lost to a 16/44 one). A folder is rated by its WORST file (the whole
     folder is downloaded), so take the minimum; absent values fall back to CD (16/44100)."""
-    depths = [f.bit_depth for f in files if f.bit_depth]
-    rates = [f.sample_rate for f in files if f.sample_rate]
-    return (min(depths) if depths else 16, min(rates) if rates else 44100)
+    if not files:
+        return 16, 44100
+    return (
+        min(file.bit_depth or 16 for file in files),
+        min(file.sample_rate or 44100 for file in files),
+    )

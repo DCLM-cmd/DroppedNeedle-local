@@ -78,6 +78,7 @@
 					mbid={song.release_group_mbid ?? ''}
 					alt={song.release_name || ''}
 					size="full"
+					requestSize={250}
 					className="w-12 h-12 rounded"
 				/>
 			</div>

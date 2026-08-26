@@ -17,10 +17,25 @@
 	let railEl = $state<HTMLDivElement | null>(null);
 	let dragging = $state<'min' | 'max' | null>(null);
 
+	// crossing swaps roles: the dragged point follows the pointer, the other handle
+	// moves instead, keeping min <= max so an overlapped pair can be pulled apart
 	function setIdx(which: 'min' | 'max', idx: number) {
 		const clamped = Math.max(0, Math.min(LAST, idx));
-		if (which === 'min') minKey = TIERS[Math.min(clamped, maxIdx)].key;
-		else maxKey = TIERS[Math.max(clamped, minIdx)].key;
+		if (which === 'min') {
+			if (clamped <= maxIdx) minKey = TIERS[clamped].key;
+			else {
+				minKey = TIERS[maxIdx].key;
+				maxKey = TIERS[clamped].key;
+				if (dragging === 'min') dragging = 'max';
+			}
+		} else {
+			if (clamped >= minIdx) maxKey = TIERS[clamped].key;
+			else {
+				maxKey = TIERS[minIdx].key;
+				minKey = TIERS[clamped].key;
+				if (dragging === 'max') dragging = 'min';
+			}
+		}
 	}
 
 	function idxFromClientX(clientX: number): number {

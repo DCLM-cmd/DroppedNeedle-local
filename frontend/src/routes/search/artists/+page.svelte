@@ -11,6 +11,7 @@
 	import { colors } from '$lib/colors';
 	import { searchStore } from '$lib/stores/search';
 	import { fetchEnrichmentBatch, applyArtistEnrichment } from '$lib/utils/enrichment';
+	import { createSearchEnrichmentBatcher } from '$lib/utils/searchEnrichmentBatcher';
 	import { isAbortError } from '$lib/utils/errorHandling';
 	import { api } from '$lib/api/client';
 
@@ -28,7 +29,6 @@
 	const limit = 24;
 	let sentinel = $state<HTMLElement>();
 	let abortController: AbortController | null = null;
-	let enrichmentController: AbortController | null = null;
 	let observer: IntersectionObserver | null = null;
 	let enrichmentSource: EnrichmentSource = $state('none');
 	let lastQuery = $state('');
@@ -45,32 +45,14 @@
 		}
 	}
 
-	async function fetchEnrichment(artistsToEnrich: Artist[]) {
-		if (artistsToEnrich.length === 0) return;
-
-		if (enrichmentController) {
-			enrichmentController.abort();
-		}
-		enrichmentController = new AbortController();
-
-		const requests = artistsToEnrich.map((a) => ({
-			musicbrainz_id: a.musicbrainz_id,
-			name: a.title
-		}));
-
-		try {
-			const enrichment = await fetchEnrichmentBatch(requests, [], enrichmentController.signal);
-			if (!enrichment) return;
-
+	const enrichmentBatcher = createSearchEnrichmentBatcher({
+		load: fetchEnrichmentBatch,
+		onresult: (enrichment) => {
 			enrichmentSource = enrichment.source;
 			artists = applyArtistEnrichment(artists, enrichment);
 			searchStore.setEnrichmentSource(enrichmentSource);
-		} catch (error) {
-			if (isAbortError(error)) {
-				return;
-			}
 		}
-	}
+	});
 
 	async function loadMore() {
 		if (loading || !hasMore || !data.query) return;
@@ -108,11 +90,6 @@
 				offset += newArtists.length;
 			}
 			searchStore.updateArtists(artists);
-
-			const needsEnrichment = artists.filter((a) => a.release_group_count == null);
-			if (needsEnrichment.length > 0) {
-				fetchEnrichment(needsEnrichment);
-			}
 		} catch (error) {
 			if (isAbortError(error)) {
 				return;
@@ -124,15 +101,11 @@
 	}
 
 	function resetAndLoad() {
+		enrichmentBatcher.reset();
 		if (abortController) {
 			abortController.abort();
 			abortController = null;
 		}
-		if (enrichmentController) {
-			enrichmentController.abort();
-			enrichmentController = null;
-		}
-
 		if (observer) {
 			observer.disconnect();
 			observer = null;
@@ -145,11 +118,6 @@
 			enrichmentSource = cache.enrichmentSource;
 			offset = cache.artists.length;
 			hasMore = cache.artists.length >= limit;
-			const needsEnrichment = artists.filter((a) => a.release_group_count == null);
-			if (needsEnrichment.length > 0) {
-				void fetchEnrichment(needsEnrichment);
-			}
-
 			if (searchStore.isStale(cache.timestamp)) {
 				offset = 0;
 				hasMore = true;
@@ -207,10 +175,7 @@
 			abortController.abort();
 			abortController = null;
 		}
-		if (enrichmentController) {
-			enrichmentController.abort();
-			enrichmentController = null;
-		}
+		enrichmentBatcher.dispose();
 	});
 </script>
 
@@ -265,7 +230,11 @@
 				class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4"
 			>
 				{#each topArtist ? artists.filter((a) => a.musicbrainz_id !== topArtist?.musicbrainz_id) : artists as artist (artist.musicbrainz_id)}
-					<SearchArtistCard {artist} {enrichmentSource} />
+					<SearchArtistCard
+						{artist}
+						{enrichmentSource}
+						onenrichmentrequest={() => enrichmentBatcher.requestArtist(artist)}
+					/>
 				{/each}
 			</div>
 		</div>

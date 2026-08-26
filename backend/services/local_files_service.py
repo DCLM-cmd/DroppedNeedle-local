@@ -22,7 +22,11 @@ from api.v1.schemas.local_files import (
     LocalStorageStats,
     LocalTrackInfo,
 )
-from core.exceptions import ExternalServiceError, ResourceNotFoundError
+from core.exceptions import (
+    ExternalServiceError,
+    RangeNotSatisfiableError,
+    ResourceNotFoundError,
+)
 from infrastructure.cache.cache_keys import LOCAL_FILES_PREFIX
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cover_urls import prefer_release_group_cover_url
@@ -34,7 +38,14 @@ from services.preferences_service import PreferencesService
 logger = logging.getLogger(__name__)
 
 AUDIO_EXTENSIONS: set[str] = {
-    ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".wav", ".wma", ".opus",
+    ".flac",
+    ".mp3",
+    ".ogg",
+    ".m4a",
+    ".aac",
+    ".wav",
+    ".wma",
+    ".opus",
 }
 
 CONTENT_TYPE_MAP: dict[str, str] = {
@@ -82,8 +93,8 @@ class LocalFilesService:
 
         The native scanner walks these and stores absolute host paths, so file
         access validates against them directly - no Lidarr-era path remapping."""
-        settings = self._preferences.get_library_settings()
-        return [Path(p) for p in settings.library_paths if p]
+        settings = self._preferences.get_typed_library_settings()
+        return [Path(root.path) for root in settings.library_roots if root.path]
 
     def _get_recently_added_ttl(self) -> int:
         try:
@@ -133,9 +144,7 @@ class LocalFilesService:
         try:
             stat_result = await asyncio.to_thread(file_path.stat)
         except OSError as exc:
-            raise ResourceNotFoundError(
-                f"Cannot access file: {file_path.name} ({exc})"
-            )
+            raise ResourceNotFoundError(f"Cannot access file: {file_path.name} ({exc})")
 
         content_type = CONTENT_TYPE_MAP.get(suffix, "application/octet-stream")
         return {
@@ -161,42 +170,32 @@ class LocalFilesService:
         try:
             stat_result = await asyncio.to_thread(file_path.stat)
         except OSError as exc:
-            raise ResourceNotFoundError(
-                f"Cannot access file: {file_path.name} ({exc})"
-            )
+            raise ResourceNotFoundError(f"Cannot access file: {file_path.name} ({exc})")
 
         file_size = stat_result.st_size
         content_type = CONTENT_TYPE_MAP.get(suffix, "application/octet-stream")
 
-        if range_header and range_header.startswith("bytes="):
-            range_spec = range_header[6:]
-            start_str, _, end_str = range_spec.partition("-")
-
-            try:
-                if not start_str and end_str:
-                    suffix_len = int(end_str)
-                    start = max(0, file_size - suffix_len)
-                    end = file_size - 1
-                elif start_str and not end_str:
-                    start = int(start_str)
-                    end = file_size - 1
-                elif start_str and end_str:
-                    start = int(start_str)
-                    end = int(end_str)
-                else:
-                    raise ValueError("Empty range")
-            except ValueError:
-                return self._iter_file(file_path, 0, file_size), {
-                    "Content-Type": content_type,
-                    "Content-Length": str(file_size),
-                    "Accept-Ranges": "bytes",
-                }, 200
+        if range_header:
+            match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", range_header)
+            if match is None or not any(match.groups()) or file_size == 0:
+                raise RangeNotSatisfiableError(file_size)
+            start_str, end_str = match.groups()
+            if not start_str:
+                suffix_len = int(end_str)
+                if suffix_len <= 0:
+                    raise RangeNotSatisfiableError(file_size)
+                start = max(0, file_size - suffix_len)
+                end = file_size - 1
+            elif not end_str:
+                start = int(start_str)
+                end = file_size - 1
+            else:
+                start = int(start_str)
+                end = int(end_str)
 
             end = min(end, file_size - 1)
             if start < 0 or start > end or start >= file_size:
-                raise ExternalServiceError(
-                    f"Range not satisfiable: {range_header} (file size: {file_size})"
-                )
+                raise RangeNotSatisfiableError(file_size)
 
             length = end - start + 1
 
@@ -235,9 +234,7 @@ class LocalFilesService:
                 extra={"path": str(path), "error": str(exc)},
             )
 
-    async def get_album_track_files(
-        self, album_id: int
-    ) -> list[dict[str, Any]]:
+    async def get_album_track_files(self, album_id: int) -> list[dict[str, Any]]:
         data = await self._library_repo.get_track_files_by_album(album_id)
         if not data:
             return []
@@ -249,14 +246,16 @@ class LocalFilesService:
             quality = tf.get("quality", {})
             quality_detail = quality.get("quality", {})
 
-            track_files.append({
-                "track_file_id": tf.get("id"),
-                "path": path_str,
-                "size_bytes": tf.get("size", 0),
-                "format": suffix if suffix else "unknown",
-                "bitrate": quality_detail.get("bitrate"),
-                "date_added": tf.get("dateAdded"),
-            })
+            track_files.append(
+                {
+                    "track_file_id": tf.get("id"),
+                    "path": path_str,
+                    "size_bytes": tf.get("size", 0),
+                    "format": suffix if suffix else "unknown",
+                    "bitrate": quality_detail.get("bitrate"),
+                    "date_added": tf.get("dateAdded"),
+                }
+            )
 
         return track_files
 
@@ -297,23 +296,23 @@ class LocalFilesService:
             except (TypeError, ValueError):
                 disc_num = 1
 
-            result.append(LocalTrackInfo(
-                track_file_id=tf_id,
-                title=track.get("title", "Unknown"),
-                track_number=track_num,
-                disc_number=disc_num,
-                duration_seconds=(track.get("duration_ms", 0) or 0) / 1000.0,
-                size_bytes=size,
-                format=fmt,
-                bitrate=tf.get("bitrate"),
-                date_added=tf.get("date_added"),
-            ))
+            result.append(
+                LocalTrackInfo(
+                    track_file_id=tf_id,
+                    title=track.get("title", "Unknown"),
+                    track_number=track_num,
+                    disc_number=disc_num,
+                    duration_seconds=(track.get("duration_ms", 0) or 0) / 1000.0,
+                    size_bytes=size,
+                    format=fmt,
+                    bitrate=tf.get("bitrate"),
+                    date_added=tf.get("date_added"),
+                )
+            )
 
         return result, total_size, format_counts
 
-    async def match_album_by_mbid(
-        self, musicbrainz_id: str
-    ) -> LocalAlbumMatch:
+    async def match_album_by_mbid(self, musicbrainz_id: str) -> LocalAlbumMatch:
         tracks = await self._library_repo.get_tracks(musicbrainz_id)
         if not tracks:
             return LocalAlbumMatch(found=False, musicbrainz_id=musicbrainz_id)
@@ -323,7 +322,11 @@ class LocalFilesService:
         format_counts: dict[str, int] = {}
         for t in result_tracks:
             format_counts[t.format] = format_counts.get(t.format, 0) + 1
-        primary_format = max(format_counts, key=lambda k: format_counts[k]) if format_counts else None
+        primary_format = (
+            max(format_counts, key=lambda k: format_counts[k])
+            if format_counts
+            else None
+        )
 
         return LocalAlbumMatch(
             found=True,
@@ -458,7 +461,12 @@ class LocalFilesService:
         page = (offset // max(limit, 1)) + 1
         sort = _LOCAL_SORT_TO_NATIVE.get(sort_by, "recent")
         albums, total = await self._library_repo.get_albums_page(
-            page=page, page_size=limit, sort=sort, q=search_query, file_format=None, decade=decade
+            page=page,
+            page_size=limit,
+            sort=sort,
+            q=search_query,
+            file_format=None,
+            decade=decade,
         )
         summaries = [self._native_album_to_summary(a) for a in albums]
         return LocalPaginatedResponse(
@@ -472,7 +480,9 @@ class LocalFilesService:
             track_file_id=str(row.get("id") or ""),
             title=row.get("track_title") or "Unknown",
             album_name=row.get("album_title") or "Unknown",
-            artist_name=row.get("album_artist_name") or row.get("artist_name") or "Unknown",
+            artist_name=row.get("album_artist_name")
+            or row.get("artist_name")
+            or "Unknown",
             album_mbid=mbid,
             cover_url=cover_url,
             format=row.get("file_format") or "",
@@ -532,30 +542,22 @@ class LocalFilesService:
             )
         return shelves
 
-    async def get_album_tracks_by_id(
-        self, mbid: str
-    ) -> list[LocalTrackInfo]:
+    async def get_album_tracks_by_id(self, mbid: str) -> list[LocalTrackInfo]:
         tracks = await self._library_repo.get_tracks(mbid)
         return [self._native_track_to_info(t) for t in tracks]
 
-    async def search_tracks(
-        self, query: str, limit: int = 30
-    ) -> list[CrateTrack]:
+    async def search_tracks(self, query: str, limit: int = 30) -> list[CrateTrack]:
         rows = await self._library_repo.search_tracks(query, limit=limit)
         return [self._row_to_crate_track(row, "surprise") for row in rows]
 
     async def search(self, query: str) -> LocalSearchResponse:
         """Combined library search: matching albums plus matching individual
         tracks (so typing an album name surfaces that album's songs)."""
-        album_result = await self.get_albums(
-            limit=20, offset=0, search_query=query
-        )
+        album_result = await self.get_albums(limit=20, offset=0, search_query=query)
         tracks = await self.search_tracks(query, limit=30)
         return LocalSearchResponse(albums=album_result.items, tracks=tracks)
 
-    async def get_recently_added(
-        self, limit: int = 20
-    ) -> list[LocalAlbumSummary]:
+    async def get_recently_added(self, limit: int = 20) -> list[LocalAlbumSummary]:
         ttl_seconds = self._get_recently_added_ttl()
         cache_key = f"{LOCAL_FILES_PREFIX}recently_added:{limit}"
         cached = await self._cache.get(cache_key)
@@ -613,4 +615,3 @@ class LocalFilesService:
                 return f"{size:.1f} {unit}"
             size /= 1024.0
         return f"{size:.1f} PB"
-

@@ -4,16 +4,19 @@ and domain-exception mapping (403/404/400)."""
 from unittest.mock import AsyncMock
 
 from fastapi import FastAPI
+import msgspec
 
 from api.v1.routes import downloads
 from core.dependencies import get_download_service
 from core.exceptions import (
+    ConflictError,
+    ConfigurationError,
     PermissionDeniedError,
     ResourceNotFoundError,
     ValidationError,
 )
-from middleware import _get_current_user
-from models.download import DownloadTask
+from middleware import _get_current_admin, _get_current_user
+from models.download import DownloadActivitySummary, DownloadTask
 from repositories.protocols.download_client import DownloadSearchResult
 from tests.helpers import build_test_client, mock_user
 
@@ -28,10 +31,17 @@ def _app(service) -> FastAPI:
     service.next_retry_at = lambda task: None
     service.auto_retry_max = 0
     service.retry_ladder_minutes = lambda: []
+    service.cleanup_states.return_value = {}
+    service.held_task_ids.return_value = set()
     app = FastAPI()
     app.include_router(downloads.router)
     app.dependency_overrides[get_download_service] = lambda: service
-    app.dependency_overrides[_get_current_user] = lambda: mock_user(role="user", user_id="u1")
+    app.dependency_overrides[_get_current_user] = lambda: mock_user(
+        role="user", user_id="u1"
+    )
+    app.dependency_overrides[_get_current_admin] = lambda: mock_user(
+        role="admin", user_id="admin-1"
+    )
     return app
 
 
@@ -52,12 +62,14 @@ def test_quarantine_route_not_shadowed_by_task_catchall():
     store.list_quarantine.return_value = []
 
     app = FastAPI()
-    app.include_router(quarantine.router)   # production order: literal /quarantine first
-    app.include_router(downloads.router)    # catch-all /{task_id} second
+    app.include_router(quarantine.router)  # production order: literal /quarantine first
+    app.include_router(downloads.router)  # catch-all /{task_id} second
     app.dependency_overrides[get_download_service] = lambda: service
     app.dependency_overrides[get_download_store] = lambda: store
     app.dependency_overrides[_get_current_admin] = mock_admin_user
-    app.dependency_overrides[_get_current_user] = lambda: mock_user(role="admin", user_id="u1")
+    app.dependency_overrides[_get_current_user] = lambda: mock_user(
+        role="admin", user_id="u1"
+    )
 
     response = build_test_client(app).get("/downloads/quarantine")
     assert response.status_code == 200
@@ -72,7 +84,65 @@ def test_list_downloads_returns_items_for_user():
     assert response.status_code == 200
     body = response.json()
     assert [item["id"] for item in body["items"]] == ["t1", "t2"]
+    assert body["items"][0]["release_mbid"] is None
+    assert body["items"][0]["release_track_mbid"] is None
     assert body["page"] == 1
+
+
+def test_activity_summary_is_compact_and_user_scoped():
+    service = AsyncMock()
+    service.get_activity_summary.return_value = DownloadActivitySummary(
+        revision=7,
+        active_count=2,
+        held_count=1,
+        failed_count=3,
+        landed_release_group_mbids=["rg-1"],
+    )
+
+    response = build_test_client(_app(service)).get("/downloads/activity-summary")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "revision": 7,
+        "active_count": 2,
+        "held_count": 1,
+        "failed_count": 3,
+        "landed_release_group_mbids": ["rg-1"],
+    }
+    service.get_activity_summary.assert_awaited_once_with("u1", "user")
+
+
+def test_list_downloads_marks_tasks_with_secured_files_for_review():
+    service = AsyncMock()
+    service.list_tasks.return_value = [_task("held"), _task("ordinary")]
+    app = _app(service)
+    service.held_task_ids.return_value = {"held"}
+
+    response = build_test_client(app).get("/downloads")
+
+    assert response.status_code == 200
+    assert [item["held_for_review"] for item in response.json()["items"]] == [
+        True,
+        False,
+    ]
+
+
+def test_list_downloads_batches_cleanup_state_without_exposing_paths():
+    service = AsyncMock()
+    service.list_tasks.return_value = [_task("t1"), _task("t2")]
+    app = _app(service)
+    service.cleanup_states.return_value = {"t1": "pending", "t2": "needs_attention"}
+
+    response = build_test_client(app).get("/downloads")
+
+    assert response.status_code == 200
+    assert [item["acquisition_cleanup_state"] for item in response.json()["items"]] == [
+        "pending",
+        "needs_attention",
+    ]
+    service.cleanup_states.assert_awaited_once_with(["t1", "t2"])
+    assert "workspace" not in response.text
+    assert "/sab" not in response.text
     service.list_tasks.assert_awaited_once_with(
         "u1", "user", status=None, release_group_mbid=None, page=1, page_size=20
     )
@@ -135,6 +205,81 @@ def test_cancel_success():
     service.cancel_task.assert_awaited_once_with("t1", "u1", "user")
 
 
+def test_try_next_source_success_for_owner():
+    service = AsyncMock()
+    service.try_next_source.return_value = _task(
+        "t1", status="queued", candidate_index=1
+    )
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/t1/next-source", json={"expected_candidate_index": 0}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "status": "queued",
+        "candidate_index": 1,
+    }
+    service.try_next_source.assert_awaited_once_with("t1", "u1", "user", 0)
+
+
+def test_try_next_source_allows_admin_role():
+    service = AsyncMock()
+    service.try_next_source.return_value = _task(
+        "t1", status="queued", candidate_index=1
+    )
+    app = _app(service)
+    app.dependency_overrides[_get_current_user] = lambda: mock_user(
+        role="admin", user_id="admin-1"
+    )
+
+    response = build_test_client(app).post(
+        "/downloads/t1/next-source", json={"expected_candidate_index": 0}
+    )
+
+    assert response.status_code == 200
+    service.try_next_source.assert_awaited_once_with("t1", "admin-1", "admin", 0)
+
+
+def test_try_next_source_non_owner_forbidden():
+    service = AsyncMock()
+    service.try_next_source.side_effect = PermissionDeniedError("not yours")
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/t1/next-source", json={"expected_candidate_index": 0}
+    )
+
+    assert response.status_code == 403
+
+
+def test_try_next_source_started_race_is_conflict():
+    service = AsyncMock()
+    service.try_next_source.side_effect = ConflictError(
+        "The transfer has already started"
+    )
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/t1/next-source", json={"expected_candidate_index": 0}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["message"] == "The transfer has already started"
+
+
+def test_try_next_source_requires_authentication():
+    service = AsyncMock()
+    app = FastAPI()
+    app.include_router(downloads.router)
+    app.dependency_overrides[get_download_service] = lambda: service
+
+    response = build_test_client(app).post(
+        "/downloads/t1/next-source", json={"expected_candidate_index": 0}
+    )
+
+    assert response.status_code == 401
+
+
 def test_retry_success_returns_new_task_id():
     service = AsyncMock()
     service.retry_task.return_value = "t2"
@@ -154,7 +299,9 @@ def test_retry_non_owner_forbidden():
 
 def test_retry_wrong_state_400():
     service = AsyncMock()
-    service.retry_task.side_effect = ValidationError("Only failed, cancelled or partial downloads can be retried")
+    service.retry_task.side_effect = ValidationError(
+        "Only failed, cancelled or partial downloads can be retried"
+    )
     response = build_test_client(_app(service)).post("/downloads/t1/retry")
     assert response.status_code == 400
 
@@ -201,7 +348,9 @@ def test_reimport_partial_is_success():
 def test_reimport_not_found_404():
     service = AsyncMock()
     service.reimport_task.side_effect = ResourceNotFoundError("Download task not found")
-    response = build_test_client(_admin_app(service)).post("/downloads/missing/reimport")
+    response = build_test_client(_admin_app(service)).post(
+        "/downloads/missing/reimport"
+    )
     assert response.status_code == 404
 
 
@@ -236,6 +385,38 @@ def test_response_completed_at_null_and_ladder_empty_by_default():
     body = response.json()
     assert body["completed_at"] is None
     assert body["retry_ladder_minutes"] == []
+
+
+def test_response_exposes_durable_quality_queue_and_attempt_details():
+    service = AsyncMock()
+    service.get_task.return_value = _task(
+        "t1",
+        quality_format="flac",
+        quality_bit_depth=24,
+        quality_sample_rate=48_000,
+        advertised_queue_depth=2710,
+        queue_position_start=91,
+        queue_position_end=100,
+        remote_queued=True,
+        preferred_quality_fallback_at=1234.5,
+        attempt_number=1,
+        attempt_total=3,
+        has_next_source=True,
+    )
+
+    response = build_test_client(_app(service)).get("/downloads/t1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["quality_format"] == "flac"
+    assert body["quality_bit_depth"] == 24
+    assert body["quality_sample_rate"] == 48_000
+    assert body["advertised_queue_depth"] == 2710
+    assert [body["queue_position_start"], body["queue_position_end"]] == [91, 100]
+    assert body["remote_queued"] is True
+    assert body["preferred_quality_fallback_at"] == 1234.5
+    assert [body["attempt_number"], body["attempt_total"]] == [1, 3]
+    assert body["has_next_source"] is True
 
 
 def test_clear_downloads_returns_count():
@@ -278,8 +459,12 @@ def test_get_files_returns_file_list():
     service = AsyncMock()
     files = [
         DownloadSearchResult(
-            username="peer", filename="A - B/01.flac", parent_directory="A - B",
-            size=123, extension="flac", duration=200.0,
+            username="peer",
+            filename="A - B/01.flac",
+            parent_directory="A - B",
+            size=123,
+            extension="flac",
+            duration=200.0,
         )
     ]
     service.get_task_files.return_value = (_task("t1", files_total=1), files)
@@ -299,9 +484,74 @@ def _held(held_path: str):
     from models.held_import import HeldImport
 
     return HeldImport(
-        id=1, user_id="u1", held_path=held_path, reason="fingerprint_mismatch",
-        source="usenet", status="held", created_at=0.0, track_title="You Shook Me",
+        id=1,
+        user_id="u1",
+        held_path=held_path,
+        reason="fingerprint_mismatch",
+        source="usenet",
+        status="held",
+        created_at=0.0,
+        track_title="You Shook Me",
     )
+
+
+def test_list_held_returns_durable_management_retry_schedule():
+    service = AsyncMock()
+    item = _held("/held/track.flac")
+    item = msgspec.structs.replace(
+        item,
+        reason="management:ROOT_UNAVAILABLE",
+        management_retry_count=2,
+        management_next_retry_at=1234.0,
+    )
+    service.list_held.return_value = [item]
+
+    response = build_test_client(_app(service)).get("/downloads/held")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["management_retry_count"] == 2
+    assert response.json()["items"][0]["management_next_retry_at"] == 1234.0
+
+
+def test_retry_management_hold_returns_album_level_result():
+    service = AsyncMock()
+    service.retry_management_hold.return_value = ["/music/a.flac", "/music/b.flac"]
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/management/t1/retry"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "imported", "files": 2}
+    service.retry_management_hold.assert_awaited_once_with("t1", "admin-1", "admin")
+
+
+def test_discard_management_hold_returns_album_level_result():
+    service = AsyncMock()
+    service.discard_management_hold.return_value = 10
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/management/t1/discard"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "discarded", "files": 10}
+    service.discard_management_hold.assert_awaited_once_with("t1", "admin-1", "admin")
+
+
+def test_import_held_without_library_root_is_400_configuration_error():
+    """Empty roots at 'Import anyway' time surfaces as an actionable 400, not a 500."""
+    service = AsyncMock()
+    service.import_held.side_effect = ConfigurationError(
+        "No library root is configured - restore one in Settings → Library, then try again."
+    )
+
+    response = build_test_client(_app(service)).post("/downloads/held/1/import")
+
+    assert response.status_code == 400
+    body = response.json()["error"]
+    assert body["code"] == "CONFIGURATION_ERROR"
+    assert "library root" in body["message"]
 
 
 def test_held_audio_streams_file_and_supports_range(tmp_path):
@@ -332,12 +582,15 @@ def test_held_audio_missing_file_is_404(tmp_path):
 
 def test_held_audio_not_owned_is_404():
     service = AsyncMock()
-    service.get_held = AsyncMock(return_value=None)  # ownership check failed / unknown id
+    service.get_held = AsyncMock(
+        return_value=None
+    )  # ownership check failed / unknown id
     resp = build_test_client(_app(service)).get("/downloads/held/1/audio")
     assert resp.status_code == 404
 
 
 # --- Quality upgrades (CollectionManagement Feature B, admin/trusted D18) ------
+
 
 def _curator_app(service, *, role: str = "admin") -> FastAPI:
     from middleware import _get_current_curator
@@ -372,14 +625,20 @@ def test_upgrade_routes_require_authentication():
     service = AsyncMock()
     client = build_test_client(_app(service))
     assert client.get("/downloads/cutoff-unmet").status_code == 401
-    assert client.post(
-        "/downloads/upgrade/album",
-        json={"release_group_mbid": "rg", "artist_name": "A", "album_title": "B"},
-    ).status_code == 401
-    assert client.post(
-        "/downloads/upgrade/track",
-        json={"recording_mbid": "rec", "artist_name": "A", "track_title": "T"},
-    ).status_code == 401
+    assert (
+        client.post(
+            "/downloads/upgrade/album",
+            json={"release_group_mbid": "rg", "artist_name": "A", "album_title": "B"},
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(
+            "/downloads/upgrade/track",
+            json={"recording_mbid": "rec", "artist_name": "A", "track_title": "T"},
+        ).status_code
+        == 401
+    )
     service.list_cutoff_unmet.assert_not_awaited()
     service.request_upgrade_album.assert_not_awaited()
 
@@ -388,15 +647,21 @@ def test_cutoff_unmet_returns_worklist_for_curator():
     service = AsyncMock()
     service.list_cutoff_unmet.return_value = [
         {
-            "release_group_mbid": "rg-1", "current_tier": "mp3_192", "track_count": 10,
-            "artist_name": "Radiohead", "artist_mbid": "am-1",
-            "album_title": "OK Computer", "year": 1997,
+            "release_group_mbid": "rg-1",
+            "current_tier": "mp3_192",
+            "track_count": 10,
+            "artist_name": "Radiohead",
+            "artist_mbid": "am-1",
+            "album_title": "OK Computer",
+            "year": 1997,
         }
     ]
     service.quality_cutoff = "lossless"
     service.upgrade_allowed = True
 
-    resp = build_test_client(_curator_app(service, role="trusted")).get("/downloads/cutoff-unmet")
+    resp = build_test_client(_curator_app(service, role="trusted")).get(
+        "/downloads/cutoff-unmet"
+    )
 
     assert resp.status_code == 200
     body = resp.json()

@@ -3,6 +3,7 @@ from pydantic import Field, TypeAdapter, ValidationError as PydanticValidationEr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Self
 import logging
+import os
 import msgspec
 from core.exceptions import ConfigurationError
 from infrastructure.file_utils import atomic_write_json, read_json
@@ -10,6 +11,44 @@ from infrastructure.file_utils import atomic_write_json, read_json
 logger = logging.getLogger(__name__)
 
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_PREFERENCES_OWNED_CONFIG_KEYS = frozenset(
+    {
+        "_internal",
+        "_legacy_lidarr",
+        "advanced_settings",
+        "connect_apps",
+        "download_client",
+        "download_clients",
+        "download_policy",
+        "events",
+        "free_music",
+        "get_it",
+        "home_settings",
+        "indexers",
+        "jellyfin_settings",
+        "lastfm_settings",
+        "library_scan_schedule",
+        "library_settings",
+        "library_sync_settings",
+        "lidarr_import",
+        "listenbrainz_settings",
+        "local_files_settings",
+        "musicbrainz_settings",
+        "navidrome_settings",
+        "oidc_settings",
+        "plex_settings",
+        "plugins",
+        "primary_music_source",
+        "scrobble_settings",
+        "security_settings",
+        "source_priority",
+        "spotify_settings",
+        "user_preferences",
+        "wanted",
+        "wrapped_settings",
+        "youtube_settings",
+    }
+)
 
 
 class Settings(BaseSettings):
@@ -46,8 +85,8 @@ class Settings(BaseSettings):
     library_db_path: Path = Field(default=Path("/app/cache/library.db"), description="SQLite library database path")
     cover_cache_max_size_mb: int = Field(default=500, description="Maximum cover cache size in MB")
     trusted_proxy_ips: str = Field(
-        default="*",
-        description="Comma-separated IPs/CIDRs trusted as reverse proxies for X-Forwarded-* headers. Use '*' to trust all (default, safe behind a single-host Docker setup). Restrict to your proxy's IP in production.",
+        default="127.0.0.1",
+        description="Comma-separated IPs/CIDRs trusted as reverse proxies for X-Forwarded-* headers. Configure the private proxy network in a reverse-proxy deployment; never use '*' on a directly reachable service.",
     )
     slskd_downloads_path: Path = Field(
         default=Path("/data/downloads/slskd"),
@@ -119,8 +158,10 @@ class Settings(BaseSettings):
         return self
     
     def get_user_agent(self) -> str:
+        version = os.environ.get("COMMIT_TAG", "dev")
         id_part = self.instance_id[:8] if self.instance_id else "unknown"
-        return f"DroppedNeedle/1.0 ({id_part}; {self.contact_email}; https://www.droppedneedle.com)"
+        email = (self.contact_email or "").strip() or "contact@droppedneedle.com"
+        return f"DroppedNeedleApp/{version} ({id_part}; {email}; https://www.droppedneedle.com)"
 
     def load_from_file(self) -> None:
         if not self.config_file_path.exists():
@@ -137,7 +178,8 @@ class Settings(BaseSettings):
             validated_values: dict[str, object] = {}
             for key, value in config_data.items():
                 if key not in model_fields:
-                    logger.warning("Unknown config key '%s', ignoring", key)
+                    if key not in _PREFERENCES_OWNED_CONFIG_KEYS:
+                        logger.warning("Unknown config key '%s', ignoring", key)
                     continue
                 try:
                     field_info = model_fields[key]

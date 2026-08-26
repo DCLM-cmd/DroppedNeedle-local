@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { RotateCcw, TimerOff, X } from 'lucide-svelte';
+	import { FolderLock, RotateCcw, TimerOff, X } from 'lucide-svelte';
 
 	import {
 		cancelDownload,
@@ -14,15 +14,21 @@
 		retryDisplay
 	} from '$lib/queries/downloads/downloadStatus';
 	import { downloadStatusConfig } from '$lib/queries/downloads/downloadStatusConfig';
-	import type { DownloadTask } from '$lib/types';
+	import type { DownloadTask, HeldImport } from '$lib/types';
 
 	import DownloadProgressBar from './DownloadProgressBar.svelte';
+	import DownloadSourceStatus from './DownloadSourceStatus.svelte';
 	import DownloadStatusBadge from './DownloadStatusBadge.svelte';
 	import VinylProgress from './VinylProgress.svelte';
 
 	// the album's in-flight (or actionable failed/partial) download. The Pressing strip - same vinyl
 	// language as the Downloads page, so a download reads the same on both screens.
-	let { task }: { task: DownloadTask } = $props();
+	interface Props {
+		task: DownloadTask;
+		managementHeld?: HeldImport[];
+	}
+
+	let { task, managementHeld = [] }: Props = $props();
 
 	const cancel = cancelDownload();
 	const retry = retryDownload();
@@ -37,6 +43,11 @@
 	const cfg = $derived(downloadStatusConfig[derivedStatus]);
 	const isSearching = $derived(derivedStatus === 'searching');
 	const isReview = $derived(derivedStatus === 'awaiting_review');
+	const isManagementHold = $derived(managementHeld.length > 0);
+	const managementDetail = $derived(managementHeld[0]?.reason_detail?.trim() || null);
+	const securedFileLabel = $derived(
+		`${managementHeld.length} ${managementHeld.length === 1 ? 'file' : 'files'} secured`
+	);
 	const isQueued = $derived(derivedStatus === 'queued');
 	const isDownloading = $derived(task.status === 'downloading');
 	const isProcessing = $derived(task.status === 'processing');
@@ -70,13 +81,26 @@
 			<VinylProgress percent={livePct} {indeterminate} spinning size={44} />
 		{:else}
 			<div class="grid size-11 place-items-center rounded-full bg-base-300/70 text-base-content/70">
-				<cfg.icon class="h-5 w-5" aria-hidden="true" />
+				{#if isManagementHold}
+					<FolderLock class="h-5 w-5 text-warning" aria-hidden="true" />
+				{:else}
+					<cfg.icon class="h-5 w-5" aria-hidden="true" />
+				{/if}
 			</div>
 		{/if}
 	</div>
 
 	<div class="min-w-0 flex-1">
-		<DownloadStatusBadge {task} />
+		{#if isManagementHold}
+			<p class="text-xs font-bold text-warning">Organizer paused · {securedFileLabel}</p>
+			{#if managementDetail}
+				<p class="mt-1 line-clamp-2 text-xs leading-relaxed text-base-content/65">
+					{managementDetail}
+				</p>
+			{/if}
+		{:else}
+			<DownloadStatusBadge {task} />
+		{/if}
 		{#if showBar}
 			<div class="mt-1.5 max-w-sm">
 				<DownloadProgressBar
@@ -91,14 +115,24 @@
 		{#if isRetrying}
 			<p class="mt-1 text-xs text-base-content/60">Trying another source…</p>
 		{/if}
-		{#if task.error_message}
-			<p class="mt-1 line-clamp-2 text-xs text-error/80">{task.error_message}</p>
+		{#if !isReview}
+			<DownloadSourceStatus
+				{task}
+				live={stream.state.source}
+				bytesDownloaded={progress?.bytes_downloaded ?? task.downloaded_bytes}
+				compact
+			/>
+			{#if task.error_message}
+				<p class="mt-1 line-clamp-2 text-xs text-error/80">{task.error_message}</p>
+			{/if}
 		{/if}
 	</div>
 
 	<div class="flex shrink-0 items-center gap-1.5">
 		{#if isReview}
-			<a href="/downloads" class="btn btn-primary btn-xs">Review</a>
+			<a href="/downloads" class="btn btn-primary btn-xs">
+				{isManagementHold ? 'Review organizer' : 'Review'}
+			</a>
 		{/if}
 		{#if canCancel(task)}
 			<button

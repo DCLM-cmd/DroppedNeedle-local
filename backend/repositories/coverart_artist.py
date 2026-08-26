@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 LOCAL_SOURCE_TIMEOUT_SECONDS = 1.0
 T = TypeVar("T")
-DEFAULT_EXTERNAL_USER_AGENT = "DroppedNeedle/1.0 (contact@droppedneedle.com; https://www.droppedneedle.com)"
+DEFAULT_EXTERNAL_USER_AGENT = "DroppedNeedleApp/1.0 (contact@droppedneedle.com; https://www.droppedneedle.com)"
 
 
 class TransientImageFetchError(Exception):

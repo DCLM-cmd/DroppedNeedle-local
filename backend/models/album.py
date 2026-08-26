@@ -7,6 +7,7 @@ class Track(AppStruct):
     disc_number: int = 1
     length: int | None = None
     recording_id: str | None = None
+    release_track_id: str | None = None
 
 
 class AlbumInfo(AppStruct):
@@ -36,3 +37,4 @@ class AlbumInfo(AppStruct):
     album_3d_face_url: str | None = None
     album_3d_thumb_url: str | None = None
     service_status: dict[str, str] | None = None
+    selected_release_mbid: str | None = None

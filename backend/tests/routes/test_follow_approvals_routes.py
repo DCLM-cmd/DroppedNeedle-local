@@ -60,6 +60,7 @@ def ctx(tmp_path: Path):
     # the pending count also sums Weekly Mix grants; keep them empty here
     personal_mix_service = AsyncMock()
     personal_mix_service.list_pending_approvals = AsyncMock(return_value=[])
+    personal_mix_service.count_pending_approvals = AsyncMock(return_value=0)
 
     app = FastAPI()
     app.include_router(requests_router)

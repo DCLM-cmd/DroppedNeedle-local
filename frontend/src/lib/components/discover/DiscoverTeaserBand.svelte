@@ -47,6 +47,7 @@
 							mbid={artist.mbid ?? ''}
 							alt={artist.name}
 							size="full"
+							requestSize={250}
 							lazy={true}
 							className="block h-full w-full object-cover"
 						/>

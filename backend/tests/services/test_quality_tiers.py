@@ -6,6 +6,7 @@ from repositories.protocols.download_client import DownloadSearchResult
 from services.native.quality_tiers import (
     candidate_tier,
     file_tier,
+    folder_hires_key,
     in_range,
     is_flac_or_mp3,
     should_acquire,
@@ -14,7 +15,14 @@ from services.native.quality_tiers import (
 )
 
 
-def _f(filename: str, *, ext: str = "", bitrate: int | None = None) -> DownloadSearchResult:
+def _f(
+    filename: str,
+    *,
+    ext: str = "",
+    bitrate: int | None = None,
+    bit_depth: int | None = None,
+    sample_rate: int | None = None,
+) -> DownloadSearchResult:
     return DownloadSearchResult(
         username="u",
         filename=filename,
@@ -22,6 +30,8 @@ def _f(filename: str, *, ext: str = "", bitrate: int | None = None) -> DownloadS
         size=1,
         extension=ext,
         bitrate=bitrate,
+        bit_depth=bit_depth,
+        sample_rate=sample_rate,
     )
 
 
@@ -51,6 +61,13 @@ def test_candidate_tier_is_worst_file():
     assert candidate_tier([]) == "low"
 
 
+def test_hires_folder_uses_conservative_defaults_for_missing_file_metadata():
+    known = _f("a.flac", bit_depth=24, sample_rate=96_000)
+    unknown = _f("b.flac")
+
+    assert folder_hires_key([known, unknown]) == (16, 44_100)
+
+
 def test_in_range_inclusive():
     assert in_range("mp3_320", "mp3_320", "lossless")
     assert in_range("lossless", "mp3_320", "lossless")
@@ -67,13 +84,20 @@ def test_is_flac_or_mp3():
 
 
 def test_tier_rank_order():
-    assert tier_rank("lossless") > tier_rank("mp3_320") > tier_rank("mp3_192") > tier_rank("low")
+    assert (
+        tier_rank("lossless")
+        > tier_rank("mp3_320")
+        > tier_rank("mp3_192")
+        > tier_rank("low")
+    )
 
 
 def test_tier_for_matches_file_tier():
     # tier_for(format, bitrate) is the shared classifier behind file_tier + the library lookup.
     assert tier_for("flac", None) == "lossless"
-    assert tier_for(".FLAC", None) == "lossless"   # case/dot tolerant (library file_format)
+    assert (
+        tier_for(".FLAC", None) == "lossless"
+    )  # case/dot tolerant (library file_format)
     assert tier_for("mp3", 320) == "mp3_320"
     assert tier_for("mp3", 256) == "mp3_256"
     assert tier_for("mp3", 200) == "mp3_192"

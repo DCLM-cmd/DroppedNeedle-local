@@ -132,6 +132,8 @@ class DownloadTaskResponse(AppStruct):
     # (derived as source=="usenet" && download_type=="track").
     source: str
     release_group_mbid: str
+    release_mbid: str | None
+    release_track_mbid: str | None
     recording_mbid: str | None
     artist_name: str
     album_title: str
@@ -163,6 +165,19 @@ class DownloadTaskResponse(AppStruct):
     # The FULL auto-retry backoff schedule, in minutes, for the configured attempt cap
     # (e.g. [15, 30, 60, 120, 240, 480]). Empty when auto-retry is off / retry_max == 0.
     retry_ladder_minutes: list[int] = []
+    acquisition_cleanup_state: str = "not_tracked"
+    quality_format: str | None = None
+    quality_bit_depth: int | None = None
+    quality_sample_rate: int | None = None
+    advertised_queue_depth: int | None = None
+    queue_position_start: int | None = None
+    queue_position_end: int | None = None
+    remote_queued: bool = False
+    preferred_quality_fallback_at: float | None = None
+    attempt_number: int = 0
+    attempt_total: int = 0
+    has_next_source: bool = False
+    held_for_review: bool = False
 
 
 class HeldImportResponse(AppStruct):
@@ -173,6 +188,8 @@ class HeldImportResponse(AppStruct):
 
     id: int
     release_group_mbid: str | None
+    release_mbid: str | None
+    release_track_mbid: str | None
     recording_mbid: str | None
     track_number: int | None
     disc_number: int | None
@@ -184,12 +201,15 @@ class HeldImportResponse(AppStruct):
     file_format: str | None
     duration_seconds: float | None
     reason: str
+    reason_detail: str | None
     source: str
     source_task_id: str | None
     created_at: float
     evidence_title: str | None = None
     evidence_artist: str | None = None
     evidence_score: float | None = None
+    management_retry_count: int = 0
+    management_next_retry_at: float | None = None
 
 
 class HeldListResponse(AppStruct):
@@ -201,10 +221,23 @@ class HeldActionResponse(AppStruct):
     final_path: str | None = None
 
 
+class HeldManagementActionResponse(AppStruct):
+    status: str
+    files: int
+
+
 class DownloadListResponse(AppStruct):
     items: list[DownloadTaskResponse]
     page: int
     page_size: int
+
+
+class DownloadActivitySummaryResponse(AppStruct):
+    revision: int
+    active_count: int
+    held_count: int
+    failed_count: int
+    landed_release_group_mbids: list[str] = []
 
 
 class DownloadFileItem(AppStruct):
@@ -228,6 +261,16 @@ class DownloadFilesResponse(AppStruct):
 class CancelDownloadResponse(AppStruct):
     success: bool
     status: str = "cancelled"
+
+
+class NextSourceRequest(AppStruct):
+    expected_candidate_index: int
+
+
+class NextSourceResponse(AppStruct):
+    success: bool
+    status: str
+    candidate_index: int
 
 
 class RetryDownloadResponse(AppStruct):

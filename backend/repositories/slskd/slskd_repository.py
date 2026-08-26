@@ -21,6 +21,7 @@ from pathlib import Path
 
 from models.common import ServiceStatus
 from repositories.protocols.download_client import (
+    DownloadMaterialization,
     DownloadSearchResult,
     DownloadTaskStatus,
     EnqueueRequest,
@@ -77,7 +78,9 @@ class SlskdRepository:
         version_block = info.get("version") if isinstance(info, dict) else None
         version = None
         if isinstance(version_block, dict):
-            version = version_block.get("current") or version_block.get("currentVersion")
+            version = version_block.get("current") or version_block.get(
+                "currentVersion"
+            )
         return ServiceStatus(
             status="ok",
             version=version,
@@ -132,7 +135,12 @@ class SlskdRepository:
             payload = [{"filename": f.filename, "size": f.size} for f in files]
             result = await self._client.enqueue(username, payload)
         if result.failed:
-            logger.warning("slskd rejected %d/%d files for %s", len(result.failed), len(files), username)
+            logger.warning(
+                "slskd rejected %d/%d files for %s",
+                len(result.failed),
+                len(files),
+                username,
+            )
         # correlation key must reflect what slskd accepted, not the input set, or
         # get_status/cancel poll forever on transfers never created for rejected files
         return TaskHandle(
@@ -147,71 +155,53 @@ class SlskdRepository:
         matched = [t for t in transfers if t.filename in wanted]
         return self._aggregate_status(handle, matched)
 
-    async def cancel(self, handle: TaskHandle) -> bool:
+    async def abort(self, handle: TaskHandle) -> bool:
+        return await self._remove_transfer_records(handle)
+
+    async def inspect_materialization(
+        self, handle: TaskHandle
+    ) -> DownloadMaterialization:
+        status = await self.get_status(handle)
+        paths = await self.list_completed_files(handle)
+        healthy = await asyncio.to_thread(self._downloads_mount_healthy)
+        if status.status in {"completed"}:
+            state = "completed"
+        elif status.status in {"partial", "failed"}:
+            state = "failed"
+        elif status.matched_transfers:
+            state = "active"
+        else:
+            state = "missing"
+        return DownloadMaterialization(
+            state=state,
+            mount_root=str(self._downloads_mount),
+            file_paths=[str(path) for path in paths],
+            mount_healthy=healthy,
+        )
+
+    async def discard_client_artifacts(self, handle: TaskHandle) -> bool:
+        return await self._remove_transfer_records(handle)
+
+    async def _remove_transfer_records(self, handle: TaskHandle) -> bool:
         transfers = await self._client.get_downloads(handle.username)
         wanted = set(handle.filenames)
         ok = True
         for transfer in transfers:
             if transfer.filename in wanted:
-                ok = await self._client.cancel_transfer(handle.username, transfer.id) and ok
-        # Remove this task's leftover files from the downloads mount (the SABnzbd
-        # path's del_files equivalent). Imported audio was MOVED out of the mount
-        # already, so anything still locatable here is a failed/rejected download
-        # that would otherwise sit on disk forever and fill the filesystem. Scoped
-        # to exactly the files we enqueued, resolved by the same mount-confined
-        # locator the import uses. Off the event loop (bounded filesystem walks).
-        await asyncio.to_thread(
-            self._remove_leftover_files, handle.username, list(handle.filenames)
-        )
+                ok = (
+                    await self._client.cancel_transfer(handle.username, transfer.id)
+                    and ok
+                )
         return ok
 
-    def _remove_leftover_files(self, username: str, filenames: list[str]) -> None:
-        """Best-effort delete of this handle's still-present files inside the
-        downloads mount, pruning directories left empty. Never raises."""
-        mount = self._downloads_mount
+    def _downloads_mount_healthy(self) -> bool:
         try:
-            mount_resolved = mount.resolve()
-            if not mount.is_dir():
-                return
+            if not self._downloads_mount.is_dir():
+                return False
+            next(self._downloads_mount.iterdir(), None)
+            return True
         except OSError:
-            return
-        for filename in filenames:
-            try:
-                located = self._locate_file(username, filename)
-                if located is None or not located.is_relative_to(mount_resolved):
-                    continue
-                # Remove the located file AND every slskd collision variant of it in the
-                # same directory (retried downloads of the same track saved as
-                # {stem}_{ticks}{ext}) - otherwise each retry leaves one more copy behind.
-                basename = located.name
-                parts = [p for p in re.split(r"[\\/]", filename) if p]
-                if parts:
-                    basename = parts[-1]
-                matches = self._collision_matcher(basename)
-                removed = 0
-                for entry in list(located.parent.iterdir()):
-                    if entry.is_file() and (entry == located or matches(entry.name)):
-                        entry.unlink(missing_ok=True)
-                        removed += 1
-                if removed:
-                    logger.info(
-                        "Removed %d leftover download file(s) for %s", removed, basename
-                    )
-                self._prune_empty_dirs(located.parent, mount_resolved)
-            except OSError as exc:
-                logger.warning("Could not remove leftover file %r: %s", filename, exc)
-
-    @staticmethod
-    def _prune_empty_dirs(directory: Path, mount: Path) -> None:
-        """Remove now-empty directories from ``directory`` up to (never including)
-        the mount root."""
-        current = directory.resolve()
-        while current != mount and current.is_relative_to(mount):
-            try:
-                current.rmdir()  # fails on non-empty - exactly the stop condition
-            except OSError:
-                return
-            current = current.parent
+            return False
 
     async def list_completed_files(self, handle: TaskHandle) -> list[Path]:
         """slskd already knows its filenames (from the search/handle), so resolve
@@ -237,48 +227,6 @@ class SlskdRepository:
             self._locate_file, handle.username, remote_filename, size
         )
 
-    @staticmethod
-    def _collision_matcher(basename: str):
-        """Predicate matching ``basename`` OR an slskd duplicate-download variant of it.
-
-        When the target filename already exists on disk (a retried/failed-over album
-        re-downloading the same track), slskd saves the new copy as
-        ``{stem}_{ticks}{ext}`` (e.g. ``Song_638196515567596428.flac``). The exact-name
-        locator never matched those, so re-downloads could neither be imported nor
-        cleaned up - they piled up on the mount forever."""
-        stem, dot, ext = basename.rpartition(".")
-        if not dot:
-            stem, ext = basename, ""
-        pattern = re.compile(
-            re.escape(stem) + r"_\d{6,20}" + (re.escape(f".{ext}") if ext else "") + r"\Z",
-            re.IGNORECASE,
-        )
-
-        def matches(name: str) -> bool:
-            return name == basename or pattern.match(name) is not None
-
-        return matches
-
-    def _pick_in_dir(self, directory: Path, basename: str) -> Path | None:
-        """The file for ``basename`` inside ``directory``: the exact name when present,
-        else the NEWEST slskd collision variant (``stem_<ticks>.ext``), else None."""
-        exact = directory / basename
-        try:
-            if exact.exists():
-                return exact
-            if not directory.is_dir():
-                return None
-            matches = self._collision_matcher(basename)
-            variants = [e for e in directory.iterdir() if e.is_file() and matches(e.name)]
-        except OSError:
-            return None
-        if not variants:
-            return None
-        try:
-            return max(variants, key=lambda e: e.stat().st_mtime)
-        except OSError:
-            return variants[0]
-
     def _locate_file(
         self, username: str, remote_filename: str, size: int | None = None
     ) -> Path | None:
@@ -295,7 +243,9 @@ class SlskdRepository:
         match for when slskd sanitised the on-disk filename and the basename no
         longer matches. The remote filename is untrusted, so every candidate is
         confined to the mount."""
-        parts = [p for p in re.split(r"[\\/]", remote_filename) if p and p not in (".", "..")]
+        parts = [
+            p for p in re.split(r"[\\/]", remote_filename) if p and p not in (".", "..")
+        ]
         if not parts:
             return None
         mount = self._downloads_mount.resolve()
@@ -304,47 +254,43 @@ class SlskdRepository:
         def _within_mount(candidate: Path) -> Path | None:
             resolved = candidate.resolve()
             if not resolved.is_relative_to(mount):
-                logger.warning("slskd path escapes the downloads mount: %r", remote_filename)
+                logger.warning(
+                    "slskd path escapes the downloads mount: %r", remote_filename
+                )
                 return None
             return resolved
 
-        name_matches = self._collision_matcher(basename)
         # 1. slskd's common layout: {mount}/{leaf remote folder}/{filename}.
         if len(parts) >= 2:
-            hit = self._pick_in_dir(mount / parts[-2], basename)
-            if hit is not None:
-                leaf = _within_mount(hit)
-                if leaf is not None:
-                    return leaf
+            leaf = _within_mount(mount / parts[-2] / basename)
+            if leaf is not None and leaf.exists():
+                return leaf
         # 2. Flat layout: {mount}/{filename}.
-        hit = self._pick_in_dir(mount, basename)
-        if hit is not None:
-            flat = _within_mount(hit)
-            if flat is not None:
-                return flat
+        flat = _within_mount(mount / basename)
+        if flat is not None and flat.exists():
+            return flat
         # 3. Peers that file by username: walk {mount}/{username}/ at any depth
         # (covers {username}/{file} and {username}/{album}/{file}). Scoped to the
         # peer so a same-named track from a different user can't be picked up.
         user_root = _within_mount(mount / username) if username else None
         if user_root is not None and user_root.is_dir():
-            hit = self._walk_find(user_root, mount, lambda e: name_matches(e.name))
+            hit = self._walk_find(user_root, mount, lambda e: e.name == basename)
             if hit is not None:
                 return hit
         # 4. slskd may have sanitised the folder name - scan one level down for it.
         try:
             for child in sorted(mount.iterdir()):
                 if child.is_dir():
-                    found = self._pick_in_dir(child, basename)
-                    if found is not None:
-                        cand = _within_mount(found)
-                        if cand is not None:
-                            return cand
+                    cand = _within_mount(child / basename)
+                    if cand is not None and cand.exists():
+                        return cand
         except OSError as exc:
             logger.warning("Could not scan downloads mount %s: %s", mount, exc)
         # 5. Last resort: slskd sanitised the FILENAME (illegal chars stripped), so
         # the basename no longer matches. An exact byte-size match under the peer's
         # folder recovers it - size is a strong key and the scope keeps it precise.
         if size and user_root is not None and user_root.is_dir():
+
             def _matches_size(entry: Path) -> bool:
                 try:
                     return entry.stat().st_size == size
@@ -354,6 +300,7 @@ class SlskdRepository:
             hit = self._walk_find(user_root, mount, _matches_size)
             if hit is not None:
                 return hit
+
         # 6. Whole-mount fallback for a file nested deeper than the cheap steps look,
         # under a folder that isn't the peer's username (e.g. {downloads}/{artist}/
         # {album}/{file}). Exact basename match across the mount, validated by byte size
@@ -361,7 +308,7 @@ class SlskdRepository:
         # a different same-named track - an unscoped size-ONLY walk would cross peers
         # (step 5 stays peer-scoped on purpose). Reached only after every step missed.
         def _name_size_match(entry: Path) -> bool:
-            if not name_matches(entry.name):
+            if entry.name != basename:
                 return False
             if not size:
                 return True
@@ -431,7 +378,9 @@ class SlskdRepository:
         completed = [t for t in transfers if "succeeded" in self._state_flags(t.state)]
         if not completed:
             return MountDiagnosis(
-                supported=True, completed_downloads=0, mount_has_files=True,
+                supported=True,
+                completed_downloads=0,
+                mount_has_files=True,
                 client_downloads_dir=client_dir,
             )
         # Resolve a small sample under the mount - the cheap get_file_path steps hit
@@ -488,7 +437,9 @@ class SlskdRepository:
             return False
         return False
 
-    async def _run_search(self, query: str, timeout: float) -> list[DownloadSearchResult]:
+    async def _run_search(
+        self, query: str, timeout: float
+    ) -> list[DownloadSearchResult]:
         async with self._search_semaphore:
             search = await self._client.start_search(query, timeout_seconds=timeout)
             loop = asyncio.get_running_loop()
@@ -571,9 +522,7 @@ class SlskdRepository:
         while matching the same files ("*nter *hikari" -> lots). An apostrophe
         right after the first letter is absorbed into the wildcard (D'Angelo ->
         *Angelo) so matching no longer depends on the peer's apostrophe form."""
-        return " ".join(
-            SlskdRepository._wildcard_word(w) for w in artist.split()
-        )
+        return " ".join(SlskdRepository._wildcard_word(w) for w in artist.split())
 
     @staticmethod
     def _wildcard_word(word: str) -> str:
@@ -627,13 +576,16 @@ class SlskdRepository:
                         filename=file.filename,
                         parent_directory=parent,
                         size=file.size,
-                        extension=SlskdRepository._extension_from_filename(file.filename),
+                        extension=SlskdRepository._extension_from_filename(
+                            file.filename
+                        ),
                         bitrate=file.bit_rate,
                         bit_depth=file.bit_depth,
                         sample_rate=file.sample_rate,
                         duration=file.length,
                         has_free_slot=resp.has_free_upload_slot,
                         upload_speed=resp.upload_speed or 0,
+                        queue_length=resp.queue_length,
                     )
                 )
         return results
@@ -651,7 +603,9 @@ class SlskdRepository:
         return {flag.strip().lower() for flag in state.split(",") if flag.strip()}
 
     @staticmethod
-    def _accepted_filenames(result: SlskdEnqueueResponse, requested: list[str]) -> list[str]:
+    def _accepted_filenames(
+        result: SlskdEnqueueResponse, requested: list[str]
+    ) -> list[str]:
         """Filenames slskd actually accepted. Enqueued/Failed entries are
         untyped: extract filenames when present, else requested-minus-failed,
         else the full requested set."""
@@ -681,12 +635,22 @@ class SlskdRepository:
         failed = 0
         succeeded_filenames: list[str] = []
         has_active_transfer = False
+        queue_positions: list[int] = []
         for transfer in transfers:
             flags = self._state_flags(transfer.state)
+            if transfer.place_in_queue is not None and transfer.place_in_queue >= 0:
+                queue_positions.append(transfer.place_in_queue)
             if "succeeded" in flags:
                 completed += 1
                 succeeded_filenames.append(transfer.filename)
-            elif flags & {"errored", "cancelled", "failed", "rejected", "timedout", "aborted"}:
+            elif flags & {
+                "errored",
+                "cancelled",
+                "failed",
+                "rejected",
+                "timedout",
+                "aborted",
+            }:
                 # 'aborted' (a "Completed, Aborted" transfer) is terminal-failed, not active:
                 # without it the file never reaches a terminal count and the task waits out
                 # the full queued_timeout (~2h) instead of failing over on the next poll.
@@ -726,4 +690,6 @@ class SlskdRepository:
             succeeded_filenames=succeeded_filenames,
             has_active_transfer=has_active_transfer,
             matched_transfers=len(transfers),
+            queue_position_start=min(queue_positions) if queue_positions else None,
+            queue_position_end=max(queue_positions) if queue_positions else None,
         )

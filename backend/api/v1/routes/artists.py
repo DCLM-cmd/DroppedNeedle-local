@@ -90,6 +90,7 @@ async def get_artist_extended(
 @router.get("/{artist_id}/releases", response_model=ArtistReleases)
 async def get_artist_releases(
     artist_id: str,
+    request: Request,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
     artist_service: ArtistService = Depends(get_artist_service)
@@ -101,7 +102,12 @@ async def get_artist_releases(
         )
     
     try:
-        return await artist_service.get_artist_releases(artist_id, offset, limit)
+        return await artist_service.get_artist_releases(
+            artist_id,
+            offset,
+            limit,
+            is_disconnected=request.is_disconnected,
+        )
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

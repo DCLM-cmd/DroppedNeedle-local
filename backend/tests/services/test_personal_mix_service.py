@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from core.exceptions import ConfigurationError
+from infrastructure.queue.priority_queue import RequestPriority
 from services.native.download_service import ALREADY_IN_LIBRARY
 from services.personal_mix_service import PersonalMixService
 from tests.helpers import make_builtin_dispatcher
@@ -28,8 +29,11 @@ def _stale_iso() -> str:
 
 def _mix_track(title, creator, album, caa_release_mbid, artist_mbid, recording_mbid):
     return SimpleNamespace(
-        title=title, creator=creator, album=album,
-        caa_release_mbid=caa_release_mbid, recording_mbid=recording_mbid,
+        title=title,
+        creator=creator,
+        album=album,
+        caa_release_mbid=caa_release_mbid,
+        recording_mbid=recording_mbid,
         artist_mbids=[artist_mbid] if artist_mbid else None,
     )
 
@@ -38,7 +42,9 @@ def _lb_playlist(tracks):
     return SimpleNamespace(tracks=tracks)
 
 
-def _playlist_record(id="mix-1", updated_at="2025-01-01T00:00:00+00:00", user_id="user-a"):
+def _playlist_record(
+    id="mix-1", updated_at="2025-01-01T00:00:00+00:00", user_id="user-a"
+):
     return SimpleNamespace(id=id, updated_at=updated_at, user_id=user_id)
 
 
@@ -52,7 +58,9 @@ def svc():
     client_factory.resolve_listenbrainz_username = AsyncMock(return_value="alice")
 
     mb_repo = AsyncMock()
-    mb_repo.get_release_group_id_from_release = AsyncMock(side_effect=lambda rid: rid.replace("caa-", "rg-"))
+    mb_repo.get_release_group_id_from_release = AsyncMock(
+        side_effect=lambda rid: rid.replace("caa-", "rg-")
+    )
 
     library_repo = AsyncMock()
     library_repo.get_library_mbids = AsyncMock(return_value=set())
@@ -101,10 +109,16 @@ def svc():
         auth_store=auth_store,
     )
     return SimpleNamespace(
-        service=service, client_factory=client_factory, mb_repo=mb_repo,
-        library_repo=library_repo, playlist_service=playlist_service,
-        download_service=download_service, listening_prefs_store=listening_prefs_store,
-        connections_store=connections_store, auth_store=auth_store, lb_repo=lb_repo,
+        service=service,
+        client_factory=client_factory,
+        mb_repo=mb_repo,
+        library_repo=library_repo,
+        playlist_service=playlist_service,
+        download_service=download_service,
+        listening_prefs_store=listening_prefs_store,
+        connections_store=connections_store,
+        auth_store=auth_store,
+        lb_repo=lb_repo,
     )
 
 
@@ -115,7 +129,9 @@ def _set_recommendation_tracks(svc, *, jams=None, exploration=None):
         playlists.append({"source_patch": "weekly-jams", "playlist_id": "pl-jams"})
         tracks_by_id["pl-jams"] = jams
     if exploration is not None:
-        playlists.append({"source_patch": "weekly-exploration", "playlist_id": "pl-expl"})
+        playlists.append(
+            {"source_patch": "weekly-exploration", "playlist_id": "pl-expl"}
+        )
         tracks_by_id["pl-expl"] = exploration
     svc.lb_repo.get_recommendation_playlists.return_value = playlists
 
@@ -136,7 +152,9 @@ async def test_not_linked_is_skipped(svc):
 
 @pytest.mark.asyncio
 async def test_fresh_playlist_is_skipped_without_force(svc):
-    svc.playlist_service.get_by_source_ref.return_value = _playlist_record(updated_at=_now_iso())
+    svc.playlist_service.get_by_source_ref.return_value = _playlist_record(
+        updated_at=_now_iso()
+    )
     result = await svc.service.build_for_user("user-a")
     assert result.skipped is True
     assert result.reason == "fresh"
@@ -145,9 +163,12 @@ async def test_fresh_playlist_is_skipped_without_force(svc):
 
 @pytest.mark.asyncio
 async def test_force_bypasses_freshness_guard(svc):
-    svc.playlist_service.get_by_source_ref.return_value = _playlist_record(updated_at=_now_iso())
+    svc.playlist_service.get_by_source_ref.return_value = _playlist_record(
+        updated_at=_now_iso()
+    )
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Song", "Artist", "Album", "caa-1", ARTIST_A, "rec-1")],
+        svc,
+        jams=[_mix_track("Song", "Artist", "Album", "caa-1", ARTIST_A, "rec-1")],
     )
     result = await svc.service.build_for_user("user-a", force=True)
     assert result.skipped is False
@@ -158,8 +179,26 @@ async def test_force_bypasses_freshness_guard(svc):
 async def test_builds_new_playlist_from_recommendation_tracks(svc):
     _set_recommendation_tracks(
         svc,
-        jams=[_mix_track("Jam Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
-        exploration=[_mix_track("Explore Song", "Artist B", "Album B", "caa-2222-2222-2222-222222222222", ARTIST_B, "rec-2")],
+        jams=[
+            _mix_track(
+                "Jam Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
+        exploration=[
+            _mix_track(
+                "Explore Song",
+                "Artist B",
+                "Album B",
+                "caa-2222-2222-2222-222222222222",
+                ARTIST_B,
+                "rec-2",
+            )
+        ],
     )
     result = await svc.service.build_for_user("user-a")
 
@@ -181,9 +220,21 @@ async def test_builds_new_playlist_from_recommendation_tracks(svc):
 async def test_owned_track_is_marked_in_library_and_not_requested(svc):
     svc.library_repo.get_library_mbids.return_value = {RG1}
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Jam Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "Jam Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
     )
-    svc.listening_prefs_store.get.return_value = SimpleNamespace(auto_request_personal_mix=True)
+    svc.listening_prefs_store.get.return_value = SimpleNamespace(
+        auto_request_personal_mix=True
+    )
 
     result = await svc.service.build_for_user("user-a")
 
@@ -197,11 +248,23 @@ async def test_owned_track_is_linked_to_its_local_file(svc):
     svc.library_repo.get_library_mbids.return_value = {RG1}
     svc.library_repo.get_tracks = AsyncMock(
         return_value=[
-            SimpleNamespace(id="file-1", recording_mbid="rec-1", track_number=3, disc_number=1),
+            SimpleNamespace(
+                id="file-1", recording_mbid="rec-1", track_number=3, disc_number=1
+            ),
         ]
     )
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Jam Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "Jam Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
     )
 
     await svc.service.build_for_user("user-a")
@@ -217,15 +280,29 @@ async def test_owned_track_is_linked_to_its_local_file(svc):
 
 
 @pytest.mark.asyncio
-async def test_recording_mbid_collision_on_another_owned_album_is_not_cross_matched(svc):
+async def test_recording_mbid_collision_on_another_owned_album_is_not_cross_matched(
+    svc,
+):
     svc.library_repo.get_library_mbids.return_value = {RG1}
     svc.library_repo.get_tracks = AsyncMock(
         return_value=[
-            SimpleNamespace(id="file-1", recording_mbid="rec-1", track_number=1, disc_number=1),
+            SimpleNamespace(
+                id="file-1", recording_mbid="rec-1", track_number=1, disc_number=1
+            ),
         ]
     )
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Song", "Artist B", "Album B", "caa-2222-2222-2222-222222222222", ARTIST_B, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "Song",
+                "Artist B",
+                "Album B",
+                "caa-2222-2222-2222-222222222222",
+                ARTIST_B,
+                "rec-1",
+            )
+        ],
     )
 
     await svc.service.build_for_user("user-a")
@@ -240,10 +317,25 @@ async def test_recording_mbid_collision_on_another_owned_album_is_not_cross_matc
 
 @pytest.mark.asyncio
 async def test_existing_playlist_is_replaced_not_recreated(svc):
-    svc.playlist_service.get_by_source_ref.return_value = _playlist_record(updated_at=_stale_iso())
-    svc.playlist_service.get_tracks.return_value = [_track_record("old-1"), _track_record("old-2")]
+    svc.playlist_service.get_by_source_ref.return_value = _playlist_record(
+        updated_at=_stale_iso()
+    )
+    svc.playlist_service.get_tracks.return_value = [
+        _track_record("old-1"),
+        _track_record("old-2"),
+    ]
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("New Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "New Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
     )
 
     result = await svc.service.build_for_user("user-a")
@@ -258,7 +350,17 @@ async def test_existing_playlist_is_replaced_not_recreated(svc):
 @pytest.mark.asyncio
 async def test_auto_request_off_by_default(svc):
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
     )
     result = await svc.service.build_for_user("user-a")
     assert result.requested_albums == 0
@@ -267,9 +369,23 @@ async def test_auto_request_off_by_default(svc):
 
 @pytest.mark.asyncio
 async def test_auto_request_requests_missing_albums_when_opted_in(svc):
-    svc.listening_prefs_store.get.return_value = SimpleNamespace(auto_request_personal_mix=True)
+    dispatch = svc.service._acquisition.request_album
+    svc.service._acquisition.request_album = AsyncMock(wraps=dispatch)
+    svc.listening_prefs_store.get.return_value = SimpleNamespace(
+        auto_request_personal_mix=True
+    )
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
     )
     result = await svc.service.build_for_user("user-a")
     assert result.requested_albums == 1
@@ -278,14 +394,30 @@ async def test_auto_request_requests_missing_albums_when_opted_in(svc):
     assert kwargs["user_id"] == "user-a"
     assert kwargs["release_group_mbid"] == RG1
     assert kwargs["origin"] == "user"
+    assert (
+        svc.service._acquisition.request_album.await_args.kwargs["track_count_priority"]
+        is RequestPriority.BACKGROUND_SYNC
+    )
 
 
 @pytest.mark.asyncio
 async def test_already_in_library_sentinel_not_counted(svc):
-    svc.listening_prefs_store.get.return_value = SimpleNamespace(auto_request_personal_mix=True)
+    svc.listening_prefs_store.get.return_value = SimpleNamespace(
+        auto_request_personal_mix=True
+    )
     svc.download_service.request_album.return_value = ALREADY_IN_LIBRARY
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
     )
     result = await svc.service.build_for_user("user-a")
     assert result.requested_albums == 0
@@ -293,10 +425,24 @@ async def test_already_in_library_sentinel_not_counted(svc):
 
 @pytest.mark.asyncio
 async def test_config_error_stops_auto_request_without_crashing(svc):
-    svc.listening_prefs_store.get.return_value = SimpleNamespace(auto_request_personal_mix=True)
-    svc.download_service.request_album.side_effect = ConfigurationError("download client disabled")
+    svc.listening_prefs_store.get.return_value = SimpleNamespace(
+        auto_request_personal_mix=True
+    )
+    svc.download_service.request_album.side_effect = ConfigurationError(
+        "download client disabled"
+    )
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
     )
     result = await svc.service.build_for_user("user-a")
     assert result.requested_albums == 0
@@ -312,7 +458,11 @@ async def test_no_tracks_at_all_is_skipped(svc):
 
 @pytest.mark.asyncio
 async def test_run_for_all_users_aggregates_and_isolates_errors(monkeypatch, svc):
-    svc.connections_store.list_user_ids_for_service.return_value = ["user-a", "user-b", "user-c"]
+    svc.connections_store.list_user_ids_for_service.return_value = [
+        "user-a",
+        "user-b",
+        "user-c",
+    ]
 
     from services.personal_mix_service import PersonalMixResult
 
@@ -334,10 +484,24 @@ async def test_run_for_all_users_aggregates_and_isolates_errors(monkeypatch, svc
 
 @pytest.mark.asyncio
 async def test_user_role_without_grant_is_not_dispatched(svc):
-    svc.listening_prefs_store.get.return_value = SimpleNamespace(auto_request_personal_mix=True)
-    svc.listening_prefs_store.get_approval_state.return_value = None  # no standing grant
+    svc.listening_prefs_store.get.return_value = SimpleNamespace(
+        auto_request_personal_mix=True
+    )
+    svc.listening_prefs_store.get_approval_state.return_value = (
+        None  # no standing grant
+    )
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
     )
     result = await svc.service.build_for_user("user-a")
     assert result.requested_albums == 0
@@ -349,10 +513,22 @@ async def test_admin_role_dispatches_without_grant_row(svc):
     svc.auth_store.get_user_by_id.return_value = SimpleNamespace(
         id="user-a", role="admin", display_name="Alice"
     )
-    svc.listening_prefs_store.get.return_value = SimpleNamespace(auto_request_personal_mix=True)
+    svc.listening_prefs_store.get.return_value = SimpleNamespace(
+        auto_request_personal_mix=True
+    )
     svc.listening_prefs_store.get_approval_state.return_value = None
     _set_recommendation_tracks(
-        svc, jams=[_mix_track("Song", "Artist A", "Album A", "caa-1111-1111-1111-111111111111", ARTIST_A, "rec-1")],
+        svc,
+        jams=[
+            _mix_track(
+                "Song",
+                "Artist A",
+                "Album A",
+                "caa-1111-1111-1111-111111111111",
+                ARTIST_A,
+                "rec-1",
+            )
+        ],
     )
     result = await svc.service.build_for_user("user-a")
     assert result.requested_albums == 1
@@ -360,9 +536,18 @@ async def test_admin_role_dispatches_without_grant_row(svc):
 
 @pytest.mark.asyncio
 async def test_auto_request_capped_per_refresh(svc):
-    svc.listening_prefs_store.get.return_value = SimpleNamespace(auto_request_personal_mix=True)
+    svc.listening_prefs_store.get.return_value = SimpleNamespace(
+        auto_request_personal_mix=True
+    )
     tracks = [
-        _mix_track(f"Song {i}", "Artist A", f"Album {i}", f"caa-{i:04d}-1111-1111-111111111111", ARTIST_A, f"rec-{i}")
+        _mix_track(
+            f"Song {i}",
+            "Artist A",
+            f"Album {i}",
+            f"caa-{i:04d}-1111-1111-111111111111",
+            ARTIST_A,
+            f"rec-{i}",
+        )
         for i in range(8)
     ]
     _set_recommendation_tracks(svc, jams=tracks)
@@ -375,7 +560,9 @@ async def test_auto_request_capped_per_refresh(svc):
 @pytest.mark.asyncio
 async def test_toggle_on_as_user_enters_pending_queue(svc):
     await svc.service.on_auto_request_toggled("user-a", "user", True)
-    svc.listening_prefs_store.upsert_approval.assert_awaited_once_with("user-a", "pending")
+    svc.listening_prefs_store.upsert_approval.assert_awaited_once_with(
+        "user-a", "pending"
+    )
 
 
 @pytest.mark.asyncio
@@ -438,13 +625,21 @@ def test_pick_seed_artists_pairs_mbid_with_name():
 
     tracks = [
         _MixTrack(
-            track_name="T1", artist_name="Artist A", album_name="Al",
-            release_group_mbid=RG1, artist_mbid=ARTIST_A, recording_mbid="rec-1",
+            track_name="T1",
+            artist_name="Artist A",
+            album_name="Al",
+            release_group_mbid=RG1,
+            artist_mbid=ARTIST_A,
+            recording_mbid="rec-1",
             in_library=False,
         ),
         _MixTrack(
-            track_name="T2", artist_name="Artist B", album_name="Al2",
-            release_group_mbid=RG2, artist_mbid=ARTIST_B, recording_mbid="rec-2",
+            track_name="T2",
+            artist_name="Artist B",
+            album_name="Al2",
+            release_group_mbid=RG2,
+            artist_mbid=ARTIST_B,
+            recording_mbid="rec-2",
             in_library=False,
         ),
     ]

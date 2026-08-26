@@ -7,7 +7,13 @@ from fastapi.responses import Response, StreamingResponse
 
 from api.v1.routes.stream import router
 from core.dependencies import get_jellyfin_playback_service
-from core.exceptions import ExternalServiceError, PlaybackNotAllowedError, ResourceNotFoundError
+from core.exceptions import (
+    ExternalServiceError,
+    JellyfinAuthError,
+    PlaybackNotAllowedError,
+    ResourceNotFoundError,
+)
+from tests.helpers import override_user_auth
 
 
 async def _fake_body():
@@ -45,6 +51,7 @@ def client(mock_playback_service):
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_jellyfin_playback_service] = lambda: mock_playback_service
+    override_user_auth(app)
     return TestClient(app)
 
 
@@ -97,11 +104,38 @@ def test_get_stream_returns_416_on_range_error(client, mock_playback_service):
     assert response.status_code == 416
 
 
+def test_get_stream_passes_current_user_id(client, mock_playback_service):
+    response = client.get("/stream/jellyfin/item-1")
+
+    assert response.status_code == 200
+    mock_playback_service.proxy_stream.assert_awaited_once_with(
+        "item-1", range_header=None, user_id="test-user-id"
+    )
+
+
+def test_get_stream_maps_upstream_auth_error_to_502(client, mock_playback_service):
+    mock_playback_service.proxy_stream.side_effect = JellyfinAuthError("token revoked")
+
+    response = client.get("/stream/jellyfin/item-auth")
+
+    assert response.status_code == 502
+
+
 def test_head_stream_returns_proxied_headers(client, mock_playback_service):
     response = client.request("HEAD", "/stream/jellyfin/item-1")
 
     assert response.status_code == 200
-    mock_playback_service.proxy_head.assert_awaited_once_with("item-1")
+    mock_playback_service.proxy_head.assert_awaited_once_with(
+        "item-1", user_id="test-user-id"
+    )
+
+
+def test_head_stream_maps_upstream_auth_error_to_502(client, mock_playback_service):
+    mock_playback_service.proxy_head.side_effect = JellyfinAuthError("token revoked")
+
+    response = client.request("HEAD", "/stream/jellyfin/item-auth")
+
+    assert response.status_code == 502
 
 
 def test_head_stream_returns_404_when_missing(client, mock_playback_service):
@@ -134,6 +168,7 @@ def test_start_stream_uses_existing_play_session_id(client, mock_playback_servic
     mock_playback_service.start_playback.assert_awaited_once_with(
         "item-1",
         play_session_id="sess-existing",
+        user_id="test-user-id",
     )
 
 
@@ -145,6 +180,7 @@ def test_start_stream_without_payload_uses_service_default(client, mock_playback
     mock_playback_service.start_playback.assert_awaited_once_with(
         "item-2",
         play_session_id=None,
+        user_id="test-user-id",
     )
 
 

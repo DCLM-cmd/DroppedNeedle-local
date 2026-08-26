@@ -8,13 +8,12 @@ const basePolicy: DownloadPolicySettings = {
 	quality_min: 'mp3_320',
 	quality_max: 'lossless',
 	flac_mp3_only: true,
-	lossless_max_kbps: 0,
 	verify_downloads: true,
 	preflight_score_auto_accept: 0.7,
 	preflight_score_manual_min: 0.5,
 	download_stall_timeout_minutes: 30,
 	download_queued_timeout_minutes: 120,
-	download_queued_start_timeout_seconds: 30,
+	preferred_quality_wait_minutes: 15,
 	max_failover_attempts: 3,
 	max_concurrent_downloads: 3,
 	auto_retry_enabled: true,
@@ -117,5 +116,20 @@ describe('SettingsDownloadPolicy upgrade controls', () => {
 		const saved = h.mutateAsync.mock.calls[0][0] as DownloadPolicySettings;
 		expect(saved.upgrade_allowed).toBe(true);
 		expect(saved.quality_cutoff).toBe('lossless');
+	});
+
+	it('loads and saves the preferred-quality queue window', async () => {
+		h.policy = { ...basePolicy, preferred_quality_wait_minutes: 22 };
+		render(SettingsDownloadPolicy);
+
+		const waitInput = page.getByRole('spinbutton', {
+			name: 'Preferred-quality queue wait (min)'
+		});
+		await expect.element(waitInput).toHaveValue(22);
+		await waitInput.fill('9');
+		await page.getByRole('button', { name: 'Save' }).click();
+
+		const saved = h.mutateAsync.mock.calls[0][0] as DownloadPolicySettings;
+		expect(saved.preferred_quality_wait_minutes).toBe(9);
 	});
 });

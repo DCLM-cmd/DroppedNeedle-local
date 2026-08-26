@@ -29,6 +29,12 @@
 	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
 	import type { YouTubeQuotaStatus, YouTubeSearchResponse } from '$lib/types';
 
+	interface Props {
+		youtubeEnabled: boolean;
+	}
+
+	let { youtubeEnabled }: Props = $props();
+
 	const deck = discoverQueueDeck;
 
 	let requesting = $state(false);
@@ -59,7 +65,9 @@
 	);
 	const videoAvailable = $derived(
 		!!enrichment?.youtube_url ||
-			(!!enrichment?.youtube_search_available && (!ytQuota || ytQuota.remaining > 0))
+			(youtubeEnabled &&
+				!!enrichment?.youtube_search_available &&
+				(!ytQuota || ytQuota.remaining > 0))
 	);
 
 	// one-sound rule (other direction): global playback starting kills deck audio
@@ -93,10 +101,11 @@
 	});
 
 	async function fetchQuota() {
+		if (!youtubeEnabled) return;
 		try {
 			ytQuota = await api.global.get<YouTubeQuotaStatus>(API.discoverQueueYoutubeQuota());
 		} catch {
-			// quota endpoint 404s when YouTube isn't configured
+			// Quota failures must not prevent the rest of the queue from working.
 		}
 	}
 
@@ -339,6 +348,9 @@
 										mbid={current.release_group_mbid}
 										alt={current.album_name}
 										size="full"
+										requestSize={250}
+										responsiveSizes="(max-width: 400px) 70vw, 280px"
+										testId="discover-primary-cover"
 										lazy={false}
 										rounded="none"
 										className="aspect-square w-full object-cover"
@@ -593,7 +605,7 @@
 									role="tab"
 									aria-selected={i === deck.currentIndex}
 									aria-label="{item.album_name} by {item.artist_name}"
-									title="{item.album_name} — {item.artist_name}"
+									title="{item.album_name} - {item.artist_name}"
 									class="deck-strip-item shrink-0 overflow-hidden rounded-lg transition-all duration-200 {i ===
 									deck.currentIndex
 										? 'ring-2 ring-primary ring-offset-2 ring-offset-base-100'
@@ -607,6 +619,7 @@
 										mbid={item.release_group_mbid}
 										alt={item.album_name}
 										size="full"
+										requestSize={250}
 										lazy={i > deck.currentIndex + 4}
 										rounded="none"
 										className="block h-12 w-12 object-cover"

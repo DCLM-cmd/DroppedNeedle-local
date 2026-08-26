@@ -29,15 +29,20 @@ export const getBasicArtistQueryOptions = (artistId: string) =>
 export const getBasicArtistQuery = (getArtistId: Getter<string>) =>
 	createQuery(() => getBasicArtistQueryOptions(getArtistId()));
 
-export const getExtendedArtistQuery = (getArtistId: Getter<string>) =>
-	createQuery(() => ({
+export const getExtendedArtistQueryOptions = (artistId: string) =>
+	queryOptions({
 		staleTime: CACHE_TTL.ARTIST_DETAIL_EXTENDED,
-		queryKey: ArtistQueryKeyFactory.extended(getArtistId()),
+		queryKey: ArtistQueryKeyFactory.extended(artistId),
+		// A fast extended query can finish before the provider page observes its lazy fields.
+		notifyOnChangeProps: 'all',
 		queryFn: ({ signal }) =>
-			api.global.get<ArtistInfoExtended>(API.artist.extended(getArtistId()), {
+			api.global.get<ArtistInfoExtended>(API.artist.extended(artistId), {
 				signal
 			})
-	}));
+	});
+
+export const getExtendedArtistQuery = (getArtistId: Getter<string>) =>
+	createQuery(() => getExtendedArtistQueryOptions(getArtistId()));
 
 export const getSimilarArtistsQuery = (
 	getParams: Getter<{ artistId: string; source: MusicSource }>

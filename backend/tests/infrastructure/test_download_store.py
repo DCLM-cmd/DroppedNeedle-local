@@ -10,6 +10,7 @@ import pytest
 
 from infrastructure.persistence.download_store import DownloadStore
 from models.download import ScoredCandidate
+from models.held_import import HeldImport
 from repositories.protocols.download_client import DownloadSearchResult
 
 
@@ -21,7 +22,11 @@ def _seed_auth_users(db_path: Path) -> None:
         )
         conn.executemany(
             "INSERT OR IGNORE INTO auth_users (id, username, role) VALUES (?, ?, ?)",
-            [("user-a", "alice", "user"), ("user-b", "bob", "user"), ("admin-1", "root", "admin")],
+            [
+                ("user-a", "alice", "user"),
+                ("user-b", "bob", "user"),
+                ("admin-1", "root", "admin"),
+            ],
         )
         conn.commit()
     finally:
@@ -42,6 +47,61 @@ def test_migration_is_idempotent(tmp_path: Path):
     DownloadStore(db_path=db_path, write_lock=lock)
     DownloadStore(db_path=db_path, write_lock=lock)  # re-run must not error
     assert db_path.exists()
+    with sqlite3.connect(db_path) as conn:
+        task_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(download_tasks)").fetchall()
+        }
+        held_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(held_imports)").fetchall()
+        }
+        activity_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'download_activity_%'"
+            ).fetchall()
+        }
+    assert {
+        "preferred_quality_fallback_at",
+        "quality_pool_key",
+        "queue_position_start",
+        "queue_position_end",
+        "remote_queued",
+        "attempt_number",
+        "attempt_total",
+        "has_next_source",
+        "release_track_mbid",
+    } <= task_columns
+    assert {
+        "reason_detail",
+        "release_track_mbid",
+        "management_retry_count",
+        "management_next_retry_at",
+        "file_cleanup_completed_at",
+    } <= held_columns
+    assert activity_tables == {
+        "download_activity_global_revision",
+        "download_activity_user_revisions",
+    }
+
+
+def test_search_link_activity_trigger_is_added_to_existing_schema(tmp_path: Path):
+    db_path = tmp_path / "library.db"
+    lock = threading.Lock()
+    DownloadStore(db_path=db_path, write_lock=lock)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TRIGGER download_activity_task_search_link")
+        conn.commit()
+
+    DownloadStore(db_path=db_path, write_lock=lock)
+
+    with sqlite3.connect(db_path) as conn:
+        trigger = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            ("download_activity_task_search_link",),
+        ).fetchone()
+    assert trigger == ("download_activity_task_search_link",)
 
 
 @pytest.mark.asyncio
@@ -57,6 +117,81 @@ async def test_create_task_returns_uuid(store):
 
 
 @pytest.mark.asyncio
+async def test_quality_queue_state_roundtrips_and_progress_clears_deadline(store):
+    task = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B"
+    )
+    await store.update_status(
+        task.id,
+        "downloading",
+        quality_format="flac",
+        quality_bit_depth=24,
+        quality_sample_rate=48_000,
+        advertised_queue_depth=2710,
+        preferred_quality_fallback_at=1234.5,
+        quality_pool_key="lossless:24:48000",
+        attempt_number=1,
+        attempt_total=3,
+        has_next_source=True,
+    )
+    await store.update_progress(
+        task.id,
+        bytes_downloaded=0,
+        files_completed=0,
+        progress_percent=0,
+        queue_position_start=91,
+        queue_position_end=100,
+        remote_queued=True,
+    )
+
+    queued = await store.get_task(task.id)
+    assert queued.quality_format == "flac"
+    assert [queued.quality_bit_depth, queued.quality_sample_rate] == [24, 48_000]
+    assert queued.advertised_queue_depth == 2710
+    assert [queued.queue_position_start, queued.queue_position_end] == [91, 100]
+    assert queued.remote_queued is True
+    assert queued.preferred_quality_fallback_at == 1234.5
+    assert [queued.attempt_number, queued.attempt_total] == [1, 3]
+    assert queued.has_next_source is True
+
+    await store.update_progress(
+        task.id,
+        bytes_downloaded=1,
+        files_completed=0,
+        progress_percent=1,
+    )
+    started = await store.get_task(task.id)
+    assert started.preferred_quality_fallback_at is None
+    assert started.remote_queued is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_clears_live_quality_queue_state(store):
+    task = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B"
+    )
+    await store.update_status(
+        task.id,
+        "downloading",
+        queue_position_start=20,
+        queue_position_end=22,
+        remote_queued=True,
+        preferred_quality_fallback_at=1234.5,
+        has_next_source=True,
+    )
+
+    await store.cancel_task_and_schedule_attempts(task.id)
+
+    cancelled = await store.get_task(task.id)
+    assert cancelled.status == "cancelled"
+    assert cancelled.queue_position_start is None
+    assert cancelled.queue_position_end is None
+    assert cancelled.remote_queued is False
+    assert cancelled.preferred_quality_fallback_at is None
+    assert cancelled.has_next_source is False
+
+
+@pytest.mark.asyncio
 async def test_get_task_for_user_ownership(store):
     task = await store.create_task(
         user_id="user-a", release_group_mbid="rg", artist_name="A", album_title="B"
@@ -69,8 +204,11 @@ async def test_get_task_for_user_ownership(store):
 @pytest.mark.asyncio
 async def test_active_task_dedup_is_user_scoped(store):
     task = await store.create_task(
-        user_id="user-a", download_type="album", release_group_mbid="rg",
-        artist_name="A", album_title="B",
+        user_id="user-a",
+        download_type="album",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
     )
     active = await store.get_active_task_for_album("rg", "user-a")
     assert active is not None and active.id == task.id
@@ -90,7 +228,9 @@ async def test_list_tasks_filters_by_release_group(store):
         user_id="user-b", release_group_mbid="rg-1", artist_name="A", album_title="One"
     )
 
-    rg1 = await store.list_tasks(user_id="user-a", user_role="user", release_group_mbid="rg-1")
+    rg1 = await store.list_tasks(
+        user_id="user-a", user_role="user", release_group_mbid="rg-1"
+    )
     assert [t.id for t in rg1] == [a1.id]
 
     # admin sees every user's task for the release group
@@ -102,6 +242,71 @@ async def test_list_tasks_filters_by_release_group(store):
     # no release-group filter -> all of user-a's tasks
     all_a = await store.list_tasks(user_id="user-a", user_role="user")
     assert len(all_a) == 2
+
+
+@pytest.mark.asyncio
+async def test_activity_summary_is_scoped_and_ignores_progress_only_updates(store):
+    user_task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-a",
+        artist_name="A",
+        album_title="One",
+    )
+    await store.create_task(
+        user_id="user-b",
+        release_group_mbid="rg-b",
+        artist_name="B",
+        album_title="Two",
+        status="failed",
+    )
+
+    initial = await store.get_activity_summary("user-a", "user")
+    assert initial.active_count == 1
+    assert initial.failed_count == 0
+    assert initial.held_count == 0
+    assert initial.landed_release_group_mbids == []
+
+    await store.update_progress(
+        user_task.id,
+        bytes_downloaded=1,
+        files_completed=0,
+        progress_percent=1,
+    )
+    after_progress = await store.get_activity_summary("user-a", "user")
+    assert after_progress.revision == initial.revision
+
+    search = await store.create_search_job(
+        "user-a", "A", "One", None, None, "rg-a", "A - One"
+    )
+    await store.set_search_job_id_and_candidate(user_task.id, search.id, None)
+    awaiting_review = await store.get_activity_summary("user-a", "user")
+    assert awaiting_review.revision == initial.revision + 1
+    assert awaiting_review.active_count == initial.active_count
+
+    await store.update_status(user_task.id, "completed", completed_at=1234.5)
+    completed = await store.get_activity_summary("user-a", "user")
+    assert completed.revision == awaiting_review.revision + 1
+    assert completed.active_count == 0
+    assert completed.landed_release_group_mbids == ["rg-a"]
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "INSERT INTO held_imports "
+            "(user_id, held_path, reason, source, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'held', ?)",
+            ("user-a", "/isolated/test.flac", "duration_mismatch", "soulseek", 1.0),
+        )
+        conn.commit()
+
+    held = await store.get_activity_summary("user-a", "user")
+    assert held.revision == completed.revision + 1
+    assert held.held_count == 1
+
+    admin = await store.get_activity_summary("admin-1", "admin")
+    assert admin.active_count == 0
+    assert admin.failed_count == 1
+    assert admin.held_count == 1
+    assert set(admin.landed_release_group_mbids) == {"rg-a"}
 
 
 @pytest.mark.asyncio
@@ -127,7 +332,10 @@ async def test_quarantine_usenet_identity_and_download_failed_reason(store):
 
     ident = usenet_identity("Some Album [FLAC]", 350 * 1024 * 1024)
     await store.record_quarantine(
-        source="usenet", identity=ident, reason="download_failed", release_group_mbid="rg2"
+        source="usenet",
+        identity=ident,
+        reason="download_failed",
+        release_group_mbid="rg2",
     )
     quarantine = await store.load_quarantine_set()
     assert ("usenet", ident) in quarantine
@@ -140,16 +348,23 @@ async def test_delete_quarantine_for_album_clears_all_releases(store):
     from models.download_identity import soulseek_identity, usenet_identity
 
     await store.record_quarantine(
-        source="soulseek", identity=soulseek_identity("peerX", "a.flac"),
-        reason="verify_failed", release_group_mbid="rg-clear",
+        source="soulseek",
+        identity=soulseek_identity("peerX", "a.flac"),
+        reason="verify_failed",
+        release_group_mbid="rg-clear",
     )
     await store.record_quarantine(
-        source="usenet", identity=usenet_identity("Album [FLAC]", 100),
-        reason="download_failed", release_group_mbid="rg-clear",
+        source="usenet",
+        identity=usenet_identity("Album [FLAC]", 100),
+        reason="download_failed",
+        release_group_mbid="rg-clear",
     )
     keep = soulseek_identity("peerY", "keep.flac")
     await store.record_quarantine(
-        source="soulseek", identity=keep, reason="verify_failed", release_group_mbid="rg-keep",
+        source="soulseek",
+        identity=keep,
+        reason="verify_failed",
+        release_group_mbid="rg-keep",
     )
 
     removed = await store.delete_quarantine_for_album("rg-clear")
@@ -167,7 +382,10 @@ async def test_quarantine_ttl_filters_expired_entries(store, tmp_path):
 
     ident = soulseek_identity("peerX", "old.flac")
     await store.record_quarantine(
-        source="soulseek", identity=ident, reason="verify_failed", release_group_mbid="rg-ttl",
+        source="soulseek",
+        identity=ident,
+        reason="verify_failed",
+        release_group_mbid="rg-ttl",
     )
     _age_all_quarantine(tmp_path / "library.db")
 
@@ -183,13 +401,19 @@ async def test_record_quarantine_prunes_expired_rows(store, tmp_path):
 
     old = soulseek_identity("p", "old.flac")
     await store.record_quarantine(
-        source="soulseek", identity=old, reason="verify_failed", release_group_mbid="rg-old",
+        source="soulseek",
+        identity=old,
+        reason="verify_failed",
+        release_group_mbid="rg-old",
     )
     _age_all_quarantine(tmp_path / "library.db")
 
     new = soulseek_identity("p", "new.flac")
     await store.record_quarantine(
-        source="soulseek", identity=new, reason="verify_failed", release_group_mbid="rg-new",
+        source="soulseek",
+        identity=new,
+        reason="verify_failed",
+        release_group_mbid="rg-new",
     )
 
     idents = {row["identity"] for row in await store.list_quarantine()}
@@ -202,19 +426,31 @@ async def test_cancel_album_auto_retries_cancels_failed_and_partial_only(store):
     """Removing an album cancels its failed/partial tasks (which seed auto-retries) but
     leaves active downloads and other albums' tasks alone."""
     failed = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-x", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg-x",
+        artist_name="A",
+        album_title="B",
         status="failed",
     )
     partial = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-x", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg-x",
+        artist_name="A",
+        album_title="B",
         status="partial",
     )
     active = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-x", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg-x",
+        artist_name="A",
+        album_title="B",
         status="downloading",
     )
     other = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-other", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg-other",
+        artist_name="A",
+        album_title="B",
         status="failed",
     )
 
@@ -230,19 +466,31 @@ async def test_cancel_album_auto_retries_cancels_failed_and_partial_only(store):
 async def test_list_tasks_by_status_user_scoped(store):
     """Non-admins see only their own tasks in the given statuses; admins span users."""
     mine_failed = await store.create_task(
-        user_id="user-a", release_group_mbid="rg", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
         status="failed",
     )
     mine_partial = await store.create_task(
-        user_id="user-a", release_group_mbid="rg", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
         status="partial",
     )
     await store.create_task(
-        user_id="user-a", release_group_mbid="rg", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
         status="downloading",  # excluded by status filter
     )
     theirs = await store.create_task(
-        user_id="user-b", release_group_mbid="rg", artist_name="A", album_title="B",
+        user_id="user-b",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
         status="failed",
     )
 
@@ -261,19 +509,31 @@ async def test_list_tasks_by_status_user_scoped(store):
 async def test_delete_tasks_by_status_hard_deletes_user_scoped(store):
     """Hard-deletes only the user's rows in the given statuses; leaves others intact."""
     completed = await store.create_task(
-        user_id="user-a", release_group_mbid="rg", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
         status="completed",
     )
     cancelled = await store.create_task(
-        user_id="user-a", release_group_mbid="rg", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
         status="cancelled",
     )
     failed = await store.create_task(
-        user_id="user-a", release_group_mbid="rg", artist_name="A", album_title="B",
+        user_id="user-a",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
         status="failed",  # not in the delete set
     )
     theirs = await store.create_task(
-        user_id="user-b", release_group_mbid="rg", artist_name="A", album_title="B",
+        user_id="user-b",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
         status="completed",  # other user, untouched by a non-admin clear
     )
 
@@ -311,7 +571,11 @@ async def test_search_job_candidates_roundtrip(store):
             parent_directory="p",
             files=[
                 DownloadSearchResult(
-                    username="u", filename="f.flac", parent_directory="p", size=1, extension="flac"
+                    username="u",
+                    filename="f.flac",
+                    parent_directory="p",
+                    size=1,
+                    extension="flac",
                 )
             ],
             coherence=0.9,
@@ -351,8 +615,12 @@ async def test_get_parked_task_for_search_job(store):
     identity and the request linkage (2026-07-05 incident review, R1)."""
     job = await store.create_search_job("user-a", "A", "B", None, None, "rg", "q")
     task = await store.create_task(
-        user_id="user-a", release_group_mbid="rg", artist_name="A", album_title="B",
-        track_title="the arrival", track_duration_seconds=155.556,
+        user_id="user-a",
+        release_group_mbid="rg",
+        artist_name="A",
+        album_title="B",
+        track_title="the arrival",
+        track_duration_seconds=155.556,
     )
     # not linked yet -> nothing parked on the job
     assert await store.get_parked_task_for_search_job(job.id) is None
@@ -445,28 +713,52 @@ async def test_list_retryable_tasks_filters_by_status_and_retry_count(store):
     import time as _t
 
     eligible_failed = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B",
-        retry_count=1, status="failed",
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        retry_count=1,
+        status="failed",
     )
-    await store.update_status(eligible_failed.id, "failed", completed_at=_t.time() - 3600)
+    await store.update_status(
+        eligible_failed.id, "failed", completed_at=_t.time() - 3600
+    )
 
     eligible_partial = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-2", artist_name="A", album_title="C",
-        retry_count=0, status="partial",
+        user_id="user-a",
+        release_group_mbid="rg-2",
+        artist_name="A",
+        album_title="C",
+        retry_count=0,
+        status="partial",
     )
-    await store.update_status(eligible_partial.id, "partial", completed_at=_t.time() - 60)
+    await store.update_status(
+        eligible_partial.id, "partial", completed_at=_t.time() - 60
+    )
 
     over_ceiling = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-3", artist_name="A", album_title="D",
-        retry_count=5, status="failed",
+        user_id="user-a",
+        release_group_mbid="rg-3",
+        artist_name="A",
+        album_title="D",
+        retry_count=5,
+        status="failed",
     )
-    await store.update_status(over_ceiling.id, "failed", completed_at=_t.time() - 999_999)
+    await store.update_status(
+        over_ceiling.id, "failed", completed_at=_t.time() - 999_999
+    )
 
     cancelled = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-4", artist_name="A", album_title="E",
-        retry_count=0, status="cancelled",
+        user_id="user-a",
+        release_group_mbid="rg-4",
+        artist_name="A",
+        album_title="E",
+        retry_count=0,
+        status="cancelled",
     )
-    await store.update_status(cancelled.id, "cancelled", completed_at=_t.time() - 999_999)
+    await store.update_status(
+        cancelled.id, "cancelled", completed_at=_t.time() - 999_999
+    )
 
     result = await store.list_retryable_tasks(max_retry_count=5)
     ids = {t.id for t in result}
@@ -485,13 +777,21 @@ async def test_list_retryable_tasks_returns_only_latest_per_target(store):
     import time as _t
 
     seed = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B",
-        retry_count=0, status="failed",
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        retry_count=0,
+        status="failed",
     )
     await store.update_status(seed.id, "failed", completed_at=_t.time() - 5000)
     retry = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B",
-        retry_count=1, status="failed",
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        retry_count=1,
+        status="failed",
     )
     await store.update_status(retry.id, "failed", completed_at=_t.time() - 100)
 
@@ -506,13 +806,21 @@ async def test_list_retryable_tasks_excludes_target_whose_latest_succeeded(store
     import time as _t
 
     failed = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B",
-        retry_count=0, status="failed",
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        retry_count=0,
+        status="failed",
     )
     await store.update_status(failed.id, "failed", completed_at=_t.time() - 5000)
     succeeded = await store.create_task(
-        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B",
-        retry_count=1, status="completed",
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        retry_count=1,
+        status="completed",
     )
     await store.update_status(succeeded.id, "completed", completed_at=_t.time() - 100)
 
@@ -525,14 +833,29 @@ async def test_list_retryable_tasks_excludes_target_whose_latest_succeeded(store
 
 def _held_kwargs(**overrides):
     base = dict(
-        user_id="user-a", held_path="/held/a.flac", reason="fingerprint_mismatch",
-        source="usenet", source_task_id="task-1", release_group_mbid="rg-1", release_mbid="rel-1",
-        recording_mbid="rec-3", track_number=3, disc_number=1, track_title="You Shook Me",
-        artist_name="Led Zeppelin", artist_mbid="678d88b2-87b0-403b-b63d-5da7465aecc3",
-        album_title="Led Zeppelin", year=1969,
-        original_filename="a.flac", file_format="flac", duration_seconds=388.0,
-        evidence_title="Nobody's Fault but Mine", evidence_artist="Led Zeppelin",
-        evidence_score=0.99, naming_template="{album}/{track}",
+        user_id="user-a",
+        held_path="/held/a.flac",
+        reason="fingerprint_mismatch",
+        source="usenet",
+        source_task_id="task-1",
+        release_group_mbid="rg-1",
+        release_mbid="rel-1",
+        release_track_mbid="release-track-3",
+        recording_mbid="rec-3",
+        track_number=3,
+        disc_number=1,
+        track_title="You Shook Me",
+        artist_name="Led Zeppelin",
+        artist_mbid="678d88b2-87b0-403b-b63d-5da7465aecc3",
+        album_title="Led Zeppelin",
+        year=1969,
+        original_filename="a.flac",
+        file_format="flac",
+        duration_seconds=388.0,
+        evidence_title="Nobody's Fault but Mine",
+        evidence_artist="Led Zeppelin",
+        evidence_score=0.99,
+        naming_template="{album}/{track}",
     )
     base.update(overrides)
     return base
@@ -540,7 +863,9 @@ def _held_kwargs(**overrides):
 
 @pytest.mark.asyncio
 async def test_held_import_record_list_get_ownership(store):
-    hid = await store.record_held_import(**_held_kwargs())
+    hid = await store.record_held_import(
+        **_held_kwargs(reason_detail="Acquisition profile changed")
+    )
     assert isinstance(hid, int)
     # owner + admin see it; another user does not
     assert len(await store.list_held_imports("user-a", "user")) == 1
@@ -548,24 +873,390 @@ async def test_held_import_record_list_get_ownership(store):
     assert await store.list_held_imports("user-b", "user") == []
     got = await store.get_held_import(hid, "user-a", "user")
     assert got is not None and got.track_title == "You Shook Me"
-    assert got.evidence_title == "Nobody's Fault but Mine"  # the AcoustID evidence round-trips
+    assert (
+        got.evidence_title == "Nobody's Fault but Mine"
+    )  # the AcoustID evidence round-trips
+    assert got.reason_detail == "Acquisition profile changed"
+    assert got.release_track_mbid == "release-track-3"
     # the album-artist MBID round-trips so "import anyway" can stamp the real artist
     assert got.artist_mbid == "678d88b2-87b0-403b-b63d-5da7465aecc3"
     assert await store.get_held_import(hid, "user-b", "user") is None  # not the owner
     # album scoping (the album page)
-    assert len(await store.list_held_imports("user-a", "user", release_group_mbid="rg-1")) == 1
-    assert await store.list_held_imports("user-a", "user", release_group_mbid="rg-x") == []
+    assert (
+        len(await store.list_held_imports("user-a", "user", release_group_mbid="rg-1"))
+        == 1
+    )
+    assert (
+        await store.list_held_imports("user-a", "user", release_group_mbid="rg-x") == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_management_holds_are_scoped_to_their_acquisition_unit(store):
+    first = await store.record_held_import(
+        **_held_kwargs(
+            reason="management:PROFILE_CHANGED",
+            source_task_id="task-a",
+            held_path="/held/task-a.flac",
+        )
+    )
+    second = await store.record_held_import(
+        **_held_kwargs(
+            reason="management:PROFILE_CHANGED",
+            source_task_id="task-b",
+            held_path="/held/task-b.flac",
+        )
+    )
+
+    assert isinstance(first, int)
+    assert isinstance(second, int)
+    task_a = await store.list_held_imports("user-a", "user", source_task_id="task-a")
+    task_b = await store.list_held_imports("user-a", "user", source_task_id="task-b")
+    assert [value.id for value in task_a] == [first]
+    assert [value.id for value in task_b] == [second]
+
+
+@pytest.mark.asyncio
+async def test_management_hold_batch_reason_and_resolution_are_atomic(store):
+    ids = [
+        await store.record_held_import(
+            **_held_kwargs(
+                reason="management:PROFILE_CHANGED",
+                source_task_id="task-unit",
+                track_number=track,
+                held_path=f"/held/{track}.flac",
+            )
+        )
+        for track in (1, 2)
+    ]
+    assert all(isinstance(value, int) for value in ids)
+    int_ids = [value for value in ids if value is not None]
+
+    await store.update_held_import_reason(
+        int_ids,
+        reason="management:SIDECAR_COLLISION",
+        reason_detail="cover.jpg already exists",
+    )
+    held = await store.list_held_imports("user-a", "user", source_task_id="task-unit")
+    assert {value.reason for value in held} == {"management:SIDECAR_COLLISION"}
+    assert {value.reason_detail for value in held} == {"cover.jpg already exists"}
+
+    await store.schedule_management_hold_retry(
+        int_ids, retry_count=2, next_retry_at=500.0
+    )
+    held = await store.list_held_imports("user-a", "user", source_task_id="task-unit")
+    assert {value.management_retry_count for value in held} == {2}
+    assert {value.management_next_retry_at for value in held} == {500.0}
+    assert await store.list_due_management_hold_units(499.0) == []
+    assert await store.list_due_management_hold_units(500.0) == [
+        ("task-unit", "user-a")
+    ]
+
+    await store.resolve_held_imports(int_ids, "imported")
+    assert (
+        await store.list_held_imports("user-a", "user", source_task_id="task-unit")
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_discarded_file_cleanup_debt_is_durable_and_clears_once(store):
+    held_id = await store.record_held_import(
+        **_held_kwargs(held_path="/held/discarded.flac")
+    )
+    assert isinstance(held_id, int)
+    await store.resolve_held_import(held_id, "discarded")
+
+    pending = await store.list_pending_discard_file_cleanups()
+    assert [value.id for value in pending] == [held_id]
+
+    await store.complete_held_file_cleanup([held_id])
+
+    assert await store.list_pending_discard_file_cleanups() == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_task_exact_release_is_pinned_once(store):
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Artist",
+        album_title="Album",
+    )
+
+    selected = await store.pin_task_release_mbid(task.id, "rg-1", "release-1")
+
+    assert selected == "release-1"
+    assert (await store.get_task(task.id)).release_mbid == "release-1"
+    assert (
+        await store.pin_task_release_mbid(task.id, "RG-1", "release-1") == "release-1"
+    )
+    with pytest.raises(ValueError, match="another edition"):
+        await store.pin_task_release_mbid(task.id, "rg-1", "release-2")
+
+
+@pytest.mark.asyncio
+async def test_management_hold_bundle_replaces_partial_rows_atomically(store):
+    old_id = await store.record_held_import(
+        **_held_kwargs(
+            reason="management:PROFILE_CHANGED",
+            source_task_id="task-unit",
+            track_number=1,
+            held_path="/held/old.flac",
+        )
+    )
+    assert isinstance(old_id, int)
+    records = [
+        HeldImport(
+            id=0,
+            status="held",
+            created_at=0.0,
+            **_held_kwargs(
+                reason="management:METADATA_UNAVAILABLE",
+                reason_detail="Retry later",
+                source_task_id="task-unit",
+                track_number=track,
+                held_path=f"/held/new-{track}.flac",
+            ),
+        )
+        for track in (1, 2)
+    ]
+
+    inserted, obsolete = await store.replace_management_hold_bundle(records)
+
+    assert len(inserted) == 2
+    assert obsolete == ["/held/old.flac"]
+    held = await store.list_held_imports("user-a", "user", source_task_id="task-unit")
+    assert {value.id for value in held} == set(inserted)
+    assert {value.track_number for value in held} == {1, 2}
+    assert {value.reason for value in held} == {"management:METADATA_UNAVAILABLE"}
+
+
+@pytest.mark.asyncio
+async def test_management_hold_identity_repair_updates_task_and_complete_unit(store):
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Led Zeppelin",
+        album_title="Led Zeppelin",
+    )
+    ids = [
+        await store.record_held_import(
+            **_held_kwargs(
+                source_task_id=task.id,
+                reason="management:TRACK_NOT_MAPPED",
+                release_mbid=None,
+                release_track_mbid=None,
+                recording_mbid=f"recording-{track}",
+                track_number=track,
+                held_path=f"/held/{track}.flac",
+            )
+        )
+        for track in (1, 2)
+    ]
+    mappings = [
+        (int(held_id), 1, track, f"recording-{track}", f"release-track-{track}")
+        for track, held_id in zip((1, 2), ids)
+    ]
+
+    await store.repair_management_hold_identity(task.id, "release-1", mappings)
+
+    repaired_task = await store.get_task(task.id)
+    assert repaired_task.release_mbid == "release-1"
+    held = await store.list_held_imports("user-a", "user", source_task_id=task.id)
+    assert {value.release_mbid for value in held} == {"release-1"}
+    assert {value.release_track_mbid for value in held} == {
+        "release-track-1",
+        "release-track-2",
+    }
+
+
+@pytest.mark.asyncio
+async def test_management_hold_identity_repair_allows_repeated_recording_on_distinct_release_tracks(
+    store,
+):
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Artist",
+        album_title="Album",
+    )
+    ids = [
+        await store.record_held_import(
+            **_held_kwargs(
+                source_task_id=task.id,
+                reason="management:TRACK_NOT_MAPPED",
+                release_mbid=None,
+                release_track_mbid=None,
+                recording_mbid="recording-shared",
+                track_number=track,
+                held_path=f"/held/{track}.flac",
+            )
+        )
+        for track in (1, 2)
+    ]
+
+    await store.repair_management_hold_identity(
+        task.id,
+        "release-1",
+        [
+            (
+                int(held_id),
+                1,
+                track,
+                "recording-shared",
+                f"release-track-{track}",
+            )
+            for track, held_id in zip((1, 2), ids)
+        ],
+    )
+
+    held = await store.list_held_imports("user-a", "user", source_task_id=task.id)
+    assert {value.recording_mbid for value in held} == {"recording-shared"}
+    assert {value.release_track_mbid for value in held} == {
+        "release-track-1",
+        "release-track-2",
+    }
+
+
+@pytest.mark.asyncio
+async def test_management_hold_identity_repair_updates_track_task_identity(store):
+    task = await store.create_task(
+        user_id="user-a",
+        download_type="track",
+        release_group_mbid="rg-1",
+        recording_mbid="recording-3",
+        track_number=3,
+        disc_number=1,
+        artist_name="Led Zeppelin",
+        album_title="Led Zeppelin",
+    )
+    held_id = await store.record_held_import(
+        **_held_kwargs(
+            source_task_id=task.id,
+            reason="management:TRACK_NOT_MAPPED",
+            release_mbid=None,
+            release_track_mbid=None,
+            recording_mbid="recording-3",
+            track_number=3,
+        )
+    )
+
+    await store.repair_management_hold_identity(
+        task.id,
+        "release-1",
+        [(int(held_id), 1, 3, "recording-3", "release-track-3")],
+        task_release_track_mbid="release-track-3",
+    )
+
+    repaired = await store.get_task(task.id)
+    assert repaired.release_mbid == "release-1"
+    assert repaired.release_track_mbid == "release-track-3"
+
+
+@pytest.mark.asyncio
+async def test_management_hold_identity_repair_rejects_partial_duplicate_and_conflicting_maps(
+    store,
+):
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Led Zeppelin",
+        album_title="Led Zeppelin",
+    )
+    ids = [
+        await store.record_held_import(
+            **_held_kwargs(
+                source_task_id=task.id,
+                reason="management:TRACK_NOT_MAPPED",
+                release_mbid=None,
+                release_track_mbid=None,
+                recording_mbid=f"recording-{track}",
+                track_number=track,
+                held_path=f"/held/{track}.flac",
+            )
+        )
+        for track in (1, 2)
+    ]
+    valid = [
+        (int(held_id), 1, track, f"recording-{track}", f"release-track-{track}")
+        for track, held_id in zip((1, 2), ids)
+    ]
+    invalid = (
+        valid[:1],
+        [valid[0], (valid[1][0], 1, 1, valid[1][3], valid[1][4])],
+        [valid[0], (valid[1][0], 1, 2, "conflicting-recording", valid[1][4])],
+        [valid[0], (valid[1][0], 1, 2, valid[1][3], valid[0][4])],
+    )
+
+    for mappings in invalid:
+        with pytest.raises(ValueError):
+            await store.repair_management_hold_identity(task.id, "release-1", mappings)
+        unchanged_task = await store.get_task(task.id)
+        held = await store.list_held_imports("user-a", "user", source_task_id=task.id)
+        assert unchanged_task.release_mbid is None
+        assert all(value.release_mbid is None for value in held)
+        assert all(value.release_track_mbid is None for value in held)
+
+
+@pytest.mark.asyncio
+async def test_management_hold_identity_repair_rejects_stale_rows_with_zero_identity_updates(
+    store,
+):
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Led Zeppelin",
+        album_title="Led Zeppelin",
+    )
+    ids = [
+        await store.record_held_import(
+            **_held_kwargs(
+                source_task_id=task.id,
+                reason="management:TRACK_NOT_MAPPED",
+                release_mbid=None,
+                release_track_mbid=None,
+                recording_mbid=f"recording-{track}",
+                track_number=track,
+                held_path=f"/held/{track}.flac",
+            )
+        )
+        for track in (1, 2)
+    ]
+    await store.resolve_held_import(int(ids[1]), "discarded")
+
+    with pytest.raises(ValueError):
+        await store.repair_management_hold_identity(
+            task.id,
+            "release-1",
+            [
+                (int(ids[0]), 1, 1, "recording-1", "release-track-1"),
+                (int(ids[1]), 1, 2, "recording-2", "release-track-2"),
+            ],
+        )
+
+    unchanged_task = await store.get_task(task.id)
+    remaining = await store.get_held_import(int(ids[0]), "user-a", "user")
+    assert unchanged_task.release_mbid is None
+    assert remaining.release_mbid is None
+    assert remaining.release_track_mbid is None
 
 
 @pytest.mark.asyncio
 async def test_held_import_deduped_per_track(store):
     first = await store.record_held_import(**_held_kwargs(held_path="/held/a.flac"))
-    dupe = await store.record_held_import(**_held_kwargs(held_path="/held/b.flac"))  # same track
+    dupe = await store.record_held_import(
+        **_held_kwargs(held_path="/held/b.flac")
+    )  # same track
     assert isinstance(first, int)
-    assert dupe is None  # de-duped on (album, disc, track) so failover can't pile up copies
+    assert (
+        dupe is None
+    )  # de-duped on (album, disc, track) so failover can't pile up copies
     assert len(await store.list_held_imports("user-a", "user")) == 1
     # a different track of the same album is NOT a dupe
-    other = await store.record_held_import(**_held_kwargs(track_number=4, track_title="Dazed"))
+    other = await store.record_held_import(
+        **_held_kwargs(track_number=4, track_title="Dazed")
+    )
     assert isinstance(other, int)
     assert len(await store.list_held_imports("user-a", "user")) == 2
 

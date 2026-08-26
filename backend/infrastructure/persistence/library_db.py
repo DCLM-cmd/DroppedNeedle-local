@@ -73,6 +73,16 @@ _LIBRARY_FILE_VALUE_COLUMNS = (
     "tagged_at",
     "genre",
     "channels",
+    "track_sort_name",
+    "artist_sort_name",
+    "album_sort_name",
+    "album_artist_sort_name",
+    "disc_subtitle",
+    "original_release_date",
+    "replaygain_track_gain",
+    "replaygain_album_gain",
+    "replaygain_track_peak",
+    "replaygain_album_peak",
 )
 
 # SQL mirror of quality_tiers.tier_for (lossless extension set + kbps bands), ranked
@@ -100,9 +110,12 @@ _LIBRARY_FILE_FOLDED_COLUMNS = {
 }
 
 _ALBUM_AGG_SORTS = {
-    "recent": "last_imported_at DESC",
-    "title": "album_title COLLATE NOCASE ASC",
-    "artist": "album_artist_name COLLATE NOCASE ASC",
+    "recent": "last_imported_at DESC, release_group_mbid",
+    "oldest": "last_imported_at ASC, release_group_mbid",
+    "title": "album_title COLLATE NOCASE ASC, release_group_mbid",
+    "artist": "album_artist_name COLLATE NOCASE ASC, album_title COLLATE NOCASE ASC, release_group_mbid",
+    "year_asc": "year ASC, album_title COLLATE NOCASE ASC, release_group_mbid",
+    "year_desc": "year DESC, album_title COLLATE NOCASE ASC, release_group_mbid",
     "random": "RANDOM()",
 }
 
@@ -144,7 +157,9 @@ def _safe_delete(conn: sqlite3.Connection, table: str) -> None:
         conn.execute(f'DELETE FROM "{table}"')
     except sqlite3.OperationalError as exc:
         if "no such table" not in str(exc):
-            logger.warning("Unexpected error clearing cross-domain table %s: %s", table, exc)
+            logger.warning(
+                "Unexpected error clearing cross-domain table %s: %s", table, exc
+            )
 
 
 class LibraryDB(PersistenceBase):
@@ -217,6 +232,69 @@ class LibraryDB(PersistenceBase):
         finally:
             conn.close()
 
+    async def get_library_revision(self) -> int:
+        """Millisecond revision advanced by imports, tag writes, and removals."""
+
+        def operation(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
+                """
+                SELECT MAX(changed_at) AS revision
+                FROM (
+                    SELECT imported_at AS changed_at FROM library_files
+                    UNION ALL SELECT tagged_at FROM library_files
+                    UNION ALL SELECT deleted_at FROM library_files
+                )
+                """
+            ).fetchone()
+            return int(float(row["revision"] or 0) * 1000) if row else 0
+
+        return await self._read(operation)
+
+    async def existing_compat_ids(
+        self,
+        *,
+        artist_ids: list[str],
+        album_ids: list[str],
+        track_ids: list[str],
+    ) -> dict[str, set[str]]:
+        def selected(conn: sqlite3.Connection, sql: str, values: list[str]) -> set[str]:
+            if not values:
+                return set()
+            placeholders = ", ".join("?" for _ in values)
+            rows = conn.execute(
+                sql.format(placeholders=placeholders), values
+            ).fetchall()
+            return {str(row[0]) for row in rows}
+
+        def operation(conn: sqlite3.Connection) -> dict[str, set[str]]:
+            artists: set[str] = set()
+            if artist_ids:
+                placeholders = ", ".join("?" for _ in artist_ids)
+                rows = conn.execute(
+                    "SELECT DISTINCT artist_id FROM ("
+                    "SELECT artist_mbid AS artist_id FROM library_files "
+                    f"WHERE deleted_at IS NULL AND artist_mbid IN ({placeholders}) "
+                    "UNION SELECT album_artist_mbid AS artist_id FROM library_files "
+                    f"WHERE deleted_at IS NULL AND album_artist_mbid IN ({placeholders}))",
+                    (*artist_ids, *artist_ids),
+                ).fetchall()
+                artists = {str(row[0]) for row in rows}
+            albums = selected(
+                conn,
+                "SELECT DISTINCT release_group_mbid FROM library_files "
+                "WHERE deleted_at IS NULL AND release_group_mbid IN ({placeholders})",
+                album_ids,
+            )
+            tracks = selected(
+                conn,
+                "SELECT id FROM library_files "
+                "WHERE deleted_at IS NULL AND id IN ({placeholders})",
+                track_ids,
+            )
+            return {"artist": artists, "album": albums, "track": tracks}
+
+        return await self._read(operation)
+
     def _ensure_native_tables(self, conn: sqlite3.Connection) -> None:
         """DDL copied verbatim from plan.md §Database Schema."""
         conn.execute(
@@ -259,9 +337,15 @@ class LibraryDB(PersistenceBase):
         )
         for index_sql in (
             "CREATE INDEX IF NOT EXISTS idx_library_files_album ON library_files(release_group_mbid)",
+            "CREATE INDEX IF NOT EXISTS idx_library_files_album_lower_active "
+            "ON library_files(lower(release_group_mbid)) WHERE deleted_at IS NULL",
             "CREATE INDEX IF NOT EXISTS idx_library_files_path ON library_files(file_path)",
             "CREATE INDEX IF NOT EXISTS idx_library_files_recording ON library_files(recording_mbid)",
             "CREATE INDEX IF NOT EXISTS idx_library_files_artist ON library_files(artist_mbid)",
+            "CREATE INDEX IF NOT EXISTS idx_library_files_artist_lower_active "
+            "ON library_files(lower(artist_mbid)) WHERE deleted_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS idx_library_files_album_artist_lower_active "
+            "ON library_files(lower(album_artist_mbid)) WHERE deleted_at IS NULL",
             "CREATE INDEX IF NOT EXISTS idx_library_files_task ON library_files(download_task_id)",
             "CREATE INDEX IF NOT EXISTS idx_library_files_deleted ON library_files(deleted_at)",
             "CREATE INDEX IF NOT EXISTS idx_library_files_album_track "
@@ -302,8 +386,12 @@ class LibraryDB(PersistenceBase):
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_manual_review_created ON manual_review_queue(created_at DESC)"
         )
-        _safe_alter(conn, "ALTER TABLE manual_review_queue ADD COLUMN track_number INTEGER")
-        _safe_alter(conn, "ALTER TABLE manual_review_queue ADD COLUMN disc_number INTEGER")
+        _safe_alter(
+            conn, "ALTER TABLE manual_review_queue ADD COLUMN track_number INTEGER"
+        )
+        _safe_alter(
+            conn, "ALTER TABLE manual_review_queue ADD COLUMN disc_number INTEGER"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS library_album_meta (
@@ -330,6 +418,21 @@ class LibraryDB(PersistenceBase):
         # (no separate backfill). Existing NULL rows fill on the next re-scan.
         _safe_alter(conn, "ALTER TABLE library_files ADD COLUMN genre TEXT")
         _safe_alter(conn, "ALTER TABLE library_files ADD COLUMN channels INTEGER")
+        for column, column_type in (
+            ("track_sort_name", "TEXT"),
+            ("artist_sort_name", "TEXT"),
+            ("album_sort_name", "TEXT"),
+            ("album_artist_sort_name", "TEXT"),
+            ("disc_subtitle", "TEXT"),
+            ("original_release_date", "TEXT"),
+            ("replaygain_track_gain", "REAL"),
+            ("replaygain_album_gain", "REAL"),
+            ("replaygain_track_peak", "REAL"),
+            ("replaygain_album_peak", "REAL"),
+        ):
+            _safe_alter(
+                conn, f"ALTER TABLE library_files ADD COLUMN {column} {column_type}"
+            )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_lf_genre ON library_files(genre) "
             "WHERE deleted_at IS NULL"
@@ -370,14 +473,16 @@ class LibraryDB(PersistenceBase):
                 mbid = artist.get("mbid")
                 if not isinstance(mbid, str) or not mbid:
                     continue
-                artist_rows.append((
-                    _normalize(mbid),
-                    mbid,
-                    str(artist.get("name") or "Unknown"),
-                    int(artist.get("album_count") or 0),
-                    artist.get("date_added"),
-                    _encode_json(artist),
-                ))
+                artist_rows.append(
+                    (
+                        _normalize(mbid),
+                        mbid,
+                        str(artist.get("name") or "Unknown"),
+                        int(artist.get("album_count") or 0),
+                        artist.get("date_added"),
+                        _encode_json(artist),
+                    )
+                )
             if artist_rows:
                 conn.executemany(
                     "INSERT INTO library_artists (mbid_lower, mbid, name, album_count, date_added, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
@@ -392,18 +497,22 @@ class LibraryDB(PersistenceBase):
                 if not isinstance(mbid, str) or not mbid:
                     continue
                 artist_mbid = album.get("artist_mbid")
-                album_rows.append((
-                    _normalize(mbid),
-                    mbid,
-                    artist_mbid,
-                    _normalize(artist_mbid if isinstance(artist_mbid, str) else None),
-                    album.get("artist_name"),
-                    str(album.get("title") or "Unknown Album"),
-                    album.get("year"),
-                    album.get("cover_url"),
-                    album.get("date_added"),
-                    _encode_json(album),
-                ))
+                album_rows.append(
+                    (
+                        _normalize(mbid),
+                        mbid,
+                        artist_mbid,
+                        _normalize(
+                            artist_mbid if isinstance(artist_mbid, str) else None
+                        ),
+                        album.get("artist_name"),
+                        str(album.get("title") or "Unknown Album"),
+                        album.get("year"),
+                        album.get("cover_url"),
+                        album.get("date_added"),
+                        _encode_json(album),
+                    )
+                )
             if album_rows:
                 conn.executemany(
                     """
@@ -537,12 +646,109 @@ class LibraryDB(PersistenceBase):
 
         return await self._read(operation)
 
+    async def get_artist_mbid_page(
+        self, *, after_mbid: str, limit: int
+    ) -> list[str]:
+        def operation(conn: sqlite3.Connection) -> list[str]:
+            rows = conn.execute(
+                "SELECT mbid_lower FROM library_artists WHERE mbid_lower>? "
+                "ORDER BY mbid_lower LIMIT ?",
+                (after_mbid.casefold(), max(1, limit)),
+            ).fetchall()
+            return [str(row["mbid_lower"]) for row in rows]
+
+        return await self._read(operation)
+
     async def get_albums(self) -> list[dict[str, Any]]:
         def operation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             rows = conn.execute(
                 "SELECT raw_json FROM library_albums ORDER BY COALESCE(date_added, 0) DESC, title COLLATE NOCASE ASC"
             ).fetchall()
             return _decode_rows(rows)
+
+        return await self._read(operation)
+
+    async def get_recent_albums(self, *, limit: int) -> list[dict[str, Any]]:
+        def operation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT raw_json FROM library_albums "
+                "ORDER BY COALESCE(date_added,0) DESC,mbid_lower LIMIT ?",
+                (max(1, limit),),
+            ).fetchall()
+            return _decode_rows(rows)
+
+        return await self._read(operation)
+
+    async def get_anniversary_albums(
+        self, *, current_year: int, anniversary_years: tuple[int, ...], limit: int
+    ) -> list[dict[str, Any]]:
+        release_years = [current_year - age for age in anniversary_years]
+        if not release_years:
+            return []
+
+        def operation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            placeholders = ",".join("?" for _ in release_years)
+            rows = conn.execute(
+                "SELECT raw_json FROM library_albums "
+                f"WHERE year IN ({placeholders}) "
+                "ORDER BY (? - year) DESC,year DESC,mbid_lower LIMIT ?",
+                (*release_years, current_year, max(1, limit)),
+            ).fetchall()
+            return _decode_rows(rows)
+
+        return await self._read(operation)
+
+    async def get_enrichment_candidates(
+        self, *, after_mbid: str | None, limit: int
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """Return one keyset page for catalog-wide metadata enrichment."""
+
+        cursor_type = ""
+        cursor_mbid = ""
+        legacy_cursor = after_mbid or ""
+        if after_mbid and ":" in after_mbid:
+            candidate_type, candidate_mbid = after_mbid.split(":", 1)
+            if candidate_type in {"artist", "album"}:
+                cursor_type = candidate_type
+                cursor_mbid = candidate_mbid.casefold()
+                legacy_cursor = ""
+
+        def operation(
+            conn: sqlite3.Connection,
+        ) -> list[tuple[str, str, dict[str, Any]]]:
+            union = (
+                "SELECT entity_type,mbid_lower,raw_json FROM ("
+                "SELECT 'artist' entity_type,mbid_lower,raw_json FROM library_artists "
+                "UNION ALL SELECT 'album',mbid_lower,raw_json FROM library_albums) "
+            )
+            if legacy_cursor:
+                rows = conn.execute(
+                    union
+                    + "WHERE mbid_lower>? ORDER BY mbid_lower,entity_type LIMIT ?",
+                    (legacy_cursor.casefold(), max(1, limit)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    union
+                    + "WHERE entity_type>? OR (entity_type=? AND mbid_lower>?) "
+                    "ORDER BY entity_type,mbid_lower LIMIT ?",
+                    (cursor_type, cursor_type, cursor_mbid, max(1, limit)),
+                ).fetchall()
+            candidates: list[tuple[str, str, dict[str, Any]]] = []
+            for row in rows:
+                try:
+                    payload = _decode_json(row["raw_json"])
+                except Exception:  # noqa: BLE001 - malformed cached metadata is skipped
+                    continue
+                if isinstance(payload, dict):
+                    candidates.append(
+                        (
+                            str(row["entity_type"]),
+                            str(row["mbid_lower"]),
+                            payload,
+                        )
+                    )
+            return candidates
 
         return await self._read(operation)
 
@@ -704,7 +910,12 @@ class LibraryDB(PersistenceBase):
                 "SELECT title, artist_name, mbid, COALESCE(artist_mbid, '') AS artist_mbid FROM library_albums"
             ).fetchall()
             return [
-                (str(row["title"]), str(row["artist_name"] or ""), str(row["mbid"]), str(row["artist_mbid"]))
+                (
+                    str(row["title"]),
+                    str(row["artist_name"] or ""),
+                    str(row["mbid"]),
+                    str(row["artist_mbid"]),
+                )
                 for row in rows
                 if row["title"] and row["mbid"]
             ]
@@ -713,9 +924,15 @@ class LibraryDB(PersistenceBase):
 
     async def get_stats(self) -> dict[str, Any]:
         def operation(conn: sqlite3.Connection) -> dict[str, Any]:
-            artist_row = conn.execute("SELECT COUNT(*) AS count FROM library_artists").fetchone()
-            album_row = conn.execute("SELECT COUNT(*) AS count FROM library_albums").fetchone()
-            sync_row = conn.execute("SELECT value FROM cache_meta WHERE key = 'last_library_sync'").fetchone()
+            artist_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM library_artists"
+            ).fetchone()
+            album_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM library_albums"
+            ).fetchone()
+            sync_row = conn.execute(
+                "SELECT value FROM cache_meta WHERE key = 'last_library_sync'"
+            ).fetchone()
             last_sync = None
             if sync_row is not None:
                 try:
@@ -724,7 +941,9 @@ class LibraryDB(PersistenceBase):
                     last_sync = None
             db_size_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
             return {
-                "artist_count": int(artist_row["count"] if artist_row is not None else 0),
+                "artist_count": int(
+                    artist_row["count"] if artist_row is not None else 0
+                ),
                 "album_count": int(album_row["count"] if album_row is not None else 0),
                 "db_size_bytes": db_size_bytes,
                 "last_sync": last_sync,
@@ -751,9 +970,13 @@ class LibraryDB(PersistenceBase):
             value_params = [row.get(col) for col in _LIBRARY_FILE_VALUE_COLUMNS]
             # folded mirrors are written via SQL fold() - the same function used at
             # search time - so the stored values never drift from the query side
-            folded_params = [row.get(src) for src in _LIBRARY_FILE_FOLDED_COLUMNS.values()]
+            folded_params = [
+                row.get(src) for src in _LIBRARY_FILE_FOLDED_COLUMNS.values()
+            ]
             if existing is not None:
-                set_clause = ", ".join(f"{col} = ?" for col in _LIBRARY_FILE_VALUE_COLUMNS)
+                set_clause = ", ".join(
+                    f"{col} = ?" for col in _LIBRARY_FILE_VALUE_COLUMNS
+                )
                 folded_clause = ", ".join(
                     f"{col} = fold(?)" for col in _LIBRARY_FILE_FOLDED_COLUMNS
                 )
@@ -798,6 +1021,10 @@ class LibraryDB(PersistenceBase):
         q: str | None = None,
         file_format: str | None = None,
         decade: int | None = None,
+        from_year: int | None = None,
+        to_year: int | None = None,
+        genre: str | None = None,
+        release_group_mbids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Aggregation-on-read: group non-deleted files by release group.
 
@@ -824,6 +1051,21 @@ class LibraryDB(PersistenceBase):
         if decade is not None:
             filters.append("lf.year >= ? AND lf.year <= ?")
             params.extend([decade, decade + 9])
+        if from_year is not None:
+            filters.append("lf.year >= ?")
+            params.append(from_year)
+        if to_year is not None:
+            filters.append("lf.year <= ?")
+            params.append(to_year)
+        if genre is not None:
+            filters.append("fold(lf.genre) = fold(?)")
+            params.append(genre)
+        if release_group_mbids is not None:
+            if not release_group_mbids:
+                return [], 0
+            placeholders = ", ".join("?" for _ in release_group_mbids)
+            filters.append(f"lf.release_group_mbid IN ({placeholders})")
+            params.extend(release_group_mbids)
         where = " AND ".join(filters)
 
         def operation(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], int]:
@@ -838,6 +1080,9 @@ class LibraryDB(PersistenceBase):
                 SELECT lf.release_group_mbid AS release_group_mbid,
                        MAX(lf.album_title) AS album_title,
                        MAX(lf.album_artist_name) AS album_artist_name,
+                       MAX(lf.album_artist_mbid) AS album_artist_mbid,
+                       MAX(lf.album_sort_name) AS album_sort_name,
+                       MIN(lf.original_release_date) AS original_release_date,
                        MAX(lf.imported_at) AS last_imported_at,
                        COUNT(*) AS track_count,
                        SUM(lf.file_size_bytes) AS total_size_bytes,
@@ -903,8 +1148,11 @@ class LibraryDB(PersistenceBase):
             rows = conn.execute(
                 f"""
                 SELECT lf.id, lf.track_title, lf.album_title, lf.artist_name,
-                       lf.album_artist_name, lf.release_group_mbid, lf.file_format,
+                       lf.artist_mbid, lf.album_artist_name, lf.album_artist_mbid,
+                       lf.release_group_mbid, lf.recording_mbid, lf.file_format,
                        lf.track_number, lf.disc_number, lf.duration_seconds,
+                       lf.year, lf.genre, lf.bit_rate, lf.sample_rate, lf.bit_depth,
+                       lf.channels, lf.file_size_bytes, lf.imported_at,
                        lam.cover_url
                 FROM library_files lf
                 LEFT JOIN library_album_meta lam
@@ -925,9 +1173,10 @@ class LibraryDB(PersistenceBase):
         """Individual tracks (with album context + cover) for the Listening Room
         crate. order: 'recent' (newest imports), 'oldest', else random. decade
         filters to a 10-year window."""
-        order_sql = {"recent": "lf.imported_at DESC", "oldest": "lf.imported_at ASC"}.get(
-            order, "RANDOM()"
-        )
+        order_sql = {
+            "recent": "lf.imported_at DESC",
+            "oldest": "lf.imported_at ASC",
+        }.get(order, "RANDOM()")
         filters = ["lf.deleted_at IS NULL", "lf.release_group_mbid IS NOT NULL"]
         params: list[object] = []
         if decade is not None:
@@ -954,9 +1203,7 @@ class LibraryDB(PersistenceBase):
 
         return await self._read(operation)
 
-    async def search_tracks(
-        self, q: str, *, limit: int = 30
-    ) -> list[dict[str, Any]]:
+    async def search_tracks(self, q: str, *, limit: int = 30) -> list[dict[str, Any]]:
         """Individual tracks (with album context + cover) matching q on track
         title, artist, album artist, or album title (LIKE, accent- and
         case-insensitive via fold()).
@@ -1098,6 +1345,37 @@ class LibraryDB(PersistenceBase):
 
         return await self._read(operation)
 
+    async def get_files_by_release_group_mbids(
+        self, mbids: list[str], *, limit: int = 120
+    ) -> list[dict[str, Any]]:
+        if not mbids:
+            return []
+
+        normalized = [mbid.casefold() for mbid in mbids]
+
+        def operation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            placeholders = ", ".join("?" for _ in normalized)
+            rows = conn.execute(
+                f"SELECT * FROM library_files WHERE deleted_at IS NULL "
+                f"AND LOWER(release_group_mbid) IN ({placeholders}) "
+                "ORDER BY disc_number, track_number, id LIMIT ?",
+                (*normalized, max(limit, 1)),
+            ).fetchall()
+            order = {mbid: index for index, mbid in enumerate(normalized)}
+            return sorted(
+                (dict(row) for row in rows),
+                key=lambda row: (
+                    order.get(
+                        str(row.get("release_group_mbid") or "").casefold(), len(order)
+                    ),
+                    int(row.get("disc_number") or 0),
+                    int(row.get("track_number") or 0),
+                    str(row.get("id") or ""),
+                ),
+            )
+
+        return await self._read(operation)
+
     async def get_files_by_album_artist_mbids(
         self, mbids: list[str], *, limit: int = 500
     ) -> list[dict[str, Any]]:
@@ -1206,7 +1484,27 @@ class LibraryDB(PersistenceBase):
 
         return await self._read(operation)
 
-    async def get_library_files_for_album(self, release_group_mbid: str) -> list[dict[str, Any]]:
+    async def get_library_files_by_ids(
+        self, file_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        ids = list(dict.fromkeys(file_ids))
+        if not ids:
+            return {}
+
+        def operation(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+            placeholders = ", ".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT * FROM library_files WHERE deleted_at IS NULL "
+                f"AND id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            return {str(row["id"]): dict(row) for row in rows}
+
+        return await self._read(operation)
+
+    async def get_library_files_for_album(
+        self, release_group_mbid: str
+    ) -> list[dict[str, Any]]:
         # stored lower-cased (see upsert_library_file / has_album_files), so normalize
         # the input the same way or a mixed-case MBID silently returns no rows
         normalized = _normalize(release_group_mbid)
@@ -1218,6 +1516,22 @@ class LibraryDB(PersistenceBase):
                 (normalized,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+        return await self._read(operation)
+
+    async def resolve_library_album_identifier(self, album_mbid: str) -> str | None:
+        """Return the active release-group MBID addressed by a group or release MBID."""
+        normalized = _normalize(album_mbid)
+
+        def operation(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute(
+                "SELECT release_group_mbid FROM library_files "
+                "WHERE deleted_at IS NULL AND "
+                "(release_group_mbid = ? OR lower(release_mbid) = ?) "
+                "ORDER BY imported_at DESC LIMIT 1",
+                (normalized, normalized),
+            ).fetchone()
+            return str(row["release_group_mbid"]) if row else None
 
         return await self._read(operation)
 
@@ -1268,7 +1582,9 @@ class LibraryDB(PersistenceBase):
 
         return await self._read(operation)
 
-    async def get_library_files_for_task(self, download_task_id: str) -> list[dict[str, Any]]:
+    async def get_library_files_for_task(
+        self, download_task_id: str
+    ) -> list[dict[str, Any]]:
         """Active rows imported by one download task (crash-idempotency reconcile)."""
 
         def operation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -1369,7 +1685,9 @@ class LibraryDB(PersistenceBase):
 
         return await self._read(operation)
 
-    async def get_library_files_for_recording(self, recording_mbid: str) -> list[dict[str, Any]]:
+    async def get_library_files_for_recording(
+        self, recording_mbid: str
+    ) -> list[dict[str, Any]]:
         def operation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             rows = conn.execute(
                 "SELECT * FROM library_files WHERE recording_mbid = ? AND deleted_at IS NULL",
@@ -1415,6 +1733,60 @@ class LibraryDB(PersistenceBase):
 
         return await self._read(operation)
 
+    async def existing_library_mbids(self, identifiers: list[str]) -> set[str]:
+        normalized = list(
+            dict.fromkeys(value.strip().casefold() for value in identifiers if value.strip())
+        )
+        if not normalized:
+            return set()
+
+        def operation(conn: sqlite3.Connection) -> set[str]:
+            found: set[str] = set()
+            for offset in range(0, len(normalized), 500):
+                batch = normalized[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    "SELECT DISTINCT release_group_mbid FROM library_files "
+                    f"WHERE lower(release_group_mbid) IN ({placeholders}) "
+                    "AND deleted_at IS NULL",
+                    batch,
+                ).fetchall()
+                found.update(str(row["release_group_mbid"]).casefold() for row in rows)
+            return found
+
+        return await self._read(operation)
+
+    async def existing_library_artist_mbids(
+        self, identifiers: list[str]
+    ) -> set[str]:
+        normalized = list(
+            dict.fromkeys(
+                value.strip().casefold() for value in identifiers if value.strip()
+            )
+        )
+        if not normalized:
+            return set()
+
+        def operation(conn: sqlite3.Connection) -> set[str]:
+            found: set[str] = set()
+            for offset in range(0, len(normalized), 500):
+                batch = normalized[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    "SELECT artist_mbid,album_artist_mbid FROM library_files "
+                    "WHERE deleted_at IS NULL AND ("
+                    f"lower(artist_mbid) IN ({placeholders}) OR "
+                    f"lower(album_artist_mbid) IN ({placeholders}))",
+                    (*batch, *batch),
+                ).fetchall()
+                for row in rows:
+                    for column in ("artist_mbid", "album_artist_mbid"):
+                        if row[column]:
+                            found.add(str(row[column]).casefold())
+            return found
+
+        return await self._read(operation)
+
     async def _exists(self, sql: str, params: tuple[Any, ...]) -> bool:
         def operation(conn: sqlite3.Connection) -> bool:
             return conn.execute(sql, params).fetchone() is not None
@@ -1455,18 +1827,42 @@ class LibraryDB(PersistenceBase):
 
         return await self._write(operation)
 
-    async def count_artist_albums(
+    async def finalize_album_removal(
         self,
+        release_group_mbid: str,
+        removed_paths: list[str],
         *,
-        artist_mbid: str | None = None,
-        artist_name: str | None = None,
-        exclude_release_group_mbid: str | None = None,
-    ) -> int:
-        """Distinct non-deleted albums for an album-artist (matched by MBID when
-        present, else by name). ``exclude_release_group_mbid`` drops one album from
-        the count, used by the removal preview before its files are soft-deleted."""
+        artist_mbid: str | None,
+        artist_name: str | None,
+    ) -> tuple[int, int]:
+        """Commit confirmed file removals and return album files/artist albums left.
 
-        def operation(conn: sqlite3.Connection) -> int:
+        File operations happen before this transaction. Only paths confirmed absent
+        are hidden, so a failed unlink stays visible and a retry can finish it.
+        """
+        normalized = _normalize(release_group_mbid)
+        now = time.time()
+
+        def operation(conn: sqlite3.Connection) -> tuple[int, int]:
+            if removed_paths:
+                conn.executemany(
+                    "UPDATE library_files SET deleted_at = ? "
+                    "WHERE release_group_mbid = ? AND file_path = ? AND deleted_at IS NULL",
+                    [(now, normalized, path) for path in removed_paths],
+                )
+
+            album_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM library_files "
+                "WHERE release_group_mbid = ? AND deleted_at IS NULL",
+                (normalized,),
+            ).fetchone()
+            album_files_remaining = int(album_row["cnt"]) if album_row else 0
+            if album_files_remaining == 0:
+                conn.execute(
+                    "DELETE FROM library_albums WHERE mbid_lower = ?",
+                    (normalized,),
+                )
+
             filters = ["deleted_at IS NULL", "release_group_mbid IS NOT NULL"]
             params: list[object] = []
             if artist_mbid:
@@ -1476,19 +1872,16 @@ class LibraryDB(PersistenceBase):
                 filters.append("album_artist_name = ?")
                 params.append(artist_name)
             else:
-                return 0
-            if exclude_release_group_mbid:
-                filters.append("release_group_mbid != ?")
-                params.append(exclude_release_group_mbid)
-            where = " AND ".join(filters)
-            row = conn.execute(
-                f"SELECT COUNT(DISTINCT release_group_mbid) AS cnt "
-                f"FROM library_files WHERE {where}",
+                return album_files_remaining, 0
+            artist_row = conn.execute(
+                "SELECT COUNT(DISTINCT release_group_mbid) AS cnt "
+                f"FROM library_files WHERE {' AND '.join(filters)}",
                 params,
             ).fetchone()
-            return int(row["cnt"]) if row else 0
+            artist_albums_remaining = int(artist_row["cnt"]) if artist_row else 0
+            return album_files_remaining, artist_albums_remaining
 
-        return await self._read(operation)
+        return await self._write(operation)
 
     async def mark_missing_files(
         self,
@@ -1602,7 +1995,9 @@ class LibraryDB(PersistenceBase):
         file_path is UNIQUE, so a re-scan refreshes the row in place rather than
         duplicating."""
         now = time.time()
-        candidates_encoded = _encode_json(to_jsonable(entry.get("candidate_mbids") or []))
+        candidates_encoded = _encode_json(
+            to_jsonable(entry.get("candidate_mbids") or [])
+        )
 
         def operation(conn: sqlite3.Connection) -> None:
             conn.execute(
@@ -1738,6 +2133,25 @@ class LibraryDB(PersistenceBase):
 
         return await self._read(operation)
 
+    async def get_library_path_mapping_sources(self) -> list[tuple[str, str, str]]:
+        """All catalog and review paths required by the typed-root dry run."""
+
+        def operation(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
+            rows = conn.execute(
+                "SELECT 'library_file' AS source_kind, id AS source_id, file_path "
+                "FROM library_files "
+                "UNION ALL "
+                "SELECT 'review_row' AS source_kind, CAST(id AS TEXT) AS source_id, "
+                "file_path FROM manual_review_queue "
+                "ORDER BY source_kind, source_id"
+            ).fetchall()
+            return [
+                (str(row["source_kind"]), str(row["source_id"]), str(row["file_path"]))
+                for row in rows
+            ]
+
+        return await self._read(operation)
+
     async def upsert_artist(self, mbid: str, name: str) -> None:
         """Idempotent insert of a (possibly synthetic) artist row (Q14, 06 s7.5).
 
@@ -1841,7 +2255,9 @@ class LibraryDB(PersistenceBase):
                 "total_artists": int(agg["artists"] or 0) if agg else 0,
                 "total_tracks": int(agg["tracks"] or 0) if agg else 0,
                 "total_size_bytes": int(agg["size"] or 0) if agg else 0,
-                "format_breakdown": {str(r["file_format"]): int(r["cnt"]) for r in fmt_rows},
+                "format_breakdown": {
+                    str(r["file_format"]): int(r["cnt"]) for r in fmt_rows
+                },
                 "unmatched_count": int(unmatched["cnt"]) if unmatched else 0,
                 "last_scan_at": last_scan_at,
             }

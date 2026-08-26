@@ -1,9 +1,9 @@
 """AudioTagger - the mutagen seam.
 
-Reads/writes tag metadata and cover art across the three formats we care about:
+Reads tag metadata and cover art across the legacy scan formats:
 MP3 (ID3v2), FLAC/OGG (Vorbis comments), and M4A (MP4 atoms). The MusicBrainz
-fields use the Picard tag names; the per-format mapping lives in the ``_*_MB``
-tables below and is the single source of truth for both read and write.
+fields use the Picard tag names. All writes now go through the staged management
+metadata engine and its tested per-format adapters.
 
 This is the mock seam for the scanner: tests mock ``AudioTagger`` (or
 ``mutagen.File``), never mutagen's per-format classes directly.
@@ -14,14 +14,18 @@ from pathlib import Path
 from typing import Any
 
 import mutagen
-from mutagen.flac import FLAC, Picture
-from mutagen.id3 import APIC, TALB, TCMP, TCON, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX, UFID
+from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
-from mutagen.mp4 import MP4, MP4Cover
-from mutagen.oggopus import OggOpus
-from mutagen.oggvorbis import OggVorbis
+from mutagen.mp4 import MP4
 
-from models.audio import AudioInfo, AudioTag
+from core.exceptions import AudioFormatError
+from infrastructure.audio.metadata_engine import (
+    AUDIO_EXTENSION_FORMATS,
+    AudioMetadataEngine,
+    legacy_audio_projection,
+)
+from models.audio import AudioArtistCredit, AudioInfo, AudioTag
+from models.audio_metadata import ReadAudioDocument
 
 logger = logging.getLogger(__name__)
 
@@ -56,16 +60,6 @@ _MP4_MB = {
     "acoustid_id": f"{_MP4_PREFIX}Acoustid Id",
 }
 
-# The release-level MusicBrainz IDs the download request owns authoritatively.
-# ``write_album_identity`` stamps only these (plus album/album-artist/year) so an
-# import never rewrites the file's own descriptive tags - title, artist, genre,
-# and the recording/artist/acoustid IDs already present stay byte-for-byte.
-_OWNED_MB_FIELDS = (
-    "musicbrainz_release_group_id",
-    "musicbrainz_release_id",
-    "musicbrainz_album_artist_id",
-)
-
 _SUFFIX_FORMATS = {
     ".flac": "flac",
     ".mp3": "mp3",
@@ -75,23 +69,6 @@ _SUFFIX_FORMATS = {
     ".m4a": "m4a",
     ".m4b": "m4a",
     ".mp4": "m4a",
-}
-
-# Forces the matching mutagen class for a known real extension instead of letting
-# ``mutagen.File`` sniff format from the path it's actually given. Needed for the
-# atomic-write staging file (a ``.part``-suffixed temp path): a FLAC ripped with a
-# (non-standard but common) leading ID3v2 tag scores itself as MP3 once the ``.flac``
-# extension bonus is gone, and then blows up trying to sync MPEG frames against FLAC
-# bytes. See ``AudioTagger._open``.
-_SUFFIX_CLASSES: dict[str, type] = {
-    ".flac": FLAC,
-    ".mp3": MP3,
-    ".ogg": OggVorbis,
-    ".oga": OggVorbis,
-    ".opus": OggOpus,
-    ".m4a": MP4,
-    ".m4b": MP4,
-    ".mp4": MP4,
 }
 
 # Only these report a meaningful bit depth. MP4Info.bits_per_sample is 16 even
@@ -119,19 +96,45 @@ def _join_all(value: Any, sep: str = "; ") -> str | None:
     ID3 ``TCON`` frame whose text is itself a list (multi-value frames stringify
     with NUL joins). Reading only the first value (``_first``) silently hides the
     rest from our DB/UI, so genre uses this instead to surface the truth."""
+    return sep.join(_all_values(value)) or None
+
+
+def _all_values(value: Any) -> list[str]:
+    """Return only format-native values; punctuation inside one value is opaque."""
     if value is None:
-        return None
+        return []
     raw = getattr(value, "text", value)  # an ID3 frame -> its text list
     items = raw if isinstance(raw, (list, tuple)) else [raw]
     out: list[str] = []
     seen: set[str] = set()
     for item in items:
-        for part in str(item).split("\x00"):
+        text = (
+            bytes(item).decode("utf-8", "replace")
+            if isinstance(item, (bytes, bytearray))
+            else str(item)
+        )
+        for part in text.split("\x00"):
             part = part.strip()
             if part and part not in seen:
                 seen.add(part)
                 out.append(part)
-    return sep.join(out) or None
+    return out
+
+
+def _artist_credits(
+    names: list[str], artist_ids: list[str], sort_name: str | None
+) -> list[AudioArtistCredit]:
+    return [
+        AudioArtistCredit(
+            name=name,
+            credited_name=name,
+            sort_name=sort_name if len(names) == 1 else None,
+            musicbrainz_artist_id=artist_ids[position]
+            if position < len(artist_ids)
+            else None,
+        )
+        for position, name in enumerate(names)
+    ]
 
 
 def _leading_int(value: Any) -> int | None:
@@ -156,21 +159,32 @@ def _year(value: Any) -> int | None:
         return None
 
 
+def _float_tag(value: Any, *, positive: bool = False) -> float | None:
+    text = _first(value)
+    if text is None:
+        return None
+    normalized = text.lower().removesuffix("db").strip()
+    try:
+        result = float(normalized)
+    except ValueError:
+        return None
+    if positive and result < 0:
+        return None
+    return result
+
+
 class AudioTagger:
     """Format-dispatching wrapper over mutagen. No state - safe as a singleton."""
 
-    @staticmethod
-    def _open(path: Path, suffix_hint: str | None = None) -> Any:
-        """Load via mutagen, normalising both the ``None`` and corrupt-file
-        (``MutagenError``) cases into a single ``ValueError``.
+    def __init__(self, metadata_engine: AudioMetadataEngine | None = None) -> None:
+        self._metadata_engine = metadata_engine or AudioMetadataEngine()
 
-        ``suffix_hint`` (a real extension, e.g. ``.flac``) forces the matching
-        mutagen class instead of letting ``mutagen.File`` sniff format from
-        ``path`` itself - needed when ``path`` is a staging file whose name
-        doesn't carry the real extension (see ``_SUFFIX_CLASSES``)."""
-        cls = _SUFFIX_CLASSES.get(suffix_hint.lower()) if suffix_hint else None
+    @staticmethod
+    def _open(path: Path) -> Any:
+        """Load via mutagen, normalising both the ``None`` and corrupt-file
+        (``MutagenError``) cases into a single ``ValueError``."""
         try:
-            audio = cls(path) if cls is not None else mutagen.File(path)
+            audio = mutagen.File(path)
         except mutagen.MutagenError as exc:
             raise ValueError(f"Unsupported or unreadable audio file: {path}") from exc
         if audio is None:
@@ -179,6 +193,11 @@ class AudioTagger:
 
     def read_tags(self, path: Path) -> tuple[AudioTag, AudioInfo]:
         """Read tags + technical info. Raises ``ValueError`` on unreadable files."""
+        if path.suffix.casefold() in AUDIO_EXTENSION_FORMATS:
+            try:
+                return legacy_audio_projection(self.read_document(path))
+            except AudioFormatError as error:
+                raise ValueError("Unsupported or unreadable audio file.") from error
         audio = self._open(path)
         fmt = _SUFFIX_FORMATS.get(Path(path).suffix.lower(), "")
         if isinstance(audio, MP4):
@@ -190,68 +209,9 @@ class AudioTagger:
         info = self._read_info(audio, Path(path), fmt)
         return tag, info
 
-    def write_mb_tags(self, path: Path, tag: AudioTag) -> None:
-        """Write the full ``AudioTag`` (descriptive + MusicBrainz fields)."""
-        audio = self._open(path)
-        if isinstance(audio, MP4):
-            self._write_mp4(audio, tag)
-        elif isinstance(audio, MP3):
-            self._write_id3(audio, tag)
-        else:
-            self._write_vorbis(audio, tag)
-        audio.save()
-
-    def write_album_identity(
-        self, path: Path, tag: AudioTag, suffix_hint: str | None = None
-    ) -> None:
-        """Stamp only the request-owned album identity - album, album artist, year
-        and the release-level MusicBrainz IDs (``_OWNED_MB_FIELDS``) - leaving every
-        other existing tag untouched.
-
-        The import path uses this instead of ``write_mb_tags`` so re-saving a
-        download never round-trips the file's own descriptive tags (title, artist,
-        genre, the recording/artist IDs) through our single-value model, which would
-        flatten a multi-value genre or artist to its first value. ``suffix_hint``
-        is passed through to ``_open`` for staging paths without a real extension."""
-        audio = self._open(path, suffix_hint)
-        if isinstance(audio, MP4):
-            if audio.tags is None:
-                audio.add_tags()
-            tags = audio.tags
-            tags["\xa9alb"] = [tag.album]
-            if tag.album_artist is not None:
-                tags["aART"] = [tag.album_artist]
-            if tag.year is not None:
-                tags["\xa9day"] = [str(tag.year)]
-            for field in _OWNED_MB_FIELDS:
-                value = getattr(tag, field)
-                if value:
-                    tags[_MP4_MB[field]] = [value.encode("utf-8")]
-        elif isinstance(audio, MP3):
-            if audio.tags is None:
-                audio.add_tags()
-            tags = audio.tags
-            tags.setall("TALB", [TALB(encoding=3, text=[tag.album])])
-            if tag.album_artist is not None:
-                tags.setall("TPE2", [TPE2(encoding=3, text=[tag.album_artist])])
-            if tag.year is not None:
-                tags.setall("TDRC", [TDRC(encoding=3, text=[str(tag.year)])])
-            for field in _OWNED_MB_FIELDS:
-                value = getattr(tag, field)
-                if value:
-                    desc = _ID3_MB[field]
-                    tags.setall(f"TXXX:{desc}", [TXXX(encoding=3, desc=desc, text=[value])])
-        else:
-            audio["ALBUM"] = tag.album
-            if tag.album_artist is not None:
-                audio["ALBUMARTIST"] = tag.album_artist
-            if tag.year is not None:
-                audio["DATE"] = str(tag.year)
-            for field in _OWNED_MB_FIELDS:
-                value = getattr(tag, field)
-                if value:
-                    audio[_VORBIS_MB[field]] = value
-        audio.save()
+    def read_document(self, path: Path) -> ReadAudioDocument:
+        """Read an admitted format without generic Mutagen dispatch."""
+        return self._metadata_engine.read(path)
 
     def read_cover_art(self, path: Path) -> bytes | None:
         try:
@@ -271,33 +231,19 @@ class AudioTagger:
                 return bytes(frame.data)
         return None
 
-    def write_cover_art(self, path: Path, data: bytes) -> None:
-        audio = self._open(path)
-        if isinstance(audio, MP4):
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags["covr"] = [MP4Cover(data, imageformat=MP4Cover.FORMAT_JPEG)]
-        elif isinstance(audio, FLAC):
-            picture = Picture()
-            picture.data = data
-            picture.type = 3  # front cover
-            picture.mime = "image/jpeg"
-            audio.clear_pictures()
-            audio.add_picture(picture)
-        else:
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags.setall(
-                "APIC", [APIC(encoding=3, mime="image/jpeg", type=3, desc="", data=data)]
-            )
-        audio.save()
-
     # -- ID3v2 (MP3) --
 
     def _read_id3(self, audio: Any) -> AudioTag:
         tags = audio.tags
         if tags is None:
             return AudioTag(title="", artist="", album="", track_number=0)
+        genres = _all_values(tags.get("TCON"))
+        artist_ids = _all_values(tags.get("TXXX:MusicBrainz Artist Id"))
+        album_artist_ids = _all_values(tags.get("TXXX:MusicBrainz Album Artist Id"))
+        artist_names = _all_values(tags.get("TXXX:Artists")) or _all_values(
+            tags.get("TPE1")
+        )
+        album_artist_names = _all_values(tags.get("TPE2"))
         return AudioTag(
             title=_first(tags.get("TIT2")) or "",
             artist=_first(tags.get("TPE1")) or "",
@@ -308,6 +254,27 @@ class AudioTagger:
             year=_year(tags.get("TDRC")),
             genre=_join_all(tags.get("TCON")),
             compilation=_first(tags.get("TCMP")) == "1",
+            title_sort=_first(tags.get("TSOT")),
+            artist_sort=_first(tags.get("TSOP")),
+            album_sort=_first(tags.get("TSOA")),
+            album_artist_sort=_first(tags.get("TSO2")),
+            disc_subtitle=_first(tags.get("TSST")),
+            original_release_date=_first(tags.get("TDOR")),
+            replaygain_track_gain=_float_tag(tags.get("TXXX:REPLAYGAIN_TRACK_GAIN")),
+            replaygain_album_gain=_float_tag(tags.get("TXXX:REPLAYGAIN_ALBUM_GAIN")),
+            replaygain_track_peak=_float_tag(
+                tags.get("TXXX:REPLAYGAIN_TRACK_PEAK"), positive=True
+            ),
+            replaygain_album_peak=_float_tag(
+                tags.get("TXXX:REPLAYGAIN_ALBUM_PEAK"), positive=True
+            ),
+            genres=genres,
+            artists=_artist_credits(artist_names, artist_ids, _first(tags.get("TSOP"))),
+            album_artists=_artist_credits(
+                album_artist_names, album_artist_ids, _first(tags.get("TSO2"))
+            ),
+            musicbrainz_artist_ids=artist_ids,
+            musicbrainz_album_artist_ids=album_artist_ids,
             **self._read_id3_mb(tags),
         )
 
@@ -319,42 +286,11 @@ class AudioTagger:
         # The recording MBID is a UFID frame (owner = musicbrainz.org), not a TXXX.
         ufid = tags.get(f"UFID:{_MB_UFID_OWNER}")
         out["musicbrainz_recording_id"] = (
-            bytes(ufid.data).decode("utf-8", "ignore").strip() or None if ufid is not None else None
+            bytes(ufid.data).decode("utf-8", "ignore").strip() or None
+            if ufid is not None
+            else None
         )
         return out
-
-    def _write_id3(self, audio: Any, tag: AudioTag) -> None:
-        if audio.tags is None:
-            audio.add_tags()
-        tags = audio.tags
-        tags.setall("TIT2", [TIT2(encoding=3, text=[tag.title])])
-        tags.setall("TPE1", [TPE1(encoding=3, text=[tag.artist])])
-        tags.setall("TALB", [TALB(encoding=3, text=[tag.album])])
-        if tag.album_artist is not None:
-            tags.setall("TPE2", [TPE2(encoding=3, text=[tag.album_artist])])
-        tags.setall("TRCK", [TRCK(encoding=3, text=[str(tag.track_number)])])
-        tags.setall("TPOS", [TPOS(encoding=3, text=[str(tag.disc_number)])])
-        if tag.year is not None:
-            tags.setall("TDRC", [TDRC(encoding=3, text=[str(tag.year)])])
-        if tag.genre is not None:
-            tags.setall("TCON", [TCON(encoding=3, text=[tag.genre])])
-        tags.setall("TCMP", [TCMP(encoding=3, text=["1" if tag.compilation else "0"])])
-        for field, desc in _ID3_MB.items():
-            value = getattr(tag, field)
-            key = f"TXXX:{desc}"
-            if value:
-                tags.setall(key, [TXXX(encoding=3, desc=desc, text=[value])])
-            elif key in tags:
-                tags.delall(key)
-        # Recording MBID -> UFID frame (not TXXX).
-        ufid_key = f"UFID:{_MB_UFID_OWNER}"
-        if tag.musicbrainz_recording_id:
-            tags.setall(
-                ufid_key,
-                [UFID(owner=_MB_UFID_OWNER, data=tag.musicbrainz_recording_id.encode("utf-8"))],
-            )
-        elif ufid_key in tags:
-            tags.delall(ufid_key)
 
     # -- Vorbis (FLAC/OGG) --
 
@@ -363,6 +299,13 @@ class AudioTagger:
             return audio.get(key)
 
         mb = {field: _first(g(key)) for field, key in _VORBIS_MB.items()}
+        genres = _all_values(g("GENRE"))
+        artist_ids = _all_values(g("MUSICBRAINZ_ARTISTID"))
+        album_artist_ids = _all_values(g("MUSICBRAINZ_ALBUMARTISTID"))
+        artist_names = _all_values(g("ARTISTS")) or _all_values(g("ARTIST"))
+        album_artist_names = _all_values(g("ALBUMARTISTS")) or _all_values(
+            g("ALBUMARTIST")
+        )
         return AudioTag(
             title=_first(g("TITLE")) or "",
             artist=_first(g("ARTIST")) or "",
@@ -373,28 +316,27 @@ class AudioTagger:
             year=_year(g("DATE")),
             genre=_join_all(g("GENRE")),
             compilation=_first(g("COMPILATION")) == "1",
+            title_sort=_first(g("TITLESORT")),
+            artist_sort=_first(g("ARTISTSORT")),
+            album_sort=_first(g("ALBUMSORT")),
+            album_artist_sort=_first(g("ALBUMARTISTSORT")),
+            disc_subtitle=_first(g("DISCSUBTITLE")),
+            original_release_date=_first(g("ORIGINALDATE")),
+            replaygain_track_gain=_float_tag(g("REPLAYGAIN_TRACK_GAIN")),
+            replaygain_album_gain=_float_tag(g("REPLAYGAIN_ALBUM_GAIN")),
+            replaygain_track_peak=_float_tag(g("REPLAYGAIN_TRACK_PEAK"), positive=True),
+            replaygain_album_peak=_float_tag(g("REPLAYGAIN_ALBUM_PEAK"), positive=True),
+            genres=genres,
+            artists=_artist_credits(artist_names, artist_ids, _first(g("ARTISTSORT"))),
+            album_artists=_artist_credits(
+                album_artist_names,
+                album_artist_ids,
+                _first(g("ALBUMARTISTSORT")),
+            ),
+            musicbrainz_artist_ids=artist_ids,
+            musicbrainz_album_artist_ids=album_artist_ids,
             **mb,
         )
-
-    def _write_vorbis(self, audio: Any, tag: AudioTag) -> None:
-        audio["TITLE"] = tag.title
-        audio["ARTIST"] = tag.artist
-        audio["ALBUM"] = tag.album
-        if tag.album_artist is not None:
-            audio["ALBUMARTIST"] = tag.album_artist
-        audio["TRACKNUMBER"] = str(tag.track_number)
-        audio["DISCNUMBER"] = str(tag.disc_number)
-        if tag.year is not None:
-            audio["DATE"] = str(tag.year)
-        if tag.genre is not None:
-            audio["GENRE"] = tag.genre
-        audio["COMPILATION"] = "1" if tag.compilation else "0"
-        for field, key in _VORBIS_MB.items():
-            value = getattr(tag, field)
-            if value:
-                audio[key] = value
-            elif key in audio:
-                del audio[key]
 
     # -- MP4 (M4A) --
 
@@ -410,10 +352,28 @@ class AudioTagger:
                 return int(value[0][0])
             return None
 
+        def freeform(key: str) -> str | None:
+            raw = tags.get(key)
+            if not raw:
+                return None
+            value = raw[0]
+            if isinstance(value, bytes):
+                return value.decode("utf-8", "replace").strip() or None
+            return _first(value)
+
         mb: dict[str, str | None] = {}
         for field, key in _MP4_MB.items():
             raw = tags.get(key)
-            mb[field] = bytes(raw[0]).decode("utf-8", "ignore").strip() or None if raw else None
+            mb[field] = (
+                bytes(raw[0]).decode("utf-8", "ignore").strip() or None if raw else None
+            )
+        genres = _all_values(tags.get("\xa9gen"))
+        artist_ids = _all_values(tags.get(_MP4_MB["musicbrainz_artist_id"]))
+        album_artist_ids = _all_values(tags.get(_MP4_MB["musicbrainz_album_artist_id"]))
+        artist_names = _all_values(tags.get(f"{_MP4_PREFIX}ARTISTS")) or _all_values(
+            tags.get("\xa9ART")
+        )
+        album_artist_names = _all_values(tags.get("aART"))
         cpil = tags.get("cpil")  # mutagen returns a plain bool for this atom
         if isinstance(cpil, list):
             cpil = cpil[0] if cpil else False
@@ -427,31 +387,33 @@ class AudioTagger:
             year=_year(text("\xa9day")),
             genre=_join_all(tags.get("\xa9gen")),
             compilation=bool(cpil),
+            title_sort=text("sonm"),
+            artist_sort=text("soar"),
+            album_sort=text("soal"),
+            album_artist_sort=text("soaa"),
+            disc_subtitle=freeform(f"{_MP4_PREFIX}DISCSUBTITLE"),
+            original_release_date=freeform(f"{_MP4_PREFIX}ORIGINALDATE"),
+            replaygain_track_gain=_float_tag(
+                freeform(f"{_MP4_PREFIX}REPLAYGAIN_TRACK_GAIN")
+            ),
+            replaygain_album_gain=_float_tag(
+                freeform(f"{_MP4_PREFIX}REPLAYGAIN_ALBUM_GAIN")
+            ),
+            replaygain_track_peak=_float_tag(
+                freeform(f"{_MP4_PREFIX}REPLAYGAIN_TRACK_PEAK"), positive=True
+            ),
+            replaygain_album_peak=_float_tag(
+                freeform(f"{_MP4_PREFIX}REPLAYGAIN_ALBUM_PEAK"), positive=True
+            ),
+            genres=genres,
+            artists=_artist_credits(artist_names, artist_ids, text("soar")),
+            album_artists=_artist_credits(
+                album_artist_names, album_artist_ids, text("soaa")
+            ),
+            musicbrainz_artist_ids=artist_ids,
+            musicbrainz_album_artist_ids=album_artist_ids,
             **mb,
         )
-
-    def _write_mp4(self, audio: Any, tag: AudioTag) -> None:
-        if audio.tags is None:
-            audio.add_tags()
-        tags = audio.tags
-        tags["\xa9nam"] = [tag.title]
-        tags["\xa9ART"] = [tag.artist]
-        tags["\xa9alb"] = [tag.album]
-        if tag.album_artist is not None:
-            tags["aART"] = [tag.album_artist]
-        tags["trkn"] = [(tag.track_number, 0)]
-        tags["disk"] = [(tag.disc_number, 0)]
-        if tag.year is not None:
-            tags["\xa9day"] = [str(tag.year)]
-        if tag.genre is not None:
-            tags["\xa9gen"] = [tag.genre]
-        tags["cpil"] = tag.compilation
-        for field, key in _MP4_MB.items():
-            value = getattr(tag, field)
-            if value:
-                tags[key] = [value.encode("utf-8")]
-            elif key in tags:
-                del tags[key]
 
     # -- technical info --
 

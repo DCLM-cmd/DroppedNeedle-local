@@ -114,6 +114,9 @@ class FollowService:
     async def list_pending_approvals(self) -> list[Approval]:
         return await self._store.list_pending_approvals()
 
+    async def count_pending_approval_units(self) -> int:
+        return await self._store.count_pending_approval_units()
+
     async def approve(
         self, user_id: str, artist_mbid: str, reviewer: tuple[str, str | None]
     ) -> bool:

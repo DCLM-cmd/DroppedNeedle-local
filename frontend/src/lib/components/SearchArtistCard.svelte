@@ -10,24 +10,33 @@
 	interface Props {
 		artist: Artist;
 		enrichmentSource?: EnrichmentSource;
+		onenrichmentrequest?: (() => void) | undefined;
 	}
 
-	let { artist, enrichmentSource = 'none' }: Props = $props();
+	let { artist, enrichmentSource = 'none', onenrichmentrequest = undefined }: Props = $props();
 
 	let listenTitle = $derived(getListenTitle(enrichmentSource, 'artist'));
 </script>
 
 <a
 	href={artistHref(artist.musicbrainz_id)}
+	onpointerenter={artist.local_id === artist.musicbrainz_id ? undefined : onenrichmentrequest}
+	onfocus={artist.local_id === artist.musicbrainz_id ? undefined : onenrichmentrequest}
 	class="card bg-base-100 w-full shadow-sm shrink-0 cursor-pointer transition-all hover:scale-105 hover:glow-primary group relative"
 >
-	<ArtistCardDownloadButton artistName={artist.title} artistMbid={artist.musicbrainz_id} />
+	{#if !artist.local_id || artist.local_id !== artist.musicbrainz_id}
+		<ArtistCardDownloadButton artistName={artist.title} artistMbid={artist.musicbrainz_id} />
+	{/if}
 	<figure class="flex justify-center pt-4">
 		<ArtistImage
-			mbid={artist.musicbrainz_id}
+			mbid={artist.local_id ?? artist.musicbrainz_id}
 			alt={artist.title}
 			size="lg"
+			requestSize={250}
+			responsiveSizes="(max-width: 639px) 144px, 176px"
 			remoteUrl={artist.thumb_url ?? null}
+			source={artist.local_id ? 'local' : 'provider'}
+			available={artist.local_id ? artist.musicbrainz_id !== artist.local_id : true}
 		/>
 	</figure>
 

@@ -30,7 +30,7 @@ def _write_config(path: Path, data: dict) -> None:
         f.write(msgspec.json.encode(data))
 
 
-# A. Config Validation — Critical errors raise
+# A. Config Validation - Critical errors raise
 
 class TestValidateConfigCriticalErrors:
     def test_valid_config_creates_settings(self) -> None:
@@ -73,7 +73,7 @@ class TestLogLevelValidator:
         assert settings.log_level == "WARNING"
 
 
-# C. load_from_file — type validation
+# C. load_from_file - type validation
 
 class TestLoadFromFileTypeValidation:
     def test_wrong_type_raises_configuration_error(self, tmp_path: Path) -> None:
@@ -100,6 +100,35 @@ class TestLoadFromFileTypeValidation:
         with caplog.at_level(logging.WARNING):
             settings.load_from_file()
         assert any("Unknown config key" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "_internal",
+            "connect_apps",
+            "download_client",
+            "home_settings",
+            "lastfm_settings",
+            "library_scan_schedule",
+            "library_settings",
+            "user_preferences",
+            "youtube_settings",
+        ],
+    )
+    def test_preferences_owned_keys_do_not_warn(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        key: str,
+    ) -> None:
+        config_path = tmp_path / "config.json"
+        _write_config(config_path, {key: {}})
+
+        settings = _make_settings(config_file_path=config_path)
+        with caplog.at_level(logging.WARNING):
+            settings.load_from_file()
+
+        assert not any(key in record.message for record in caplog.records)
 
     def test_invalid_url_in_file_raises(self, tmp_path: Path) -> None:
         config_path = tmp_path / "config.json"

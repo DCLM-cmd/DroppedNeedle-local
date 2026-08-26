@@ -126,3 +126,129 @@ class TestProxyStream:
         response = await service.proxy_stream("/part/key", range_header="bytes=0-100")
         repo.proxy_get_stream.assert_awaited_once_with("/part/key", range_header="bytes=0-100")
         assert response.status_code == 206
+
+
+class TestPerUserAttribution:
+    """Linked users scrobble through their own token; unlinked fall back (issue #138)."""
+
+    def _factory(self, per_user_repo):
+        factory = MagicMock()
+        factory.resolve_plex = AsyncMock(return_value=per_user_repo)
+        return factory
+
+    @pytest.mark.asyncio
+    async def test_scrobble_uses_per_user_repo_when_linked(self):
+        service, app_repo = _make_service()
+        per_user = MagicMock()
+        per_user.scrobble = AsyncMock(return_value=True)
+        service._client_factory = self._factory(per_user)
+
+        result = await service.scrobble("rk-1", user_id="u1")
+
+        assert result is True
+        per_user.scrobble.assert_awaited_once_with("rk-1")
+        app_repo.scrobble.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scrobble_falls_back_to_app_repo_when_unlinked(self):
+        service, app_repo = _make_service()
+        service._client_factory = self._factory(None)
+
+        result = await service.scrobble("rk-1", user_id="u1")
+
+        assert result is True
+        app_repo.scrobble.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_per_user_auth_failure_fails_closed(self):
+        from core.exceptions import PlexAuthError
+
+        service, app_repo = _make_service()
+        per_user = MagicMock()
+        per_user.scrobble = AsyncMock(side_effect=PlexAuthError("revoked token"))
+        service._client_factory = self._factory(per_user)
+
+        result = await service.scrobble("rk-1", user_id="u1")
+
+        # fail closed: no silent misattribution via the app account
+        assert result is False
+        app_repo.scrobble.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stopped_uses_per_user_repo_when_linked(self):
+        service, app_repo = _make_service()
+        per_user = MagicMock()
+        per_user.now_playing = AsyncMock(return_value=True)
+        service._client_factory = self._factory(per_user)
+
+        result = await service.report_stopped("rk-1", user_id="u1")
+
+        assert result is True
+        per_user.now_playing.assert_awaited_once_with("rk-1", state="stopped")
+        app_repo.now_playing.assert_not_awaited()
+
+
+class TestPerUserProxy:
+    """Streaming proxies through the user's linked repo, app account as fallback."""
+
+    @staticmethod
+    def _factory(per_user_repo):
+        factory = MagicMock()
+        factory.resolve_plex = AsyncMock(return_value=per_user_repo)
+        return factory
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_uses_per_user_repo_when_linked(self):
+        app_repo = MagicMock()
+        per_user = MagicMock()
+        per_user.proxy_get_stream = AsyncMock(
+            return_value=StreamProxyResult(
+                status_code=200, headers={}, media_type="audio/mpeg",
+                body_chunks=iter([b"data"]),
+            )
+        )
+        service = PlexPlaybackService(
+            plex_repo=app_repo, client_factory=self._factory(per_user)
+        )
+
+        await service.proxy_stream("/part/key", range_header="bytes=0-", user_id="u1")
+
+        per_user.proxy_get_stream.assert_awaited_once_with(
+            "/part/key", range_header="bytes=0-"
+        )
+        app_repo.proxy_get_stream.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_proxy_head_uses_per_user_repo_when_linked(self):
+        app_repo = MagicMock()
+        per_user = MagicMock()
+        per_user.proxy_head_stream = AsyncMock(
+            return_value=StreamProxyResult(status_code=200, headers={}, media_type=None)
+        )
+        service = PlexPlaybackService(
+            plex_repo=app_repo, client_factory=self._factory(per_user)
+        )
+
+        await service.proxy_head("/part/key", user_id="u1")
+
+        per_user.proxy_head_stream.assert_awaited_once_with("/part/key")
+        app_repo.proxy_head_stream.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_falls_back_to_app_repo_when_unlinked(self):
+        app_repo = MagicMock()
+        app_repo.proxy_get_stream = AsyncMock(
+            return_value=StreamProxyResult(
+                status_code=200, headers={}, media_type="audio/mpeg",
+                body_chunks=iter([b"data"]),
+            )
+        )
+        service = PlexPlaybackService(
+            plex_repo=app_repo, client_factory=self._factory(None)
+        )
+
+        await service.proxy_stream("/part/key", user_id="u1")
+
+        app_repo.proxy_get_stream.assert_awaited_once_with(
+            "/part/key", range_header=None
+        )

@@ -5,16 +5,26 @@ import LibraryAlbumCard from './LibraryAlbumCard.svelte';
 import type { LibraryAlbumSummary } from '$lib/types';
 
 const baseAlbum: LibraryAlbumSummary = {
-	release_group_mbid: 'b1392450-e666-3926-a536-22c65f834433',
-	album_title: 'OK Computer',
-	album_artist_name: 'Radiohead',
+	id: 'local-album-1',
+	title: 'OK Computer',
+	artist_name: 'Radiohead',
+	artist_id: 'local-artist-1',
+	musicbrainz_release_group_id: 'b1392450-e666-3926-a536-22c65f834433',
+	musicbrainz_release_id: null,
+	musicbrainz_artist_id: null,
+	album_identity_state: 'release_group_linked',
 	track_count: 12,
+	total_duration_seconds: 3200,
 	total_size_bytes: 123456,
-	quality_format: 'flac',
+	format: 'flac',
 	year: 1997,
 	is_compilation: false,
-	cover_url: null,
-	last_imported_at: null
+	cover_available: false,
+	date_added: null,
+	sort_name: null,
+	original_release_date: null,
+	contribution_id: null,
+	contribution_state: null
 };
 
 function renderComponent(overrides: Partial<LibraryAlbumSummary> = {}) {
@@ -40,12 +50,35 @@ describe('LibraryAlbumCard.svelte', () => {
 	});
 
 	it('shows an MP3 format badge for mp3 albums', async () => {
-		renderComponent({ quality_format: 'mp3' });
+		renderComponent({ format: 'mp3' });
 		await expect.element(page.getByText('MP3')).toBeInTheDocument();
 	});
 
 	it('shows the track count', async () => {
 		renderComponent();
 		await expect.element(page.getByText('12 tracks')).toBeInTheDocument();
+	});
+
+	it('opens linked albums on their MusicBrainz route', async () => {
+		renderComponent();
+		await expect
+			.element(page.getByRole('link', { name: 'Open OK Computer' }))
+			.toHaveAttribute('href', '/album/b1392450-e666-3926-a536-22c65f834433');
+	});
+
+	it('marks local-only albums and keeps their local route', async () => {
+		renderComponent({
+			musicbrainz_release_group_id: null,
+			album_identity_state: 'local_only'
+		});
+		await expect
+			.element(page.getByRole('link', { name: 'Open OK Computer' }))
+			.toHaveAttribute('href', '/album/local-album-1');
+		await expect.element(page.getByText('Local-only', { exact: true })).toBeVisible();
+	});
+
+	it('does not add an identity badge to linked album cards', async () => {
+		renderComponent();
+		await expect.element(page.getByText('Local-only', { exact: true })).not.toBeInTheDocument();
 	});
 });

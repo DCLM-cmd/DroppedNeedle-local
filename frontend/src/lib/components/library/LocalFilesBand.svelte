@@ -7,13 +7,13 @@
 	import { playbackToast } from '$lib/stores/playbackToast.svelte';
 	import { API } from '$lib/constants';
 	import { api } from '$lib/api/client';
-	import { getCoverUrl } from '$lib/utils/errorHandling';
+	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import type { NativeTrackListItem, NativeTrackPage } from '$lib/types';
 
 	const statsQuery = getLocalStatsQuery();
 	const recentQuery = getLocalRecentQuery();
 	const stats = $derived(statsQuery.data);
-	const collage = $derived((recentQuery.data ?? []).slice(0, 8));
+	const backdropAlbum = $derived(recentQuery.data?.[0] ?? null);
 
 	const PAGE_SIZE = 100;
 	const loader = createLibraryTrackLoader<NativeTrackListItem>(
@@ -92,16 +92,22 @@
 <section
 	class="group relative isolate overflow-hidden rounded-3xl border border-base-content/10 shadow-lg transition-all duration-300 hover:-translate-y-1 hover:border-base-content/20 hover:shadow-2xl"
 >
-	{#if collage.length}
-		<div aria-hidden="true" class="pointer-events-none absolute inset-0 flex scale-110 blur-2xl">
-			{#each collage as album (album.musicbrainz_id)}
-				<img
-					src={getCoverUrl(album.cover_url, album.musicbrainz_id)}
-					alt=""
-					loading="lazy"
-					class="h-full min-w-0 flex-1 object-cover opacity-60"
-				/>
-			{/each}
+	{#if backdropAlbum}
+		<div
+			aria-hidden="true"
+			class="pointer-events-none absolute inset-0 scale-110 blur-2xl"
+			data-testid="local-files-backdrop"
+		>
+			<AlbumImage
+				mbid={backdropAlbum.musicbrainz_id}
+				customUrl={backdropAlbum.cover_url}
+				alt=""
+				size="full"
+				requestSize={250}
+				testId="local-files-backdrop-image"
+				rounded="none"
+				className="h-full w-full object-cover opacity-60"
+			/>
 		</div>
 	{/if}
 

@@ -38,10 +38,14 @@
 	} from '$lib/queries/profile/ProfileMutations.svelte';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';
+	import PlexIcon from '$lib/components/PlexIcon.svelte';
 	import type { ProfileServiceConnection } from '$lib/queries/profile/types';
+	import MediaServerAccountsCard from '$lib/components/profile/MediaServerAccountsCard.svelte';
+	import NavidromeMusicFoldersCard from '$lib/components/profile/NavidromeMusicFoldersCard.svelte';
 	import ScrobblingDiscoveryCard from '$lib/components/profile/ScrobblingDiscoveryCard.svelte';
 	import SpotifyConnectionCard from '$lib/components/profile/SpotifyConnectionCard.svelte';
 	import ProfileConnectApps from '$lib/components/profile/ProfileConnectApps.svelte';
+	import PageSectionToc from '$lib/components/PageSectionToc.svelte';
 	import { page } from '$app/state';
 	import { browser } from '$app/environment';
 	import { onMount } from 'svelte';
@@ -60,6 +64,34 @@
 	const visibleServices = $derived(
 		(profile?.services ?? []).filter((s) => !HIDDEN_SERVICES.has(s.name))
 	);
+	const navidromeEnabled = $derived(
+		profile?.services.some((service) => service.name === 'Navidrome' && service.enabled) ?? false
+	);
+	const mediaAccountsEnabled = $derived(
+		profile?.services.some(
+			(service) => service.enabled && ['Navidrome', 'Jellyfin', 'Plex'].includes(service.name)
+		) ?? false
+	);
+
+	type ProfileTocSection = {
+		id: string;
+		label: string;
+	};
+
+	const profileTocSections = $derived.by<ProfileTocSection[]>(() => {
+		if (!profile) return [];
+
+		return [
+			{ id: 'account', label: 'Account' },
+			{ id: 'connected-services', label: 'Connected Services' },
+			...(mediaAccountsEnabled ? [{ id: 'media-accounts', label: 'Media Accounts' }] : []),
+			...(navidromeEnabled ? [{ id: 'navidrome-music-folders', label: 'Music Folders' }] : []),
+			{ id: 'connect-apps', label: 'Connect Apps' },
+			{ id: 'scrobbling', label: 'Scrobbling' },
+			{ id: 'spotify', label: 'Spotify' },
+			...(profile.library_stats.length > 0 ? [{ id: 'libraries', label: 'Your Libraries' }] : [])
+		];
+	});
 
 	// Scroll to a deep-link anchor (e.g. /profile#connect-apps) once the async
 	// profile content has rendered. SvelteKit's built-in scroll fires before the
@@ -269,6 +301,7 @@
 	function getServiceIcon(name: string) {
 		if (name === 'Jellyfin') return JellyfinIcon;
 		if (name === 'Navidrome') return NavidromeIcon;
+		if (name === 'Plex') return PlexIcon;
 		if (name === 'ListenBrainz') return Music;
 		if (name === 'Last.fm') return Radio;
 		return Database;
@@ -277,6 +310,7 @@
 	function getServiceColor(name: string): string {
 		if (name === 'Jellyfin') return 'text-purple-400';
 		if (name === 'Navidrome') return 'text-green-400';
+		if (name === 'Plex') return 'text-amber-400';
 		if (name === 'ListenBrainz') return 'text-orange-400';
 		if (name === 'Last.fm') return 'text-red-400';
 		return 'text-base-content';
@@ -285,19 +319,22 @@
 	function getServiceBorderColor(name: string): string {
 		if (name === 'Jellyfin') return 'border-purple-500/30';
 		if (name === 'Navidrome') return 'border-green-500/30';
+		if (name === 'Plex') return 'border-amber-500/30';
 		if (name === 'ListenBrainz') return 'border-orange-500/30';
 		if (name === 'Last.fm') return 'border-red-500/30';
 		return 'border-base-300';
 	}
 
 	function getServiceProfileUrl(service: ProfileServiceConnection): string | null {
-		if (!service.enabled || !service.username) return null;
+		if (!service.enabled) return null;
+		if (!service.username && service.name !== 'Plex') return null;
 		if (service.name === 'Last.fm')
 			return `https://www.last.fm/user/${encodeURIComponent(service.username)}`;
 		if (service.name === 'ListenBrainz')
 			return `https://listenbrainz.org/user/${encodeURIComponent(service.username)}`;
 		if (service.name === 'Jellyfin' && service.url) return service.url;
 		if (service.name === 'Navidrome' && service.url) return service.url;
+		if (service.name === 'Plex' && service.url) return service.url;
 		return null;
 	}
 
@@ -455,8 +492,13 @@
 
 	{#if profile}
 		<div class="px-4 pb-12 sm:px-6 lg:px-8">
-			<div class="mx-auto max-w-4xl space-y-8 stagger-fade-in">
-				<section>
+			<div class="relative mx-auto flex max-w-4xl flex-col gap-8 stagger-fade-in xl:max-w-[66rem]">
+				<PageSectionToc
+					sections={profileTocSections}
+					className="xl:absolute xl:inset-y-0 xl:left-0 xl:w-36"
+				/>
+
+				<section id="account" class="scroll-mt-24 xl:ml-40">
 					<h2
 						class="mb-4 flex items-center gap-2 text-sm font-semibold uppercase tracking-widest text-base-content/50"
 					>
@@ -663,7 +705,7 @@
 					</div>
 				</section>
 
-				<section>
+				<section id="connected-services" class="scroll-mt-24 xl:ml-40">
 					<h2
 						class="mb-4 flex items-center gap-2 text-sm font-semibold uppercase tracking-widest text-base-content/50"
 					>
@@ -721,20 +763,28 @@
 					</div>
 				</section>
 
-				<div id="connect-apps" class="scroll-mt-20">
+				<div id="media-accounts" class="scroll-mt-24 xl:ml-40">
+					<MediaServerAccountsCard services={profile.services} />
+				</div>
+
+				<div id="navidrome-music-folders" class="scroll-mt-24 xl:ml-40">
+					<NavidromeMusicFoldersCard {userId} />
+				</div>
+
+				<div id="connect-apps" class="scroll-mt-24 xl:ml-40">
 					<ProfileConnectApps />
 				</div>
 
-				<div id="scrobbling" class="scroll-mt-20">
-					<ScrobblingDiscoveryCard />
+				<div id="scrobbling" class="scroll-mt-24 xl:ml-40">
+					<ScrobblingDiscoveryCard {navidromeEnabled} />
 				</div>
 
-				<div id="spotify" class="scroll-mt-20">
+				<div id="spotify" class="scroll-mt-24 xl:ml-40">
 					<SpotifyConnectionCard />
 				</div>
 
 				{#if profile.library_stats.length > 0}
-					<section>
+					<section id="libraries" class="scroll-mt-24 xl:ml-40">
 						<h2
 							class="mb-4 flex items-center gap-2 text-sm font-semibold uppercase tracking-widest text-base-content/50"
 						>
@@ -804,7 +854,7 @@
 					</section>
 				{/if}
 
-				<section class="flex justify-center gap-3 pt-2">
+				<section class="flex justify-center gap-3 pt-2 xl:ml-40">
 					<a
 						href="/settings"
 						class="btn btn-outline btn-sm gap-2 rounded-full border-base-content/20 text-base-content/60 transition-all hover:border-primary hover:text-primary"

@@ -1,13 +1,12 @@
 import type { MusicSource } from './stores/musicSource';
 
-export const AUTH_FREE_PATHS = ['/login', '/setup', '/auth/callback'];
+export const AUTH_FREE_PATHS = ['/login', '/setup', '/auth/callback', '/recover-password'];
 
 // concert distances are stored in km but displayed in miles (owner decision U6)
 export const KM_PER_MILE = 1.609;
 
 const CACHE_KEY_GROUPS = {
 	core: {
-		LIBRARY_MBIDS: 'droppedneedle_library_mbids',
 		RECENTLY_ADDED: 'droppedneedle_recently_added',
 		HOME_CACHE: 'droppedneedle_home_cache',
 		DISCOVER_QUEUE: 'droppedneedle_discover_queue',
@@ -19,6 +18,7 @@ const CACHE_KEY_GROUPS = {
 		JELLYFIN_ALBUMS_LIST: 'droppedneedle_jellyfin_albums_list',
 		NAVIDROME_SIDEBAR: 'droppedneedle_navidrome_sidebar',
 		NAVIDROME_ALBUMS_LIST: 'droppedneedle_navidrome_albums_list',
+		NAVIDROME_FOLDER_SCOPE: 'droppedneedle_navidrome_folder_scope',
 		PLEX_SIDEBAR: 'droppedneedle_plex_sidebar',
 		PLEX_ALBUMS_LIST: 'droppedneedle_plex_albums_list',
 		LOCAL_FILES_ALBUMS_LIST: 'droppedneedle_local_files_albums_list'
@@ -61,8 +61,6 @@ const CACHE_TTL_GROUPS = {
 		DEFAULT: 5 * 60 * 1000,
 		LIBRARY: 5 * 60 * 1000,
 		LIBRARY_NATIVE: 60 * 1000,
-		SCAN_STATUS: 2 * 1000,
-		SCAN_STATUS_IDLE: 15 * 1000,
 		RECENTLY_ADDED: 5 * 60 * 1000,
 		HOME: 5 * 60 * 1000,
 		DISCOVER: 30 * 60 * 1000,
@@ -132,6 +130,13 @@ export const STATUS_COLORS = {
 export const YOUTUBE_PLAYER_ELEMENT_ID = 'yt-player-embed';
 
 export const API = {
+	auth: {
+		setupStatus: () => '/api/v1/auth/setup/status',
+		me: () => '/api/v1/auth/me',
+		passwordRecoveryReset: () => '/api/v1/auth/password-recovery/reset',
+		adminPasswordRecovery: (userId: string) =>
+			`/api/v1/auth/admin/users/${encodeURIComponent(userId)}/password-recovery`
+	},
 	artist: {
 		basic: (id: string) => `/api/v1/artists/${id}`,
 		extended: (id: string) => `/api/v1/artists/${id}/extended`,
@@ -177,6 +182,7 @@ export const API = {
 	},
 	library: {
 		mbids: () => '/api/v1/library/mbids',
+		membership: () => '/api/v1/library/membership',
 		albums: (page = 1, sort = 'recent', q?: string, format?: string, pageSize = 50) => {
 			let url = `/api/v1/library/albums?page=${page}&page_size=${pageSize}&sort=${sort}`;
 			if (q) url += `&q=${encodeURIComponent(q)}`;
@@ -188,37 +194,391 @@ export const API = {
 			if (q) url += `&q=${encodeURIComponent(q)}`;
 			return url;
 		},
-		artists: (limit = 50, offset = 0, sortBy = 'name', sortOrder = 'asc', q?: string) => {
+		artists: (
+			limit = 50,
+			offset = 0,
+			sortBy = 'name',
+			sortOrder = 'asc',
+			q?: string,
+			scope: 'album' | 'contributors' = 'album'
+		) => {
 			let url = `/api/v1/library/artists?limit=${limit}&offset=${offset}&sort_by=${sortBy}&sort_order=${sortOrder}`;
 			if (q) url += `&q=${encodeURIComponent(q)}`;
+			url += `&scope=${scope}`;
 			return url;
 		},
 		album: (mbid: string) => `/api/v1/library/albums/${mbid}/status`,
-		albumTracks: (mbid: string) => `/api/v1/library/albums/${mbid}/tracks`,
+		albumDetail: (albumId: string) => `/api/v1/library/albums/${albumId}`,
+		albumCopies: (albumId: string) => `/api/v1/library/albums/${albumId}/copies`,
+		albumTracks: (albumId: string) => `/api/v1/library/albums/${albumId}/tracks`,
+		createContribution: (albumId: string) => `/api/v1/library/albums/${albumId}/contributions`,
+		contribution: (contributionId: string) => `/api/v1/library/contributions/${contributionId}`,
+		contributionDraft: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/draft`,
+		rebuildContribution: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/rebuild`,
+		cancelContribution: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/cancel`,
+		searchDiscogsReleases: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/discogs/search`,
+		selectDiscogsRelease: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/discogs/select`,
+		removeDiscogsRelease: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/discogs/remove`,
+		checkContributionDuplicates: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/musicbrainz/duplicates`,
+		attachContributionRelease: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/musicbrainz/attach`,
+		createContributionSeed: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/musicbrainz/seed`,
+		recordContributionResult: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/musicbrainz/result`,
+		retryContributionVerification: (contributionId: string) =>
+			`/api/v1/library/contributions/${contributionId}/musicbrainz/verify`,
+		cachedAlbumArtwork: (albumId: string, coverVersion: number) =>
+			`/api/v1/library/albums/${encodeURIComponent(albumId)}/artwork/cached?v=${coverVersion}`,
+		exactReleaseArtwork: (releaseMbid: string, size = 250) =>
+			`/api/v1/covers/release/${encodeURIComponent(releaseMbid)}?size=${size}`,
+		artistDetail: (artistId: string) => `/api/v1/library/artists/${artistId}`,
+		artistAlbums: (artistId: string) => `/api/v1/library/artists/${artistId}/albums`,
+		artistAppearances: (artistId: string, limit = 20, offset = 0) =>
+			`/api/v1/library/artists/${artistId}/appearances?limit=${limit}&offset=${offset}`,
+		recentlyAdded: (limit = 20) => `/api/v1/library/recently-added?limit=${limit}`,
 		stats: () => '/api/v1/library/stats',
 		scanSchedule: () => '/api/v1/settings/library/schedule',
 		rescanAlbum: (mbid: string) => `/api/v1/library/albums/${mbid}/rescan`,
 		reidentifyAlbum: (mbid: string) => `/api/v1/library/albums/${mbid}/reidentify`,
-		updateTrackTags: (fileId: string) => `/api/v1/library/tracks/${fileId}`,
+		reenableAlbumManagement: (albumId: string) =>
+			`/api/v1/library/albums/${encodeURIComponent(albumId)}/management/re-enable`,
+		editionConversionPreflight: (albumId: string) =>
+			`/api/v1/library/albums/${encodeURIComponent(albumId)}/edition-conversions/preflight`,
+		editionConversion: (jobId: string) =>
+			`/api/v1/library/edition-conversions/${encodeURIComponent(jobId)}`,
+		editionConversionPreview: (jobId: string) =>
+			`/api/v1/library/edition-conversions/${encodeURIComponent(jobId)}/preview`,
+		editionConversionStart: (jobId: string) =>
+			`/api/v1/library/edition-conversions/${encodeURIComponent(jobId)}/start`,
+		editionConversionRetry: (jobId: string) =>
+			`/api/v1/library/edition-conversions/${encodeURIComponent(jobId)}/retry`,
+		editionConversionRecheck: (jobId: string) =>
+			`/api/v1/library/edition-conversions/${encodeURIComponent(jobId)}/recheck`,
+		editionConversionCancel: (jobId: string) =>
+			`/api/v1/library/edition-conversions/${encodeURIComponent(jobId)}/cancel`,
+		reidentificationReleases: (
+			albumId: string,
+			title: string,
+			artist: string,
+			limit = 12,
+			offset = 0
+		) => {
+			const query = new URLSearchParams({
+				title,
+				artist,
+				limit: String(limit),
+				offset: String(offset)
+			});
+			return `/api/v1/library/albums/${encodeURIComponent(albumId)}/reidentification/releases?${query.toString()}`;
+		},
 		trackTags: (fileId: string) => `/api/v1/library/tracks/${fileId}/tags`,
 		removeTrack: (fileId: string) => `/api/v1/library/tracks/${fileId}`,
-		scanStart: () => '/api/v1/library/scan/start',
 		scanCancel: () => '/api/v1/library/scan/cancel',
-		scanStatus: () => '/api/v1/library/scan/status',
 		scanStream: () => '/api/v1/library/scan/stream',
+		activity: () => '/api/v1/library/activity',
+		activityStream: () => '/api/v1/library/activity/stream',
+		operationsStream: () => '/api/v1/library/operations/stream',
+		pauseIdentification: () => '/api/v1/library/identification/pause',
+		resumeIdentification: () => '/api/v1/library/identification/resume',
+		scanRuns: (limit?: number, cursor?: string) => {
+			const query = new URLSearchParams();
+			if (limit !== undefined) query.set('limit', String(limit));
+			if (cursor) query.set('cursor', cursor);
+			let url = '/api/v1/library/scan-runs';
+			if (query.size) url += `?${query.toString()}`;
+			return url;
+		},
+		currentScanRuns: () => '/api/v1/library/scan-runs/current',
+		scanRunEstimate: (scopeIds: string[] = []) => {
+			const query = scopeIds.map((id) => `scope_ids=${encodeURIComponent(id)}`).join('&');
+			return `/api/v1/library/scan-runs/estimate${query ? `?${query}` : ''}`;
+		},
+		scanRun: (runId: string) => `/api/v1/library/scan-runs/${runId}`,
+		scanRunFailures: (runId: string, limit?: number, cursor?: number) => {
+			const query = new URLSearchParams();
+			if (limit !== undefined) query.set('limit', String(limit));
+			if (cursor !== undefined) query.set('cursor', String(cursor));
+			let url = `/api/v1/library/scan-runs/${runId}/failures`;
+			if (query.size) url += `?${query.toString()}`;
+			return url;
+		},
+		pauseScanRun: (runId: string) => `/api/v1/library/scan-runs/${runId}/pause`,
+		resumeScanRun: (runId: string) => `/api/v1/library/scan-runs/${runId}/resume`,
+		stopScanRun: (runId: string) => `/api/v1/library/scan-runs/${runId}/stop`,
+		reviews: (
+			params: {
+				cursor?: string;
+				limit?: number;
+				state?: string;
+				reasonCode?: string;
+				rootId?: string;
+				policy?: string;
+				search?: string;
+				sort?: string;
+			} = {}
+		) => {
+			const query = new URLSearchParams();
+			if (params.cursor) query.set('cursor', params.cursor);
+			if (params.limit !== undefined) query.set('limit', String(params.limit));
+			if (params.state) query.set('state', params.state);
+			if (params.reasonCode) query.set('reason_code', params.reasonCode);
+			if (params.rootId) query.set('root_id', params.rootId);
+			if (params.policy) query.set('policy', params.policy);
+			if (params.search) query.set('search', params.search);
+			if (params.sort) query.set('sort', params.sort);
+			return `/api/v1/library/reviews${query.size ? `?${query.toString()}` : ''}`;
+		},
+		review: (reviewId: string) => `/api/v1/library/reviews/${reviewId}`,
+		reviewKeepTagged: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/keep-tagged`,
+		reviewDetachKeepTagged: (reviewId: string) =>
+			`/api/v1/library/reviews/${reviewId}/detach-and-keep-tagged`,
+		reviewExclude: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/exclude`,
+		reviewRestore: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/restore`,
+		reviewDismiss: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/dismiss`,
+		reviewCandidate: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/candidate`,
+		reviewRetry: (reviewId: string) => `/api/v1/library/reviews/${reviewId}/retry`,
+		bulkReviewPreview: () => '/api/v1/library/reviews/bulk-preview',
+		bulkReviewApply: () => '/api/v1/library/reviews/bulk-apply',
+		operation: (jobId: string) => `/api/v1/library/operations/${jobId}`,
+		pauseOperation: (jobId: string) => `/api/v1/library/operations/${jobId}/pause`,
+		resumeOperation: (jobId: string) => `/api/v1/library/operations/${jobId}/resume`,
+		stopOperation: (jobId: string) => `/api/v1/library/operations/${jobId}/stop`,
+		operationCandidate: (jobId: string) => `/api/v1/library/operations/${jobId}/candidate`,
+		previewAlbumSplit: (albumId: string) => `/api/v1/library/albums/${albumId}/split-preview`,
+		splitAlbum: (albumId: string) => `/api/v1/library/albums/${albumId}/split`,
+		previewAlbumMerge: () => '/api/v1/library/albums/merge-preview',
+		mergeAlbums: () => '/api/v1/library/albums/merge',
+		previewTrackMove: () => '/api/v1/library/tracks/move-preview',
+		moveTracks: () => '/api/v1/library/tracks/move',
+		previewResetAlbumGrouping: (albumId: string) =>
+			`/api/v1/library/albums/${albumId}/reset-grouping-preview`,
+		resetAlbumGrouping: (albumId: string) => `/api/v1/library/albums/${albumId}/reset-grouping`,
+		previewArtistMerge: () => '/api/v1/library/artists/merge-preview',
+		mergeArtists: () => '/api/v1/library/artists/merge',
+		artistReconciliation: () => '/api/v1/library/artists/reconciliation',
+		artistDuplicateGroups: (
+			params: {
+				limit?: number;
+				cursor?: string;
+				state?: string;
+				search?: string;
+			} = {}
+		) => {
+			const query = new URLSearchParams();
+			if (params.limit !== undefined) query.set('limit', String(params.limit));
+			if (params.cursor) query.set('cursor', params.cursor);
+			if (params.state) query.set('state', params.state);
+			if (params.search) query.set('search', params.search);
+			const suffix = query.size ? `?${query.toString()}` : '';
+			return `/api/v1/library/artists/duplicate-groups${suffix}`;
+		},
+		artistDuplicateGroup: (groupId: string) =>
+			`/api/v1/library/artists/duplicate-groups/${groupId}`,
+		dismissArtistDuplicateGroup: (groupId: string) =>
+			`/api/v1/library/artists/duplicate-groups/${groupId}/dismiss`,
+		identityRepairs: (limit?: number, cursor?: string) => {
+			const query = new URLSearchParams();
+			if (limit !== undefined) query.set('limit', String(limit));
+			if (cursor) query.set('cursor', cursor);
+			let url = '/api/v1/library/identity-repairs';
+			if (query.size) url += `?${query.toString()}`;
+			return url;
+		},
+		identityRepairEstimate: (rootIds: string[]) => {
+			const query = new URLSearchParams();
+			for (const rootId of rootIds) query.append('root_id', rootId);
+			const suffix = query.size ? `?${query.toString()}` : '';
+			return `/api/v1/library/identity-repairs/estimate${suffix}`;
+		},
+		identityRepair: (jobId: string) => `/api/v1/library/identity-repairs/${jobId}`,
+		identityRepairFindings: (
+			jobId: string,
+			limit?: number,
+			cursor?: string,
+			findingCategory?: string
+		) => {
+			const query = new URLSearchParams();
+			if (limit !== undefined) query.set('limit', String(limit));
+			if (cursor) query.set('cursor', cursor);
+			if (findingCategory) query.set('finding_category', findingCategory);
+			let url = `/api/v1/library/identity-repairs/${jobId}/findings`;
+			if (query.size) url += `?${query.toString()}`;
+			return url;
+		},
+		applyIdentityRepair: (jobId: string) => `/api/v1/library/identity-repairs/${jobId}/apply`,
+		pauseIdentityRepair: (jobId: string) => `/api/v1/library/identity-repairs/${jobId}/pause`,
+		resumeIdentityRepair: (jobId: string) => `/api/v1/library/identity-repairs/${jobId}/resume`,
+		stopIdentityRepair: (jobId: string) => `/api/v1/library/identity-repairs/${jobId}/stop`,
+		identityPreparations: (limit?: number, cursor?: string) => {
+			const query = new URLSearchParams();
+			if (limit !== undefined) query.set('limit', String(limit));
+			if (cursor) query.set('cursor', cursor);
+			const path = '/api/v1/library/management/identity-preparations';
+			return query.size ? `${path}?${query.toString()}` : path;
+		},
+		identityPreparationEstimate: (rootIds: string[]) => {
+			const query = new URLSearchParams();
+			for (const rootId of rootIds) query.append('root_id', rootId);
+			const path = '/api/v1/library/management/identity-preparations/estimate';
+			return query.size ? `${path}?${query.toString()}` : path;
+		},
+		identityPreparation: (jobId: string) =>
+			`/api/v1/library/management/identity-preparations/${encodeURIComponent(jobId)}`,
+		identityPreparationFindings: (
+			jobId: string,
+			limit?: number,
+			cursor?: string,
+			findingCategory?: string
+		) => {
+			const query = new URLSearchParams();
+			if (limit !== undefined) query.set('limit', String(limit));
+			if (cursor) query.set('cursor', cursor);
+			if (findingCategory) query.set('finding_category', findingCategory);
+			const path = `/api/v1/library/management/identity-preparations/${encodeURIComponent(jobId)}/findings`;
+			return query.size ? `${path}?${query.toString()}` : path;
+		},
+		applyIdentityPreparation: (jobId: string) =>
+			`/api/v1/library/management/identity-preparations/${encodeURIComponent(jobId)}/apply`,
+		discardIdentityPreparation: (jobId: string) =>
+			`/api/v1/library/management/identity-preparations/${encodeURIComponent(jobId)}/discard`,
+		scanDiagnostics: (runId: string) => `/api/v1/library/scan-runs/${runId}/diagnostics`,
 		unmatched: () => '/api/v1/library/scan/unmatched',
 		resolveUnmatched: (id: number) => `/api/v1/library/scan/unmatched/${id}/resolve`,
 		resolveUnmatchedBatch: () => '/api/v1/library/scan/unmatched/resolve-batch',
 		settings: () => '/api/v1/settings/library',
+		typedSettings: () => '/api/v1/settings/library/roots',
+		policyTree: () => '/api/v1/settings/library/policy-tree',
+		policyImpact: () => '/api/v1/settings/library/policy-impact',
+		policyApplyPreview: () => '/api/v1/settings/library/policy-apply-preview',
+		pathMapping: () => '/api/v1/settings/library/path-mapping',
+		restorableRoots: () => '/api/v1/settings/library/restorable-roots',
+		restoreRoots: () => '/api/v1/settings/library/restore-roots',
 		addPath: () => '/api/v1/settings/library/paths',
 		removePath: (path: string) => `/api/v1/settings/library/paths?path=${encodeURIComponent(path)}`,
-		removeAlbumPreview: (mbid: string) => `/api/v1/library/album/${mbid}/removal-preview`,
 		removeAlbum: (mbid: string) => `/api/v1/library/album/${mbid}`,
 		resolveTracks: () => '/api/v1/library/resolve-tracks'
 	},
+	libraryManagement: {
+		settings: () => '/api/v1/settings/library-management',
+		impact: () => '/api/v1/settings/library-management/impact',
+		validate: () => '/api/v1/settings/library-management/validate',
+		profiles: () => '/api/v1/settings/library-management/profiles',
+		profile: (profileId: string) =>
+			`/api/v1/settings/library-management/profiles/${encodeURIComponent(profileId)}`,
+		copyProfile: (profileId: string) =>
+			`/api/v1/settings/library-management/profiles/${encodeURIComponent(profileId)}/copy`,
+		exportProfile: (profileId: string) =>
+			`/api/v1/settings/library-management/profiles/${encodeURIComponent(profileId)}/export`,
+		profileImportPreview: () => '/api/v1/settings/library-management/profile-imports/preview',
+		profileImports: () => '/api/v1/settings/library-management/profile-imports',
+		profilePresetDiff: (profileId: string) =>
+			`/api/v1/settings/library-management/profiles/${encodeURIComponent(profileId)}/preset-diff`,
+		activationPreviews: () => '/api/v1/settings/library-management/activation-previews',
+		activationPreview: (jobId: string) =>
+			`/api/v1/settings/library-management/activation-previews/${encodeURIComponent(jobId)}`,
+		activationConfirmations: () => '/api/v1/settings/library-management/activation-confirmations',
+		previews: () => '/api/v1/library/management/previews',
+		tagEditor: (trackId: string) =>
+			`/api/v1/library/management/tracks/${encodeURIComponent(trackId)}/tag-editor`,
+		tagEditPreviews: () => '/api/v1/library/management/tag-edit-previews',
+		baselineRestorePreviews: () => '/api/v1/library/management/baselines/restore-previews',
+		duplicateResolutionPreviews: () => '/api/v1/library/management/duplicate-resolution-previews',
+		baselinePurgeImpact: () => '/api/v1/library/management/baselines/purge-impact',
+		purgeBaselines: () => '/api/v1/library/management/baselines/purge',
+		recoveryDiagnostics: () => '/api/v1/library/management/recovery/diagnostics',
+		preview: (jobId: string) => `/api/v1/library/management/previews/${encodeURIComponent(jobId)}`,
+		applyPreview: (jobId: string) =>
+			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/apply`,
+		discardPreview: (jobId: string) =>
+			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/discard`,
+		operations: (
+			params: {
+				limit?: number;
+				cursor?: string;
+				origin?: string;
+				profileId?: string;
+				rootId?: string;
+				state?: string;
+				mode?: string;
+				createdFrom?: number;
+				createdTo?: number;
+			} = {}
+		) => {
+			const query = new URLSearchParams();
+			if (params.limit !== undefined) query.set('limit', String(params.limit));
+			if (params.cursor) query.set('cursor', params.cursor);
+			if (params.origin) query.set('origin', params.origin);
+			if (params.profileId) query.set('profile_id', params.profileId);
+			if (params.rootId) query.set('root_id', params.rootId);
+			if (params.state) query.set('state', params.state);
+			if (params.mode) query.set('mode', params.mode);
+			if (params.createdFrom !== undefined) query.set('created_from', String(params.createdFrom));
+			if (params.createdTo !== undefined) query.set('created_to', String(params.createdTo));
+			const path = '/api/v1/library/management/operations';
+			return `${path}${query.size ? `?${query.toString()}` : ''}`;
+		},
+		operation: (jobId: string) =>
+			`/api/v1/library/management/operations/${encodeURIComponent(jobId)}`,
+		undoPreview: (jobId: string) =>
+			`/api/v1/library/management/operations/${encodeURIComponent(jobId)}/undo-preview`,
+		operationResults: (jobId: string, afterOrdinal?: number, limit?: number) => {
+			const query = new URLSearchParams();
+			if (afterOrdinal !== undefined) query.set('after_ordinal', String(afterOrdinal));
+			if (limit !== undefined) query.set('limit', String(limit));
+			const path = `/api/v1/library/management/operations/${encodeURIComponent(jobId)}/results`;
+			return `${path}${query.size ? `?${query.toString()}` : ''}`;
+		},
+		previewItems: (
+			jobId: string,
+			params: {
+				afterOrdinal?: number;
+				limit?: number;
+				eligibility?: string;
+				reasonCode?: string;
+				rootId?: string;
+				artistId?: string;
+				albumId?: string;
+				audioFormat?: string;
+				collisionClass?: string;
+				hasPreservedValue?: boolean;
+				hasRepresentationLoss?: boolean;
+				changeKind?: string;
+			} = {}
+		) => {
+			const query = new URLSearchParams();
+			if (params.afterOrdinal !== undefined)
+				query.set('after_ordinal', String(params.afterOrdinal));
+			if (params.limit !== undefined) query.set('limit', String(params.limit));
+			if (params.eligibility) query.set('eligibility', params.eligibility);
+			if (params.reasonCode) query.set('reason_code', params.reasonCode);
+			if (params.rootId) query.set('root_id', params.rootId);
+			if (params.artistId) query.set('artist_id', params.artistId);
+			if (params.albumId) query.set('album_id', params.albumId);
+			if (params.audioFormat) query.set('audio_format', params.audioFormat);
+			if (params.collisionClass) query.set('collision_class', params.collisionClass);
+			if (params.hasPreservedValue) query.set('has_preserved_value', 'true');
+			if (params.hasRepresentationLoss) query.set('has_representation_loss', 'true');
+			if (params.changeKind) query.set('change_kind', params.changeKind);
+			const path = `/api/v1/library/management/previews/${encodeURIComponent(jobId)}/items`;
+			return `${path}${query.size ? `?${query.toString()}` : ''}`;
+		},
+		previewArtwork: (jobId: string, ordinal: number, sha256: string) =>
+			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/items/${ordinal}/artwork/${encodeURIComponent(sha256)}`
+	},
 	search: {
-		artists: (query: string) => `/api/v1/search/artists?q=${encodeURIComponent(query)}`,
-		albums: (query: string) => `/api/v1/search/albums?q=${encodeURIComponent(query)}`,
+		artists: (query: string, limit = 50) =>
+			`/api/v1/search/artists?q=${encodeURIComponent(query)}&limit=${limit}`,
+		albums: (query: string, limit = 50) =>
+			`/api/v1/search/albums?q=${encodeURIComponent(query)}&limit=${limit}`,
+		enrichment: () => '/api/v1/search/enrich/batch',
 		suggest: (query: string, limit = 5) =>
 			`/api/v1/search/suggest?q=${encodeURIComponent(query.trim())}&limit=${limit}`
 	},
@@ -226,6 +586,14 @@ export const API = {
 		health: () => '/api/v1/system/health'
 	},
 	home: () => '/api/v1/home',
+	homeGenre: (genre: string, limit = 50, artistOffset = 0, albumOffset = 0) => {
+		const params = new URLSearchParams({
+			limit: String(limit),
+			artist_offset: String(artistOffset),
+			album_offset: String(albumOffset)
+		});
+		return `/api/v1/home/genre/${encodeURIComponent(genre)}?${params.toString()}`;
+	},
 	homeIntegrationStatus: () => '/api/v1/home/integration-status',
 	discover: () => '/api/v1/discover',
 	discoverRefresh: () => '/api/v1/discover/refresh',
@@ -301,6 +669,11 @@ export const API = {
 		lastfmAuthToken: () => '/api/v1/me/connections/lastfm/auth/token',
 		lastfmAuthSession: () => '/api/v1/me/connections/lastfm/auth/session',
 		listenbrainz: () => '/api/v1/me/connections/listenbrainz',
+		navidrome: () => '/api/v1/me/connections/navidrome',
+		navidromeMusicFolderPreferences: () => '/api/v1/me/navidrome/music-folder-preferences',
+		jellyfin: () => '/api/v1/me/connections/jellyfin',
+		plexAuthPin: () => '/api/v1/me/connections/plex/auth/pin',
+		plexAuthPoll: (pinId: number) => `/api/v1/me/connections/plex/auth/poll?pin_id=${pinId}`,
 		spotifyAuthUrl: () => '/api/v1/me/connections/spotify/auth/url',
 		spotifyPlaylists: () => '/api/v1/me/spotify/playlists',
 		spotifyImport: (playlistId: string) => `/api/v1/me/spotify/playlists/${playlistId}/import`,
@@ -376,6 +749,8 @@ export const API = {
 	freeMusic: {
 		tasks: (all: boolean = false) => `/api/v1/free-music/tasks${all ? '?all=true' : ''}`,
 		task: (id: string) => `/api/v1/free-music/tasks/${id}`,
+		remove: (id: string) => `/api/v1/free-music/tasks/${id}`,
+		clearHistory: (all: boolean = false) => `/api/v1/free-music/tasks${all ? '?all=true' : ''}`,
 		cancel: (id: string) => `/api/v1/free-music/tasks/${id}/cancel`,
 		retry: (id: string) => `/api/v1/free-music/tasks/${id}/retry`
 	},
@@ -407,6 +782,7 @@ export const API = {
 		adminAppPassword: (id: string) => `/api/v1/connect-apps/admin/app-passwords/${id}`
 	},
 	downloads: {
+		activitySummary: () => '/api/v1/downloads/activity-summary',
 		searchAlbum: () => '/api/v1/downloads/search/album',
 		searchJob: (jobId: string) => `/api/v1/downloads/search/${jobId}`,
 		pick: (jobId: string) => `/api/v1/downloads/search/${jobId}/pick`,
@@ -427,6 +803,7 @@ export const API = {
 		stream: (taskId: string) => `/api/v1/downloads/${taskId}/stream`,
 		streamAll: () => '/api/v1/downloads/stream',
 		cancel: (taskId: string) => `/api/v1/downloads/${taskId}/cancel`,
+		nextSource: (taskId: string) => `/api/v1/downloads/${taskId}/next-source`,
 		retry: (taskId: string) => `/api/v1/downloads/${taskId}/retry`,
 		clear: () => '/api/v1/downloads/clear',
 		stopAllRetries: () => '/api/v1/downloads/stop-all-retries',
@@ -439,6 +816,9 @@ export const API = {
 		},
 		heldImport: (id: number) => `/api/v1/downloads/held/${id}/import`,
 		heldDiscard: (id: number) => `/api/v1/downloads/held/${id}/discard`,
+		heldManagementRetry: (taskId: string) => `/api/v1/downloads/held/management/${taskId}/retry`,
+		heldManagementDiscard: (taskId: string) =>
+			`/api/v1/downloads/held/management/${taskId}/discard`,
 		heldAudio: (id: number) => `/api/v1/downloads/held/${id}/audio`,
 		reimport: (taskId: string) => `/api/v1/downloads/${taskId}/reimport`,
 		cutoffUnmet: () => '/api/v1/downloads/cutoff-unmet',
@@ -447,6 +827,7 @@ export const API = {
 	},
 	requests: {
 		new: () => '/api/v1/requests/new',
+		pendingApprovalCount: () => '/api/v1/requests/pending-approvals/count',
 		autoDownloadApprovals: () => '/api/v1/requests/auto-download-approvals',
 		approveAutoDownload: (userId: string, mbid: string) =>
 			`/api/v1/requests/auto-download-approvals/${userId}/${mbid}/approve`,
@@ -508,6 +889,8 @@ export const API = {
 		playlists: (limit = 50) => `/api/v1/jellyfin/playlists?limit=${limit}`,
 		playlistDetail: (id: string) => `/api/v1/jellyfin/playlists/${id}`,
 		playlistImport: (id: string) => `/api/v1/jellyfin/playlists/${id}/import`,
+		playlistImage: (playlistId: string, itemId: string, size = 500) =>
+			`/api/v1/jellyfin/playlist-image/${playlistId}/${itemId}?size=${size}`,
 		instantMix: (itemId: string, limit = 50) =>
 			`/api/v1/jellyfin/instant-mix/${itemId}?limit=${limit}`,
 		instantMixByArtist: (artistId: string, limit = 50) =>
@@ -557,6 +940,8 @@ export const API = {
 		playlists: (limit = 50) => `/api/v1/navidrome/playlists?limit=${limit}`,
 		playlistDetail: (id: string) => `/api/v1/navidrome/playlists/${id}`,
 		playlistImport: (id: string) => `/api/v1/navidrome/playlists/${id}/import`,
+		playlistCover: (playlistId: string, coverArtId: string, size = 500) =>
+			`/api/v1/navidrome/playlist-cover/${playlistId}/${coverArtId}?size=${size}`,
 		random: (size = 20, genre?: string) => {
 			let url = `/api/v1/navidrome/random?size=${size}`;
 			if (genre) url += `&genre=${encodeURIComponent(genre)}`;
@@ -624,6 +1009,8 @@ export const API = {
 		playlists: (limit = 50) => `/api/v1/plex/playlists?limit=${limit}`,
 		playlistDetail: (id: string) => `/api/v1/plex/playlists/${id}`,
 		playlistImport: (id: string) => `/api/v1/plex/playlists/${id}/import`,
+		playlistImage: (playlistId: string, itemId: string, size = 500) =>
+			`/api/v1/plex/playlist-image/${playlistId}/${itemId}?size=${size}`,
 		discovery: (count = 10) => `/api/v1/plex/discovery?count=${count}`,
 		sessions: () => '/api/v1/plex/sessions',
 		history: (limit = 50, offset = 0) => `/api/v1/plex/history?limit=${limit}&offset=${offset}`,
@@ -648,6 +1035,7 @@ export const API = {
 		releases: () => '/api/v1/version/releases'
 	},
 	local: {
+		lyrics: (trackId: string) => `/api/v1/local/tracks/${trackId}/lyrics`,
 		albumMatch: (mbid: string) => `/api/v1/local/albums/match/${mbid}`,
 		albums: (
 			limit = 50,

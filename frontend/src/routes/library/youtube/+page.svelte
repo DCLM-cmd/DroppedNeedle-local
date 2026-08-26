@@ -238,6 +238,7 @@
 							customUrl={link.cover_url}
 							alt={link.album_name}
 							size="full"
+							requestSize={250}
 							rounded="none"
 							className="w-full h-full"
 						/>

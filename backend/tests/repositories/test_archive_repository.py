@@ -1,5 +1,5 @@
 """ArchiveRepository: the licence filter, the dark-item degradation, and the
-response shapes recorded in repositories/ARCHIVE_API_NOTES.md."""
+response shapes."""
 
 import json
 from unittest.mock import AsyncMock
@@ -68,7 +68,11 @@ async def test_search_drops_items_without_an_open_licence():
                     "docs": [
                         {"identifier": "good", "title": "Good", "licenseurl": CC},
                         {"identifier": "unlicensed", "title": "Bad"},
-                        {"identifier": "closed", "title": "Bad", "licenseurl": "http://x/arr"},
+                        {
+                            "identifier": "closed",
+                            "title": "Bad",
+                            "licenseurl": "http://x/arr",
+                        },
                     ]
                 }
             },
@@ -126,7 +130,13 @@ async def test_get_item_files_returns_audio_with_track_numbers():
             {
                 "metadata": {"licenseurl": CC},
                 "files": [
-                    {"name": "01.mp3", "format": "VBR MP3", "size": "500", "track": "1", "title": "One"},
+                    {
+                        "name": "01.mp3",
+                        "format": "VBR MP3",
+                        "size": "500",
+                        "track": "1",
+                        "title": "One",
+                    },
                     {"name": "01.flac", "format": "FLAC", "size": "5000", "track": "1"},
                     {"name": "cover.jpg", "format": "JPEG", "size": "10"},
                 ],
@@ -144,7 +154,7 @@ async def test_get_item_files_returns_audio_with_track_numbers():
 
 @pytest.mark.asyncio
 async def test_dark_item_returns_no_files_and_does_not_raise():
-    """A removed item answers {} rather than 404 (ARCHIVE_API_NOTES)."""
+    """A removed item answers {} rather than 404."""
     repo, _ = _repo(_response(200, {}))
     assert await repo.get_item_files("gone") == ("", [])
 
@@ -152,7 +162,13 @@ async def test_dark_item_returns_no_files_and_does_not_raise():
 @pytest.mark.asyncio
 async def test_item_without_open_licence_yields_no_files():
     repo, _ = _repo(
-        _response(200, {"metadata": {"licenseurl": ""}, "files": [{"name": "a.mp3", "format": "MP3"}]})
+        _response(
+            200,
+            {
+                "metadata": {"licenseurl": ""},
+                "files": [{"name": "a.mp3", "format": "MP3"}],
+            },
+        )
     )
     assert await repo.get_item_files("a-new-low-in-hifi") == ("", [])
 
@@ -179,7 +195,9 @@ async def test_invalid_json_raises_archive_error():
     client = AsyncMock()
     client.get = AsyncMock(
         return_value=httpx.Response(
-            200, content=b"<html>", request=httpx.Request("GET", "https://archive.org/x")
+            200,
+            content=b"<html>",
+            request=httpx.Request("GET", "https://archive.org/x"),
         )
     )
     with pytest.raises(ArchiveError):

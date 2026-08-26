@@ -13,13 +13,17 @@ import services.artist_discovery_service as _ads_module
 @pytest.fixture(autouse=True)
 def _reset_precache_flag():
     _ads_module._discovery_precache_running = False
+    _ads_module._precache_consecutive_failures = 0
+    _ads_module._precache_paused_until = 0.0
     yield
     _ads_module._discovery_precache_running = False
+    _ads_module._precache_consecutive_failures = 0
+    _ads_module._precache_paused_until = 0.0
 
 
 def _make_service(
     *, lb_configured: bool = True, lastfm_enabled: bool = False,
-    client_factory=None, auth_store=None,
+    client_factory=None, auth_store=None, workload_gate=None,
 ):
     lb_repo = MagicMock()
     lb_repo.is_configured.return_value = lb_configured
@@ -48,6 +52,7 @@ def _make_service(
         preferences_service=prefs,
         client_factory=client_factory,
         auth_store=auth_store,
+        workload_gate=workload_gate,
     )
     return svc
 
@@ -106,6 +111,54 @@ async def test_lock_released_after_exception():
     ):
         result = await svc.precache_artist_discovery(["mbid-a"], delay=0)
         assert result >= 0
+
+
+@pytest.mark.asyncio
+async def test_precache_rechecks_background_gate_for_each_source() -> None:
+    gate = MagicMock()
+    gate.wait_until_available = AsyncMock()
+    svc = _make_service(lastfm_enabled=True, workload_gate=gate)
+    svc._cache.get = AsyncMock(return_value=object())
+
+    await svc.precache_artist_discovery(["mbid-a"], delay=0)
+
+    assert gate.wait_until_available.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_listenbrainz_fallback_and_expected_misses_reuse_lastfm_cache() -> None:
+    svc = _make_service(lastfm_enabled=True)
+    cache_values: dict[str, object] = {}
+
+    async def cache_get(key: str):
+        return cache_values.get(key)
+
+    async def cache_set(key: str, value: object, ttl_seconds: int):
+        assert ttl_seconds > 0
+        cache_values[key] = value
+
+    svc._cache.get = AsyncMock(side_effect=cache_get)
+    svc._cache.set = AsyncMock(side_effect=cache_set)
+    svc._lb_repo.get_similar_artists = AsyncMock(return_value=[])
+    svc._lb_repo.get_artist_top_recordings = AsyncMock(return_value=[])
+    svc._lb_repo.get_artist_top_release_groups = AsyncMock(return_value=[])
+    svc._lastfm_repo.get_similar_artists = AsyncMock(return_value=[])
+    svc._lastfm_repo.get_artist_top_tracks = AsyncMock(return_value=[])
+    svc._lastfm_repo.get_artist_top_albums = AsyncMock(return_value=[])
+    svc._library_repo.get_library_mbids = AsyncMock(return_value=set())
+    svc._library_repo.get_requested_mbids = AsyncMock(return_value=set())
+    svc._mb_repo.get_release_groups_by_artist = AsyncMock(return_value=[])
+
+    await svc.precache_artist_discovery(["mbid-a"], delay=0)
+
+    svc._lastfm_repo.get_similar_artists.assert_awaited_once()
+    svc._lastfm_repo.get_artist_top_tracks.assert_awaited_once()
+    svc._lastfm_repo.get_artist_top_albums.assert_awaited_once()
+    assert {key for key in cache_values if key.endswith(":lastfm")} == {
+        "artist_discovery:similar:mbid-a:15:lastfm",
+        "artist_discovery:top_songs:mbid-a:10:lastfm",
+        "artist_discovery:top_albums:mbid-a:10:lastfm",
+    }
 
 
 @pytest.mark.asyncio

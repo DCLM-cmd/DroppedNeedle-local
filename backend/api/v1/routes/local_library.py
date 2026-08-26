@@ -8,12 +8,18 @@ from api.v1.schemas.local_files import (
     DecadesResponse,
     LocalAlbumMatch,
     LocalAlbumSummary,
+    LocalLyricLine,
+    LocalLyricsResponse,
     LocalPaginatedResponse,
     LocalSearchResponse,
     LocalStorageStats,
     LocalTrackInfo,
 )
-from core.dependencies import get_local_files_service
+from core.dependencies import (
+    CurrentUserDep,
+    NativeLyricsServiceDep,
+    get_local_files_service,
+)
 from core.exceptions import ExternalServiceError
 from infrastructure.msgspec_fastapi import MsgSpecRoute
 from services.local_files_service import LocalFilesService
@@ -21,6 +27,30 @@ from services.local_files_service import LocalFilesService
 logger = logging.getLogger(__name__)
 
 router = APIRouter(route_class=MsgSpecRoute, prefix="/local", tags=["local-files"])
+
+
+@router.get("/tracks/{file_id}/lyrics", response_model=LocalLyricsResponse)
+async def get_local_track_lyrics(
+    file_id: str,
+    current_user: CurrentUserDep,
+    service: NativeLyricsServiceDep,
+) -> LocalLyricsResponse:
+    lyrics = await service.get(file_id)
+    if lyrics is None:
+        raise HTTPException(status_code=404, detail="Lyrics not available")
+    return LocalLyricsResponse(
+        text="\n".join(line.value for line in lyrics.lines),
+        is_synced=lyrics.synced,
+        lines=[
+            LocalLyricLine(
+                text=line.value,
+                start_seconds=(
+                    line.start_ms / 1000 if line.start_ms is not None else None
+                ),
+            )
+            for line in lyrics.lines
+        ],
+    )
 
 
 @router.get("/albums", response_model=LocalPaginatedResponse)
@@ -35,8 +65,12 @@ async def get_local_albums(
 ) -> LocalPaginatedResponse:
     try:
         return await service.get_albums(
-            limit=limit, offset=offset, sort_by=sort_by, sort_order=sort_order,
-            search_query=q, decade=decade,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            search_query=q,
+            decade=decade,
         )
     except ExternalServiceError as e:
         logger.error("Failed to get local albums: %s", e)
@@ -55,9 +89,7 @@ async def match_local_album(
         raise HTTPException(status_code=502, detail="Failed to match local album")
 
 
-@router.get(
-    "/albums/{mbid}/tracks", response_model=list[LocalTrackInfo]
-)
+@router.get("/albums/{mbid}/tracks", response_model=list[LocalTrackInfo])
 async def get_local_album_tracks(
     mbid: str,
     service: LocalFilesService = Depends(get_local_files_service),
@@ -66,9 +98,7 @@ async def get_local_album_tracks(
         return await service.get_album_tracks_by_id(mbid)
     except ExternalServiceError as e:
         logger.error("Failed to get local album tracks %s: %s", mbid, e)
-        raise HTTPException(
-            status_code=502, detail="Failed to get local album tracks"
-        )
+        raise HTTPException(status_code=502, detail="Failed to get local album tracks")
 
 
 @router.get("/search", response_model=LocalSearchResponse)
@@ -80,9 +110,7 @@ async def search_local(
         return await service.search(q)
     except ExternalServiceError as e:
         logger.error("Failed to search local files: %s", e)
-        raise HTTPException(
-            status_code=502, detail="Failed to search local files"
-        )
+        raise HTTPException(status_code=502, detail="Failed to search local files")
 
 
 @router.get("/recent", response_model=list[LocalAlbumSummary])
@@ -94,9 +122,7 @@ async def get_local_recent(
         return await service.get_recently_added(limit=limit)
     except ExternalServiceError as e:
         logger.error("Failed to get recent local albums: %s", e)
-        raise HTTPException(
-            status_code=502, detail="Failed to get recent local albums"
-        )
+        raise HTTPException(status_code=502, detail="Failed to get recent local albums")
 
 
 @router.get("/stats", response_model=LocalStorageStats)
