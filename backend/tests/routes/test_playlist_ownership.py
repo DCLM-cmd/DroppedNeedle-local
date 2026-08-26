@@ -219,13 +219,17 @@ async def test_check_track_membership_scoped_to_user(env):
 
 @pytest.mark.asyncio
 async def test_migrate_playlists_owner_to_admin(env):
-    from main import _migrate_playlists_owner_to_admin
+    # F-NL-03: the migration moved into the target runtime lifecycle.
 
     await _seed_users(env.auth_store)
     env.repo.create_playlist("Legacy 1")  # user_id IS NULL
     env.repo.create_playlist("Legacy 2")
 
-    await _migrate_playlists_owner_to_admin(env.auth_store, env.repo)
+    # F-NL-03 dropped the main:app helper; the legacy repo method remains the
+    # supported backfill for the legacy playlist table.
+    from repositories.async_playlist_repository import AsyncPlaylistRepository
+
+    await AsyncPlaylistRepository(env.repo).assign_unowned_to(ADMIN_ID)
     rows = env.repo.get_all_playlists()
     assert rows, "expected backfilled rows"
     assert all(r.user_id == ADMIN_ID for r in rows)

@@ -230,7 +230,11 @@ def test_admin_user_list_carries_per_user_avatar_path(tmp_path):
 
 
 def test_migrate_shared_avatar_to_first_admin(tmp_path):
-    from main import _migrate_shared_avatar_to_first_admin
+    # F-NL-03: the shared-avatar migration moved into the target runtime
+    # lifecycle as _migrate_shared_avatar(auth_store, cache_dir).
+    from services.native.target_application_lifecycle import (
+        _migrate_shared_avatar,
+    )
 
     store = AuthStore(tmp_path / "library.db")
     auth = AuthService(store)
@@ -245,12 +249,12 @@ def test_migrate_shared_avatar_to_first_admin(tmp_path):
     legacy.mkdir(parents=True)
     (legacy / "avatar.png").write_bytes(PNG_BYTES)
 
-    asyncio.run(_migrate_shared_avatar_to_first_admin(store, cache_dir))
+    asyncio.run(_migrate_shared_avatar(store, cache_dir))
 
     assert (cache_dir / "avatars" / f"{admin.id}.png").exists()
     assert not (legacy / "avatar.png").exists()
     assert asyncio.run(store.get_user_by_id(admin.id)).avatar_url == f"/api/v1/profile/avatar/{admin.id}"
 
     # Idempotent: a re-run is a no-op (admin already has an avatar_url).
-    asyncio.run(_migrate_shared_avatar_to_first_admin(store, cache_dir))
+    asyncio.run(_migrate_shared_avatar(store, cache_dir))
     assert asyncio.run(store.get_user_by_id(admin.id)).avatar_url == f"/api/v1/profile/avatar/{admin.id}"
