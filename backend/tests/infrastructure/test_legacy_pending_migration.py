@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 import sqlite3
 import threading
 from pathlib import Path
@@ -680,3 +681,137 @@ async def test_runtime_smoke_real_migration_through_schedule_for_input_b(
     assert await service.schedule() is False
 
 
+@pytest.mark.asyncio
+async def test_pending_migration_projects_moved_root_after_restoration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-MIG-03: rows left pending because their mount was absent at cutover
+    become migratable after the user configures the CURRENT mount. The service
+    re-proves the move with the same rules as cutover and passes the verified
+    projector into the bounded migration."""
+    old_root = tmp_path / "Old" / "Music"
+    current_root = tmp_path / "Current" / "Music"
+    database = tmp_path / "library.db"
+    _create_source(database, old_root)
+    store = _store(database)
+
+    # The library MOVED: the same relative files now live under Current with
+    # the exact byte sizes recorded in the legacy rows.
+    current_compilation = current_root / "Compilation"
+    current_compilation.mkdir(parents=True)
+    (current_compilation / "01.flac").write_bytes(b"a" * 100)
+    (current_compilation / "02.flac").write_bytes(b"b" * 200)
+
+    # /tmp is a blocked probe prefix in production; relax it exactly like the
+    # reconciler tests so the moved-root proof can run against tmp_path.
+    import services.native.legacy_path_reconciler as lpr_module
+
+    monkeypatch.setattr(lpr_module, "_BLOCKED_ROOTS", (Path("/"),))
+
+    # Cutover with an UNRELATED root configured: every legacy path is outside
+    # the configured roots -> lenient skip leaves them pending, and the
+    # durable marker is created.
+    await BoundedLegacyCatalogMigrator(
+        store,
+        _resolver(("root", tmp_path / "Unrelated")),
+        emit_progress=lambda _message: None,
+        batch_size=1,
+        skip_unmappable_paths=True,
+    ).migrate("lenient-migration", now=100)
+    counts = await store.get_pending_legacy_counts()
+    assert counts["library_file"] == 2
+
+    # Root restoration: the user points the root at the CURRENT mount.
+    resolver = _resolver(("root", current_root))
+    service = LegacyPendingMigrationService(store, lambda: resolver)
+    original_run = service._run
+
+    async def run_and_reset(run_id: str) -> None:
+        try:
+            await original_run(run_id)
+        finally:
+            service._running = False
+
+    service._run = run_and_reset
+
+    assert await service.schedule() is True
+    while service._running:
+        await asyncio.sleep(0.01)
+
+    with sqlite3.connect(database) as connection:
+        tracks = connection.execute(
+            "SELECT relative_path, file_path FROM local_tracks ORDER BY relative_path"
+        ).fetchall()
+        provenance = connection.execute(
+            "SELECT COUNT(*) FROM library_migration_provenance "
+            "WHERE source_kind = 'library_file'"
+        ).fetchone()[0]
+    # All four seeded rows (2 identified + 2 review-derived) follow the same
+    # projector onto the CURRENT mount, not the dead old mount.
+    relative_paths = {row[0] for row in tracks}
+    assert relative_paths == {
+        "Compilation/01.flac",
+        "Compilation/02.flac",
+        "Local Album/01.flac",
+        "Rejected/01.flac",
+    }
+    assert all(row[1].startswith(str(current_root)) for row in tracks)
+    assert provenance == 2
+    # Idempotency: the same input again is a no-op.
+    assert await service.schedule() is False
+
+
+@pytest.mark.asyncio
+async def test_pending_migration_keeps_wrong_size_destination_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-MIG-03 negative boundary: a destination whose size does not match the
+    legacy evidence makes the all-row proof block the remap - nothing is
+    guessed, and the rows stay pending and retryable."""
+    old_root = tmp_path / "Old" / "Music"
+    current_root = tmp_path / "Current" / "Music"
+    database = tmp_path / "library.db"
+    _create_source(database, old_root)
+    store = _store(database)
+
+    current_compilation = current_root / "Compilation"
+    current_compilation.mkdir(parents=True)
+    (current_compilation / "01.flac").write_bytes(b"a" * 100)
+    # Wrong size for one destination: the all-row proof must reject the remap.
+    (current_compilation / "02.flac").write_bytes(b"b" * 12345)
+
+    monkeypatch.setattr(
+        "services.native.legacy_path_reconciler._BLOCKED_ROOTS", (Path("/"),)
+    )
+
+    await BoundedLegacyCatalogMigrator(
+        store,
+        _resolver(("root", tmp_path / "Unrelated")),
+        emit_progress=lambda _message: None,
+        batch_size=1,
+        skip_unmappable_paths=True,
+    ).migrate("lenient-migration", now=100)
+
+    resolver = _resolver(("root", current_root))
+    service = LegacyPendingMigrationService(store, lambda: resolver)
+    original_run = service._run
+
+    async def run_and_reset(run_id: str) -> None:
+        try:
+            await original_run(run_id)
+        finally:
+            service._running = False
+
+    service._run = run_and_reset
+
+    assert await service.schedule() is True
+    while service._running:
+        await asyncio.sleep(0.01)
+
+    with sqlite3.connect(database) as connection:
+        track_count = connection.execute(
+            "SELECT COUNT(*) FROM local_tracks"
+        ).fetchone()[0]
+    assert track_count == 0  # nothing was guessed
+    counts = await store.get_pending_legacy_counts()
+    assert counts["library_file"] == 2  # rows remain pending and retryable
