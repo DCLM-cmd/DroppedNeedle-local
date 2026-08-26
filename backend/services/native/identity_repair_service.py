@@ -20,7 +20,12 @@ from api.v1.schemas.library_operations import (
     RepairFindingResponse,
     SuggestedEditionSummary,
 )
-from core.exceptions import ExternalServiceError, ResourceNotFoundError, ValidationError
+from core.exceptions import (
+    ExternalServiceError,
+    ResourceNotFoundError,
+    StaleRevisionError,
+    ValidationError,
+)
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
 from infrastructure.persistence.native_library_store import (
@@ -62,6 +67,10 @@ from services.native.library_operation_service import (
     LEASE_SECONDS,
     LibraryOperationService,
 )
+from infrastructure.persistence.gh293_calibration import (
+    BACKGROUND_TIMESLICE_SECONDS,
+)
+from services.native.wal_checkpoint_service import WalCheckpointService
 
 MANAGEMENT_READINESS_PURPOSE = "management_readiness"
 MANAGEMENT_MAPPING_VERSION = "management-edition-readiness-v4"
@@ -84,12 +93,14 @@ class IdentityRepairService:
         evidence: AlbumEvidenceEngine | None = None,
         canonical_provider: CanonicalMusicBrainzRepositoryProtocol | None = None,
         provider_available: Callable[[], bool] | None = None,
+        wal_checkpoint: WalCheckpointService | None = None,
     ) -> None:
         self._store = store
         self._provider = provider
         self._evidence = evidence or AlbumEvidenceEngine()
         self._canonical_provider = canonical_provider
         self._provider_available = provider_available
+        self._wal_checkpoint = wal_checkpoint
         self._operations = LibraryOperationService(store)
 
     async def create(
@@ -242,8 +253,42 @@ class IdentityRepairService:
         availability = (
             self._provider_available if provider_available is None else provider_available
         )
+        started = time.monotonic()
         while True:
             timestamp = time.time() if now is None else now
+            while True:
+                try:
+                    staged = await self._store.materialize_repair_operation_batch(
+                        str(job["id"]), worker_id, now=timestamp
+                    )
+                except StaleRevisionError:
+                    # A catalog change while the worklist is unsealed rebases the
+                    # SAME static-key job onto the current revision (or fails
+                    # closed when progress exists) and resumes next pass.
+                    rebased = await self._store.rebase_repair_operation(
+                        str(job["id"]), worker_id, now=timestamp
+                    )
+                    if rebased["rebased"]:
+                        return self._operations._response(
+                            await self._store.yield_operation_job(
+                                str(job["id"]),
+                                worker_id,
+                                now=timestamp,
+                                reason_code="PIN_REBASED",
+                            )
+                        )
+                    return self._operations._response(rebased["job"])
+                if staged["complete"]:
+                    break
+                if time.monotonic() - started >= BACKGROUND_TIMESLICE_SECONDS:
+                    return self._operations._response(
+                        await self._store.yield_operation_job(
+                            str(job["id"]),
+                            worker_id,
+                            now=timestamp,
+                            reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                        )
+                    )
             if availability is not None and not availability():
                 return await self._defer_audit(str(job["id"]), worker_id, timestamp)
             controlled = await self._store.checkpoint_operation_control(
@@ -251,53 +296,96 @@ class IdentityRepairService:
             )
             if controlled is not None and controlled["state"] != "running":
                 return self._operations._response(controlled)
-            work = await self._store.claim_operation_work(
-                str(job["id"]), worker_id, now=timestamp
-            )
-            if work is None:
-                await self._store.mark_repair_ready(
+            if (
+                self._wal_checkpoint is not None
+                and self._wal_checkpoint.background_suspended
+            ):
+                return self._operations._response(
+                    await self._store.yield_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        now=timestamp,
+                        reason_code="WAL_BACKPRESSURE",
+                    )
+                )
+            if time.monotonic() - started >= BACKGROUND_TIMESLICE_SECONDS:
+                return self._operations._response(
+                    await self._store.yield_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        now=timestamp,
+                        reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                    )
+                )
+            # One bounded pass of subjects; control is probed read-only between
+            # units and transitioned at pass cadence.
+            control_pending = False
+            while time.monotonic() - started < BACKGROUND_TIMESLICE_SECONDS:
+                if await self._store.probe_operation_control(
+                    str(job["id"]), worker_id
+                ):
+                    control_pending = True
+                    break
+                work = await self._store.claim_operation_work(
                     str(job["id"]), worker_id, now=timestamp
                 )
-                return await self._operations.get(str(job["id"]))
-            context = await self._store.get_album_identification_context(
-                str(work["local_album_id"])
-            )
-            renewed = await self._store.heartbeat_operation_job(
-                str(job["id"]),
-                worker_id,
-                now=timestamp,
-                lease_seconds=LEASE_SECONDS,
-            )
-            if not renewed:
-                raise ResourceNotFoundError("The identity check lease changed.")
-            try:
-                if purpose == MANAGEMENT_READINESS_PURPOSE:
-                    finding, attempt, evidence = await self._classify_management_readiness(
-                        str(job["id"]), work, context, timestamp
+                if work is None:
+                    await self._store.mark_repair_ready(
+                        str(job["id"]), worker_id, now=timestamp
                     )
-                else:
-                    finding, attempt, evidence = await self._classify(
-                        str(job["id"]), work, context
-                    )
-            except _ProviderUnavailable:
-                return await self._defer_audit(
+                    return await self._operations.get(str(job["id"]))
+                timestamp = time.time() if now is None else now
+                context = await self._store.get_album_identification_context(
+                    str(work["local_album_id"])
+                )
+                renewed = await self._store.heartbeat_operation_job(
                     str(job["id"]),
                     worker_id,
-                    timestamp,
-                    ordinal=int(work["ordinal"]),
+                    now=timestamp,
+                    lease_seconds=LEASE_SECONDS,
                 )
-            await self._store.save_repair_finding_for_work(
-                str(job["id"]),
-                int(work["ordinal"]),
-                worker_id=worker_id,
-                expected_work_revision=int(work["row_revision"]),
-                finding=finding,
-                attempt=attempt,
-                evidence=evidence,
-                now=timestamp,
+                if not renewed:
+                    raise ResourceNotFoundError("The identity check lease changed.")
+                try:
+                    if purpose == MANAGEMENT_READINESS_PURPOSE:
+                        finding, attempt, evidence = await self._classify_management_readiness(
+                            str(job["id"]), work, context, timestamp
+                        )
+                    else:
+                        finding, attempt, evidence = await self._classify(
+                            str(job["id"]), work, context
+                        )
+                except _ProviderUnavailable:
+                    return await self._defer_audit(
+                        str(job["id"]),
+                        worker_id,
+                        timestamp,
+                        ordinal=int(work["ordinal"]),
+                    )
+                await self._store.save_repair_finding_for_work(
+                    str(job["id"]),
+                    int(work["ordinal"]),
+                    worker_id=worker_id,
+                    expected_work_revision=int(work["row_revision"]),
+                    finding=finding,
+                    attempt=attempt,
+                    evidence=evidence,
+                    now=timestamp,
+                )
+                if checkpoint is not None:
+                    await checkpoint()
+            if control_pending:
+                continue  # outer loop performs the control transition
+            # Pass budget elapsed with subjects still pending: yield with the
+            # persisted cooldown (no immediate reclaim).
+            return self._operations._response(
+                await self._store.yield_operation_job(
+                    str(job["id"]),
+                    worker_id,
+                    now=timestamp,
+                    reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                )
             )
-            if checkpoint is not None:
-                await checkpoint()
 
     async def _defer_audit(
         self,
@@ -1007,43 +1095,120 @@ class IdentityRepairService:
         now: float | None = None,
         checkpoint: Callable[[], Awaitable[None]] | None = None,
     ) -> OperationResponse:
+        started = time.monotonic()
         while True:
             timestamp = time.time() if now is None else now
+            while True:
+                try:
+                    staged = await self._store.materialize_repair_operation_batch(
+                        str(job["id"]), worker_id, now=timestamp
+                    )
+                except StaleRevisionError:
+                    # A catalog change while the worklist is unsealed rebases the
+                    # SAME static-key job onto the current revision (or fails
+                    # closed when progress exists) and resumes next pass.
+                    rebased = await self._store.rebase_repair_operation(
+                        str(job["id"]), worker_id, now=timestamp
+                    )
+                    if rebased["rebased"]:
+                        return self._operations._response(
+                            await self._store.yield_operation_job(
+                                str(job["id"]),
+                                worker_id,
+                                now=timestamp,
+                                reason_code="PIN_REBASED",
+                            )
+                        )
+                    return self._operations._response(rebased["job"])
+                if staged["complete"]:
+                    break
+                if time.monotonic() - started >= BACKGROUND_TIMESLICE_SECONDS:
+                    return self._operations._response(
+                        await self._store.yield_operation_job(
+                            str(job["id"]),
+                            worker_id,
+                            now=timestamp,
+                            reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                        )
+                    )
             controlled = await self._store.checkpoint_operation_control(
                 str(job["id"]), worker_id, now=timestamp
             )
             if controlled is not None and controlled["state"] != "running":
                 return self._operations._response(controlled)
-            work = await self._store.claim_operation_work(
-                str(job["id"]), worker_id, now=timestamp
-            )
-            if work is None:
-                done = await self._store.finish_operation_job(
+            if (
+                self._wal_checkpoint is not None
+                and self._wal_checkpoint.background_suspended
+            ):
+                return self._operations._response(
+                    await self._store.yield_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        now=timestamp,
+                        reason_code="WAL_BACKPRESSURE",
+                    )
+                )
+            if time.monotonic() - started >= BACKGROUND_TIMESLICE_SECONDS:
+                return self._operations._response(
+                    await self._store.yield_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        now=timestamp,
+                        reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                    )
+                )
+            # One bounded pass of subjects; control is probed read-only between
+            # units and transitioned at pass cadence.
+            control_pending = False
+            while time.monotonic() - started < BACKGROUND_TIMESLICE_SECONDS:
+                if await self._store.probe_operation_control(
+                    str(job["id"]), worker_id
+                ):
+                    control_pending = True
+                    break
+                work = await self._store.claim_operation_work(
+                    str(job["id"]), worker_id, now=timestamp
+                )
+                if work is None:
+                    done = await self._store.finish_sealed_repair_operation_job(
+                        str(job["id"]),
+                        worker_id,
+                        state="succeeded",
+                        terminal_code="APPLY_COMPLETED",
+                        now=timestamp,
+                    )
+                    return self._operations._response(done)
+                timestamp = time.time() if now is None else now
+                renewed = await self._store.heartbeat_operation_job(
                     str(job["id"]),
                     worker_id,
-                    state="succeeded",
-                    terminal_code="APPLY_COMPLETED",
+                    now=timestamp,
+                    lease_seconds=LEASE_SECONDS,
+                )
+                if not renewed:
+                    raise ResourceNotFoundError("The identity check lease changed.")
+                await self._store.apply_repair_work(
+                    str(job["id"]),
+                    int(work["ordinal"]),
+                    worker_id=worker_id,
+                    expected_work_revision=int(work["row_revision"]),
+                    actor_user_id=actor_user_id,
                     now=timestamp,
                 )
-                return self._operations._response(done)
-            renewed = await self._store.heartbeat_operation_job(
-                str(job["id"]),
-                worker_id,
-                now=timestamp,
-                lease_seconds=LEASE_SECONDS,
+                if checkpoint is not None:
+                    await checkpoint()
+            if control_pending:
+                continue  # outer loop performs the control transition
+            # Pass budget elapsed with subjects still pending: yield with the
+            # persisted cooldown (no immediate reclaim).
+            return self._operations._response(
+                await self._store.yield_operation_job(
+                    str(job["id"]),
+                    worker_id,
+                    now=timestamp,
+                    reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                )
             )
-            if not renewed:
-                raise ResourceNotFoundError("The identity check lease changed.")
-            await self._store.apply_repair_work(
-                str(job["id"]),
-                int(work["ordinal"]),
-                worker_id=worker_id,
-                expected_work_revision=int(work["row_revision"]),
-                actor_user_id=actor_user_id,
-                now=timestamp,
-            )
-            if checkpoint is not None:
-                await checkpoint()
 
     async def findings(
         self,

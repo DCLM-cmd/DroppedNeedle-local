@@ -564,6 +564,11 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
         "start_library_contribution_verification_worker",
         lambda *a, **k: None,
     )
+    # (GH-293) The PASSIVE WAL checkpoint task registers a real background loop;
+    # drain it here so lifespan tests never leave a pending task behind.
+    monkeypatch.setattr(
+        target_module, "start_target_wal_checkpoint_task", lambda _service: None
+    )
     watchdog_starters: dict[str, object] = {}
     monkeypatch.setattr(
         target_module,

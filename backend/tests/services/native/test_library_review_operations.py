@@ -5530,7 +5530,10 @@ async def test_operation_supervisor_renews_long_identity_audit_leases(
     ready = await supervisor.run_once("worker")
 
     assert ready is not None and ready.state == "ready"
-    assert lease_expiries == [70.0, 80.0]
+    # (GH-293) Control is checked at pass cadence; the per-unit heartbeat clock
+    # advances once per claimed subject, so the recorded lease expiries are
+    # 20 s + 60 s and 30 s + 60 s under the test's fake clock.
+    assert lease_expiries == [80.0, 90.0]
 
     queued = await preparation.begin_management_preparation_apply(
         created.id,
@@ -5567,7 +5570,8 @@ async def test_operation_supervisor_renews_long_identity_audit_leases(
     done = await supervisor.run_once("worker")
 
     assert done is not None and done.state == "succeeded"
-    assert apply_lease_expiries == [120.0]
+    # (GH-293) Pass cadence: the single apply unit heartbeats at 70 s + 60 s.
+    assert apply_lease_expiries == [130.0]
 
 
 @pytest.mark.asyncio
@@ -6180,6 +6184,16 @@ async def test_management_identity_preparation_excludes_trackless_albums(
 
     assert estimate.album_count == 1
     assert created.expected_work_count == 1
+    # (GH-293) Work rows materialize in bounded pages when the worker runs.
+    claimed = await store.claim_operation_job(
+        "worker", now=3, lease_seconds=60, kind="repair"
+    )
+    assert claimed is not None
+    staged = await store.materialize_repair_operation_batch(
+        created.id, "worker", now=3
+    )
+    assert staged["complete"] is True
+    assert staged["materialized_count"] == 1
     with sqlite3.connect(db_path) as connection:
         work = connection.execute(
             "SELECT local_album_id FROM library_operation_work WHERE job_id = ?",
@@ -6213,6 +6227,16 @@ async def test_management_identity_preparation_excludes_fully_missing_albums(
     assert estimate.album_count == 1
     assert estimate.mapping_required_count == 1
     assert created.expected_work_count == 1
+    # (GH-293) Work rows materialize in bounded pages when the worker runs.
+    claimed = await store.claim_operation_job(
+        "worker", now=3, lease_seconds=60, kind="repair"
+    )
+    assert claimed is not None
+    staged = await store.materialize_repair_operation_batch(
+        created.id, "worker", now=3
+    )
+    assert staged["complete"] is True
+    assert staged["materialized_count"] == 1
     with sqlite3.connect(db_path) as connection:
         work = connection.execute(
             "SELECT local_album_id FROM library_operation_work WHERE job_id = ?",

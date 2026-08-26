@@ -826,6 +826,12 @@ async def test_expired_worker_lease_recovers_after_restart(
         "worker-before-restart", now=3, lease_seconds=1, kind="repair"
     )
     assert claimed is not None
+    # (GH-293) Work rows are materialized in bounded pages when the worker runs;
+    # a crash after a materialization page commit must resume without re-insert.
+    staged = await store.materialize_repair_operation_batch(
+        claimed["id"], "worker-before-restart", now=3
+    )
+    assert staged["complete"] is True
     running_work = await store.claim_operation_work(
         claimed["id"], "worker-before-restart", now=3
     )

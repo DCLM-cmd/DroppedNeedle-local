@@ -9,6 +9,10 @@ import unicodedata
 from pathlib import Path
 from typing import Any, TypeVar
 
+from infrastructure.persistence.connection_settings import (
+    report_connection_settings,
+)
+
 T = TypeVar("T")
 
 
@@ -147,6 +151,9 @@ class PersistenceBase:
         # (AUD-7) Uniform backstop: a writer blocked by another writer waits up to
         # 5s for the lock instead of failing immediately with "database is locked".
         conn.execute("PRAGMA busy_timeout=5000")
+        # (GH-293) Labeled connection-local settings telemetry (bounded, once per
+        # role per process). Never inferred from a fresh probe connection.
+        report_connection_settings("persistence_base", conn)
         return conn
 
     def _execute(self, operation: Any, write: bool) -> Any:

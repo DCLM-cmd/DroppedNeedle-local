@@ -29,6 +29,10 @@ from core.exceptions import (
     ValidationError,
 )
 from infrastructure.persistence._database import PersistenceBase
+from infrastructure.persistence.gh293_calibration import (
+    BACKGROUND_YIELD_COOLDOWN_SECONDS,
+    MATERIALIZATION_PAGE_CAP,
+)
 from infrastructure.persistence.native_library_schema import SCHEMA_SQL
 from infrastructure.queue.durable_work_wakeup import DurableWorkWakeups
 from infrastructure.validators import is_valid_mbid
@@ -735,6 +739,41 @@ class NativeLibraryStore(PersistenceBase):
                     self._scan_invalidation_pending = False
                 else:
                     self._scan_invalidation_pending = True
+        return result
+
+    async def _write_background(
+        self, operation: Callable[[sqlite3.Connection], _T]
+    ) -> _T:
+        """Background-priority write that still performs normal catalog
+        invalidation after commit.
+
+        (GH-293) Identity backfill mutations must not win against interactive
+        writes, so they go through the shared lock's background admission. The
+        catalog-change invalidation contract is identical to ``_write``.
+        """
+
+        def tracked(connection: sqlite3.Connection) -> tuple[_T, bool]:
+            before = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            result = operation(connection)
+            after = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            return result, before != after
+
+        result, catalog_changed = await super()._background_write(tracked)
+        if catalog_changed:
+            try:
+                await self._invalidate()
+            except Exception:  # noqa: BLE001 - the database commit already succeeded
+                logger.exception(
+                    "Target catalog cache invalidation failed after commit"
+                )
         return result
 
     async def flush_scan_invalidation(self, *, terminal: bool = False) -> None:
@@ -14240,7 +14279,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return result
 
-        result = await self._write(operation)
+        result = await self._write_background(operation)
         if result.get("reidentification_job_created") is True:
             self.work_wakeups.notify("identification")
         return result
@@ -14280,7 +14319,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return dict(updated)
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def apply_provider_anchored_artist_convergence(
         self,
@@ -14622,7 +14661,7 @@ class NativeLibraryStore(PersistenceBase):
                 "filesystem_writes": 0,
             }
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def apply_artist_credit_projection(
         self,
@@ -15076,7 +15115,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return result
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def get_artist_reconciliation_context(
         self, local_album_id: str
@@ -15186,7 +15225,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return result
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def defer_artist_reconciliation_work(
         self,
@@ -15238,7 +15277,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return dict(updated)
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def get_artist_reconciliation_status_data(self) -> dict[str, Any]:
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -26580,6 +26619,27 @@ class NativeLibraryStore(PersistenceBase):
             self.work_wakeups.notify("operation")
         return result
 
+    async def probe_operation_control(
+        self, job_id: str, worker_id: str
+    ) -> bool:
+        """Read-only per-unit control check (no write lock, no transaction).
+
+        (GH-293) Workers check control at pass cadence with a real transition,
+        and probe this cheap read between units so a pause/stop issued mid-pass
+        is honored within one unit instead of writing a control transaction per
+        subject.
+        """
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            row = connection.execute(
+                "SELECT control_request FROM library_operation_jobs "
+                "WHERE id = ? AND state = 'running' AND lease_owner = ?",
+                (job_id, worker_id),
+            ).fetchone()
+            return row is not None and str(row["control_request"]) != "none"
+
+        return await self._read(operation)
+
     async def checkpoint_operation_control(
         self, job_id: str, worker_id: str, *, now: float
     ) -> dict[str, Any] | None:
@@ -26609,7 +26669,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return dict(updated)
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     async def finish_operation_job(
         self, job_id: str, worker_id: str, *, state: str, terminal_code: str, now: float
@@ -27546,6 +27606,23 @@ class NativeLibraryStore(PersistenceBase):
         source_matcher_version: str | None,
         target_matcher_version: str,
     ) -> dict[str, Any]:
+        """Create a repair job header plus its strictly pinned materialization state.
+
+        (GH-293) The header, snapshot, and materialization marker are created in
+        one small foreground transaction. The catalog revision is captured from
+        the store INSIDE this transaction and used for BOTH the job header
+        (``input_catalog_revision``) and the materialization pin, so the subject
+        set is fixed for the job's whole life: every materialization page
+        enforces the pin and fails/stales the job BEFORE any live changed
+        subject is inserted when the revision moved; an unsealed, zero-progress
+        job is atomically REBASED onto the current revision by
+        ``rebase_repair_operation`` (same static job, no fresh startup job).
+        Work rows are materialized in keyset pages of at most 500 subjects per
+        transaction by ``materialize_repair_operation_batch`` (background lock
+        priority). ``expected_work_count`` starts as a pinned COUNT(*) estimate
+        and is corrected to the exact staged count when materialization seals.
+        """
+
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             if job.idempotency_key:
                 existing = connection.execute(
@@ -27555,72 +27632,22 @@ class NativeLibraryStore(PersistenceBase):
                 if existing is not None:
                     return dict(existing)
             purpose = str(scope.get("purpose", "existing_matches"))
-            root_ids = [str(value) for value in scope.get("root_ids", [])]
-            root_clause = ""
-            parameters: list[Any] = []
-            if root_ids:
-                root_clause = f"AND a.root_id IN ({','.join('?' for _ in root_ids)})"
-                parameters.extend(root_ids)
-            if purpose in {
-                "artist_identity_reconciliation",
-                "catalog_identity_hygiene",
-            }:
-                album_ids = [str(value) for value in scope.get("album_ids", [])]
-                album_clause = ""
-                if album_ids:
-                    album_clause = f"AND a.id IN ({','.join('?' for _ in album_ids)})"
-                    parameters.extend(album_ids)
-                active_track_clause = (
-                    "AND EXISTS (SELECT 1 FROM local_tracks active_track "
-                    "WHERE active_track.local_album_id = a.id "
-                    "AND active_track.availability = 'indexed') "
-                    if purpose == "artist_identity_reconciliation"
-                    else ""
-                )
-                rows = connection.execute(
-                    "SELECT a.id, a.row_revision, i.row_revision identity_revision, "
-                    "i.decision_source, i.attempt_id, i.release_mbid "
-                    "FROM local_albums a LEFT JOIN local_album_external_identities i "
-                    "ON i.local_album_id = a.id AND i.provider = 'musicbrainz' "
-                    "WHERE a.retired_into_album_id IS NULL "
-                    f"{active_track_clause}{root_clause} {album_clause} ORDER BY a.id",
-                    parameters,
-                ).fetchall()
-            elif purpose == "management_readiness":
-                rows = connection.execute(
-                    "SELECT a.id, a.row_revision, i.row_revision identity_revision, "
-                    "i.decision_source, i.attempt_id FROM local_albums a "
-                    "LEFT JOIN local_album_external_identities i ON i.local_album_id = a.id "
-                    "AND i.provider = 'musicbrainz' "
-                    "WHERE a.retired_into_album_id IS NULL "
-                    "AND EXISTS (SELECT 1 FROM local_tracks t WHERE t.local_album_id = a.id "
-                    "AND t.availability = 'indexed') "
-                    "AND NOT EXISTS (SELECT 1 FROM library_management_exclusions exclusion "
-                    "WHERE exclusion.local_album_id=a.id) "
-                    "AND NOT EXISTS (SELECT 1 FROM library_edition_conversion_jobs conversion "
-                    "WHERE conversion.local_album_id=a.id AND conversion.state IN "
-                    "('preflight','acquiring','ready','needs_recheck')) "
-                    f"{root_clause} ORDER BY a.id",
-                    parameters,
-                ).fetchall()
-            else:
-                identity_clause = ""
-                if source_matcher_version is not None:
-                    identity_clause = "AND i.matcher_version = ?"
-                    parameters.append(source_matcher_version)
-                elif bool(scope.get("legacy_only", True)):
-                    identity_clause = "AND i.decision_source = 'legacy_import'"
-                rows = connection.execute(
-                    "SELECT a.id, a.row_revision, i.row_revision identity_revision, "
-                    "i.decision_source, i.attempt_id FROM local_albums a "
-                    "JOIN local_album_external_identities i ON i.local_album_id = a.id "
-                    "WHERE a.retired_into_album_id IS NULL "
-                    "AND EXISTS (SELECT 1 FROM local_tracks t "
-                    "WHERE t.local_album_id = a.id AND t.availability = 'indexed') "
-                    f"{root_clause} "
-                    f"{identity_clause} ORDER BY a.id",
-                    parameters,
-                ).fetchall()
+            from_sql, where_sql, parameters = self._repair_scope_sql(
+                scope, purpose=purpose, source_matcher_version=source_matcher_version
+            )
+            # Strict pin: the catalog revision is captured INSIDE this creation
+            # transaction and used for BOTH the job header and the materialization
+            # row, so the subject set is fixed for the job's whole life.
+            pinned_revision = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            estimated_count = int(
+                connection.execute(
+                    f"SELECT COUNT(*) {from_sql} {where_sql}", parameters
+                ).fetchone()[0]
+            )
             connection.execute(
                 "INSERT INTO library_operation_jobs "
                 "(id, kind, state, requested_by_user_id, input_catalog_revision, expected_work_count, "
@@ -27628,8 +27655,8 @@ class NativeLibraryStore(PersistenceBase):
                 (
                     job.id,
                     job.requested_by_user_id,
-                    job.input_catalog_revision,
-                    len(rows),
+                    pinned_revision,
+                    estimated_count,
                     job.idempotency_key,
                     job.created_at,
                     job.created_at,
@@ -27647,36 +27674,23 @@ class NativeLibraryStore(PersistenceBase):
                     job.created_at,
                 ),
             )
-            connection.executemany(
-                "INSERT INTO library_operation_work "
-                "(job_id, ordinal, local_album_id, expected_subject_revision, expected_input_revision, "
-                "action, idempotency_key, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                [
+            connection.execute(
+                "INSERT INTO library_repair_materialization "
+                "(job_id, pinned_catalog_revision, eligibility_version, purpose, "
+                "staging_cursor, staged_ordinal, staged_count, sealed, created_at, updated_at) "
+                "VALUES (?,?,?,?,NULL,-1,0,0,?,?)",
+                (
+                    job.id,
+                    pinned_revision,
                     (
-                        job.id,
-                        ordinal,
-                        row["id"],
-                        row["row_revision"],
-                        (
-                            f"{row['identity_revision'] or ''}:"
-                            f"{row['decision_source'] or ''}:"
-                            f"{row['attempt_id'] or ''}:"
-                            f"{(row['release_mbid'] if 'release_mbid' in row.keys() else '') or ''}"
-                        ),
-                        (
-                            "artist_identity_reconciliation"
-                            if purpose == "artist_identity_reconciliation"
-                            else "catalog_identity_hygiene"
-                            if purpose == "catalog_identity_hygiene"
-                            else "management_identity_audit"
-                            if purpose == "management_readiness"
-                            else "repair_audit"
-                        ),
-                        f"{job.id}:{row['id']}:audit",
-                        job.created_at,
-                    )
-                    for ordinal, row in enumerate(rows)
-                ],
+                        f"{purpose}:"
+                        f"{source_matcher_version or ''}:"
+                        f"{target_matcher_version}"
+                    ),
+                    purpose,
+                    job.created_at,
+                    job.created_at,
+                ),
             )
             self._bump_stream(connection, "operation")
             return dict(
@@ -27688,6 +27702,603 @@ class NativeLibraryStore(PersistenceBase):
         result = await self._write(operation)
         self.work_wakeups.notify("operation")
         return result
+
+    def _repair_scope_sql(
+        self,
+        scope: dict[str, Any],
+        *,
+        purpose: str,
+        source_matcher_version: str | None,
+    ) -> tuple[str, str, list[Any]]:
+        """Canonical eligibility predicate shared by count, pin, and pages."""
+        parameters: list[Any] = []
+        root_ids = [str(value) for value in scope.get("root_ids", [])]
+        root_clause = ""
+        if root_ids:
+            root_clause = f"AND a.root_id IN ({','.join('?' for _ in root_ids)})"
+            parameters.extend(root_ids)
+        if purpose in {
+            "artist_identity_reconciliation",
+            "catalog_identity_hygiene",
+        }:
+            album_ids = [str(value) for value in scope.get("album_ids", [])]
+            album_clause = ""
+            if album_ids:
+                album_clause = f"AND a.id IN ({','.join('?' for _ in album_ids)})"
+                parameters.extend(album_ids)
+            active_track_clause = (
+                "AND EXISTS (SELECT 1 FROM local_tracks active_track "
+                "WHERE active_track.local_album_id = a.id "
+                "AND active_track.availability = 'indexed') "
+                if purpose == "artist_identity_reconciliation"
+                else ""
+            )
+            return (
+                "FROM local_albums a LEFT JOIN local_album_external_identities i "
+                "ON i.local_album_id = a.id AND i.provider = 'musicbrainz'",
+                (
+                    "WHERE a.retired_into_album_id IS NULL "
+                    f"{active_track_clause}{root_clause} {album_clause}"
+                ),
+                parameters,
+            )
+        if purpose == "management_readiness":
+            return (
+                "FROM local_albums a LEFT JOIN local_album_external_identities i "
+                "ON i.local_album_id = a.id AND i.provider = 'musicbrainz'",
+                (
+                    "WHERE a.retired_into_album_id IS NULL "
+                    "AND EXISTS (SELECT 1 FROM local_tracks t WHERE t.local_album_id = a.id "
+                    "AND t.availability = 'indexed') "
+                    "AND NOT EXISTS (SELECT 1 FROM library_management_exclusions exclusion "
+                    "WHERE exclusion.local_album_id=a.id) "
+                    "AND NOT EXISTS (SELECT 1 FROM library_edition_conversion_jobs conversion "
+                    "WHERE conversion.local_album_id=a.id AND conversion.state IN "
+                    "('preflight','acquiring','ready','needs_recheck')) "
+                    f"{root_clause}"
+                ),
+                parameters,
+            )
+        identity_clause = ""
+        if source_matcher_version is not None:
+            identity_clause = "AND i.matcher_version = ?"
+            parameters.append(source_matcher_version)
+        elif bool(scope.get("legacy_only", True)):
+            identity_clause = "AND i.decision_source = 'legacy_import'"
+        return (
+            "FROM local_albums a "
+            "JOIN local_album_external_identities i ON i.local_album_id = a.id",
+            (
+                "WHERE a.retired_into_album_id IS NULL "
+                "AND EXISTS (SELECT 1 FROM local_tracks t "
+                "WHERE t.local_album_id = a.id AND t.availability = 'indexed') "
+                f"{root_clause} {identity_clause}"
+            ),
+            parameters,
+        )
+
+    def _repair_subject_select(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        scope: dict[str, Any],
+        purpose: str,
+        source_matcher_version: str | None,
+        after_id: str | None,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        """Keyset page of eligible repair subjects ordered by album id.
+
+        Shared by the creation-time COUNT(*) and by paged materialization so the
+        eligibility predicate is identical for the whole job. Binds in fixed
+        order (GH-293 review fix):
+        root_ids -> album_ids -> identity matcher -> keyset -> limit. The page
+        caller must hold the pinned catalog revision unchanged (strict pin).
+        """
+        from_sql, where_sql, parameters = self._repair_scope_sql(
+            scope, purpose=purpose, source_matcher_version=source_matcher_version
+        )
+        keyset_clause = "AND a.id > ?" if after_id is not None else ""
+        if after_id is not None:
+            parameters.append(after_id)
+        parameters.append(limit)
+        sql = (
+            f"SELECT a.id, a.row_revision, i.row_revision identity_revision, "
+            f"i.decision_source, i.attempt_id, i.release_mbid "
+            f"{from_sql} {where_sql} {keyset_clause} "
+            f"ORDER BY a.id LIMIT ?"
+        )
+        return connection.execute(sql, parameters).fetchall()
+
+    def _repair_materialization_backfill_tx(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        *,
+        now: float,
+    ) -> bool:
+        """Compatibility backfill for repair jobs created before GH-293.
+
+        Old jobs carry their full work row set already (inline materialization)
+        and no ``library_repair_materialization`` row. On first sight they are
+        retro-sealed with the existing row count, idempotently, so queued /
+        running / paused / ready / succeeded jobs keep their semantics across
+        the upgrade. Returns True when a row was inserted.
+        """
+        existing = connection.execute(
+            "SELECT 1 FROM library_repair_materialization WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if existing is not None:
+            return False
+        job = connection.execute(
+            "SELECT input_catalog_revision FROM library_operation_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        snapshot = connection.execute(
+            "SELECT scope_json, source_matcher_version, target_matcher_version "
+            "FROM library_repair_snapshots WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if job is None or snapshot is None:
+            return False
+        purpose = str(
+            json.loads(str(snapshot["scope_json"])).get("purpose", "existing_matches")
+        )
+        count, max_ordinal = connection.execute(
+            "SELECT COUNT(*), COALESCE(MAX(ordinal), -1) "
+            "FROM library_operation_work WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO library_repair_materialization "
+            "(job_id, pinned_catalog_revision, eligibility_version, purpose, "
+            "staging_cursor, staged_ordinal, staged_count, sealed, created_at, updated_at) "
+            "VALUES (?,?,?,?,NULL,?,?,1,?,?) ON CONFLICT(job_id) DO NOTHING",
+            (
+                job_id,
+                int(job["input_catalog_revision"] or 0),
+                (
+                    f"{purpose}:"
+                    f"{snapshot['source_matcher_version'] or ''}:"
+                    f"{snapshot['target_matcher_version']}"
+                ),
+                purpose,
+                int(max_ordinal),
+                int(count),
+                now,
+                now,
+            ),
+        )
+        return True
+
+    async def materialize_repair_operation_batch(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        now: float,
+        batch_size: int = MATERIALIZATION_PAGE_CAP,
+    ) -> dict[str, Any]:
+        """Materialize one keyset page of repair work rows atomically.
+
+        (GH-293) At most ``batch_size`` subjects per transaction, in background
+        lock priority, strictly pinned to the creation catalog revision. The
+        page advances the durable cursor, staged ordinal and count, and seals
+        materialization when the keyset is exhausted; a revision change before
+        sealing raises ``StaleRevisionError`` inside the page transaction BEFORE
+        any live changed subject is inserted. A crash before or after a page
+        commit resumes from the cursor without omission, duplication, or false
+        completion. Jobs created before this change (no materialization row,
+        work already inline) are retro-sealed on first sight. Once sealed, the
+        probe is a read and never opens a write transaction. The job must be
+        running under this worker's lease.
+        """
+        limit = min(max(batch_size, 1), MATERIALIZATION_PAGE_CAP)
+
+        async def sealed_probe() -> dict[str, Any] | None:
+            def read(connection: sqlite3.Connection) -> dict[str, Any] | None:
+                row = connection.execute(
+                    "SELECT sealed, staged_count FROM library_repair_materialization "
+                    "WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if row is not None and int(row["sealed"]) == 1:
+                    return {
+                        "complete": True,
+                        "materialized_count": int(row["staged_count"]),
+                        "page_size": 0,
+                    }
+                return None
+
+            return await self._read(read)
+
+        sealed = await sealed_probe()
+        if sealed is not None:
+            # A sealed no-op must NOT open a write transaction (or acquire the
+            # write lock) on the per-pass hot path (GH-293 review fix).
+            return sealed
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            job = connection.execute(
+                "SELECT id FROM library_operation_jobs WHERE id = ? AND state = 'running' "
+                "AND lease_owner = ?",
+                (job_id, worker_id),
+            ).fetchone()
+            if job is None:
+                raise StaleRevisionError(
+                    "The operation lease changed while its work was materialized."
+                )
+            materialization = connection.execute(
+                "SELECT * FROM library_repair_materialization WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if materialization is None:
+                self._repair_materialization_backfill_tx(
+                    connection, job_id, now=now
+                )
+                materialization = connection.execute(
+                    "SELECT * FROM library_repair_materialization WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if materialization is None:
+                    raise ResourceNotFoundError(
+                        "Repair materialization state not found."
+                    )
+            if int(materialization["sealed"]) == 1:
+                return {
+                    "complete": True,
+                    "materialized_count": int(materialization["staged_count"]),
+                    "page_size": 0,
+                }
+            # Strict pin (review fix): if the catalog revision moved since the
+            # creation transaction, THIS page fails BEFORE inserting any live
+            # changed subject. The job is stale and must be re-created or
+            # versioned; no partial/changing set ever materializes.
+            current_revision = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            if current_revision != int(materialization["pinned_catalog_revision"]):
+                raise StaleRevisionError(
+                    "The catalog revision changed after the repair worklist was "
+                    "pinned; re-create the job at the new revision."
+                )
+            snapshot = connection.execute(
+                "SELECT scope_json, source_matcher_version FROM library_repair_snapshots "
+                "WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if snapshot is None:
+                raise ResourceNotFoundError("Repair snapshot not found.")
+            scope = json.loads(str(snapshot["scope_json"]))
+            purpose = str(materialization["purpose"])
+            rows = self._repair_subject_select(
+                connection,
+                scope=scope,
+                purpose=purpose,
+                source_matcher_version=snapshot["source_matcher_version"],
+                after_id=materialization["staging_cursor"],
+                limit=limit + 1,
+            )
+            page = rows[:limit]
+            action = (
+                "artist_identity_reconciliation"
+                if purpose == "artist_identity_reconciliation"
+                else "catalog_identity_hygiene"
+                if purpose == "catalog_identity_hygiene"
+                else "management_identity_audit"
+                if purpose == "management_readiness"
+                else "repair_audit"
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO library_operation_work "
+                "(job_id, ordinal, local_album_id, expected_subject_revision, expected_input_revision, "
+                "action, idempotency_key, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        job_id,
+                        int(materialization["staged_ordinal"]) + 1 + offset,
+                        row["id"],
+                        row["row_revision"],
+                        (
+                            f"{row['identity_revision'] or ''}:"
+                            f"{row['decision_source'] or ''}:"
+                            f"{row['attempt_id'] or ''}:"
+                            f"{(row['release_mbid'] if 'release_mbid' in row.keys() else '') or ''}"
+                        ),
+                        action,
+                        f"{job_id}:{row['id']}:audit",
+                        now,
+                    )
+                    for offset, row in enumerate(page)
+                ],
+            )
+            complete = len(rows) <= limit
+            new_ordinal = (
+                int(materialization["staged_ordinal"]) + len(page)
+                if page
+                else int(materialization["staged_ordinal"])
+            )
+            new_count = int(materialization["staged_count"]) + len(page)
+            new_cursor = str(page[-1]["id"]) if page else materialization["staging_cursor"]
+            connection.execute(
+                "UPDATE library_repair_materialization SET staging_cursor = ?, "
+                "staged_ordinal = ?, staged_count = ?, sealed = ?, updated_at = ? "
+                "WHERE job_id = ?",
+                (
+                    new_cursor,
+                    new_ordinal,
+                    new_count,
+                    int(complete),
+                    now,
+                    job_id,
+                ),
+            )
+            if complete:
+                # The sealed count is authoritative; make the display truthful.
+                connection.execute(
+                    "UPDATE library_operation_jobs SET expected_work_count = ?, "
+                    "updated_at = ?, row_revision = row_revision + 1, "
+                    "event_revision = event_revision + 1 WHERE id = ?",
+                    (new_count, now, job_id),
+                )
+            self._bump_stream(connection, "operation")
+            return {
+                "complete": bool(complete),
+                "materialized_count": new_count,
+                "page_size": len(page),
+            }
+
+        return await self._write_background(operation)
+
+    async def rebase_repair_operation(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        """Atomically rebase a pin-stale, unsealed repair job onto the current
+        catalog revision (GH-293 review fix).
+
+        Preconditions, verified in ONE transaction:
+        - the job is running under this worker's lease,
+        - materialization is UNSEALED,
+        - ZERO completed work (no succeeded/failed/skipped rows, completed_count
+          == 0).
+
+        On success the SAME static-idempotency job is reused: only its staged
+        work rows are deleted, the durable cursor/count/seal are reset, the job's
+        ``input_catalog_revision`` AND the materialization pin are moved to the
+        current in-store revision, ``expected_work_count`` is re-estimated, and
+        the operation stream is bumped. The worker resumes on a later bounded
+        pass (cooldown + timed wakeup), so a startup catalog change never
+        strands a static-key backfill and never creates a fresh job.
+
+        On failure of the preconditions (completed work exists, or the job is
+        already sealed/terminal) the job FAILS CLOSED to a durable ``failed``
+        state with terminal code ``PIN_STALE_WITH_PROGRESS`` instead of silently
+        discarding evidence.
+        """
+        from infrastructure.persistence.gh293_calibration import (
+            BACKGROUND_YIELD_COOLDOWN_SECONDS,
+        )
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            job = connection.execute(
+                "SELECT * FROM library_operation_jobs WHERE id = ? AND state = 'running' "
+                "AND lease_owner = ?",
+                (job_id, worker_id),
+            ).fetchone()
+            if job is None:
+                raise StaleRevisionError(
+                    "The operation lease changed while the pin was stale."
+                )
+            materialization = connection.execute(
+                "SELECT * FROM library_repair_materialization WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if materialization is None:
+                raise StaleRevisionError(
+                    "Repair materialization state not found for rebase."
+                )
+            terminal_work = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM library_operation_work WHERE job_id = ? "
+                    "AND state IN ('succeeded','failed','skipped')",
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            if (
+                int(materialization["sealed"]) == 1
+                or terminal_work > 0
+                or int(job["completed_count"]) > 0
+            ):
+                failed = connection.execute(
+                    "UPDATE library_operation_jobs SET state = 'failed', "
+                    "terminal_code = 'PIN_STALE_WITH_PROGRESS', terminal_at = ?, "
+                    "updated_at = ?, lease_owner = NULL, lease_expires_at = NULL, "
+                    "heartbeat_at = NULL, row_revision = row_revision + 1, "
+                    "event_revision = event_revision + 1 "
+                    "WHERE id = ? AND state = 'running' AND lease_owner = ? RETURNING *",
+                    (now, now, job_id, worker_id),
+                ).fetchone()
+                self._bump_stream(connection, "operation")
+                return {"rebased": False, "job": dict(failed)}
+
+            snapshot = connection.execute(
+                "SELECT scope_json, source_matcher_version FROM library_repair_snapshots "
+                "WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            scope = json.loads(str(snapshot["scope_json"]))
+            purpose = str(materialization["purpose"])
+            from_sql, where_sql, parameters = self._repair_scope_sql(
+                scope, purpose=purpose,
+                source_matcher_version=snapshot["source_matcher_version"],
+            )
+            current_revision = int(
+                connection.execute(
+                    "SELECT value FROM library_catalog_revision WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            estimated_count = int(
+                connection.execute(
+                    f"SELECT COUNT(*) {from_sql} {where_sql}", parameters
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "DELETE FROM library_operation_work WHERE job_id = ?", (job_id,)
+            )
+            connection.execute(
+                "UPDATE library_repair_materialization SET "
+                "pinned_catalog_revision = ?, staging_cursor = NULL, "
+                "staged_ordinal = -1, staged_count = 0, sealed = 0, updated_at = ? "
+                "WHERE job_id = ?",
+                (current_revision, now, job_id),
+            )
+            updated = connection.execute(
+                "UPDATE library_operation_jobs SET input_catalog_revision = ?, "
+                "expected_work_count = ?, updated_at = ?, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE id = ? AND state = 'running' AND lease_owner = ? RETURNING *",
+                (current_revision, estimated_count, now, job_id, worker_id),
+            ).fetchone()
+            self._bump_stream(connection, "operation")
+            return {"rebased": True, "job": dict(updated)}
+
+        result = await self._write_background(operation)
+        # Rebind the operation wakeup so a later bounded pass resumes promptly
+        # (never an immediate self-wakeup into a rebase loop).
+        self.work_wakeups.notify_after(
+            "operation", max(0.1, BACKGROUND_YIELD_COOLDOWN_SECONDS)
+        )
+        return result
+
+    async def get_repair_materialization_status(
+        self, job_id: str
+    ) -> dict[str, Any] | None:
+        def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            return _row(
+                connection.execute(
+                    "SELECT * FROM library_repair_materialization WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+            )
+
+        return await self._read(operation)
+
+    async def yield_operation_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        now: float,
+        reason_code: str,
+        retry_not_before: float | None = None,
+    ) -> dict[str, Any]:
+        """Release a running operation back to 'queued' without losing progress.
+
+        (GH-293) Used when a background timeslice expires, public bootstrap
+        demand or WAL backpressure suspends background producers, or scan-active
+        deferral is needed. Running work rows are reset to pending so the job
+        resumes exactly at the interrupted unit; the durable cursor, sealed
+        marker, and counters are untouched. A positive ``next_attempt_at``
+        (default: the calibration cooldown) is persisted and a real timed
+        wakeup is scheduled, so the yielding worker never wakes itself into an
+        immediate re-claim hot loop.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            connection.execute(
+                "UPDATE library_operation_work SET state = 'pending', failure_code = ?, "
+                "updated_at = ?, row_revision = row_revision + 1 "
+                "WHERE job_id = ? AND state = 'running'",
+                (reason_code, now, job_id),
+            )
+            updated = connection.execute(
+                "UPDATE library_operation_jobs SET state = 'queued', lease_owner = NULL, "
+                "lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?, "
+                "next_attempt_at = ?, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE id = ? AND kind = 'repair' AND state = 'running' "
+                "AND lease_owner = ? RETURNING *",
+                (now, next_attempt_at, job_id, worker_id),
+            ).fetchone()
+            if updated is None:
+                raise StaleRevisionError(
+                    "The operation lease changed while it yielded."
+                )
+            self._bump_stream(connection, "operation")
+            return dict(updated)
+
+        if retry_not_before is not None:
+            next_attempt_at = retry_not_before
+        else:
+            next_attempt_at = now + BACKGROUND_YIELD_COOLDOWN_SECONDS
+        result = await self._write_background(operation)
+        if next_attempt_at is not None:
+            self.work_wakeups.notify_after("operation", next_attempt_at - now)
+        else:
+            self.work_wakeups.notify("operation")
+        return result
+
+    async def finish_sealed_repair_operation_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        state: str,
+        terminal_code: str,
+        now: float,
+    ) -> dict[str, Any]:
+        """Finish a repair job only after materialization is sealed and every
+        materialized subject is terminal (GH-293). Jobs created before GH-293
+        (inline work, no materialization row) are retro-sealed first."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            materialization = connection.execute(
+                "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if materialization is None:
+                self._repair_materialization_backfill_tx(
+                    connection, job_id, now=now
+                )
+                materialization = connection.execute(
+                    "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+            if materialization is None or int(materialization["sealed"]) != 1:
+                raise StaleRevisionError(
+                    "The repair worklist is not sealed yet."
+                )
+            active = connection.execute(
+                "SELECT COUNT(*) FROM library_operation_work WHERE job_id = ? "
+                "AND state IN ('pending','running')",
+                (job_id,),
+            ).fetchone()[0]
+            if int(active) != 0:
+                raise StaleRevisionError(
+                    "The repair still has unfinished materialized subjects."
+                )
+            updated = connection.execute(
+                "UPDATE library_operation_jobs SET state = ?, terminal_code = ?, terminal_at = ?, "
+                "updated_at = ?, lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE id = ? AND state = 'running' AND lease_owner = ? RETURNING *",
+                (state, terminal_code, now, now, job_id, worker_id),
+            ).fetchone()
+            if updated is None:
+                raise StaleRevisionError(
+                    "The operation lease changed before completion."
+                )
+            self._bump_stream(connection, "operation")
+            return dict(updated)
+
+        return await self._write_background(operation)
 
     async def estimate_management_identity_preparation(
         self, root_ids: list[str]
@@ -27865,7 +28476,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return dict(updated)
 
-        result = await self._write(operation)
+        result = await self._write_background(operation)
         if retry_not_before is not None:
             self.work_wakeups.notify_after("operation", retry_not_before - now)
         return result
@@ -27960,12 +28571,29 @@ class NativeLibraryStore(PersistenceBase):
             )
             self._bump_stream(connection, "operation")
 
-        await self._write(operation)
+        await self._write_background(operation)
 
     async def mark_repair_ready(
         self, job_id: str, worker_id: str, *, now: float
     ) -> dict[str, Any]:
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            materialization = connection.execute(
+                "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if materialization is None:
+                # Pre-GH-293 jobs carry their work inline; retro-seal them.
+                self._repair_materialization_backfill_tx(
+                    connection, job_id, now=now
+                )
+                materialization = connection.execute(
+                    "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+            if materialization is None or int(materialization["sealed"]) != 1:
+                raise StaleRevisionError(
+                    "The repair worklist is not sealed yet."
+                )
             pending = connection.execute(
                 "SELECT COUNT(*) FROM library_operation_work WHERE job_id = ? "
                 "AND state IN ('pending','running')",
@@ -28559,7 +29187,7 @@ class NativeLibraryStore(PersistenceBase):
             self._bump_stream(connection, "operation")
             return {"state": state, "failure_code": failure_code}
 
-        return await self._write(operation)
+        return await self._write_background(operation)
 
     def _apply_suggested_edition_tx(
         self,

@@ -28,6 +28,9 @@ from core.exceptions import (
     StaleRevisionError,
     ValidationError,
 )
+from infrastructure.persistence.gh293_calibration import (
+    BACKGROUND_TIMESLICE_SECONDS,
+)
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from infrastructure.validators import is_valid_mbid
 from infrastructure.queue.priority_queue import RequestPriority
@@ -44,6 +47,8 @@ from repositories.protocols.musicbrainz_management import (
     MbManagementRelease,
 )
 from services.native.background_workload_gate import BackgroundWorkloadGate
+from services.native.bootstrap_demand_signal import BootstrapDemandSignal
+from services.native.wal_checkpoint_service import WalCheckpointService
 
 ARTIST_RECONCILIATION_PURPOSE = "artist_identity_reconciliation"
 ARTIST_RECONCILIATION_VERSION = "musicbrainz-artist-credit-v3"
@@ -192,6 +197,8 @@ class ArtistIdentityReconciliationService:
         provider: CanonicalMusicBrainzRepositoryProtocol,
         workload_gate: BackgroundWorkloadGate | None = None,
         on_catalog_changed: Callable[[], Awaitable[None]] | None = None,
+        bootstrap_demand: BootstrapDemandSignal | None = None,
+        wal_checkpoint: WalCheckpointService | None = None,
         *,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -199,6 +206,8 @@ class ArtistIdentityReconciliationService:
         self._provider = provider
         self._workload_gate = workload_gate
         self._on_catalog_changed = on_catalog_changed
+        self._bootstrap_demand = bootstrap_demand
+        self._wal_checkpoint = wal_checkpoint
         self._clock = clock
 
     async def enqueue_backfill(self) -> dict:
@@ -246,230 +255,310 @@ class ArtistIdentityReconciliationService:
 
     async def run_claimed(self, job: dict, worker_id: str) -> dict:
         job_id = str(job["id"])
+        started = time.monotonic()
         while True:
             now = self._clock()
+            while True:
+                try:
+                    staged = await self._store.materialize_repair_operation_batch(
+                        job_id, worker_id, now=now
+                    )
+                except StaleRevisionError:
+                    # A catalog change while the worklist is unsealed rebases the
+                    # SAME static-key job onto the current revision (or fails
+                    # closed when progress exists) and resumes next pass.
+                    rebased = await self._store.rebase_repair_operation(
+                        job_id, worker_id, now=now
+                    )
+                    return await self._store.yield_operation_job(
+                        job_id,
+                        worker_id,
+                        now=now,
+                        reason_code="PIN_REBASED",
+                    ) if rebased["rebased"] else rebased["job"]
+                if staged["complete"]:
+                    break
+                if time.monotonic() - started >= BACKGROUND_TIMESLICE_SECONDS:
+                    return await self._store.yield_operation_job(
+                        job_id,
+                        worker_id,
+                        now=now,
+                        reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+                    )
             controlled = await self._store.checkpoint_operation_control(
                 job_id, worker_id, now=now
             )
             if controlled is not None and controlled["state"] != "running":
                 return controlled
-            work = await self._store.claim_operation_work(job_id, worker_id, now=now)
-            if work is None:
-                return await self._store.finish_operation_job(
+            if (
+                self._workload_gate is not None
+                and not self._workload_gate.scan_active
+            ):
+                # Scan-active is handled below by deferring the claimed unit;
+                # never block a repair worker inside the scan safety wait.
+                await self._workload_gate.wait_until_available()
+            if self._bootstrap_demand is not None:
+                await self._bootstrap_demand.wait_until_idle()
+            if (
+                self._wal_checkpoint is not None
+                and self._wal_checkpoint.background_suspended
+            ):
+                return await self._store.yield_operation_job(
                     job_id,
                     worker_id,
-                    state="succeeded",
-                    terminal_code="RECONCILIATION_COMPLETED",
                     now=now,
+                    reason_code="WAL_BACKPRESSURE",
                 )
-            album_id = str(work["local_album_id"])
-            context = await self._store.get_artist_reconciliation_context(album_id)
-            revision = _input_revision(context) if context is not None else "missing"
-            if self._workload_gate is not None and self._workload_gate.scan_active:
-                return await self._store.defer_artist_reconciliation_work(
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    local_album_id=album_id,
-                    input_revision=revision,
-                    reason_code="FILESYSTEM_SCAN_ACTIVE",
-                    now=now,
+            # One bounded pass of subjects; control is probed read-only between
+            # units and materialization stays sealed (read-only probe).
+            control_pending = False
+            while time.monotonic() - started < BACKGROUND_TIMESLICE_SECONDS:
+                if await self._store.probe_operation_control(job_id, worker_id):
+                    control_pending = True
+                    break
+                now = self._clock()
+                work = await self._store.claim_operation_work(
+                    job_id, worker_id, now=now
                 )
-            if context is not None and legacy_identity_has_provider_contradiction(
-                context
-            ):
-                await self._store.complete_artist_reconciliation_work(
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    local_album_id=album_id,
-                    input_revision=revision,
-                    result_state="provider_conflict",
-                    reason_code=("LEGACY_IDENTITY_CONTRADICTS_EMBEDDED_RELEASE_GROUP"),
-                    now=now,
-                    skipped=True,
-                )
-                continue
-            if context is None or context["identity"] is None:
-                anchored = await self._store.apply_provider_anchored_artist_convergence(
-                    album_id,
-                    operation_job_id=job_id,
-                    now=now,
-                )
-                retired = list(anchored["retired_artist_ids"])
-                if retired and self._on_catalog_changed is not None:
-                    await self._on_catalog_changed()
-                await self._store.complete_artist_reconciliation_work(
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    local_album_id=album_id,
-                    input_revision=revision,
-                    result_state=(
-                        "resolved_automatically" if retired else "waiting_for_identity"
-                    ),
-                    reason_code=(
-                        "PROVIDER_ANCHORED_ARTISTS_CONVERGED"
-                        if retired
-                        else "EXACT_RELEASE_NOT_ACCEPTED"
-                    ),
-                    now=now,
-                    skipped=not retired,
-                )
-                continue
-            identity = context["identity"]
-            release_mbid = identity.get("release_mbid")
-            if not release_mbid:
-                anchored = await self._store.apply_provider_anchored_artist_convergence(
-                    album_id,
-                    operation_job_id=job_id,
-                    now=now,
-                )
-                retired = list(anchored["retired_artist_ids"])
-                if retired and self._on_catalog_changed is not None:
-                    await self._on_catalog_changed()
-                await self._store.complete_artist_reconciliation_work(
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    local_album_id=album_id,
-                    input_revision=revision,
-                    result_state=(
-                        "resolved_automatically" if retired else "waiting_for_identity"
-                    ),
-                    reason_code=(
-                        "PROVIDER_ANCHORED_ARTISTS_CONVERGED"
-                        if retired
-                        else "EXACT_RELEASE_NOT_ACCEPTED"
-                    ),
-                    now=now,
-                    skipped=not retired,
-                )
-                continue
-            anchored = await self._store.apply_provider_anchored_artist_convergence(
-                album_id,
-                operation_job_id=job_id,
-                now=now,
-            )
-            if anchored["retired_artist_ids"] and self._on_catalog_changed is not None:
-                await self._on_catalog_changed()
-            previous = context["state"]
-            if (
-                previous is not None
-                and previous["input_revision"] == revision
-                and previous["state"] != "provider_deferred"
-            ):
-                await self._store.complete_artist_reconciliation_work(
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    local_album_id=album_id,
-                    input_revision=revision,
-                    result_state=str(previous["state"]),
-                    reason_code="UNCHANGED_PROVIDER_EVIDENCE",
-                    now=now,
-                    skipped=True,
-                )
-                continue
-
-            release: MbManagementRelease | None = None
-            cached_document: CanonicalReleaseDocument | None = None
-            automatic_lookup = any(
-                str(track["applied_policy"]) == "automatic"
-                for track in context["tracks"]
-            )
-            cached_payload = context["canonical_payload_json"]
-            if cached_payload:
-                try:
-                    cached_document = msgspec.json.decode(
-                        cached_payload, type=CanonicalReleaseDocument
+                if work is None:
+                    return await self._store.finish_sealed_repair_operation_job(
+                        job_id,
+                        worker_id,
+                        state="succeeded",
+                        terminal_code="RECONCILIATION_COMPLETED",
+                        now=now,
                     )
-                except msgspec.DecodeError:
-                    cached_document = None
-            if cached_document is None and not automatic_lookup:
-                await self._store.complete_artist_reconciliation_work(
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    local_album_id=album_id,
-                    input_revision=revision,
-                    result_state="waiting_for_identity",
-                    reason_code="LOCAL_METADATA_PROVIDER_LOOKUP_DISABLED",
-                    now=now,
-                )
-                continue
-            if cached_document is None:
-                try:
-                    release = await self._provider.get_canonical_release(
-                        str(release_mbid),
-                        includes=("artist-credits", "recordings", "release-groups"),
-                        priority=RequestPriority.BACKGROUND_SYNC,
-                    )
-                except ExternalServiceError:
+                album_id = str(work["local_album_id"])
+                context = await self._store.get_artist_reconciliation_context(album_id)
+                revision = _input_revision(context) if context is not None else "missing"
+                if (
+                    self._workload_gate is not None
+                    and self._workload_gate.scan_active
+                ):
                     return await self._store.defer_artist_reconciliation_work(
                         job_id=job_id,
                         ordinal=int(work["ordinal"]),
                         worker_id=worker_id,
                         local_album_id=album_id,
                         input_revision=revision,
-                        reason_code="PROVIDER_DEFERRED",
+                        reason_code="FILESYSTEM_SCAN_ACTIVE",
                         now=now,
-                        retry_not_before=now + _PROVIDER_DEFER_RETRY_SECONDS,
                     )
-            try:
-                projection = self._projection(
-                    context,
-                    revision=revision,
-                    release=release,
-                    cached_document=cached_document,
-                )
-            except ValidationError as error:
-                await self._store.complete_artist_reconciliation_work(
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    local_album_id=album_id,
-                    input_revision=revision,
-                    result_state="provider_conflict",
-                    reason_code=str(error),
+                if (
+                    self._wal_checkpoint is not None
+                    and self._wal_checkpoint.background_suspended
+                ):
+                    return await self._store.yield_operation_job(
+                        job_id,
+                        worker_id,
+                        now=now,
+                        reason_code="WAL_BACKPRESSURE",
+                    )
+                if context is not None and legacy_identity_has_provider_contradiction(
+                    context
+                ):
+                    await self._store.complete_artist_reconciliation_work(
+                        job_id=job_id,
+                        ordinal=int(work["ordinal"]),
+                        worker_id=worker_id,
+                        local_album_id=album_id,
+                        input_revision=revision,
+                        result_state="provider_conflict",
+                        reason_code=("LEGACY_IDENTITY_CONTRADICTS_EMBEDDED_RELEASE_GROUP"),
+                        now=now,
+                        skipped=True,
+                    )
+                    continue
+                if context is None or context["identity"] is None:
+                    anchored = await self._store.apply_provider_anchored_artist_convergence(
+                        album_id,
+                        operation_job_id=job_id,
+                        now=now,
+                    )
+                    retired = list(anchored["retired_artist_ids"])
+                    if retired and self._on_catalog_changed is not None:
+                        await self._on_catalog_changed()
+                    await self._store.complete_artist_reconciliation_work(
+                        job_id=job_id,
+                        ordinal=int(work["ordinal"]),
+                        worker_id=worker_id,
+                        local_album_id=album_id,
+                        input_revision=revision,
+                        result_state=(
+                            "resolved_automatically" if retired else "waiting_for_identity"
+                        ),
+                        reason_code=(
+                            "PROVIDER_ANCHORED_ARTISTS_CONVERGED"
+                            if retired
+                            else "EXACT_RELEASE_NOT_ACCEPTED"
+                        ),
+                        now=now,
+                        skipped=not retired,
+                    )
+                    continue
+                identity = context["identity"]
+                release_mbid = identity.get("release_mbid")
+                if not release_mbid:
+                    anchored = await self._store.apply_provider_anchored_artist_convergence(
+                        album_id,
+                        operation_job_id=job_id,
+                        now=now,
+                    )
+                    retired = list(anchored["retired_artist_ids"])
+                    if retired and self._on_catalog_changed is not None:
+                        await self._on_catalog_changed()
+                    await self._store.complete_artist_reconciliation_work(
+                        job_id=job_id,
+                        ordinal=int(work["ordinal"]),
+                        worker_id=worker_id,
+                        local_album_id=album_id,
+                        input_revision=revision,
+                        result_state=(
+                            "resolved_automatically" if retired else "waiting_for_identity"
+                        ),
+                        reason_code=(
+                            "PROVIDER_ANCHORED_ARTISTS_CONVERGED"
+                            if retired
+                            else "EXACT_RELEASE_NOT_ACCEPTED"
+                        ),
+                        now=now,
+                        skipped=not retired,
+                    )
+                    continue
+                anchored = await self._store.apply_provider_anchored_artist_convergence(
+                    album_id,
+                    operation_job_id=job_id,
                     now=now,
-                    skipped=True,
                 )
-                continue
-            try:
-                await self._store.apply_artist_credit_projection(
-                    projection,
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    now=now,
-                )
-                if self._on_catalog_changed is not None:
+                if anchored["retired_artist_ids"] and self._on_catalog_changed is not None:
                     await self._on_catalog_changed()
-            except StaleRevisionError:
-                await self._store.complete_artist_reconciliation_work(
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    local_album_id=album_id,
-                    input_revision=revision,
-                    result_state="waiting_for_identity",
-                    reason_code="STALE_INPUT",
-                    now=now,
-                    skipped=True,
+                previous = context["state"]
+                if (
+                    previous is not None
+                    and previous["input_revision"] == revision
+                    and previous["state"] != "provider_deferred"
+                ):
+                    await self._store.complete_artist_reconciliation_work(
+                        job_id=job_id,
+                        ordinal=int(work["ordinal"]),
+                        worker_id=worker_id,
+                        local_album_id=album_id,
+                        input_revision=revision,
+                        result_state=str(previous["state"]),
+                        reason_code="UNCHANGED_PROVIDER_EVIDENCE",
+                        now=now,
+                        skipped=True,
+                    )
+                    continue
+
+                release: MbManagementRelease | None = None
+                cached_document: CanonicalReleaseDocument | None = None
+                automatic_lookup = any(
+                    str(track["applied_policy"]) == "automatic"
+                    for track in context["tracks"]
                 )
-            except (ConflictError, ValidationError) as error:
-                await self._store.complete_artist_reconciliation_work(
-                    job_id=job_id,
-                    ordinal=int(work["ordinal"]),
-                    worker_id=worker_id,
-                    local_album_id=album_id,
-                    input_revision=revision,
-                    result_state="provider_conflict",
-                    reason_code=str(error),
-                    now=now,
-                    skipped=True,
-                )
+                cached_payload = context["canonical_payload_json"]
+                if cached_payload:
+                    try:
+                        cached_document = msgspec.json.decode(
+                            cached_payload, type=CanonicalReleaseDocument
+                        )
+                    except msgspec.DecodeError:
+                        cached_document = None
+                if cached_document is None and not automatic_lookup:
+                    await self._store.complete_artist_reconciliation_work(
+                        job_id=job_id,
+                        ordinal=int(work["ordinal"]),
+                        worker_id=worker_id,
+                        local_album_id=album_id,
+                        input_revision=revision,
+                        result_state="waiting_for_identity",
+                        reason_code="LOCAL_METADATA_PROVIDER_LOOKUP_DISABLED",
+                        now=now,
+                    )
+                    continue
+                if cached_document is None:
+                    try:
+                        release = await self._provider.get_canonical_release(
+                            str(release_mbid),
+                            includes=("artist-credits", "recordings", "release-groups"),
+                            priority=RequestPriority.BACKGROUND_SYNC,
+                        )
+                    except ExternalServiceError:
+                        return await self._store.defer_artist_reconciliation_work(
+                            job_id=job_id,
+                            ordinal=int(work["ordinal"]),
+                            worker_id=worker_id,
+                            local_album_id=album_id,
+                            input_revision=revision,
+                            reason_code="PROVIDER_DEFERRED",
+                            now=now,
+                            retry_not_before=now + _PROVIDER_DEFER_RETRY_SECONDS,
+                        )
+                try:
+                    projection = self._projection(
+                        context,
+                        revision=revision,
+                        release=release,
+                        cached_document=cached_document,
+                    )
+                except ValidationError as error:
+                    await self._store.complete_artist_reconciliation_work(
+                        job_id=job_id,
+                        ordinal=int(work["ordinal"]),
+                        worker_id=worker_id,
+                        local_album_id=album_id,
+                        input_revision=revision,
+                        result_state="provider_conflict",
+                        reason_code=str(error),
+                        now=now,
+                        skipped=True,
+                    )
+                    continue
+                try:
+                    await self._store.apply_artist_credit_projection(
+                        projection,
+                        job_id=job_id,
+                        ordinal=int(work["ordinal"]),
+                        worker_id=worker_id,
+                        now=now,
+                    )
+                    if self._on_catalog_changed is not None:
+                        await self._on_catalog_changed()
+                except StaleRevisionError:
+                    await self._store.complete_artist_reconciliation_work(
+                        job_id=job_id,
+                        ordinal=int(work["ordinal"]),
+                        worker_id=worker_id,
+                        local_album_id=album_id,
+                        input_revision=revision,
+                        result_state="waiting_for_identity",
+                        reason_code="STALE_INPUT",
+                        now=now,
+                        skipped=True,
+                    )
+                except (ConflictError, ValidationError) as error:
+                    await self._store.complete_artist_reconciliation_work(
+                        job_id=job_id,
+                        ordinal=int(work["ordinal"]),
+                        worker_id=worker_id,
+                        local_album_id=album_id,
+                        input_revision=revision,
+                        result_state="provider_conflict",
+                        reason_code=str(error),
+                        now=now,
+                        skipped=True,
+                    )
+            if control_pending:
+                continue  # outer loop performs the control transition
+            # Pass budget elapsed with subjects still pending: yield with the
+            # persisted cooldown (no immediate reclaim).
+            return await self._store.yield_operation_job(
+                job_id,
+                worker_id,
+                now=now,
+                reason_code="BACKGROUND_TIMESLICE_EXPIRED",
+            )
 
     @staticmethod
     def _projection(

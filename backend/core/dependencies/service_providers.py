@@ -106,6 +106,22 @@ def get_background_workload_gate() -> "BackgroundWorkloadGate":
 
 
 @singleton
+def get_bootstrap_demand_signal() -> "BootstrapDemandSignal":
+    from services.native.bootstrap_demand_signal import BootstrapDemandSignal
+
+    return BootstrapDemandSignal()
+
+
+@singleton
+def get_wal_checkpoint_service() -> "WalCheckpointService":
+    from core.config import get_settings
+
+    from services.native.wal_checkpoint_service import WalCheckpointService
+
+    return WalCheckpointService(get_settings().library_db_path)
+
+
+@singleton
 def get_library_filesystem_coordinator() -> "LibraryFilesystemCoordinator":
     from services.native.library_filesystem_coordinator import (
         LibraryFilesystemCoordinator,
@@ -620,6 +636,8 @@ def get_artist_identity_reconciliation_service() -> (
         get_musicbrainz_repository(),
         get_background_workload_gate(),
         _invalidate_artist_reconciliation_catalog,
+        get_bootstrap_demand_signal(),
+        get_wal_checkpoint_service(),
     )
 
 
@@ -635,6 +653,8 @@ def get_catalog_identity_hygiene_service() -> "CatalogIdentityHygieneService":
         get_native_library_store(),
         get_background_workload_gate(),
         _invalidate_artist_reconciliation_catalog,
+        get_bootstrap_demand_signal(),
+        get_wal_checkpoint_service(),
     )
 
 
@@ -651,6 +671,7 @@ def get_target_identity_repair_service() -> "IdentityRepairService":
         AlbumEvidenceEngine(),
         get_musicbrainz_repository(),
         provider_available=get_mb_provider_availability(),
+        wal_checkpoint=get_wal_checkpoint_service(),
     )
 
 

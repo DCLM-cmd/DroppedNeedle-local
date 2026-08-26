@@ -1140,6 +1140,27 @@ CREATE TABLE IF NOT EXISTS library_repair_snapshots (
     created_at REAL NOT NULL
 );
 
+-- (GH-293) Durable keyset materialization state for catalog-wide repair jobs.
+-- The job header is created first; work rows are then materialized in pages of
+-- at most 500 subjects per transaction, each page atomically advancing the
+-- keyset cursor, the staged ordinal/count, and the sealed marker. A crash before
+-- or after a page commit resumes from the cursor without omission or
+-- duplication. Sealing fixes the materialized subject set: catalog changes after
+-- the pinned boundary require a new or versioned job.
+CREATE TABLE IF NOT EXISTS library_repair_materialization (
+    job_id TEXT PRIMARY KEY REFERENCES library_operation_jobs(id) ON DELETE CASCADE,
+    pinned_catalog_revision INTEGER NOT NULL
+        CHECK(pinned_catalog_revision BETWEEN 0 AND 9223372036854775807),
+    eligibility_version TEXT NOT NULL CHECK(length(trim(eligibility_version)) > 0),
+    purpose TEXT NOT NULL CHECK(length(trim(purpose)) > 0),
+    staging_cursor TEXT,
+    staged_ordinal INTEGER NOT NULL DEFAULT -1 CHECK(staged_ordinal >= -1),
+    staged_count INTEGER NOT NULL DEFAULT 0 CHECK(staged_count >= 0),
+    sealed INTEGER NOT NULL DEFAULT 0 CHECK(sealed IN (0,1)),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS library_identity_repair_findings (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES library_operation_jobs(id) ON DELETE CASCADE,

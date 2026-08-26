@@ -221,6 +221,7 @@ from services.native.target_application_lifecycle import (
     start_target_operational_runtime,
 )
 from services.native.target_startup_validator import TargetStartupValidator
+from services.native.wal_checkpoint_service import start_target_wal_checkpoint_task
 from static_server import mount_frontend
 
 logger = logging.getLogger(__name__)
@@ -674,6 +675,11 @@ async def production_target_lifespan(app: FastAPI):
         for start_worker in worker_starters.values():
             start_worker()
         start_target_worker_watchdog(worker_starters)
+        # (GH-293) Safe PASSIVE WAL checkpoint policy with high/low-water
+        # backpressure; registered, one sleep per iteration, never TRUNCATE.
+        from core.dependencies.service_providers import get_wal_checkpoint_service
+
+        start_target_wal_checkpoint_task(get_wal_checkpoint_service())
         await start_target_operational_runtime(
             settings=settings,
             preferences=preferences,

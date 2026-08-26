@@ -9,6 +9,10 @@ from pathlib import Path
 
 import msgspec
 
+from infrastructure.persistence.connection_settings import (
+    report_connection_settings,
+)
+
 logger = logging.getLogger(__name__)
 
 TOKEN_BYTES = 32
@@ -66,7 +70,14 @@ class AuthStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # (GH-293) Uniform backstop with the shared persistence policy: the
+        # setup-status read must wait for the write lock instead of failing
+        # immediately with "database is locked".
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA foreign_keys=ON")
+        # (GH-293) Labeled connection-local settings telemetry (bounded, once per
+        # role per process).
+        report_connection_settings("auth_store", conn)
         return conn
 
     def _execute(self, operation, write: bool):
