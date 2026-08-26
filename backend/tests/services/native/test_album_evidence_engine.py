@@ -671,3 +671,115 @@ def test_administrator_exact_release_position_mapping_fails_closed(
     assert not engine.complete_administrator_exact_release_mapping(
         local, candidate, evidence
     )
+
+
+def _suffixed_pair(
+    suffix_title: str,
+    *,
+    local_title: str = "The Dark Side of the Moon",
+) -> tuple[list[GroupingTrack], AlbumCandidate]:
+    """Complete position+duration evidence for every track; only the release
+    title carries an edition qualifier."""
+    local = [
+        _track(
+            "one",
+            "Speak to Me",
+            number=1,
+            duration=180,
+            album=local_title,
+        ),
+        _track(
+            "two",
+            "Breathe",
+            number=2,
+            duration=200,
+            album=local_title,
+        ),
+    ]
+    candidate = _candidate(
+        "rg-suffix",
+        [
+            _candidate_track("Speak to Me", 1, duration=182),
+            _candidate_track("Breathe", 2, duration=201),
+        ],
+        title=suffix_title,
+    )
+    return local, candidate
+
+
+@pytest.mark.parametrize(
+    ("suffix_title",),
+    [
+        ("The Dark Side of the Moon (2011 - Remaster)",),
+        ("The Dark Side of the Moon (Deluxe Edition)",),
+        ("The Dark Side of the Moon [20th Anniversary Edition]",),
+        ("Thé Därk Side of the Moon - Remastered",),
+    ],
+)
+def test_edition_suffixes_do_not_contradict_complete_track_evidence(
+    suffix_title: str,
+) -> None:
+    """F-MATCH-01: a provider-only edition qualifier must not fail the album
+    title gate when supported track evidence is otherwise complete."""
+    engine = AlbumEvidenceEngine()
+    local, candidate = _suffixed_pair(suffix_title)
+
+    evidence = engine.evaluate_candidate(local, candidate)
+
+    assert evidence.album_title_classification == "supported"
+    assert evidence.reason_code == "SUPPORTED"
+
+
+def test_real_base_title_difference_remains_contradictory() -> None:
+    """Negative control: stripping suffixes never rescues a different album."""
+    engine = AlbumEvidenceEngine()
+    local, candidate = _suffixed_pair(
+        "A Completely Different Record (2011 - Remaster)"
+    )
+
+    evidence = engine.evaluate_candidate(local, candidate)
+
+    assert evidence.album_title_classification == "contradictory"
+    assert evidence.reason_code == "CONFLICTING_TRACK_EVIDENCE"
+
+
+def test_artist_suffix_is_not_stripped_by_the_album_title_gate() -> None:
+    """The shared helper applies to album titles only: an artist-name qualifier
+    still fails the artist gate (no broad fuzzy normalization)."""
+    from services.native.album_evidence_engine import (
+        _album_metadata_class,
+        _album_title_class,
+    )
+
+    assert _album_title_class(
+        "The Wall", "The Wall (Special Edition)"
+    ) == "supported"
+    # Artist comparison keeps its raw gate - a qualified artist name that is
+    # genuinely different stays contradictory.
+    assert (
+        _album_metadata_class("Pink Floyd", "Pink Floyd Tribute Band")
+        == "contradictory"
+    )
+
+
+@pytest.mark.parametrize(
+    ("local_title", "candidate_title"),
+    [
+        ("Abbey Road", "Abbey Road (Remastered)"),
+        ("ABBEY ROAD", "abbey road (deluxe)"),
+        ("Abbey Road", "Abbey Road - 20th Anniversary Edition"),
+    ],
+)
+def test_suffix_normalization_is_symmetric_across_case_and_punctuation(
+    local_title: str,
+    candidate_title: str,
+) -> None:
+    """Both operands normalize identically regardless of which side carries
+    the suffix, brackets, case, or punctuation variant."""
+    from services.native.album_evidence_engine import _album_title_class
+
+    assert (
+        _album_title_class(local_title, candidate_title)
+        == _album_title_class(candidate_title, local_title)
+        == "supported"
+    )

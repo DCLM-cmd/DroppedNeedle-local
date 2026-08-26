@@ -15,6 +15,7 @@ from models.identification import (
     IdentificationDecision,
     TrackEvidence,
 )
+from services.native.edition_suffix import strip_edition_suffix
 from services.native.local_album_grouper import _hungarian_min
 
 MATCHER_VERSION = "feedback-fixes-v2"
@@ -153,6 +154,19 @@ def _album_metadata_class(local: str, candidate: str) -> str:
     if not local.strip():
         return "unknown"
     return "supported" if _distance(local, candidate) <= 0.20 else "contradictory"
+
+
+def _album_title_class(local: str, candidate: str) -> str:
+    """Album-title gate with edition-suffix normalization (F-MATCH-01).
+
+    Both operands pass through the shared suffix helper before the existing
+    fold/distance pipeline; the 0.20 threshold is unchanged. Applied to album
+    titles only - artist names, track titles, and MBIDs never see it.
+    """
+    return _album_metadata_class(
+        strip_edition_suffix(local),
+        strip_edition_suffix(candidate),
+    )
 
 
 class AlbumEvidenceEngine:
@@ -430,7 +444,7 @@ class AlbumEvidenceEngine:
             ),
             "",
         )
-        title_class = _album_metadata_class(album_title, candidate.album_title)
+        title_class = _album_title_class(album_title, candidate.album_title)
         artist_class = _album_metadata_class(album_artist, candidate.album_artist_name)
         supported = sum(item.classification == "supported" for item in track_evidence)
         comparable = sum(item.classification != "unknown" for item in track_evidence)

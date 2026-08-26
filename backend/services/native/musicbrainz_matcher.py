@@ -22,6 +22,7 @@ from unidecode import unidecode
 from infrastructure.msgspec_fastapi import AppStruct
 from infrastructure.queue.priority_queue import RequestPriority
 from models.musicbrainz import recording_release_group_rank
+from services.native.edition_suffix import strip_edition_suffix
 
 if TYPE_CHECKING:
     from repositories.musicbrainz_album import RecordingReleaseGroup
@@ -29,19 +30,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_WHITESPACE = re.compile(r"\s+")
+
 # Confidence at/above which Tier 2 auto-accepts (0-1 scale).
 TEXT_MATCH_THRESHOLD = 0.85
 
 _RG_TITLE_DISAMBIGUATION = 0.5
 
-_EDITION_SUFFIXES = re.compile(
-    r"\b(deluxe|remastered|remaster|edition|anniversary|special|expanded|"
-    r"complete|bonus|acoustic|live|demo|radio edit|extended|instrumental|"
-    r"mono|stereo|explicit|clean|version|single|promo)\b",
-    re.IGNORECASE,
-)
-_BRACKETS = re.compile(r"[\(\)\[\]{}]")
-_WHITESPACE = re.compile(r"\s+")
 _PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
 
 # CJK / Kana ranges - strings containing these must NOT be transliterated.
@@ -101,9 +96,7 @@ class MusicBrainzMatcher:
     @classmethod
     def _strip_edition_suffix(cls, title: str) -> str:
         """Remove edition qualifiers + leftover brackets, collapse whitespace."""
-        stripped = _EDITION_SUFFIXES.sub("", title)
-        stripped = _BRACKETS.sub(" ", stripped)
-        return _WHITESPACE.sub(" ", stripped).strip()
+        return strip_edition_suffix(title)
 
     @classmethod
     def title_similarity(cls, a: str, b: str) -> float:
