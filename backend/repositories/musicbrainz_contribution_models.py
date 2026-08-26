@@ -59,8 +59,11 @@ class MbContributionRelease(msgspec.Struct):
     title: str = ""
     date: str = ""
     country: str = ""
-    status: str = ""
-    packaging: str = ""
+    # Live-verified 2026-08-20: MusicBrainz returns `packaging` and `status` as
+    # explicit JSON null on release verification and url-rels nested releases.
+    # All other optional fields were observed absent (not null) and stay non-null.
+    status: str | None = None
+    packaging: str | None = None
     barcode: str = ""
     release_group: MbContributionReleaseGroup = msgspec.field(
         name="release-group", default_factory=MbContributionReleaseGroup

@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 import msgspec
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import ExternalServiceError, InvalidExternalPayloadError
 from models.album import AlbumInfo
 from models.search import SearchResult
 from services.preferences_service import PreferencesService
@@ -73,6 +73,20 @@ def _record_mb_degradation(msg: str) -> None:
     ctx = try_get_degradation_context()
     if ctx:
         ctx.record(IntegrationResult.error(source="musicbrainz", msg=msg))
+
+
+def _raise_unmappable_payload(
+    exc: InvalidExternalPayloadError, method: str
+) -> InvalidExternalPayloadError:
+    """Record a deterministic MusicBrainz payload-shape failure and re-raise it.
+
+    `InvalidExternalPayloadError` is deliberately non-breaking and non-retriable at
+    `mb_api_get`, so this keeps the shared breaker closed and never caches the failed
+    result. It stays a typed error so contribution callers can separate a deterministic
+    payload problem from a genuine provider outage.
+    """
+    _record_mb_degradation(f"MusicBrainz {method} returned an unmappable payload: {exc}")
+    return exc
 
 
 class _ReleaseGroupSearchPayload(msgspec.Struct):
@@ -732,6 +746,8 @@ class MusicBrainzAlbumMixin:
                     priority=priority,
                     decode_type=MbContributionUrl,
                 )
+            except InvalidExternalPayloadError as exc:
+                raise _raise_unmappable_payload(exc, "url resolution") from exc
             except (httpx.HTTPError, CircuitOpenError) as error:
                 raise ExternalServiceError(
                     "MusicBrainz URL resolution is temporarily unavailable."
@@ -797,6 +813,8 @@ class MusicBrainzAlbumMixin:
                     priority=priority,
                     decode_type=MbContributionRelease,
                 )
+            except InvalidExternalPayloadError as exc:
+                raise _raise_unmappable_payload(exc, "release verification") from exc
             except (httpx.HTTPError, CircuitOpenError) as error:
                 raise ExternalServiceError(
                     "MusicBrainz release verification is temporarily unavailable."
@@ -842,6 +860,8 @@ class MusicBrainzAlbumMixin:
                     priority=priority,
                     decode_type=MbContributionReleaseSearch,
                 )
+            except InvalidExternalPayloadError as exc:
+                raise _raise_unmappable_payload(exc, "duplicate release search") from exc
             except (httpx.HTTPError, CircuitOpenError) as error:
                 raise ExternalServiceError(
                     "MusicBrainz release search is temporarily unavailable."

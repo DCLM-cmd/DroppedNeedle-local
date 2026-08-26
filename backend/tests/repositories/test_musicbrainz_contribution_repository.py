@@ -7,7 +7,7 @@ import msgspec
 import httpx
 import pytest
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import ExternalServiceError, InvalidExternalPayloadError
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
 from models.library_contribution import MusicBrainzDuplicateFacts
@@ -133,6 +133,119 @@ async def test_verification_normalizes_transport_and_circuit_failures(
             "aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b",
             priority=RequestPriority.BACKGROUND_SYNC,
             bypass_cache=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_release_verification_accepts_live_null_packaging(monkeypatch) -> None:
+    import repositories.musicbrainz_album as module
+
+    monkeypatch.setattr(
+        module,
+        "mb_api_get",
+        AsyncMock(
+            return_value=_decoded(
+                "contribution_release_null_packaging.json", MbContributionRelease
+            )
+        ),
+    )
+    release = await _Repo().get_release_for_verification(
+        "aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b",
+        priority=RequestPriority.BACKGROUND_SYNC,
+    )
+    assert release is not None
+    assert release.packaging is None
+    assert release.status == "Official"
+    assert release.date == "1992-08-31"
+    assert release.release_group_mbid == "dcff25f1-702d-3b5e-b0da-d48172e6e62a"
+
+
+@pytest.mark.asyncio
+async def test_url_resolution_accepts_live_null_status_and_packaging(monkeypatch) -> None:
+    import repositories.musicbrainz_album as module
+
+    monkeypatch.setattr(
+        module,
+        "mb_api_get",
+        AsyncMock(
+            return_value=_decoded("contribution_url_release_null.json", MbContributionUrl)
+        ),
+    )
+    resolution = await _Repo().resolve_url(
+        "https://www.discogs.com/release/3562468",
+        includes=("release-rels",),
+        priority=RequestPriority.USER_INITIATED,
+    )
+    assert resolution.release_mbids == ["aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_search_omitted_optional_fields_decode_to_none(monkeypatch) -> None:
+    import repositories.musicbrainz_album as module
+
+    monkeypatch.setattr(
+        module,
+        "mb_api_get",
+        AsyncMock(
+            return_value=_decoded("contribution_search.json", MbContributionReleaseSearch)
+        ),
+    )
+    results = await _Repo().search_duplicate_releases(
+        MusicBrainzDuplicateFacts(
+            title="Goldberg Variations, BWV 988",
+            artist_name="Glenn Gould",
+        ),
+        priority=RequestPriority.USER_INITIATED,
+        limit=8,
+    )
+    assert results
+    assert results[0].packaging is None
+    assert results[0].status is None
+
+
+@pytest.mark.asyncio
+async def test_verification_raises_typed_payload_error_records_degradation_no_cache(
+    monkeypatch,
+) -> None:
+    import repositories.musicbrainz_album as module
+
+    monkeypatch.setattr(
+        module,
+        "mb_api_get",
+        AsyncMock(side_effect=InvalidExternalPayloadError("unexpected payload shape")),
+    )
+    degraded: list[str] = []
+    monkeypatch.setattr(
+        module, "_record_mb_degradation", lambda msg: degraded.append(msg)
+    )
+    repo = _Repo()
+    with pytest.raises(InvalidExternalPayloadError):
+        await repo.get_release_for_verification(
+            "aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b",
+            priority=RequestPriority.BACKGROUND_SYNC,
+            bypass_cache=True,
+        )
+    assert degraded == [
+        "MusicBrainz release verification returned an unmappable payload: "
+        "unexpected payload shape"
+    ]
+    repo._cache.set.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_search_raises_typed_payload_error(monkeypatch) -> None:
+    import repositories.musicbrainz_album as module
+
+    monkeypatch.setattr(
+        module,
+        "mb_api_get",
+        AsyncMock(side_effect=InvalidExternalPayloadError("unexpected payload shape")),
+    )
+    with pytest.raises(InvalidExternalPayloadError):
+        await _Repo().search_duplicate_releases(
+            MusicBrainzDuplicateFacts(title="Goldberg", artist_name="Gould"),
+            priority=RequestPriority.USER_INITIATED,
+            limit=8,
         )
 
 

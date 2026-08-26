@@ -5,7 +5,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import (
+    ExternalServiceError,
+    InvalidExternalPayloadError,
+)
 from infrastructure.cache.memory_cache import InMemoryCache
 from models.library_contribution import (
     MusicBrainzVerifiedRelease,
@@ -13,6 +16,7 @@ from models.library_contribution import (
 )
 from services.native.library_contribution_service import LibraryContributionService
 from services.native.library_contribution_verification_worker import (
+    UNMAPPABLE_PROVIDER_PAYLOAD,
     LibraryContributionVerificationWorker,
 )
 from tests.services.native.test_library_contribution_service import _service
@@ -265,6 +269,41 @@ async def test_musicbrainz_outage_returns_job_to_durable_retry(tmp_path) -> None
             "SELECT state, last_failure_code FROM library_contribution_verification_jobs"
         ).fetchone()
     assert job == ("queued", "MUSICBRAINZ_TEMPORARILY_UNAVAILABLE")
+
+
+@pytest.mark.asyncio
+async def test_deterministic_payload_routes_to_review_with_unmappable_code(
+    tmp_path,
+) -> None:
+    service, musicbrainz, path, contribution_id = await _returned_contribution(tmp_path)
+    musicbrainz.get_release_for_verification.side_effect = InvalidExternalPayloadError(
+        "unexpected payload shape"
+    )
+    worker = LibraryContributionVerificationWorker(service._store, service, musicbrainz)
+
+    assert await worker.run_once("worker-1", now=time.time() + 1) == "needs_review"
+
+    review = await service.get(contribution_id)
+    assert review.state == "needs_review"
+    assert review.result_release_mbid == _RELEASE_MBID
+    assert review.next_actions == ["retry_verification", "cancel"]
+    with sqlite3.connect(path) as connection:
+        job = connection.execute(
+            "SELECT state, last_failure_code FROM "
+            "library_contribution_verification_jobs"
+        ).fetchone()
+        assert job == ("needs_review", UNMAPPABLE_PROVIDER_PAYLOAD)
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM local_album_external_identities"
+            ).fetchone()[0]
+            == 0
+        )
+        attempt = connection.execute(
+            "SELECT terminal_reason_code FROM library_identification_attempts "
+            "ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        assert attempt[0] == UNMAPPABLE_PROVIDER_PAYLOAD
 
 
 @pytest.mark.asyncio

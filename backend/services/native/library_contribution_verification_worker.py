@@ -3,7 +3,11 @@ from __future__ import annotations
 import time
 import uuid
 
-from core.exceptions import ExternalServiceError, ResourceNotFoundError
+from core.exceptions import (
+    ExternalServiceError,
+    InvalidExternalPayloadError,
+    ResourceNotFoundError,
+)
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from infrastructure.queue.priority_queue import RequestPriority
 from models.identification import IdentificationAttempt, IdentificationEvidenceRecord
@@ -18,6 +22,11 @@ MAX_AUTOMATIC_WINDOW_SECONDS = 2 * 60 * 60
 MAX_AUTOMATIC_ATTEMPTS = 10
 MAX_RETRY_SECONDS = 10 * 60
 CLEANUP_INTERVAL_SECONDS = 60 * 60
+# Deterministic MusicBrainz payload-shape failure (InvalidExternalPayloadError).
+# Owner option A (2026-08-20): review immediately, breaker stays closed, no provider
+# resurrection, manual retry_verification after an application update. Kept local to the
+# contribution path; F-IDENT-02 owns the eventual shared constant (identical spelling).
+UNMAPPABLE_PROVIDER_PAYLOAD = "UNMAPPABLE_PROVIDER_PAYLOAD"
 
 
 class LibraryContributionVerificationWorker:
@@ -85,6 +94,19 @@ class LibraryContributionVerificationWorker:
                 contribution.result_release_mbid,
                 priority=RequestPriority.BACKGROUND_SYNC,
                 bypass_cache=True,
+            )
+        except InvalidExternalPayloadError:
+            # Deterministic, schema-level payload problem: review immediately and do not
+            # retry (the shape will not change until the model is updated; the shared
+            # breaker stays closed and the row is never provider-resurrected). Manual
+            # retry_verification becomes available after an application update.
+            return await self._finish_without_candidate(
+                job,
+                job_revision=job_revision,
+                worker_id=worker_id,
+                contribution=contribution,
+                failure_code=UNMAPPABLE_PROVIDER_PAYLOAD,
+                now=timestamp,
             )
         except ExternalServiceError:
             return await self._retry_or_review(
