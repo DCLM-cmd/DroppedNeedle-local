@@ -14,6 +14,7 @@ from core.exceptions import (
 )
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.library_management_planner import LibraryManagementPlanner
+from services.native.library_operation_service import LEASE_SECONDS
 from services.native.library_management_publisher import LibraryManagementPublisher
 from services.native.library_management_undo_service import LibraryManagementUndoService
 from services.native.library_management_baseline_service import (
@@ -169,7 +170,14 @@ class LibraryManagementWorker:
         if current is None:
             raise ValidationError("Library management job disappeared after planning.")
         if planned.origin == "scan_discovered" and planned.phase == "ready":
-            summary = json.loads(planned.summary_json)
+            try:
+                summary = json.loads(planned.summary_json)
+            except (json.JSONDecodeError, TypeError) as error:
+                # F-107: a corrupt stored summary must classify as a
+                # deterministic validation failure, not escape as unknown.
+                raise ValidationError(
+                    "The stored Library Management snapshot is invalid."
+                ) from error
             if (
                 int(summary.get("blocked_count", 0)) == 0
                 and int(summary.get("stale_count", 0)) == 0
@@ -198,6 +206,9 @@ class LibraryManagementWorker:
             )
             if controlled is not None and controlled["state"] != "running":
                 return controlled
+            # F-105: renew the 60 s operation lease once per bundle so a
+            # concurrent lease reaper can never yank a long apply mid-flight.
+            await self._renew_lease(job_id, worker_id)
             work = await self._store.claim_operation_work(
                 job_id, worker_id, now=time.time()
             )
@@ -240,6 +251,7 @@ class LibraryManagementWorker:
                         completed_at=time.time(),
                     )
                     continue
+                await self._renew_lease(job_id, worker_id)
                 await self._publisher.publish_bundle(job_id, ordinal, worker_id)
             except (
                 StaleRevisionError,
@@ -310,3 +322,59 @@ class LibraryManagementWorker:
                     failure_code="PUBLICATION_FAILED",
                     completed_at=time.time(),
                 )
+            except Exception as error:
+                # F-107: an unclassified failure must still terminate the work
+                # row durably; otherwise a deterministic poison bundle requeues
+                # forever with no administrator-visible outcome.
+                current = await self._store.get_operation_work_item(job_id, ordinal)
+                if current is not None and current["state"] == "succeeded":
+                    continue
+                logger.error(
+                    "Library management publication failed unexpectedly "
+                    "job_id=%s bundle_ordinal=%s failure_type=%s reason=%s",
+                    job_id,
+                    ordinal,
+                    type(error).__name__,
+                    str(error),
+                    exc_info=True,
+                )
+                try:
+                    await self._store.complete_operation_work(
+                        job_id,
+                        ordinal,
+                        worker_id=worker_id,
+                        expected_work_revision=int(work["row_revision"]),
+                        state="failed",
+                        result_json=json.dumps(
+                            {
+                                "failure_type": type(error).__name__,
+                                "reason": str(error),
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        failure_code="PUBLICATION_FAILED",
+                        completed_at=time.time(),
+                    )
+                except Exception:  # noqa: BLE001 - marking must not mask the cause
+                    logger.exception(
+                        "Library management failed-work marking itself failed "
+                        "for %s/%s",
+                        job_id,
+                        ordinal,
+                    )
+                    raise
+
+    async def _renew_lease(self, job_id: str, worker_id: str) -> None:
+        """F-105: treat a failed heartbeat as loss-of-lease for this applier."""
+
+        renewed = await self._store.heartbeat_operation_job(
+            job_id,
+            worker_id,
+            now=time.time(),
+            lease_seconds=LEASE_SECONDS,
+        )
+        if not renewed:
+            raise StaleRevisionError(
+                "The Library Management operation lease changed before completion."
+            )

@@ -39,6 +39,13 @@ class AutomaticScanManagementService:
         self._store = store
         self._profiles = profiles
         self._planner = planner
+        # F-110: (root_id, relative_path) -> (live stat signature,
+        # managed_path_revision). An unchanged signature means the file has not
+        # drifted per the repo change-detection contract, so the expensive
+        # byte-hash verdict is reusable across scheduling decisions.
+        self._path_revision_cache: dict[
+            tuple[str, str], tuple[tuple[int, ...] | None, str | None]
+        ] = {}
 
     async def schedule_scanned_album(self, local_album_id: str) -> str | None:
         context = await self._store.get_album_identification_context(local_album_id)
@@ -282,12 +289,46 @@ class AutomaticScanManagementService:
             root = roots.get(str(track["root_id"]))
             if root is None:
                 return False
-            path_revision = await asyncio.to_thread(
-                self._managed_path_revision, track, Path(root.path)
+            path_revision = await self._managed_path_revision_cached(
+                track, Path(root.path)
             )
             if path_revision != state.managed_path_revision:
                 return False
         return True
+
+    async def _managed_path_revision_cached(
+        self, track: dict, root: Path
+    ) -> str | None:
+        """Hash only when the file's live stat signature changed (F-110).
+
+        A cheap lstat guards the O(bytes) SHA-256: identical size/mtime/inode
+        since the last verdict means no drift per the repo change-detection
+        contract, so the stored verdict is reused across scheduling decisions.
+        """
+
+        relative = PurePosixPath(str(track["relative_path"]))
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            return await asyncio.to_thread(self._managed_path_revision, track, root)
+        path = root.joinpath(*relative.parts)
+        try:
+            info = os.stat(path)
+            signature = (
+                int(info.st_size),
+                int(info.st_mtime_ns),
+                int(info.st_ino),
+                int(info.st_dev),
+            )
+        except OSError:
+            signature = None
+        key = (str(track["root_id"]), str(track["relative_path"]))
+        cached = self._path_revision_cache.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        revision = await asyncio.to_thread(self._managed_path_revision, track, root)
+        self._path_revision_cache[key] = (signature, revision)
+        return revision
 
     @classmethod
     def _managed_path_revision(cls, track: dict, root: Path) -> str | None:

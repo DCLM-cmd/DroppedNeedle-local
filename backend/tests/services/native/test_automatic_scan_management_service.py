@@ -350,3 +350,49 @@ async def test_scan_preview_seals_directly_into_durable_automatic_apply(
         await service.schedule_identified_album("album-1", managed_input_revision)
         is not None
     )
+
+
+@pytest.mark.asyncio
+async def test_managed_path_revision_cache_skips_hash_until_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-110: unchanged live stat signature reuses the stored verdict without
+    re-reading bytes; a real content change re-hashes."""
+    service = AutomaticScanManagementService(AsyncMock(), AsyncMock(), AsyncMock())
+    relative = Path("a") / "b.flac"
+    managed = tmp_path / relative
+    managed.parent.mkdir(parents=True)
+    managed.write_bytes(b"x" * 10)
+    track = {
+        "root_id": "root-1",
+        "relative_path": relative.as_posix(),
+        "file_path": str(managed),
+    }
+
+    calls: list[Path] = []
+    real_hash = service._hash_file
+
+    def counting_hash(path: Path) -> str:
+        calls.append(path)
+        return real_hash(path)
+
+    monkeypatch.setattr(
+        AutomaticScanManagementService,
+        "_hash_file",
+        staticmethod(counting_hash),
+    )
+
+    first = await service._managed_path_revision_cached(track, tmp_path)
+    second = await service._managed_path_revision_cached(track, tmp_path)
+
+    assert first is not None
+    assert first == second
+    assert len(calls) == 1
+
+    managed.write_bytes(b"x" * 11)
+
+    third = await service._managed_path_revision_cached(track, tmp_path)
+
+    assert third != first
+    assert len(calls) == 2

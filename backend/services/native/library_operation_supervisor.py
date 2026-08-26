@@ -91,10 +91,10 @@ class LibraryOperationSupervisor:
             row = await self._reidentification.run_claimed(
                 job, worker_id, now=timestamp
             )
-            return self._operations._response(row)
+            return self._operations.response_for(row)
         if job["kind"] == "library_management":
             row = await self._management.run_claimed(job, worker_id)
-            return self._operations._response(row)
+            return self._operations.response_for(row)
         if job["kind"] == "bulk_review_apply":
             return await self._operations.run_bulk_claimed(
                 job,
@@ -115,9 +115,9 @@ class LibraryOperationSupervisor:
                     terminal_code="CATALOG_IDENTITY_HYGIENE_WORKER_UNAVAILABLE",
                     now=timestamp,
                 )
-                return self._operations._response(row)
+                return self._operations.response_for(row)
             row = await self._catalog_identity_hygiene.run_claimed(job, worker_id)
-            return self._operations._response(row)
+            return self._operations.response_for(row)
         if repair_scope.get("purpose") == ARTIST_RECONCILIATION_PURPOSE:
             if self._artist_reconciliation is None:
                 row = await self._store.finish_operation_job(
@@ -127,9 +127,9 @@ class LibraryOperationSupervisor:
                     terminal_code="RECONCILIATION_WORKER_UNAVAILABLE",
                     now=timestamp,
                 )
-                return self._operations._response(row)
+                return self._operations.response_for(row)
             row = await self._artist_reconciliation.run_claimed(job, worker_id)
-            return self._operations._response(row)
+            return self._operations.response_for(row)
         if snapshot["snapshot"]["phase"] == "apply":
             return await self._repairs.run_claimed_apply(
                 job,

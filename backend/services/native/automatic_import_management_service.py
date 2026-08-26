@@ -394,7 +394,11 @@ class AutomaticImportManagementService:
                         management_warnings=management_warnings,
                         artifacts=tuple(artifacts),
                     )
-                assert sidecars_added
+                # F-109: validated-input contracts must not vanish under -O.
+                if not sidecars_added:
+                    raise ValidationError(
+                        "A conversion import lost its sealed sidecar artifacts."
+                    )
                 for request in sorted(
                     (value for value in bundle.files if value.conversion_recycle_only),
                     key=lambda value: value.ordinal,
@@ -801,7 +805,13 @@ class AutomaticImportManagementService:
                 if artifact.content is not None:
                     size = len(artifact.content)
                 else:
-                    assert artifact.source_path is not None
+                    if artifact.source_path is None:
+                        # F-109: contract check must survive python -O; the
+                        # hold outcome is the honest classification here.
+                        raise AutomaticManagementHoldError(
+                            ROOT_UNAVAILABLE,
+                            "An automatic import sidecar is unavailable.",
+                        )
                     try:
                         size = (
                             await asyncio.to_thread(Path(artifact.source_path).stat)

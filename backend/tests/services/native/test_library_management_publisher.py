@@ -9,7 +9,8 @@ import sqlite3
 import unicodedata
 import stat
 from pathlib import Path, PurePosixPath
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import msgspec
@@ -3373,3 +3374,118 @@ async def _bare_ready_operation(tmp_path: Path):
             (handle.job_id, settings_revision, f"{handle.job_id}:bundle:0"),
         )
     return root, source, store, audio, preferences, handle.job_id
+
+
+class _RecordingCoordinator(LibraryFilesystemCoordinator):
+    """Coordinator wrapper that records lease acquisition/release ordering."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[tuple[str, tuple[str, ...]]] = []
+
+    @asynccontextmanager
+    async def write_many(self, root_ids):
+        roots = tuple(sorted(set(root_ids)))
+        self.events.append(("acquire", roots))
+        try:
+            async with super().write_many(root_ids):
+                self.events.append(("held", roots))
+                yield
+        finally:
+            self.events.append(("release", roots))
+
+
+@pytest.mark.asyncio
+async def test_outer_compensation_mutates_roots_only_under_the_writer_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-106: when a failure bypasses the inner critical-section handler, the
+    outer compensation must restore/unlink while a fresh write lease is held."""
+    import services.native.library_management_publisher as publisher_module
+
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    recording = _RecordingCoordinator()
+    publisher._filesystem = recording
+
+    real_unlink = publisher_module.unlink_rooted
+
+    def recording_unlink(roots, root_id, relative_path, **kwargs):
+        recording.events.append(("unlink_rooted", (str(relative_path),)))
+        return real_unlink(roots, root_id, relative_path, **kwargs)
+
+    monkeypatch.setattr(publisher_module, "unlink_rooted", recording_unlink)
+
+    # A destination created after preview fails the recheck inside the critical
+    # section; its handler re-raises so the OUTER compensation path runs too.
+    items = await store.get_library_management_bundle_plan_items(job_id, 0)
+    planned_relative = str(items[0].destination_relative_path)
+    planned = root / planned_relative
+    planned.parent.mkdir(parents=True)
+    planned.write_bytes(b"sneaky")
+
+    with pytest.raises(Exception):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    acquires = [
+        index
+        for index, (kind, _roots) in enumerate(recording.events)
+        if kind == "held"
+    ]
+    releases = [
+        index
+        for index, (kind, _roots) in enumerate(recording.events)
+        if kind == "release"
+    ]
+    assert acquires and releases
+    unlinks = [
+        index
+        for index, (kind, _paths) in enumerate(recording.events)
+        if kind == "unlink_rooted"
+    ]
+    assert unlinks, "expected compensation unlink work to be recorded"
+    for index in unlinks:
+        assert any(a < index < r for a, r in zip(acquires, releases)), (
+            "every compensation mutation must happen while a write lease is held"
+        )
+    # the fence covered every touched root of the bundle's journals
+    first_acquire_roots = next(
+        roots for kind, roots in recording.events if kind == "acquire"
+    )
+    assert "root-1" in first_acquire_roots
+
+
+@pytest.mark.asyncio
+async def test_publish_refuses_destination_created_in_replace_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-112: an out-of-model writer creating the destination inside the
+    recheck-to-replace window must hit the NOREPLACE backstop instead of being
+    silently overwritten."""
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    items = await store.get_library_management_bundle_plan_items(job_id, 0)
+    planned = root / str(items[0].destination_relative_path)
+    planned.parent.mkdir(parents=True)
+    planned.write_bytes(b"external writer bytes")
+
+    # silence the earlier recheck so the failure lands exactly on the
+    # replace-time backstop rather than the recheck-time collision check
+    async def no_recheck(_prepared, _roots):
+        return None
+
+    monkeypatch.setattr(publisher, "_recheck_prepared", no_recheck)
+
+    with pytest.raises(
+        LibraryManagementDestinationConflictError,
+        match="created after preview",
+    ):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    # the external file survived untouched and nothing half-published remains
+    assert planned.read_bytes() == b"external writer bytes"
+    assert source.is_file()

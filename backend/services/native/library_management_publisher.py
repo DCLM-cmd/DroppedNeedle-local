@@ -74,6 +74,7 @@ from services.native.library_filesystem_coordinator import (
     MANAGEMENT_ARTIFACT_PREFIX,
     LibraryFilesystemCoordinator,
     replace_rooted,
+    replace_rooted_publication,
     unlink_rooted,
 )
 from services.native.library_policy_resolver import LibraryPolicyResolver
@@ -1323,9 +1324,15 @@ class LibraryManagementPublisher:
         if journal.state == "published":
             return
         if value.replacement == value.destination and journal.state == "validated":
-            assert value.replacement_backup is not None
-            assert value.request.replacement_root_id is not None
-            assert journal.replacement_backup_relative_path is not None
+            # F-109: validated-input contracts must not vanish under python -O.
+            if (
+                value.replacement_backup is None
+                or value.request.replacement_root_id is None
+                or journal.replacement_backup_relative_path is None
+            ):
+                raise ValidationError(
+                    "An import replacement backup lacks its sealed identity."
+                )
             await asyncio.to_thread(
                 replace_rooted,
                 roots,
@@ -1345,8 +1352,9 @@ class LibraryManagementPublisher:
                 updated_at=self._clock(),
             )
             value.journal = journal
+        # F-112: staged temp -> destination publish gets the NOREPLACE backstop.
         await asyncio.to_thread(
-            replace_rooted,
+            replace_rooted_publication,
             roots,
             value.request.destination_root_id,
             journal.temporary_relative_path,
@@ -1863,10 +1871,17 @@ class LibraryManagementPublisher:
             "restoring",
         }:
             raise StaleRevisionError("The management operation is not applying.")
-        pinned = msgspec.json.decode(
-            snapshot.profile_snapshot_json.encode(),
-            type=PinnedLibraryManagementProfile,
-        )
+        try:
+            pinned = msgspec.json.decode(
+                snapshot.profile_snapshot_json.encode(),
+                type=PinnedLibraryManagementProfile,
+            )
+        except (msgspec.DecodeError, msgspec.ValidationError) as error:
+            # F-107: corrupt stored state must classify as a deterministic
+            # validation failure, not escape as an unknown exception.
+            raise ValidationError(
+                "The stored Library Management profile snapshot is invalid."
+            ) from error
         items = await self._store.get_library_management_bundle_plan_items(
             job_id, bundle_ordinal
         )
@@ -1944,12 +1959,33 @@ class LibraryManagementPublisher:
                     critical_cancelled,
                 ) = await self._finish_critical_task(critical)
         except BaseException:
+            # F-106: the primary compensation runs inside the fence via the
+            # critical section's own handler, but an exception that bypasses it
+            # (cancellation during acquisition/exit, plumbing failure) lands
+            # here with the lease already released. Restore/unlink under a
+            # freshly acquired fence over every touched root so no concurrent
+            # acquirer can mutate the directories being restored (E28).
+            compensation_roots = {
+                root_id
+                for value in prepared
+                for root_id in (
+                    value.journal.source_root_id,
+                    value.journal.temporary_root_id,
+                    value.journal.backup_root_id,
+                    value.journal.destination_root_id,
+                )
+                if root_id is not None
+            }
 
             async def rollback() -> None:
-                await self._rollback(prepared, roots)
-                await asyncio.to_thread(
-                    self._remove_unpublished_temporaries, prepared, roots
-                )
+                if not compensation_roots:
+                    # Failure before any journal existed: nothing to restore.
+                    return
+                async with self._filesystem.write_many(compensation_roots):
+                    await self._rollback(prepared, roots)
+                    await asyncio.to_thread(
+                        self._remove_unpublished_temporaries, prepared, roots
+                    )
 
             rollback_task = asyncio.create_task(rollback())
             await self._finish_critical_task(rollback_task)
@@ -3436,9 +3472,18 @@ class LibraryManagementPublisher:
     ) -> None:
         journal = value.journal
         if value.recycle_move:
-            assert value.backup is not None and value.source is not None
-            assert journal.source_root_id and journal.source_relative_path
-            assert journal.backup_root_id and journal.backup_relative_path
+            # F-109: validated-input contracts must not vanish under python -O.
+            if (
+                value.backup is None
+                or value.source is None
+                or journal.source_root_id is None
+                or journal.source_relative_path is None
+                or journal.backup_root_id is None
+                or journal.backup_relative_path is None
+            ):
+                raise ValidationError(
+                    "A management recycle move lacks its sealed path identity."
+                )
             await asyncio.to_thread(
                 replace_rooted,
                 roots,
@@ -3461,9 +3506,18 @@ class LibraryManagementPublisher:
         elif value.source == value.destination or (
             journal.subject_kind == "external_art" and value.source is not None
         ):
-            assert value.backup is not None and value.source is not None
-            assert journal.source_root_id and journal.source_relative_path
-            assert journal.backup_root_id and journal.backup_relative_path
+            # F-109: validated-input contracts must not vanish under python -O.
+            if (
+                value.backup is None
+                or value.source is None
+                or journal.source_root_id is None
+                or journal.source_relative_path is None
+                or journal.backup_root_id is None
+                or journal.backup_relative_path is None
+            ):
+                raise ValidationError(
+                    "A management same-path move lacks its sealed path identity."
+                )
             await asyncio.to_thread(
                 replace_rooted,
                 roots,
@@ -3493,10 +3547,20 @@ class LibraryManagementPublisher:
                 updated_at=self._clock(),
             )
             return
-        assert journal.temporary_root_id and journal.temporary_relative_path
-        assert journal.destination_root_id and journal.destination_relative_path
+        # F-109: validated-input contracts must not vanish under python -O.
+        if (
+            journal.temporary_root_id is None
+            or journal.temporary_relative_path is None
+            or journal.destination_root_id is None
+            or journal.destination_relative_path is None
+        ):
+            raise ValidationError(
+                "A management publication lacks its staged destination identity."
+            )
+        # F-112: the temp->destination publish must not silently overwrite an
+        # out-of-model writer that appeared inside the recheck-to-replace window.
         await asyncio.to_thread(
-            replace_rooted,
+            replace_rooted_publication,
             roots,
             journal.temporary_root_id,
             journal.temporary_relative_path,

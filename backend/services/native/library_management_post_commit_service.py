@@ -95,7 +95,11 @@ class LibraryManagementPostCommitService:
         )
         for result in results:
             if isinstance(result, Exception):
-                logger.warning("Library Management cache invalidation failed")
+                # F-108: operators need the cause, not just the fact.
+                logger.warning(
+                    "Library Management cache invalidation failed",
+                    exc_info=result,
+                )
 
         release_group_mbids = {
             str(track["provider_release_group_mbid"])
@@ -118,7 +122,10 @@ class LibraryManagementPostCommitService:
         )
         for result in disk_results:
             if isinstance(result, Exception):
-                logger.warning("Library Management disk cache invalidation failed")
+                logger.warning(
+                    "Library Management disk cache invalidation failed",
+                    exc_info=result,
+                )
 
     async def _enqueue_external_refreshes(self, operation_id: str) -> None:
         snapshot = await self._store.get_library_management_job_snapshot(operation_id)

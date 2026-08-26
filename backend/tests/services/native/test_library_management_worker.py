@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -498,3 +499,106 @@ async def test_concurrent_appliers_publish_one_bundle_without_duplicate_work(
         if isinstance(result, StaleRevisionError)
     ]
     assert len(losers) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        msgspec.DecodeError("corrupt profile snapshot"),
+        RuntimeError("unexpected blob-store explosion"),
+        sqlite3.OperationalError("disk I/O error"),
+    ],
+)
+async def test_apply_worker_marks_unknown_failures_as_durable_failures(error):
+    """F-107: an unclassified exception must terminate the work row durably
+    instead of leaving the job retrying forever with no visible outcome."""
+    worker, store, publisher = _worker()
+    store.claim_operation_work.side_effect = [
+        {"ordinal": 0, "row_revision": 2, "state": "running"},
+        None,
+    ]
+    store.get_operation_work_item.return_value = {
+        "ordinal": 0,
+        "state": "running",
+    }
+    publisher.publish_bundle.side_effect = error
+
+    result = await worker.run_claimed({"id": "management-1"}, "management-worker")
+
+    assert result["state"] == "succeeded"
+    values = store.complete_operation_work.await_args.kwargs
+    assert values["state"] == "failed"
+    assert values["failure_code"] == "PUBLICATION_FAILED"
+    payload = msgspec.json.decode(values["result_json"])
+    assert payload["failure_type"] == type(error).__name__
+    assert payload["reason"] == str(error)
+
+
+@pytest.mark.asyncio
+async def test_apply_worker_cancellation_propagates_without_marking() -> None:
+    """F-107: CancelledError stays a BaseException — no durable failed marking,
+    because durability belongs to the publisher's shielded critical task."""
+    worker, store, publisher = _worker()
+    store.claim_operation_work.side_effect = [
+        {"ordinal": 0, "row_revision": 2, "state": "running"},
+        None,
+    ]
+
+    async def cancel_during_publish(*_args) -> None:
+        raise asyncio.CancelledError
+
+    publisher.publish_bundle.side_effect = cancel_during_publish
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_claimed({"id": "management-1"}, "management-worker")
+
+    store.complete_operation_work.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_worker_renews_the_operation_lease_per_bundle() -> None:
+    """F-105: one heartbeat per loop iteration keeps the 60 s lease alive."""
+    from services.native.library_operation_service import LEASE_SECONDS
+
+    worker, store, _publisher = _worker()
+    store.claim_operation_work.side_effect = [
+        {"ordinal": 0, "row_revision": 2, "state": "running"},
+        None,
+    ]
+
+    result = await worker.run_claimed({"id": "management-1"}, "management-worker")
+
+    assert result["state"] == "succeeded"
+    # two renewals inside the bundle iteration (loop top + post-publish) and
+    # one at the top of the draining iteration
+    assert store.heartbeat_operation_job.await_count == 3
+    for call in store.heartbeat_operation_job.await_args_list:
+        assert call.args[0] == "management-1"
+        assert call.args[1] == "management-worker"
+        assert call.kwargs["lease_seconds"] == LEASE_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_apply_worker_stops_when_the_lease_is_lost() -> None:
+    """F-105: a failed heartbeat records the bundle outcome and the zombie
+    applier exits before claiming any further work."""
+    worker, store, _publisher = _worker()
+    store.claim_operation_work.side_effect = [
+        {"ordinal": 0, "row_revision": 2, "state": "running"},
+    ]
+    store.get_operation_work_item.return_value = {
+        "ordinal": 0,
+        "state": "running",
+    }
+    store.heartbeat_operation_job.side_effect = [True] + [False] * 10
+
+    with pytest.raises(StaleRevisionError, match="lease"):
+        await worker.run_claimed({"id": "management-1"}, "management-worker")
+
+    # iteration 1 recorded its bundle as skipped/STALE_INPUT, iteration 2's
+    # top-of-loop heartbeat failed before another claim could happen
+    assert store.claim_operation_work.await_count == 1
+    values = store.complete_operation_work.await_args.kwargs
+    assert values["state"] == "skipped"
+    assert values["failure_code"] == "STALE_INPUT"

@@ -847,7 +847,7 @@ async def test_shared_operation_supervisor_dispatches_catalog_hygiene_repair() -
         }
     }
     operations = Mock()
-    operations._response.return_value = "response"
+    operations.response_for.return_value = "response"
     hygiene = AsyncMock()
     hygiene.run_claimed.return_value = {"id": job["id"], "state": "succeeded"}
     supervisor = LibraryOperationSupervisor(

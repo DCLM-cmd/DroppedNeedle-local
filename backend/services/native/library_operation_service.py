@@ -246,6 +246,29 @@ class LibraryOperationService:
         )
 
     @staticmethod
+    def response_for(
+        row: dict,
+        *,
+        results: list[OperationWorkResult] | None = None,
+        results_truncated: bool = False,
+        repair_summary: RepairReportSummary | None = None,
+        reidentification_candidates: list[ReviewCandidateDetail] | None = None,
+        selected_reidentification_candidate_key: str | None = None,
+    ) -> OperationResponse:
+        """Public response builder (F-111); cross-module callers use this."""
+
+        return LibraryOperationService._response(
+            row,
+            results=results,
+            results_truncated=results_truncated,
+            repair_summary=repair_summary,
+            reidentification_candidates=reidentification_candidates,
+            selected_reidentification_candidate_key=(
+                selected_reidentification_candidate_key
+            ),
+        )
+
+    @staticmethod
     def _response(
         row: dict,
         *,

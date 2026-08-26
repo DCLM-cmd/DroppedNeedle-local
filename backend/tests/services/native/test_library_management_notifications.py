@@ -524,3 +524,54 @@ async def test_delivery_enqueue_failure_leaves_invalidation_complete(real_store)
     assert disk_cache.delete_album.await_count == 2
     assert disk_cache.delete_artist.await_count == 2
     discovery.mark_discover_stale.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_commit_cache_failure_warnings_carry_the_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F-108: gathered cache/invalidation failures must be logged with their
+    exception detail, not as a bare message."""
+    import logging
+
+    store = AsyncMock()
+    store.get_target_tracks_by_ids.return_value = {
+        "track-1": {
+            "provider_release_group_mbid": "release-group-1",
+            "provider_album_artist_mbid": "artist-1",
+            "provider_artist_mbid": "artist-1",
+        }
+    }
+    store.get_track_management_state.return_value = None
+    failing_memory_cache = AsyncMock()
+    failing_memory_cache.clear_prefix.side_effect = RuntimeError(
+        "redis connection reset"
+    )
+    failing_disk_cache = AsyncMock()
+    failing_disk_cache.delete_album.side_effect = OSError("mb cache dir gone")
+    discovery = AsyncMock()
+    service = LibraryManagementPostCommitService(
+        store,
+        MagicMock(),
+        failing_memory_cache,
+        failing_disk_cache,
+        discovery,
+        lambda: MagicMock(),
+    )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="services.native.library_management_post_commit_service",
+    ):
+        await service.after_commit({"track-1"}, {"album-1"})
+
+    warnings = [
+        record
+        for record in caplog.records
+        if "cache invalidation failed" in record.getMessage()
+    ]
+    # one warning per identification prefix plus the disk-cache pair
+    assert len(warnings) >= 2
+    assert all(record.exc_info is not None for record in warnings)
+    assert any(isinstance(record.exc_info[1], RuntimeError) for record in warnings)
+    assert any(isinstance(record.exc_info[1], OSError) for record in warnings)

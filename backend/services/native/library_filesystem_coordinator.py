@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import threading
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -10,6 +12,16 @@ import os
 from pathlib import Path
 from pathlib import PurePosixPath
 import stat
+
+from core.exceptions import LibraryManagementDestinationConflictError
+
+_RENAME_NOREPLACE = 1 << 0
+# Kernels/filesystems without renameat2 support report these errnos; the
+# publication then falls back to the previous recheck-then-replace behavior.
+_NOREPLACE_UNSUPPORTED_ERRNOS = frozenset(
+    {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTTY}
+)
+_LIBC = ctypes.CDLL(None, use_errno=True)
 
 
 class _RootLeaseState:
@@ -216,6 +228,68 @@ def _rooted_parent(root: Path, relative_path: str) -> Iterator[tuple[int, str]]:
         yield descriptor, relative.parts[-1]
     finally:
         os.close(descriptor)
+
+
+def _renameat2_noreplace(
+    old_dir_fd: int, old_name: str, new_dir_fd: int, new_name: str
+) -> None:
+    """renameat2(RENAME_NOREPLACE): fail with EEXIST instead of overwriting."""
+
+    result = _LIBC.renameat2(
+        ctypes.c_int(old_dir_fd),
+        ctypes.c_char_p(os.fsencode(old_name)),
+        ctypes.c_int(new_dir_fd),
+        ctypes.c_char_p(os.fsencode(new_name)),
+        ctypes.c_uint(_RENAME_NOREPLACE),
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), os.fspath(new_name))
+
+
+def replace_rooted_publication(
+    roots: dict[str, Path],
+    source_root_id: str,
+    source_relative_path: str,
+    destination_root_id: str,
+    destination_relative_path: str,
+) -> None:
+    """Publish one staged temp onto its destination with a NOREPLACE backstop.
+
+    F-112: the recheck-then-replace window must not silently overwrite an
+    out-of-model external writer's file. Unsupported platforms/filesystems
+    fall back to plain os.replace (previous behavior); an existing destination
+    becomes LibraryManagementDestinationConflictError.
+    """
+
+    try:
+        source_root = roots[source_root_id]
+        destination_root = roots[destination_root_id]
+    except KeyError as error:
+        raise ValueError("A rooted replacement references an unknown root.") from error
+    with _rooted_parent(source_root, source_relative_path) as source:
+        with _rooted_parent(
+            destination_root, destination_relative_path
+        ) as destination:
+            try:
+                _renameat2_noreplace(
+                    source[0], source[1], destination[0], destination[1]
+                )
+            except OSError as error:
+                if error.errno == errno.EEXIST:
+                    raise LibraryManagementDestinationConflictError(
+                        "A management destination was created after preview."
+                    ) from error
+                if error.errno not in _NOREPLACE_UNSUPPORTED_ERRNOS:
+                    raise
+                # renameat2 unsupported here: previous recheck-then-replace
+                # behavior is the only option on this filesystem.
+                os.replace(
+                    source[1],
+                    destination[1],
+                    src_dir_fd=source[0],
+                    dst_dir_fd=destination[0],
+                )
 
 
 def replace_rooted(
