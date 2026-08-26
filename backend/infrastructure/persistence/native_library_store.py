@@ -13733,6 +13733,56 @@ class NativeLibraryStore(PersistenceBase):
         return mbids[0]
 
     @staticmethod
+    def _album_has_provider_proof_tx(
+        connection: sqlite3.Connection,
+        source_artist_id: str,
+        expected_artist_mbid: str,
+    ) -> bool:
+        """F-IDENT-01 option B gate for the name-anchored convergence path.
+
+        Album-level proof for the source artist's album is an accepted
+        MusicBrainz release identity or a revision-valid stored credit proof
+        row agreeing on the expected provider MBID. A current, revision-valid
+        contradictory proof row vetoes the retirement; a missing identity and
+        missing proof rows (the name-only case) never satisfies the gate.
+        """
+        current_proofs = connection.execute(
+            "SELECT lower(proof.artist_mbid) artist_mbid "
+            "FROM library_artist_credit_proofs proof "
+            "JOIN local_album_external_identities album_identity "
+            "ON album_identity.local_album_id = proof.local_album_id "
+            "AND album_identity.provider = 'musicbrainz' "
+            "AND proof.album_identity_revision = album_identity.row_revision "
+            "AND proof.release_mbid = album_identity.release_mbid "
+            "LEFT JOIN local_track_external_identities track_identity "
+            "ON track_identity.local_track_id = proof.local_track_id "
+            "AND track_identity.provider = 'musicbrainz' "
+            "AND proof.track_identity_revision = track_identity.row_revision "
+            "AND proof.release_track_mbid = track_identity.release_track_mbid "
+            "WHERE proof.source_local_artist_id = ?",
+            (source_artist_id,),
+        ).fetchall()
+        expected = expected_artist_mbid.casefold()
+        if any(row["artist_mbid"] != expected for row in current_proofs):
+            return False
+        if current_proofs:
+            return True
+        accepted_release = connection.execute(
+            "SELECT 1 FROM local_track_artists credit "
+            "JOIN local_tracks track ON track.id = credit.local_track_id "
+            "JOIN local_albums album ON album.id = track.local_album_id "
+            "JOIN local_album_external_identities identity "
+            "ON identity.local_album_id = album.id "
+            "AND identity.provider = 'musicbrainz' "
+            "WHERE credit.local_artist_id = ? "
+            "AND track.availability = 'indexed' "
+            "AND album.retired_into_album_id IS NULL "
+            "AND identity.release_mbid IS NOT NULL LIMIT 1",
+            (source_artist_id,),
+        ).fetchone()
+        return accepted_release is not None
+
+    @staticmethod
     def _finish_artist_reconciliation_work_tx(
         connection: sqlite3.Connection,
         *,
@@ -14665,6 +14715,15 @@ class NativeLibraryStore(PersistenceBase):
                 if not valid or resolved_target is None:
                     continue
                 survivor_id, artist_mbid = resolved_target
+                # F-IDENT-01 (option B, owner 2026-08-20): album-level provider
+                # proof gates every name-anchored retirement. An accepted
+                # MusicBrainz release identity on the source album, or a stored,
+                # revision-valid credit proof row, is required; normalized-name
+                # agreement alone never retires.
+                if not self._album_has_provider_proof_tx(
+                    connection, source_id, artist_mbid
+                ):
+                    continue
                 if (
                     direct_identity is not None
                     and str(direct_identity["provider_artist_id"]).casefold()

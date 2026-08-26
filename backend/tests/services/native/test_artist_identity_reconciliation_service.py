@@ -221,6 +221,17 @@ async def _accept_exact_identity(
         )
 
 
+def connection_state(
+    db_path: Path, album_id: str
+) -> tuple[str, str]:
+    with sqlite3.connect(db_path) as connection:
+        return connection.execute(
+            "SELECT state, reason_code FROM library_artist_reconciliation_state "
+            "WHERE local_album_id = ?",
+            (album_id,),
+        ).fetchone()
+
+
 async def _run_album(
     service: ArtistIdentityReconciliationService,
     store: NativeLibraryStore,
@@ -492,11 +503,63 @@ async def test_incomplete_track_mapping_projects_release_credit_but_does_not_mer
 
 
 @pytest.mark.asyncio
-async def test_provider_anchored_album_artist_absorbs_its_split_track_credit(
+async def test_no_embedded_ids_and_no_proof_do_not_retire_the_split_source(
     store: NativeLibraryStore, db_path: Path
 ) -> None:
+    """F-IDENT-01 option B: the name-anchored convergence path is proof-gated.
+
+    No embedded artist MBIDs and no accepted release identity or stored proof
+    rows means normalized-name agreement alone must not retire the source."""
+    _survivor_id, source_id, album_id = await _seed_provider_anchored_split(store)
+    service = ArtistIdentityReconciliationService(store, AsyncMock(), clock=lambda: 3)
+
+    result = await _run_album(service, store, album_id)
+
+    with sqlite3.connect(db_path) as connection:
+        retired_into = connection.execute(
+            "SELECT retired_into_artist_id FROM local_artists WHERE id = ?",
+            (source_id,),
+        ).fetchone()[0]
+        track_artist_id = connection.execute(
+            "SELECT local_artist_id FROM local_track_artists WHERE local_track_id = 'track-split'"
+        ).fetchone()[0]
+        action_count = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE reason_code = 'AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE'"
+        ).fetchone()[0]
+        aliases = connection.execute(
+            "SELECT COUNT(*) FROM local_artist_aliases WHERE alias = 'source-split'"
+        ).fetchone()[0]
+    assert retired_into is None
+    assert track_artist_id == source_id  # credits untouched
+    assert action_count == 0
+    assert aliases == 0
+    # The proof-gated deferral reports waiting_for_identity, never the
+    # convergence reason code.
+    state = connection_state(db_path, album_id)
+    assert state == ("waiting_for_identity", "EXACT_RELEASE_NOT_ACCEPTED")
+    assert state[1] != "PROVIDER_ANCHORED_ARTISTS_CONVERGED"
+
+
+@pytest.mark.asyncio
+async def test_accepted_release_identity_proves_the_anchor_and_retires(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Album-level proof per F-IDENT-01 option B: an accepted MusicBrainz
+    release identity on the source album authorizes the name-anchored
+    retirement; references migrate through the surviving artist idempotently."""
     survivor_id, source_id, album_id = await _seed_provider_anchored_split(store)
     service = ArtistIdentityReconciliationService(store, AsyncMock(), clock=lambda: 3)
+
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id=album_id,
+            release_group_mbid=RELEASE_GROUP_MBID,
+            release_mbid=RELEASE_MBID,
+            selected_at=2,
+        ),
+        expected_album_revision=1,
+    )
 
     await _run_album(service, store, album_id)
     merge_context = AsyncMock(wraps=store.get_artist_merge_context)
@@ -530,6 +593,27 @@ async def test_provider_anchored_album_artist_absorbs_its_split_track_credit(
     )
     assert progress.automatically_resolved_count == 1
     assert merge_context.await_count == 2
+
+    # Idempotent: re-running the convergence transaction retires nothing
+    # further and never duplicates the automatic action row.
+    repeat_job = await service.enqueue_album(album_id)
+    assert repeat_job is not None
+    repeated = await store.apply_provider_anchored_artist_convergence(
+        album_id,
+        operation_job_id=repeat_job["id"],
+        now=4,
+    )
+    assert repeated["retired_artist_ids"] == []
+    with sqlite3.connect(db_path) as connection:
+        action_total = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE reason_code = 'AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE'"
+        ).fetchone()[0]
+        alias_owner = connection.execute(
+            "SELECT local_artist_id FROM local_artist_aliases WHERE alias = 'source-split'"
+        ).fetchone()[0]
+    assert action_total == 1
+    assert alias_owner == survivor_id
 
 
 @pytest.mark.asyncio
@@ -571,6 +655,17 @@ async def test_embedded_provider_identity_resolves_unanchored_credits_of_same_ar
         store,
         source_id,
         suffix="4",
+    )
+    # Album-level proof (F-IDENT-01 option B): accepted release identity on the
+    # source's own split album authorizes the convergence.
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id=album_id,
+            release_group_mbid=RELEASE_GROUP_MBID,
+            release_mbid=RELEASE_MBID,
+            selected_at=2,
+        ),
+        expected_album_revision=1,
     )
     service = ArtistIdentityReconciliationService(store, AsyncMock(), clock=lambda: 3)
 
@@ -1501,3 +1596,146 @@ async def test_shared_operation_supervisor_dispatches_reconciliation_repair() ->
 
     assert result == "response"
     reconciliation.run_claimed.assert_awaited_once_with(job, "worker")
+
+
+@pytest.mark.asyncio
+async def test_stored_revision_valid_proof_row_authorizes_the_anchor(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """The durable album-level proof row (recorded by credit projection) also
+    satisfies the gate when no accepted identity remains on the album."""
+    import hashlib
+
+    survivor_id, source_id, album_id = await _seed_provider_anchored_split(store)
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id=album_id,
+            release_group_mbid=RELEASE_GROUP_MBID,
+            release_mbid=RELEASE_MBID,
+            selected_at=2,
+        ),
+        expected_album_revision=1,
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_artist_credit_proofs "
+            "(subject_kind, subject_id, local_album_id, local_track_id, credit_position, "
+            "source_local_artist_id, local_artist_id, artist_mbid, canonical_name, "
+            "credited_name, sort_name, join_phrase, release_mbid, release_track_mbid, "
+            "album_identity_revision, track_identity_revision, evidence_hash, created_at, "
+            "updated_at) VALUES ('track', 'track-split', 'album-split', 'track-split', 0, "
+            "?, ?, ?, 'Same Artist', 'Same Artist', 'Artist, Same', '', ?, ?, 1, 1, ?, 5, 5)",
+            (
+                source_id,
+                survivor_id,
+                ARTIST_MBID,
+                RELEASE_MBID,
+                RELEASE_TRACK_MBID,
+                hashlib.sha256(b"evidence").hexdigest(),
+            ),
+        )
+    service = ArtistIdentityReconciliationService(store, AsyncMock(), clock=lambda: 3)
+
+    await _run_album(service, store, album_id)
+
+    with sqlite3.connect(db_path) as connection:
+        retired_into = connection.execute(
+            "SELECT retired_into_artist_id FROM local_artists WHERE id = ?",
+            (source_id,),
+        ).fetchone()[0]
+    assert retired_into == survivor_id
+
+
+@pytest.mark.asyncio
+async def test_conflicting_current_proof_row_blocks_the_anchor_retirement(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A current, revision-valid contradictory proof row vetoes the retirement
+    even though the album carries an accepted release identity."""
+    import hashlib
+
+    survivor_id, source_id, album_id = await _seed_provider_anchored_split(store)
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id=album_id,
+            release_group_mbid=RELEASE_GROUP_MBID,
+            release_mbid=RELEASE_MBID,
+            selected_at=2,
+        ),
+        expected_album_revision=1,
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_artist_credit_proofs "
+            "(subject_kind, subject_id, local_album_id, local_track_id, credit_position, "
+            "source_local_artist_id, local_artist_id, artist_mbid, canonical_name, "
+            "credited_name, sort_name, join_phrase, release_mbid, release_track_mbid, "
+            "album_identity_revision, track_identity_revision, evidence_hash, created_at, "
+            "updated_at) VALUES ('track', 'track-split', 'album-split', 'track-split', 0, "
+            "?, ?, ?, 'Other Artist', 'Other Artist', 'Artist, Other', '', ?, ?, 1, 1, ?, 5, 5)",
+            (
+                source_id,
+                survivor_id,
+                OTHER_ARTIST_MBID,
+                RELEASE_MBID,
+                RELEASE_TRACK_MBID,
+                hashlib.sha256(b"evidence").hexdigest(),
+            ),
+        )
+    service = ArtistIdentityReconciliationService(store, AsyncMock(), clock=lambda: 3)
+
+    await _run_album(service, store, album_id)
+
+    with sqlite3.connect(db_path) as connection:
+        retired_into = connection.execute(
+            "SELECT retired_into_artist_id FROM local_artists WHERE id = ?",
+            (source_id,),
+        ).fetchone()[0]
+        action_count = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE reason_code = 'AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE'"
+        ).fetchone()[0]
+    assert retired_into is None
+    assert action_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_proof_row_without_accepted_identity_does_not_retire(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A stored proof row only counts while it is valid against the current
+    identity revisions; with the accepted identity gone, a row recorded
+    against the old revision cannot satisfy the gate."""
+    import hashlib
+
+    survivor_id, source_id, album_id = await _seed_provider_anchored_split(store)
+    # A proof row left behind by a since-cleared accepted identity: its
+    # album_identity_revision no longer joins any current identity row.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_artist_credit_proofs "
+            "(subject_kind, subject_id, local_album_id, local_track_id, credit_position, "
+            "source_local_artist_id, local_artist_id, artist_mbid, canonical_name, "
+            "credited_name, sort_name, join_phrase, release_mbid, release_track_mbid, "
+            "album_identity_revision, track_identity_revision, evidence_hash, created_at, "
+            "updated_at) VALUES ('track', 'track-split', 'album-split', 'track-split', 0, "
+            "?, ?, ?, 'Same Artist', 'Same Artist', 'Artist, Same', '', ?, ?, 1, 1, ?, 5, 5)",
+            (
+                source_id,
+                survivor_id,
+                ARTIST_MBID,
+                RELEASE_MBID,
+                RELEASE_TRACK_MBID,
+                hashlib.sha256(b"evidence").hexdigest(),
+            ),
+        )
+    service = ArtistIdentityReconciliationService(store, AsyncMock(), clock=lambda: 3)
+
+    await _run_album(service, store, album_id)
+
+    with sqlite3.connect(db_path) as connection:
+        retired_into = connection.execute(
+            "SELECT retired_into_artist_id FROM local_artists WHERE id = ?",
+            (source_id,),
+        ).fetchone()[0]
+    assert retired_into is None
