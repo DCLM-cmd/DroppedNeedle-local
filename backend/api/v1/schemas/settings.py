@@ -658,6 +658,14 @@ class PrimaryMusicSourceSettings(AppStruct):
 _OFFICIAL_MB_RATE_LIMIT = 1.0
 _OFFICIAL_MB_CONCURRENT_SEARCHES = 6
 
+# P2 full-mirror tier (owner decision 2026-08-24): non-official endpoints are
+# user-owned or deliberately chosen infrastructure, so throughput there is a
+# user decision within these widened bounds. rate_limit == 0 is the "Unlimited"
+# sentinel: valid OFF-OFFICIAL ONLY - it bypasses the client-side limiter for
+# that host entirely. The official ceilings below are never raised.
+_MAX_MB_RATE_LIMIT = 500.0
+_MAX_MB_CONCURRENT_SEARCHES = 64
+
 
 def is_official_musicbrainz(url: str) -> bool:
     from urllib.parse import urlparse
@@ -685,22 +693,49 @@ class MusicBrainzConnectionSettings(AppStruct):
     api_url: str = "https://musicbrainz.org/ws/2"
     rate_limit: float = 1.0
     concurrent_searches: int = 6
+    # Surfaced on the save/settings response: True when the official-host clamp
+    # had to force entered values down (or lift a sentinel 0 up) to the official
+    # limits. The frontend renders this as "values were clamped to official
+    # limits" - never a refusal, always applied.
+    clamped_to_official_limits: bool = False
 
     def __post_init__(self) -> None:
         self.api_url = self.api_url.strip()
         if not self.api_url or not self.api_url.startswith(("http://", "https://")):
             self.api_url = "https://musicbrainz.org/ws/2"
         self.api_url = self.api_url.rstrip("/")
+        self.clamped_to_official_limits = False
         if is_official_musicbrainz(self.api_url):
+            before = (self.rate_limit, self.concurrent_searches)
             self.rate_limit = min(self.rate_limit, _OFFICIAL_MB_RATE_LIMIT)
             self.concurrent_searches = min(
                 self.concurrent_searches, _OFFICIAL_MB_CONCURRENT_SEARCHES
             )
-        if self.rate_limit < 0.1 or self.rate_limit > 50.0:
-            raise msgspec.ValidationError("rate_limit must be between 0.1 and 50.0")
-        if self.concurrent_searches < 1 or self.concurrent_searches > 30:
+            # The Unlimited sentinel is off-official only: on the official host
+            # a 0 lifts to the official rate instead of disabling the limiter.
+            if self.rate_limit <= 0:
+                self.rate_limit = _OFFICIAL_MB_RATE_LIMIT
+            self.clamped_to_official_limits = before != (
+                self.rate_limit,
+                self.concurrent_searches,
+            )
+            return
+
+        if (
+            self.rate_limit < 0
+            or (0 < self.rate_limit < 0.1)
+            or (self.rate_limit > _MAX_MB_RATE_LIMIT)
+        ):
             raise msgspec.ValidationError(
-                "concurrent_searches must be between 1 and 30"
+                "rate_limit must be 0 (unlimited) or between 0.1 and "
+                f"{_MAX_MB_RATE_LIMIT}"
+            )
+        if (
+            self.concurrent_searches < 1
+            or self.concurrent_searches > _MAX_MB_CONCURRENT_SEARCHES
+        ):
+            raise msgspec.ValidationError(
+                f"concurrent_searches must be between 1 and {_MAX_MB_CONCURRENT_SEARCHES}"
             )
 
 

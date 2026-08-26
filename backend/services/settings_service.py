@@ -690,8 +690,10 @@ class SettingsService:
             get_mb_api_base,
             set_mb_api_base,
             mb_rate_limiter,
+            mb_rate_limiter_bypassed,
             mb_circuit_breaker,
             mb_deduplicator,
+            set_mb_rate_limiter_bypass,
         )
         from api.v1.schemas.settings import (
             is_official_musicbrainz,
@@ -704,12 +706,17 @@ class SettingsService:
             settings.concurrent_searches = min(
                 settings.concurrent_searches, _OFFICIAL_MB_CONCURRENT_SEARCHES
             )
+            # the Unlimited sentinel is off-official only
+            if settings.rate_limit <= 0:
+                settings.rate_limit = _OFFICIAL_MB_RATE_LIMIT
 
         # Compare against live module state, not stored settings: the route
         # saves before calling this handler, so stored == incoming always.
+        # While the sentinel bypasses the limiter its stored rate is inert.
+        effective_rate = 0.0 if mb_rate_limiter_bypassed() else mb_rate_limiter.rate
         if (
             get_mb_api_base() == settings.api_url
-            and mb_rate_limiter.rate == settings.rate_limit
+            and effective_rate == settings.rate_limit
             and mb_rate_limiter.capacity == settings.concurrent_searches
         ):
             logger.info(
@@ -719,7 +726,11 @@ class SettingsService:
             return
 
         set_mb_api_base(settings.api_url)
-        mb_rate_limiter.update_rate(settings.rate_limit)
+        if settings.rate_limit == 0:
+            set_mb_rate_limiter_bypass(True)
+        else:
+            set_mb_rate_limiter_bypass(False)
+            mb_rate_limiter.update_rate(settings.rate_limit)
         mb_rate_limiter.update_capacity(settings.concurrent_searches)
         mb_circuit_breaker.reset()
         mb_deduplicator.clear()

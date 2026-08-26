@@ -45,6 +45,25 @@ mb_circuit_breaker = CircuitBreaker(
 # A larger bucket preserves the average refill rate but still permits a cold-start burst.
 mb_rate_limiter = TokenBucketRateLimiter(rate=1.0, capacity=1)
 
+# P2 full-mirror tier (owner decision 2026-08-24): rate_limit=0 on a
+# NON-official host means "Unlimited" - the client-side limiter is bypassed
+# entirely for that host. Priority lanes, mb_deduplicator, and the circuit
+# breaker below are NEVER relaxed; only this token bucket is skipped. The
+# official-host defaults above stay pinned; appliers
+# (musicbrainz_repository._apply_settings / settings_service.
+# on_musicbrainz_settings_changed) flip this flag from saved settings.
+_mb_limiter_bypassed = False
+
+
+def set_mb_rate_limiter_bypass(bypass: bool) -> None:
+    global _mb_limiter_bypassed
+    _mb_limiter_bypassed = bypass
+
+
+def mb_rate_limiter_bypassed() -> bool:
+    return _mb_limiter_bypassed
+
+
 mb_deduplicator = RequestDeduplicator()
 
 _http_client: httpx.AsyncClient | None = None
@@ -92,7 +111,8 @@ async def mb_api_get(
     priority_mgr = get_priority_queue()
     semaphore = await priority_mgr.acquire_slot(priority)
     async with semaphore:
-        await mb_rate_limiter.acquire()
+        if not _mb_limiter_bypassed:
+            await mb_rate_limiter.acquire()
         client = get_mb_http_client()
         url = f"{get_mb_api_base()}{path}"
         request_params = dict(params) if params else {}

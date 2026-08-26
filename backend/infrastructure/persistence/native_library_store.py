@@ -131,6 +131,21 @@ from models.local_catalog import (
 MAX_REVISION = 9_223_372_036_854_775_807
 
 
+def _provider_base_url_for(decision_source: str) -> str | None:
+    """P2 full-mirror provenance stamp (owner decision 2026-08-24).
+
+    Auditability ONLY: records which MusicBrainz endpoint class served an
+    accepted AUTOMATIC identity (get_mb_api_base() at capture time). Never
+    read by identity predicates, never gates any decision; manual and
+    legacy_import rows stay NULL by definition.
+    """
+    if decision_source != "automatic":
+        return None
+    from repositories.musicbrainz_base import get_mb_api_base
+
+    return get_mb_api_base()
+
+
 def _has_surrogates(text: str) -> bool:
     """True when the string carries surrogateescape code points (raw
     filesystem bytes that are not valid UTF-8 - F-021)."""
@@ -1293,7 +1308,8 @@ class NativeLibraryStore(PersistenceBase):
                 "ALTER TABLE local_track_external_identities ADD COLUMN release_track_mbid TEXT",
                 "ALTER TABLE local_track_external_identities ADD COLUMN medium_position INTEGER CHECK(medium_position IS NULL OR medium_position > 0)",
                 "ALTER TABLE local_track_external_identities ADD COLUMN release_track_position INTEGER CHECK(release_track_position IS NULL OR release_track_position > 0)",
-                "ALTER TABLE library_management_overrides ADD COLUMN subject_revision INTEGER NOT NULL DEFAULT 1 CHECK(subject_revision BETWEEN 1 AND 9223372036854775807)",
+                "ALTER TABLE local_album_external_identities ADD COLUMN provider_base_url TEXT",
+                "ALTER TABLE local_track_external_identities ADD COLUMN provider_base_url TEXT",
                 "ALTER TABLE library_management_plan_items ADD COLUMN destination_collision_key TEXT",
                 "ALTER TABLE library_management_plan_items ADD COLUMN catalog_document_json TEXT",
                 "ALTER TABLE library_management_plan_items ADD COLUMN catalog_document_hash TEXT",
@@ -6633,7 +6649,8 @@ class NativeLibraryStore(PersistenceBase):
                     "INSERT INTO local_album_external_identities "
                     "(local_album_id, provider, release_group_mbid, release_mbid, "
                     "decision_source, matcher_version, attempt_id, selected_by_user_id, "
-                    "selected_at, row_revision) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "selected_at, row_revision, provider_base_url) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         identity.local_album_id,
                         identity.release_group_mbid,
@@ -6644,13 +6661,15 @@ class NativeLibraryStore(PersistenceBase):
                         identity.selected_by_user_id,
                         identity.selected_at,
                         identity.row_revision,
+                        _provider_base_url_for(identity.decision_source),
                     ),
                 )
             else:
                 updated = connection.execute(
                     "UPDATE local_album_external_identities SET release_group_mbid = ?, "
                     "release_mbid = ?, decision_source = ?, matcher_version = ?, attempt_id = ?, "
-                    "selected_by_user_id = ?, selected_at = ?, row_revision = row_revision + 1 "
+                    "selected_by_user_id = ?, selected_at = ?, row_revision = row_revision + 1, "
+                    "provider_base_url = ? "
                     "WHERE local_album_id = ? AND provider = 'musicbrainz' AND row_revision < ?",
                     (
                         identity.release_group_mbid,
@@ -6660,6 +6679,7 @@ class NativeLibraryStore(PersistenceBase):
                         identity.attempt_id,
                         identity.selected_by_user_id,
                         identity.selected_at,
+                        _provider_base_url_for(identity.decision_source),
                         identity.local_album_id,
                         MAX_REVISION,
                     ),
@@ -7949,14 +7969,16 @@ class NativeLibraryStore(PersistenceBase):
                 connection.execute(
                     "INSERT INTO local_album_external_identities "
                     "(local_album_id, provider, release_group_mbid, release_mbid, decision_source, "
-                    "matcher_version, attempt_id, selected_by_user_id, selected_at) "
-                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?) "
+                    "matcher_version, attempt_id, selected_by_user_id, selected_at, "
+                    "provider_base_url) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(local_album_id, provider) DO UPDATE SET "
                     "release_group_mbid = excluded.release_group_mbid, "
                     "release_mbid = excluded.release_mbid, decision_source = excluded.decision_source, "
                     "matcher_version = excluded.matcher_version, attempt_id = excluded.attempt_id, "
                     "selected_by_user_id = excluded.selected_by_user_id, "
-                    "selected_at = excluded.selected_at, row_revision = row_revision + 1",
+                    "selected_at = excluded.selected_at, row_revision = row_revision + 1, "
+                    "provider_base_url = excluded.provider_base_url",
                     (
                         attempt.local_album_id,
                         selected.release_group_mbid,
@@ -7966,6 +7988,7 @@ class NativeLibraryStore(PersistenceBase):
                         attempt.id,
                         selected_by_user_id,
                         completed_at,
+                        _provider_base_url_for(decision_source),
                     ),
                 )
                 connection.execute(
@@ -7981,15 +8004,16 @@ class NativeLibraryStore(PersistenceBase):
                         "INSERT INTO local_track_external_identities "
                         "(local_track_id, provider, recording_mbid, release_mbid, "
                         "release_track_mbid, medium_position, release_track_position, "
-                        "decision_source, attempt_id, selected_at) "
-                        "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "decision_source, attempt_id, selected_at, provider_base_url) "
+                        "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT(local_track_id, provider) DO UPDATE SET "
                         "recording_mbid = excluded.recording_mbid, release_mbid = excluded.release_mbid, "
                         "release_track_mbid = excluded.release_track_mbid, "
                         "medium_position = excluded.medium_position, "
                         "release_track_position = excluded.release_track_position, "
                         "decision_source = excluded.decision_source, attempt_id = excluded.attempt_id, "
-                        "selected_at = excluded.selected_at, row_revision = row_revision + 1",
+                        "selected_at = excluded.selected_at, row_revision = row_revision + 1, "
+                        "provider_base_url = excluded.provider_base_url",
                         (
                             track.local_track_id,
                             track.recording_mbid,
@@ -8000,6 +8024,7 @@ class NativeLibraryStore(PersistenceBase):
                             decision_source,
                             attempt.id,
                             completed_at,
+                            _provider_base_url_for(decision_source),
                         ),
                     )
                 if (
@@ -23611,21 +23636,26 @@ class NativeLibraryStore(PersistenceBase):
                 for warning in request.management_warnings
             )
         )
-        album_id = next(iter(album_ids))
-        release_group_mbid = str(first_request.release_group_mbid)
-        release_mbid = str(first_request.release_mbid)
         connection.execute(
             "INSERT INTO local_album_external_identities "
             "(local_album_id,provider,release_group_mbid,release_mbid,decision_source,"
-            "matcher_version,attempt_id,selected_by_user_id,selected_at,row_revision) "
-            "VALUES (?,'musicbrainz',?,?,'automatic','import-publisher-v1',NULL,NULL,?,1) "
+            "matcher_version,attempt_id,selected_by_user_id,selected_at,row_revision,"
+            "provider_base_url) "
+            "VALUES (?,'musicbrainz',?,?,'automatic','import-publisher-v1',NULL,NULL,?,1,?) "
             "ON CONFLICT(local_album_id,provider) DO UPDATE SET "
             "release_group_mbid=excluded.release_group_mbid,"
             "release_mbid=excluded.release_mbid,decision_source='automatic',"
             "matcher_version=excluded.matcher_version,attempt_id=NULL,"
             "selected_by_user_id=NULL,selected_at=excluded.selected_at,"
-            "row_revision=local_album_external_identities.row_revision+1",
-            (album_id, release_group_mbid, release_mbid, now),
+            "row_revision=local_album_external_identities.row_revision+1,"
+            "provider_base_url=excluded.provider_base_url",
+            (
+                album_id,
+                release_group_mbid,
+                release_mbid,
+                now,
+                _provider_base_url_for("automatic"),
+            ),
         )
         for (_track_id, _write), request in selected.values():
             if (
@@ -23637,13 +23667,12 @@ class NativeLibraryStore(PersistenceBase):
                 raise ValidationError(
                     "An automatic import lost its accepted release-track mapping."
                 )
-        for ordinal, ((track_id, _write), request) in selected.items():
             connection.execute(
                 "INSERT INTO local_track_external_identities "
                 "(local_track_id,provider,recording_mbid,release_mbid,release_track_mbid,"
                 "medium_position,release_track_position,decision_source,attempt_id,"
-                "selected_at,row_revision) "
-                "VALUES (?,'musicbrainz',?,?,?,?,?,'automatic',NULL,?,1) "
+                "selected_at,row_revision,provider_base_url) "
+                "VALUES (?,'musicbrainz',?,?,?,?,?,'automatic',NULL,?,1,?) "
                 "ON CONFLICT(local_track_id,provider) DO UPDATE SET "
                 "recording_mbid=excluded.recording_mbid,"
                 "release_mbid=excluded.release_mbid,"
@@ -23652,7 +23681,8 @@ class NativeLibraryStore(PersistenceBase):
                 "release_track_position=excluded.release_track_position,"
                 "decision_source='automatic',attempt_id=NULL,"
                 "selected_at=excluded.selected_at,"
-                "row_revision=local_track_external_identities.row_revision+1",
+                "row_revision=local_track_external_identities.row_revision+1,"
+                "provider_base_url=excluded.provider_base_url",
                 (
                     track_id,
                     request.recording_mbid,
@@ -23661,12 +23691,9 @@ class NativeLibraryStore(PersistenceBase):
                     request.medium_position,
                     request.release_track_position,
                     now,
+                    _provider_base_url_for("automatic"),
                 ),
             )
-
-        job_id = operation_job_id or str(
-            uuid.uuid5(_IMPORT_MANAGEMENT_JOB_NAMESPACE, bundle_id)
-        )
         selection_json = json.dumps(
             {"kind": "albums", "ids": [album_id], "import_bundle_id": bundle_id},
             separators=(",", ":"),

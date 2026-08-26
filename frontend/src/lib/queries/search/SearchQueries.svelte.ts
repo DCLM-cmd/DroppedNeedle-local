@@ -48,7 +48,7 @@ export const getLocalArtistSearchQueryOptions = (query: string, limit = 24) =>
 			})
 	});
 
-export const getLocalArtistSearchQuery = (getQuery: Getter<string>, limit = 24) =>
+export const getLocalArtistSearchQuery = (getQuery: Getter<string>, _limit = 24) =>
 	createQuery(() => getLocalArtistSearchQueryOptions(getQuery().trim()));
 
 export const getLocalAlbumSearchQueryOptions = (query: string, limit = 24) =>
@@ -63,7 +63,7 @@ export const getLocalAlbumSearchQueryOptions = (query: string, limit = 24) =>
 			)
 	});
 
-export const getLocalAlbumSearchQuery = (getQuery: Getter<string>, limit = 24) =>
+export const getLocalAlbumSearchQuery = (getQuery: Getter<string>, _limit = 24) =>
 	createQuery(() => getLocalAlbumSearchQueryOptions(getQuery().trim()));
 
 export const getRemoteArtistSearchQuery = (getQuery: Getter<string>, limit = 6) =>

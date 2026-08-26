@@ -604,6 +604,8 @@ The full API reference is in [PLUGINS.md](PLUGINS.md).
 
 All integrations are configured through the web UI. No config files or environment variables needed beyond the basics listed below.
 
+Running your own [MusicBrainz](https://musicbrainz.org/) mirror instead of using the shared public API? See [docs/musicbrainz-mirror-selfhosting.md](docs/musicbrainz-mirror-selfhosting.md).
+
 ---
 
 ## Configuration
