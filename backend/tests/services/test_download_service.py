@@ -1836,3 +1836,67 @@ async def test_upgrade_origin_never_fetches_an_unheld_recording():
 
     assert result == ALREADY_IN_LIBRARY
     store.create_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_import_held_resolves_only_after_source_consumption(tmp_path):
+    """F-INDEXREC-04: a result-aware seam proves import_held resolves the row as
+    imported only after the validated no-op consumed the held source off disk."""
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+    consumption_order: list[str] = []
+
+    async def place(held):
+        # Simulate the validated no-op branch: consume the source, then return.
+        await asyncio.to_thread(Path(held.held_path).unlink, True)
+        consumption_order.append("unlinked")
+        return Path("/music/Led Zeppelin/03 You Shook Me.flac")
+
+    fp.place_held_file = AsyncMock(side_effect=place)
+    svc = _held_service(store, fp)
+
+    final_path = await svc.import_held(hid, "user-a", "user")
+
+    assert final_path.endswith("03 You Shook Me.flac")
+    assert consumption_order == ["unlinked"]
+    assert not held_file.exists()
+    assert await store.list_held_imports("user-a", "user") == []
+    assert await store.has_unresolved_held_for_task("t-1") is False
+
+
+@pytest.mark.asyncio
+async def test_import_held_unlink_failure_leaves_row_retryable(tmp_path):
+    """F-INDEXREC-04 negative boundary: an unlink I/O error inside the no-op
+    branch propagates and the held row is NOT resolved as imported."""
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+
+    async def place(_held):
+        raise OSError("disk I/O error during unlink")
+
+    fp.place_held_file = AsyncMock(side_effect=place)
+    svc = _held_service(store, fp)
+
+    with pytest.raises(OSError, match="disk I/O error"):
+        await svc.import_held(hid, "user-a", "user")
+
+    held = await store.list_held_imports("user-a", "user")
+    assert [value.id for value in held] == [hid]
+    assert await store.has_unresolved_held_for_task("t-1") is True
+    assert held_file.exists()

@@ -383,7 +383,9 @@ async def test_place_held_file_worse_upgrade_keeps_existing(tmp_path: Path):
     assert target == old
     assert old.exists() and old.read_bytes() == b"OLD-BYTES"
     assert _bin_files(bin_path) == []
-    assert held_file.exists()  # duplicate evidence is not deletion authority
+    # F-INDEXREC-04 (DECISIONS-LIVE): the validated redundant no-op consumes the
+    # held source; deletion authority remains limited to this no-op success.
+    assert not held_file.exists()
 
 
 @pytest.mark.asyncio
@@ -410,3 +412,49 @@ async def test_place_held_file_uses_persisted_origin_when_task_is_gone(tmp_path:
     assert Path(target).exists()
     assert not old.exists()
     assert len(_bin_files(bin_path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_place_held_file_same_path_non_upgrade_consumes_source(tmp_path: Path):
+    """F-INDEXREC-04: an occupied same-path target that is not an upgrade is a
+    validated redundant no-op - the destination stays byte-identical and the
+    held source is consumed."""
+    fp, manager, library, _downloads, bin_path = _make(tmp_path)
+    existing = await _seed_existing(
+        manager,
+        library / "Radiohead/OK Computer (1997)/0101 Airbag.flac",
+        file_format="flac",
+        bit_rate=900,
+    )
+    held_file = tmp_path / "held" / "src.flac"
+    held_file.parent.mkdir()
+    shutil.copy(_FLAC, held_file)
+
+    target = await fp.place_held_file(_held(held_file, task_id=None))
+
+    assert Path(target) == existing
+    assert existing.read_bytes() == b"OLD-BYTES"
+    assert not held_file.exists()
+    assert _bin_files(bin_path) == []
+
+
+@pytest.mark.asyncio
+async def test_place_held_file_replace_without_recycle_bin_consumes_source(tmp_path: Path):
+    """F-INDEXREC-04: a same-path upgrade that cannot safely replace (no recycle
+    bin) returns the occupied destination as a no-op and consumes the source."""
+    fp, manager, library, _downloads, bin_path = _make(tmp_path, with_bin=False)
+    existing = await _seed_existing(
+        manager,
+        library / "Radiohead/OK Computer (1997)/0101 Airbag.flac",
+        file_format="mp3",
+        bit_rate=128,  # strictly worse than the held flac
+    )
+    held_file = tmp_path / "held" / "src.flac"
+    held_file.parent.mkdir()
+    shutil.copy(_FLAC, held_file)
+
+    target = await fp.place_held_file(_held(held_file, task_id=None))
+
+    assert Path(target) == existing
+    assert existing.read_bytes() == b"OLD-BYTES"
+    assert not held_file.exists()
