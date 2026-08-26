@@ -977,8 +977,12 @@ class MusicBrainzAlbumMixin:
 
             return rg_id
         except Exception as e:  # noqa: BLE001
+            # F-MATCH-05: a transient provider failure must never become the
+            # definitive empty-string negative cache entry. Only a successfully
+            # decoded response that proves "no release group" may cache that;
+            # here we record degradation and leave the key unset so the next
+            # call can retry once deduplication and the breaker permit it.
             _record_mb_degradation(f"release-to-rg lookup failed: {e}")
-            await self._cache.set(cache_key, "", ttl_seconds=3600)
             return None
 
     async def search_recordings(
@@ -1111,12 +1115,15 @@ class MusicBrainzAlbumMixin:
             await self._cache.set(cache_key, rg_id or "", ttl_seconds=86400)
             return rg_id
         except Exception as e:  # noqa: BLE001
+            # F-MATCH-05: same policy as the release-to-rg helper - a transient
+            # failure records degradation and stays uncached; only a decoded
+            # response proving "no selectable group" may cache the definitive
+            # empty sentinel.
             if not isinstance(e, CircuitOpenError):
                 logger.error(
                     f"Failed to resolve recording {recording_mbid} to release group: {e}"
                 )
             _record_mb_degradation(f"recording-to-rg lookup failed: {e}")
-            await self._cache.set(cache_key, "", ttl_seconds=3600)
             return None
 
     async def get_recording_position_on_release(

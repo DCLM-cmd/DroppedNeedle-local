@@ -1,6 +1,7 @@
 """Tests for MusicBrainzAlbumMixin.get_release_group - the protocol method that maps
 a raw MusicBrainz release-group dict to an AlbumInfo (year/title/artist backfill)."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -102,3 +103,160 @@ async def test_release_to_rg_resolution_threads_priority(monkeypatch):
     api.reset_mock()
     assert await repo.get_release_group_id_from_release("rel-2") == "rg-9"
     assert api.await_args.kwargs["priority"] is RequestPriority.BACKGROUND_SYNC
+
+
+class _RealDictCache:
+    """Functioning in-memory cache so negative-cache writes are observable."""
+
+    def __init__(self) -> None:
+        self.store: dict = {}
+        self.writes: list[tuple] = []
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ttl_seconds=None):
+        self.writes.append((key, value, ttl_seconds))
+        self.store[key] = value
+
+
+def _suffix_repo(cache: _RealDictCache) -> MusicBrainzAlbumMixin:
+    from types import SimpleNamespace
+
+    repo = MusicBrainzAlbumMixin.__new__(MusicBrainzAlbumMixin)
+    repo._cache = cache
+
+    class _Prefs:
+        def get_advanced_settings(self):
+            return SimpleNamespace(cache_ttl_search=60)
+
+    repo._preferences_service = _Prefs()
+    return repo
+
+
+@pytest.mark.asyncio
+async def test_transient_release_to_rg_failure_is_not_negative_cached(
+    monkeypatch,
+) -> None:
+    """F-MATCH-05: a transient release-to-group failure records degradation
+    without writing the definitive empty sentinel; an immediate healthy retry
+    reaches the provider and returns the real group."""
+    import repositories.musicbrainz_album as mb_album
+    from infrastructure.degradation import (
+        clear_degradation_context,
+        init_degradation_context,
+    )
+
+    cache = _RealDictCache()
+    repo = _suffix_repo(cache)
+    calls = {"n": 0}
+
+    async def flaky_get(url, params=None, priority=None, decode_type=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("transient provider failure")
+        return SimpleNamespace(release_group={"id": "rg-real"}, media=[])
+
+    monkeypatch.setattr(mb_album, "mb_api_get", flaky_get)
+
+    ctx = init_degradation_context()
+    try:
+        first = await repo.get_release_group_id_from_release("rel-1")
+        second = await repo.get_release_group_id_from_release("rel-1")
+    finally:
+        clear_degradation_context()
+
+    assert first is None
+    assert second == "rg-real"
+    assert calls["n"] == 2  # the transient failure was not cached
+    assert not any(value == "" for _, value, _ in cache.writes)
+    assert "musicbrainz" in ctx.deterministic_sources() or ctx.has_degradation()
+
+
+@pytest.mark.asyncio
+async def test_transient_recording_to_rg_failure_is_not_negative_cached(
+    monkeypatch,
+) -> None:
+    """Same policy for the recording-to-group helper."""
+    import repositories.musicbrainz_album as mb_album
+    from infrastructure.degradation import clear_degradation_context
+
+    cache = _RealDictCache()
+    repo = _suffix_repo(cache)
+    calls = {"n": 0}
+
+    async def flaky_get(url, params=None, priority=None, decode_type=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("transient provider failure")
+        return SimpleNamespace(
+            releases=[
+                {
+                    "release-group": {"id": "rg-from-recording"},
+                    "status": "Official",
+                    "date": "1997-05-21",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(mb_album, "mb_api_get", flaky_get)
+    try:
+        first = await repo.resolve_recording_to_release_group("rec-1")
+        second = await repo.resolve_recording_to_release_group("rec-1")
+    finally:
+        clear_degradation_context()
+
+    assert first is None
+    assert second == "rg-from-recording"
+    assert calls["n"] == 2
+    assert not any(value == "" for _, value, _ in cache.writes)
+
+
+@pytest.mark.asyncio
+async def test_provider_confirmed_no_group_stays_a_cached_negative(
+    monkeypatch,
+) -> None:
+    """A decoded response proving 'no release group' is the legitimate long
+    negative case: cached for 86400 s and served without another call."""
+    import repositories.musicbrainz_album as mb_album
+
+    cache = _RealDictCache()
+    repo = _suffix_repo(cache)
+    calls = {"n": 0}
+
+    async def no_group_get(url, params=None, priority=None, decode_type=None):
+        calls["n"] += 1
+        # A decoded response with no "release-group" key models as {}.
+        return SimpleNamespace(release_group={}, media=[])
+
+    monkeypatch.setattr(mb_album, "mb_api_get", no_group_get)
+
+    first = await repo.get_release_group_id_from_release("rel-none")
+    second = await repo.get_release_group_id_from_release("rel-none")
+
+    assert first is None and second is None
+    assert calls["n"] == 1
+    assert cache.writes == [("mb:release_to_rg:rel-none", "", 86400)]
+
+
+@pytest.mark.asyncio
+async def test_positive_release_to_rg_result_keeps_existing_ttl_and_value() -> None:
+    from infrastructure.cache.cache_keys import MB_RELEASE_TO_RG_PREFIX
+    import repositories.musicbrainz_album as mb_album
+
+    async def must_not_be_called(url, params=None, priority=None, decode_type=None):
+        raise AssertionError("provider boundary reached on a cached positive")
+
+    cache = _RealDictCache()
+    cache.store[f"{MB_RELEASE_TO_RG_PREFIX}rel-pos"] = "rg-positive"
+    repo = _suffix_repo(cache)
+    monkeypatch_target = mb_album
+    saved = monkeypatch_target.mb_api_get
+    try:
+        monkeypatch_target.mb_api_get = must_not_be_called
+        value = await repo.get_release_group_id_from_release("rel-pos")
+    finally:
+        monkeypatch_target.mb_api_get = saved
+    assert value == "rg-positive"
+    # Served entirely from cache: no provider call, nothing rewritten.
+    assert cache.writes == []
