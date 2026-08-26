@@ -49,6 +49,17 @@ class TestEnqueue:
         assert queue._queue.qsize() == 2
 
     @pytest.mark.asyncio
+    async def test_enqueue_defaults_and_stores_is_monitored(
+        self, queue: AudioDBBrowseQueue
+    ):
+        await queue.enqueue("album", "def-456", name="Parachutes")
+        await queue.enqueue("album", "ghi-789", name="Pylon", is_monitored=True)
+        first = queue._queue.get_nowait()
+        second = queue._queue.get_nowait()
+        assert first.is_monitored is False
+        assert second.is_monitored is True
+
+    @pytest.mark.asyncio
     async def test_enqueue_full_queue_drops(self, queue: AudioDBBrowseQueue):
         queue._queue = asyncio.Queue(maxsize=2)
         await queue.enqueue("artist", "a")
@@ -78,12 +89,16 @@ class TestConsumer:
             pass
 
         mock_audiodb_svc.fetch_and_cache_artist_images.assert_called_once_with(
-            "abc-123", "Coldplay", is_monitored=False,
+            "abc-123",
+            "Coldplay",
+            is_monitored=False,
         )
 
     @pytest.mark.asyncio
     async def test_consumer_processes_album(self, queue, mock_audiodb_svc, mock_prefs):
-        await queue.enqueue("album", "def-456", name="Parachutes", artist_name="Coldplay")
+        await queue.enqueue(
+            "album", "def-456", name="Parachutes", artist_name="Coldplay"
+        )
 
         task = queue.start_consumer(mock_audiodb_svc, mock_prefs)
         await asyncio.sleep(0.05)
@@ -94,12 +109,66 @@ class TestConsumer:
             pass
 
         mock_audiodb_svc.fetch_and_cache_album_images.assert_called_once_with(
-            "def-456", artist_name="Coldplay", album_name="Parachutes", is_monitored=False,
+            "def-456",
+            artist_name="Coldplay",
+            album_name="Parachutes",
+            is_monitored=False,
         )
         assert queue.is_pending("album", "def-456") is False
 
     @pytest.mark.asyncio
-    async def test_consumer_skips_when_disabled(self, queue, mock_audiodb_svc, mock_prefs):
+    async def test_consumer_passes_monitored_flag_for_albums(
+        self, queue, mock_audiodb_svc, mock_prefs
+    ):
+        await queue.enqueue(
+            "album",
+            "def-456",
+            name="Parachutes",
+            artist_name="Coldplay",
+            is_monitored=True,
+        )
+
+        task = queue.start_consumer(mock_audiodb_svc, mock_prefs)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        mock_audiodb_svc.fetch_and_cache_album_images.assert_called_once_with(
+            "def-456",
+            artist_name="Coldplay",
+            album_name="Parachutes",
+            is_monitored=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_consumer_keeps_artist_items_unmonitored(
+        self, queue, mock_audiodb_svc, mock_prefs
+    ):
+        # artist enqueuers never thread the flag today; the consumer must not
+        # start honoring it for artists as a side effect of the album change
+        await queue.enqueue("artist", "abc-123", name="Coldplay", is_monitored=True)
+
+        task = queue.start_consumer(mock_audiodb_svc, mock_prefs)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        mock_audiodb_svc.fetch_and_cache_artist_images.assert_called_once_with(
+            "abc-123",
+            "Coldplay",
+            is_monitored=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_consumer_skips_when_disabled(
+        self, queue, mock_audiodb_svc, mock_prefs
+    ):
         mock_prefs.get_advanced_settings.return_value.audiodb_enabled = False
         await queue.enqueue("artist", "abc-123", name="Coldplay")
 
@@ -115,8 +184,12 @@ class TestConsumer:
         assert queue.is_pending("artist", "abc-123") is False
 
     @pytest.mark.asyncio
-    async def test_consumer_handles_item_error(self, queue, mock_audiodb_svc, mock_prefs, caplog):
-        mock_audiodb_svc.fetch_and_cache_artist_images.side_effect = RuntimeError("boom")
+    async def test_consumer_handles_item_error(
+        self, queue, mock_audiodb_svc, mock_prefs, caplog
+    ):
+        mock_audiodb_svc.fetch_and_cache_artist_images.side_effect = RuntimeError(
+            "boom"
+        )
         await queue.enqueue("artist", "abc-123", name="Coldplay")
 
         caplog.set_level(logging.ERROR, logger="services.audiodb_browse_queue")

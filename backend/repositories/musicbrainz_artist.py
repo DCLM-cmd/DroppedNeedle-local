@@ -10,8 +10,11 @@ from core.exceptions import ExternalServiceError
 from services.preferences_service import PreferencesService
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.cache_keys import (
-    mb_artist_search_key, mb_artist_detail_key,
-    MB_ARTISTS_BY_TAG_PREFIX, MB_ARTIST_RELS_PREFIX,
+    mb_artist_search_key,
+    mb_artist_detail_key,
+    mb_artist_rgs_browse_key,
+    MB_ARTISTS_BY_TAG_PREFIX,
+    MB_ARTIST_RELS_PREFIX,
 )
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
@@ -39,7 +42,9 @@ class _ArtistSearchPayload(msgspec.Struct):
 
 
 class _ArtistReleaseGroupsPayload(msgspec.Struct):
-    release_groups: list[dict[str, Any]] = msgspec.field(name="release-groups", default_factory=list)
+    release_groups: list[dict[str, Any]] = msgspec.field(
+        name="release-groups", default_factory=list
+    )
     release_group_count: int = msgspec.field(name="release-group-count", default=0)
 
 
@@ -64,11 +69,11 @@ class MusicBrainzArtistMixin:
         artist_id = artist.get("id", "")
         if artist_id in FILTERED_ARTIST_MBIDS:
             return None
-        
+
         name = artist.get("name", "Unknown Artist")
         if name.lower() in FILTERED_ARTIST_NAMES:
             return None
-        
+
         return SearchResult(
             type="artist",
             title=name,
@@ -80,10 +85,7 @@ class MusicBrainzArtistMixin:
         )
 
     async def search_artists(
-        self,
-        query: str,
-        limit: int = 10,
-        offset: int = 0
+        self, query: str, limit: int = 10, offset: int = 0
     ) -> list[SearchResult]:
         cache_key = mb_artist_search_key(query, limit, offset)
 
@@ -116,7 +118,9 @@ class MusicBrainzArtistMixin:
                     break
 
             advanced_settings = self._preferences_service.get_advanced_settings()
-            await self._cache.set(cache_key, results, ttl_seconds=advanced_settings.cache_ttl_search)
+            await self._cache.set(
+                cache_key, results, ttl_seconds=advanced_settings.cache_ttl_search
+            )
             return results
         except Exception as e:  # noqa: BLE001
             logger.error(f"MusicBrainz artist search failed: {e}")
@@ -124,10 +128,7 @@ class MusicBrainzArtistMixin:
             return []
 
     async def search_artists_by_tag(
-        self,
-        tag: str,
-        limit: int = 50,
-        offset: int = 0
+        self, tag: str, limit: int = 50, offset: int = 0
     ) -> list[SearchResult]:
         cache_key = f"{MB_ARTISTS_BY_TAG_PREFIX}{tag.lower()}:{limit}:{offset}"
 
@@ -149,10 +150,16 @@ class MusicBrainzArtistMixin:
             artists = result.artists
             artists = dedupe_by_id(artists)
 
-            results = [r for a in artists[:limit] if (r := self._map_artist_to_result(a)) is not None]
+            results = [
+                r
+                for a in artists[:limit]
+                if (r := self._map_artist_to_result(a)) is not None
+            ]
 
             advanced_settings = self._preferences_service.get_advanced_settings()
-            await self._cache.set(cache_key, results, ttl_seconds=advanced_settings.cache_ttl_search * 2)
+            await self._cache.set(
+                cache_key, results, ttl_seconds=advanced_settings.cache_ttl_search * 2
+            )
             return results
         except Exception as e:  # noqa: BLE001
             logger.error(f"MusicBrainz artist tag search failed for '{tag}': {e}")
@@ -167,7 +174,9 @@ class MusicBrainzArtistMixin:
             return cached
 
         dedupe_key = f"mb:artist:{mbid}"
-        return await mb_deduplicator.dedupe(dedupe_key, lambda: self._fetch_artist_by_id(mbid, cache_key))
+        return await mb_deduplicator.dedupe(
+            dedupe_key, lambda: self._fetch_artist_by_id(mbid, cache_key)
+        )
 
     async def get_artist_relations(self, mbid: str) -> dict | None:
         detail_key = mb_artist_detail_key(mbid)
@@ -181,7 +190,9 @@ class MusicBrainzArtistMixin:
             return cached_rels
 
         dedupe_key = f"{MB_ARTIST_RELS_PREFIX}{mbid}"
-        return await mb_deduplicator.dedupe(dedupe_key, lambda: self._fetch_artist_relations(mbid, rels_key))
+        return await mb_deduplicator.dedupe(
+            dedupe_key, lambda: self._fetch_artist_relations(mbid, rels_key)
+        )
 
     async def _fetch_artist_relations(self, mbid: str, cache_key: str) -> dict | None:
         try:
@@ -233,9 +244,12 @@ class MusicBrainzArtistMixin:
             await self._cache.set(cache_key, artist_result, ttl_seconds=21600)
 
             from core.task_registry import TaskRegistry
+
             registry = TaskRegistry.get_instance()
             if not registry.is_running("mb-release-group-warmup"):
-                _rg_task = asyncio.create_task(self._warm_release_group_cache(all_release_groups[:6]))
+                _rg_task = asyncio.create_task(
+                    self._warm_release_group_cache(all_release_groups[:6])
+                )
                 try:
                     registry.register("mb-release-group-warmup", _rg_task)
                 except RuntimeError:
@@ -247,13 +261,17 @@ class MusicBrainzArtistMixin:
             _record_mb_degradation(f"artist fetch failed: {e}")
             return None
 
-    async def _warm_release_group_cache(self, release_groups: list[dict[str, Any]]) -> None:
+    async def _warm_release_group_cache(
+        self, release_groups: list[dict[str, Any]]
+    ) -> None:
         for rg in release_groups:
             rg_id = rg.get("id")
             if not rg_id:
                 continue
             try:
-                await self.get_release_group_by_id(rg_id, priority=RequestPriority.BACKGROUND_SYNC)
+                await self.get_release_group_by_id(
+                    rg_id, priority=RequestPriority.BACKGROUND_SYNC
+                )
             except (CircuitOpenError, ExternalServiceError, httpx.HTTPError):
                 pass
 
@@ -277,7 +295,9 @@ class MusicBrainzArtistMixin:
 
             return release_groups, total_count
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to fetch release groups for artist {artist_mbid} at offset {offset}: {e}")
+            logger.error(
+                f"Failed to fetch release groups for artist {artist_mbid} at offset {offset}: {e}"
+            )
             _record_mb_degradation(f"release groups failed: {e}")
             return [], 0
 
@@ -286,6 +306,7 @@ class MusicBrainzArtistMixin:
         artist_mbid: str,
         offset: int = 0,
         limit: int = 50,
+        priority: RequestPriority = RequestPriority.BACKGROUND_SYNC,
     ) -> tuple[list[dict[str, Any]], int]:
         """Like get_artist_release_groups but PROPAGATES failures (CircuitOpenError,
         ExternalServiceError, httpx errors) instead of masking them as an empty
@@ -295,7 +316,7 @@ class MusicBrainzArtistMixin:
         result = await mb_api_get(
             "/release-group",
             params={"artist": artist_mbid, "limit": limit, "offset": offset},
-            priority=RequestPriority.BACKGROUND_SYNC,
+            priority=priority,
             decode_type=_ArtistReleaseGroupsPayload,
         )
         return result.release_groups, int(result.release_group_count)
@@ -306,7 +327,52 @@ class MusicBrainzArtistMixin:
         limit: int = 10,
         priority: RequestPriority = RequestPriority.BACKGROUND_SYNC,
     ) -> list[dict[str, Any]]:
-        release_groups, _ = await self.get_artist_release_groups(
-            artist_mbid, offset=0, limit=limit, priority=priority
+        """QW1: single-page artist->RG browse with cache-aside + coalescing.
+
+        Previously a cache-free wrapper, so every more-by-artist render paid
+        one wire call against the 1 req/s bucket. Now: positive entries TTL
+        3600 s, genuinely-empty results negative-cached briefly (600 s), and
+        concurrent cold callers share one wire call via mb_deduplicator.
+        Failures are NEVER cached - they propagate after recording degradation
+        so outages cannot poison the cache (same rationale as
+        musicbrainz_album._fetch_release_group_by_id).
+        """
+        cache_key = mb_artist_rgs_browse_key(artist_mbid, limit)
+
+        cached = await self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        return await mb_deduplicator.dedupe(
+            cache_key,
+            lambda: self._fetch_browse_release_groups(
+                artist_mbid, limit, priority, cache_key
+            ),
         )
+
+    async def _fetch_browse_release_groups(
+        self,
+        artist_mbid: str,
+        limit: int,
+        priority: RequestPriority,
+        cache_key: str,
+    ) -> list[dict[str, Any]]:
+        try:
+            release_groups, _total = await self.get_artist_release_groups_or_raise(
+                artist_mbid, offset=0, limit=limit, priority=priority
+            )
+        except Exception as e:  # noqa: BLE001 - telemetry then re-raise (QW1)
+            # Same message site as the old swallowing variant; propagation is
+            # what keeps failures distinguishable from "genuinely zero RGs".
+            logger.error(
+                f"Failed to fetch release groups for artist {artist_mbid}: {e}"
+            )
+            _record_mb_degradation(f"release groups failed: {e}")
+            raise
+        if release_groups:
+            await self._cache.set(cache_key, release_groups, ttl_seconds=3600)
+        else:
+            # Genuinely empty discography: short negative cache so a dead-end
+            # artist page isn't re-browsed on every view.
+            await self._cache.set(cache_key, [], ttl_seconds=600)
         return release_groups

@@ -294,6 +294,17 @@ def mb_artist_release_groups_key(artist_mbid: str) -> str:
     return f"{MB_ARTIST_RGS_PREFIX}{artist_mbid.casefold()}"
 
 
+def mb_artist_rgs_browse_key(artist_mbid: str, limit: int) -> str:
+    """Key for the single-page artist->release-groups browse (QW1).
+
+    Extends MB_ARTIST_RGS_PREFIX, so it is swept by musicbrainz_prefixes()
+    consumers without any new prefix-list membership. Collision-safe: the
+    sibling builder above stores bare casefolded MBIDs and MBIDs never
+    contain ':', so the ':browse:' segment cannot collide.
+    """
+    return f"{MB_ARTIST_RGS_PREFIX}{artist_mbid.casefold()}:browse:{limit}"
+
+
 def mb_release_group_key(mbid: str, includes: Optional[list[str]] = None) -> str:
     includes_str = ",".join(sorted(includes)) if includes else "default"
     return f"{MB_RG_DETAIL_PREFIX}{mbid}:{includes_str}"

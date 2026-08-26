@@ -957,27 +957,78 @@ class ListenBrainzRepository:
     ) -> dict[str, int]:
         """Get listen counts for multiple release groups in a single call.
 
-        Returns a dict mapping mbid -> total_listen_count.
+        B4 Change 2: per-MBID cache-aside in front of the popularity POST.
+        Keys ``{LB_PREFIX}rg_popularity:{mbid}`` join listenbrainz_prefixes()
+        sweeps with zero new wiring. TTL 3600 s mirrors the sibling artist
+        popularity cache; MBIDs absent from a successful response are
+        negative-cached with the house False sentinel at 300 s so obscure
+        release groups don't re-POST on every view.
+
+        Poisoning guards - an outage must never read as "zero listens":
+        nothing is written when lb_popularity_degraded() short-circuits,
+        when the POST raises, or when the response is not a well-formed list.
+        Concurrent identical batches share one leader via
+        _metadata_deduplicator (recording-metadata precedent).
         """
         if not release_group_mbids:
             return {}
+
+        unique_mbids = list(dict.fromkeys(release_group_mbids))
+        keys = {mbid: f"{LB_PREFIX}rg_popularity:{mbid}" for mbid in unique_mbids}
+
+        cached_values = await asyncio.gather(
+            *(self._cache.get(key) for key in keys.values())
+        )
+        counts: dict[str, int] = {}
+        misses: list[str] = []
+        for mbid, cached in zip(unique_mbids, cached_values):
+            if cached is None:
+                misses.append(mbid)
+            elif isinstance(cached, int) and not isinstance(cached, bool):
+                counts[mbid] = cached
+            # False sentinel: known-absent within its short TTL - no value,
+            # and no reason to hit the wire again yet.
+
+        if not misses:
+            return counts
 
         if lb_popularity_degraded():
             _record_degradation("ListenBrainz popularity is temporarily unavailable")
             return {}
 
-        result = await self._post(
-            "/1/popularity/release-group", {"release_group_mbids": release_group_mbids}
+        sorted_misses = sorted(misses)
+        dedupe_key = "listenbrainz:rg-popularity:" + ",".join(sorted_misses)
+        result = await _metadata_deduplicator.dedupe(
+            dedupe_key,
+            lambda: self._post(
+                "/1/popularity/release-group", {"release_group_mbids": sorted_misses}
+            ),
         )
-        if not result or not isinstance(result, list):
-            return {}
+        if result is None or not isinstance(result, list):
+            # Malformed/absent payload = outage signal, never "zero listens":
+            # write nothing. A well-formed empty LIST is legitimate - it
+            # negative-caches all misses below.
+            return counts
 
-        counts: dict[str, int] = {}
+        found: list[str] = []
         for item in result:
             mbid = item.get("release_group_mbid")
             count = item.get("total_listen_count")
             if mbid and count is not None:
                 counts[mbid] = count
+                found.append(mbid)
+
+        await asyncio.gather(
+            *(
+                self._cache.set(keys[mbid], counts[mbid], ttl_seconds=3600)
+                for mbid in found
+            ),
+            *(
+                self._cache.set(keys[mbid], False, ttl_seconds=300)
+                for mbid in sorted_misses
+                if mbid not in counts
+            ),
+        )
         return counts
 
     def is_configured(self) -> bool:

@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from infrastructure.queue.priority_queue import RequestPriority
 from repositories.lastfm_models import LastFmAlbum
 from services.artist_discovery_service import ArtistDiscoveryService
 
@@ -88,7 +89,7 @@ class TestLastFmTopAlbumsCanonicalization:
         assert len(result.albums) == 3
         mb_repo.get_release_group_id_from_release.assert_not_awaited()
         mb_repo.get_release_groups_by_artist.assert_awaited_once_with(
-            ARTIST_MBID, limit=100
+            ARTIST_MBID, limit=100, priority=RequestPriority.USER_INITIATED
         )
 
     @pytest.mark.asyncio

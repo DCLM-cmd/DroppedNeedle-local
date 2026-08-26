@@ -8,7 +8,11 @@ from api.v1.schemas.discovery import (
     SimilarAlbumsResponse,
     MoreByArtistResponse,
 )
-from repositories.protocols import ListenBrainzRepositoryProtocol, MusicBrainzRepositoryProtocol, LibraryRepositoryProtocol
+from repositories.protocols import (
+    ListenBrainzRepositoryProtocol,
+    MusicBrainzRepositoryProtocol,
+    LibraryRepositoryProtocol,
+)
 from repositories.listenbrainz_repository import lb_popularity_degraded
 from infrastructure.persistence import LibraryDB
 from infrastructure.queue.priority_queue import RequestPriority
@@ -68,14 +72,16 @@ class AlbumDiscoveryService:
             return SimilarAlbumsResponse(configured=False)
 
         try:
-            similar_artists = await lb_repo.get_similar_artists(artist_mbid, max_similar=5)
+            similar_artists = await lb_repo.get_similar_artists(
+                artist_mbid, max_similar=5
+            )
             if not similar_artists:
                 return SimilarAlbumsResponse(albums=[])
 
             try:
                 library_album_mbids, requested_album_mbids = await asyncio.gather(
                     self._library_repo.get_library_mbids(),
-                    self._library_repo.get_requested_mbids()
+                    self._library_repo.get_requested_mbids(),
                 )
             except Exception:  # noqa: BLE001
                 library_album_mbids = set()
@@ -88,8 +94,12 @@ class AlbumDiscoveryService:
                 lfm_repo = await self._resolve_lastfm(user_id)
                 if lfm_repo is not None:
                     fb = await self._similar_albums_lastfm(
-                        similar_artists[:5], album_mbid, count,
-                        library_album_mbids, requested_album_mbids, lfm_repo,
+                        similar_artists[:5],
+                        album_mbid,
+                        count,
+                        library_album_mbids,
+                        requested_album_mbids,
+                        lfm_repo,
                     )
                     if fb:
                         return SimilarAlbumsResponse(albums=fb[:count])
@@ -108,14 +118,16 @@ class AlbumDiscoveryService:
                 for rg in result:
                     if rg.release_group_mbid and rg.release_group_mbid != album_mbid:
                         mbid_lower = rg.release_group_mbid.lower()
-                        albums.append(DiscoveryAlbum(
-                            musicbrainz_id=rg.release_group_mbid,
-                            title=rg.release_group_name,
-                            artist_name=artist.artist_name,
-                            artist_id=artist.artist_mbid,
-                            in_library=mbid_lower in library_album_mbids,
-                            requested=mbid_lower in requested_album_mbids,
-                        ))
+                        albums.append(
+                            DiscoveryAlbum(
+                                musicbrainz_id=rg.release_group_mbid,
+                                title=rg.release_group_name,
+                                artist_name=artist.artist_name,
+                                artist_id=artist.artist_mbid,
+                                in_library=mbid_lower in library_album_mbids,
+                                requested=mbid_lower in requested_album_mbids,
+                            )
+                        )
                         if len(albums) >= count:
                             break
                 if len(albums) >= count:
@@ -128,8 +140,12 @@ class AlbumDiscoveryService:
                 lfm_repo = await self._resolve_lastfm(user_id)
                 if lfm_repo is not None:
                     fb = await self._similar_albums_lastfm(
-                        similar_artists[:5], album_mbid, count,
-                        library_album_mbids, requested_album_mbids, lfm_repo,
+                        similar_artists[:5],
+                        album_mbid,
+                        count,
+                        library_album_mbids,
+                        requested_album_mbids,
+                        lfm_repo,
                     )
                     if fb:
                         return SimilarAlbumsResponse(albums=fb[:count])
@@ -140,15 +156,22 @@ class AlbumDiscoveryService:
             return SimilarAlbumsResponse(albums=[])
 
     async def _similar_albums_lastfm(
-        self, similar_artists: list, album_mbid: str, count: int,
-        library_album_mbids: set, requested_album_mbids: set, lfm_repo,
+        self,
+        similar_artists: list,
+        album_mbid: str,
+        count: int,
+        library_album_mbids: set,
+        requested_album_mbids: set,
+        lfm_repo,
     ) -> list:
         """Build similar-album candidates from Last.fm top-albums per similar artist,
         resolving release-group MBIDs via the shared resolver (used only when LB
         popularity is degraded)."""
         top = await asyncio.gather(
             *(
-                lfm_repo.get_artist_top_albums(a.artist_name, mbid=a.artist_mbid, limit=3)
+                lfm_repo.get_artist_top_albums(
+                    a.artist_name, mbid=a.artist_mbid, limit=3
+                )
                 for a in similar_artists
             ),
             return_exceptions=True,
@@ -157,7 +180,12 @@ class AlbumDiscoveryService:
         for artist, albums in zip(similar_artists, top):
             if isinstance(albums, Exception) or not albums:
                 continue
-            pairs.append((SimpleNamespace(mbid=artist.artist_mbid, name=artist.artist_name), albums))
+            pairs.append(
+                (
+                    SimpleNamespace(mbid=artist.artist_mbid, name=artist.artist_name),
+                    albums,
+                )
+            )
         if not pairs:
             return []
         items = await self._mbid.lastfm_albums_to_queue_items(
@@ -166,14 +194,16 @@ class AlbumDiscoveryService:
         albums: list[DiscoveryAlbum] = []
         for it in items:
             mbid_lower = it.release_group_mbid.lower()
-            albums.append(DiscoveryAlbum(
-                musicbrainz_id=it.release_group_mbid,
-                title=it.album_name,
-                artist_name=it.artist_name,
-                artist_id=it.artist_mbid or None,
-                in_library=mbid_lower in library_album_mbids,
-                requested=mbid_lower in requested_album_mbids,
-            ))
+            albums.append(
+                DiscoveryAlbum(
+                    musicbrainz_id=it.release_group_mbid,
+                    title=it.album_name,
+                    artist_name=it.artist_name,
+                    artist_id=it.artist_mbid or None,
+                    in_library=mbid_lower in library_album_mbids,
+                    requested=mbid_lower in requested_album_mbids,
+                )
+            )
         return albums
 
     async def get_more_by_artist(
@@ -181,7 +211,11 @@ class AlbumDiscoveryService:
         artist_mbid: str,
         exclude_album_mbid: str,
         count: int = 10,
-        priority: RequestPriority = RequestPriority.BACKGROUND_SYNC,
+        # QW1 Part B: inline-awaited user-facing section - BACKGROUND_SYNC
+        # parked it behind the 2 s user-inactivity gate that this same page
+        # load keeps resetting (indefinite deferral). USER_INITIATED acquires
+        # immediately; steady-state hits return from cache before any slot.
+        priority: RequestPriority = RequestPriority.USER_INITIATED,
     ) -> MoreByArtistResponse:
         try:
             release_groups = await self._mb_repo.get_release_groups_by_artist(
@@ -195,7 +229,7 @@ class AlbumDiscoveryService:
             try:
                 library_album_mbids, requested_album_mbids = await asyncio.gather(
                     self._library_repo.get_library_mbids(),
-                    self._library_repo.get_requested_mbids()
+                    self._library_repo.get_requested_mbids(),
                 )
             except Exception:  # noqa: BLE001
                 library_album_mbids = set()
@@ -223,15 +257,17 @@ class AlbumDiscoveryService:
                         pass
 
                 mbid_lower = rg_mbid.lower()
-                albums.append(DiscoveryAlbum(
-                    musicbrainz_id=rg_mbid,
-                    title=rg.get("title", "Unknown"),
-                    artist_name=artist_name,
-                    artist_id=artist_mbid,
-                    year=year,
-                    in_library=mbid_lower in library_album_mbids,
-                    requested=mbid_lower in requested_album_mbids,
-                ))
+                albums.append(
+                    DiscoveryAlbum(
+                        musicbrainz_id=rg_mbid,
+                        title=rg.get("title", "Unknown"),
+                        artist_name=artist_name,
+                        artist_id=artist_mbid,
+                        year=year,
+                        in_library=mbid_lower in library_album_mbids,
+                        requested=mbid_lower in requested_album_mbids,
+                    )
+                )
 
                 if len(albums) >= count:
                     break

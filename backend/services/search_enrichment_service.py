@@ -1,5 +1,7 @@
+import asyncio
 import logging
-from typing import Optional
+from collections.abc import Awaitable, Sequence
+from typing import Optional, TypeVar
 
 from api.v1.schemas.search import (
     AlbumEnrichment,
@@ -23,6 +25,30 @@ from services.preferences_service import PreferencesService
 logger = logging.getLogger(__name__)
 
 MAX_ENRICHMENT = 10
+
+# B4: equals the repository's own _request_semaphore, so the service cannot
+# amplify in-flight pressure beyond what ListenBrainzRepository already
+# tolerates; <=10-item batches never stress the 5/s token bucket either.
+_ENRICH_CONCURRENCY = 2
+
+_T = TypeVar("_T")
+
+
+async def _gather_bounded(
+    coros: Sequence[Awaitable[_T]],
+) -> list[_T | BaseException]:
+    """Run coroutines with at most _ENRICH_CONCURRENCY in flight, preserving
+    input order (house pattern: library_service._resolve_one,
+    homepage_service warmers). Exceptions surface as entries, not raises."""
+    semaphore = asyncio.Semaphore(_ENRICH_CONCURRENCY)
+
+    async def _run(coro: Awaitable[_T]) -> _T:
+        async with semaphore:
+            return await coro
+
+    return list(
+        await asyncio.gather(*(_run(coro) for coro in coros), return_exceptions=True)
+    )
 
 
 def _record_optional_degradation(source: str) -> None:
@@ -118,16 +144,21 @@ class SearchEnrichmentService:
                 for req in artist_requests
             ]
         else:
-            artists = []
-            for req in artist_requests:
-                artists.append(
-                    await self._enrich_artist(
-                        req.musicbrainz_id,
-                        source,
-                        name=req.name,
-                        is_disconnected=is_disconnected,
-                    )
-                )
+            artists = self._resolve_gathered(
+                await _gather_bounded(
+                    [
+                        self._enrich_artist(
+                            req.musicbrainz_id,
+                            source,
+                            name=req.name,
+                            is_disconnected=is_disconnected,
+                        )
+                        for req in artist_requests
+                    ]
+                ),
+                artist_requests,
+                lambda req: ArtistEnrichment(musicbrainz_id=req.musicbrainz_id),
+            )
 
         await check_disconnected(is_disconnected)
         albums: list[AlbumEnrichment]
@@ -152,16 +183,21 @@ class SearchEnrichmentService:
                 for req in album_requests
             ]
         elif source == "lastfm" and album_requests and self._lastfm_repo:
-            albums = []
-            for req in album_requests:
-                albums.append(
-                    await self._enrich_album_lastfm(
-                        req.musicbrainz_id,
-                        req.artist_name,
-                        req.album_name,
-                        is_disconnected=is_disconnected,
-                    )
-                )
+            albums = self._resolve_gathered(
+                await _gather_bounded(
+                    [
+                        self._enrich_album_lastfm(
+                            req.musicbrainz_id,
+                            req.artist_name,
+                            req.album_name,
+                            is_disconnected=is_disconnected,
+                        )
+                        for req in album_requests
+                    ]
+                ),
+                album_requests,
+                lambda req: AlbumEnrichment(musicbrainz_id=req.musicbrainz_id),
+            )
         else:
             albums = [
                 AlbumEnrichment(musicbrainz_id=req.musicbrainz_id)
@@ -170,6 +206,27 @@ class SearchEnrichmentService:
 
         await check_disconnected(is_disconnected)
         return EnrichmentResponse(artists=artists, albums=albums, source=source)
+
+    @staticmethod
+    def _resolve_gathered(results, requests, make_fallback):
+        """B4 post-scan: map gathered results back onto their requests in
+        order (gather preserves input order).
+
+        ClientDisconnectedError (and non-Exception BaseExceptions such as
+        CancelledError) re-raise to preserve the early-abort contract; any
+        other exception entry degrades to the bare fallback object, matching
+        what each _enrich_* helper's own except-branch returns today."""
+        resolved = []
+        for res, req in zip(results, requests):
+            if isinstance(res, ClientDisconnectedError):
+                raise res
+            if isinstance(res, BaseException) and not isinstance(res, Exception):
+                raise res
+            if isinstance(res, BaseException):
+                resolved.append(make_fallback(req))
+            else:
+                resolved.append(res)
+        return resolved
 
     async def _enrich_artist(
         self,

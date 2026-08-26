@@ -105,7 +105,8 @@ class AlbumService:
         album_name: str | None = None,
         *,
         allow_fetch: bool = False,
-    ) -> str | None:
+        is_monitored: bool = False,
+    ) -> Optional[str]:
         if self._audiodb_image_service is None:
             return None
         try:
@@ -130,6 +131,7 @@ class AlbumService:
                         release_group_id,
                         name=album_name,
                         artist_name=artist_name,
+                        is_monitored=is_monitored,
                     )
         except Exception as e:  # noqa: BLE001 - normalize unexpected track composition failures
             logger.warning(
@@ -171,6 +173,7 @@ class AlbumService:
                             release_group_mbid,
                             name=album_name,
                             artist_name=artist_name,
+                            is_monitored=is_monitored,
                         )
                 return album_info
             album_info.album_thumb_url = images.album_thumb_url
@@ -296,7 +299,7 @@ class AlbumService:
                     release_group_id,
                     cached.artist_name,
                     cached.title,
-                    allow_fetch=True,
+                    allow_fetch=False,
                     is_monitored=cached.in_library,
                 )
                 return cached
@@ -346,7 +349,7 @@ class AlbumService:
             release_group_id,
             album_info.artist_name,
             album_info.title,
-            allow_fetch=True,
+            allow_fetch=False,
             is_monitored=album_info.in_library,
         )
         await self._save_album_to_cache(release_group_id, album_info)
@@ -385,6 +388,7 @@ class AlbumService:
                         cached_album_info.artist_name,
                         cached_album_info.title,
                         allow_fetch=False,
+                        is_monitored=in_library,
                     )
                 return AlbumBasicInfo(
                     title=cached_album_info.title,
@@ -422,6 +426,7 @@ class AlbumService:
                 basic.artist_name,
                 basic.title,
                 allow_fetch=False,
+                is_monitored=in_library,
             )
             return basic
 

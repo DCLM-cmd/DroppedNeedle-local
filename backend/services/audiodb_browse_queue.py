@@ -22,6 +22,7 @@ class BrowseQueueItem(msgspec.Struct):
     mbid: str
     name: str | None = None
     artist_name: str | None = None
+    is_monitored: bool = False
 
 
 class AudioDBBrowseQueue:
@@ -39,6 +40,7 @@ class AudioDBBrowseQueue:
         mbid: str,
         name: str | None = None,
         artist_name: str | None = None,
+        is_monitored: bool = False,
     ) -> None:
         now = time.monotonic()
         self._evict_expired(now)
@@ -56,6 +58,7 @@ class AudioDBBrowseQueue:
             mbid=mbid,
             name=name,
             artist_name=artist_name,
+            is_monitored=is_monitored,
         )
         self._queue.put_nowait(item)
         self._pending.add((entity_type, mbid))
@@ -72,20 +75,23 @@ class AudioDBBrowseQueue:
 
     def start_consumer(
         self,
-        audiodb_image_service: 'AudioDBImageService',
-        preferences_service: 'PreferencesService',
+        audiodb_image_service: "AudioDBImageService",
+        preferences_service: "PreferencesService",
     ) -> asyncio.Task:
         self._consumer_task = asyncio.create_task(
             self._process_queue(audiodb_image_service, preferences_service)
         )
         from core.task_registry import TaskRegistry
-        TaskRegistry.get_instance().register("audiodb-browse-consumer", self._consumer_task)
+
+        TaskRegistry.get_instance().register(
+            "audiodb-browse-consumer", self._consumer_task
+        )
         return self._consumer_task
 
     async def _process_queue(
         self,
-        svc: 'AudioDBImageService',
-        preferences_service: 'PreferencesService',
+        svc: "AudioDBImageService",
+        preferences_service: "PreferencesService",
     ) -> None:
         processed = 0
         try:
@@ -99,12 +105,16 @@ class AudioDBBrowseQueue:
 
                     if item.entity_type == "artist":
                         await svc.fetch_and_cache_artist_images(
-                            item.mbid, item.name, is_monitored=False,
+                            item.mbid,
+                            item.name,
+                            is_monitored=False,
                         )
                     elif item.entity_type == "album":
                         await svc.fetch_and_cache_album_images(
-                            item.mbid, artist_name=item.artist_name,
-                            album_name=item.name, is_monitored=False,
+                            item.mbid,
+                            artist_name=item.artist_name,
+                            album_name=item.name,
+                            is_monitored=item.is_monitored,
                         )
 
                     processed += 1

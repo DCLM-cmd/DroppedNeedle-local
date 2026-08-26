@@ -1,8 +1,10 @@
 """Integration-level tests for the artist/album detail → AudioDB enrichment flows.
 
-Covers the critical paths identified in Phase 3 peer review:
-- Cached artist/album objects still receive AudioDB enrichment (allow_fetch=True)
-- Album basic info endpoint performs on-demand AudioDB fetch
+Covers the critical paths identified in Phase 3 peer review (reversed for albums by B10):
+- Cached artist objects still receive AudioDB enrichment (allow_fetch=True)
+- Cached album objects receive AudioDB enrichment from cache only (allow_fetch=False);
+  misses enqueue the background browse queue instead of fetching inline
+- Album basic info endpoint applies cached AudioDB images (no network fetch on critical path)
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,8 +13,9 @@ import pytest
 
 from api.v1.schemas.artist import ArtistInfo
 from api.v1.schemas.album import AlbumInfo, AlbumBasicInfo
-from repositories.audiodb_models import AudioDBArtistImages, AudioDBAlbumImages
+from services.audiodb_browse_queue import AudioDBBrowseQueue
 from services.artist_service import ArtistService
+from repositories.audiodb_models import AudioDBArtistImages, AudioDBAlbumImages
 from services.album_service import AlbumService
 
 
@@ -87,13 +90,16 @@ def _artist_service(audiodb=None) -> ArtistService:
     )
 
 
-def _album_service(audiodb=None) -> AlbumService:
+def _album_service(
+    audiodb=None, browse_queue: AudioDBBrowseQueue | None = None
+) -> AlbumService:
     if audiodb is None:
         audiodb = MagicMock()
     prefs = MagicMock()
     adv = MagicMock()
     adv.cache_ttl_album_library = 86400
     adv.cache_ttl_album_non_library = 3600
+    adv.audiodb_enabled = True
     prefs.get_advanced_settings.return_value = adv
     library_db = MagicMock()
     library_db.resolve_library_album_identifier = AsyncMock(return_value=None)
@@ -105,6 +111,7 @@ def _album_service(audiodb=None) -> AlbumService:
         disk_cache=MagicMock(),
         preferences_service=prefs,
         audiodb_image_service=audiodb,
+        audiodb_browse_queue=browse_queue,
     )
 
 
@@ -144,7 +151,9 @@ class TestArtistDetailCacheHitEnrichment:
     @pytest.mark.asyncio
     async def test_cached_artist_audiodb_failure_returns_cached(self):
         audiodb = MagicMock()
-        audiodb.get_cached_artist_images = AsyncMock(side_effect=RuntimeError("unavailable"))
+        audiodb.get_cached_artist_images = AsyncMock(
+            side_effect=RuntimeError("unavailable")
+        )
         svc = _artist_service(audiodb)
         cached = _cached_artist()
         svc._cache = MagicMock()
@@ -157,12 +166,13 @@ class TestArtistDetailCacheHitEnrichment:
 
 
 class TestAlbumDetailCacheHitEnrichment:
-    """get_album_info() must apply AudioDB images even on cache hit."""
+    """get_album_info() must apply AudioDB images even on cache hit - from cache
+    (B10: never an inline fetch; misses enqueue the background browse queue)."""
 
     @pytest.mark.asyncio
     async def test_cached_album_gets_audiodb_enrichment(self):
         audiodb = MagicMock()
-        audiodb.fetch_and_cache_album_images = AsyncMock(return_value=ALBUM_IMAGES)
+        audiodb.get_cached_album_images = AsyncMock(return_value=ALBUM_IMAGES)
         svc = _album_service(audiodb)
         cached = _cached_album()
         svc._get_cached_album_info = AsyncMock(return_value=cached)
@@ -170,12 +180,51 @@ class TestAlbumDetailCacheHitEnrichment:
         result = await svc.get_album_info(TEST_ALBUM_MBID)
 
         assert result.album_thumb_url == "https://cdn.example.com/album_thumb.jpg"
-        audiodb.fetch_and_cache_album_images.assert_awaited_once()
+        audiodb.get_cached_album_images.assert_awaited_once_with(TEST_ALBUM_MBID)
+        audiodb.fetch_and_cache_album_images.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cached_album_miss_enqueues_instead_of_fetching(self):
+        audiodb = MagicMock()
+        audiodb.get_cached_album_images = AsyncMock(return_value=None)
+        queue = AudioDBBrowseQueue()
+        svc = _album_service(audiodb, browse_queue=queue)
+        cached = _cached_album()
+        svc._get_cached_album_info = AsyncMock(return_value=cached)
+
+        result = await svc.get_album_info(TEST_ALBUM_MBID)
+
+        assert result.title == "Parachutes"
+        assert result.album_thumb_url is None
+        audiodb.fetch_and_cache_album_images.assert_not_called()
+        assert queue._queue.qsize() == 1
+        item = queue._queue.get_nowait()
+        assert item.entity_type == "album"
+        assert item.mbid == TEST_ALBUM_MBID
+        assert item.name == "Parachutes"
+        assert item.artist_name == "Coldplay"
+        assert item.is_monitored is False
+
+    @pytest.mark.asyncio
+    async def test_repeated_warm_hit_miss_enqueues_once_per_dedup_window(self):
+        audiodb = MagicMock()
+        audiodb.get_cached_album_images = AsyncMock(return_value=None)
+        queue = AudioDBBrowseQueue()
+        svc = _album_service(audiodb, browse_queue=queue)
+        svc._get_cached_album_info = AsyncMock(return_value=_cached_album())
+
+        await svc.get_album_info(TEST_ALBUM_MBID)
+        await svc.get_album_info(TEST_ALBUM_MBID)
+
+        assert queue._queue.qsize() == 1
+        audiodb.fetch_and_cache_album_images.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cached_album_audiodb_failure_returns_cached(self):
         audiodb = MagicMock()
-        audiodb.fetch_and_cache_album_images = AsyncMock(side_effect=RuntimeError("unavailable"))
+        audiodb.get_cached_album_images = AsyncMock(
+            side_effect=RuntimeError("unavailable")
+        )
         svc = _album_service(audiodb)
         cached = _cached_album()
         svc._get_cached_album_info = AsyncMock(return_value=cached)

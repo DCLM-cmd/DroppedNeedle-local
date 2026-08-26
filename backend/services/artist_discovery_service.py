@@ -19,6 +19,7 @@ from repositories.protocols import (
 )
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.persistence import LibraryDB
+from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
 from services.per_user_client_factory import PerUserClientFactory
 from services.preferences_service import PreferencesService
@@ -79,7 +80,9 @@ def _record_precache_unit_success() -> None:
     _precache_consecutive_failures = 0
 
 
-_PrecacheOutcome = Literal["healthy_data", "healthy_empty", "degraded", "failed", "configured_absent"]
+_PrecacheOutcome = Literal[
+    "healthy_data", "healthy_empty", "degraded", "failed", "configured_absent"
+]
 
 
 def _classify_precache_outcome(
@@ -314,7 +317,11 @@ class ArtistDiscoveryService:
 
         # Degraded empty must use short TTL, not healthy-empty TTL (NEW-CPU-02)
         _ctx = try_get_degradation_context()
-        _degraded = (_ctx is not None and _ctx.has_degradation()) or lb_popularity_degraded() or lb_unavailable
+        _degraded = (
+            (_ctx is not None and _ctx.has_degradation())
+            or lb_popularity_degraded()
+            or lb_unavailable
+        )
         if _degraded and not result.similar_artists:
             await self._cache.set(cache_key, result, ttl_seconds=CIRCUIT_OPEN_CACHE_TTL)
             return result
@@ -416,7 +423,11 @@ class ArtistDiscoveryService:
 
         # Degraded empty must use short TTL, not healthy-empty TTL (NEW-CPU-02)
         _ctx = try_get_degradation_context()
-        _degraded = (_ctx is not None and _ctx.has_degradation()) or lb_popularity_degraded() or lb_unavailable
+        _degraded = (
+            (_ctx is not None and _ctx.has_degradation())
+            or lb_popularity_degraded()
+            or lb_unavailable
+        )
         if _degraded and not result.songs:
             await self._cache.set(cache_key, result, ttl_seconds=CIRCUIT_OPEN_CACHE_TTL)
             return result
@@ -554,7 +565,11 @@ class ArtistDiscoveryService:
 
         # Degraded empty must use short TTL, not healthy-empty TTL (NEW-CPU-02)
         _ctx = try_get_degradation_context()
-        _degraded = (_ctx is not None and _ctx.has_degradation()) or lb_popularity_degraded() or lb_unavailable
+        _degraded = (
+            (_ctx is not None and _ctx.has_degradation())
+            or lb_popularity_degraded()
+            or lb_unavailable
+        )
         if _degraded and not result.albums:
             await self._cache.set(cache_key, result, ttl_seconds=CIRCUIT_OPEN_CACHE_TTL)
             return result
@@ -691,7 +706,9 @@ class ArtistDiscoveryService:
         if _discovery_precache_running:
             return 0
         if monotonic() < _precache_paused_until:
-            logger.debug("Discovery precache skipped: paused after repeated upstream failures")
+            logger.debug(
+                "Discovery precache skipped: paused after repeated upstream failures"
+            )
             return 0
 
         _discovery_precache_running = True
@@ -849,7 +866,9 @@ class ArtistDiscoveryService:
                     if status_service:
                         artist_name = (mbid_to_name or {}).get(mbid, mbid[:8])
                         await status_service.update_progress(
-                            local_progress, current_item=artist_name, generation=generation
+                            local_progress,
+                            current_item=artist_name,
+                            generation=generation,
                         )
                     _record_precache_unit_success()
                     return True
@@ -1083,8 +1102,12 @@ class ArtistDiscoveryService:
 
             trimmed = lfm_albums[:count]
             try:
+                # QW1 Part B: synchronous leg of the user-facing top-albums
+                # response; USER_INITIATED avoids the 2 s inactivity gate that
+                # this same page load keeps resetting (BACKGROUND_SYNC/
+                # PREFETCH_VISIBLE both route into the gated branch).
                 release_groups = await self._mb_repo.get_release_groups_by_artist(
-                    artist_mbid, limit=100
+                    artist_mbid, limit=100, priority=RequestPriority.USER_INITIATED
                 )
             except Exception as exc:  # noqa: BLE001 - optional canonicalization must degrade
                 logger.warning(
