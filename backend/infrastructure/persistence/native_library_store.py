@@ -1724,6 +1724,77 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def resolve_canonical_target_ids(
+        self, kind: str, identifiers: list[str]
+    ) -> dict[str, str]:
+        """F-TARGETCATALOG-06: batch provider-aware canonical resolution.
+
+        Preserves ``resolve_canonical_target_id`` semantics exactly: local
+        IDs, aliases, retired IDs, and unambiguous MusicBrainz release-group /
+        release identities resolve to their one canonical local target;
+        missing and AMBIGUOUS identities (more than one active indexed match)
+        stay absent from the mapping rather than picking a first row.
+        """
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> dict[str, str]:
+            unique = list(dict.fromkeys(identifiers))
+            resolved: dict[str, str] = {}
+            provider_pending: list[str] = []
+            for identifier in unique:
+                direct = self._resolve_target_id(
+                    connection, kind=kind, identifier=identifier
+                )
+                if direct is not None:
+                    resolved[identifier] = direct
+                else:
+                    provider_pending.append(identifier)
+            if not provider_pending:
+                return resolved
+            if kind != "album":
+                # Only the album kind has the provider identity branch today;
+                # mirror the single-item resolver's per-identifier membership
+                # query for other kinds (bounded by the 200-item request cap).
+                for identifier in provider_pending:
+                    matches = self._resolve_target_membership_ids(
+                        connection, kind=kind, identifier=identifier
+                    )
+                    if len(matches) == 1:
+                        resolved[identifier] = matches[0]
+                return resolved
+            # One provider-identity read for the whole pending batch. A row
+            # matches an identifier when its release-group MBID OR release
+            # MBID equals the identifier case-insensitively - exactly the
+            # single-item membership predicate, evaluated in one query.
+            rows = connection.execute(
+                "SELECT identity.local_album_id AS id, "
+                "LOWER(identity.release_group_mbid) AS rg, "
+                "LOWER(identity.release_mbid) AS rel "
+                "FROM local_album_external_identities identity "
+                "JOIN local_albums subject ON subject.id = identity.local_album_id "
+                "WHERE identity.provider = 'musicbrainz' "
+                "AND subject.retired_into_album_id IS NULL "
+                "AND EXISTS (SELECT 1 FROM local_tracks active_track "
+                "WHERE active_track.local_album_id = subject.id "
+                "AND active_track.availability = 'indexed')"
+            ).fetchall()
+            needles = {identifier.casefold() for identifier in provider_pending}
+            candidates_by_needle: dict[str, set[str]] = {
+                needle: set() for needle in needles
+            }
+            for row in rows:
+                for needle in needles:
+                    if row["rg"] == needle or row["rel"] == needle:
+                        candidates_by_needle[needle].add(str(row["id"]))
+            for identifier in provider_pending:
+                candidates = candidates_by_needle[identifier.casefold()]
+                if len(candidates) == 1:
+                    resolved[identifier] = next(iter(candidates))
+            return resolved
+
+        return await self._read(operation)
+
     @classmethod
     def _resolve_unique_target_subject_id(
         cls, connection: sqlite3.Connection, *, kind: str, identifier: str
@@ -2460,6 +2531,41 @@ class NativeLibraryStore(PersistenceBase):
             return changed
 
         return await self._write(operation)
+
+    async def get_target_album_tracks_batch(
+        self, album_ids: list[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """F-TARGETCATALOG-06: indexed track rows for many canonical local
+        album IDs in one bounded query, grouped by canonical album ID.
+
+        Rows use the same ``_TARGET_TRACK_SELECT`` fields and the same
+        disc/track/id ordering as ``get_target_album_tracks``. Unknown IDs get
+        an empty list."""
+        if not album_ids:
+            return {}
+        unique = list(dict.fromkeys(str(a) for a in album_ids))
+        placeholders = ",".join("?" for _ in unique)
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> dict[str, list[dict[str, Any]]]:
+            rows = connection.execute(
+                _TARGET_TRACK_SELECT
+                + f" WHERE a.id IN ({placeholders}) "
+                "AND t.availability = 'indexed' "
+                "ORDER BY a.id, t.disc_number, t.track_number, t.id",
+                unique,
+            ).fetchall()
+            grouped: dict[str, list[dict[str, Any]]] = {
+                album_id: [] for album_id in unique
+            }
+            for row in rows:
+                grouped.setdefault(
+                    str(row["local_album_id"]), []
+                ).append(dict(row))
+            return grouped
+
+        return await self._read(operation)
 
     async def get_target_album_tracks(
         self, album_identifier: str, *, include_unavailable: bool = False

@@ -2830,3 +2830,107 @@ async def test_defer_reidentification_work_requires_the_running_lease(
             now=5.0,
             retry_not_before=125.0,
         )
+
+
+# --- F-TARGETCATALOG-06: batch canonical target resolution --------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_canonical_target_ids_covers_provider_alias_retired_and_ambiguous(
+    store: NativeLibraryStore,
+) -> None:
+    """F-TARGETCATALOG-06: the batch resolver returns exactly one mapping per
+    unambiguous identifier and omits ambiguous ones entirely."""
+    await store.create_catalog_membership(_membership("1"))
+    await store.create_catalog_membership(_membership("2"))
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id="album-1",
+            release_group_mbid="rg-shared",
+            release_mbid="release-1",
+            selected_at=2,
+        ),
+        expected_album_revision=1,
+    )
+    # album-2 shares the release-group identity of album-1 while staying an
+    # active indexed album, so "rg-shared" is ambiguous across both.
+    connection = sqlite3.connect(store.db_path)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO local_album_external_identities "
+            "(local_album_id, provider, release_group_mbid, decision_source, "
+            "selected_at) VALUES ('album-2', 'musicbrainz', 'rg-shared', "
+            "'manual', 3)"
+        )
+        connection.execute(
+            "INSERT INTO local_album_aliases (alias, local_album_id, kind, "
+            "created_at) VALUES ('alias-one', 'album-1', 'merged_album', 3)"
+        )
+        connection.execute(
+            "INSERT INTO local_albums (id, root_id, grouping_key, title, "
+            "title_folded, album_artist_id, grouping_source, created_at, "
+            "updated_at, retired_into_album_id) VALUES ('album-retired', "
+            "'root-1', 'group-retired', 'Album Retired', 'album retired', "
+            "(SELECT album_artist_id FROM local_albums WHERE id = 'album-1'), "
+            "'automatic', 4, 4, 'album-1')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    resolved = await store.resolve_canonical_target_ids(
+        "album",
+        [
+            "album-1",          # local ID
+            "alias-one",        # alias
+            "album-retired",    # retired ID -> survivor
+            "release-1",        # provider release MBID
+            "rg-shared",        # ambiguous across two active albums
+            "missing-id",       # unknown
+            "album-1",          # duplicate input
+        ],
+    )
+
+    assert resolved["album-1"] == "album-1"
+    assert resolved["alias-one"] == "album-1"
+    assert resolved["album-retired"] == "album-1"
+    assert resolved["release-1"] == "album-1"
+    assert "rg-shared" not in resolved
+    assert "missing-id" not in resolved
+
+
+@pytest.mark.asyncio
+async def test_get_target_album_tracks_batch_groups_indexed_rows(
+    store: NativeLibraryStore,
+) -> None:
+    """F-TARGETCATALOG-06: one batch read groups indexed rows per canonical
+    album; unavailable tracks are skipped and unknown IDs get empty lists."""
+    await store.create_catalog_membership(_membership("1"))
+    await store.create_catalog_membership(_membership("2"))
+
+    grouped = await store.get_target_album_tracks_batch(
+        ["album-1", "album-2", "album-missing"]
+    )
+    assert [row["id"] for row in grouped["album-1"]] == ["track-1"]
+    assert [row["id"] for row in grouped["album-2"]] == ["track-2"]
+    assert grouped["album-missing"] == []
+
+    single = await store.get_target_album_tracks("album-2")
+    assert [
+        (row["id"], row["disc_number"], row["track_number"])
+        for row in grouped["album-2"]
+    ] == [(row["id"], row["disc_number"], row["track_number"]) for row in single]
+
+    # Unavailable tracks stay out of the batch result.
+    connection = sqlite3.connect(store.db_path)
+    try:
+        connection.execute(
+            "UPDATE local_tracks SET availability = 'missing' "
+            "WHERE id = 'track-2'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    grouped_after = await store.get_target_album_tracks_batch(["album-2"])
+    assert grouped_after["album-2"] == []

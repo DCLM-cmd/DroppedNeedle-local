@@ -2773,3 +2773,193 @@ async def test_discover_queue_keeps_mismatched_provider_candidate_visible(
     assert not by_mbid["mismatched-provider-id"].in_library  # stays visible
     # The provider-matched candidate is correctly filtered out as in-library.
     assert RELEASE_GROUP_MBID not in by_mbid
+
+
+# --- F-TARGETCATALOG-06: batch canonical + album-track resolution --------------
+
+
+def _resolve_item(rg: str | None, disc: int | None, track: int | None):
+    from api.v1.schemas.library import TrackResolveItem
+
+    return TrackResolveItem(
+        release_group_mbid=rg, disc_number=disc, track_number=track
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_resolution_preserves_provider_alias_retired_and_ambiguous(
+    target_services,
+) -> None:
+    """F-TARGETCATALOG-06: provider IDs (RG and release), aliases, local IDs,
+    and retired IDs resolve identically under the batch resolver; an ambiguous
+    provider identity stays unresolved; duplicates deduplicate."""
+    store, *_ = target_services
+    service = TargetNativeLibraryService(store)
+
+    # Alias for the identified album.
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_album_aliases "
+            "(alias, local_album_id, kind, created_at) VALUES (?, ?, 'merged_album', 1)",
+            ("alias-identified", IDENTIFIED_ALBUM_ID),
+        )
+        # Retired album resolving to its survivor.
+        connection.execute(
+            "INSERT INTO local_albums (id, root_id, grouping_key, title, "
+            "title_folded, album_artist_id, grouping_source, created_at, updated_at, "
+            "retired_into_album_id) VALUES ('album-retired', 'root-1', "
+            "'g-retired', 'Old Name', 'old name', "
+            "(SELECT album_artist_id FROM local_albums WHERE id = ?), "
+            "'automatic', 1, 1, ?)",
+            (IDENTIFIED_ALBUM_ID, IDENTIFIED_ALBUM_ID),
+        )
+        # A second ACTIVE indexed album sharing the identified release-group
+        # MBID -> the provider identity is now AMBIGUOUS for that RG.
+        connection.execute(
+            "INSERT INTO local_albums (id, root_id, grouping_key, title, "
+            "title_folded, album_artist_id, grouping_source, created_at, "
+            "updated_at) VALUES ('album-shadow', 'root-1', 'g-shadow', "
+            "'Shadow Copy', 'shadow copy', (SELECT album_artist_id FROM "
+            "local_albums WHERE id = ?), 'automatic', 1, 1)",
+            (IDENTIFIED_ALBUM_ID,),
+        )
+        connection.execute(
+            "INSERT INTO local_tracks (id, local_album_id, root_id, "
+            "relative_path, file_path, path_hash, file_size_bytes, "
+            "file_mtime_ns, stat_revision, tag_revision, title, title_folded, "
+            "artist_name, artist_name_folded, album_title, album_title_folded, "
+            "album_artist_name, album_artist_name_folded, ingest_source, "
+            "stat_revision_kind, membership_source, disc_number, track_number, "
+            "duration_seconds, file_format, availability, imported_at) "
+            "VALUES ('track-shadow', 'album-shadow', 'root-1', "
+            "'shadow/01.flac', '/music/shadow/01.flac', 'h-shadow', 1, 1, "
+            "'stat-shadow', 'tag-shadow', 'Track', 'track', 'Artist', "
+            "'artist', 'Shadow Copy', 'shadow copy', 'Artist', 'artist', "
+            "'scan', 'exact', 'automatic', 1, 1, 180.0, 'flac', 'indexed', 1)"
+        )
+
+    resolved_map = await store.resolve_canonical_target_ids(
+        "album",
+        [
+            RELEASE_GROUP_MBID,      # ambiguous: two active albums share this RG
+            IDENTIFIED_ALBUM_ID,     # local ID
+            "alias-identified",      # alias
+            "album-retired",         # retired ID -> survivor
+            "unknown-provider-id",   # missing
+            RELEASE_GROUP_MBID,      # duplicate of the first item
+        ],
+    )
+    assert resolved_map.get(IDENTIFIED_ALBUM_ID) == IDENTIFIED_ALBUM_ID
+    assert resolved_map.get("alias-identified") == IDENTIFIED_ALBUM_ID
+    assert resolved_map.get("album-retired") == IDENTIFIED_ALBUM_ID
+    assert "unknown-provider-id" not in resolved_map
+    # Ambiguous RG stays unresolved - no first-match behavior.
+    assert RELEASE_GROUP_MBID.casefold() not in {
+        value.casefold() for value in resolved_map.values()
+    } or resolved_map.get(RELEASE_GROUP_MBID) != IDENTIFIED_ALBUM_ID
+
+
+@pytest.mark.asyncio
+async def test_resolve_tracks_batches_and_keeps_wire_contract(target_services):
+    """F-TARGETCATALOG-06: one canonical batch lookup and one track-map batch
+    read per request; invalid items keep base results; order preserved; the
+    200-item boundary excludes later items."""
+    store, *_ = target_services
+
+    calls = {
+        "canonical_single": 0,
+        "canonical_batch": 0,
+        "album_tracks_single": 0,
+        "album_tracks_batch": 0,
+    }
+    original_canonical = type(store).resolve_canonical_target_id
+    original_canonical_batch = type(store).resolve_canonical_target_ids
+    original_tracks_single = type(store).get_target_album_tracks
+    original_tracks_batch = type(store).get_target_album_tracks_batch
+
+    async def spy_canonical(self, kind, identifier):
+        calls["canonical_single"] += 1
+        return await original_canonical(self, kind, identifier)
+
+    async def spy_canonical_batch(self, kind, identifiers):
+        calls["canonical_batch"] += 1
+        return await original_canonical_batch(self, kind, identifiers)
+
+    async def spy_tracks_single(self, album_identifier, **kwargs):
+        calls["album_tracks_single"] += 1
+        return await original_tracks_single(self, album_identifier, **kwargs)
+
+    async def spy_tracks_batch(self, album_ids):
+        calls["album_tracks_batch"] += 1
+        return await original_tracks_batch(self, album_ids)
+
+    type(store).resolve_canonical_target_id = spy_canonical
+    type(store).resolve_canonical_target_ids = spy_canonical_batch
+    type(store).get_target_album_tracks = spy_tracks_single
+    type(store).get_target_album_tracks_batch = spy_tracks_batch
+    try:
+        service = TargetNativeLibraryService(store)
+        # The fixture track sits at disc 1 / track number 0.
+        items = [
+            _resolve_item(RELEASE_GROUP_MBID, 1, 0),  # valid
+            _resolve_item(RELEASE_GROUP_MBID, 1, 99),  # valid, no such track
+            _resolve_item("unknown-rg", 1, 1),  # unknown ID
+            _resolve_item(None, 1, None),  # missing RG+track: never triggers
+            _resolve_item(RELEASE_GROUP_MBID, 1, 0),  # exact duplicate of item 0
+        ]
+        response = await service.resolve_tracks(items)
+    finally:
+        type(store).resolve_canonical_target_id = original_canonical
+        type(store).resolve_canonical_target_ids = original_canonical_batch
+        type(store).get_target_album_tracks = original_tracks_single
+        type(store).get_target_album_tracks_batch = original_tracks_batch
+
+    assert calls["canonical_batch"] == 1
+    assert calls["album_tracks_batch"] == 1
+    # No per-item single-item lookups.
+    assert calls["canonical_single"] == 0
+    assert calls["album_tracks_single"] == 0
+
+    assert [item.release_group_mbid for item in response.items] == [
+        RELEASE_GROUP_MBID,
+        RELEASE_GROUP_MBID,
+        "unknown-rg",
+        None,
+        RELEASE_GROUP_MBID,
+    ]
+    # Item 0 and its duplicate resolve to the same local track.
+    assert response.items[0].source == "local"
+    assert (
+        response.items[4].track_source_id == response.items[0].track_source_id
+    )
+    # Track-number miss stays unresolved-but-shaped.
+    assert response.items[1].source is None
+    # Unknown ID keeps base result.
+    assert response.items[2].source is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_tracks_200_item_boundary_unchanged():
+    from unittest.mock import AsyncMock, MagicMock
+
+    store = MagicMock(spec=[
+        "resolve_canonical_target_ids", "get_target_album_tracks_batch",
+    ])
+
+    async def batch_ids(kind, identifiers):
+        return {identifier: identifier for identifier in identifiers}
+
+    async def batch_tracks(album_ids):
+        return {a: [] for a in album_ids}
+
+    store.resolve_canonical_target_ids = AsyncMock(side_effect=batch_ids)
+    store.get_target_album_tracks_batch = AsyncMock(side_effect=batch_tracks)
+    service = TargetNativeLibraryService(store)
+
+    items = [_resolve_item(f"rg-{i}", 1, 1) for i in range(205)]
+    response = await service.resolve_tracks(items)
+
+    # Exactly the first 200 items processed; the rest excluded.
+    assert len(response.items) == 200
+    requested = store.resolve_canonical_target_ids.await_args.args[1]
+    assert len(requested) == 200
