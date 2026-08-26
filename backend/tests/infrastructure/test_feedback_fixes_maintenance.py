@@ -270,12 +270,17 @@ def test_staged_runner_pins_source_captures_migrates_starts_and_rolls_back(
 
 
 def test_prepare_refuses_active_work(tmp_path: Path) -> None:
+    """F-NL-03: the retired scan_state table is no longer an active-work
+    source; a processing drop-import job must still block prepare."""
     data_root = _data_root(tmp_path)
     with sqlite3.connect(data_root / "cache" / "library.db") as connection:
         connection.execute(
-            "CREATE TABLE scan_state(id INTEGER PRIMARY KEY, status TEXT NOT NULL)"
+            "CREATE TABLE drop_import_jobs("
+            "id TEXT PRIMARY KEY, status TEXT NOT NULL)"
         )
-        connection.execute("INSERT INTO scan_state VALUES (1, 'scanning')")
+        connection.execute(
+            "INSERT INTO drop_import_jobs VALUES ('job-1', 'processing')"
+        )
 
     with pytest.raises(
         feedback_fixes.MaintenanceStageError, match="workload is active"

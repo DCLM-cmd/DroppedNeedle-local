@@ -29,7 +29,6 @@ from api.v1.routes import following as following_routes
 from api.v1.routes import free_music as free_music_routes
 from api.v1.routes import import_drop as import_drop_routes
 from api.v1.routes import plugins as plugins_routes
-from api.v1.routes import library as library_routes
 from api.v1.routes import library_contributions as library_contribution_routes
 from api.v1.routes import library_management as library_management_routes
 from api.v1.routes import library_operations_target as library_operations_target_routes
@@ -39,7 +38,6 @@ from api.v1.routes import library_scan_target as target_library_scan_routes
 from api.v1.routes import library_target as target_library_routes
 from api.v1.routes import lidarr_import as lidarr_import_routes
 from api.v1.routes import discovery_batches as discovery_batches_routes
-from api.v1.routes import library_scan as library_scan_routes
 from api.v1.routes import me_connections as me_routes
 from api.v1.routes import navidrome_preferences as navidrome_preferences_routes
 from api.v1.routes import playlists as playlists_routes
@@ -70,7 +68,6 @@ from core.dependencies import (
     get_library_management_profile_service,
     get_library_contribution_service,
     get_library_policy_service,
-    get_library_scanner,
     get_library_service,
     get_local_files_service,
     get_drop_import_service,
@@ -90,7 +87,6 @@ from core.dependencies import (
     get_preferences_service,
     get_request_service,
     get_requests_page_service,
-    get_scan_state_store,
     get_settings_service,
     get_spotify_import_service,
     get_sse_publisher,
@@ -137,7 +133,6 @@ _SERVICE_PROVIDERS = (
     get_library_management_profile_service,
     get_library_policy_service,
     get_target_library_policy_service,
-    get_library_scanner,
     get_library_service,
     get_local_files_service,
     get_drop_import_service,
@@ -157,7 +152,6 @@ _SERVICE_PROVIDERS = (
     get_preferences_service,
     get_request_service,
     get_requests_page_service,
-    get_scan_state_store,
     get_settings_service,
     get_spotify_import_service,
     get_sse_publisher,
@@ -255,9 +249,6 @@ _ADMIN_ENDPOINTS = [
     # Connect Apps admin oversight: see/revoke every user's app-passwords.
     ("GET", "/api/v1/connect-apps/admin/app-passwords", None),
     ("DELETE", "/api/v1/connect-apps/admin/app-passwords/ap-1", None),
-    ("POST", "/api/v1/library/scan/start", None),
-    ("POST", "/api/v1/library/scan/cancel", None),
-    ("GET", "/api/v1/library/scan/unmatched", None),
     ("GET", "/api/v1/settings/library/roots", None),
     ("PUT", "/api/v1/settings/library/roots", {"library_roots": []}),
     ("GET", "/api/v1/settings/library/policy-tree", None),
@@ -397,12 +388,6 @@ _ADMIN_ENDPOINTS = [
         "POST",
         "/api/v1/settings/library/policy-apply-preview",
         {"scope_ids": [], "expected_policy_revision": "policy"},
-    ),
-    ("POST", "/api/v1/library/scan/unmatched/1/resolve", {"resolution": "reject"}),
-    (
-        "POST",
-        "/api/v1/library/scan/unmatched/resolve-batch",
-        {"release_group_mbid": "rg-1", "items": []},
     ),
     ("GET", "/api/v1/download-client/config", None),
     ("PUT", "/api/v1/download-client/config", {}),
@@ -769,7 +754,6 @@ _USER_ENDPOINTS = [
         "/api/v1/me/navidrome/music-folder-preferences",
         {"mode": "all", "selected_folder_ids": []},
     ),
-    ("GET", "/api/v1/library/scan/status", None),
     ("GET", "/api/v1/download-client/status", None),
     ("GET", "/api/v1/downloads", None),
     ("GET", "/api/v1/downloads/activity-summary", None),
@@ -903,7 +887,6 @@ def _client(scenario: str):
     # routers MUST precede the /downloads/{task_id} catch-all.
     for router in (
         auth_routes.router,
-        library_scan_routes.router,
         download_client_routes.router,
         download_clients_routes.router,
         quarantine_routes.router,
@@ -915,7 +898,6 @@ def _client(scenario: str):
         target_library_routes.router,
         library_contribution_routes.router,
         target_library_scan_routes.router,
-        library_routes.router,
         target_library_policy_routes.router,
         library_management_routes.router,
         library_policy_routes.router,

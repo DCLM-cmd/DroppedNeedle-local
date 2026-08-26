@@ -43,7 +43,6 @@ _AUTOMATIC_TARGET_COMMAND = [
     "--start-target",
 ]
 _ACTIVE_WORK_QUERIES = (
-    ("legacy_scan", "scan_state", "status = 'scanning'"),
     ("drop_import", "drop_import_jobs", "status = 'processing'"),
     (
         "download_import",

@@ -46,7 +46,7 @@ from models.library_management import (
 )
 from services.native.album_matcher import LocalTrack, MBTrack, score_release
 from services.native.file_processor import row_covers_track
-from services.native.library_manager import _AUDIO_SUFFIXES
+from infrastructure.audio.metadata_engine import AUDIO_SUFFIXES
 from services.native.naming import NamingTemplateEngine
 from services.native.quality_tiers import tier_for, tier_rank
 from services.native.recycle_bin import resolve_bin_path
@@ -440,11 +440,11 @@ class DropImportService:
                 audio = sorted(
                     p
                     for p in child.rglob("*")
-                    if p.is_file() and p.suffix.lower() in _AUDIO_SUFFIXES
+                    if p.is_file() and p.suffix.lower() in AUDIO_SUFFIXES
                 )
                 if audio:
                     units[child.name] = audio
-            elif child.is_file() and child.suffix.lower() in _AUDIO_SUFFIXES:
+            elif child.is_file() and child.suffix.lower() in AUDIO_SUFFIXES:
                 units.setdefault(_LOOSE_UNIT_NAME, []).append(child)
         return list(units.items()), notes
 
@@ -473,7 +473,7 @@ class DropImportService:
                 if raw.is_absolute() or ".." in raw.parts:
                     skipped += 1
                     continue
-                if raw.suffix.lower() not in _AUDIO_SUFFIXES:
+                if raw.suffix.lower() not in AUDIO_SUFFIXES:
                     skipped += 1
                     continue
                 safe = target_dir.joinpath(*(_safe_component(p) for p in raw.parts))

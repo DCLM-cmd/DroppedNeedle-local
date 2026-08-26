@@ -28,7 +28,7 @@ Backend:
 cd backend
 pip install -r requirements-dev.txt
 cp env.dev.example .env
-uvicorn main:app --reload --port 8688
+uvicorn target_main:app --reload --port 8688
 ```
 
 Frontend:

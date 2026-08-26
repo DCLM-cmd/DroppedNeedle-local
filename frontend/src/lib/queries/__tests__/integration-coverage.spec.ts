@@ -225,7 +225,6 @@ const COVERAGE: Array<[string, string, string]> = [
 	],
 	['remove library album', API.library.removeAlbum('M1'), '/api/v1/library/album/M1'],
 	['rescan album', API.library.rescanAlbum('M1'), '/api/v1/library/albums/M1/rescan'],
-	['scan cancel', API.library.scanCancel(), '/api/v1/library/scan/cancel'],
 	['library activity', API.library.activity(), '/api/v1/library/activity'],
 	['library activity stream', API.library.activityStream(), '/api/v1/library/activity/stream'],
 	[
@@ -559,7 +558,6 @@ const COVERAGE: Array<[string, string, string]> = [
 		API.library.scanDiagnostics('R1'),
 		'/api/v1/library/scan-runs/R1/diagnostics'
 	],
-	['scan unmatched', API.library.unmatched(), '/api/v1/library/scan/unmatched'],
 	['typed library settings', API.library.typedSettings(), '/api/v1/settings/library/roots'],
 	['target library settings', API.library.settings(), '/api/v1/settings/library'],
 	['library policy tree', API.library.policyTree(), '/api/v1/settings/library/policy-tree'],
@@ -576,16 +574,6 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/settings/library/restorable-roots'
 	],
 	['library restore roots', API.library.restoreRoots(), '/api/v1/settings/library/restore-roots'],
-	[
-		'resolve unmatched',
-		API.library.resolveUnmatched(1),
-		'/api/v1/library/scan/unmatched/1/resolve'
-	],
-	[
-		'resolve unmatched batch',
-		API.library.resolveUnmatchedBatch(),
-		'/api/v1/library/scan/unmatched/resolve-batch'
-	],
 	// per-user section visibility (user-scoped)
 	['section prefs', API.me.sectionPrefs(), '/api/v1/me/section-prefs'],
 	['home integration status', API.homeIntegrationStatus(), '/api/v1/home/integration-status'],

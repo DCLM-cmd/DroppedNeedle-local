@@ -301,14 +301,29 @@ def test_target_application_exposes_only_typed_library_root_mutations() -> None:
 
 
 def test_deployed_entrypoint_has_no_target_selector_or_target_mount() -> None:
-    backend = Path(__file__).parents[2]
-    deployed_source = (backend / "main.py").read_text()
-    target_source = (backend / "target_application.py").read_text()
+    """F-NL-03 cutover: the legacy main:app entrypoint is an unsupported-install
+    guard - a stale launcher must fail with upgrade guidance, never serve a
+    partial legacy API, and the target source keeps its single composition."""
+    import subprocess
+    import sys
 
-    assert "target_application" not in deployed_source
-    assert "library_target" not in deployed_source
-    assert "library_management" not in deployed_source
-    assert "get_target_" not in deployed_source
+    backend = Path(__file__).parents[2]
+    main_source = (backend / "main.py").read_text()
+    assert "APIRouter" not in main_source
+    assert "include_router" not in main_source
+    assert "FastAPI(" not in main_source
+    assert "target_main:app" in main_source  # operator guidance present
+    result = subprocess.run(
+        [sys.executable, "-c", "import main"],
+        cwd=backend,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(backend)},
+    )
+    assert result.returncode != 0
+    assert "Unsupported installation" in (result.stderr + result.stdout)
+    assert "target_main:app" in (result.stderr + result.stdout)
+    target_source = (backend / "target_application.py").read_text()
     module = ast.parse(target_source)
     assert not any(
         isinstance(node, (ast.Assign, ast.AnnAssign))
@@ -379,7 +394,10 @@ def test_production_target_application_always_runs_startup_validation(
     reject.assert_awaited_once_with("steady_state")
 
 
-def test_target_lifecycle_retains_every_nonlegacy_source_task() -> None:
+def test_target_lifecycle_retains_every_source_task() -> None:
+    """F-NL-03 cutover: the legacy main.py composition is gone; the target
+    lifecycle is the sole source of long-lived tasks and retains every
+    non-legacy starter (the two legacy scan tasks are removed, not replaced)."""
     backend = Path(__file__).parents[2]
 
     def starter_calls(path: Path, functions: set[str]) -> set[str]:
@@ -395,17 +413,17 @@ def test_target_lifecycle_retains_every_nonlegacy_source_task() -> None:
             and call.func.id.startswith("start_")
         }
 
-    source = starter_calls(backend / "main.py", {"lifespan"})
     target = starter_calls(
         backend / "target_application.py", {"production_target_lifespan"}
     ) | starter_calls(
         backend / "services/native/target_application_lifecycle.py",
         {"start_target_operational_runtime"},
     )
-    replaced = {"start_library_scan_resume_task", "start_library_auto_scan_task"}
 
-    assert source - replaced <= target
-    assert replaced.isdisjoint(target)
+    assert {
+        "start_library_scan_resume_task",
+        "start_library_auto_scan_task",
+    }.isdisjoint(target)
     assert {
         "start_library_contribution_verification_worker",
         "start_target_scan_supervisor",

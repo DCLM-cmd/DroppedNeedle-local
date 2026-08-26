@@ -21,7 +21,6 @@ from infrastructure.persistence import (
     YouTubeStore,
     MBIDStore,
     NativeLibraryStore,
-    ScanStateStore,
     SyncStateStore,
 )
 from infrastructure.persistence._database import PriorityWriteLock
@@ -143,13 +142,6 @@ def get_sync_state_store() -> SyncStateStore:
     settings = get_settings()
     lock = get_persistence_write_lock()
     return SyncStateStore(db_path=settings.library_db_path, write_lock=lock)
-
-
-@singleton
-def get_scan_state_store() -> ScanStateStore:
-    settings = get_settings()
-    lock = get_persistence_write_lock()
-    return ScanStateStore(db_path=settings.library_db_path, write_lock=lock)
 
 
 @singleton

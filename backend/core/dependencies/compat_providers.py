@@ -191,17 +191,6 @@ def get_playback_report_service() -> "PlaybackReportService":
 
 
 @singleton
-def get_compat_scan_service() -> "CompatScanService":
-    from services.compat.scan_service import CompatScanService
-    from .cache_providers import get_scan_state_store, get_preferences_service
-    from .service_providers import get_library_scanner
-
-    return CompatScanService(
-        get_scan_state_store(), get_library_scanner(), get_preferences_service()
-    )
-
-
-@singleton
 def get_advanced_transcode_service() -> "AdvancedTranscodeService":
     from services.compat.advanced_transcode_service import AdvancedTranscodeService
 

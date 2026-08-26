@@ -281,8 +281,6 @@ export const API = {
 		},
 		trackTags: (fileId: string) => `/api/v1/library/tracks/${fileId}/tags`,
 		removeTrack: (fileId: string) => `/api/v1/library/tracks/${fileId}`,
-		scanCancel: () => '/api/v1/library/scan/cancel',
-		scanStream: () => '/api/v1/library/scan/stream',
 		activity: () => '/api/v1/library/activity',
 		activityStream: () => '/api/v1/library/activity/stream',
 		operationsStream: () => '/api/v1/library/operations/stream',
@@ -450,9 +448,6 @@ export const API = {
 		discardIdentityPreparation: (jobId: string) =>
 			`/api/v1/library/management/identity-preparations/${encodeURIComponent(jobId)}/discard`,
 		scanDiagnostics: (runId: string) => `/api/v1/library/scan-runs/${runId}/diagnostics`,
-		unmatched: () => '/api/v1/library/scan/unmatched',
-		resolveUnmatched: (id: number) => `/api/v1/library/scan/unmatched/${id}/resolve`,
-		resolveUnmatchedBatch: () => '/api/v1/library/scan/unmatched/resolve-batch',
 		settings: () => '/api/v1/settings/library',
 		typedSettings: () => '/api/v1/settings/library/roots',
 		policyTree: () => '/api/v1/settings/library/policy-tree',

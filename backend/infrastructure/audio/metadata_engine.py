@@ -73,6 +73,13 @@ _MAX_EMBEDDED_ART_PIXELS = 100_000_000
 _SNAPSHOT_VERSION = 1
 _ADAPTER_VERSION = "1"
 
+# F-NL-03: single shared admitted-audio-extension set (formerly the private
+# _AUDIO_SUFFIXES mirror in library_manager). Importers, upload validation,
+# and drop-import all admit exactly these containers.
+AUDIO_SUFFIXES = frozenset(
+    {".flac", ".mp3", ".m4a", ".m4b", ".mp4", ".ogg", ".oga", ".opus", ".wav"}
+)
+
 AUDIO_EXTENSION_FORMATS: dict[str, AudioContainer] = {
     ".flac": "flac",
     ".mp3": "mp3",

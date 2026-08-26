@@ -404,7 +404,7 @@ async def compat_env(
         deps.get_native_lyrics_service: lambda: lyrics,
         deps.get_compat_avatar_service: lambda: avatars,
         deps.get_playback_report_service: lambda: playback_report,
-        deps.get_compat_scan_service: lambda: scan,
+        deps.get_target_compat_scan_service: lambda: scan,
         deps.get_advanced_transcode_service: lambda: advanced_transcode,
         deps.get_transcode_service: lambda: transcode,
     }

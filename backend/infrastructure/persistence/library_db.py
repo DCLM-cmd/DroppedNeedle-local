@@ -2177,15 +2177,9 @@ class LibraryDB(PersistenceBase):
             unmatched = conn.execute(
                 "SELECT COUNT(*) AS cnt FROM manual_review_queue WHERE resolution IS NULL"
             ).fetchone()
+            # F-NL-03: the legacy scan_state table is no longer a runtime
+            # source; last_scan_at now comes from durable target run history.
             last_scan_at = None
-            try:
-                scan_row = conn.execute(
-                    "SELECT started_at FROM scan_state WHERE id = 1"
-                ).fetchone()
-                if scan_row is not None:
-                    last_scan_at = scan_row["started_at"]
-            except sqlite3.OperationalError:
-                pass
             return {
                 "total_albums": int(agg["albums"] or 0) if agg else 0,
                 "total_artists": int(agg["artists"] or 0) if agg else 0,

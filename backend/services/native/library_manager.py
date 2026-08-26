@@ -36,7 +36,9 @@ def _tag_is_compilation(tag: AudioTag) -> bool:
     return bool(tag.compilation or tag.album_artist == "Various Artists")
 
 
-_AUDIO_SUFFIXES = {".flac", ".mp3", ".m4a", ".m4b", ".mp4", ".ogg", ".oga", ".opus", ".wav"}
+from infrastructure.audio.metadata_engine import AUDIO_SUFFIXES
+
+_AUDIO_SUFFIXES = AUDIO_SUFFIXES  # F-NL-03: shared admitted set
 # files imported within this window are protected from a reconcile race with the
 # orchestrator that may have just moved them
 _DOWNLOAD_PROTECT_WINDOW_SECONDS = 300.0

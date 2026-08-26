@@ -29,7 +29,6 @@ from .cache_providers import (
     get_youtube_store,
     get_mbid_store,
     get_sync_state_store,
-    get_scan_state_store,
     get_discovery_snapshot_store,
     get_preferences_service,
 )
@@ -1030,60 +1029,6 @@ def get_audio_fingerprinter() -> "AudioFingerprinter":
 def get_library_manager() -> "LibraryManager":
     # reuse the repo provider's singleton so there is one instance (one write lock)
     return get_library_repository()  # type: ignore[return-value]
-
-
-@singleton
-def get_library_scanner() -> "LibraryScanner":
-    from services.native.library_scanner import LibraryScanner
-
-    # singleton so the cancel route and the running scan share one `_cancel` event
-    return LibraryScanner(
-        audio_tagger=get_audio_tagger(),
-        fingerprinter=get_audio_fingerprinter(),
-        mb_matcher=get_musicbrainz_matcher(),
-        album_identifier=get_album_identifier(),
-        library_manager=get_library_manager(),
-        scan_state_store=get_scan_state_store(),
-        event_bus=get_sse_publisher(),
-        invalidate_albums=_build_scan_invalidation(
-            get_cache(), get_disk_cache(), get_discovery_snapshot_store()
-        ),
-    )
-
-
-def _build_file_processor(
-    library_manager,
-    library_paths,
-    *,
-    library_root_ids=None,
-    publish_import_bundle=None,
-    policy_revision_getter=None,
-) -> "FileProcessor":
-    from pathlib import Path
-
-    from core.config import get_settings
-    from services.native.file_processor import FileProcessor
-    from services.native.recycle_bin import resolve_bin_path
-
-    from .repo_providers import get_download_client_repository, get_download_store
-
-    policy = get_preferences_service().get_download_policy()
-    return FileProcessor(
-        get_audio_tagger(),
-        naming_engine=get_naming_template_engine(),
-        library_manager=library_manager,
-        library_paths=[Path(path) for path in library_paths],
-        client=get_download_client_repository(),
-        slskd_downloads_path=Path(get_settings().slskd_downloads_path),
-        fingerprinter=get_audio_fingerprinter(),
-        verify_downloads=policy.verify_downloads,
-        download_store=get_download_store(),
-        held_dir=Path(get_settings().cache_dir) / "held",
-        recycle_bin=resolve_bin_path(policy.recycle_bin_path, library_paths),
-        library_root_ids=library_root_ids,
-        publish_import_bundle=publish_import_bundle,
-        policy_revision_getter=policy_revision_getter,
-    )
 
 
 @singleton

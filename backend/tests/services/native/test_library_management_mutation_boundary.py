@@ -14,14 +14,12 @@ from infrastructure.audio.tagger import AudioTagger
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.drop_import_service import DropImportService
 from services.native.file_processor import FileProcessor
-from services.native.library_scanner import LibraryScanner
 from services.native.target_catalog_writer_service import TargetCatalogWriterService
 
 
 def test_obsolete_scalar_audio_mutators_are_not_public() -> None:
     for name in ("write_mb_tags", "write_album_identity", "write_cover_art"):
         assert not hasattr(AudioTagger, name)
-    assert not hasattr(LibraryScanner, "update_track_tags")
     assert not hasattr(TargetCatalogWriterService, "update_tags")
     assert not hasattr(NativeLibraryStore, "update_target_track_tags")
 

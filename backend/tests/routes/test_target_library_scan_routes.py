@@ -705,6 +705,8 @@ def test_scan_run_failures_auth_matrix(app: FastAPI, native_store: AsyncMock) ->
 
 
 def test_target_route_security_inventory_is_complete() -> None:
+    """F-NL-03: the target router exposes exactly the revisioned scan surface;
+    every legacy /library/scan/* path is an absence check."""
     paths = {
         route.path
         for route in router.routes
@@ -724,40 +726,9 @@ def test_target_route_security_inventory_is_complete() -> None:
         "/library/scan-runs/{run_id}/pause",
         "/library/scan-runs/{run_id}/resume",
         "/library/scan-runs/{run_id}/stop",
-        "/library/scan/start",
-        "/library/scan/cancel",
-        "/library/scan/status",
     }
-
-
-def test_legacy_scan_status_projects_the_legacy_contract(
-    admin_client, coordinator: AsyncMock
-) -> None:
-    coordinator.current.return_value = [
-        SimpleNamespace(id="run-1", started_at=10.0, updated_at=12.0, state="indexing")
-    ]
-    coordinator.snapshot.return_value = SimpleNamespace(
-        counters={
-            "total_count": 10,
-            "inspected_count": 6,
-            "indexed_count": 3,
-            "unchanged_count": 2,
-            "errored_count": 1,
-        }
-    )
-
-    response = admin_client.get("/library/scan/status")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "scanning",
-        "total_files": 10,
-        "processed_files": 6,
-        "matched_files": 5,
-        "failed_files": 1,
-        "started_at": 10.0,
-        "updated_at": 12.0,
-    }
+    for legacy in ("/library/scan/start", "/library/scan/cancel", "/library/scan/status"):
+        assert legacy not in paths
 
 
 @pytest.mark.asyncio

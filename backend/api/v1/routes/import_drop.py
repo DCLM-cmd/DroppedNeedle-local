@@ -25,7 +25,7 @@ from core.dependencies import get_drop_import_service
 from core.exceptions import ValidationError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from middleware import CurrentCuratorDep
-from services.native.library_manager import _AUDIO_SUFFIXES
+from infrastructure.audio.metadata_engine import AUDIO_SUFFIXES
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ async def upload_drop(
     for upload in files:
         name = upload.filename or ""
         suffix = Path(name).suffix.lower()
-        if suffix != ".zip" and suffix not in _AUDIO_SUFFIXES:
+        if suffix != ".zip" and suffix not in AUDIO_SUFFIXES:
             raise ValidationError(f"Unsupported file type: {name or 'unnamed file'}")
 
     staged: list[tuple[str, Path]] = []
