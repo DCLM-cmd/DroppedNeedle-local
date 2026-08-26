@@ -28,6 +28,7 @@ from infrastructure.cache.cache_keys import (
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.validators import validate_mbid
+from infrastructure.degradation import try_get_degradation_context
 from infrastructure.queue.priority_queue import RequestPriority
 from core.exceptions import ExternalServiceError, ResourceNotFoundError
 from services.audiodb_image_service import AudioDBImageService
@@ -436,6 +437,14 @@ class AlbumService:
             logger.error(f"Failed to get basic album info for {release_group_id}: {e}")
             raise ResourceNotFoundError(f"Failed to get album info: {e}")
 
+    @staticmethod
+    def _mb_degraded() -> bool:
+        """B2 guard (mandatory): True only when the musicbrainz source itself
+        recorded a degradation in this request context. Other sources'
+        degradations must not veto the empty-tracklist negative cache."""
+        ctx = try_get_degradation_context()
+        return ctx is not None and ctx.degraded_summary().get("musicbrainz") is not None
+
     async def get_album_tracks_info(
         self,
         release_group_id: str,
@@ -476,6 +485,15 @@ class AlbumService:
                         else settings.cache_ttl_album_non_library
                     )
                     await self._cache.set(tracks_cache_key, result, ttl_seconds=ttl)
+                elif not self._mb_degraded():
+                    # B2: empty-and-not-degraded -> cache the actual empty
+                    # AlbumTracksInfo @600 s; the domain object doubles as the
+                    # sentinel, so replayed responses are byte-identical.
+                    # Degraded empties stay UNCACHED: _fetch_release_by_id
+                    # collapses breaker-open/HTTP failures into None exactly
+                    # like 404s, so without this guard a transient outage
+                    # would pin "no tracks" for 10 minutes (F-MATCH-05).
+                    await self._cache.set(tracks_cache_key, result, ttl_seconds=600)
                 if not future.done():
                     future.set_result(result)
                 return result
@@ -566,6 +584,13 @@ class AlbumService:
         candidate_ids = list(
             dict.fromkeys(rid for rid in (selected_release_id, *ranked_ids) if rid)
         )
+        # B3.4 DECLINED (per plan): gathering the first two candidates against
+        # the official 1 req/s MB bucket saves no wall-clock - tokens are
+        # spaced ~1 s apart regardless of concurrency, so the pair's floor is
+        # unchanged and it costs +1 wire call whenever candidate 1 succeeds
+        # (the common case). With B2's negative cache in place the
+        # pathological repeat cost is already gone. Gate any future attempt on
+        # a measured inter-call gap >100 ms or mirror adoption.
         fallback_number = 0
         for index, candidate_id in enumerate(candidate_ids):
             role = "selected"
@@ -926,8 +951,18 @@ class AlbumService:
             str(release["id"]) for release in ranked_releases if release.get("id")
         ]
 
-        pinned = await self._pinned_release_id(release_group_id)
-        owned, file_count = await self._library_edition_evidence(release_group_id)
+        # B3.3 micro-win: these two reads are independent (SQLite pin row vs
+        # library file-count evidence) - gather saves one local DB round-trip.
+        # The enrich pair further downstream deliberately stays SERIAL: against
+        # the official 1 req/s MB bucket, gathering selected+primary lookups
+        # saves no wall-clock (tokens are spaced ~1 s regardless) and ADDS +1
+        # wire call whenever the selected release succeeds - reversing the
+        # volume-optimal stop-on-first-tracks property. Revisit only behind a
+        # mirror adoption or a measured inter-call gap >100 ms.
+        pinned, (owned, file_count) = await asyncio.gather(
+            self._pinned_release_id(release_group_id),
+            self._library_edition_evidence(release_group_id),
+        )
 
         if pinned in release_ids:
             return pinned, owned, pinned

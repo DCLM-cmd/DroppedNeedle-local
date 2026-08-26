@@ -1,4 +1,7 @@
 """Tests that the basic artist info path returns correctly and skips Wikidata enrichment."""
+
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -34,7 +37,9 @@ def _make_mb_artist() -> dict:
     }
 
 
-def _make_service(*, cached_artist: ArtistInfo | None = None) -> tuple[ArtistService, AsyncMock]:
+def _make_service(
+    *, cached_artist: ArtistInfo | None = None
+) -> tuple[ArtistService, AsyncMock]:
     mb_repo = AsyncMock()
     mb_repo.get_artist_by_id = AsyncMock(return_value=_make_mb_artist())
 
@@ -75,6 +80,8 @@ def _make_service(*, cached_artist: ArtistInfo | None = None) -> tuple[ArtistSer
         memory_cache=memory_cache,
         disk_cache=disk_cache,
     )
+    svc.test_memory_cache = memory_cache
+    svc.test_disk_cache = disk_cache
     return svc, wikidata_repo
 
 
@@ -123,3 +130,41 @@ class TestGetArtistInfoBasic:
 
         with pytest.raises(ValueError):
             await svc.get_artist_info_basic("not-a-uuid")
+
+
+class TestBasicInfoDeferralEquivalence:
+    """B3.1: moving the disk mirror to a deferred task must leave the returned
+    payload byte-identical; the memory write stays inline (readable on return)."""
+
+    @pytest.mark.asyncio
+    async def test_payload_byte_identical_and_memory_inline(self):
+        import msgspec
+
+        svc, _wikidata = _make_service()
+        result = await svc.get_artist_info_basic(ARTIST_MBID)
+
+        # Memory cache holds the exact object returned, inline on return.
+        svc.test_memory_cache.set.assert_awaited_once()
+        cached_value = svc.test_memory_cache.set.await_args.args[1]
+        assert msgspec.json.encode(cached_value) == msgspec.json.encode(result)
+
+        # Disk mirror is deferred but completes with the same payload.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        svc.test_disk_cache.set_artist.assert_awaited_once()
+        disk_args = svc.test_disk_cache.set_artist.await_args
+        assert disk_args.args[0] == ARTIST_MBID
+        assert msgspec.json.encode(disk_args.args[1]) == msgspec.json.encode(result)
+
+    @pytest.mark.asyncio
+    async def test_deferred_disk_failure_does_not_break_response(self):
+        svc, _wikidata = _make_service()
+        svc.test_disk_cache.set_artist = AsyncMock(
+            side_effect=RuntimeError("disk gone")
+        )
+
+        result = await svc.get_artist_info_basic(ARTIST_MBID)
+
+        assert result.name == "Test Artist"
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)  # let the deferred task fail; response unaffected

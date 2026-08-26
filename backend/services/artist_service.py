@@ -45,7 +45,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# MB is rate-limited to 1 req/s in-process; bound the cold browse to 10 pages
+
+def _log_deferred_disk_write_failure(task: "asyncio.Task[None]") -> None:
+    """B3.1: the deferred artist disk mirror must never crash the response
+    path - a failed/cancelled mirror only costs one disk re-fetch after
+    restart, so warn-and-swallow is the correct disposition."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("Deferred artist disk-cache write failed: %s", exc)
+
+
 # (1000 release groups) so pathological artists don't hog the limiter.
 _MAX_RG_PAGES = 10
 
@@ -76,6 +87,10 @@ class ArtistService:
         self._ownership = ownership_service
         self._artist_in_flight: dict[str, asyncio.Future[ArtistInfo]] = {}
         self._artist_basic_in_flight: dict[str, asyncio.Future[ArtistInfo]] = {}
+        # B1: coalesces concurrent cold /extended renders onto one leader chain.
+        self._artist_extended_in_flight: dict[
+            str, asyncio.Future[ArtistExtendedInfo]
+        ] = {}
 
     async def _get_library_cache_mbids(self) -> set[str]:
         if self._library_db is None:
@@ -331,13 +346,19 @@ class ArtistService:
         artist_id = validate_mbid(artist_id, "artist")
         cached = await self._get_cached_artist(artist_id)
         if cached:
-            cached = await self._apply_audiodb_artist_images(
-                cached,
-                artist_id,
-                cached.name,
-                allow_fetch=False,
+            # B3.1: refresh (library flags on releases + artist-level flags)
+            # and AudioDB image application (fanart/thumb/logo URL fields)
+            # mutate DISJOINT fields of the same object; under cooperative
+            # asyncio their field writes interleave but never parallelize.
+            await asyncio.gather(
+                self._apply_audiodb_artist_images(
+                    cached,
+                    artist_id,
+                    cached.name,
+                    allow_fetch=False,
+                ),
+                self._refresh_library_flags(cached),
             )
-            await self._refresh_library_flags(cached)
             return cached
 
         if artist_id in self._artist_basic_in_flight:
@@ -350,12 +371,15 @@ class ArtistService:
             artist_info = await self._build_artist_from_musicbrainz(
                 artist_id, include_extended=False, include_releases=False
             )
-            await self._refresh_library_flags(artist_info)
-            artist_info = await self._apply_audiodb_artist_images(
-                artist_info,
-                artist_id,
-                artist_info.name,
-                allow_fetch=False,
+            # B3.1: same disjoint-field gather as the cached path above.
+            await asyncio.gather(
+                self._refresh_library_flags(artist_info),
+                self._apply_audiodb_artist_images(
+                    artist_info,
+                    artist_id,
+                    artist_info.name,
+                    allow_fetch=False,
+                ),
             )
             await self._save_artist_to_cache(artist_id, artist_info)
             if not future.done():
@@ -452,23 +476,26 @@ class ArtistService:
                 )
                 await self._disk_cache.delete_artist(artist_id)
                 return None
-            ttl = self._get_artist_ttl(artist_info.in_library)
-            await self._cache.set(cache_key, artist_info, ttl_seconds=ttl)
-            return artist_info
-        return None
 
     async def _save_artist_to_cache(
         self, artist_id: str, artist_info: ArtistInfo
     ) -> None:
         cache_key = f"{ARTIST_INFO_PREFIX}{artist_id}"
         ttl = self._get_artist_ttl(artist_info.in_library)
+        # B3.1: memory write stays inline - coalesced followers and the next
+        # request read it. The disk mirror moves off the response path onto a
+        # fire-and-forget task; the exposure window is one event-loop tick and
+        # worst-case loss costs one disk re-fetch after restart.
         await self._cache.set(cache_key, artist_info, ttl_seconds=ttl)
-        await self._disk_cache.set_artist(
-            artist_id,
-            artist_info,
-            is_monitored=artist_info.in_library,
-            ttl_seconds=ttl if not artist_info.in_library else None,
+        task = asyncio.create_task(
+            self._disk_cache.set_artist(
+                artist_id,
+                artist_info,
+                is_monitored=artist_info.in_library,
+                ttl_seconds=ttl if not artist_info.in_library else None,
+            )
         )
+        task.add_done_callback(_log_deferred_disk_write_failure)
 
     def _get_artist_ttl(self, in_library: bool) -> int:
         advanced_settings = self._preferences_service.get_advanced_settings()
@@ -487,15 +514,44 @@ class ArtistService:
                 return ArtistExtendedInfo(
                     description=cached_info.description, image=cached_info.image
                 )
-            mb_artist = await self._mb_repo.get_artist_by_id(artist_id)
-            if not mb_artist:
-                raise ResourceNotFoundError("Artist not found")
-            description, image = await self._fetch_wikidata_info(mb_artist)
-            if cached_info:
-                cached_info.description = description
-                cached_info.image = image
-                await self._save_artist_to_cache(artist_id, cached_info)
-            return ArtistExtendedInfo(description=description, image=image)
+
+            # B1: coalesce concurrent cold renders - K viewers of a wiki-less
+            # or cold artist share ONE leader chain; followers await (shielded)
+            # the identical object the leader built. Lifecycle mirrors
+            # get_artist_info_basic above.
+            if artist_id in self._artist_extended_in_flight:
+                return await asyncio.shield(self._artist_extended_in_flight[artist_id])
+
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[ArtistExtendedInfo] = loop.create_future()
+            self._artist_extended_in_flight[artist_id] = future
+            try:
+                # B1: url-rels only. extract_wiki_info reads just
+                # mb_artist["relations"], so the full detail fetch (2 wire
+                # calls when the detail entry expired) was pure waste;
+                # get_artist_relations serves the same need from a 24 h
+                # relations cache. Lane moves USER_INITIATED -> IMAGE_FETCH
+                # (_fetch_artist_relations pins IMAGE_FETCH) - this is a
+                # cosmetic enrichment leg, not primary content.
+                mb_artist = await self._mb_repo.get_artist_relations(artist_id)
+                if not mb_artist:
+                    raise ResourceNotFoundError("Artist not found")
+                description, image = await self._fetch_wikidata_info(mb_artist)
+                if cached_info:
+                    cached_info.description = description
+                    cached_info.image = image
+                    await self._save_artist_to_cache(artist_id, cached_info)
+                result = ArtistExtendedInfo(description=description, image=image)
+                if not future.done():
+                    future.set_result(result)
+                return result
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                    future.exception()  # mark retrieved: no orphan-log when leader alone
+                raise
+            finally:
+                self._artist_extended_in_flight.pop(artist_id, None)
         except Exception as e:  # noqa: BLE001
             logger.error(f"Error fetching extended artist info for {artist_id}: {e}")
             return ArtistExtendedInfo(description=None, image=None)
@@ -688,20 +744,28 @@ class ArtistService:
         include_releases: bool = True,
     ) -> tuple[dict, set[str], set[str], set[str]]:
         if library_artist_mbids is not None and library_album_mbids is not None:
+            # B3.1: cache-mbid read rides alongside the requested fetch instead
+            # of a serial tail after the main gather.
             mb_artist = await self._mb_repo.get_artist_by_id(artist_id)
             library_mbids = library_artist_mbids
             album_mbids = library_album_mbids
             try:
-                requested_mbids = await self._library_repo.get_requested_mbids()
+                requested_mbids, cache_mbids = await asyncio.gather(
+                    self._library_repo.get_requested_mbids(),
+                    self._get_library_cache_mbids(),
+                )
+                album_mbids = album_mbids | cache_mbids
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     f"Lidarr unavailable, proceeding without requested data: {exc}"
                 )
                 requested_mbids = set()
         elif self._ownership is not None:
-            mb_artist, artist_relationship = await asyncio.gather(
+            # B3.1: cache-mbid read joins the gather (spare width).
+            mb_artist, artist_relationship, cache_mbids = await asyncio.gather(
                 self._mb_repo.get_artist_by_id(artist_id),
                 self._ownership.provider_artist_relationship(artist_id),
+                self._get_library_cache_mbids(),
             )
             if not mb_artist:
                 raise ResourceNotFoundError("Artist not found")
@@ -713,12 +777,16 @@ class ArtistService:
                 )
             else:
                 album_mbids, requested_mbids = set(), set()
+            album_mbids = album_mbids | cache_mbids
         else:
+            # B3.1: cache-mbid read joins the gather (4-wide already had room;
+            # failures degrade to an empty set like the other library reads).
             mb_artist, *library_results = await asyncio.gather(
                 self._mb_repo.get_artist_by_id(artist_id),
                 self._library_repo.get_artist_mbids(),
                 self._library_repo.get_library_mbids(include_release_ids=True),
                 self._library_repo.get_requested_mbids(),
+                self._get_library_cache_mbids(),
                 return_exceptions=True,
             )
             if isinstance(mb_artist, BaseException):
@@ -744,9 +812,12 @@ class ArtistService:
                 if not isinstance(library_results[2], BaseException)
                 else set()
             )
-
-        cache_mbids = await self._get_library_cache_mbids()
-        album_mbids = album_mbids | cache_mbids
+            cache_mbids = (
+                library_results[3]
+                if not isinstance(library_results[3], BaseException)
+                else set()
+            )
+            album_mbids = album_mbids | cache_mbids
 
         if not mb_artist:
             raise ResourceNotFoundError("Artist not found")

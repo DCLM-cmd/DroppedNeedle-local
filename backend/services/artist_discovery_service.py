@@ -374,17 +374,24 @@ class ArtistDiscoveryService:
                     lb_repo, recordings
                 )
 
-                songs = []
-                for r in recordings[:count]:
-                    disc_number = None
-                    track_number = None
-                    if r.release_mbid and r.recording_mbid:
-                        pos = await self._mb_repo.get_recording_position_on_release(
-                            r.release_mbid, r.recording_mbid
-                        )
-                        if pos:
-                            disc_number, track_number = pos
+                # B3.2: positions are pure in-process dict reads off
+                # MB_RELEASE_REC_PREFIX (no wire call either way), so gathering
+                # them is hygiene-only; zip keeps positions mapped by index so
+                # output order is identical to the serial loop.
+                ranked = recordings[:count]
 
+                async def _position(rec):
+                    if rec.release_mbid and rec.recording_mbid:
+                        return await self._mb_repo.get_recording_position_on_release(
+                            rec.release_mbid, rec.recording_mbid
+                        )
+                    return None
+
+                positions = await asyncio.gather(*(_position(r) for r in ranked))
+
+                songs = []
+                for r, pos in zip(ranked, positions):
+                    disc_number, track_number = pos if pos else (None, None)
                     songs.append(
                         TopSong(
                             recording_mbid=r.recording_mbid,
