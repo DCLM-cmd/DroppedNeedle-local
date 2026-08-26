@@ -12,6 +12,7 @@ from datetime import date
 import json
 from pathlib import Path
 from urllib.request import Request, urlopen
+from core.config import get_settings
 
 SOURCE_URL = "https://musicbrainz.org/ws/2/genre/all?fmt=txt"
 
@@ -30,12 +31,7 @@ def main() -> None:
     existing = json.loads(args.asset.read_text(encoding="utf-8"))
     request = Request(
         SOURCE_URL,
-        headers={
-            "User-Agent": (
-                "DroppedNeedle/LibraryManagement "
-                "(https://github.com/DroppedNeedle/DroppedNeedle)"
-            )
-        },
+        headers={"User-Agent": get_settings().get_user_agent()},
     )
     with urlopen(request, timeout=30) as response:  # noqa: S310 - fixed HTTPS URL
         names = sorted(

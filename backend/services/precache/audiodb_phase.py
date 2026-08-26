@@ -8,6 +8,7 @@ from typing import Any, TYPE_CHECKING
 
 import httpx
 
+from core.config import get_settings
 from repositories.protocols import CoverArtRepositoryProtocol
 from repositories.coverart_disk_cache import get_cache_filename, VALID_IMAGE_CONTENT_TYPES
 from services.cache_status_service import CacheStatusService
@@ -102,7 +103,7 @@ class AudioDBPhase:
                 else:
                     logger.debug("audiodb.prewarm action=http_client_fallback entity_type=%s mbid=%s", entity_type, mbid[:8])
                     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
-                        response = await client.get(url, headers={"User-Agent": "DroppedNeedle/1.0"}, follow_redirects=True)
+                        response = await client.get(url, headers={"User-Agent": get_settings().get_user_agent()}, follow_redirects=True)
 
             if response.status_code != 200:
                 logger.debug(
