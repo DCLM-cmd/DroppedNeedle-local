@@ -72,6 +72,7 @@ class LibraryInventoryScanner:
         directory_probe: DirectoryProbe = Path.is_dir,
         max_detached_walkers: int = 4,
         probe_executor_max_workers: int = 1,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._store = store
         self._directory_walker = directory_walker
@@ -84,6 +85,7 @@ class LibraryInventoryScanner:
         self._probe_lock = threading.Lock()
         self._pending_probes: set[asyncio.Future[bool]] = set()
         self._closed = False
+        self._clock = clock
     def _finish_detached_walker(self, task: asyncio.Task[None]) -> None:
         self._detached_walkers.discard(task)
         if not task.cancelled():
@@ -151,7 +153,7 @@ class LibraryInventoryScanner:
                     root_id=scope.root_id,
                     relative_path=relative_path,
                     failure_code=failure_code,
-                    recorded_at=time.time(),
+                    recorded_at=self._clock(),
                     failure_detail=failure_detail,
                     phase="discovering",
                 )
@@ -221,7 +223,7 @@ class LibraryInventoryScanner:
                     expected_state=current.state,
                     expected_revision=current.row_revision,
                     new_state="failed",
-                    now=current.updated_at,
+                    now=self._clock(),
                     terminal_code="ROOT_UNAVAILABLE",
                 )
             selected = (
@@ -273,7 +275,7 @@ class LibraryInventoryScanner:
                     expected_state=current.state,
                     expected_revision=current.row_revision,
                     new_state="failed",
-                    now=current.updated_at,
+                    now=self._clock(),
                     terminal_code="WALK_TIMEOUT",
                 )
             if should_fail_capacity:
@@ -306,7 +308,7 @@ class LibraryInventoryScanner:
                     expected_state=current.state,
                     expected_revision=current.row_revision,
                     new_state="failed",
-                    now=current.updated_at,
+                    now=self._clock(),
                     terminal_code="WALK_TIMEOUT",
                 )
             assert probe_future is not None
@@ -375,7 +377,7 @@ class LibraryInventoryScanner:
                     expected_state=current.state,
                     expected_revision=current.row_revision,
                     new_state="failed",
-                    now=current.updated_at,
+                    now=self._clock(),
                     terminal_code="WALK_TIMEOUT",
                 )
             except asyncio.CancelledError:
@@ -407,7 +409,7 @@ class LibraryInventoryScanner:
                         expected_state=current.state,
                         expected_revision=current.row_revision,
                         new_state="failed",
-                        now=current.updated_at,
+                        now=self._clock(),
                         terminal_code="WALK_TIMEOUT",
                     )
                 raise
@@ -431,7 +433,7 @@ class LibraryInventoryScanner:
                     expected_state=current.state,
                     expected_revision=current.row_revision,
                     new_state="failed",
-                    now=current.updated_at,
+                    now=self._clock(),
                     terminal_code="ROOT_UNAVAILABLE",
                 )
             while True:
@@ -473,7 +475,7 @@ class LibraryInventoryScanner:
                         expected_state="discovering",
                         expected_revision=current.row_revision,
                         new_state="failed",
-                        now=current.updated_at,
+                        now=self._clock(),
                         terminal_code=walk_failure_code or "ROOT_PERMISSION_DENIED",
                     )
                 return current

@@ -2126,3 +2126,232 @@ async def test_production_smoke_identification_worker_future_wake_no_reclaim(tmp
     assert await queue.claim("worker-2", now=now + 5) is None
     assert await queue.claim("worker-2", now=now + 13) is None
     assert await queue.claim("worker-2", now=now + 33) is not None
+
+@pytest.mark.asyncio
+async def test_discovery_missing_root_uses_fresh_clock() -> None:
+    stale = 100.0
+    fresh = 300.0
+
+    def fake_clock() -> float:
+        return fresh
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state = AsyncMock(return_value="pending")
+    store.complete_scan_scope_discovery = AsyncMock()
+    store.record_scan_failures = AsyncMock()
+    store.transition_scan_run = AsyncMock(
+        return_value=ScanRun(
+            id="run-1",
+            kind="incremental",
+            trigger="manual",
+            state="failed",
+            phase="discovering",
+            updated_at=fresh,
+            terminal_at=fresh,
+            row_revision=2,
+        )
+    )
+    run = ScanRun(
+        id="run-1",
+        kind="incremental",
+        trigger="manual",
+        state="discovering",
+        phase="discovering",
+        updated_at=stale,
+        row_revision=1,
+    )
+    scope = ScanScope(root_id="root-a", relative_path=".", policy_revision="rev-1")
+    scanner = LibraryInventoryScanner(store, clock=fake_clock)
+    result = await scanner.discover(
+        run, [scope], {}, SimpleNamespace(policy_revision="rev-1"), AsyncMock(return_value=True)
+    )
+    assert result.state == "failed"
+    assert store.record_scan_failures.await_count == 1
+    recorded = store.record_scan_failures.call_args[0][1][0]
+    assert recorded.recorded_at == fresh
+    assert recorded.failure_code == "ROOT_UNAVAILABLE"
+    assert store.transition_scan_run.await_count == 1
+    _args, kwargs = store.transition_scan_run.call_args
+    assert kwargs["now"] == fresh
+    assert kwargs["now"] > stale
+    assert kwargs["terminal_code"] == "ROOT_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_discovery_missing_path_uses_fresh_clock(tmp_path: Path) -> None:
+    stale = 100.0
+    fresh = 350.0
+
+    def fake_clock() -> float:
+        return fresh
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state = AsyncMock(return_value="pending")
+    store.complete_scan_scope_discovery = AsyncMock()
+    store.record_scan_failures = AsyncMock()
+    store.transition_scan_run = AsyncMock(
+        return_value=ScanRun(
+            id="run-1",
+            kind="incremental",
+            trigger="manual",
+            state="failed",
+            phase="discovering",
+            updated_at=fresh,
+            terminal_at=fresh,
+            row_revision=2,
+        )
+    )
+    root = tmp_path / "music"
+    root.mkdir()
+    run = ScanRun(
+        id="run-1",
+        kind="incremental",
+        trigger="manual",
+        state="discovering",
+        phase="discovering",
+        updated_at=stale,
+        row_revision=1,
+    )
+    scope = ScanScope(root_id="root-a", relative_path="Missing", policy_revision="rev-1", root_path=str(root))
+    scanner = LibraryInventoryScanner(store, clock=fake_clock, directory_probe=lambda _p: False)
+    result = await scanner.discover(
+        run, [scope], {"root-a": root}, SimpleNamespace(policy_revision="rev-1"), AsyncMock(return_value=True)
+    )
+    assert result.state == "failed"
+    recorded = store.record_scan_failures.call_args[0][1][0]
+    assert recorded.recorded_at == fresh
+    assert recorded.failure_code == "ROOT_UNAVAILABLE"
+    assert store.transition_scan_run.call_args.kwargs["now"] == fresh
+    assert store.transition_scan_run.call_args.kwargs["now"] > stale
+
+
+@pytest.mark.asyncio
+async def test_discovery_probe_timeout_uses_fresh_clock(tmp_path: Path) -> None:
+    stale = 100.0
+    fresh = 400.0
+
+    def fake_clock() -> float:
+        return fresh
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state = AsyncMock(return_value="pending")
+    store.complete_scan_scope_discovery = AsyncMock()
+    store.record_scan_failures = AsyncMock()
+    store.transition_scan_run = AsyncMock(
+        return_value=ScanRun(
+            id="run-1",
+            kind="incremental",
+            trigger="manual",
+            state="failed",
+            phase="discovering",
+            updated_at=fresh,
+            terminal_at=fresh,
+            row_revision=2,
+        )
+    )
+    root = tmp_path / "music"
+    root.mkdir()
+    run = ScanRun(
+        id="run-1",
+        kind="incremental",
+        trigger="manual",
+        state="discovering",
+        phase="discovering",
+        updated_at=stale,
+        row_revision=1,
+    )
+    scope = ScanScope(root_id="root-a", relative_path=".", policy_revision="rev-1", root_path=str(root))
+
+    def blocking_probe(_path: Path) -> bool:
+        time.sleep(0.12)
+        return True
+
+    scanner = LibraryInventoryScanner(
+        store, clock=fake_clock, walk_deadline_seconds=0.05, directory_probe=blocking_probe
+    )
+    result = await scanner.discover(
+        run, [scope], {"root-a": root}, SimpleNamespace(policy_revision="rev-1"), AsyncMock(return_value=True)
+    )
+    assert result.state == "failed"
+    recorded = store.record_scan_failures.call_args[0][1][0]
+    assert recorded.recorded_at == fresh
+    assert recorded.failure_code == "WALK_TIMEOUT"
+    assert store.transition_scan_run.call_args.kwargs["now"] == fresh
+    assert store.transition_scan_run.call_args.kwargs["now"] > stale
+    # failure record and terminal share the same fresh clock and ordering is consistent
+    assert recorded.recorded_at <= store.transition_scan_run.call_args.kwargs["now"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_walk_failure_uses_fresh_clock(tmp_path: Path) -> None:
+    stale = 100.0
+    fresh = 450.0
+
+    def fake_clock() -> float:
+        return fresh
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state = AsyncMock(return_value="pending")
+    store.get_scan_scope_discovery_generation = AsyncMock(return_value=1)
+    store.complete_scan_scope_discovery = AsyncMock()
+    store.record_scan_failures = AsyncMock()
+    store.get_scan_run = AsyncMock(
+        return_value=(
+            ScanRun(
+                id="run-1",
+                kind="incremental",
+                trigger="manual",
+                state="discovering",
+                phase="discovering",
+                updated_at=stale,
+                row_revision=2,
+            ),
+            [],
+            {},
+        )
+    )
+    store.transition_scan_run = AsyncMock(
+        return_value=ScanRun(
+            id="run-1",
+            kind="incremental",
+            trigger="manual",
+            state="failed",
+            phase="discovering",
+            updated_at=fresh,
+            terminal_at=fresh,
+            row_revision=3,
+        )
+    )
+    store.cleanup_stale_scan_inventory = AsyncMock()
+    store.restart_scan_scope_discovery = AsyncMock()
+    root = tmp_path / "music"
+    root.mkdir()
+    run = ScanRun(
+        id="run-1",
+        kind="incremental",
+        trigger="manual",
+        state="discovering",
+        phase="discovering",
+        updated_at=stale,
+        row_revision=1,
+    )
+    scope = ScanScope(root_id="root-a", relative_path=".", policy_revision="rev-1", root_path=str(root))
+
+    class StubScanner(LibraryInventoryScanner):
+        async def _walk_scope(self, *args, **kwargs):  # type: ignore[override]
+            # Simulate a walk that observed a permission error and returned incomplete
+            return (run, False, "WALK_TIMEOUT")
+
+    scanner = StubScanner(store, clock=fake_clock)
+    # Ensure the discover loop sees the scope as not completed and checkpoint passes
+    result = await scanner.discover(
+        run, [scope], {"root-a": root}, SimpleNamespace(policy_revision="rev-1"), AsyncMock(return_value=True)
+    )
+    assert result.state == "failed"
+    # No _record_failure for this path - the walk failure is converted directly to terminal
+    # but the terminal still uses fresh clock
+    assert store.transition_scan_run.await_count == 1
+    _args, kwargs = store.transition_scan_run.call_args
+    assert kwargs["now"] == fresh
+    assert kwargs["now"] > stale
+    assert kwargs["terminal_code"] == "WALK_TIMEOUT"

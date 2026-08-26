@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import get_args
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -32,6 +33,7 @@ from services.native.library_inventory_scanner import (
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.library_reconciler import LibraryReconciler
 from services.native.library_scan_coordinator import LibraryScanCoordinator
+from services.native.library_scan_scheduler import LibraryAutomaticScanScheduler
 from services.native.library_schedule_service import LibraryScheduleService
 
 
@@ -2504,3 +2506,76 @@ async def test_multi_trigger_follow_up_preserves_metadata_across_restart(
         ("automatic", "accepted"),
         ("subsonic", "covered"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_delayed_probe_failure_persists_fresh_terminal_and_scheduler_anchor(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    stale = 100.0
+    requested = await target_store.request_scan_run(
+        _request(resolver), run_id="run-fresh", requested_at=stale
+    )
+    claimed = await target_store.claim_next_scan_run(now=stale)
+    assert claimed is not None and claimed.state == "discovering"
+    fresh = 400.0
+
+    def fake_clock() -> float:
+        return fresh
+
+    def blocking_probe(_path: Path) -> bool:
+        time.sleep(0.12)
+        return True
+
+    scanner = LibraryInventoryScanner(
+        target_store, clock=fake_clock, walk_deadline_seconds=0.05, directory_probe=blocking_probe
+    )
+
+    async def checkpoint(_run_id: str, _revision: str) -> bool:
+        return True
+
+    failed = await scanner.discover(
+        claimed, (await target_store.get_scan_run(claimed.id))[1], {"root-a": root}, resolver, checkpoint
+    )
+    assert failed.state == "failed"
+    persisted, _, _ = await target_store.get_scan_run(failed.id)
+    assert persisted.phase_timings.get("discovering", 0) == fresh - stale
+    with sqlite3.connect(target_store.db_path) as connection:
+        failure = connection.execute(
+            "SELECT failure_code, recorded_at FROM library_scan_failures WHERE run_id = ?",
+            (failed.id,),
+        ).fetchone()
+    assert failure is not None and failure[0] == "WALK_TIMEOUT"
+    assert float(failure[1]) == fresh
+    assert float(failure[1]) <= float(persisted.terminal_at or 0)
+    scheduler = LibraryAutomaticScanScheduler()
+    coordinator_mock = AsyncMock()
+    coordinator_mock.latest_filesystem_terminal.return_value = persisted
+    before_due = await scheduler.tick(
+        coordinator_mock,
+        resolver,
+        frequency="24hr",
+        daily_time="03:00",
+        timezone_name="Europe/London",
+        now=datetime.fromtimestamp(fresh + 86400 - 100).astimezone(),
+    )
+    assert before_due is False
+    coordinator_mock.request_run.assert_not_awaited()
+    coordinator_mock.reset_mock()
+    coordinator_mock.latest_filesystem_terminal.return_value = persisted
+    due = await scheduler.tick(
+        coordinator_mock,
+        resolver,
+        frequency="24hr",
+        daily_time="03:00",
+        timezone_name="Europe/London",
+        now=datetime.fromtimestamp(fresh + 86400 + 1).astimezone(),
+    )
+    assert due is True
+    reopened = NativeLibraryStore(db_path=Path(target_store.db_path), write_lock=threading.Lock())
+    reopened_run, _, _ = await reopened.get_scan_run(failed.id)
+    assert reopened_run.terminal_at == fresh
+    assert reopened_run.updated_at == fresh
