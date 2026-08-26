@@ -1,4 +1,26 @@
-"""Re-migrate legacy catalog rows left pending after the automatic upgrade."""
+"""Re-migrate legacy catalog rows left pending after the automatic upgrade.
+
+F6/H6 trigger model. There is NO periodic scheduler BY DESIGN (owner decision
+in the lenient-upgrade posture; NEW-MIG-01 explicitly declined a second
+supervisor). Pending rows are retried only when one of these triggers fires:
+
+1. Target startup - ``backend/target_application.py`` schedules once during
+   the operational-runtime lifespan stage, gated on ``library_enabled()`` and
+   exception-isolated so a scheduling failure never blocks startup.
+2. ``PUT /api/v1/settings/library`` (``library_policies_target.py``) - a
+   saved roots change schedules when the saved settings are enabled
+   (``response.enabled``).
+3. ``POST /api/v1/settings/library/restore-roots`` (same module) - a root
+   restore schedules under the same ``response.enabled`` gate.
+
+The fourth site named by the migration audit (the legacy-app schedule route)
+is dead code since the legacy composition removal (audit DR-3); only the
+three target-app triggers above exist. Consequence: a legacy row arriving
+after a run's final revision check waits for the NEXT trigger - latency is
+accepted. Gate correctness lives in ``_due_run_id``: durable completed marker,
+nonzero pending counts, and composite run id
+``legacy-pending-<policy_revision>-<source_revision>`` not already completed.
+"""
 
 from __future__ import annotations
 

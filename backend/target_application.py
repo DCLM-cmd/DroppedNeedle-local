@@ -690,6 +690,9 @@ async def production_target_lifespan(app: FastAPI):
             auth_store=auth_store,
         )
         if library_enabled():
+            # F6/H6 pending-migration trigger 1 of 3 (live sites): scheduled
+            # once at startup. No periodic scheduler exists by design; a row
+            # missing this window waits for the next roots save or restore.
             try:
                 await get_legacy_pending_migration_service().schedule()
             except Exception:  # noqa: BLE001

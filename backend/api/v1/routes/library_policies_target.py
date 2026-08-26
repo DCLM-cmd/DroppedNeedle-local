@@ -50,6 +50,8 @@ async def update_library_settings(
         expected_policy_revision=request.expected_policy_revision,
     )
     if response.enabled:
+        # F6/H6 pending-migration trigger 2 of 3 (live sites): a saved roots
+        # change re-schedules the pending migration; disabled saves do not.
         await pending_migration.schedule()
     return response
 
@@ -92,5 +94,7 @@ async def restore_library_roots(
 ) -> LibrarySettingsResponse:
     response = await service.restore_roots(request)
     if response.enabled:
+        # F6/H6 pending-migration trigger 3 of 3 (live sites): restoring
+        # roots re-schedules the pending migration under the same gate.
         await pending_migration.schedule()
     return response

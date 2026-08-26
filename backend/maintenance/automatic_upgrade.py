@@ -1244,6 +1244,15 @@ def _record_post_admission_startup_failure(
     startup_started: float,
     returncode: int | None,
 ) -> None:
+    """F8/H8 ops semantics: a post-admission target startup failure
+    deliberately keeps ``stage="completed"`` - the upgraded database is KEPT,
+    not rolled back - and appends a ``target_startup_failure`` evidence
+    object to the state record instead of flipping the stage to ``failed``.
+    Operators must inspect the full state record (or grep for
+    ``target_startup_failure``): grepping for ``failed`` misses this failure
+    class entirely. A later healthy boot clears the flag via
+    ``_clear_post_admission_startup_failure``, returning the record to a
+    plain completed state."""
     state_path = settings.cache_dir / f"automatic-upgrade-{UPGRADE_ID}.json"
     state = _read_state(state_path)
     if state is None or state.get("stage") != "completed":
