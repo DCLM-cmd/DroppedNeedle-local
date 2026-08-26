@@ -219,9 +219,13 @@ Environment faults, such as a missing or unavailable downloads mount, are not qu
 Imported files are placed using a template. The variables:
 
 ```
-{artist} {album} {albumartist} {year} {track:02d} {title} {ext}
+{initial} {artist} {album} {albumartist} {year} {track:02d} {title} {ext}
 {disc} {genre} {medium} {musicbrainz_id} {artist_mbid}
 ```
+
+`{initial}` uses the effective album artist (the album artist, falling back to the track artist where needed),
+trims Unicode whitespace, ignores a leading case-insensitive `The` plus following Unicode whitespace, and
+returns exactly one uppercase alphabetic code point. Empty or non-alphabetic leads return `#`.
 
 The default:
 

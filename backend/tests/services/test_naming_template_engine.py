@@ -142,6 +142,73 @@ def test_genre_variable(engine):
     result = engine.format_path("{genre}", _tag(genre="Jazz"), "flac")
     assert result == Path("Jazz")
 
+@pytest.mark.parametrize(
+    ("album_artist", "artist", "expected"),
+    [
+        ("Radiohead", "Fallback", "R"),
+        (" The National ", "Fallback", "N"),
+        ("\t tHe\u2003National\u00a0", "Fallback", "N"),
+        ("The\tNational", "Fallback", "N"),
+        ("The  Doors", "Fallback", "D"),
+        ("the xx", "Fallback", "X"),
+        ("t0ni", "Fallback", "T"),
+        ("2 Chainz", "Fallback", "#"),
+        ("_m0lly", "Fallback", "#"),
+        ("Öxxö Xööx", "Fallback", "Ö"),
+        ("高橋洋子", "Fallback", "高"),
+        ("The", "Fallback", "T"),
+        ("\u0301Radiohead", "Fallback", "#"),
+        ("ßeta", "Fallback", "S"),
+        ("ﬃn", "Fallback", "F"),
+        (None, "The National", "N"),
+        ("", "Radiohead", "R"),
+        ("  ", "Radiohead", "#"),
+        (None, "", "#"),
+    ],
+)
+def test_initial_variable_uses_exact_artist_bucket(
+    engine, album_artist, artist, expected
+):
+    result = engine.format_path(
+        "{initial}",
+        _tag(album_artist=album_artist, artist=artist),
+        "flac",
+    )
+
+    assert result == Path(expected)
+    assert len(result.name) == 1
+
+
+def test_initial_composes_nfd_artist_before_selecting_the_bucket(engine):
+    composed = "Éclair"
+    decomposed = unicodedata.normalize("NFD", composed)
+
+    composed_result = engine.format_path(
+        "{initial}", _tag(album_artist=composed), "flac"
+    )
+    decomposed_result = engine.format_path(
+        "{initial}", _tag(album_artist=decomposed), "flac"
+    )
+
+    assert composed_result == decomposed_result == Path("É")
+
+
+def test_initial_keeps_legacy_paths_relative_when_artist_is_traversal_text(engine):
+    result = engine.format_path(
+        "{initial}/{albumartist}/{title}.{ext}",
+        _tag(album_artist="../escape"),
+        "flac",
+    )
+
+    assert result == Path("#/_escape/Airbag.flac")
+    assert not result.is_absolute()
+    assert ".." not in result.parts
+
+
+def test_validate_template_accepts_initial(engine):
+    assert engine.validate_template("{initial}/{albumartist}/{album}.{ext}") == []
+
+
 
 def test_medium_variable_is_empty(engine):
     result = engine.format_path("x{medium}y", _tag(), "flac")

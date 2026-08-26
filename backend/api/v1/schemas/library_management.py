@@ -693,6 +693,7 @@ def _validate_naming_language(source: str, script_name: str) -> None:
         "album_artists",
         "album_artist_sorts",
         "albumartist",
+        "initial",
         "year",
         "track",
         "disc",

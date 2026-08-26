@@ -16,6 +16,7 @@ from api.v1.schemas.library_management import (
     LibraryManagementRootOverrides,
     LibraryManagementSettings,
     ManagedFieldSettings,
+    NamingScriptSettings,
     build_initial_library_management_settings,
     normalize_library_management_settings,
     profile_revision,
@@ -134,6 +135,59 @@ def test_legacy_template_is_copied_into_an_unassigned_path_only_profile() -> Non
     assert profile.artwork.embedded_enabled is False
     assert profile.artwork.external_enabled is False
     assert settings.root_assignments == []
+
+
+def test_legacy_initial_template_is_accepted_by_settings_builder() -> None:
+    source = "{initial}/{albumartist}/{album}/{title}.{ext}"
+    settings = build_initial_library_management_settings(source)
+
+    script = next(
+        value
+        for value in settings.naming_scripts
+        if value.id == LEGACY_NAMING_SCRIPT_ID
+    )
+
+    assert script.source == source
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "{initial}/{albumartist}/{title}.{ext}",
+        "{upper(initial)}/{albumartist}/{title}.{ext}",
+    ),
+)
+def test_initial_plain_and_expression_scripts_are_schema_valid(source: str) -> None:
+    settings = build_initial_library_management_settings()
+    settings.naming_scripts.append(
+        NamingScriptSettings(
+            id="55f447a4-3053-4a42-989e-669bf3d954e8",
+            name="Initial naming",
+            source=source,
+        )
+    )
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    profile.organization.compatibility.unicode_normalization = "NFKC"
+
+    normalized = normalize_library_management_settings(settings)
+
+    script = next(
+        value
+        for value in normalized.naming_scripts
+        if value.id == "55f447a4-3053-4a42-989e-669bf3d954e8"
+    )
+    assert script.source == source
+    assert (
+        next(
+            value
+            for value in normalized.profiles
+            if value.id == PICARD_ORGANIZER_PROFILE_ID
+        )
+        .organization.compatibility.unicode_normalization
+        == "NFKC"
+    )
 
 
 def test_nested_settings_round_trip_and_revisions_are_stable() -> None:

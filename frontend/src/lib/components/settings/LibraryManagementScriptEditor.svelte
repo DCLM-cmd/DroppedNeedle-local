@@ -190,8 +190,13 @@
 				<summary class="cursor-pointer font-semibold">Language reference</summary>
 				{#if kind === 'naming'}
 					<p class="mt-2">
-						Common values: title, album, album_disambiguation, artist, albumartist, year, disc,
-						track, medium_format, medium_number, genre, ext, codec.
+						Common values: title, album, album_disambiguation, artist, albumartist, initial, year,
+						disc, track, medium_format, medium_number, genre, ext, codec.
+					</p>
+					<p class="mt-1">
+						{'{initial}'} uses the effective album artist, ignores leading Unicode whitespace and a case-insensitive
+						"The" plus following Unicode whitespace, then returns one uppercase letter; empty or nonletter
+						leads return "#".
 					</p>
 					<p class="mt-1">
 						Functions: default, conditional, concat, is_empty, pad, replace, lower, upper, title,

@@ -41,6 +41,22 @@ _RESERVED_NAMES = frozenset(
     | {f"com{i}" for i in range(1, 10)}
     | {f"lpt{i}" for i in range(1, 10)}
 )
+_LEADING_THE = re.compile(r"^the\s+", re.IGNORECASE)
+
+
+def _artist_initial(artist: str, normalization_form: str) -> str:
+    """Return the single-code-point artist bucket for a naming template."""
+    name = unicodedata.normalize(normalization_form, artist).strip()
+    name = _LEADING_THE.sub("", name, count=1).strip()
+    if not name:
+        return "#"
+    first = name[0]
+    if not first.isalpha():
+        return "#"
+    return next(
+        (character for character in first.upper() if character.isalpha()),
+        "#",
+    )
 
 
 class NamingTemplateEngine:
@@ -52,6 +68,7 @@ class NamingTemplateEngine:
             "artist",
             "album",
             "albumartist",
+            "initial",
             "year",
             "title",
             "ext",
@@ -80,6 +97,7 @@ class NamingTemplateEngine:
             "album_artists",
             "album_artist_sorts",
             "albumartist",
+            "initial",
             "year",
             "track",
             "disc",
@@ -493,6 +511,8 @@ class NamingTemplateEngine:
                 return tag.album
             case "albumartist":
                 return tag.album_artist or tag.artist
+            case "initial":
+                return _artist_initial(tag.album_artist or tag.artist, "NFC")
             case "year":
                 return str(tag.year) if tag.year else ""
             case "title":
@@ -623,6 +643,12 @@ class NamingTemplateEngine:
         elif compatibility.extension_case == "upper":
             extension = extension.upper()
         bitrate = max(0, round(document.technical.bitrate_bps / 1000))
+        albumartist = (
+            metadata.album_artist_display
+            or (album_artists[0] if album_artists else "")
+            or metadata.artist_display
+            or (artists[0] if artists else "")
+        )
         variables.update(
             artist=metadata.artist_display or (artists[0] if artists else ""),
             artists=artists,
@@ -633,11 +659,10 @@ class NamingTemplateEngine:
                 metadata.album_artist_display
                 or (album_artists[0] if album_artists else "")
             ),
-            albumartist=(
-                metadata.album_artist_display
-                or (album_artists[0] if album_artists else "")
-                or metadata.artist_display
-                or (artists[0] if artists else "")
+            albumartist=albumartist,
+            initial=_artist_initial(
+                albumartist,
+                compatibility.unicode_normalization,
             ),
             album_artists=album_artists,
             album_artist_display=metadata.album_artist_display or "",
