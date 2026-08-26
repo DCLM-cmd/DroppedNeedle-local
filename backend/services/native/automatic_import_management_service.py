@@ -143,7 +143,21 @@ class AutomaticImportManagementService:
         prepared = list(bundle.files)
         automatic: dict[int, tuple[object, object]] = {}
         try:
-            for request in bundle.files:
+            # F-NL-01 (DECISIONS-LIVE): an unmapped bonus file is imported
+            # unmanaged by default and must not hold the mapped part of the
+            # unit. Only management-eligible requests resolve a profile; the
+            # identity check below stays at the managed-request boundary.
+            managed_requests = [
+                request
+                for request in bundle.files
+                if (
+                    request.authoritative_mapping
+                    and request.release_group_mbid
+                    and request.release_mbid
+                )
+                or trigger == "edition_conversion"
+            ]
+            for request in managed_requests:
                 root_id = (
                     request.replacement_root_id
                     if request.conversion_recycle_only
@@ -174,7 +188,11 @@ class AutomaticImportManagementService:
                 )
             if not automatic:
                 return bundle
-            if len(automatic) != len(bundle.files):
+            if any(
+                value.conversion_recycle_only
+                and value.ordinal not in automatic
+                for value in bundle.files
+            ):
                 raise ConfigurationError(
                     "One import unit cannot cross automatic and unmanaged root assignments."
                 )
@@ -194,6 +212,7 @@ class AutomaticImportManagementService:
                     not request.authoritative_mapping
                     or not request.release_group_mbid
                     or not request.release_mbid
+                    or not request.release_track_mbid
                 ):
                     raise ProviderIdentityRequiredError(
                         "Every automatic import file needs an accepted release-track mapping."
