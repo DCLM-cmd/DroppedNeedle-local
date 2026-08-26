@@ -1,5 +1,10 @@
+import threading
+from collections import OrderedDict
+from collections.abc import Callable
+from typing import Any, Optional
+
 import httpx
-from typing import Optional
+
 from core.config import Settings, get_settings
 
 
@@ -9,9 +14,84 @@ def _get_user_agent(settings: Optional[Settings] = None) -> str:
     return get_settings().get_user_agent()
 
 
+def _freeze_value(value: Any) -> Any:
+    """Deterministic encoding for cache-key participation.
+
+    Hashable values pass through; unhashable containers are canonicalized so
+    equal contents always produce an equal key instead of being dropped."""
+    if isinstance(value, dict):
+        return tuple(sorted((k, _freeze_value(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(v) for v in value)
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
 class HttpClientFactory:
-    _clients: dict[str, httpx.AsyncClient] = {}
-    
+    """Named outbound HTTP clients with a parameter-aware cache.
+
+    F-PERF-08: the cache key is the immutable effective-construction
+    configuration - logical name plus timeout, connect timeout, pool limits,
+    HTTP/2, User-Agent identity, and normalized extra kwargs. Equal effective
+    configurations for one name share one client; different values never
+    silently inherit the first caller's settings. Superseded generations move
+    to ``_retired`` on :meth:`retire_name` and are closed by the awaited
+    lifecycle paths only - never from a synchronous lookup."""
+
+    _MAX_GENERATIONS = 32
+
+    _clients: "OrderedDict[tuple[int, Any], httpx.AsyncClient]" = OrderedDict()
+    _retired: list[httpx.AsyncClient] = []
+    _lock = threading.Lock()
+    _generation_counter = 0
+
+    @classmethod
+    def _effective_key(
+        cls,
+        *,
+        name: str,
+        timeout: float,
+        connect_timeout: float,
+        max_connections: int,
+        max_keepalive: int,
+        http2: bool,
+        user_agent: str,
+        kwargs: dict[str, Any],
+    ) -> tuple:
+        frozen_kwargs = tuple(
+            sorted((key, _freeze_value(value)) for key, value in kwargs.items())
+        )
+        # The leading generation counter keeps logically identical entries from
+        # colliding across retirement cycles while remaining fully derived
+        # from immutable construction inputs plus the name.
+        return (
+            hash(
+                (
+                    name,
+                    timeout,
+                    connect_timeout,
+                    max_connections,
+                    max_keepalive,
+                    http2,
+                    user_agent,
+                    frozen_kwargs,
+                )
+            ),
+            name,
+            timeout,
+            connect_timeout,
+            max_connections,
+            max_keepalive,
+            http2,
+            user_agent,
+            frozen_kwargs,
+        )
+
     @classmethod
     def get_client(
         cls,
@@ -22,10 +102,27 @@ class HttpClientFactory:
         max_keepalive: int = 200,
         settings: Optional[Settings] = None,
         http2: bool = True,
-        **kwargs
+        **kwargs,
     ) -> httpx.AsyncClient:
-        if name not in cls._clients:
-            cls._clients[name] = httpx.AsyncClient(
+        user_agent = _get_user_agent(settings)
+        key = cls._effective_key(
+            name=name,
+            timeout=timeout,
+            connect_timeout=connect_timeout,
+            max_connections=max_connections,
+            max_keepalive=max_keepalive,
+            http2=http2,
+            user_agent=user_agent,
+            kwargs=kwargs,
+        )
+        with cls._lock:
+            existing = cls._clients.get(key)
+            if existing is not None:
+                cls._clients.move_to_end(key)
+                return existing
+            # Construction inside the lock coalesces concurrent first access:
+            # two callers with one effective key cannot build duplicates.
+            client = httpx.AsyncClient(
                 http2=http2,
                 timeout=httpx.Timeout(timeout, connect=connect_timeout),
                 limits=httpx.Limits(
@@ -35,16 +132,62 @@ class HttpClientFactory:
                 ),
                 follow_redirects=True,
                 transport=httpx.AsyncHTTPTransport(http2=http2, retries=0),
-                headers={"User-Agent": _get_user_agent(settings)},
-                **kwargs
+                headers={"User-Agent": user_agent},
+                **kwargs,
             )
-        return cls._clients[name]
-    
+            cls._generation_counter += 1
+            cls._clients[key] = client
+            cls._enforce_generation_cap_locked()
+            return client
+
+    @classmethod
+    def _enforce_generation_cap_locked(cls) -> None:
+        """Bounded history: oldest non-current entries become retired work."""
+        while len(cls._clients) > cls._MAX_GENERATIONS:
+            _, oldest = cls._clients.popitem(last=False)
+            cls._retired.append(oldest)
+
+    @classmethod
+    def retire_name(cls, name: str) -> int:
+        """Move every active client of a logical name to the retired pool.
+
+        Synchronous and side-effect free beyond bookkeeping: nothing is
+        closed here, so an in-flight request holding the previous generation
+        is never torn down by a lookup or a settings save."""
+        retired_count = 0
+        with cls._lock:
+            for key in [key for key in cls._clients if key[1] == name]:
+                cls._retired.append(cls._clients.pop(key))
+                retired_count += 1
+        return retired_count
+
+    @classmethod
+    async def close_retired(cls) -> int:
+        """Awaited close of every superseded generation, exactly once."""
+        with cls._lock:
+            batch, cls._retired = cls._retired, []
+        closed = 0
+        for client in batch:
+            await client.aclose()
+            closed += 1
+        return closed
+
     @classmethod
     async def close_all(cls) -> None:
-        for client in cls._clients.values():
+        """Application shutdown / full reset: close active AND retired
+        generations exactly once; safe to call repeatedly."""
+        with cls._lock:
+            active = list(cls._clients.values())
+            cls._clients.clear()
+            batch, cls._retired = cls._retired, []
+        for client in [*active, *batch]:
             await client.aclose()
-        cls._clients.clear()
+
+    @classmethod
+    def reset_for_tests(cls) -> None:
+        with cls._lock:
+            cls._clients.clear()
+            cls._retired.clear()
 
 
 def get_http_client(

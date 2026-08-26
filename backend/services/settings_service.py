@@ -321,6 +321,23 @@ class SettingsService:
         await self.clear_home_cache()
         logger.info("YouTube settings change: singleton reset, home caches cleared")
 
+    async def on_http_settings_changed(self) -> None:
+        """F-PERF-08: advanced HTTP timeout/pool values changed.
+
+        Retire the shared factory generations so the next resolution builds
+        clients from the saved settings, clear the provider graphs that hold
+        default/ListenBrainz/cover-art clients, and close the superseded
+        generations through the awaited lifecycle path."""
+        from infrastructure.http.client import HttpClientFactory
+
+        for logical_name in ("default", "listenbrainz", "coverart"):
+            HttpClientFactory.retire_name(logical_name)
+        from core.dependencies import clear_listenbrainz_dependent_caches
+
+        clear_listenbrainz_dependent_caches()
+        await self.on_coverart_settings_changed()
+        await HttpClientFactory.close_retired()
+
     async def on_coverart_settings_changed(self) -> None:
         from core.dependencies import (
             get_coverart_repository,

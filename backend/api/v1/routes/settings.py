@@ -254,13 +254,26 @@ async def update_advanced_settings(
 ):
     try:
         backend_settings = settings.to_backend()
+        previous = preferences_service.get_advanced_settings()
         if _is_masked_api_key(backend_settings.audiodb_api_key):
-            current = preferences_service.get_advanced_settings()
             backend_settings = msgspec.structs.replace(
-                backend_settings, audiodb_api_key=current.audiodb_api_key
+                backend_settings, audiodb_api_key=previous.audiodb_api_key
             )
         preferences_service.save_advanced_settings(backend_settings)
-        await settings_service.on_coverart_settings_changed()
+        # F-PERF-08: only HTTP-affecting saves retire client generations.
+        http_changed = any(
+            getattr(previous, field) != getattr(backend_settings, field)
+            for field in (
+                "http_timeout",
+                "http_connect_timeout",
+                "http_max_connections",
+                "http_max_keepalive",
+            )
+        )
+        if http_changed:
+            await settings_service.on_http_settings_changed()
+        else:
+            await settings_service.on_coverart_settings_changed()
         saved = preferences_service.get_advanced_settings()
         return AdvancedSettingsFrontend.from_backend(saved)
     except ConfigurationError as e:
