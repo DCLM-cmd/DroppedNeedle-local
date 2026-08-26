@@ -8196,6 +8196,90 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._write(operation)
 
+    async def prune_old_terminal_identification_jobs(
+        self,
+        *,
+        now: float,
+        retention_days: int = 30,
+        limit: int = 500,
+    ) -> tuple[int, bool]:
+        """F-PERF-04: bounded 30-day retention for terminal automatic jobs.
+
+        Signed decision (LibraryAudit DECISIONS-LIVE): keep terminal automatic
+        jobs for 30 days with a strict ``terminal_at < now - N*86400`` cutoff,
+        prune in one bounded transaction, and preserve queued/running/paused
+        work, needs-review rows, deferred active rows, failed attention rows
+        (``MAX_DEFERRALS_EXCEEDED`` / ``SUBJECT_NOT_AVAILABLE``), review-retry
+        and post-processing kinds, and any job/attempt/evidence chain still
+        referenced by an identity, a review, or another job. An attempt is
+        removed only when it was this job's terminal result AND nothing else
+        references it; evidence goes first (RESTRICT) and only when no repair
+        finding holds it. Returns ``(removed_jobs, more_candidates)`` so the
+        caller can observe bounded progress and continue.
+        """
+        cutoff = now - retention_days * 86400.0
+
+        def operation(connection: sqlite3.Connection) -> tuple[int, bool]:
+            candidates = connection.execute(
+                "SELECT id, terminal_result_id FROM library_identification_jobs "
+                "WHERE kind = 'automatic' "
+                "AND state IN ('succeeded','failed','cancelled') "
+                "AND terminal_at IS NOT NULL AND terminal_at < ? "
+                "AND (state != 'failed' OR COALESCE(last_failure_code, '') NOT IN "
+                "('MAX_DEFERRALS_EXCEEDED','SUBJECT_NOT_AVAILABLE')) "
+                "ORDER BY terminal_at ASC, id ASC LIMIT ?",
+                (cutoff, max(1, limit) + 1),
+            ).fetchall()
+            has_more = len(candidates) > max(1, limit)
+            removed = 0
+            for row in candidates[: max(1, limit)]:
+                attempt_id = row["terminal_result_id"]
+                connection.execute(
+                    "DELETE FROM library_identification_jobs WHERE id = ?",
+                    (row["id"],),
+                )
+                removed += 1
+                if not attempt_id:
+                    continue
+                still_referenced = connection.execute(
+                    "SELECT EXISTS("
+                    "SELECT 1 FROM local_album_external_identities i "
+                    "WHERE i.attempt_id = ?) OR EXISTS("
+                    "SELECT 1 FROM local_artist_external_identities i "
+                    "WHERE i.attempt_id = ?) OR EXISTS("
+                    "SELECT 1 FROM local_track_external_identities i "
+                    "WHERE i.attempt_id = ?) OR EXISTS("
+                    "SELECT 1 FROM library_identification_reviews r "
+                    "WHERE r.attempt_id = ?) OR EXISTS("
+                    "SELECT 1 FROM library_identification_jobs j "
+                    "WHERE j.terminal_result_id = ?)",
+                    (attempt_id,) * 5,
+                ).fetchone()[0]
+                if still_referenced:
+                    # Identity/review/other-job chain survives; its evidence
+                    # and attempt stay for audit (RESTRICT-safe by design).
+                    continue
+                blocked_by_findings = connection.execute(
+                    "SELECT EXISTS("
+                    "SELECT 1 FROM library_identity_repair_findings f "
+                    "JOIN library_identification_evidence e ON e.id = f.evidence_id "
+                    "WHERE e.attempt_id = ?)",
+                    (attempt_id,),
+                ).fetchone()[0]
+                if blocked_by_findings:
+                    continue
+                connection.execute(
+                    "DELETE FROM library_identification_evidence WHERE attempt_id = ?",
+                    (attempt_id,),
+                )
+                connection.execute(
+                    "DELETE FROM library_identification_attempts WHERE id = ?",
+                    (attempt_id,),
+                )
+            return removed, has_more
+
+        return await self._write(operation)
+
     async def compact_terminal_identification_evidence(
         self, *, older_than: float
     ) -> tuple[int, int]:

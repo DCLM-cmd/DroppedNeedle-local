@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from infrastructure.persistence.request_history import RequestHistoryStore
     from infrastructure.persistence.mbid_store import MBIDStore
     from infrastructure.persistence.youtube_store import YouTubeStore
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
     from infrastructure.persistence.wanted_store import WantedStore
     from services.requests_page_service import RequestsPageService
     from services.native.new_release_service import NewReleaseService
@@ -1140,6 +1141,7 @@ async def prune_stores_periodically(
     ignored_retention_days: int = 365,
     interval: int = 21600,
     wanted_store: "WantedStore | None" = None,
+    native_store: "NativeLibraryStore | None" = None,
 ) -> None:
     await asyncio.sleep(600)
     while True:
@@ -1151,6 +1153,13 @@ async def prune_stores_periodically(
                 # terminal (stopped/fulfilled) watches age out on the same window
                 # as requests; orphaned seen-candidate rows go with them (§5.1)
                 await wanted_store.prune(request_retention_days)
+            if native_store is not None:
+                # F-PERF-04: bounded 30-day retention for terminal automatic
+                # identification jobs (signed LibraryAudit decision); one batch
+                # per pass, continuation handled by the next interval.
+                await native_store.prune_old_terminal_identification_jobs(
+                    now=time()
+                )
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1167,6 +1176,7 @@ def start_store_prune_task(
     ignored_retention_days: int = 365,
     interval: int = 21600,
     wanted_store: "WantedStore | None" = None,
+    native_store: "NativeLibraryStore | None" = None,
 ) -> asyncio.Task:
     task = asyncio.create_task(
         prune_stores_periodically(
@@ -1177,6 +1187,7 @@ def start_store_prune_task(
             ignored_retention_days=ignored_retention_days,
             interval=interval,
             wanted_store=wanted_store,
+            native_store=native_store,
         )
     )
     TaskRegistry.get_instance().register("store-prune", task)

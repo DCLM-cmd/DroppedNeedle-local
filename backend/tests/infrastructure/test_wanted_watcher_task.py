@@ -87,3 +87,52 @@ async def test_store_prune_also_prunes_wanted(monkeypatch):
         )
 
     wanted_store.prune.assert_awaited_once_with(180)
+
+
+@pytest.mark.asyncio
+async def test_store_prune_also_prunes_native_identification(monkeypatch):
+    """F-PERF-04: the six-hour store-prune pass invokes the native library
+    store's bounded identification retention alongside the other stores."""
+    sleeps, fake_sleep = _break_after(2)
+    monkeypatch.setattr(tasks.asyncio, "sleep", fake_sleep)
+    request_history, mbid_store, youtube_store = AsyncMock(), AsyncMock(), AsyncMock()
+    wanted_store = AsyncMock()
+    native_store = AsyncMock()
+    native_store.prune_old_terminal_identification_jobs.return_value = (3, True)
+
+    with pytest.raises(asyncio.CancelledError):
+        await tasks.prune_stores_periodically(
+            request_history,
+            mbid_store,
+            youtube_store,
+            request_retention_days=180,
+            wanted_store=wanted_store,
+            native_store=native_store,
+        )
+
+    wanted_store.prune.assert_awaited_once_with(180)
+    native_store.prune_old_terminal_identification_jobs.assert_awaited_once()
+    _, kwargs = native_store.prune_old_terminal_identification_jobs.await_args
+    assert set(kwargs) == {"now"}  # signed defaults: 30-day retention, bounded
+
+
+@pytest.mark.asyncio
+async def test_store_prune_survives_native_identification_errors(monkeypatch):
+    """One failing store must not break the loop: the error is logged and the
+    pass still reaches the interval sleep (house background-loop rule)."""
+    sleeps, fake_sleep = _break_after(2)
+    monkeypatch.setattr(tasks.asyncio, "sleep", fake_sleep)
+    request_history, mbid_store, youtube_store = AsyncMock(), AsyncMock(), AsyncMock()
+    native_store = AsyncMock()
+    native_store.prune_old_terminal_identification_jobs.side_effect = RuntimeError("db busy")
+
+    with pytest.raises(asyncio.CancelledError):
+        await tasks.prune_stores_periodically(
+            request_history,
+            mbid_store,
+            youtube_store,
+            native_store=native_store,
+        )
+
+    # the loop reached the sleep after the failure instead of crashing
+    assert len(sleeps) >= 1

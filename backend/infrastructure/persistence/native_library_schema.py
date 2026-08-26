@@ -1724,6 +1724,8 @@ CREATE INDEX IF NOT EXISTS idx_identification_attempt_subject_track ON library_i
 CREATE INDEX IF NOT EXISTS idx_identification_evidence_attempt ON library_identification_evidence(attempt_id);
 CREATE INDEX IF NOT EXISTS idx_identification_jobs_claim ON library_identification_jobs(state, not_before, priority, enqueue_sequence);
 CREATE INDEX IF NOT EXISTS idx_identification_jobs_lease ON library_identification_jobs(state, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_identification_jobs_terminal
+ON library_identification_jobs(state, terminal_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_identification_jobs_album_active ON library_identification_jobs(local_album_id, kind, state, enqueue_sequence) WHERE local_album_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_identification_jobs_track_active ON library_identification_jobs(local_track_id, kind, state, enqueue_sequence) WHERE local_track_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_library_reviews_cursor ON library_identification_reviews(updated_at DESC, id DESC);

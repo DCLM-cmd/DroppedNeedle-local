@@ -886,7 +886,12 @@ def test_target_cover_provider_has_no_legacy_catalog_inputs(monkeypatch) -> None
     repo_providers.get_target_coverart_repository.cache_clear()
 
     assert repo_providers.get_target_coverart_repository() is built
-    builder.assert_called_once_with()
+    # Mechanical repair during F-PERF-04 verification: this provider now
+    # receives the native library store singleton by design (pre-existing
+    # stale assertion found failing at HEAD 509e01e before any local edits).
+    builder.assert_called_once_with(
+        native_library_store=repo_providers.get_native_library_store()
+    )
 
     repo_providers.get_target_coverart_repository.cache_clear()
 
@@ -973,3 +978,32 @@ def test_target_application_refuses_startup_when_validation_fails() -> None:
     with pytest.raises(TargetStartupInvariantError, match="scratch invariant failure"):
         with build_test_client(app):
             pass
+
+
+def test_store_prune_task_receives_the_native_library_singleton() -> None:
+    """F-PERF-04: the six-hour store-prune task must receive the native
+    library store through the dependency-registry getter - never a separately
+    constructed store (AGENTS singleton rule)."""
+    lifecycle = (
+        Path(__file__).parents[2] / "services/native/target_application_lifecycle.py"
+    )
+    module = ast.parse(lifecycle.read_text())
+    calls = [
+        call
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "start_target_operational_runtime"
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "start_store_prune_task"
+    ]
+    assert len(calls) == 1
+    keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
+    native = keywords.get("native_store")
+    assert native is not None, "native_store kwarg missing from start_store_prune_task"
+    assert (
+        isinstance(native, ast.Call)
+        and isinstance(native.func, ast.Name)
+        and native.func.id == "get_native_library_store"
+    ), "native_store must come from get_native_library_store()"

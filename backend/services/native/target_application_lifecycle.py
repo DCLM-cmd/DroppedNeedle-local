@@ -246,6 +246,7 @@ async def start_target_operational_runtime(
         get_youtube_store,
     )
     from core.dependencies.auth_providers import get_auth_store
+    from core.dependencies.cache_providers import get_native_library_store
     from core.dependencies.repo_providers import get_download_store
     from core.dependencies.service_providers import get_plugin_host
     from core.tasks import (
@@ -390,6 +391,8 @@ async def start_target_operational_runtime(
         ignored_retention_days=advanced.ignored_releases_retention_days,
         interval=advanced.store_prune_interval_hours * 3600,
         wanted_store=get_wanted_store(),
+        # F-PERF-04: the singleton native store joins the six-hour prune pass.
+        native_store=get_native_library_store(),
     )
     start_recycle_bin_prune_task(preferences)
     start_background_upgrade_scan_task(
