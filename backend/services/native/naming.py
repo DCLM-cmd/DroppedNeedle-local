@@ -284,6 +284,73 @@ class NamingTemplateEngine:
             rendered_characters=len(relative),
         )
 
+    def format_management_literal_path(
+        self,
+        relative_path: str,
+        compatibility: PathCompatibilitySettings,
+        *,
+        script_name: str = "naming script",
+        root: Path | None = None,
+    ) -> NamingRenderResult:
+        """Normalize an already-literal relative path without template parsing.
+
+        F-075: composed fallback paths (e.g. ``<album-dir>/cover.jpg``) must
+        never be re-parsed as template source — brace-bearing directory names
+        are legal filename characters, and treating them as template bodies
+        silently redirects writes or fails with a misleading script error.
+        Applies exactly the output-side pipeline of ``format_management_path``:
+        per-component cleaning, length limits, and collision-key construction.
+        """
+
+        raw_path = relative_path
+        parts = raw_path.split("/")
+        if (
+            not raw_path
+            or raw_path.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ScriptValidationError(
+                "Naming script rendered an empty, absolute, or traversing path.",
+                script_name=script_name,
+                line=1,
+                column=1,
+            )
+        cleaned = tuple(
+            self._clean_management_component(part, compatibility) for part in parts
+        )
+        relative = "/".join(cleaned)
+        encoded_length = len(relative.encode("utf-8"))
+        if encoded_length > compatibility.maximum_path_length:
+            raise PathLimitExceededError(
+                "Rendered relative path exceeds the configured path limit.",
+                script_name=script_name,
+                line=1,
+                column=1,
+            )
+        absolute_text = str(root / Path(relative)) if root is not None else relative
+        if len(absolute_text.encode("utf-8")) > compatibility.maximum_path_length:
+            raise PathLimitExceededError(
+                "Rendered absolute path exceeds the configured path limit.",
+                script_name=script_name,
+                line=1,
+                column=1,
+            )
+        if compatibility.windows_legacy_path_limit and len(absolute_text) > 259:
+            raise PathLimitExceededError(
+                "Rendered path exceeds the enabled Windows 259-character limit.",
+                script_name=script_name,
+                line=1,
+                column=1,
+            )
+        collision_key = "/".join(
+            unicodedata.normalize("NFC", part).casefold() for part in cleaned
+        )
+        return NamingRenderResult(
+            relative_path=relative,
+            collision_key=collision_key,
+            rendered_characters=len(relative),
+        )
+
     def _render(self, template: str, tag: AudioTag, ext: str) -> Path:
         result: list[str] = []
         for part in self._TOKEN.split(template):

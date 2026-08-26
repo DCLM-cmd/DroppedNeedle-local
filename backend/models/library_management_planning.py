@@ -111,12 +111,34 @@ def pin_library_management_profile(
         raise ValueError(
             "A profile references an unknown management script."
         ) from error
+    # F-078: the pin must hold private deep copies — profile/scripts are
+    # mutable AppStructs and a shared reference would let a later mutator
+    # corrupt an already-sealed preview between pin and serialization.
     return PinnedLibraryManagementProfile(
-        profile=profile,
-        naming_script=standard,
-        multi_disc_naming_script=multi_disc,
-        external_artwork_naming_script=external,
-        tagging_scripts=tagging,
+        profile=msgspec.convert(
+            msgspec.to_builtins(profile), type=LibraryManagementProfile
+        ),
+        naming_script=msgspec.convert(
+            msgspec.to_builtins(standard), type=NamingScriptSettings
+        ),
+        multi_disc_naming_script=(
+            msgspec.convert(
+                msgspec.to_builtins(multi_disc), type=NamingScriptSettings
+            )
+            if multi_disc is not None
+            else None
+        ),
+        external_artwork_naming_script=(
+            msgspec.convert(
+                msgspec.to_builtins(external), type=NamingScriptSettings
+            )
+            if external is not None
+            else None
+        ),
+        tagging_scripts=tuple(
+            msgspec.convert(msgspec.to_builtins(script), type=TaggingScriptSettings)
+            for script in tagging
+        ),
         recycle_bin_path=settings.recycle_bin_path,
     )
 

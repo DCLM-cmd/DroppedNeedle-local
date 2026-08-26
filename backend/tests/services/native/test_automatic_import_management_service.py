@@ -626,3 +626,64 @@ async def test_mixed_mapped_plus_bonus_bundle_publishes_bonus_unmanaged(
     assert by_ordinal[1].pinned_profile is None
     assert by_ordinal[1].authoritative_mapping is False
     assert by_ordinal[1].release_track_mbid is None
+
+
+@pytest.mark.asyncio
+async def test_automatic_import_fallback_keeps_braced_destination_literal(
+    tmp_path: Path,
+) -> None:
+    """F-075 parity: the automatic lane's default artwork fallback must treat
+    the composed path literally so brace-bearing album directories survive."""
+    import msgspec
+
+    root, source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    current = preferences.get_library_management_settings()
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    profile.artwork.embedded_enabled = False
+    profile.artwork.external_enabled = True
+    preferences.save_library_management_settings_if_current(
+        settings, expected_settings_revision=current.settings_revision
+    )
+    _activate(preferences, policy_revision)
+    service, _planner_value = _service(tmp_path, preferences, store)
+    artwork = b"braced destination artwork"
+    service._artwork.project = AsyncMock(
+        return_value=ArtworkProjection(
+            external=(
+                ArtworkOutput(
+                    output_kind="external",
+                    image_type="front",
+                    content=artwork,
+                    mime_type="image/jpeg",
+                    format="jpeg",
+                    width=800,
+                    height=800,
+                    byte_size=len(artwork),
+                    sha256=hashlib.sha256(artwork).hexdigest(),
+                    source="cover_art_archive_release",
+                    source_candidate_id="exact-release-front",
+                    source_is_exact_release=True,
+                ),
+            )
+        )
+    )
+    # brace the canonical album title so the rendered album directory itself
+    # contains braces (the fallback parent derives from that rendered path)
+    _service_planner = _planner_value
+    release = _service_planner._canonical._musicbrainz.get_canonical_release.return_value
+    braced = copy.deepcopy(release)
+    braced.title = "Live {2020}"
+    _service_planner._canonical._musicbrainz.get_canonical_release.return_value = braced
+
+    bundle = _bundle(tmp_path, source, policy_revision)
+
+    prepared = await service.prepare(bundle)
+
+    artifact = prepared.files[0].artifacts[0]
+    assert "Live {2020}" in artifact.destination_relative_path
+    assert artifact.destination_relative_path.endswith("cover.jpg")

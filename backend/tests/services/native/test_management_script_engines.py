@@ -1,3 +1,4 @@
+import unicodedata
 from pathlib import Path
 
 import msgspec
@@ -501,3 +502,52 @@ def test_settings_round_trip_new_path_compatibility_controls() -> None:
         normalized.profiles[0].organization.compatibility.windows_legacy_path_limit
         is True
     )
+
+
+def test_format_management_literal_path_never_parses_template_bodies() -> None:
+    """F-075/F-083: the literal-path entry point applies only output-side
+    normalization — brace-bearing directory names round-trip untouched and a
+    body like {title} stays literal instead of resolving as a variable."""
+    compatibility = PathCompatibilitySettings()
+    result = NamingTemplateEngine().format_management_literal_path(
+        "Live {2020}/Live {Deluxe}/{title} $special cover.jpg",
+        compatibility,
+        script_name="Default external artwork naming",
+        root=Path("/music"),
+    )
+
+    assert result.relative_path == (
+        "Live {2020}/Live {Deluxe}/{title} $special cover.jpg"
+    )
+    assert result.collision_key == (
+        unicodedata.normalize("NFC", result.relative_path).casefold()
+    )
+    assert result.rendered_characters == len(result.relative_path)
+
+
+def test_format_management_literal_path_normalizes_and_enforces_limits() -> None:
+    """F-075: literal paths get the same NFC/cleaning/length pipeline as
+    rendered templates, including CJK components and limit enforcement."""
+    engine = NamingTemplateEngine()
+    cjk_name = "宇宙のアルバム"
+    result = engine.format_management_literal_path(
+        f"{cjk_name}/cover.jpg",
+        PathCompatibilitySettings(),
+        script_name="Default external artwork naming",
+        root=Path("/music"),
+    )
+    assert result.relative_path == f"{cjk_name}/cover.jpg"
+    assert result.collision_key == f"{cjk_name.casefold()}/cover.jpg"
+
+    with pytest.raises(ScriptValidationError, match="traversing"):
+        engine.format_management_literal_path(
+            "../escape.jpg",
+            PathCompatibilitySettings(),
+            script_name="Default external artwork naming",
+        )
+    with pytest.raises(PathLimitExceededError):
+        engine.format_management_literal_path(
+            "x" * 300 + ".jpg",
+            PathCompatibilitySettings(maximum_path_length=180),
+            script_name="Default external artwork naming",
+        )

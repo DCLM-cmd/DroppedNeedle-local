@@ -747,16 +747,11 @@ class AutomaticImportManagementService:
                 )
             else:
                 stem = "cover" if output.image_type == "front" else output.image_type
-                rendered = self._naming.format_management_path(
+                rendered = self._naming.format_management_literal_path(
                     (parent / f"{stem}.{extension}").as_posix(),
-                    named,
                     pinned.profile.organization.compatibility,
                     script_name="Default external artwork naming",
                     root=root,
-                    artwork_type=output.image_type,
-                    artwork_comment=output.description,
-                    artwork_extension=extension,
-                    artwork_format=output.format,
                 )
             if rendered.collision_key in collision_keys:
                 raise AutomaticManagementHoldError(
