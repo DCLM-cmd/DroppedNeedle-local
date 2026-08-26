@@ -2799,3 +2799,63 @@ async def test_provider_reset_and_enqueue_never_resurrect_unmappable_rows(
         ).fetchone()
     assert failure_code == "UNMAPPABLE_PROVIDER_PAYLOAD"
     assert not_before > 3  # backoff preserved, not cleared by the provider sweep
+
+
+@pytest.mark.asyncio
+async def test_deferral_sequence_matches_the_declared_cap_exactly(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-IDENT-04: the applied backoff sequence is exactly 30 through 7,680 s,
+    cumulative 15,330 s; attempt ten terminalizes with the original cause and
+    no eleventh retry is schedulable."""
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+    await queue.enqueue_album("album-1", input_revision="revision", now=1)
+    expected_waits = [30, 60, 120, 240, 480, 960, 1_920, 3_840, 7_680]
+    now = 2.0
+    applied: list[float] = []
+    for attempt in range(1, MAX_DEFERRAL_ATTEMPTS + 1):
+        claimed = await queue.claim("worker", now=now)
+        assert claimed is not None, f"attempt {attempt} was not claimable"
+        assert claimed["attempt_count"] == attempt
+        with sqlite3.connect(db_path) as connection:
+            not_before_before = connection.execute(
+                "SELECT not_before FROM library_identification_jobs"
+            ).fetchone()[0]
+        await queue.defer(claimed, "worker", "PROVIDER_TEMPORARILY_UNAVAILABLE", now=now)
+        with sqlite3.connect(db_path) as connection:
+            state, not_before, failure_code, attempts = connection.execute(
+                "SELECT state, not_before, last_failure_code, attempt_count "
+                "FROM library_identification_jobs"
+            ).fetchone()
+        if attempt < MAX_DEFERRAL_ATTEMPTS:
+            assert state == "queued"
+            wait = not_before - now
+            assert wait == pytest.approx(float(expected_waits[attempt - 1]))
+            applied.append(wait)
+            assert failure_code == "PROVIDER_TEMPORARILY_UNAVAILABLE"
+            # A claim before the due time is blocked by the durable timestamp.
+            early_claim = await queue.claim(
+                "worker", now=(not_before_before + not_before) / 2
+            )
+            assert early_claim is None
+            now = not_before
+        else:
+            assert state == "failed"
+            assert failure_code == "MAX_DEFERRALS_EXCEEDED"
+            cause = connection.execute(
+                "SELECT attention_cause FROM library_identification_jobs"
+            ).fetchone()[0]
+            assert cause == "PROVIDER_TEMPORARILY_UNAVAILABLE"
+            terminal_at_row = connection.execute(
+                "SELECT terminal_at FROM library_identification_jobs"
+            ).fetchone()[0]
+            assert terminal_at_row == pytest.approx(now)
+            break
+
+    assert applied == [float(value) for value in expected_waits]
+    assert sum(applied) == 15_330.0
+    assert max(applied) == float(MAX_BACKOFF_SECONDS)
+
+    # No eleventh retry is schedulable.
+    assert await queue.claim("worker", now=now + 100_000) is None

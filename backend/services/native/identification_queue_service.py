@@ -14,8 +14,14 @@ PRIORITY_REVIEW_RETRY = 30
 PRIORITY_HISTORICAL_BACKLOG = 40
 PRIORITY_SUPPORTING_MAINTENANCE = 50
 LEASE_SECONDS = 60.0
-MAX_BACKOFF_SECONDS = 6 * 60 * 60
+# F-IDENT-04 policy (owner-signed): the cap is DERIVED so it always equals the
+# largest delay the doubling formula can actually schedule under the retained
+# ten-attempt terminal bound. Applied sequence: 30, 60, 120, 240, 480, 960,
+# 1,920, 3,840, 7,680 seconds - cumulative 15,330 seconds before attempt ten
+# terminalizes. This is a bounded-retry window, never a provider-health
+# timeout; provider recovery is gated separately by resurrection eligibility.
 MAX_DEFERRAL_ATTEMPTS = 10
+MAX_BACKOFF_SECONDS = 30 * 2 ** min(MAX_DEFERRAL_ATTEMPTS - 2, 10)
 SUBJECT_NOT_AVAILABLE_GRACE_SECONDS = 24 * 60 * 60
 
 
