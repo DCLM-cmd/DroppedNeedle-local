@@ -27,6 +27,10 @@ class IntegrationResult(Generic[T]):
     source: str
     status: IntegrationStatus
     error_message: str | None = None
+    # True only for deterministic payload-shape/validation failures (e.g. a
+    # typed MusicBrainz response that cannot decode). Never set for HTTP,
+    # network, rate-limit, or breaker-open failures.
+    deterministic: bool = False
 
 
     @property
@@ -52,6 +56,16 @@ class IntegrationResult(Generic[T]):
     ) -> IntegrationResult[T]:
         return IntegrationResult(
             data=data, source=source, status="degraded", error_message=msg
+        )
+
+    @staticmethod
+    def deterministic_error(source: str, msg: str) -> IntegrationResult[None]:
+        return IntegrationResult(
+            data=None,
+            source=source,
+            status="error",
+            error_message=msg,
+            deterministic=True,
         )
 
     @staticmethod

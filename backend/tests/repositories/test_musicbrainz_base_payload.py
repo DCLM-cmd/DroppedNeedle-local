@@ -69,3 +69,40 @@ async def test_service_failure_still_counts_toward_breaker(
 
     assert type(captured.value) is ExternalServiceError
     assert mb_base.mb_circuit_breaker.failure_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recall_records_deterministic_payload_reason_without_breaking(
+    fake_transport, monkeypatch
+) -> None:
+    """F-IDENT-02: a candidate-recall method that hits an unmappable typed
+    payload must record the deterministic degradation reason and return empty,
+    while the shared breaker stays closed (non-breaking contract intact)."""
+    from infrastructure.degradation import clear_degradation_context, init_degradation_context
+    from repositories.musicbrainz_album import MusicBrainzAlbumMixin
+
+    monkeypatch.setattr(
+        mb_base,
+        "_http_client",
+        _client(b'{"release-groups": {"not": "a list"}}'),
+    )
+
+    class _StubPreferences:
+        def get_advanced_settings(self):
+            return SimpleNamespace(cache_ttl_search=60)
+
+    repo = MusicBrainzAlbumMixin.__new__(MusicBrainzAlbumMixin)
+    repo._cache = SimpleNamespace(get=AsyncMock(return_value=None), set=AsyncMock())
+    repo._preferences_service = _StubPreferences()
+
+    ctx = init_degradation_context()
+    try:
+        results = await repo.search_release_groups("Artist", "Album", limit=5)
+        assert results == []
+        assert ctx.has_deterministic_failure()
+        assert "musicbrainz" in ctx.deterministic_sources()
+    finally:
+        clear_degradation_context()
+
+    assert mb_base.mb_circuit_breaker.failure_count == 0
+    assert mb_base.mb_circuit_breaker.state == CircuitState.CLOSED

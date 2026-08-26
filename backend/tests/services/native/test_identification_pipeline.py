@@ -2641,3 +2641,161 @@ async def test_album_identification_circuit_open_defers_with_retry_after(store: 
     assert await queue.claim("worker-2", now=now + 10) is None
     later = await queue.claim("worker-2", now=now + 43)
     assert later is not None and later["id"] == job["id"]
+
+
+@pytest.mark.asyncio
+async def test_unmappable_payload_defers_with_deterministic_code(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-IDENT-02: a healthy breaker plus a deterministic payload-shape failure
+    must defer under UNMAPPABLE_PROVIDER_PAYLOAD - never the outage code."""
+    await _seed_album(store)
+    job = await _claimed_job(store)
+
+    class UnmappableProvider(FakeProvider):
+        async def search_album_candidate_ids(
+            self, artist: str, title: str, limit: int, priority: RequestPriority
+        ) -> list[str]:
+            from infrastructure.degradation import try_get_degradation_context
+            from infrastructure.integration_result import IntegrationResult
+
+            ctx = try_get_degradation_context()
+            assert ctx is not None
+            ctx.record(
+                IntegrationResult.deterministic_error(
+                    source="musicbrainz",
+                    msg="MusicBrainz release-group search returned an unmappable payload.",
+                )
+            )
+            return []
+
+    outcome = await _service(
+        store,
+        UnmappableProvider(),
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "provider_deferred"
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT state, last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert row == ("queued", "UNMAPPABLE_PROVIDER_PAYLOAD")
+
+
+@pytest.mark.asyncio
+async def test_unmappable_payload_reaches_terminal_attention_with_honest_cause(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """The ordinary bounded cap applies; terminal attention preserves the
+    deterministic cause instead of reporting a provider outage."""
+    await _seed_album(store)
+
+    class UnmappableProvider(FakeProvider):
+        async def search_album_candidate_ids(
+            self, artist: str, title: str, limit: int, priority: RequestPriority
+        ) -> list[str]:
+            from infrastructure.degradation import try_get_degradation_context
+            from infrastructure.integration_result import IntegrationResult
+
+            ctx = try_get_degradation_context()
+            assert ctx is not None
+            ctx.record(
+                IntegrationResult.deterministic_error(
+                    source="musicbrainz",
+                    msg="MusicBrainz release-group search returned an unmappable payload.",
+                )
+            )
+            return []
+
+    service = _service(
+        store,
+        UnmappableProvider(),
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    )
+    # The bounded cap is 10 attempts; exponential backoff stays under 40k s per
+    # step, so advancing the clock by 40k s per attempt walks the whole ladder.
+    for attempt in range(12):
+        job = await store.enqueue_identification_job(
+            IdentificationJob(
+                id="job-album-1",
+                local_album_id="album-1",
+                kind="automatic",
+                dedupe_key="automatic:album-1:revision",
+                input_revision="revision",
+                priority=20,
+                created_at=1,
+            )
+        )
+        claimed = await store.claim_identification_job(
+            "worker", now=3 + attempt * 40000, lease_seconds=60
+        )
+        if claimed is None:
+            continue
+        outcome = await service.run_claimed_job(
+            claimed, "worker", now=3 + attempt * 40000
+        )
+        if outcome != "provider_deferred":
+            break
+
+    with sqlite3.connect(db_path) as connection:
+        failed_row = connection.execute(
+            "SELECT last_failure_code, attention_cause FROM library_identification_jobs "
+            "WHERE state = 'failed' ORDER BY terminal_at DESC LIMIT 1"
+        ).fetchone()
+
+    with sqlite3.connect(db_path) as connection:
+        failed_row = connection.execute(
+            "SELECT last_failure_code, attention_cause FROM library_identification_jobs "
+            "WHERE state = 'failed' ORDER BY terminal_at DESC LIMIT 1"
+        ).fetchone()
+    assert failed_row is not None
+    assert failed_row[0] == "MAX_DEFERRALS_EXCEEDED"
+    assert failed_row[1] == "UNMAPPABLE_PROVIDER_PAYLOAD"
+
+
+@pytest.mark.asyncio
+async def test_provider_reset_and_enqueue_never_resurrect_unmappable_rows(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Provider-health reset keeps unmappable backoff untouched, and a later
+    same-key enqueue must not resurrect a terminally-unmappable album."""
+    await _seed_album(store)
+    job = await _claimed_job(store)
+
+    class UnmappableProvider(FakeProvider):
+        async def search_album_candidate_ids(
+            self, artist: str, title: str, limit: int, priority: RequestPriority
+        ) -> list[str]:
+            from infrastructure.degradation import try_get_degradation_context
+            from infrastructure.integration_result import IntegrationResult
+
+            ctx = try_get_degradation_context()
+            assert ctx is not None
+            ctx.record(
+                IntegrationResult.deterministic_error(
+                    source="musicbrainz",
+                    msg="MusicBrainz release-group search returned an unmappable payload.",
+                )
+            )
+            return []
+
+    await _service(
+        store,
+        UnmappableProvider(),
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    queue = IdentificationQueueService(store)
+    reset_count = await store.reset_provider_identification_deferrals(now=100)
+    assert reset_count == 0  # exact-code gate: unmappable rows are untouched
+    with sqlite3.connect(db_path) as connection:
+        not_before, failure_code = connection.execute(
+            "SELECT not_before, last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert failure_code == "UNMAPPABLE_PROVIDER_PAYLOAD"
+    assert not_before > 3  # backoff preserved, not cleared by the provider sweep

@@ -75,6 +75,24 @@ def _record_mb_degradation(msg: str) -> None:
         ctx.record(IntegrationResult.error(source="musicbrainz", msg=msg))
 
 
+def _record_mb_unmappable_payload(method: str) -> None:
+    """Record a deterministic payload-shape failure for candidate recall.
+
+    Recall methods return empty results on failure; this marker lets the
+    identification service classify the empty recall as
+    ``UNMAPPABLE_PROVIDER_PAYLOAD`` instead of a transient provider outage
+    (F-IDENT-02). The shared breaker stays closed either way.
+    """
+    ctx = try_get_degradation_context()
+    if ctx:
+        ctx.record(
+            IntegrationResult.deterministic_error(
+                source="musicbrainz",
+                msg=f"MusicBrainz {method} returned an unmappable payload.",
+            )
+        )
+
+
 def _raise_unmappable_payload(
     exc: InvalidExternalPayloadError, method: str
 ) -> InvalidExternalPayloadError:
@@ -479,6 +497,9 @@ class MusicBrainzAlbumMixin:
                 cache_key, results, ttl_seconds=advanced_settings.cache_ttl_search
             )
             return results
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload("release-group search")
+            return []
         except Exception as e:  # noqa: BLE001
             # CircuitOpenError is expected while the breaker is open; the
             # degradation record is the signal, an error log per call is spam.
@@ -585,6 +606,9 @@ class MusicBrainzAlbumMixin:
                 return None
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload(f"release-group {mbid} fetch")
+            return None
         except Exception as e:  # noqa: BLE001
             if not isinstance(e, CircuitOpenError):
                 logger.error(f"Failed to fetch release group {mbid}: {e}")
@@ -894,6 +918,9 @@ class MusicBrainzAlbumMixin:
                 return None
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload(f"release {release_id} fetch")
+            return None
         except Exception as e:  # noqa: BLE001
             if not isinstance(e, CircuitOpenError):
                 logger.error(f"Failed to fetch release {release_id}: {e}")
@@ -1034,6 +1061,9 @@ class MusicBrainzAlbumMixin:
                 cache_key, matches, ttl_seconds=advanced_settings.cache_ttl_search
             )
             return matches
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload("recording search")
+            return []
         except Exception as e:  # noqa: BLE001
             if not isinstance(e, CircuitOpenError):
                 logger.error(f"MusicBrainz recording search failed: {e}")
@@ -1147,6 +1177,9 @@ class MusicBrainzAlbumMixin:
                 return None
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
+        except InvalidExternalPayloadError:
+            _record_mb_unmappable_payload(f"recording {recording_id} fetch")
+            return None
         except Exception as e:  # noqa: BLE001
             if not isinstance(e, CircuitOpenError):
                 logger.error(f"Failed to fetch recording {recording_id}: {e}")

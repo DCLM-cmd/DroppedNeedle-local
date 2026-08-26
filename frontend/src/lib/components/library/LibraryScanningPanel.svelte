@@ -94,6 +94,7 @@
 	function deferredReasonLabel(code: string): string {
 		const labels: Record<string, string> = {
 			PROVIDER_TEMPORARILY_UNAVAILABLE: 'provider temporarily unavailable',
+			UNMAPPABLE_PROVIDER_PAYLOAD: 'provider response could not be mapped (data problem, not an outage)',
 			SUBJECT_NOT_AVAILABLE: 'album no longer available',
 			MAX_DEFERRALS_EXCEEDED: 'retry limit reached'
 		};

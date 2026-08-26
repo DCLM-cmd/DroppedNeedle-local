@@ -665,6 +665,44 @@ def test_scan_run_failures_returns_persisted_detail_for_indexing_rows(
     assert item["phase"] == "indexing"
 
 
+def test_activity_reports_healthy_breaker_with_unmappable_reason(
+    admin_client,
+    coordinator: AsyncMock,
+    identification_queue: AsyncMock,
+    administrative_work: AsyncMock,
+) -> None:
+    """F-IDENT-02: a healthy MusicBrainz breaker keeps provider_unavailable
+    false while deferred reason counts carry the deterministic unmappable code."""
+    from types import SimpleNamespace as _NS
+
+    coordinator.current.return_value = []
+    coordinator.history.return_value = []
+    identification_queue.stream_revisions.return_value = {}
+    identification_queue.activity_snapshot.return_value = {
+        "control_state": "running",
+        "control_revision": 1,
+        "counts": {"queued": 1},
+        "started_at": 1.0,
+        "updated_at": 2.0,
+        "deferred_count": 1,
+        "deferred_reason_counts": {"UNMAPPABLE_PROVIDER_PAYLOAD": 1},
+        "claimable_count": 0,
+        "attention_count": 0,
+        "kept_local_count": 0,
+        "active_priority": 20,
+        "failure_event_id": None,
+        "failure_at": None,
+        "foreground_operation_count": 0,
+    }
+    administrative_work.active.return_value = []
+
+    payload = admin_client.get("/library/activity").json()
+    item = next(item for item in payload["items"] if item["kind"] == "identification")
+    assert item["provider_unavailable"] is False
+    assert item["deferred_count"] == 1
+    assert item["deferred_reason_counts"] == {"UNMAPPABLE_PROVIDER_PAYLOAD": 1}
+
+
 def test_scan_run_failures_returns_snake_case_items(
     admin_client, native_store: AsyncMock
 ) -> None:

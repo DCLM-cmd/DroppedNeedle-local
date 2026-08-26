@@ -429,6 +429,28 @@ describe('LibraryScanningPanel', () => {
 		expect(page.getByText(/MusicBrainz is currently unavailable/).query()).toBeNull();
 	});
 
+	it('labels unmappable provider payloads honestly without an outage warning', async () => {
+		h.activity = {
+			data: {
+				items: [
+					activity('identification', {
+						deferred_count: 1,
+						deferred_reason_counts: { UNMAPPABLE_PROVIDER_PAYLOAD: 1 },
+						provider_unavailable: false
+					})
+				]
+			},
+			isLoading: false,
+			isError: false
+		};
+		render(LibraryScanningPanel);
+		await expect.element(page.getByText(/1\s+metadata\s+check is deferred/)).toBeVisible();
+		await expect
+			.element(page.getByText(/provider response could not be mapped \(data problem, not an outage\): 1/))
+			.toBeVisible();
+		expect(page.getByText(/MusicBrainz is currently unavailable/).query()).toBeNull();
+	});
+
 	it('shows no identification alert when nothing is deferred or needs attention', async () => {
 		h.activity = {
 			data: {

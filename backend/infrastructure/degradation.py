@@ -20,16 +20,28 @@ _degradation_ctx_var: contextvars.ContextVar[DegradationContext | None] = (
 class DegradationContext:
     """Accumulates per-source integration status within a single request."""
 
-    __slots__ = ("_services",)
+    __slots__ = ("_services", "_deterministic")
 
     def __init__(self) -> None:
         self._services: dict[str, IntegrationStatus] = {}
+        self._deterministic: set[str] = set()
 
     def record(self, result: IntegrationResult) -> None:  # type: ignore[type-arg]
         """Record an integration result, keeping the worst status per source."""
         prev = self._services.get(result.source)
         if prev is None or _severity(result.status) > _severity(prev):
             self._services[result.source] = result.status
+        if getattr(result, "deterministic", False):
+            # Deterministic payload-shape failures are tracked separately so a
+            # caller can classify them distinctly from transient degradation.
+            self._deterministic.add(result.source)
+
+    def deterministic_sources(self) -> set[str]:
+        """Sources whose recorded failures include a deterministic payload error."""
+        return set(self._deterministic)
+
+    def has_deterministic_failure(self) -> bool:
+        return bool(self._deterministic)
 
     def summary(self) -> dict[str, str]:
         """Return ``{source: status}`` for all recorded integrations."""

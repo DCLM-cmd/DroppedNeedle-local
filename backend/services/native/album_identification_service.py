@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+
+import msgspec
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -340,6 +342,12 @@ def _enforce_raw_track_identities(
         decision.selected_candidate_key = None
 
 
+# F-IDENT-02: deterministic payload-shape failures defer under this stable
+# code instead of PROVIDER_TEMPORARILY_UNAVAILABLE. The spelling is part of
+# the persisted contract (last_failure_code / attention_cause) and the API/UI.
+UNMAPPABLE_PROVIDER_PAYLOAD = "UNMAPPABLE_PROVIDER_PAYLOAD"
+
+
 class AlbumIdentificationService:
     def __init__(
         self,
@@ -526,6 +534,20 @@ class AlbumIdentificationService:
 
             _enforce_raw_track_identities(decision, raw_tracks)
             degraded = degradation.degraded_summary()
+            if (
+                degradation.has_deterministic_failure()
+                and not decision.candidates
+            ):
+                # F-IDENT-02: a typed payload-shape failure is deterministic,
+                # not an outage. Defer under the honest code so the row keeps
+                # the ordinary bounded backoff but never provider-resurrects.
+                await self._queue.defer(
+                    job,
+                    worker_id,
+                    UNMAPPABLE_PROVIDER_PAYLOAD,
+                    now=timestamp,
+                )
+                return "provider_deferred"
             if degraded and not decision.candidates:
                 await self._queue.defer(
                     job,
@@ -614,6 +636,7 @@ class AlbumIdentificationService:
                         "review",
                     }
                 )
+            return str(decision.outcome)
         except CircuitOpenError as exc:
             # Defer with breaker deadline, not just queue backoff, per F-PERF-01
             retry_after = getattr(exc, "retry_after_seconds", None)
