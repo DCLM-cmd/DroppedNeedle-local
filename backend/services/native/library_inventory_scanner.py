@@ -89,8 +89,13 @@ class LibraryInventoryScanner:
     def _detach_walker(self, task: asyncio.Task[None]) -> None:
         if task.done():
             return
-        if len(self._detached_walkers) < self._max_detached_walkers:
-            self._detached_walkers.add(task)
+        if len(self._detached_walkers) >= self._max_detached_walkers:
+            logger.warning(
+                "library_scan event=detached_walker_cap_exceeded count=%s max=%s",
+                len(self._detached_walkers) + 1,
+                self._max_detached_walkers,
+            )
+        self._detached_walkers.add(task)
         task.add_done_callback(self._finish_detached_walker)
 
     async def _record_failure(
@@ -326,42 +331,36 @@ class LibraryInventoryScanner:
                 while True:
                     if stopped.is_set():
                         break
-                    lease = (
-                        self._filesystem.read_sync(scope.root_id)
-                        if self._filesystem is not None
-                        else _uncoordinated_read()
-                    )
-                    with lease:
-                        try:
-                            directory, subdirectories, filenames = next(walker)
-                        except StopIteration:
-                            break
+                    try:
+                        directory, subdirectories, filenames = next(walker)
+                    except StopIteration:
+                        break
+                    heartbeat.touch(directory)
+                    subdirectories[:] = [
+                        name
+                        for name in subdirectories
+                        if not is_management_artifact(Path(name))
+                    ]
+                    inspected: list[
+                        tuple[Path, os.stat_result] | BaseException
+                    ] = []
+                    for filename in filenames:
                         heartbeat.touch(directory)
-                        subdirectories[:] = [
-                            name
-                            for name in subdirectories
-                            if not is_management_artifact(Path(name))
-                        ]
-                        inspected: list[
-                            tuple[Path, os.stat_result] | BaseException
-                        ] = []
-                        for filename in filenames:
-                            heartbeat.touch(directory)
-                            path = Path(directory) / filename
-                            if (
-                                path.suffix.casefold() not in AUDIO_EXTENSIONS
-                                or is_management_artifact(path)
-                            ):
-                                continue
-                            resolved = path.resolve(strict=False)
-                            if not resolved.is_relative_to(root):
-                                continue
-                            try:
-                                inspected.append((resolved, resolved.stat()))
-                            except FileNotFoundError:
-                                continue
-                            except OSError as exc:
-                                inspected.append(exc)
+                        path = Path(directory) / filename
+                        if (
+                            path.suffix.casefold() not in AUDIO_EXTENSIONS
+                            or is_management_artifact(path)
+                        ):
+                            continue
+                        resolved = path.resolve(strict=False)
+                        if not resolved.is_relative_to(root):
+                            continue
+                        try:
+                            inspected.append((resolved, resolved.stat()))
+                        except FileNotFoundError:
+                            continue
+                        except OSError as exc:
+                            inspected.append(exc)
                     for item in inspected:
                         asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
             except (OSError, RuntimeError) as exc:

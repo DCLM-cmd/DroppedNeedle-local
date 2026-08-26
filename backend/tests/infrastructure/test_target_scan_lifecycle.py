@@ -1757,3 +1757,139 @@ def test_daily_schedule_handles_dst_and_manual() -> None:
         )
         is None
     )
+@pytest.mark.asyncio
+async def test_normal_scan_with_filesystem_coordinator_completes_and_releases_leases(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist" / "Album").mkdir(parents=True)
+    (root / "Artist" / "Album" / "track-1.flac").write_bytes(b"audio")
+    resolver = _resolver(root)
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(
+        target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05
+    )
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        scanner,
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+    )
+    await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+    assert not scanner._detached_walkers
+    # Writer can acquire immediately after normal walk (no lease held)
+    async with asyncio.timeout(0.5):
+        async with filesystem.write("root-a"):
+            pass
+    assert completed.counters["new_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_wedged_walk_allows_concurrent_write_and_revision_restart(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").write_bytes(b"one")
+    resolver = _resolver(root)
+    filesystem = LibraryFilesystemCoordinator()
+    walk_calls = 0
+    block = threading.Event()
+
+    def blocking_walker(*_args, **_kwargs):
+        nonlocal walk_calls
+        walk_calls += 1
+        if walk_calls == 1:
+            yield (str(root), [], ["track.flac"])
+            block.wait(timeout=5.0)
+            return
+        yield from os.walk(str(root), followlinks=False)
+
+    scanner = LibraryInventoryScanner(
+        target_store,
+        filesystem_coordinator=filesystem,
+        directory_walker=blocking_walker,
+        walk_deadline_seconds=30.0,
+    )
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        scanner,
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+    )
+    await coordinator.request_run(_request(resolver))
+    task = asyncio.create_task(coordinator.run_once({"root-a": root}))
+    await asyncio.sleep(0.1)
+    # Bump revision while walker is blocked - must not block (no lease held)
+    async with asyncio.timeout(0.5):
+        async with filesystem.write("root-a"):
+            pass
+    revision_after_write = filesystem.revision("root-a")
+    assert revision_after_write == 1
+    block.set()
+    completed = await asyncio.wait_for(task, timeout=5.0)
+    assert completed is not None and completed.state == "completed"
+    # First walk saw stale revision, so discover restarted and performed second walk
+    assert walk_calls == 2
+    assert not scanner._detached_walkers
+
+
+@pytest.mark.asyncio
+async def test_wedged_walk_timeout_with_filesystem_does_not_block_writer_and_next_scan(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").write_bytes(b"one")
+    resolver = _resolver(root)
+    filesystem = LibraryFilesystemCoordinator()
+    wedged = threading.Event()
+    calls = 0
+
+    def walker(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield (str(root), [], ["track.flac"])
+            wedged.wait()
+            return
+        yield from os.walk(str(root), followlinks=False)
+
+    scanner = LibraryInventoryScanner(
+        target_store,
+        filesystem_coordinator=filesystem,
+        directory_walker=walker,
+        walk_deadline_seconds=0.05,
+    )
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        scanner,
+        LibraryIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+    )
+    await coordinator.request_run(_request(resolver))
+    failed = await asyncio.wait_for(coordinator.run_once({"root-a": root}), timeout=2.0)
+    assert failed is not None and failed.state == "failed"
+    assert failed.terminal_code == "WALK_TIMEOUT"
+    assert len(scanner._detached_walkers) == 1
+    # Writer must acquire while walker still wedged
+    async with asyncio.timeout(0.5):
+        async with filesystem.write("root-a"):
+            pass
+    wedged.set()
+    deadline = time.monotonic() + 2.0
+    while scanner._detached_walkers and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert not scanner._detached_walkers
+    # Next scan must be claimable and complete normally
+    await coordinator.request_run(_request(resolver, trigger="automatic"))
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+
+

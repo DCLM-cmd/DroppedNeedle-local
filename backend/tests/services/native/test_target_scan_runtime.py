@@ -41,6 +41,7 @@ from services.native.target_application_runtime import (
 )
 from infrastructure.resilience.retry import CircuitState
 from services.native.background_workload_gate import BackgroundWorkloadGate
+from services.native.library_filesystem_coordinator import LibraryFilesystemCoordinator
 
 
 @pytest.mark.asyncio
@@ -1029,6 +1030,234 @@ async def test_wedged_walk_times_out_detaches_producer_and_recovers(
     )
     assert completed is True
     assert failure_code is None
+@pytest.mark.asyncio
+async def test_wedged_next_does_not_hold_read_lease_so_writer_acquires(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").touch()
+    wedged = threading.Event()
+
+    def walker(*_args, **_kwargs):
+        yield (str(root), [], ["track.flac"])
+        wedged.wait()
+        return
+
+    store = AsyncMock()
+    store.classify_scan_paths.return_value = {"track.flac": ("new", None)}
+    store.add_scan_inventory_batch.return_value = (2, 1)
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=walker,
+        filesystem_coordinator=filesystem,
+        walk_deadline_seconds=0.05,
+    )
+    scope = ScanScope(root_id="root-a", policy_revision="policy-1")
+    resolver = SimpleNamespace(resolve=lambda _path: None)
+    checkpoint = AsyncMock(return_value=True)
+
+    started = time.monotonic()
+    _updated, completed, failure_code = await scanner._walk_scope(
+        _scan_run(), scope, root, root, resolver, checkpoint
+    )
+    elapsed = time.monotonic() - started
+    assert completed is False
+    assert failure_code == "WALK_TIMEOUT"
+    assert elapsed < 2.0
+    assert len(scanner._detached_walkers) == 1
+
+    # Writer must acquire while walker is still blocked (no lease held)
+    writer_acquired = False
+    try:
+        async with asyncio.timeout(0.5):
+            async with filesystem.write("root-a"):
+                writer_acquired = True
+    except TimeoutError:
+        writer_acquired = False
+    assert writer_acquired is True
+
+    wedged.set()
+    deadline = time.monotonic() + 2.0
+    while scanner._detached_walkers and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert not scanner._detached_walkers
+
+
+@pytest.mark.asyncio
+async def test_blocked_stat_does_not_hold_read_lease_so_writer_acquires(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    track = root / "track.flac"
+    track.touch()
+    wedged = threading.Event()
+    real_stat = Path.stat
+
+    def blocking_stat(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(self).endswith("track.flac") and not wedged.is_set():
+            wedged.wait(timeout=2.0)
+        return real_stat(self, *args, **kwargs)
+
+    def walker(*_args, **_kwargs):
+        yield (str(root), [], ["track.flac"])
+
+    store = AsyncMock()
+    store.classify_scan_paths.return_value = {}
+    store.add_scan_inventory_batch.return_value = (2, 1)
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=walker,
+        filesystem_coordinator=filesystem,
+        walk_deadline_seconds=0.05,
+    )
+    scope = ScanScope(root_id="root-a", policy_revision="policy-1")
+    resolver = SimpleNamespace(resolve=lambda _path: None)
+    checkpoint = AsyncMock(return_value=True)
+
+    import unittest.mock as mock
+
+    with mock.patch.object(Path, "stat", blocking_stat):
+        started = time.monotonic()
+        _updated, completed, failure_code = await scanner._walk_scope(
+            _scan_run(), scope, root, root, resolver, checkpoint
+        )
+        elapsed = time.monotonic() - started
+        assert completed is False
+        assert failure_code == "WALK_TIMEOUT"
+        assert elapsed < 2.0
+        assert len(scanner._detached_walkers) == 1
+
+        writer_acquired = False
+        try:
+            async with asyncio.timeout(0.5):
+                async with filesystem.write("root-a"):
+                    writer_acquired = True
+        except TimeoutError:
+            writer_acquired = False
+        assert writer_acquired is True
+
+        wedged.set()
+        deadline = time.monotonic() + 2.0
+        while scanner._detached_walkers and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert not scanner._detached_walkers
+
+
+@pytest.mark.asyncio
+async def test_cancelled_walk_detaches_when_blocked_and_does_not_hang(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").touch()
+    wedged = threading.Event()
+
+    def walker(*_args, **_kwargs):
+        yield (str(root), [], ["track.flac"])
+        wedged.wait()
+        return
+
+    store = AsyncMock()
+    store.classify_scan_paths.return_value = {}
+    store.add_scan_inventory_batch.return_value = (2, 1)
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=walker,
+        filesystem_coordinator=filesystem,
+        walk_deadline_seconds=0.05,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(resolve=lambda _path: None)
+    checkpoint = AsyncMock(return_value=True)
+
+    task = asyncio.create_task(
+        scanner._walk_scope(_scan_run(), scope, root, root, resolver, checkpoint)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=1.0)
+    except asyncio.CancelledError:
+        pass
+    # Walker still blocked, but cancel should have detached without hanging
+    assert len(scanner._detached_walkers) == 1
+    # Writer must still acquire while walker blocked (no lease held)
+    writer_acquired = False
+    try:
+        async with asyncio.timeout(0.5):
+            async with filesystem.write("root"):
+                writer_acquired = True
+    except TimeoutError:
+        writer_acquired = False
+    assert writer_acquired is True
+    wedged.set()
+    deadline = time.monotonic() + 2.0
+    while scanner._detached_walkers and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert not scanner._detached_walkers
+
+
+@pytest.mark.asyncio
+async def test_repeated_stalled_walkers_all_tracked_and_warned(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").touch()
+    events: list[threading.Event] = [threading.Event() for _ in range(5)]
+    call_index = 0
+
+    def walker(*_args, **_kwargs):
+        nonlocal call_index
+        idx = call_index
+        call_index += 1
+        yield (str(root), [], ["track.flac"])
+        events[idx].wait()
+        return
+
+    store = AsyncMock()
+    store.classify_scan_paths.return_value = {"track.flac": ("new", None)}
+    store.add_scan_inventory_batch.return_value = (2, 1)
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=walker,
+        filesystem_coordinator=filesystem,
+        walk_deadline_seconds=0.05,
+        max_detached_walkers=4,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(resolve=lambda _path: None)
+    checkpoint = AsyncMock(return_value=True)
+
+    for ordinal in range(5):
+        store.record_scan_failures.reset_mock()
+        store.complete_scan_scope_discovery.reset_mock()
+        with caplog.at_level(logging.WARNING, logger="services.native.library_inventory_scanner"):
+            _updated, completed, failure_code = await scanner._walk_scope(
+                _scan_run(f"run-{ordinal}"), scope, root, root, resolver, checkpoint
+            )
+        assert completed is False
+        assert failure_code == "WALK_TIMEOUT"
+    # All 5 must be tracked, not silently dropped; 5th exceeds cap and warns
+    assert len(scanner._detached_walkers) == 5
+    assert "detached_walker_cap_exceeded" in caplog.text
+
+    for ev in events:
+        ev.set()
+    deadline = time.monotonic() + 2.0
+    while scanner._detached_walkers and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert not scanner._detached_walkers
+
+
 
 
 @pytest.mark.asyncio
