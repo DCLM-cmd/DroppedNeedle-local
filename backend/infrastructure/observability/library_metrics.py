@@ -28,6 +28,8 @@ LIBRARY_COUNTERS = (
     "sse_events",
     "sse_counter_events",
     "playback_starts",
+    "precache_healthy_empty",
+    "precache_degraded",
 )
 
 

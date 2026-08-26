@@ -22,6 +22,13 @@ from infrastructure.persistence import LibraryDB
 from infrastructure.resilience.retry import CircuitOpenError
 from services.per_user_client_factory import PerUserClientFactory
 from services.preferences_service import PreferencesService
+from infrastructure.degradation import (
+    clear_degradation_context,
+    init_degradation_context,
+    try_get_degradation_context,
+)
+from repositories.listenbrainz_repository import lb_popularity_degraded
+
 
 if TYPE_CHECKING:
     from infrastructure.persistence.auth_store import AuthStore
@@ -48,6 +55,10 @@ _discovery_precache_running = False
 _precache_consecutive_failures = 0
 _precache_paused_until = 0.0  # time.monotonic deadline; 0 = not paused
 
+from infrastructure.observability.library_metrics import LibraryMetrics
+
+_precache_metrics = LibraryMetrics.for_library_workload()
+
 
 def _record_precache_unit_failure() -> None:
     global _precache_consecutive_failures, _precache_paused_until
@@ -66,6 +77,26 @@ def _record_precache_unit_failure() -> None:
 def _record_precache_unit_success() -> None:
     global _precache_consecutive_failures
     _precache_consecutive_failures = 0
+
+
+_PrecacheOutcome = Literal["healthy_data", "healthy_empty", "degraded", "failed", "configured_absent"]
+
+
+def _classify_precache_outcome(
+    results: list[Any],
+    degraded: bool,
+    has_data: bool,
+    configured_absent: bool,
+) -> _PrecacheOutcome:
+    if any(isinstance(r, Exception) for r in results):
+        return "failed"
+    if configured_absent:
+        return "configured_absent"
+    if has_data:
+        return "healthy_data"
+    if degraded:
+        return "degraded"
+    return "healthy_empty"
 
 
 def _dedupe_similar_artists(artists: list[SimilarArtist]) -> list[SimilarArtist]:
@@ -281,7 +312,10 @@ class ArtistDiscoveryService:
 
         result.similar_artists = _dedupe_similar_artists(result.similar_artists)
 
-        if lb_unavailable and not result.similar_artists:
+        # Degraded empty must use short TTL, not healthy-empty TTL (NEW-CPU-02)
+        _ctx = try_get_degradation_context()
+        _degraded = (_ctx is not None and _ctx.has_degradation()) or lb_popularity_degraded() or lb_unavailable
+        if _degraded and not result.similar_artists:
             await self._cache.set(cache_key, result, ttl_seconds=CIRCUIT_OPEN_CACHE_TTL)
             return result
         in_library = await self._is_library_artist(artist_mbid)
@@ -380,7 +414,10 @@ class ArtistDiscoveryService:
             if fb is not None and fb.songs:
                 result, lb_unavailable = fb, False
 
-        if lb_unavailable and not result.songs:
+        # Degraded empty must use short TTL, not healthy-empty TTL (NEW-CPU-02)
+        _ctx = try_get_degradation_context()
+        _degraded = (_ctx is not None and _ctx.has_degradation()) or lb_popularity_degraded() or lb_unavailable
+        if _degraded and not result.songs:
             await self._cache.set(cache_key, result, ttl_seconds=CIRCUIT_OPEN_CACHE_TTL)
             return result
         in_library = await self._is_library_artist(artist_mbid)
@@ -515,7 +552,10 @@ class ArtistDiscoveryService:
             if fb is not None and fb.albums:
                 result, lb_unavailable = fb, False
 
-        if lb_unavailable and not result.albums:
+        # Degraded empty must use short TTL, not healthy-empty TTL (NEW-CPU-02)
+        _ctx = try_get_degradation_context()
+        _degraded = (_ctx is not None and _ctx.has_degradation()) or lb_popularity_degraded() or lb_unavailable
+        if _degraded and not result.albums:
             await self._cache.set(cache_key, result, ttl_seconds=CIRCUIT_OPEN_CACHE_TTL)
             return result
         in_library = await self._is_library_artist(artist_mbid)
@@ -709,11 +749,16 @@ class ArtistDiscoveryService:
             nonlocal cached_count, source_fetches, progress_counter
             if monotonic() < _precache_paused_until:
                 return False
+            # Isolated degradation context per artist task, no sibling leakage
+            ctx = init_degradation_context()
+            degraded = False
+            has_data = False
+            configured_absent = False
+            had_fetch = False
+            gathered_results: list[Any] = []
             try:
                 async with sem:
                     if monotonic() < _precache_paused_until:
-                        # Pause tripped while this unit queued on the semaphore:
-                        # fast-complete without invoking sources.
                         return False
                     for source in sources:
                         if self._workload_gate is not None:
@@ -735,7 +780,7 @@ class ArtistDiscoveryService:
                         )
                         if has_all:
                             continue
-
+                        had_fetch = True
                         results = await asyncio.gather(
                             self.get_similar_artists(
                                 mbid,
@@ -757,31 +802,73 @@ class ArtistDiscoveryService:
                             ),
                             return_exceptions=True,
                         )
-                        errors = [r for r in results if isinstance(r, Exception)]
-                        if errors:
-                            logger.debug(
-                                "Discovery precache errors for %s: %s", mbid[:8], errors
-                            )
-                        async with counter_lock:
-                            source_fetches += 1
-
+                        gathered_results.extend(results)
+                        # Configured absence is per-section source selection, not response attr.
+                        # For precache, sources already reflects configured Last.fm/ListenBrainz,
+                        # so if we fetched, the source was configured; has_all already handled.
+                        # Keep configured_absent False for real precache units.
+                        configured_absent = False
+                        for r in results:
+                            if isinstance(r, Exception):
+                                continue
+                            sa = getattr(r, "similar_artists", None)
+                            if isinstance(sa, list) and len(sa) > 0:
+                                has_data = True
+                            sg = getattr(r, "songs", None)
+                            if isinstance(sg, list) and len(sg) > 0:
+                                has_data = True
+                            al = getattr(r, "albums", None)
+                            if isinstance(al, list) and len(al) > 0:
+                                has_data = True
+                        if ctx.has_degradation() or lb_popularity_degraded():
+                            degraded = True
+                if not had_fetch:
+                    # Already cached, treat as success (no degradation)
+                    outcome: _PrecacheOutcome = "healthy_data"
+                else:
+                    outcome = _classify_precache_outcome(
+                        gathered_results, degraded, has_data, configured_absent
+                    )
+                # Metrics and success/failure handling
+                if outcome == "healthy_empty":
+                    _precache_metrics.increment("precache_healthy_empty")
+                elif outcome == "degraded":
+                    _precache_metrics.increment("precache_degraded")
+                # Fallback data is usable but primary degradation observable
+                if degraded and has_data and outcome == "healthy_data":
+                    _precache_metrics.increment("precache_degraded")
+                if outcome in ("healthy_data", "healthy_empty", "configured_absent"):
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    async with counter_lock:
+                        if outcome != "configured_absent":
+                            cached_count += 1
+                        progress_counter += 1
+                        local_progress = progress_counter
+                        counted_workers.add(idx)
+                    if status_service:
+                        artist_name = (mbid_to_name or {}).get(mbid, mbid[:8])
+                        await status_service.update_progress(
+                            local_progress, current_item=artist_name, generation=generation
+                        )
+                    _record_precache_unit_success()
+                    return True
+                # degraded or failed
                 if delay > 0:
                     await asyncio.sleep(delay)
-
                 async with counter_lock:
-                    cached_count += 1
                     progress_counter += 1
                     local_progress = progress_counter
                     counted_workers.add(idx)
-
                 if status_service:
                     artist_name = (mbid_to_name or {}).get(mbid, mbid[:8])
                     await status_service.update_progress(
                         local_progress, current_item=artist_name, generation=generation
                     )
-
-                _record_precache_unit_success()
-                return True
+                _record_precache_unit_failure()
+                if outcome == "degraded":
+                    logger.debug("Discovery precache degraded for %s", mbid[:8])
+                return False
             except Exception as e:  # noqa: BLE001
                 _record_precache_unit_failure()
                 logger.warning("Failed to precache discovery for %s: %s", mbid[:8], e)
@@ -795,6 +882,8 @@ class ArtistDiscoveryService:
                         local_progress, current_item=artist_name, generation=generation
                     )
                 return False
+            finally:
+                clear_degradation_context()
 
         async def process_artist_with_timeout(idx: int, mbid: str) -> bool:
             nonlocal progress_counter
