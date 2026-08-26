@@ -28,8 +28,17 @@ class TargetLibraryRepository:
     def is_configured(self) -> bool:
         return True
 
-    def is_library_empty(self) -> bool:
-        return False
+    async def delete_album(self, album_id: int, delete_files: bool = False) -> bool:
+        raise NotImplementedError(
+            "delete_album with int album_id is not supported in the target native"
+            " catalog; use delete by release_group_mbid via LibraryManager.delete_album_row"
+        )
+
+    async def delete_artist(self, artist_id: int, delete_files: bool = False) -> bool:
+        raise NotImplementedError(
+            "delete_artist with int artist_id is not supported in the target native"
+            " catalog; use delete by artist_mbid"
+        )
 
     async def get_status(self) -> ServiceStatus:
         return ServiceStatus(status="ok")

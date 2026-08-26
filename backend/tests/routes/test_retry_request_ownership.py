@@ -8,7 +8,6 @@ from api.v1.routes.requests_page import router
 from core.dependencies import get_requests_page_service
 from infrastructure.persistence.request_history import RequestHistoryStore
 from middleware import _get_current_user
-from services.native.stubs import LibraryStub
 from services.requests_page_service import RequestsPageService
 from tests.helpers import build_test_client, make_builtin_dispatcher, mock_user
 
@@ -32,13 +31,18 @@ def _make_service(tmp_path, status: str) -> RequestsPageService:
     download_service = MagicMock()
     download_service.request_album = AsyncMock(return_value="task-xyz")
 
+    fake_repo = AsyncMock()
+    fake_repo.get_library_mbids = AsyncMock(return_value=set())
+    fake_repo.get_library_album_mbids = AsyncMock(return_value=set())
+    fake_repo.get_library_artist_mbids = AsyncMock(return_value=set())
     return RequestsPageService(
-        library_repo=LibraryStub(),
+        library_repo=fake_repo,
         request_history=store,
         library_mbids_fn=_mbids,
         get_download_service=lambda: download_service,
         acquisition=make_builtin_dispatcher(lambda: download_service),
     )
+
 
 
 def _client(tmp_path, *, role: str, user_id: str, status: str = "failed"):

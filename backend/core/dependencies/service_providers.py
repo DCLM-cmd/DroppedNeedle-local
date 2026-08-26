@@ -1858,7 +1858,7 @@ def get_playlist_service() -> "PlaylistService":
 def get_library_service() -> "LibraryService":
     from services.library_service import LibraryService
 
-    library_repo = get_library_repository()
+    library_repo = get_target_library_repository()
     library_db = get_library_db()
     cover_repo = get_coverart_repository()
     preferences_service = get_preferences_service()
@@ -1945,8 +1945,15 @@ def _build_home_service(
 
 @singleton
 def get_home_service() -> "HomeService":
-    return _build_home_service(get_library_repository(), get_play_history_store())
+    from .compat_providers import get_target_consumer_composition
 
+    target = get_target_consumer_composition()
+    return _build_home_service(
+        target.repository,
+        target.history,
+        target.ownership,
+        get_genre_artwork_service(),
+    )
 
 @singleton
 def get_target_home_service() -> "HomeService":
@@ -2417,7 +2424,7 @@ def get_jellyfin_playback_service() -> "JellyfinPlaybackService":
 def get_local_files_service() -> "LocalFilesService":
     from services.local_files_service import LocalFilesService
 
-    library_repo = get_library_repository()
+    library_repo = get_target_library_repository()
     preferences_service = get_preferences_service()
     cache = get_cache()
     return LocalFilesService(library_repo, preferences_service, cache)

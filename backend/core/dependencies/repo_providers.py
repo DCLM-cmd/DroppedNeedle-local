@@ -40,11 +40,13 @@ def _get_configured_http_client() -> httpx.AsyncClient:
 
 @singleton
 def get_library_repository() -> "LibraryRepositoryProtocol":
-    # answers the wide legacy surface for services not yet migrated to the native engine
-    from services.native.library_manager import LibraryManager
+    from services.native.target_library_repository import TargetLibraryRepository
 
-    return LibraryManager(get_library_db())
+    from .cache_providers import get_native_library_store
 
+    return TargetLibraryRepository(
+        get_native_library_store(), get_request_history_store()
+    )
 
 @singleton
 def get_musicbrainz_repository() -> "MusicBrainzRepository":
