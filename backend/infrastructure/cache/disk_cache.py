@@ -2,8 +2,10 @@ import asyncio
 import hashlib
 import json
 import shutil
+import threading
 import time
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from infrastructure.serialization import to_jsonable
@@ -20,13 +22,25 @@ def _decode_json(text: str) -> Any:
 class DiskMetadataCache:
     _CACHE_VERSION = "v3"
 
+    # F-PERF-06 named touch policy: a successful warm read updates the
+    # sidecar's ``last_accessed`` at most once per this interval. Inside the
+    # window hits are free of metadata writes; the in-memory map keeps eviction
+    # accurate until the next durable touch. Restart safety comes from the
+    # sidecar itself - a fresh process falls back to the stored value.
+    _ACCESS_TOUCH_INTERVAL_SECONDS = 300.0
+    _TOUCH_MEMORY_MAX_ENTRIES = 4096
+
     def __init__(
         self,
         base_path: Path,
         recent_metadata_max_size_mb: int = 128,
         recent_covers_max_size_mb: int = 0,
         persistent_metadata_ttl_hours: int = 24,
+        clock: Callable[[], float] | None = None,
     ):
+        self._clock: Callable[[], float] = clock or time.time
+        self._touch_lock = threading.Lock()
+        self._touch_memory: dict[str, float] = {}
         self.base_path = Path(base_path)
         self.recent_metadata_max_size_bytes = max(recent_metadata_max_size_mb, 0) * 1024 * 1024
         self.recent_covers_max_size_bytes = max(recent_covers_max_size_mb, 0) * 1024 * 1024
@@ -92,6 +106,7 @@ class DiskMetadataCache:
     def _delete_file_pair(self, file_path: Path) -> None:
         file_path.unlink(missing_ok=True)
         self._meta_path(file_path).unlink(missing_ok=True)
+        self._forget_touch_memory(file_path)
 
     def _load_meta(self, meta_path: Path) -> dict[str, Any]:
         if not meta_path.exists():
@@ -102,10 +117,11 @@ class DiskMetadataCache:
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    @staticmethod
-    def _is_expired(meta: dict[str, Any]) -> bool:
+    def _is_expired(self, meta: dict[str, Any]) -> bool:
+        # F-PERF-06 clock seam: expiry honours the same injectable clock as
+        # access touches so tests stay deterministic without real sleeps.
         expires_at = meta.get("expires_at")
-        return isinstance(expires_at, (int, float)) and time.time() > float(expires_at)
+        return isinstance(expires_at, (int, float)) and self._clock() > float(expires_at)
 
     def _cleanup_expired_directory(self, directory: Path) -> int:
         removed = 0
@@ -142,10 +158,9 @@ class DiskMetadataCache:
                 size_bytes = data_path.stat().st_size
             except FileNotFoundError:
                 continue
-            meta = self._load_meta(self._meta_path(data_path))
-            last_accessed = float(meta.get("last_accessed", meta.get("created_at", 0.0)) or 0.0)
             total_size += size_bytes
-            candidates.append((last_accessed, data_path, size_bytes))
+            # F-PERF-06: throttled touches stay visible between sidecar writes.
+            candidates.append((self._durable_or_memory_touch(data_path), data_path, size_bytes))
 
         if total_size <= max_size_bytes:
             return 0
@@ -170,6 +185,7 @@ class DiskMetadataCache:
         if expires_at is not None:
             meta["expires_at"] = expires_at
         self._meta_path(file_path).write_text(_encode_json(meta))
+        self._touch_memory[str(self._meta_path(file_path))] = now
 
     def _read_json_entry(self, file_path: Path, honor_expiry: bool) -> dict[str, Any] | None:
         if not file_path.exists():
@@ -200,13 +216,63 @@ class DiskMetadataCache:
             return None
 
         if meta_path.exists():
-            meta["last_accessed"] = time.time()
-            try:
-                meta_path.write_text(_encode_json(meta))
-            except OSError:
-                pass
+            self._touch_access_metadata(meta_path, meta)
 
         return payload
+
+    def _touch_access_metadata(self, meta_path: Path, meta: dict[str, Any]) -> None:
+        """F-PERF-06 throttled access touch.
+
+        A warm read updates the durable ``last_accessed`` at most once per
+        ``_ACCESS_TOUCH_INTERVAL_SECONDS``; inside the window the hit only
+        refreshes this cache's bounded in-memory map, which size enforcement
+        reads alongside the sidecar. The per-cache lock coalesces concurrent
+        hits for one path so a burst cannot schedule one write per worker
+        thread. Failures stay best-effort: a touch error never invalidates a
+        valid payload."""
+        now = self._clock()
+        key = str(meta_path)
+        stored = float(
+            meta.get("last_accessed", meta.get("created_at", 0.0)) or 0.0
+        )
+        with self._touch_lock:
+            last_touched = max(self._touch_memory.get(key, 0.0), stored)
+            if now - last_touched < self._ACCESS_TOUCH_INTERVAL_SECONDS:
+                # Inside the window: no durable write; keep the freshest known
+                # signal visible to eviction via the in-memory map.
+                self._touch_memory[key] = last_touched
+                return
+            meta["last_accessed"] = now
+            try:
+                meta_path.write_text(_encode_json(meta))
+                self._touch_memory[key] = now
+            except OSError:
+                pass
+            self._prune_touch_memory(now)
+
+    def _prune_touch_memory(self, now: float) -> None:
+        """Bounded cleanup: drop stale windows first, then oldest touches."""
+        cutoff = now - self._ACCESS_TOUCH_INTERVAL_SECONDS * 4
+        stale = [key for key, touched in self._touch_memory.items() if touched < cutoff]
+        for key in stale:
+            del self._touch_memory[key]
+        while len(self._touch_memory) > self._TOUCH_MEMORY_MAX_ENTRIES:
+            oldest_key = min(self._touch_memory, key=self._touch_memory.get)
+            del self._touch_memory[oldest_key]
+
+    def _durable_or_memory_touch(self, data_path: Path) -> float:
+        """Most recent recency signal for eviction decisions: durable sidecar
+        value (or created_at fallback) unless an in-memory throttled touch is
+        newer. Keeps LRU/size eviction correct between durable touches."""
+        meta = self._load_meta(self._meta_path(data_path))
+        durable = float(meta.get("last_accessed", meta.get("created_at", 0.0)) or 0.0)
+        memory_value = self._touch_memory.get(str(self._meta_path(data_path)))
+        return max(durable, memory_value) if memory_value is not None else durable
+
+    def _forget_touch_memory(self, *data_paths: Path) -> None:
+        with self._touch_lock:
+            for data_path in data_paths:
+                self._touch_memory.pop(str(self._meta_path(data_path)), None)
 
     async def _set_entity(
         self,
@@ -328,6 +394,7 @@ class DiskMetadataCache:
                 meta["last_accessed"] = time.time()
                 persistent_meta.write_text(_encode_json(meta))
                 recent_meta.unlink(missing_ok=True)
+            self._forget_touch_memory(recent_path)
             return True
 
         return await asyncio.to_thread(operation)
@@ -372,16 +439,11 @@ class DiskMetadataCache:
                         size_bytes = data_path.stat().st_size
                     except FileNotFoundError:
                         continue
-                    meta_path = self._meta_path(data_path)
-                    meta: dict[str, Any] = {}
-                    if meta_path.exists():
-                        try:
-                            meta = _decode_json(meta_path.read_text())
-                        except Exception:  # noqa: BLE001
-                            meta = {}
-                    last_accessed = float(meta.get("last_accessed", meta.get("created_at", 0.0)) or 0.0)
                     total_size += size_bytes
-                    candidates.append((last_accessed, data_path, size_bytes))
+                    # F-PERF-06: throttled touches stay visible to LRU choice.
+                    candidates.append(
+                        (self._durable_or_memory_touch(data_path), data_path, size_bytes)
+                    )
 
             if total_size <= self.recent_metadata_max_size_bytes:
                 return 0
