@@ -152,10 +152,11 @@ class BoundedLegacyCatalogMigrator:
     ) -> BoundedMigrationOutcome:
         migrated_at = time.time() if now is None else now
         source_revision = await self._store.get_bounded_legacy_source_revision()
+        policy_revision = self._resolver.policy_revision
         completed_json = await self._store.get_completed_migration_report(
             migration_id,
             source_revision=source_revision,
-            root_revision=self._resolver.policy_revision,
+            root_revision=policy_revision,
         )
         if completed_json is not None:
             report = msgspec.json.decode(completed_json, type=MigrationDryRunReport)
@@ -182,7 +183,7 @@ class BoundedLegacyCatalogMigrator:
         await self._store.save_migration_dry_run(
             migration_id,
             source_revision=source_revision,
-            root_revision=self._resolver.policy_revision,
+            root_revision=policy_revision,
             report_json=msgspec.json.encode(initial).decode(),
             created_at=migrated_at,
         )
@@ -212,24 +213,28 @@ class BoundedLegacyCatalogMigrator:
 
         if self._migrated_source_keys is None:
             await self._migrate_roots(migration_id, source_revision, migrated_at)
+        self._ensure_policy_revision(policy_revision)
         await self._migrate_identified_catalog(
             migration_id,
             source_revision,
             migrated_at,
             total=preflight.identified_tracks,
         )
+        self._ensure_policy_revision(policy_revision)
         await self._migrate_local_only_catalog(
             migration_id,
             source_revision,
             migrated_at,
             total=preflight.local_only_tracks,
         )
+        self._ensure_policy_revision(policy_revision)
         await self._migrate_review_catalog(
             migration_id,
             source_revision,
             migrated_at,
             total=totals["manual_review_queue"],
         )
+        self._ensure_policy_revision(policy_revision)
         await self._migrate_references(
             migration_id,
             source_revision,
@@ -265,6 +270,7 @@ class BoundedLegacyCatalogMigrator:
             raise StaleRevisionError(
                 "The copied legacy database changed during its bounded migration."
             )
+        self._ensure_policy_revision(policy_revision)
         invariants = await self._store.validate_migrated_catalog()
         if any(invariants.values()):
             raise ValidationError("The imported catalog failed its target invariants.")
@@ -302,6 +308,15 @@ class BoundedLegacyCatalogMigrator:
             invariants=invariants,
             skipped_counts=dict(self._skipped),
         )
+
+    def _ensure_policy_revision(self, policy_revision: str) -> None:
+        """F1/H1: a roots/policy save mid-run invalidates the projector this
+        run captured; abort non-completed so pending rows retry under the new
+        revision instead of committing stale placements."""
+        if self._resolver.policy_revision != policy_revision:
+            raise StaleRevisionError(
+                "The library roots or policy changed during the bounded migration."
+            )
 
     async def _preflight_catalog(self, total: int) -> _CatalogPreflight:
         phase = "Checking catalog compatibility"

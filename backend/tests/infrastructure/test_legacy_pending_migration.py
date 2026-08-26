@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from core.exceptions import StaleRevisionError
+
 from api.v1.schemas.library_policies import LibraryRootSettings, TypedLibrarySettings
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.bounded_legacy_catalog_migrator import (
@@ -821,10 +823,10 @@ async def test_pending_migration_keeps_wrong_size_destination_pending(
 async def test_policy_revision_change_during_pending_run_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """F1 characterization: a roots/policy save racing an in-flight pending
-    run today completes SILENTLY under the projector captured before the
-    flip, permanently pinning stale placements. Documents the gap fixed by
-    H1; the post-fix version of this test asserts fail-closed behavior."""
+    """F1/H1: a roots/policy save racing an in-flight pending run must abort
+    the run non-completed instead of silently completing under the captured
+    projector. The untouched rows stay pending and the next schedule imports
+    them exactly once under the new revision."""
     historical_root = tmp_path / "Historical" / "Music"
     _write_catalog_files(historical_root)
     database = tmp_path / "library.db"
@@ -869,14 +871,48 @@ async def test_policy_revision_change_during_pending_run_fails_closed(
         batch_size=1,
         skip_unmappable_paths=True,
     )
-    # Pre-H1: no revision gate exists, so the run completes anyway.
-    await migrator.migrate_pending(stale_run_id)
+    with pytest.raises(StaleRevisionError):
+        await migrator.migrate_pending(stale_run_id)
 
     with sqlite3.connect(database) as connection:
         state = connection.execute(
             "SELECT state FROM library_migration_runs WHERE id = ?",
             (stale_run_id,),
         ).fetchone()[0]
-    assert state == "completed"
+    assert state != "completed"
     counts = await store.get_pending_legacy_counts()
-    assert counts["review_row"] == 0  # imported under the stale projector
+    assert counts["library_file"] == 0  # imported before the policy flip
+    assert counts["review_row"] == 4  # never processed: still retryable
+
+    # Follow-up schedule runs under the new revision and converges.
+    service = LegacyPendingMigrationService(store, lambda: resolver)
+    original_run = service._run
+
+    async def run_and_reset(run_id: str) -> None:
+        try:
+            await original_run(run_id)
+        finally:
+            service._running = False
+
+    service._run = run_and_reset
+    candidate = pending_run_id(resolver.policy_revision, revision)
+    assert candidate != stale_run_id
+    assert await store.get_migration_run_state(candidate) != "completed"
+    assert await service.schedule() is True
+    while service._running:
+        await asyncio.sleep(0.01)
+
+    with sqlite3.connect(database) as connection:
+        final_state = connection.execute(
+            "SELECT state FROM library_migration_runs WHERE id = ?",
+            (candidate,),
+        ).fetchone()[0]
+        review_provenance = connection.execute(
+            "SELECT COUNT(*) FROM library_migration_provenance "
+            "WHERE source_kind = 'review_row'"
+        ).fetchone()[0]
+    counts = await store.get_pending_legacy_counts()
+    assert counts["review_row"] == 0
+    assert counts["library_file"] == 0
+    assert review_provenance == 4  # imported exactly once, under P2
+    assert await service.schedule() is False
