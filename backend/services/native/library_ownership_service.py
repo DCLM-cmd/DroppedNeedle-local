@@ -118,10 +118,16 @@ class LibraryOwnershipService:
             for candidate in candidates
             if candidate.release_group_mbid
         }
+        # F-TARGETCATALOG-05 (owner-signed): folded-name fallback is only for
+        # providerLESS candidates. Provider-bearing candidates are owned solely
+        # by a matching provider identity, so they neither request nor consume
+        # providerless folded-key rows.
         folded_keys = {
             (_fold(candidate.title), _fold(candidate.album_artist))
             for candidate in candidates
-            if candidate.title and candidate.album_artist
+            if candidate.release_group_mbid is None
+            and candidate.title
+            and candidate.album_artist
         }
         rows = await self._store.target_album_ownership_rows(
             provider_ids=provider_ids,
@@ -153,11 +159,15 @@ class LibraryOwnershipService:
             title = _fold(candidate.title)
             artist = _fold(candidate.album_artist)
             if (
-                not title
+                provider_id
+                or not title
                 or not artist
                 or title in self._placeholders
                 or artist in self._placeholders
             ):
+                # F-TARGETCATALOG-05: a provider-bearing candidate that missed
+                # the provider match is NOT owned by a local-only album.
+                # Placeholders likewise prove nothing for providerless ones.
                 projections.append(AlbumOwnershipProjection(False))
                 continue
             matches = [

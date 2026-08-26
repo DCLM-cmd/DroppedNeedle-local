@@ -1745,7 +1745,9 @@ async def test_target_ownership_projection_is_conservative_and_provider_independ
         (False, None),
         (False, None),
         (False, None),
-        (True, LOCAL_ALBUM_ID),
+        # F-TARGETCATALOG-05 (owner-signed): an unmatched provider-bearing
+        # candidate is NOT owned by a local-only album - no folded fallback.
+        (False, None),
     ]
     assert await ownership.provider_album_id(IDENTIFIED_ALBUM_ID) == RELEASE_GROUP_MBID
     assert await ownership.provider_track_id(IDENTIFIED_TRACK_ID) == RECORDING_MBID
@@ -2608,3 +2610,166 @@ async def test_target_album_removal_keeps_partial_failure_reporting(
     assert good_row is not None and good_row["availability"] == "missing"
     assert bad_row is not None and bad_row["availability"] == "indexed"
     assert bad_path.exists()  # real failure is not hidden or retried destructively
+
+@pytest.mark.asyncio
+async def test_provider_bearing_candidates_never_consume_folded_fallback(
+    target_services,
+) -> None:
+    """F-TARGETCATALOG-05 signed rule matrix: provider match owns; a
+    provider-bearing candidate with only same-name local-only rows is NOT
+    owned; providerless candidates keep the folded fallback with the existing
+    one-year/unknown-year behaviour; placeholders, big year gaps, retired
+    albums, and unindexed albums never create ownership."""
+    store, _view, _favorites, _history, _root = target_services
+    ownership = LibraryOwnershipService(store)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_albums SET year = 2020 WHERE id = ?", (LOCAL_ALBUM_ID,)
+        )
+
+    projections = await ownership.project_albums(
+        [
+            # Provider match stays owned.
+            AlbumOwnershipCandidate(
+                RELEASE_GROUP_MBID, "Identified", "Identified Artist", None
+            ),
+            # Provider-bearing mismatch with same-name local-only row: not owned.
+            AlbumOwnershipCandidate(
+                "different-provider-id", "Local Only", "Local Only Artist", 2020
+            ),
+            # Provider-bearing mismatch ignores years entirely (no fallback).
+            AlbumOwnershipCandidate(
+                "another-provider-id", "Local Only", "Local Only Artist", None
+            ),
+            # Providerless fallback keeps one-year tolerance.
+            AlbumOwnershipCandidate(None, "Local Only", "Local Only Artist", 2021),
+            # Providerless fallback keeps unknown-year acceptance.
+            AlbumOwnershipCandidate(None, "Local Only", "Local Only Artist", None),
+            # Providerless with >1 year difference is not owned.
+            AlbumOwnershipCandidate(None, "Local Only", "Local Only Artist", 1999),
+            # Placeholders prove nothing for providerless candidates.
+            AlbumOwnershipCandidate(None, "Unknown album", "Unknown artist", None),
+        ]
+    )
+
+    assert [(item.owned, item.local_album_id) for item in projections] == [
+        (True, IDENTIFIED_ALBUM_ID),
+        (False, None),
+        (False, None),
+        (True, LOCAL_ALBUM_ID),
+        (True, LOCAL_ALBUM_ID),
+        (False, None),
+        (False, None),
+    ]
+
+    # Retired and unindexed local-only rows are invisible to the fallback.
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=LocalAlbum(
+                id="retired-local",
+                root_id="root",
+                grouping_key="retired-key",
+                title="Local Only",
+                album_artist_id=LOCAL_ARTIST_ID,
+                album_artist_name="Local Only Artist",
+                year=2020,
+                created_at=1,
+                updated_at=1,
+                retired_into_album_id=LOCAL_ALBUM_ID,
+            ),
+            artists=[],
+            tracks=[
+                LocalTrack(
+                    id="retired-track",
+                    local_album_id="retired-local",
+                    root_id="root",
+                    file_path="/music/retired.flac",
+                    relative_path="retired.flac",
+                    path_hash="hash-retired",
+                    file_size_bytes=1,
+                    file_mtime_ns=1,
+                    stat_revision="stat-retired",
+                    tag_revision="tag-retired",
+                    title="T",
+                    artist_name="Artist",
+                    album_title="Local Only",
+                    album_artist_name="Local Only Artist",
+                    duration_seconds=180,
+                    file_format="flac",
+                    imported_at=1,
+                    applied_policy="automatic",
+                )
+            ],
+            track_credits={},
+        )
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET availability='missing' "
+            "WHERE id='retired-track'"
+        )
+    projection = await ownership.project_album(
+        release_group_mbid=None,
+        title="Local Only",
+        album_artist="Local Only Artist",
+        year=2020,
+    )
+    # Still owned via LOCAL_ALBUM_ID; the retired duplicate adds no ambiguity.
+    assert projection.owned is True
+
+
+@pytest.mark.asyncio
+async def test_discover_queue_keeps_mismatched_provider_candidate_visible(
+    target_services,
+) -> None:
+    """F-MATCH-05 consumer check via F-TARGETCATALOG-05: the discover queue
+    retains a candidate whose provider ID mismatches the library (owned=False),
+    while the provider-matched candidate is filtered as in-library."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from services.discover.queue_service import DiscoverQueueService
+
+    store, *_rest = target_services
+    integration = SimpleNamespace(
+        get_queue_settings=lambda: SimpleNamespace(queue_size=10),
+        is_jellyfin_enabled=lambda: False,
+        is_library_configured=lambda: True,
+    )
+    mbid_resolution = AsyncMock()
+    mbid_resolution.get_user_listened_release_group_mbids.return_value = set()
+    mbid_resolution.get_library_album_mbids.return_value = set()
+    service = DiscoverQueueService(
+        listenbrainz_repo=AsyncMock(),
+        jellyfin_repo=AsyncMock(),
+        musicbrainz_repo=AsyncMock(),
+        integration=integration,
+        mbid_resolution=mbid_resolution,
+        ownership_service=LibraryOwnershipService(store),
+    )
+    service._build_anonymous_queue = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                release_group_mbid="mismatched-provider-id",
+                album_name="Local Only",
+                artist_name="Local Only Artist",
+                in_library=False,
+            ),
+            SimpleNamespace(
+                release_group_mbid=RELEASE_GROUP_MBID,
+                album_name="Identified",
+                artist_name="Identified Artist",
+                in_library=False,
+            ),
+        ]
+    )
+    service._resolve_user_music = AsyncMock(
+        return_value=(None, None, "", "", False, False, "listenbrainz")
+    )
+
+    response = await service.build_queue("user-1")
+
+    by_mbid = {item.release_group_mbid: item for item in response.items}
+    assert not by_mbid["mismatched-provider-id"].in_library  # stays visible
+    # The provider-matched candidate is correctly filtered out as in-library.
+    assert RELEASE_GROUP_MBID not in by_mbid
