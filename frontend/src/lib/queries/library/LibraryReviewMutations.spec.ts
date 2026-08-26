@@ -44,7 +44,7 @@ beforeEach(() => {
 });
 
 describe('review action invalidation scoping', () => {
-	it.each<ReviewAction>(['keep_tagged', 'detach_keep_tagged', 'exclude', 'restore'])(
+	it.each<ReviewAction>(['detach_keep_tagged', 'exclude', 'restore'])(
 		'sweeps the catalog layer for catalog-mutating action %s',
 		async (action) => {
 			const mutation = actOnLibraryReview(action) as unknown as {
@@ -63,22 +63,25 @@ describe('review action invalidation scoping', () => {
 		}
 	);
 
-	it('keeps dismiss review-local: no library/artist/home/discover sweep', async () => {
-		const mutation = actOnLibraryReview('dismiss') as unknown as {
-			onSuccess: (
-				result: unknown,
-				input: { reviewId: string; body: Record<string, unknown> }
-			) => Promise<void>;
-		};
+	it.each<ReviewAction>(['dismiss', 'keep_tagged'])(
+		'keeps %s review-local: no library/artist/home/discover sweep',
+		async (action) => {
+			const mutation = actOnLibraryReview(action) as unknown as {
+				onSuccess: (
+					result: unknown,
+					input: { reviewId: string; body: Record<string, unknown> }
+				) => Promise<void>;
+			};
 
-		await mutation.onSuccess({}, { reviewId: 'review-1', body: {} });
+			await mutation.onSuccess({}, { reviewId: 'review-1', body: {} });
 
-		const keys = invalidate.mock.calls.map(([filters]) => filters.queryKey);
-		for (const key of REVIEW_LOCAL_KEYS) {
-			expect(keys).toContainEqual(key);
+			const keys = invalidate.mock.calls.map(([filters]) => filters.queryKey);
+			for (const key of REVIEW_LOCAL_KEYS) {
+				expect(keys).toContainEqual(key);
+			}
+			for (const key of CATALOG_KEYS) {
+				expect(keys).not.toContainEqual(key);
+			}
 		}
-		for (const key of CATALOG_KEYS) {
-			expect(keys).not.toContainEqual(key);
-		}
-	});
+	);
 });

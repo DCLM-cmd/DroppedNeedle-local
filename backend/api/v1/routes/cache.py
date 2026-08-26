@@ -11,6 +11,7 @@ router = APIRouter(route_class=MsgSpecRoute, prefix="/cache", tags=["cache"])
 
 @router.get("/stats", response_model=CacheStats)
 async def get_cache_stats(
+    _: CurrentAdminDep,
     cache_service: CacheService = Depends(get_cache_service),
 ):
     return await cache_service.get_stats()

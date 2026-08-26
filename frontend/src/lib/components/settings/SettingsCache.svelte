@@ -25,14 +25,18 @@
 	let loading = $state(false);
 	let clearing = $state(false);
 	let message = $state('');
+	let needsAdmin = $state(false);
 
 	export async function load() {
 		loading = true;
 		message = '';
+		needsAdmin = false;
 		try {
 			const response = await fetch(getApiUrl('/api/v1/cache/stats'));
 			if (response.ok) {
 				cacheStats = await response.json();
+			} else if (response.status === 401 || response.status === 403) {
+				needsAdmin = true;
 			} else {
 				message = "Couldn't load cache stats";
 			}
@@ -54,7 +58,13 @@
 						: type === 'audiodb'
 							? 'AudioDB'
 							: type;
-		if (!confirm(`Are you sure you want to clear the ${typeLabel} cache?`)) {
+		const prompt =
+			type === 'all'
+				? `Are you sure you want to wipe the entire cache? This also deletes all ${
+						cacheStats?.disk_cover_count ?? 0
+					} cover image files (~${cacheStats?.disk_cover_size_mb ?? 0} MB); they are re-fetched from upstream over time.`
+				: `Are you sure you want to clear the ${typeLabel} cache?`;
+		if (!confirm(prompt)) {
 			return;
 		}
 
@@ -99,6 +109,10 @@
 		{#if loading}
 			<div class="flex justify-center items-center py-12">
 				<span class="loading loading-spinner loading-lg"></span>
+			</div>
+		{:else if needsAdmin}
+			<div role="alert" class="alert alert-warning mt-4">
+				<span>Admin access is required to view cache statistics.</span>
 			</div>
 		{:else if cacheStats}
 			<div class="stats stats-vertical lg:stats-horizontal shadow mb-6">
@@ -161,7 +175,7 @@
 						onclick={() => clearCache('disk')}
 						disabled={clearing}
 					>
-						Clear Disk Metadata
+						Metadata Only — Covers Preserved
 					</button>
 					<button
 						class="btn btn-outline btn-sm"
@@ -192,7 +206,7 @@
 						{#if clearing}
 							<span class="loading loading-spinner loading-sm"></span>
 						{/if}
-						Clear All
+						Full Wipe — Also Deletes {cacheStats.disk_cover_count} Cover Files
 					</button>
 				</div>
 			</div>

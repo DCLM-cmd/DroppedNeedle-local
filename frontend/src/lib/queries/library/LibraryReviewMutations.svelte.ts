@@ -62,10 +62,18 @@ export function actOnLibraryReview(action: ReviewAction) {
 			return api.global.post<ReviewActionResponse>(url, input.body);
 		},
 		onSuccess: async (_result, input) => {
-			// dismiss changes no catalog rows (verified non-mutating), so it sweeps
-			// review-local prefixes only. keep_tagged stays broad: backend
-			// row-effect confirmation pending — not narrowed.
-			const catalogMutating = action !== 'dismiss';
+			// dismiss and keep_tagged mutate no catalog rows: both run only the
+			// common write set in NativeLibraryStore.apply_review_decision
+			// (backend/infrastructure/persistence/native_library_store.py) — the
+			// library_identification_reviews row, queued automatic-job
+			// cancellation in library_identification_jobs, a
+			// library_catalog_actions audit insert, and revision-counter bumps.
+			// Those feed only review/activity/identification payloads; no home,
+			// discover, library-list, or artist-page reader touches them. The
+			// catalog tables move only under the other actions: local_tracks via
+			// exclude/restore, local_(album|track)_external_identities via
+			// detach_keep_tagged.
+			const catalogMutating = action !== 'dismiss' && action !== 'keep_tagged';
 			await invalidateReviewState(input.reviewId, { catalog: catalogMutating });
 			toastStore.show({ message: 'Review decision saved', type: 'success' });
 		},
