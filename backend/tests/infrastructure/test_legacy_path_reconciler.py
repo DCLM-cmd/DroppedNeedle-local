@@ -658,8 +658,66 @@ async def test_legacy_probe_timeout_still_aborts_on_non_path_blocker(
 
 
 
+@pytest.mark.asyncio
+async def test_reconcile_emits_sanitized_progress_heartbeats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """F5/H5: reconcile() with an emitter reports cumulative counts and
+    outcome classes only - zero paths, zero user identifiers - and the
+    default (no emitter) stays completely silent."""
+    import time as time_module
 
+    historical_root = tmp_path / "Historical" / "Music"
+    _write_catalog_files(historical_root)
+    database = tmp_path / "library.db"
+    _create_source(database, historical_root)
+    store = NativeLibraryStore(database, threading.Lock())
+    settings = _settings(("root", tmp_path / "Missing" / "Music"))
 
+    stat_calls = {"count": 0}
+    orig_stat = Path.stat
 
+    def counting_stat(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        stat_calls["count"] += 1
+        time_module.sleep(0.001)
+        return orig_stat(self, *args, **kwargs)
 
+    monkeypatch.setattr(Path, "stat", counting_stat)
 
+    messages: list[str] = []
+    result = await LegacyPathReconciler(store, settings, batch_size=1).reconcile(
+        emit_progress=messages.append
+    )
+
+    assert result.mode == "exact"
+    assert stat_calls["count"] > 0
+    assert messages
+    assert any("scanned=" in message for message in messages)
+    joined = "\n".join(messages)
+    # Zero absolute paths or user identifiers in any heartbeat.
+    assert str(historical_root) not in joined
+    assert str(tmp_path) not in joined
+    assert ".flac" not in joined
+    assert "alice" not in joined and "admin" not in joined
+    # Cumulative scanned counts are monotonic.
+    scanned_values = [
+        int(part.split("=", 1)[1])
+        for message in messages
+        for part in message.split()
+        if part.startswith("scanned=")
+    ]
+    assert scanned_values == sorted(scanned_values)
+    # Final summary names the outcome class and totals.
+    assert messages[-1].startswith("legacy_path_reconciled mode=")
+    assert "library_files=2" in messages[-1]
+    assert "review_rows=4" in messages[-1]
+
+    # Default path: no emitter, nothing printed at all.
+    silent_result = await LegacyPathReconciler(
+        store, settings, batch_size=1
+    ).reconcile()
+    assert silent_result.mode == "exact"
+    captured = capsys.readouterr()
+    assert captured.out == ""

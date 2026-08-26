@@ -676,7 +676,9 @@ async def _perform_target_migration() -> dict[str, Any]:
     try:
         reconciler = LegacyPathReconciler(store, typed_settings)
         try:
-            reconciliation = await reconciler.reconcile()
+            reconciliation = await reconciler.reconcile(
+                emit_progress=lambda message: print(f"[upgrade] {message}", flush=True)
+            )
         finally:
             await reconciler.aclose()
         if reconciliation.mode == "exact":

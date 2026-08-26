@@ -119,6 +119,13 @@ class _PathInaccessibleError(RuntimeError):
     pass
 
 
+def _emit_progress(emit: Callable[[str], None] | None, message: str) -> None:
+    if emit is not None:
+        emit(message)
+
+
+
+
 class LegacyPathReconciler:
     def __init__(
         self,
@@ -241,8 +248,25 @@ class LegacyPathReconciler:
             raise
 
 
-    async def reconcile(self) -> LegacyPathReconciliationResult:
-        inventory = await self._inventory()
+    async def reconcile(
+        self, *, emit_progress: Callable[[str], None] | None = None
+    ) -> LegacyPathReconciliationResult:
+        """F5/H5: ``emit_progress`` receives sanitized counts and outcome
+        classes only - never paths or user identifiers."""
+        result = await self._reconcile(emit_progress)
+        _emit_progress(
+            emit_progress,
+            f"legacy_path_reconciled mode={result.mode} "
+            f"library_files={result.library_file_count} "
+            f"review_rows={result.review_row_count} "
+            f"reason={result.failure_reason or '-'}",
+        )
+        return result
+
+    async def _reconcile(
+        self, emit: Callable[[str], None] | None
+    ) -> LegacyPathReconciliationResult:
+        inventory = await self._inventory(emit)
         outside_files = inventory["outside_files"]
         outside_reviews = inventory["outside_reviews"]
         if outside_files == 0 and outside_reviews == 0:
@@ -278,15 +302,15 @@ class LegacyPathReconciler:
         used_root_ids = inventory["used_root_ids"]
         if present == outside_files:
             return await self._reconcile_exact(
-                unused_roots, outside_files, outside_reviews, used_root_ids
+                unused_roots, outside_files, outside_reviews, used_root_ids, emit
             )
         if absent == outside_files:
             return await self._reconcile_moved(
-                unused_roots, outside_files, outside_reviews, used_root_ids
+                unused_roots, outside_files, outside_reviews, used_root_ids, emit
             )
         return self._blocked("legacy_path_inaccessible", outside_files, outside_reviews)
 
-    async def _inventory(self) -> dict[str, Any]:
+    async def _inventory(self, emit: Callable[[str], None] | None) -> dict[str, Any]:
         result: dict[str, Any] = {
             "outside_files": 0,
             "outside_reviews": 0,
@@ -296,6 +320,7 @@ class LegacyPathReconciler:
             "timeout_files": 0,
             "used_root_ids": set(),
         }
+        scanned = 0
         async for rows in self._library_batches():
             outside: list[dict[str, Any]] = []
             for row in rows:
@@ -327,6 +352,15 @@ class LegacyPathReconciler:
                     result["inaccessible_files"] += 1
                 else:
                     result[f"{value}_files"] += 1
+            scanned += len(rows)
+            _emit_progress(
+                emit,
+                "legacy_path_inventory "
+                f"scanned={scanned} outside={result['outside_files']} "
+                f"present={result['present_files']} absent={result['absent_files']} "
+                f"inaccessible={result['inaccessible_files']} "
+                f"timeout={result['timeout_files']}",
+            )
 
         async for rows in self._review_batches():
             for row in rows:
@@ -335,6 +369,10 @@ class LegacyPathReconciler:
                     result["used_root_ids"].add(resolved.root_id)
                 else:
                     result["outside_reviews"] += 1
+        _emit_progress(
+            emit,
+            f"legacy_path_inventory review_rows_outside={result['outside_reviews']}",
+        )
         return result
 
     async def _reconcile_exact(
@@ -343,6 +381,7 @@ class LegacyPathReconciler:
         outside_files: int,
         outside_reviews: int,
         used_root_ids: set[str],
+        emit: Callable[[str], None] | None = None,
     ) -> LegacyPathReconciliationResult:
         basenames = {
             root.id: Path(root.path).resolve(strict=False).name.casefold()
@@ -365,12 +404,14 @@ class LegacyPathReconciler:
                     "ambiguous_root_assignment", outside_files, outside_reviews
                 )
             candidates.update(batch_candidates)
+            _emit_progress(emit, f"legacy_path_candidates count={len(candidates)}")
         selected = await self._select_candidates(
             candidates,
             moved=False,
             outside_files=outside_files,
             outside_reviews=outside_reviews,
             used_root_ids=used_root_ids,
+            emit=emit,
         )
         if isinstance(selected, str):
             return self._blocked(selected, outside_files, outside_reviews)
@@ -395,6 +436,7 @@ class LegacyPathReconciler:
         outside_files: int,
         outside_reviews: int,
         used_root_ids: set[str],
+        emit: Callable[[str], None] | None = None,
     ) -> LegacyPathReconciliationResult:
         candidates: set[_Candidate] = set()
         async for rows in self._library_batches():
@@ -423,6 +465,7 @@ class LegacyPathReconciler:
             outside_files=outside_files,
             outside_reviews=outside_reviews,
             used_root_ids=used_root_ids,
+            emit=emit,
         )
         if isinstance(selected, str):
             return self._blocked(selected, outside_files, outside_reviews)
@@ -441,10 +484,12 @@ class LegacyPathReconciler:
         outside_files: int,
         outside_reviews: int,
         used_root_ids: set[str],
+        emit: Callable[[str], None] | None = None,
     ) -> list[_Candidate] | str:
         if not candidates:
             return "unverified_path_remap" if moved else "no_historical_root_match"
         used: set[_Candidate] = set()
+        verified = 0
         async for rows in self._library_batches():
             try:
                 matches, inaccessible = await self._matching_candidates(rows, candidates, moved)
@@ -467,6 +512,8 @@ class LegacyPathReconciler:
                         )
                     )
                 used.add(row_matches[0])
+                verified += 1
+            _emit_progress(emit, f"legacy_path_verify verified={verified}")
 
         roots = [candidate.root_id for candidate in used]
         if len(roots) != len(set(roots)):
