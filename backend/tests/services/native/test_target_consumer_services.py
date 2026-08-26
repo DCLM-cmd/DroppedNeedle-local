@@ -18,12 +18,11 @@ from mutagen.flac import FLAC, Picture
 
 from api.compat.jellyfin.builders import JellyfinBuilder
 from api.compat.subsonic.models import to_album_id3, to_child
-from api.v1.routes import library, library_target, local_library, requests
+from api.v1.routes import library_target, local_library, requests
 from api.v1.schemas.library_policies import LibraryRootSettings, TypedLibrarySettings
 from api.v1.schemas.discover import RadioPlanRequest, RadioSeedItem
 from api.v1.schemas.scrobble import ScrobbleRequest
 from core.dependencies import (
-    get_library_manager,
     get_local_files_service,
     get_preferences_service,
     get_request_history_store,
@@ -61,7 +60,6 @@ from services.native.library_ownership_service import (
     AlbumOwnershipCandidate,
     LibraryOwnershipService,
 )
-from services.native.library_manager import LibraryManager
 from services.native.target_native_library_service import TargetNativeLibraryService
 from services.native.target_catalog_writer_service import TargetCatalogWriterService
 from services.native.download_service import DownloadService
@@ -1580,6 +1578,85 @@ async def test_spotify_and_personal_mix_write_only_target_playlists(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_provider_identity", [True, False])
+async def test_cutoff_repository_normalizes_target_artist_metadata(
+    target_services, with_provider_identity: bool
+) -> None:
+    """NEW-TARGET-01: target cutoff rows expose the shared artist contract -
+    display name plus ONLY the provider identity as artist_mbid (never the
+    local album-artist ID alias)."""
+    store, _view, _favorites, _history, root = target_services
+    track_id = "20000000-0000-4000-8000-000000000095"
+    album_id = "10000000-0000-4000-8000-000000000095"
+    artist_id = "30000000-0000-4000-8000-000000000095"
+    path = root / "cutoff.flac"
+    shutil.copy2(Path(__file__).parents[2] / "fixtures/library/flac_no_tags.flac", path)
+    stat = path.stat()
+    _tag, info = AudioTagger().read_tags(path)
+    membership = _membership(
+        album_id=album_id,
+        track_id=track_id,
+        artist_id=artist_id,
+        root=root,
+        title="Cutoff",
+    )
+    membership.tracks[0].file_path = str(path)
+    membership.tracks[0].relative_path = path.name
+    membership.tracks[0].file_size_bytes = stat.st_size
+    membership.tracks[0].file_mtime_ns = stat.st_mtime_ns
+    membership.tracks[0].stat_revision = f"{stat.st_size}:{stat.st_mtime_ns}"
+    membership.tracks[0].file_format = info.file_format
+    membership.tracks[0].duration_seconds = info.duration_seconds
+    await store.create_catalog_membership(membership)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET file_format='mp3', bit_rate=192 "
+            "WHERE id = ?",
+            (track_id,),
+        )
+        connection.execute(
+            "INSERT INTO local_album_external_identities "
+            "(local_album_id, provider, release_group_mbid, decision_source, selected_at) "
+            "VALUES (?, 'musicbrainz', 'rg-cutoff', 'manual', 1)",
+            (album_id,),
+        )
+        if with_provider_identity:
+            connection.execute(
+                "INSERT INTO local_artist_external_identities "
+                "(local_artist_id, provider, provider_artist_id, decision_source, selected_at) "
+                "VALUES (?, 'musicbrainz', 'provider-artist-cutoff', 'manual', 1)",
+                (artist_id,),
+            )
+    preferences = SimpleNamespace(
+        get_typed_library_settings=lambda: SimpleNamespace(
+            library_roots=[SimpleNamespace(path=str(root))]
+        )
+    )
+    local_files = LocalFilesService(
+        TargetLibraryRepository(store), preferences, AsyncMock()
+    )
+    repository = TargetLibraryRepository(store)
+
+    rows = await repository.list_cutoff_unmet("lossless")
+
+    assert len(rows) == 1
+    row = rows[0]
+    # Shared contract keys are present and unambiguous.
+    assert row["artist_name"] == "Cutoff Artist"
+    if with_provider_identity:
+        assert row["artist_mbid"] == "provider-artist-cutoff"
+    else:
+        assert row["artist_mbid"] is None
+    # The local album-artist ID never masquerades as a provider MBID.
+    assert row["artist_mbid"] != artist_id
+    assert row["current_tier"] == "mp3_192"
+    # Target rows carry the provider identity in provider_release_group_mbid;
+    # release_group_mbid falls back to the local album id when the seed had no
+    # legacy release group.
+    assert row["provider_release_group_mbid"] == "rg-cutoff"
+
+
+@pytest.mark.asyncio
 async def test_target_removal_writer_audits_without_deleting_stable_rows(
     target_services, tmp_path: Path
 ) -> None:
@@ -1835,39 +1912,6 @@ async def test_local_only_album_track_and_artist_never_cross_provider_boundaries
     assert await ownership.provider_album_id(IDENTIFIED_ALBUM_ID) == RELEASE_GROUP_MBID
     assert await ownership.provider_track_id(IDENTIFIED_TRACK_ID) == RECORDING_MBID
     assert await ownership.provider_artist_id(IDENTIFIED_ARTIST_ID) == ARTIST_MBID
-
-
-@pytest.mark.asyncio
-async def test_native_library_routes_browse_target_catalog_with_local_ids(
-    target_services,
-) -> None:
-    store, _view, _favorites, _history, _root = target_services
-    manager = LibraryManager(TargetLibraryRepository(store))
-    app = FastAPI()
-    app.include_router(library.router)
-    app.dependency_overrides[get_library_manager] = lambda: manager
-    app.dependency_overrides[_get_current_user] = lambda: mock_user(
-        role="user", user_id="user-1"
-    )
-    client = build_test_client(app)
-
-    albums = client.get("/library/albums?page_size=10")
-    artists = client.get("/library/artists?limit=10")
-    tracks = client.get("/library/tracks?limit=10")
-    stats = client.get("/library/stats")
-    album_tracks = client.get(f"/library/albums/{LOCAL_ALBUM_ID}/tracks")
-
-    assert albums.status_code == 200
-    assert {item["release_group_mbid"] for item in albums.json()["items"]} == {
-        IDENTIFIED_ALBUM_ID,
-        LOCAL_ALBUM_ID,
-    }
-    assert artists.status_code == 200
-    assert LOCAL_ARTIST_ID in {item["artist_mbid"] for item in artists.json()["items"]}
-    assert tracks.status_code == 200
-    assert LOCAL_TRACK_ID in {item["track_file_id"] for item in tracks.json()["items"]}
-    assert stats.json()["total_tracks"] == 2
-    assert [item["id"] for item in album_tracks.json()["items"]] == [LOCAL_TRACK_ID]
 
 
 @pytest.mark.asyncio

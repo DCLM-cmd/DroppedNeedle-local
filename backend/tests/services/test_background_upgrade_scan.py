@@ -62,3 +62,60 @@ async def test_sweep_skips_satisfied_albums_and_needs_an_admin():
     )
     assert enqueued == 0
     service.list_cutoff_unmet.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sweep_forwards_normalized_target_artist_metadata():
+    """NEW-TARGET-01: the periodic sweep forwards the normalized artist name and
+    provider MBID from target-shaped cutoff rows instead of "Unknown"/None."""
+    service = AsyncMock()
+    service.list_cutoff_unmet.return_value = [
+        {
+            "release_group_mbid": "target-rg",
+            # Target-shaped row: legacy keys absent; normalized keys present.
+            "album_artist_name": "Target Artist",
+            "artist_name": "Target Artist",
+            "provider_artist_mbid": "provider-artist-1",
+            "artist_mbid": "provider-artist-1",
+            "album_title": "Target Album",
+            "year": 2024,
+            "current_tier": "mp3_320",
+            "track_count": 7,
+        }
+    ]
+    service.request_upgrade_album.return_value = "task-t"
+    admin = SimpleNamespace(id="admin-1", role="admin")
+
+    await run_background_upgrade_sweep(service, _auth([admin]), _policy())
+
+    kwargs = service.request_upgrade_album.await_args.kwargs
+    assert kwargs["artist_name"] == "Target Artist"
+    assert kwargs["artist_mbid"] == "provider-artist-1"
+
+
+@pytest.mark.asyncio
+async def test_sweep_providerless_row_keeps_none_artist_mbid():
+    """NEW-TARGET-01: a providerless row keeps artist_mbid None (absence), and
+    only the display name is forwarded."""
+    service = AsyncMock()
+    service.list_cutoff_unmet.return_value = [
+        {
+            "release_group_mbid": "providerless-rg",
+            "album_artist_name": "Providerless Artist",
+            "artist_name": "Providerless Artist",
+            "provider_artist_mbid": None,
+            "artist_mbid": None,
+            "album_title": "Providerless Album",
+            "year": 2023,
+            "current_tier": "mp3_320",
+            "track_count": 5,
+        }
+    ]
+    service.request_upgrade_album.return_value = "task-p"
+    admin = SimpleNamespace(id="admin-1", role="admin")
+
+    await run_background_upgrade_sweep(service, _auth([admin]), _policy())
+
+    kwargs = service.request_upgrade_album.await_args.kwargs
+    assert kwargs["artist_name"] == "Providerless Artist"
+    assert kwargs["artist_mbid"] is None

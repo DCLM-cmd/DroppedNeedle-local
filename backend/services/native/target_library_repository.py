@@ -128,7 +128,16 @@ class TargetLibraryRepository:
         for row in rows:
             tier = await self.album_quality_tier(str(row["release_group_mbid"]))
             if tier is not None and tier_rank(tier) < tier_rank(cutoff):
-                result.append({**row, "current_tier": tier})
+                # NEW-TARGET-01: translate the target row to the shared cutoff
+                # worklist contract. artist_mbid is ONLY the provider identity -
+                # never the local album-artist ID alias.
+                normalized = {
+                    **row,
+                    "current_tier": tier,
+                    "artist_name": row.get("album_artist_name"),
+                    "artist_mbid": row.get("provider_artist_mbid"),
+                }
+                result.append(normalized)
         return result
 
     async def get_file_rows_for_album(self, album_id: str) -> list[dict[str, Any]]:
