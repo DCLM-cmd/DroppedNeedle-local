@@ -126,6 +126,7 @@ class WantedWatcherService:
         sse_publisher: "SSEPublisher",
         preferences: "PreferencesService",
         inter_want_delay: float = 5.0,
+        provider_available: Callable[[], bool] | None = None,
     ) -> None:
         self._store = wanted_store
         self._requests = request_history
@@ -139,6 +140,7 @@ class WantedWatcherService:
         self._sse = sse_publisher
         self._preferences = preferences
         self._inter_want_delay = inter_want_delay
+        self._provider_available = provider_available
 
     async def run_sweep(self) -> WantedSweepSummary:
         # Read fresh every sweep so flipping the toggle needs no restart (§5.3).
@@ -432,6 +434,11 @@ class WantedWatcherService:
         statuses = ["failed"]
         if settings.watch_partial_albums:
             statuses.append("incomplete")
+        # Sweep-level provider gate: read once, after enabled gate, for optional date enrichment
+        provider_available = self._provider_available() if self._provider_available is not None else True
+        cache: dict[str, str | None] = {}
+        if not provider_available:
+            logger.warning("wanted.enrol_provider_outage", extra={"reason": "circuit_open"})
         for status in statuses:
             page = 1
             while True:
@@ -442,7 +449,7 @@ class WantedWatcherService:
                     break
                 for record in records:
                     try:
-                        if await self._maybe_enrol(record):
+                        if await self._maybe_enrol(record, provider_available, cache):
                             enrolled += 1
                     except Exception:  # noqa: BLE001 - one bad row must not stop enrolment
                         logger.warning(
@@ -455,7 +462,9 @@ class WantedWatcherService:
                 page += 1
         return enrolled
 
-    async def _maybe_enrol(self, record: "RequestHistoryRecord") -> bool:
+    async def _maybe_enrol(
+        self, record: "RequestHistoryRecord", provider_available: bool, cache: dict[str, str | None]
+    ) -> bool:
         existing = await self._store.get_watch(record.musicbrainz_id)
         if existing is not None and existing.state != "fulfilled":
             # watching/dormant/stopped: never auto-revive - the human's choice
@@ -491,7 +500,7 @@ class WantedWatcherService:
         if not record.user_id:
             return False  # no requester to act for (D7)
 
-        first_release_date = await self._first_release_date(record)
+        first_release_date = await self._first_release_date(record, provider_available, cache)
         next_check = now + self._interval_seconds(
             first_release_date, quiet_streak=0, now=now
         )
@@ -538,21 +547,37 @@ class WantedWatcherService:
         message = task.error_message or ""
         return message.startswith(_NO_SOURCE_MSG) or message.startswith(_NO_MATCH_MSG)
 
-    async def _first_release_date(self, record: "RequestHistoryRecord") -> str | None:
+    async def _first_release_date(
+        self, record: "RequestHistoryRecord", provider_available: bool = True, cache: dict[str, str | None] | None = None
+    ) -> str | None:
+        if cache is None:
+            cache = {}
         return await self._first_release_date_for_mbid(
-            record.musicbrainz_id, record.year
+            record.musicbrainz_id, record.year, provider_available, cache
         )
 
     async def _first_release_date_for_mbid(
-        self, mbid: str, year: int | None
+        self, mbid: str, year: int | None, provider_available: bool = True, cache: dict[str, str | None] | None = None
     ) -> str | None:
+        if cache is None:
+            cache = {}
+        if mbid in cache:
+            cached = cache[mbid]
+            if cached is not None:
+                return cached
+            return str(year) if year else None
+        if not provider_available:
+            cache[mbid] = None
+            return str(year) if year else None
         rg = await self._mb.get_release_group_by_id(
             mbid, priority=RequestPriority.BACKGROUND_SYNC
         )
         first_release_date = (rg or {}).get("first-release-date")
         if first_release_date:
-            return str(first_release_date)
-        # degraded fetch: the row's year gives a coarse age bucket
+            result = str(first_release_date)
+            cache[mbid] = result
+            return result
+        cache[mbid] = None
         return str(year) if year else None
 
     def _log_enrolled(

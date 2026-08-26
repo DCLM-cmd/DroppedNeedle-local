@@ -1454,6 +1454,7 @@ def _build_wanted_watcher_service(
         mb_repo=get_musicbrainz_repository(),
         sse_publisher=get_sse_publisher(),
         preferences=get_preferences_service(),
+        provider_available=get_mb_provider_availability(),
     )
 
 
