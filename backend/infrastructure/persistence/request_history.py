@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import sqlite3
 import threading
@@ -6,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import msgspec
+
+from infrastructure.persistence._database import PersistenceBase
 
 logger = logging.getLogger(__name__)
 
@@ -44,24 +45,18 @@ class RequestHistoryRecord(msgspec.Struct):
     reviewed_at: str | None = None
 
 
-class RequestHistoryStore:
+class RequestHistoryStore(PersistenceBase):
     _ACTIVE_STATUSES = ("pending", "downloading")
     # Statuses a non-admin user sees in their "active" view (includes awaiting approval)
     _USER_ACTIVE_STATUSES = ("pending", "downloading", "awaiting_approval", "queued")
 
-    def __init__(self, db_path: Path, write_lock: threading.Lock | None = None):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_lock = write_lock or threading.Lock()
-        with self._write_lock:
-            self._ensure_tables()
+    # foreign_keys intentionally omitted: this store never set it, and adding FK
+    # enforcement could raise IntegrityErrors on legacy rows (out-of-scope to
+    # enable here). busy_timeout stays unpinned like the other compat-era stores.
+    busy_timeout_ms: int | None = None
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+    def __init__(self, db_path: Path, write_lock: threading.Lock | None = None):
+        super().__init__(db_path, write_lock or threading.Lock())
 
     def _ensure_tables(self) -> None:
         conn = self._connect()
@@ -122,29 +117,6 @@ class RequestHistoryStore:
             conn.commit()
         finally:
             conn.close()
-
-    def _execute(self, operation, write: bool):
-        if write:
-            with self._write_lock:
-                conn = self._connect()
-                try:
-                    result = operation(conn)
-                    conn.commit()
-                    return result
-                finally:
-                    conn.close()
-
-        conn = self._connect()
-        try:
-            return operation(conn)
-        finally:
-            conn.close()
-
-    async def _read(self, operation):
-        return await asyncio.to_thread(self._execute, operation, False)
-
-    async def _write(self, operation):
-        return await asyncio.to_thread(self._execute, operation, True)
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row | None) -> RequestHistoryRecord | None:

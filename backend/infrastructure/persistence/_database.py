@@ -125,12 +125,34 @@ def _decode_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return decoded
 
 
+def _safe_alter(conn: sqlite3.Connection, sql: str) -> bool:
+    """Run an ``ALTER TABLE ... ADD COLUMN`` that may already have been applied.
+
+    Returns True if the column was added, False if it already existed."""
+    try:
+        conn.execute(sql)
+        return True
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+        return False
+
+
 class PersistenceBase:
     """Shared base for all domain-specific SQLite stores.
 
     All stores receive the *same* ``db_path`` and ``write_lock`` so they
     operate on a single database file with serialised writes.
     """
+
+    # (GH-293) Telemetry role label for connection-settings reporting. Subclasses
+    # that predate the shared base may pin their historical label (AuthStore).
+    connection_label: str = "persistence_base"
+    # (AUD-7) Explicit busy-handler timeout in ms applied at connect. None skips
+    # the pragma, leaving Python's sqlite3.connect(timeout=5.0) driver default:
+    # stores that historically never issued one override this so convergence
+    # does not silently pin them to a future change of the base's value.
+    busy_timeout_ms: int | None = 5000
 
     def __init__(
         self, db_path: Path, write_lock: threading.Lock | PriorityWriteLock
@@ -150,10 +172,12 @@ class PersistenceBase:
         conn.execute("PRAGMA synchronous=NORMAL")
         # (AUD-7) Uniform backstop: a writer blocked by another writer waits up to
         # 5s for the lock instead of failing immediately with "database is locked".
-        conn.execute("PRAGMA busy_timeout=5000")
+        # Stores that historically never set one pin busy_timeout_ms = None above.
+        if self.busy_timeout_ms is not None:
+            conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         # (GH-293) Labeled connection-local settings telemetry (bounded, once per
         # role per process). Never inferred from a fresh probe connection.
-        report_connection_settings("persistence_base", conn)
+        report_connection_settings(self.connection_label, conn)
         return conn
 
     def _execute(self, operation: Any, write: bool) -> Any:

@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import sqlite3
 import threading
@@ -6,6 +5,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import msgspec
+
+from infrastructure.persistence._database import PersistenceBase
 
 logger = logging.getLogger(__name__)
 
@@ -23,23 +24,15 @@ class PlayHistoryRecord(msgspec.Struct, frozen=True):
     source: str | None = None
 
 
-class PlayHistoryStore:
+class PlayHistoryStore(PersistenceBase):
     """Append-only per-user listening history; written for every play regardless
     of external linkage (D6)."""
 
     def __init__(self, db_path: Path, write_lock: threading.Lock | None = None):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_lock = write_lock or threading.Lock()
-        with self._write_lock:
-            self._ensure_tables()
+        super().__init__(db_path, write_lock or threading.Lock())
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn = super()._connect()
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
@@ -65,29 +58,6 @@ class PlayHistoryStore:
             conn.commit()
         finally:
             conn.close()
-
-    def _execute(self, operation, write: bool):
-        if write:
-            with self._write_lock:
-                conn = self._connect()
-                try:
-                    result = operation(conn)
-                    conn.commit()
-                    return result
-                finally:
-                    conn.close()
-
-        conn = self._connect()
-        try:
-            return operation(conn)
-        finally:
-            conn.close()
-
-    async def _read(self, operation):
-        return await asyncio.to_thread(self._execute, operation, False)
-
-    async def _write(self, operation):
-        return await asyncio.to_thread(self._execute, operation, True)
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> PlayHistoryRecord:

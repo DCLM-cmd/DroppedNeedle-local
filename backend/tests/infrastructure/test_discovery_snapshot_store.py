@@ -3,6 +3,7 @@ import sqlite3
 
 import pytest
 
+from infrastructure.persistence._database import _safe_alter
 from infrastructure.persistence.discovery_snapshot_store import DiscoverySnapshotStore
 
 
@@ -19,7 +20,7 @@ def test_safe_alter_reraises_unrelated_schema_errors(tmp_path) -> None:
     conn = sqlite3.connect(store.db_path)
     try:
         with pytest.raises(sqlite3.OperationalError):
-            store._safe_alter(conn, "ALTER TABLE missing_table ADD COLUMN value TEXT")
+            _safe_alter(conn, "ALTER TABLE missing_table ADD COLUMN value TEXT")
     finally:
         conn.close()
 

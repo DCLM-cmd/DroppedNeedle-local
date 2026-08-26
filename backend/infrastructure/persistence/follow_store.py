@@ -7,7 +7,6 @@ Per DD1, follow state lives here and never as a column on ``library_artists`` /
 ``library_albums`` - those are wiped and rebuilt on every full library scan.
 """
 
-import asyncio
 import logging
 import sqlite3
 import threading
@@ -16,6 +15,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import msgspec
+
+from infrastructure.persistence._database import PersistenceBase, _safe_alter
 
 logger = logging.getLogger(__name__)
 
@@ -120,20 +121,12 @@ class NewReleaseInput(msgspec.Struct, frozen=True):
     first_release_date: str | None = None
 
 
-class FollowStore:
+class FollowStore(PersistenceBase):
     def __init__(self, db_path: Path, write_lock: threading.Lock | None = None):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_lock = write_lock or threading.Lock()
-        with self._write_lock:
-            self._ensure_tables()
+        super().__init__(db_path, write_lock or threading.Lock())
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn = super()._connect()
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
@@ -209,10 +202,10 @@ class FollowStore:
             )
             # Additive ratchet for DBs created before the LidarrImport bulk-approval columns
             # (LidarrImport DR5). Idempotent: a no-op once the columns exist.
-            self._safe_alter(
+            _safe_alter(
                 conn, "ALTER TABLE auto_download_approvals ADD COLUMN batch_id TEXT"
             )
-            self._safe_alter(
+            _safe_alter(
                 conn, "ALTER TABLE auto_download_approvals ADD COLUMN source TEXT"
             )
             conn.execute(
@@ -222,38 +215,6 @@ class FollowStore:
             conn.commit()
         finally:
             conn.close()
-
-    @staticmethod
-    def _safe_alter(conn: sqlite3.Connection, sql: str) -> None:
-        """Idempotent additive migration: an ``ADD COLUMN`` that already ran raises
-        ``OperationalError: duplicate column name`` - swallow only that."""
-        try:
-            conn.execute(sql)
-        except sqlite3.OperationalError:
-            pass
-
-    def _execute(self, operation, write: bool):
-        if write:
-            with self._write_lock:
-                conn = self._connect()
-                try:
-                    result = operation(conn)
-                    conn.commit()
-                    return result
-                finally:
-                    conn.close()
-
-        conn = self._connect()
-        try:
-            return operation(conn)
-        finally:
-            conn.close()
-
-    async def _read(self, operation):
-        return await asyncio.to_thread(self._execute, operation, False)
-
-    async def _write(self, operation):
-        return await asyncio.to_thread(self._execute, operation, True)
 
     @staticmethod
     def _derive_state(intent: bool, approval_state: str | None) -> str:

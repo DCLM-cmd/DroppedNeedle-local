@@ -20,6 +20,7 @@ from infrastructure.persistence._database import (
     _decode_rows,
     _encode_json,
     _normalize,
+    _safe_alter,
 )
 from infrastructure.serialization import to_jsonable
 
@@ -29,19 +30,6 @@ logger = logging.getLogger(__name__)
 def _escape_like(term: str) -> str:
     """Escape SQL LIKE metacharacters so they match literally."""
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def _safe_alter(conn: sqlite3.Connection, sql: str) -> bool:
-    """Run an ``ALTER TABLE ... ADD COLUMN`` that may already have been applied.
-
-    Returns True if the column was added, False if it already existed."""
-    try:
-        conn.execute(sql)
-        return True
-    except sqlite3.OperationalError as exc:
-        if "duplicate column" not in str(exc).lower():
-            raise
-        return False
 
 
 # On UPDATE, id / imported_at / download_task_id are preserved, never overwritten.

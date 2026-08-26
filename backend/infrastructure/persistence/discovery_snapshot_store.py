@@ -2,7 +2,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from infrastructure.persistence._database import PersistenceBase
+from infrastructure.persistence._database import PersistenceBase, _safe_alter
 
 
 class DiscoverySnapshotStore(PersistenceBase):
@@ -26,12 +26,12 @@ class DiscoverySnapshotStore(PersistenceBase):
                 )
                 """
             )
-            self._safe_alter(
+            _safe_alter(
                 conn,
                 "ALTER TABLE discovery_snapshots "
                 "ADD COLUMN stale INTEGER NOT NULL DEFAULT 0",
             )
-            self._safe_alter(
+            _safe_alter(
                 conn,
                 "ALTER TABLE discovery_snapshots "
                 "ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 0",
@@ -52,14 +52,6 @@ class DiscoverySnapshotStore(PersistenceBase):
             conn.commit()
         finally:
             conn.close()
-
-    @staticmethod
-    def _safe_alter(conn: sqlite3.Connection, sql: str) -> None:
-        try:
-            conn.execute(sql)
-        except sqlite3.OperationalError as exc:
-            if "duplicate column name" not in str(exc).lower():
-                raise
 
     async def get(self, snapshot_key: str) -> bytes | None:
         def operation(conn: sqlite3.Connection) -> bytes | None:

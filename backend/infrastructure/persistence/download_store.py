@@ -24,6 +24,7 @@ from infrastructure.persistence._database import (
     PersistenceBase,
     _decode_json,
     _encode_json,
+    _safe_alter,
 )
 from infrastructure.serialization import to_jsonable
 from models.download import (
@@ -422,14 +423,6 @@ _ATTEMPT_CAS_UPDATABLE = frozenset(
         "handle_json",
     }
 )
-
-
-def _safe_alter(conn: sqlite3.Connection, sql: str) -> None:
-    try:
-        conn.execute(sql)
-    except sqlite3.OperationalError as error:
-        if "duplicate column" not in str(error).lower():
-            raise
 
 
 class DownloadStore(PersistenceBase):
