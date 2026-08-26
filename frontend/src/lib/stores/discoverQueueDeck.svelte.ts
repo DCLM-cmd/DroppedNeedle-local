@@ -18,7 +18,7 @@ import {
 } from '$lib/utils/discoverQueueCache';
 import { isAbortError } from '$lib/utils/errorHandling';
 import { invalidateDiscoverRecommendations } from '$lib/queries/discover/DiscoverInvalidation';
-import { SvelteMap } from 'svelte/reactivity';
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import type {
 	DiscoverQueueEnrichment,
 	DiscoverQueueItemFull,
@@ -39,6 +39,18 @@ function emptyEnrichment(): DiscoverQueueEnrichment {
 		artist_description: null,
 		listen_count: null
 	};
+}
+
+function dedupeByMbid(items: DiscoverQueueItemFull[]): DiscoverQueueItemFull[] {
+	const seen = new SvelteSet<string>();
+	const unique: DiscoverQueueItemFull[] = [];
+	for (const item of items) {
+		const mbid = item.release_group_mbid;
+		if (!mbid || seen.has(mbid)) continue;
+		seen.add(mbid);
+		unique.push(item);
+	}
+	return unique;
 }
 
 function createDiscoverQueueDeck() {
@@ -109,7 +121,7 @@ function createDiscoverQueueDeck() {
 			const data = await api.global.get<DiscoverQueueResponse>(API.discoverQueue(), {
 				signal: abortController?.signal
 			});
-			queue = data.items.map((item) => ({ ...item }));
+			queue = dedupeByMbid(data.items.map((item) => ({ ...item })));
 			queueId = data.queue_id;
 			currentIndex = 0;
 			inFlightEnrich.clear();
@@ -140,7 +152,7 @@ function createDiscoverQueueDeck() {
 				{ release_group_mbids: mbids },
 				{ signal: abortController?.signal }
 			);
-			const inLibrary = new Set(data.in_library || []);
+			const inLibrary = new SvelteSet(data.in_library || []);
 			if (inLibrary.size > 0) {
 				queue = queue.filter((i) => !inLibrary.has(i.release_group_mbid));
 				if (currentIndex >= queue.length) currentIndex = Math.max(0, queue.length - 1);
@@ -230,9 +242,10 @@ function createDiscoverQueueDeck() {
 			discoverQueueStatusStore.stopPolling();
 
 			const cached = getQueueCachedData(userId());
-			if (cached && cached.data.items.length > 0) {
-				queue = cached.data.items;
-				currentIndex = Math.min(cached.data.currentIndex, cached.data.items.length - 1);
+			const cachedItems = cached ? dedupeByMbid(cached.data.items) : [];
+			if (cached && cachedItems.length > 0) {
+				queue = cachedItems;
+				currentIndex = Math.max(0, Math.min(cached.data.currentIndex, queue.length - 1));
 				queueId = cached.data.queueId;
 				phase = 'ready';
 				await validateCachedQueue();

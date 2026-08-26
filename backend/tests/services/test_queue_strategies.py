@@ -1,7 +1,7 @@
 """Unit tests for queue_strategies - pure functions extracted from DiscoverQueueService."""
 
 import random
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -25,6 +25,7 @@ from services.discover.queue_strategies import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _item(rg_mbid: str, artist_mbid: str = "artist-1") -> DiscoverQueueItemLight:
     return DiscoverQueueItemLight(
@@ -155,21 +156,34 @@ class TestBuildSimilarArtistPools:
     async def test_returns_one_pool_per_seed(self) -> None:
         lb_repo = AsyncMock()
         lb_repo.get_similar_artists.return_value = [
-            ListenBrainzSimilarArtist(artist_mbid="sim-1", artist_name="Sim1", listen_count=100),
+            ListenBrainzSimilarArtist(
+                artist_mbid="sim-1", artist_name="Sim1", listen_count=100
+            ),
         ]
         lb_repo.get_artist_top_release_groups.return_value = [
             ListenBrainzReleaseGroup(
-                release_group_name="Album1", artist_name="Sim1",
-                listen_count=50, release_group_mbid="rg-1",
+                release_group_name="Album1",
+                artist_name="Sim1",
+                listen_count=50,
+                release_group_mbid="rg-1",
             ),
         ]
         mbid_svc = _make_mbid_svc()
         seeds = [
-            ListenBrainzArtist(artist_name="Seed1", listen_count=200, artist_mbids=["seed-1"]),
-            ListenBrainzArtist(artist_name="Seed2", listen_count=150, artist_mbids=["seed-2"]),
+            ListenBrainzArtist(
+                artist_name="Seed1", listen_count=200, artist_mbids=["seed-1"]
+            ),
+            ListenBrainzArtist(
+                artist_name="Seed2", listen_count=150, artist_mbids=["seed-2"]
+            ),
         ]
         pools = await build_similar_artist_pools(
-            seeds, set(), 5, 3, lb_repo=lb_repo, mbid_svc=mbid_svc,
+            seeds,
+            set(),
+            5,
+            3,
+            lb_repo=lb_repo,
+            mbid_svc=mbid_svc,
         )
         assert len(pools) == 2
         assert all(len(p) > 0 for p in pools)
@@ -183,9 +197,16 @@ class TestBuildSimilarArtistPools:
             ),
         ]
         mbid_svc = _make_mbid_svc()
-        seeds = [ListenBrainzArtist(artist_name="S", listen_count=1, artist_mbids=["s1"])]
+        seeds = [
+            ListenBrainzArtist(artist_name="S", listen_count=1, artist_mbids=["s1"])
+        ]
         pools = await build_similar_artist_pools(
-            seeds, set(), 5, 3, lb_repo=lb_repo, mbid_svc=mbid_svc,
+            seeds,
+            set(),
+            5,
+            3,
+            lb_repo=lb_repo,
+            mbid_svc=mbid_svc,
         )
         assert pools == [[]]
 
@@ -193,19 +214,32 @@ class TestBuildSimilarArtistPools:
     async def test_dedup_within_pool(self) -> None:
         lb_repo = AsyncMock()
         lb_repo.get_similar_artists.return_value = [
-            ListenBrainzSimilarArtist(artist_mbid="sim-a", artist_name="SimA", listen_count=100),
-            ListenBrainzSimilarArtist(artist_mbid="sim-b", artist_name="SimB", listen_count=80),
+            ListenBrainzSimilarArtist(
+                artist_mbid="sim-a", artist_name="SimA", listen_count=100
+            ),
+            ListenBrainzSimilarArtist(
+                artist_mbid="sim-b", artist_name="SimB", listen_count=80
+            ),
         ]
         lb_repo.get_artist_top_release_groups.return_value = [
             ListenBrainzReleaseGroup(
-                release_group_name="Same Album", artist_name="SimA",
-                listen_count=50, release_group_mbid="dup-rg",
+                release_group_name="Same Album",
+                artist_name="SimA",
+                listen_count=50,
+                release_group_mbid="dup-rg",
             ),
         ]
         mbid_svc = _make_mbid_svc()
-        seeds = [ListenBrainzArtist(artist_name="S", listen_count=1, artist_mbids=["s1"])]
+        seeds = [
+            ListenBrainzArtist(artist_name="S", listen_count=1, artist_mbids=["s1"])
+        ]
         pools = await build_similar_artist_pools(
-            seeds, set(), 5, 3, lb_repo=lb_repo, mbid_svc=mbid_svc,
+            seeds,
+            set(),
+            5,
+            3,
+            lb_repo=lb_repo,
+            mbid_svc=mbid_svc,
         )
         assert len(pools[0]) == 1
 
@@ -213,18 +247,29 @@ class TestBuildSimilarArtistPools:
     async def test_excludes_excluded_mbids(self) -> None:
         lb_repo = AsyncMock()
         lb_repo.get_similar_artists.return_value = [
-            ListenBrainzSimilarArtist(artist_mbid="sim-1", artist_name="Sim1", listen_count=100),
+            ListenBrainzSimilarArtist(
+                artist_mbid="sim-1", artist_name="Sim1", listen_count=100
+            ),
         ]
         lb_repo.get_artist_top_release_groups.return_value = [
             ListenBrainzReleaseGroup(
-                release_group_name="Excluded", artist_name="Sim1",
-                listen_count=50, release_group_mbid="excluded-rg",
+                release_group_name="Excluded",
+                artist_name="Sim1",
+                listen_count=50,
+                release_group_mbid="excluded-rg",
             ),
         ]
         mbid_svc = _make_mbid_svc()
-        seeds = [ListenBrainzArtist(artist_name="S", listen_count=1, artist_mbids=["s1"])]
+        seeds = [
+            ListenBrainzArtist(artist_name="S", listen_count=1, artist_mbids=["s1"])
+        ]
         pools = await build_similar_artist_pools(
-            seeds, {"excluded-rg"}, 5, 3, lb_repo=lb_repo, mbid_svc=mbid_svc,
+            seeds,
+            {"excluded-rg"},
+            5,
+            3,
+            lb_repo=lb_repo,
+            mbid_svc=mbid_svc,
         )
         assert pools[0] == []
 
@@ -232,9 +277,16 @@ class TestBuildSimilarArtistPools:
     async def test_seed_without_mbid(self) -> None:
         lb_repo = AsyncMock()
         mbid_svc = _make_mbid_svc()
-        seeds = [ListenBrainzArtist(artist_name="NoMBID", listen_count=1, artist_mbids=[])]
+        seeds = [
+            ListenBrainzArtist(artist_name="NoMBID", listen_count=1, artist_mbids=[])
+        ]
         pools = await build_similar_artist_pools(
-            seeds, set(), 5, 3, lb_repo=lb_repo, mbid_svc=mbid_svc,
+            seeds,
+            set(),
+            5,
+            3,
+            lb_repo=lb_repo,
+            mbid_svc=mbid_svc,
         )
         assert pools == [[]]
         lb_repo.get_similar_artists.assert_not_called()
@@ -257,8 +309,10 @@ class TestDiscoverByGenres:
         mbid_svc = _make_mbid_svc()
 
         result = await discover_by_genres(
-            ["rock"], set(),
-            mb_repo=mb_repo, mbid_svc=mbid_svc,
+            ["rock"],
+            set(),
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
         )
         assert len(result) == 1
         assert result[0].release_group_mbid == "rg-rock-1"
@@ -269,8 +323,10 @@ class TestDiscoverByGenres:
         mbid_svc = _make_mbid_svc()
 
         result = await discover_by_genres(
-            [], set(),
-            mb_repo=mb_repo, mbid_svc=mbid_svc,
+            [],
+            set(),
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
         )
         assert result == []
 
@@ -285,8 +341,10 @@ class TestDiscoverByGenres:
         mbid_svc = _make_mbid_svc()
 
         result = await discover_by_genres(
-            ["rock", "indie"], set(),
-            mb_repo=mb_repo, mbid_svc=mbid_svc,
+            ["rock", "indie"],
+            set(),
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
         )
         assert len(result) == 1
 
@@ -301,25 +359,39 @@ class TestGetArtistDeepCuts:
     async def test_excludes_current_top_and_listened(self) -> None:
         lb_repo = AsyncMock()
         top_rg = ListenBrainzReleaseGroup(
-            release_group_name="Top Album", artist_name="ArtistA",
-            listen_count=200, release_group_mbid="top-rg",
+            release_group_name="Top Album",
+            artist_name="ArtistA",
+            listen_count=200,
+            release_group_mbid="top-rg",
             artist_mbids=["artist-a"],
         )
         lb_repo.get_user_top_release_groups.return_value = [top_rg]
         deep_rg = ListenBrainzReleaseGroup(
-            release_group_name="Deep Cut", artist_name="ArtistA",
-            listen_count=20, release_group_mbid="deep-rg",
+            release_group_name="Deep Cut",
+            artist_name="ArtistA",
+            listen_count=20,
+            release_group_mbid="deep-rg",
         )
         listened_rg = ListenBrainzReleaseGroup(
-            release_group_name="Listened", artist_name="ArtistA",
-            listen_count=30, release_group_mbid="listened-rg",
+            release_group_name="Listened",
+            artist_name="ArtistA",
+            listen_count=30,
+            release_group_mbid="listened-rg",
         )
-        lb_repo.get_artist_top_release_groups.return_value = [top_rg, deep_rg, listened_rg]
+        lb_repo.get_artist_top_release_groups.return_value = [
+            top_rg,
+            deep_rg,
+            listened_rg,
+        ]
         mbid_svc = _make_mbid_svc()
 
         result = await get_artist_deep_cuts(
-            "user1", set(), {"listened-rg"}, 3,
-            lb_repo=lb_repo, mbid_svc=mbid_svc,
+            "user1",
+            set(),
+            {"listened-rg"},
+            3,
+            lb_repo=lb_repo,
+            mbid_svc=mbid_svc,
         )
         rg_ids = [it.release_group_mbid for it in result]
         assert "deep-rg" in rg_ids
@@ -333,8 +405,12 @@ class TestGetArtistDeepCuts:
         mbid_svc = _make_mbid_svc()
 
         result = await get_artist_deep_cuts(
-            "user1", set(), set(), 3,
-            lb_repo=lb_repo, mbid_svc=mbid_svc,
+            "user1",
+            set(),
+            set(),
+            3,
+            lb_repo=lb_repo,
+            mbid_svc=mbid_svc,
         )
         assert result == []
 
@@ -343,8 +419,10 @@ class TestGetArtistDeepCuts:
         lb_repo = AsyncMock()
         top_rgs = [
             ListenBrainzReleaseGroup(
-                release_group_name=f"Album{i}", artist_name=f"Artist{i}",
-                listen_count=200 - i, release_group_mbid=f"rg-{i}",
+                release_group_name=f"Album{i}",
+                artist_name=f"Artist{i}",
+                listen_count=200 - i,
+                release_group_mbid=f"rg-{i}",
                 artist_mbids=[f"artist-{i}"],
             )
             for i in range(10)
@@ -354,8 +432,12 @@ class TestGetArtistDeepCuts:
         mbid_svc = _make_mbid_svc()
 
         await get_artist_deep_cuts(
-            "user1", set(), set(), 3,
-            lb_repo=lb_repo, mbid_svc=mbid_svc,
+            "user1",
+            set(),
+            set(),
+            3,
+            lb_repo=lb_repo,
+            mbid_svc=mbid_svc,
         )
         assert lb_repo.get_artist_top_release_groups.call_count == 6
 
@@ -371,8 +453,10 @@ class TestGetTrendingFiller:
         lb_repo = AsyncMock()
         lb_repo.get_sitewide_top_release_groups.return_value = [
             ListenBrainzReleaseGroup(
-                release_group_name="Trending", artist_name="Artist",
-                listen_count=500, release_group_mbid="t-1",
+                release_group_name="Trending",
+                artist_name="Artist",
+                listen_count=500,
+                release_group_mbid="t-1",
                 artist_mbids=["a-1"],
             ),
         ]
@@ -380,8 +464,14 @@ class TestGetTrendingFiller:
         mbid_svc = _make_mbid_svc()
 
         result = await get_trending_filler(
-            5, set(), set(), None, "listenbrainz",
-            lb_repo=lb_repo, mb_repo=mb_repo, mbid_svc=mbid_svc,
+            5,
+            set(),
+            set(),
+            None,
+            "listenbrainz",
+            lb_repo=lb_repo,
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
         )
         assert len(result) >= 1
         assert result[0].is_wildcard is True
@@ -391,8 +481,10 @@ class TestGetTrendingFiller:
         lb_repo = AsyncMock()
         lb_repo.get_sitewide_top_release_groups.return_value = [
             ListenBrainzReleaseGroup(
-                release_group_name=f"T{i}", artist_name=f"A{i}",
-                listen_count=100, release_group_mbid=f"t-{i}",
+                release_group_name=f"T{i}",
+                artist_name=f"A{i}",
+                listen_count=100,
+                release_group_mbid=f"t-{i}",
                 artist_mbids=[f"a-{i}"],
             )
             for i in range(20)
@@ -401,8 +493,14 @@ class TestGetTrendingFiller:
         mbid_svc = _make_mbid_svc()
 
         result = await get_trending_filler(
-            3, set(), set(), None, "listenbrainz",
-            lb_repo=lb_repo, mb_repo=mb_repo, mbid_svc=mbid_svc,
+            3,
+            set(),
+            set(),
+            None,
+            "listenbrainz",
+            lb_repo=lb_repo,
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
         )
         assert len(result) <= 3
 
@@ -411,23 +509,31 @@ class TestGetTrendingFiller:
         lb_repo = AsyncMock()
         lb_repo.get_sitewide_top_release_groups.return_value = [
             ListenBrainzReleaseGroup(
-                release_group_name="Ignored", artist_name="A",
-                listen_count=100, release_group_mbid="ignored-1",
+                release_group_name="Ignored",
+                artist_name="A",
+                listen_count=100,
+                release_group_mbid="ignored-1",
                 artist_mbids=["a-1"],
             ),
             ListenBrainzReleaseGroup(
-                release_group_name="InLib", artist_name="A",
-                listen_count=100, release_group_mbid="lib-1",
+                release_group_name="InLib",
+                artist_name="A",
+                listen_count=100,
+                release_group_mbid="lib-1",
                 artist_mbids=["a-2"],
             ),
             ListenBrainzReleaseGroup(
-                release_group_name="Seen", artist_name="A",
-                listen_count=100, release_group_mbid="seen-1",
+                release_group_name="Seen",
+                artist_name="A",
+                listen_count=100,
+                release_group_mbid="seen-1",
                 artist_mbids=["a-3"],
             ),
             ListenBrainzReleaseGroup(
-                release_group_name="OK", artist_name="A",
-                listen_count=100, release_group_mbid="ok-1",
+                release_group_name="OK",
+                artist_name="A",
+                listen_count=100,
+                release_group_mbid="ok-1",
                 artist_mbids=["a-4"],
             ),
         ]
@@ -435,8 +541,14 @@ class TestGetTrendingFiller:
         mbid_svc = _make_mbid_svc()
 
         result = await get_trending_filler(
-            10, {"ignored-1"}, {"lib-1"}, {"seen-1"}, "listenbrainz",
-            lb_repo=lb_repo, mb_repo=mb_repo, mbid_svc=mbid_svc,
+            10,
+            {"ignored-1"},
+            {"lib-1"},
+            {"seen-1"},
+            "listenbrainz",
+            lb_repo=lb_repo,
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
         )
         rg_ids = {it.release_group_mbid for it in result}
         assert "ignored-1" not in rg_ids
@@ -445,14 +557,77 @@ class TestGetTrendingFiller:
         assert "ok-1" in rg_ids
 
     @pytest.mark.asyncio
+    async def test_lb_path_deduplicates_repeated_release_groups(self) -> None:
+        lb_repo = AsyncMock()
+        lb_repo.get_sitewide_top_release_groups.return_value = [
+            ListenBrainzReleaseGroup(
+                release_group_name="First",
+                artist_name="Artist",
+                listen_count=500,
+                release_group_mbid="RG-SHARED",
+                artist_mbids=["a-1"],
+            ),
+            ListenBrainzReleaseGroup(
+                release_group_name="Duplicate",
+                artist_name="Artist",
+                listen_count=400,
+                release_group_mbid="rg-shared",
+                artist_mbids=["a-1"],
+            ),
+            ListenBrainzReleaseGroup(
+                release_group_name="Distinct",
+                artist_name="Artist",
+                listen_count=300,
+                release_group_mbid="RG-DISTINCT",
+                artist_mbids=["a-2"],
+            ),
+            ListenBrainzReleaseGroup(
+                release_group_name="Ignored",
+                artist_name="Artist",
+                listen_count=200,
+                release_group_mbid="RG-IGNORED",
+                artist_mbids=["a-3"],
+            ),
+        ]
+        mb_repo = AsyncMock()
+        mbid_svc = _make_mbid_svc()
+
+        with patch(
+            "services.discover.queue_strategies.random.shuffle",
+            side_effect=lambda values: None,
+        ):
+            result = await get_trending_filler(
+                2,
+                {"rg-ignored"},
+                set(),
+                None,
+                "listenbrainz",
+                lb_repo=lb_repo,
+                mb_repo=mb_repo,
+                mbid_svc=mbid_svc,
+            )
+
+        assert [item.release_group_mbid for item in result] == [
+            "RG-SHARED",
+            "RG-DISTINCT",
+        ]
+        assert result[0].album_name == "First"
+
+    @pytest.mark.asyncio
     async def test_returns_empty_when_count_zero(self) -> None:
         lb_repo = AsyncMock()
         mb_repo = AsyncMock()
         mbid_svc = _make_mbid_svc()
 
         result = await get_trending_filler(
-            0, set(), set(), None, "listenbrainz",
-            lb_repo=lb_repo, mb_repo=mb_repo, mbid_svc=mbid_svc,
+            0,
+            set(),
+            set(),
+            None,
+            "listenbrainz",
+            lb_repo=lb_repo,
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
         )
         assert result == []
 
@@ -461,8 +636,10 @@ class TestGetTrendingFiller:
         lb_repo = AsyncMock()
         lb_repo.get_sitewide_top_release_groups.return_value = [
             ListenBrainzReleaseGroup(
-                release_group_name="VA Album", artist_name="Various",
-                listen_count=100, release_group_mbid="va-rg",
+                release_group_name="VA Album",
+                artist_name="Various",
+                listen_count=100,
+                release_group_mbid="va-rg",
                 artist_mbids=[VARIOUS_ARTISTS_MBID],
             ),
         ]
@@ -470,8 +647,14 @@ class TestGetTrendingFiller:
         mbid_svc = _make_mbid_svc()
 
         result = await get_trending_filler(
-            5, set(), set(), None, "listenbrainz",
-            lb_repo=lb_repo, mb_repo=mb_repo, mbid_svc=mbid_svc,
+            5,
+            set(),
+            set(),
+            None,
+            "listenbrainz",
+            lb_repo=lb_repo,
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
         )
         assert all(it.release_group_mbid != "va-rg" for it in result)
 
@@ -493,14 +676,23 @@ class TestGetTrendingFiller:
         lfm_repo.get_artist_top_albums.return_value = [album]
 
         mbid_svc = _make_mbid_svc()
-        mbid_svc.lastfm_albums_to_queue_items = AsyncMock(return_value=[
-            _item("lfm-rg-1", "pop-artist-1"),
-        ])
+        mbid_svc.lastfm_albums_to_queue_items = AsyncMock(
+            return_value=[
+                _item("lfm-rg-1", "pop-artist-1"),
+            ]
+        )
 
         result = await get_trending_filler(
-            5, set(), set(), None, "lastfm",
-            lb_repo=lb_repo, mb_repo=mb_repo, mbid_svc=mbid_svc,
-            lfm_repo=lfm_repo, is_lastfm_enabled=True,
+            5,
+            set(),
+            set(),
+            None,
+            "lastfm",
+            lb_repo=lb_repo,
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
+            lfm_repo=lfm_repo,
+            is_lastfm_enabled=True,
         )
         assert len(result) >= 1
         assert result[0].release_group_mbid == "lfm-rg-1"
@@ -529,9 +721,16 @@ class TestGetTrendingFiller:
         mb_repo.search_release_groups_by_tag.return_value = [decade_release]
 
         result = await get_trending_filler(
-            3, set(), set(), None, "lastfm",
-            lb_repo=lb_repo, mb_repo=mb_repo, mbid_svc=mbid_svc,
-            lfm_repo=lfm_repo, is_lastfm_enabled=True,
+            3,
+            set(),
+            set(),
+            None,
+            "lastfm",
+            lb_repo=lb_repo,
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
+            lfm_repo=lfm_repo,
+            is_lastfm_enabled=True,
         )
         assert len(result) >= 1
         assert result[0].release_group_mbid == "decade-rg-1"
@@ -549,9 +748,16 @@ class TestGetTrendingFiller:
         mbid_svc = _make_mbid_svc()
 
         result = await get_trending_filler(
-            3, set(), set(), None, "lastfm",
-            lb_repo=lb_repo, mb_repo=mb_repo, mbid_svc=mbid_svc,
-            lfm_repo=None, is_lastfm_enabled=False,
+            3,
+            set(),
+            set(),
+            None,
+            "lastfm",
+            lb_repo=lb_repo,
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
+            lfm_repo=None,
+            is_lastfm_enabled=False,
         )
         assert result == []
 
@@ -570,9 +776,16 @@ class TestGetTrendingFiller:
         mb_repo.search_release_groups_by_tag.return_value = [decade_release]
 
         result = await get_trending_filler(
-            3, set(), set(), None, "listenbrainz",
-            lb_repo=lb_repo, mb_repo=mb_repo, mbid_svc=mbid_svc,
-            lfm_repo=None, is_lastfm_enabled=False,
+            3,
+            set(),
+            set(),
+            None,
+            "listenbrainz",
+            lb_repo=lb_repo,
+            mb_repo=mb_repo,
+            mbid_svc=mbid_svc,
+            lfm_repo=None,
+            is_lastfm_enabled=False,
         )
         assert len(result) >= 1
         assert result[0].release_group_mbid == "decade-rg-9"

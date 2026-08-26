@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { apiMock, statusMock, cacheMock, cacheTtls } = vi.hoisted(() => {
+const { apiMock, statusMock, cacheMock, cacheTtls, authMock } = vi.hoisted(() => {
 	type StatusState = { status: string; error?: string };
 	type Listener = (s: StatusState) => void;
 	const listeners: Listener[] = [];
@@ -39,7 +39,8 @@ const { apiMock, statusMock, cacheMock, cacheTtls } = vi.hoisted(() => {
 			setQueueCachedData: vi.fn(),
 			removeQueueCachedData: vi.fn()
 		},
-		cacheTtls: { discoverQueueAutoGenerate: true, discoverQueuePollingInterval: 1000 }
+		cacheTtls: { discoverQueueAutoGenerate: true, discoverQueuePollingInterval: 1000 },
+		authMock: { user: { id: 'user-1' } }
 	};
 });
 
@@ -48,7 +49,7 @@ vi.mock('$lib/stores/discoverQueueStatus', () => ({ discoverQueueStatusStore: st
 vi.mock('$lib/utils/discoverQueueCache', () => cacheMock);
 vi.mock('$lib/stores/cacheTtl.svelte', () => ({ getCacheTTLs: () => cacheTtls }));
 vi.mock('$lib/stores/authStore.svelte', () => ({
-	authStore: { user: { id: 'user-1' } }
+	authStore: authMock
 }));
 vi.mock('$lib/queries/QueryClient', () => ({
 	invalidateQueriesWithPersister: vi.fn().mockResolvedValue(undefined)
@@ -84,9 +85,22 @@ function makeItem(mbid: string) {
 describe('discoverQueueDeck state machine', () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		authMock.user.id = 'user-1';
 		statusMock.listeners.length = 0;
 		cacheMock.getQueueCachedData.mockReturnValue(null);
 		discoverQueueDeck.destroy();
+	});
+
+	it('dedupes duplicate and missing release group IDs from a fetched queue', async () => {
+		statusMock.fetchStatus.mockResolvedValue({ status: 'ready' });
+		apiMock.global.get.mockResolvedValue({
+			items: [makeItem('rg-1'), makeItem(''), makeItem('rg-1'), makeItem('rg-2')],
+			queue_id: 'q-fetched'
+		});
+
+		await discoverQueueDeck.init();
+
+		expect(discoverQueueDeck.queue.map((i) => i.release_group_mbid)).toEqual(['rg-1', 'rg-2']);
 	});
 
 	it('resumes instantly from a cached queue and validates it', async () => {
@@ -108,6 +122,33 @@ describe('discoverQueueDeck state machine', () => {
 			expect.anything()
 		);
 	});
+	it.each([
+		['negative', -1, 0],
+		['oversized', 99, 1]
+	] as const)(
+		'dedupes cached items and clamps a %s index after dedupe',
+		async (_label, currentIndex, expectedIndex) => {
+			cacheMock.getQueueCachedData.mockReturnValue({
+				data: {
+					items: [makeItem('rg-1'), makeItem(''), makeItem('rg-1'), makeItem('rg-2')],
+					currentIndex,
+					queueId: 'q-cached'
+				},
+				timestamp: Date.now()
+			});
+			apiMock.global.post.mockResolvedValue({ in_library: [] });
+
+			await discoverQueueDeck.init();
+
+			expect(discoverQueueDeck.queue.map((i) => i.release_group_mbid)).toEqual(['rg-1', 'rg-2']);
+			expect(discoverQueueDeck.currentIndex).toBe(expectedIndex);
+			expect(apiMock.global.post).toHaveBeenCalledWith(
+				expect.stringContaining('validate'),
+				{ release_group_mbids: ['rg-1', 'rg-2'] },
+				expect.anything()
+			);
+		}
+	);
 
 	it('validation drops items that entered the library', async () => {
 		cacheMock.getQueueCachedData.mockReturnValue({
@@ -119,6 +160,38 @@ describe('discoverQueueDeck state machine', () => {
 		await discoverQueueDeck.init();
 
 		expect(discoverQueueDeck.queue.map((i) => i.release_group_mbid)).toEqual(['rg-2']);
+		expect(cacheMock.setQueueCachedData).toHaveBeenCalledWith(
+			expect.objectContaining({ queueId: 'q1' }),
+			'user-1'
+		);
+	});
+	it('restores the cached queue ID instead of persisting a prior account identifier', async () => {
+		statusMock.fetchStatus.mockResolvedValue({ status: 'ready' });
+		apiMock.global.get.mockResolvedValue({
+			items: [makeItem('rg-prior')],
+			queue_id: 'q-user-1'
+		});
+
+		await discoverQueueDeck.init();
+
+		authMock.user.id = 'user-2';
+		cacheMock.getQueueCachedData.mockReturnValue({
+			data: { items: [makeItem('rg-1'), makeItem('rg-2')], currentIndex: 0, queueId: 'q-user-2' },
+			timestamp: Date.now()
+		});
+		apiMock.global.post.mockResolvedValue({ in_library: ['rg-1'] });
+
+		await discoverQueueDeck.init();
+
+		expect(cacheMock.setQueueCachedData).toHaveBeenNthCalledWith(
+			1,
+			expect.objectContaining({ queueId: 'q-user-1' }),
+			'user-1'
+		);
+		expect(cacheMock.setQueueCachedData).toHaveBeenLastCalledWith(
+			expect.objectContaining({ queueId: 'q-user-2' }),
+			'user-2'
+		);
 	});
 
 	it('removeByMbid reconciles a queue that has not been loaded yet', () => {
