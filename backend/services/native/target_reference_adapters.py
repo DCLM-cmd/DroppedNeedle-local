@@ -100,6 +100,28 @@ class TargetGenreIndex:
         )
 
 
+def _summary_record(row: dict[str, Any]) -> PlaylistSummaryRecord:
+    """F-TARGETCATALOG-07: shared row conversion so the full-list and the
+    ID-filtered summary paths produce identical records."""
+    return PlaylistSummaryRecord(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        cover_image_path=row.get("cover_image_path"),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        track_count=int(row["track_count"]),
+        total_duration=int(row["total_duration"]),
+        cover_urls=(
+            [value for value in str(row["cover_urls"]).split(",") if value]
+            if row.get("cover_urls")
+            else []
+        ),
+        source_ref=row.get("source_ref"),
+        user_id=row.get("user_id"),
+        is_public=bool(row.get("is_public")),
+    )
+
+
 def _playlist_record(row: dict[str, Any]) -> PlaylistRecord:
     return PlaylistRecord(
         id=str(row["id"]),
@@ -194,30 +216,13 @@ class TargetPlaylistRepository:
         self, user_id: str | None = None
     ) -> list[PlaylistSummaryRecord]:
         rows = await self._store.list_target_playlists(user_id)
-        return [
-            PlaylistSummaryRecord(
-                id=str(row["id"]),
-                name=str(row["name"]),
-                cover_image_path=row.get("cover_image_path"),
-                created_at=str(row["created_at"]),
-                updated_at=str(row["updated_at"]),
-                track_count=int(row["track_count"]),
-                total_duration=int(row["total_duration"]),
-                cover_urls=(
-                    [value for value in str(row["cover_urls"]).split(",") if value]
-                    if row.get("cover_urls")
-                    else []
-                ),
-                source_ref=row.get("source_ref"),
-                user_id=row.get("user_id"),
-                is_public=bool(row.get("is_public")),
-            )
-            for row in rows
-        ]
+        return [_summary_record(row) for row in rows]
 
     async def get_summary(self, playlist_id: str) -> PlaylistSummaryRecord | None:
-        rows = await self.get_all_playlists()
-        return next((row for row in rows if row.id == playlist_id), None)
+        # F-TARGETCATALOG-07: one ID-filtered aggregate instead of loading
+        # and filtering the full playlist list.
+        row = await self._store.get_target_playlist_summary(playlist_id)
+        return _summary_record(row) if row is not None else None
 
     async def set_public(
         self, playlist_id: str, is_public: bool

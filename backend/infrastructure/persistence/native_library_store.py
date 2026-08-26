@@ -4448,8 +4448,26 @@ class NativeLibraryStore(PersistenceBase):
     async def get_target_playlist_summary(
         self, playlist_id: str
     ) -> dict[str, Any] | None:
-        rows = await self.list_target_playlists()
-        return next((row for row in rows if row["id"] == playlist_id), None)
+        """F-TARGETCATALOG-07: ID-filtered single-playlist aggregate.
+
+        Same select shape and LEFT JOIN semantics as
+        ``list_target_playlists`` restricted to one ``p.id``; no user filter,
+        because callers (``PlaylistService.set_public``) have already enforced
+        owner access before this internal post-mutation read."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            row = connection.execute(
+                "SELECT p.*, COUNT(pt.id) AS track_count, "
+                "COALESCE(SUM(pt.duration), 0) AS total_duration, "
+                "GROUP_CONCAT(NULLIF(pt.cover_url, '')) AS cover_urls "
+                "FROM library_playlists p LEFT JOIN library_playlist_tracks pt "
+                "ON pt.playlist_id = p.id "
+                "WHERE p.id = ? GROUP BY p.id",
+                (playlist_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+        return await self._read(operation)
 
     async def update_target_playlist(
         self,
