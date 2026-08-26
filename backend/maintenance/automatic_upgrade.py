@@ -587,7 +587,11 @@ async def _perform_target_migration() -> dict[str, Any]:
     preferences = get_preferences_service()
     typed_settings = preferences.get_typed_library_settings()
     store = get_native_library_store()
-    reconciliation = await LegacyPathReconciler(store, typed_settings).reconcile()
+    reconciler = LegacyPathReconciler(store, typed_settings)
+    try:
+        reconciliation = await reconciler.reconcile()
+    finally:
+        await reconciler.aclose()
     if reconciliation.mode == "exact":
         preferences.retarget_library_roots_for_upgrade(
             dict(reconciliation.root_retargets)

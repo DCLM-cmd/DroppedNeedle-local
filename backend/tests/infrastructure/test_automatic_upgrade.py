@@ -14,8 +14,10 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 import maintenance.automatic_upgrade as automatic_upgrade
+
 from core.config import Settings
 from maintenance.automatic_upgrade import (
     AutomaticUpgradeError,
@@ -1774,3 +1776,124 @@ def test_write_state_falls_back_when_rename_unavailable(
     automatic_upgrade._write_state(path, payload)
 
     assert automatic_upgrade._read_state(path) == payload
+@pytest.mark.asyncio
+async def test_perform_target_migration_carries_probe_timeout_evidence_and_always_closes_reconciler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Use a historical root that will be probed and will timeout
+    historical_root = tmp_path / "Historical" / "Music"
+    historical_root.mkdir(parents=True)
+    (historical_root / "track.flac").write_bytes(b"a" * 100)
+    database = tmp_path / "cache" / "library.db"
+    database.parent.mkdir(parents=True)
+    from tests.infrastructure.test_legacy_catalog_importer import _create_source
+
+    _create_source(database, historical_root)
+    # Mock Path.stat to block for Historical for longer than probe timeout (5s)
+    blocked = threading.Event()
+    orig_stat = Path.stat
+
+    def blocking_stat(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if "Historical" in str(self):
+            blocked.wait(timeout=10.0)
+        return orig_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", blocking_stat)
+    # Mock other expensive phases, but not the reconciler's reconcile (the behavior under assertion)
+    monkeypatch.setattr(automatic_upgrade, "migrate_legacy_config", lambda: None)
+    from core.config import Settings
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
+    from api.v1.schemas.library_policies import LibraryRootSettings, TypedLibrarySettings
+    from services.native.library_policy_resolver import LibraryPolicyResolver
+
+    settings = Settings(
+        root_app_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        library_db_path=database,
+        config_file_path=tmp_path / "config" / "config.json",
+    )
+    settings.config_file_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.config_file_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(automatic_upgrade, "get_settings", lambda: settings)
+    # Mock preferences to return a settings with Missing root (so Historical is outside)
+    from unittest.mock import MagicMock
+
+    mock_preferences = MagicMock()
+    mock_preferences.get_typed_library_settings.return_value = TypedLibrarySettings(
+        library_roots=[LibraryRootSettings(id="root", path=str(tmp_path / "Missing" / "Music"), label="Library", policy="automatic")],
+        staging_path=str(tmp_path / "Staging"),
+    )
+    mock_preferences.retarget_library_roots_for_upgrade = MagicMock()
+    monkeypatch.setattr("core.dependencies.cache_providers.get_preferences_service", lambda: mock_preferences)
+    test_store = NativeLibraryStore(database, threading.Lock())
+    monkeypatch.setattr("core.dependencies.cache_providers.get_native_library_store", lambda: test_store)
+    # Track reconciler aclose
+    from services.native.legacy_path_reconciler import LegacyPathReconciler
+
+    original_aclose = LegacyPathReconciler.aclose
+    aclose_called = []
+
+    async def tracked_aclose(self):  # type: ignore[no-untyped-def]
+        aclose_called.append(True)
+        await original_aclose(self)
+
+    monkeypatch.setattr(LegacyPathReconciler, "aclose", tracked_aclose)
+    # Mock migrator to capture projector and skip flag, and return lenient success
+    captured = {}
+
+    class FakeMigrator:
+        def __init__(self, store, resolver, emit_progress=None, path_projector=None, skip_unmappable_paths=False, **kwargs):  # type: ignore[no-untyped-def]
+            captured["path_projector"] = path_projector
+            captured["skip_unmappable"] = skip_unmappable_paths
+            self.store = store
+            self.resolver = resolver
+
+        async def migrate(self, migration_id, now=None):  # type: ignore[no-untyped-def]
+            from services.native.bounded_legacy_catalog_migrator import BoundedMigrationOutcome
+            from models.library_migration import MigrationDryRunReport
+
+            report = MigrationDryRunReport(
+                migration_id=migration_id,
+                source_revision="src",
+                root_revision="root",
+                state="applied",
+                identified_albums=0,
+                local_only_albums=0,
+                identified_tracks=0,
+                local_only_tracks=0,
+                artists=0,
+                reference_counts=[],
+                invariants={},
+                network_calls=0,
+                tag_reads=0,
+                fingerprints=0,
+                embedded_art_reads=0,
+            )
+            return BoundedMigrationOutcome(report=report, skipped_counts={"library_file": 2, "review_row": 4})
+
+    monkeypatch.setattr("services.native.bounded_legacy_catalog_migrator.BoundedLegacyCatalogMigrator", FakeMigrator)
+
+    # Mock validator to avoid needing full DB
+    from services.native.target_startup_validator import TargetStartupValidator
+
+    monkeypatch.setattr(TargetStartupValidator, "validate", AsyncMock(return_value={"invariants": {}}))
+    # Mock get_library_policy_resolver to avoid cache
+    monkeypatch.setattr("core.dependencies.service_providers.get_library_policy_resolver", lambda: LibraryPolicyResolver(mock_preferences.get_typed_library_settings.return_value))
+    monkeypatch.setattr("maintenance.automatic_upgrade.get_library_policy_resolver", lambda: LibraryPolicyResolver(mock_preferences.get_typed_library_settings.return_value))
+    try:
+        evidence = await automatic_upgrade._perform_target_migration()
+        assert aclose_called, "reconciler.aclose should be awaited even on timeout"
+        assert captured["path_projector"] is None
+        assert captured["skip_unmappable"] is True
+        assert "path_reconciliation" in evidence
+        assert evidence["path_reconciliation"]["failure_reason"] == "legacy_path_probe_timeout"
+        assert evidence["path_reconciliation"]["mode"] == "blocked"
+        # Sanitized: no raw historical path in evidence
+        import json
+
+        assert str(historical_root) not in json.dumps(evidence["path_reconciliation"])
+        assert evidence.get("skipped", {}).get("library_file", 0) >= 2
+    finally:
+        blocked.set()
+
+
