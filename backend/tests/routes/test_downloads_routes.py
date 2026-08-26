@@ -477,9 +477,6 @@ def test_get_files_returns_file_list():
     assert body["files"][0]["size"] == 123
 
 
-# -- held-track audio preview --
-
-
 def _held(held_path: str):
     from models.held_import import HeldImport
 
@@ -589,7 +586,7 @@ def test_held_audio_not_owned_is_404():
     assert resp.status_code == 404
 
 
-# --- Quality upgrades (CollectionManagement Feature B, admin/trusted D18) ------
+# collection-management feature B quality-upgrade routes: admin/trusted curator gate (D18)
 
 
 def _curator_app(service, *, role: str = "admin") -> FastAPI:

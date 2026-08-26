@@ -319,7 +319,6 @@ async def test_supervisor_disabled_startup_recovers_stopping_without_scheduler(
         LibraryReconciler(store),
         lambda: enabled_resolver,
     )
-    # Create a run and make it stopping
     from models.library_work import ScanRequest, ScanScope
 
     request = ScanRequest(
@@ -334,10 +333,9 @@ async def test_supervisor_disabled_startup_recovers_stopping_without_scheduler(
     await coordinator.control(run.id, "stop", run.row_revision)
     persisted, _, _ = await store.get_scan_run(run.id)
     assert persisted.state == "stopping"
-    # Now run supervisor with disabled resolver — should do narrow recovery and not scheduler/run_once
+    # disabled resolver at startup: narrow recovery runs, no scheduler/run_once
     scheduler = AsyncMock()
     wakeups = SimpleNamespace(revision=lambda _k: 0, wait=AsyncMock(side_effect=asyncio.CancelledError()))
-    # Use the same coordinator but with disabled resolver
     await supervise_target_scans(
         lambda: coordinator,
         lambda: {"root-a": root},
@@ -346,7 +344,6 @@ async def test_supervisor_disabled_startup_recovers_stopping_without_scheduler(
         lambda: disabled_resolver,
         lambda: {"frequency": "manual", "daily_time": "03:00", "timezone_name": "UTC"},
     )
-    # After disabled startup, stopping should be cancelled
     terminal, _, _ = await store.get_scan_run(run.id)
     assert terminal.state == "cancelled"
     assert terminal.requested_control == "none"
@@ -1887,7 +1884,7 @@ async def test_concurrent_probe_submissions_atomic_never_exceeds_cap(
     resolver = SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1")
     checkpoint = AsyncMock(return_value=True)
 
-    # Two concurrent discovers while first probe is wedged — second must see capacity and fail fast without exceeding cap
+    # Two concurrent discovers while first probe is wedged - second must see capacity and fail fast without exceeding cap
     task1 = asyncio.create_task(scanner.discover(_scan_run("run-1"), [scope], {scope.root_id: root}, resolver, checkpoint))
     await asyncio.sleep(0.02)
     assert scanner.probe_pending_count == 1
@@ -1946,7 +1943,7 @@ async def test_no_deadlock_when_blocked_future_completes_during_capacity_failure
     # Second probe at capacity will enter failure path and await slow_record (0.2s). During that await, release first probe.
     task2 = asyncio.create_task(scanner.discover(_scan_run("run-2"), [scope], {scope.root_id: root}, resolver, checkpoint))
     await asyncio.sleep(0.05)
-    # Release first probe while second is in its await — if lock were held across await, this would deadlock
+    # Release first probe while second is in its await - if lock were held across await, this would deadlock
     wedged.set()
     # Both should complete within 1s without deadlock
     await asyncio.wait_for(asyncio.gather(task1, task2), timeout=1.0)
@@ -2000,7 +1997,7 @@ async def test_close_with_permanently_blocked_probe_does_not_hang(
 ) -> None:
     root = tmp_path / "music"
     root.mkdir()
-    # Never set this event — probe blocks forever
+    # Never set this event - probe blocks forever
     blocked = threading.Event()
 
     def probe(_path: Path) -> bool:
@@ -2032,8 +2029,7 @@ async def test_close_with_permanently_blocked_probe_does_not_hang(
     store2.get_scan_scope_discovery_state.return_value = "pending"
     result2 = await scanner.discover(_scan_run("run-2"), [scope], {scope.root_id: root}, SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1"), AsyncMock(return_value=True))
     assert store2.transition_scan_run.await_args is None or store2.transition_scan_run.await_args.kwargs.get("terminal_code") == "WALK_TIMEOUT"
-    # Thread is daemon, should not prevent exit — we can check daemon flag of any remaining probe thread
-    # The blocked thread is still alive but daemon, so we just ensure close didn't hang
+    # blocked probe thread stays alive as a daemon; aclose must not hang on it
     await scanner.aclose()
 @pytest.mark.asyncio
 async def test_probe_loop_closed_does_not_set_future_from_worker_thread(

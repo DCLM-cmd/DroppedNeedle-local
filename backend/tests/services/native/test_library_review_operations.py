@@ -7836,7 +7836,7 @@ async def test_invalid_or_empty_dates_sort_last_and_provider_absent_uses_evidenc
     assert finding2.reason_code == "EXACT_EDITION_SUGGESTED"
 
 
-# --- F-055: degradation-flag outages defer like raised ones -------------------
+# F-055: degradation-flag outages defer like raised ones
 
 
 class _DegradedEmptyProvider(_IdentificationProvider):
@@ -7993,7 +7993,7 @@ async def test_deterministic_empty_payload_stays_terminal_first_pass(
     assert row["reidentification_attempt_count"] == 0
 
 
-# --- D-EDITION-AUTO: automatic exact-edition acceptance (S-1/S-2/S-3). ---
+# D-EDITION-AUTO: automatic exact-edition acceptance (S-1/S-2/S-3).
 
 
 def _auto_preparation(

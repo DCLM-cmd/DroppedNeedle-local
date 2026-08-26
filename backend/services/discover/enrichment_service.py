@@ -311,7 +311,6 @@ class QueueEnrichmentService:
 
         return enrichment
 
-    # ------------------------------------------------------------------
     # A2 part 3: LB popularity batch coalescer.
     #
     # Collapses concurrent 1-item popularity calls within one build into a
@@ -319,7 +318,6 @@ class QueueEnrichmentService:
     # whichever fires first). Caching/dedup lives downstream in the repo
     # method (B4 landed lb_rg_popularity keys + _metadata_deduplicator) -
     # this layer only batches, never caches.
-    # ------------------------------------------------------------------
 
     _POPULARITY_WINDOW_SECONDS = 0.5
     _POPULARITY_MAX_BATCH = 50

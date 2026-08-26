@@ -48,9 +48,6 @@ def _valid_record(tmp_path: Path) -> Path:
     return path
 
 
-# --- comparative outcomes are exhaustive and honest ---------------------------
-
-
 def test_comparative_outcomes_are_exhaustive_and_mutually_exclusive():
     directions = ("lower_better", "higher_better")
     for direction in directions:
@@ -98,9 +95,6 @@ def test_tolerance_enables_equality_for_continuous_metrics():
     assert outcome == "equality"
 
 
-# --- calibration fail-closed semantics -----------------------------------------
-
-
 def test_missing_calibration_file_fails_closed(tmp_path: Path):
     with pytest.raises(CalibrationError, match="missing"):
         load_calibration(tmp_path / "absent.json")
@@ -145,9 +139,6 @@ def test_fixture_manifest_mismatch_fails_closed(tmp_path: Path):
     (fixture_root / "sub" / "b.flac").write_bytes(b"changed")
     with pytest.raises(CalibrationError, match="manifest hash mismatch"):
         load_calibration(record_path, fixture_root=fixture_root)
-
-
-# --- runner end-to-end ----------------------------------------------------------
 
 
 def _run_runner(tmp_path: Path, calibration_path: Path | None, monkeypatch) -> tuple[int, dict]:

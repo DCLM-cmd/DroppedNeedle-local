@@ -10,9 +10,6 @@ KEY_A = ("release-a",)
 KEY_B = ("release-b",)
 
 
-# --- edition_date_key --------------------------------------------------------
-
-
 def test_edition_date_key_missing_and_garbage_share_latest_key():
     invalid = edition_date_key(None)
     assert invalid == edition_date_key("")
@@ -39,9 +36,6 @@ def test_edition_date_key_returns_three_ints_and_strips_whitespace():
     key = edition_date_key(" 2024-06-15 ")
     assert len(key) == 3
     assert all(isinstance(part, int) for part in key)
-
-
-# --- recall_key --------------------------------------------------------------
 
 
 def test_recall_key_returns_none_without_usable_id_or_track_count():
@@ -96,9 +90,6 @@ def test_recall_key_year_only_loses_to_dated_sibling_of_same_year():
     )
     assert year_only is not None and dated is not None
     assert dated < year_only
-
-
-# --- auto_accept_decision ----------------------------------------------------
 
 
 def test_auto_accept_empty_list_reviews():

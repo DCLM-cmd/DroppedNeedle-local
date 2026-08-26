@@ -62,8 +62,8 @@ async def upload_drop(
     files: list[UploadFile] = File(...),
     service=Depends(get_drop_import_service),
 ):
-    """Accept zips and/or audio files as one import job. Files are validated by
-    extension up front so nothing is staged for a drop that would be rejected."""
+    """Extensions are validated before staging so nothing lands on disk
+    for a drop that would be rejected."""
     if not files:
         raise ValidationError("No files were uploaded")
     if len(files) > _MAX_FILES_PER_DROP:

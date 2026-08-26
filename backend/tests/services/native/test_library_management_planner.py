@@ -2481,7 +2481,7 @@ async def test_preview_keeps_braced_album_directory_in_artwork_fallback(
     album_title: str,
 ) -> None:
     """F-075/F-083: without an external naming script the composed fallback
-    path is normalized literally — brace-bearing album directories are neither
+    path is normalized literally - brace-bearing album directories are neither
     re-rendered as templates nor blocked with SCRIPT_VALIDATION_FAILED."""
     (
         root,

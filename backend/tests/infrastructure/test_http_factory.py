@@ -38,9 +38,6 @@ def _settings(user_agent: str = "dropneedle/test") -> SimpleNamespace:
     )
 
 
-# --- order independence --------------------------------------------------------
-
-
 @pytest.mark.parametrize("first_timeout,second_timeout", [(5.0, 30.0), (30.0, 5.0)])
 def test_same_name_different_timeouts_never_share(first_timeout: float, second_timeout: float):
     constructed: list[dict] = []
@@ -112,9 +109,6 @@ def test_user_agent_identity_is_part_of_the_key():
     assert second.headers["User-Agent"] == "agent/two"
 
 
-# --- logical-name isolation ----------------------------------------------------
-
-
 def test_named_clients_keep_distinct_policies():
     settings = _settings()
     default_client = get_http_client(settings)
@@ -161,9 +155,6 @@ def test_concurrent_first_access_builds_once():
 
     assert constructions["n"] == 1
     assert len({id(client) for client in clients}) == 1
-
-
-# --- retirement lifecycle -------------------------------------------------------
 
 
 def test_retire_name_moves_generations_without_closing_from_lookup():

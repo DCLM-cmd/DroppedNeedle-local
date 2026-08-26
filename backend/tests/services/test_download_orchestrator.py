@@ -417,9 +417,7 @@ async def _new_task(store, **overrides):
     return await store.create_task(**kwargs)
 
 
-# ---------------------------------------------------------------------------
 # Happy path + park/no-match/config
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -575,9 +573,7 @@ async def test_disabled_slskd_is_not_routed_even_when_configured(tmp_path: Path)
     client.enqueue.assert_not_awaited()
 
 
-# ---------------------------------------------------------------------------
 # Partial + quarantine + harvest
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -751,9 +747,7 @@ async def test_enqueue_failure_fails_without_quarantine(tmp_path: Path):
     )  # nothing downloaded -> nothing quarantined
 
 
-# ---------------------------------------------------------------------------
 # Stall watchdog + safe harvest (Phase 1)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -943,9 +937,7 @@ async def test_stall_harvests_succeeded_subset_without_quarantining_missing(
     assert await store.load_quarantine_set() == set()  # missing track NOT quarantined
 
 
-# ---------------------------------------------------------------------------
 # Auto-failover (Phase 2 + 5a)
-# ---------------------------------------------------------------------------
 
 
 class _FailoverClient:
@@ -1822,9 +1814,7 @@ async def test_incomplete_album_repulls_whole_album_from_next_source(tmp_path: P
     assert final.source_username == "full"
 
 
-# ---------------------------------------------------------------------------
 # Cancel / retry / resume / dispatch
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -2165,9 +2155,7 @@ async def test_startup_resume_tracks_handle_so_cancel_can_reach_it(tmp_path: Pat
     orch._active_tasks[task.id].cancel()
 
 
-# ---------------------------------------------------------------------------
 # Request/library state bridge (Phase 3)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -2274,9 +2262,7 @@ async def test_reap_stale_tasks_skips_live_and_fresh(tmp_path: Path):
     ).status == "downloading"  # recently polled -> left alone
 
 
-# ---------------------------------------------------------------------------
 # Auto-retry (retry_failed_tasks)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -2647,7 +2633,7 @@ async def test_create_retry_task_skips_relink_when_request_owned_by_other_task(
     assert record.download_task_id == "newer-task"
 
 
-# -- settle_after_manual_import: an "import anyway" that completes an album must stop the retry --
+# settle_after_manual_import: an "import anyway" that completes an album must stop the retry
 
 
 @pytest.mark.asyncio
@@ -2864,7 +2850,7 @@ async def test_reimport_rejects_attempt_leased_by_cleanup_worker(tmp_path: Path)
     fp.process_downloaded.assert_not_awaited()
 
 
-# -- P4: coverage-based completeness (2026-07-05 incident, last line of defense) --
+# P4: coverage-based completeness (2026-07-05 incident, last line of defense)
 
 
 def _album_service_with(tracks):
@@ -3102,12 +3088,10 @@ async def test_coverage_mb_failure_fails_open_to_count_check(tmp_path: Path):
     assert (await store.get_task(task.id)).status == "completed"
 
 
-# ---------------------------------------------------------------------------
 # Phase 2: re-gate an AUTOMATIC re-dispatch against the CURRENT quality policy.
 # A policy tightened after a candidate was scored must not be defeated by a
 # failover / track-repull / reimport of a now out-of-range stored candidate.
 # Explicit user picks (pick_candidate) are intentionally NOT gated (owner D2).
-# ---------------------------------------------------------------------------
 
 
 def _mp3_candidate(

@@ -100,7 +100,7 @@
 
 <div class="card bg-base-200">
 	<div class="card-body">
-		<h2 class="card-title text-2xl mb-4">Cache Management</h2>
+		<h2 class="card-title text-2xl mb-4">Cache management</h2>
 		<p class="text-base-content/70 mb-6">
 			View cache usage and clear stored data. Frequently used items stay in memory, and the rest
 			stay on disk.
@@ -117,13 +117,13 @@
 		{:else if cacheStats}
 			<div class="stats stats-vertical lg:stats-horizontal shadow mb-6">
 				<div class="stat">
-					<div class="stat-title">Memory Cache</div>
+					<div class="stat-title">Memory cache</div>
 					<div class="stat-value text-primary">{cacheStats.memory_entries}</div>
 					<div class="stat-desc">{cacheStats.memory_size_mb} MB (hot items)</div>
 				</div>
 
 				<div class="stat">
-					<div class="stat-title">Disk Metadata</div>
+					<div class="stat-title">Disk metadata</div>
 					<div class="stat-value text-secondary">{cacheStats.disk_metadata_count}</div>
 					<div class="stat-desc">
 						{cacheStats.disk_metadata_albums} albums, {cacheStats.disk_metadata_artists} artists
@@ -131,7 +131,7 @@
 				</div>
 
 				<div class="stat">
-					<div class="stat-title">Cover Images</div>
+					<div class="stat-title">Cover images</div>
 					<div class="stat-value text-accent">{cacheStats.disk_cover_count}</div>
 					<div class="stat-desc">{cacheStats.disk_cover_size_mb} MB</div>
 				</div>
@@ -148,7 +148,7 @@
 				</div>
 
 				<div class="stat">
-					<div class="stat-title">AudioDB Cache</div>
+					<div class="stat-title">AudioDB cache</div>
 					<div class="stat-value text-info">
 						{(cacheStats.disk_audiodb_artist_count ?? 0) +
 							(cacheStats.disk_audiodb_album_count ?? 0)}
@@ -161,35 +161,35 @@
 			</div>
 
 			<div class="space-y-4">
-				<h3 class="text-xl font-semibold">Clear Cache</h3>
+				<h3 class="text-xl font-semibold">Clear cache</h3>
 				<div class="flex flex-wrap gap-2">
 					<button
 						class="btn btn-outline btn-sm"
 						onclick={() => clearCache('memory')}
 						disabled={clearing}
 					>
-						Clear Memory
+						Clear memory
 					</button>
 					<button
 						class="btn btn-outline btn-sm"
 						onclick={() => clearCache('disk')}
 						disabled={clearing}
 					>
-						Metadata Only — Covers Preserved
+						Metadata only - covers preserved
 					</button>
 					<button
 						class="btn btn-outline btn-sm"
 						onclick={() => clearCache('covers')}
 						disabled={clearing}
 					>
-						Clear Covers
+						Clear covers
 					</button>
 					<button
 						class="btn btn-outline btn-sm"
 						onclick={() => clearCache('library')}
 						disabled={clearing}
 					>
-						Clear Library
+						Clear library
 					</button>
 					<button
 						class="btn btn-outline btn-sm"
@@ -206,7 +206,7 @@
 						{#if clearing}
 							<span class="loading loading-spinner loading-sm"></span>
 						{/if}
-						Full Wipe — Also Deletes {cacheStats.disk_cover_count} Cover Files
+						Full wipe - also deletes {cacheStats.disk_cover_count} cover files
 					</button>
 				</div>
 			</div>

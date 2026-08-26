@@ -230,7 +230,7 @@ async def test_soft_delete_album_files_returns_affected_paths(db, tmp_path):
     assert await db.soft_delete_album_files("rg-1") == []
 
 
-# -- P5: single-file removal (the album page's orphan-review action) --
+# P5: single-file removal (the album page's orphan-review action)
 
 
 @pytest.mark.asyncio
@@ -313,7 +313,7 @@ async def test_removal_clears_native_track_cache(db):
     memory_cache.delete.assert_any_await(f"{ALBUM_TRACKS_INFO_PREFIX}release-group-1")
 
 
-# -- F-206: recycle-intended removal fails closed when no bin resolves --
+# F-206: recycle-intended removal fails closed when no bin resolves
 
 
 def _recycle_service(db: LibraryDB, roots: list[Path], bin_path: str = ""):

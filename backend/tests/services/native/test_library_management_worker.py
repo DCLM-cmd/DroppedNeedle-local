@@ -355,7 +355,7 @@ async def test_keep_existing_duplicate_is_durable_without_filesystem_publish() -
     )
 
 
-# -- F-210: concurrent-applier drill on one operation job --
+# F-210: concurrent-applier drill on one operation job
 
 
 @pytest.fixture
@@ -537,7 +537,7 @@ async def test_apply_worker_marks_unknown_failures_as_durable_failures(error):
 
 @pytest.mark.asyncio
 async def test_apply_worker_cancellation_propagates_without_marking() -> None:
-    """F-107: CancelledError stays a BaseException — no durable failed marking,
+    """F-107: CancelledError stays a BaseException - no durable failed marking,
     because durability belongs to the publisher's shielded critical task."""
     worker, store, publisher = _worker()
     store.claim_operation_work.side_effect = [

@@ -141,7 +141,7 @@ def test_best_image_url_none_when_empty():
     assert _best_image_url([]) is None
 
 
-# --- GH-287: playlist-cover persistence (real stores + mock CDN) ---------------
+# GH-287: playlist-cover persistence (real stores + mock CDN)
 
 _SPOTIFY_IMAGES = [{"url": COVER_URL, "width": 640, "height": 640}]
 
@@ -380,7 +380,7 @@ async def test_import_cannot_write_other_users_playlist(tmp_path):
     assert _cover_files(tmp_path) == []
 
 
-# --- fetch-level units ---------------------------------------------------------
+# fetch-level units
 
 
 @pytest.mark.asyncio

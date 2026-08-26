@@ -247,7 +247,7 @@ def _accepted_match(rg: str = "rg-1"):
     )
 
 
-# -- extraction safety --
+# extraction safety
 
 
 def test_safe_extract_refuses_traversal_and_skips_non_audio(tmp_path):
@@ -329,7 +329,7 @@ def test_corrupt_zip_is_noted_not_fatal(tmp_path):
     assert dict(units).keys() == {"good"}
 
 
-# -- the happy path, end to end --
+# the happy path, end to end
 
 
 @pytest.mark.asyncio
@@ -535,7 +535,7 @@ async def test_import_resolves_open_request_and_notifies_requester(tmp_path):
     service._on_import.assert_awaited_once()
 
 
-# -- F-NL-05: request fulfillment gates on complete authoritative coverage --
+# F-NL-05: request fulfillment gates on complete authoritative coverage
 
 
 def _configure_fulfillment_spy(service) -> None:
@@ -769,7 +769,7 @@ async def test_no_canonical_tracklist_never_fulfils_request(tmp_path):
     assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
 
 
-# -- duplicates and upgrades --
+# duplicates and upgrades
 
 
 @pytest.mark.asyncio
@@ -857,7 +857,7 @@ async def test_strictly_better_quality_upgrades_and_recycles(tmp_path):
     assert library.upsert_file.await_count == 2
 
 
-# -- needs_review, manual match, discard --
+# needs_review, manual match, discard
 
 
 @pytest.mark.asyncio
@@ -993,7 +993,7 @@ async def test_discard_removes_staged_files(tmp_path):
     assert not Path(job.staging_dir).exists()
 
 
-# -- single files and loose drops --
+# single files and loose drops
 
 
 @pytest.mark.asyncio
@@ -1028,7 +1028,7 @@ async def test_single_file_identifies_via_fingerprint(tmp_path):
     library.upsert_file.assert_awaited_once()
 
 
-# -- housekeeping --
+# housekeeping
 
 
 @pytest.mark.asyncio
@@ -1068,7 +1068,7 @@ async def test_create_job_requires_library_path(tmp_path):
         )
 
 
-# -- real audio, real tagger --
+# real audio, real tagger
 
 
 @pytest.mark.asyncio

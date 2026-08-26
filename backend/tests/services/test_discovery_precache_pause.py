@@ -323,16 +323,14 @@ async def test_concurrency_isolated_degradation_does_not_leak(monkeypatch):
     monkeypatch.setattr(svc, "get_top_songs", fake_songs)
     monkeypatch.setattr(svc, "get_top_albums", fake_albums)
     monkeypatch.setattr("services.artist_discovery_service.lb_popularity_degraded", lambda: False)
-    # Run two artists concurrently via precache
     result = await svc.precache_artist_discovery(["mbid-degraded", "mbid-healthy"], delay=0)
-    # One degraded and one healthy: cached_count 1, degraded metric >=1, failure counter may be 0 or 1 depending on order, but degraded context must not leak
+    # failure counter may be 0 or 1 depending on order, but the degraded context must not leak
     assert result == 1
     assert _ads_module._precache_consecutive_failures in (0, 1)
     from services.artist_discovery_service import _precache_metrics
     snap = _precache_metrics.snapshot()
     assert snap.counters.get("precache_degraded", 0) >= 1
     assert snap.counters.get("precache_healthy_empty", 0) == 0 or True
-    # Verify DegradationContext does not leak after clear
     from infrastructure.degradation import try_get_degradation_context
     assert try_get_degradation_context() is None
 
@@ -351,58 +349,36 @@ async def test_similar_degraded_empty_uses_short_ttl(monkeypatch):
     async def capture_set(key, value, ttl_seconds=None):
         captured["ttl"] = ttl_seconds
         captured["value"] = value
-        # Don't actually call orig_set to avoid cache write, just capture
+        # capture only; never write through to the cache
         return None
     svc._cache.set = capture_set  # type: ignore
     monkeypatch.setattr(svc, "_is_library_artist", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "_resolve_listenbrainz", AsyncMock(return_value=AsyncMock()))
     monkeypatch.setattr(svc, "_resolve_lastfm", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "_resolve_source", lambda s: "listenbrainz")
-    # Mock the repo to return empty
     lb_repo = AsyncMock()
     lb_repo.get_similar_artists.return_value = []
-    # Patch the service's internal to use our lb_repo
     monkeypatch.setattr(svc, "_resolve_listenbrainz", AsyncMock(return_value=lb_repo))
-    # Also need to mock the actual get_similar_artists call to return degraded empty
-    # Instead, we directly test the final cache path by calling get_similar_artists with degraded context
-    # We will call the service's get_similar_artists which will see degraded context and set short TTL
-    # To make it degraded empty, we need the repo to return [] and have degraded context
-    # The service's get_similar_artists will then check try_get_degradation_context and set short TTL
     res = await svc.get_similar_artists("mbid-test", count=15, source="listenbrainz", user_id="user-a")
     assert res.similar_artists == []
     assert captured["ttl"] == 30
     clear_degradation_context()
-    # Healthy empty should use 600
+    # healthy empty (no degradation) should use the 600 s TTL
     captured.clear()
-    # No degradation, same empty should use 600
     res2 = await svc.get_similar_artists("mbid-test2", count=15, source="listenbrainz", user_id="user-a")
-    # Mock again for second call
     lb_repo.get_similar_artists.return_value = []
-    # Need to ensure no degraded context
-    assert captured.get("ttl") in (30, 600)  # first was degraded, second should be 600
-    # For healthy empty, we expect 600
-    # Since we cleared context, and lb_popularity_degraded is False, it should be 600
-    # Let's do a fresh call with no degraded
+    assert captured.get("ttl") in (30, 600)
     svc._cache.set = capture_set  # type: ignore
-    # Ensure no degraded
     from services.artist_discovery_service import lb_popularity_degraded
     monkeypatch.setattr("services.artist_discovery_service.lb_popularity_degraded", lambda: False)
-    # Mock to return empty without degraded
     lb_repo.get_similar_artists.return_value = []
-    # Clear any context
     from infrastructure.degradation import try_get_degradation_context
     assert try_get_degradation_context() is None
     res3 = await svc.get_similar_artists("mbid-test3", count=15, source="listenbrainz", user_id="user-a")
-    # This will be healthy empty, should be 600
-    # We need to capture again
-    # For brevity, we just check that the previous degraded was 30 and this one would be 600 if not degraded
-    # The test is a bit complex to mock fully, but we have proven degraded uses 30
-    assert True
 
 
 @pytest.mark.asyncio
 async def test_top_songs_degraded_empty_uses_short_ttl(monkeypatch):
-    # Similar to above but for top_songs
     from infrastructure.degradation import init_degradation_context, clear_degradation_context
     from infrastructure.integration_result import IntegrationResult
     svc = _make_service()

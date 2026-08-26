@@ -1,4 +1,4 @@
-"""ST2 P1: MbCanonicalStore unit tests — real SQLite at tmp_path.
+"""ST2 P1: MbCanonicalStore unit tests - real SQLite at tmp_path.
 
 Covers: construct-twice-on-same-path idempotency, release_to_rg batch
 read/write with '' negative, canonical_redirect identity-lane gate,

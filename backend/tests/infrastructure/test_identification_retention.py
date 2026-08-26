@@ -126,9 +126,6 @@ def _scalar(db_path: Path, sql: str) -> object:
         return row[0] if row is not None else None
 
 
-# --- schema idempotency -------------------------------------------------------
-
-
 def test_store_init_twice_creates_terminal_index_once(store: RetentionStore, db_path: Path) -> None:
     _seed_job(db_path, "job-old")
     before = _scalar(db_path, "SELECT COUNT(*) FROM library_identification_jobs")
@@ -152,9 +149,6 @@ def test_store_init_twice_creates_terminal_index_once(store: RetentionStore, db_
     assert _scalar(db_path, "SELECT COUNT(*) FROM library_identification_jobs") == before
 
 
-# --- cutoff boundary ----------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_prune_respects_strict_30_day_cutoff(store: RetentionStore, db_path: Path) -> None:
     at_cutoff = NOW - 30 * DAY          # exactly at the boundary: keep
@@ -167,9 +161,6 @@ async def test_prune_respects_strict_30_day_cutoff(store: RetentionStore, db_pat
     assert removed == 1 and has_more is False
     assert _scalar(db_path, "SELECT COUNT(*) FROM library_identification_jobs WHERE id='job-at-cutoff'") == 1
     assert _scalar(db_path, "SELECT COUNT(*) FROM library_identification_jobs WHERE id='job-older'") == 0
-
-
-# --- preservation matrix ------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -324,9 +315,6 @@ async def test_prune_keeps_evidence_held_by_repair_findings(
     assert _scalar(db_path, "SELECT COUNT(*) FROM library_identification_attempts WHERE id='attempt-findings'") == 1
 
 
-# --- bounded continuation -----------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_prune_batch_limit_continues_in_stable_order(
     store: RetentionStore, db_path: Path
@@ -352,9 +340,6 @@ async def test_prune_batch_limit_continues_in_stable_order(
     removed_3, more_3 = await store.prune_old_terminal_identification_jobs(now=NOW, limit=2)
     assert removed_3 == 1 and more_3 is False
     assert _scalar(db_path, "SELECT COUNT(*) FROM library_identification_jobs") == 0
-
-
-# --- activity snapshot: shapes, plan, post-prune truth ------------------------
 
 
 @pytest.mark.asyncio

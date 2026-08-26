@@ -125,7 +125,7 @@ def test_should_acquire_upgrades_on_only_below_cutoff():
     assert should_acquire("mp3_320", "mp3_320", upgrade_allowed=True) is False
 
 
-# --- F-EDITION-04: MP4-family lossless requires bit-depth evidence ------------
+# F-EDITION-04: MP4-family lossless requires bit-depth evidence
 
 def test_tier_for_alac_m4a_with_depth_is_lossless():
     from repositories.protocols.download_client import DownloadSearchResult

@@ -148,9 +148,9 @@
 
 <div class="min-h-screen bg-base-100">
 	<!-- Desktop is an app-style two-pane layout: the page itself doesn't scroll;
-	     the tab rail and the content pane each scroll independently. This is what
-	     keeps the wheel from being trapped by a hidden sidebar scroller when the
-	     tab list grows taller than the viewport. Mobile keeps natural page flow. -->
+	     the tab rail and the content pane each scroll independently, so the wheel
+	     isn't trapped by a hidden sidebar scroller when the tab list grows taller
+	     than the viewport. Mobile keeps natural page flow. -->
 	<div class="container mx-auto p-4 max-w-7xl lg:flex lg:h-[calc(100vh-4rem)] lg:flex-col">
 		<div class="mb-6 lg:shrink-0">
 			<h1 class="text-3xl font-bold">Settings</h1>

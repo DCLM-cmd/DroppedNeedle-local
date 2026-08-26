@@ -140,9 +140,6 @@ def _indexed_count(database: Path) -> int:
         ).fetchone()[0]
 
 
-# --- measurable gates ----------------------------------------------------------
-
-
 async def gate_trigger_and_duplicate(tmp_path: Path) -> dict:
     """Duplicate requests coalesce onto one run while it is ACTIVE; a disjoint
     scope expands that run; after the covering run FAILS the durable queued
@@ -381,9 +378,6 @@ GATES_WITHOUT_CALIBRATION = (
     gate_cancellation_bounds,
     gate_incomplete_never_deletes,
 )
-
-
-# --- comparative outcomes -------------------------------------------------------
 
 
 def comparative_outcome(

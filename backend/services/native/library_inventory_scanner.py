@@ -41,14 +41,11 @@ logger = logging.getLogger(__name__)
 class _WalkHeartbeat:
     """Thread-safe liveness signal written by the walk producer thread.
 
-    Deadline semantics (F-025): the consumer fires WALK_TIMEOUT only when NO
-    progress signal has arrived for ``walk_deadline_seconds`` - where progress
-    means either a directory yield or an inventory item delivered to the
-    queue. A single huge directory whose cold listing takes longer than the
-    deadline produces no observable progress and can still false-positive;
-    that tradeoff is accepted for hashless scans (see F-029's boundary note)
-    and is contained by F-024's loud walker-cap refusal instead of silent
-    thread leaks.
+    F-025: WALK_TIMEOUT fires only when NO progress signal (directory yield or
+    queued item) arrived for ``walk_deadline_seconds``. A single huge directory
+    whose cold listing outlasts the deadline can still false-positive; that
+    tradeoff is accepted for hashless scans (F-029) and contained by F-024's
+    loud walker-cap refusal instead of silent thread leaks.
     """
 
     def __init__(self) -> None:

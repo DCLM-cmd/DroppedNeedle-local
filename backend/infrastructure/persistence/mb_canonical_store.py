@@ -3,18 +3,18 @@
 A SQLite-backed store beneath the in-process memory cache holding three
 MusicBrainz-derived mapping families:
 
-- ``canonical_redirect`` — recording merge-redirect resolution (#6). The
+- ``canonical_redirect`` - recording merge-redirect resolution (#6). The
   identity lane reads it with ``official_source_only=True``; display lanes
   tolerate any capture source.
-- ``release_to_rg`` — the release→release-group map behind the six fan-out
+- ``release_to_rg`` - the release→release-group map behind the six fan-out
   services (#11). ``rg_mbid = ''`` is an authoritative negative, mirroring
   the F-MATCH-05 sentinel discipline; transient failures write nothing.
-- ``recording_isrc`` — ISRC → recording mbid pairs from Spotify-import
+- ``recording_isrc`` - ISRC → recording mbid pairs from Spotify-import
   /isrc/ lookups (#22).
 
 Provenance: every row stamps ``source_host`` (the MB base URL that answered).
 Per internal-mb-surface.md §5a, persisted MB-derived mappings inherit MB proof
-status regardless of serving host — but the identity-lane gate additionally
+status regardless of serving host - but the identity-lane gate additionally
 narrows to rows captured against the official endpoint, because a
 user-settable ``api_url`` is not provenance-stamped upstream.
 
@@ -54,10 +54,6 @@ class MbCanonicalStore(PersistenceBase):
         with self._write_lock:
             self._ensure_tables()
             self._seed_from_mbid_resolution_map()
-
-    # ------------------------------------------------------------------
-    # Schema
-    # ------------------------------------------------------------------
 
     def _ensure_tables(self) -> None:
         conn = self._connect()
@@ -139,10 +135,6 @@ class MbCanonicalStore(PersistenceBase):
         finally:
             conn.close()
 
-    # ------------------------------------------------------------------
-    # release_to_rg (#11)
-    # ------------------------------------------------------------------
-
     async def get_release_to_rg_batch(self, release_mbids: list[str]) -> dict[str, str]:
         """Map of lowercased release id -> rg id ('' = known-negative). Only
         ids present in the store appear in the result."""
@@ -193,10 +185,6 @@ class MbCanonicalStore(PersistenceBase):
             conn.commit()
 
         await self._write(operation)
-
-    # ------------------------------------------------------------------
-    # canonical_redirect (#6)
-    # ------------------------------------------------------------------
 
     async def get_canonical_redirect(
         self,
@@ -267,10 +255,6 @@ class MbCanonicalStore(PersistenceBase):
             conn.commit()
 
         await self._write(operation)
-
-    # ------------------------------------------------------------------
-    # recording_isrc (#22)
-    # ------------------------------------------------------------------
 
     async def get_recordings_by_isrc(self, isrc: str) -> list[str]:
         isrc_normalized = isrc.strip().upper()

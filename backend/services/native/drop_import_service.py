@@ -208,8 +208,6 @@ class DropImportService:
         self._policy_revision_getter = policy_revision_getter
         self._tasks: dict[str, asyncio.Task] = {}
 
-    # -- public API --
-
     def incoming_dir(self) -> Path:
         """Where the route streams uploads before a job exists. Same filesystem
         as the job staging dirs, so adopting them into a job is a rename."""
@@ -367,8 +365,6 @@ class DropImportService:
         ]
         if removable:
             await asyncio.to_thread(_cleanup, removable)
-
-    # -- job processing --
 
     def _on_task_done(self, job_id: str, task: asyncio.Task) -> None:
         self._tasks.pop(job_id, None)
@@ -672,7 +668,7 @@ class DropImportService:
 
         await asyncio.to_thread(_tidy)
 
-    # -- identification (mirrors the scanner's tiers) --
+    # identification mirrors the scanner's tiers
 
     async def _read_entries(self, paths: list[Path]) -> tuple[list[_Entry], int]:
         entries: list[_Entry] = []
@@ -809,7 +805,7 @@ class DropImportService:
             enriched.append(local)
         return enriched, seeds
 
-    # -- organisation (mirrors the download import) --
+    # organisation mirrors the download import
 
     def _require_library_root(self) -> Path:
         lib = self._prefs.get_typed_library_settings_raw()
@@ -1097,8 +1093,6 @@ class DropImportService:
             acoustid_id=file_tag.acoustid_id,
             compilation=file_tag.compilation or meta.is_various,
         )
-
-    # -- post-import hooks --
 
     async def _after_import(
         self, job: DropImportJob, ident: _Identified, *, fulfills_request: bool

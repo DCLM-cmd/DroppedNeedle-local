@@ -479,7 +479,7 @@ async def test_pdf_local_artwork_is_external_only(tmp_path: Path) -> None:
     assert projection.external[0].image_type == "booklet"
 
 
-# --- F-PERF-07: per-pass local artwork inspection reuse ------------------------
+# F-PERF-07: per-pass local artwork inspection reuse
 
 
 class _FsCounters:

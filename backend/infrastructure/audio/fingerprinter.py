@@ -49,7 +49,6 @@ _FPCALC_TIMEOUT = 30.0
 _MAX_FPCALC_CONCURRENCY = 4
 # A best result below this AcoustID score is not a confident match.
 _ACOUSTID_MIN_SCORE = 0.70
-# Separators that delimit multiple artists in an AcoustID credit string.
 _ARTIST_SEPARATORS = (";", ",", "feat.", "ft.", "&", "+", "vs.", " x ", " with ")
 
 # F-040: the house resilience pattern (audiodb/coverart/geocoding precedent) -
@@ -183,8 +182,6 @@ class AudioFingerprinter:
         self._http = http
         self._api_key_provider = api_key_provider
         self._rate_limiter = rate_limiter
-        # Gate concurrent fpcalc subprocesses so a scan can't fork-bomb the host; core-scaled
-        # (see _MAX_FPCALC_CONCURRENCY).
         self._fpcalc_semaphore = asyncio.Semaphore(
             min(os.cpu_count() or 2, _MAX_FPCALC_CONCURRENCY)
         )
@@ -306,8 +303,6 @@ class AudioFingerprinter:
                 f"AcoustID API error ({response.status_code})"
             )
         if response.status_code != 200:
-            # Deterministic rejection (400 bad request, 401 bad key): never
-            # retried, never counted toward the breaker.
             raise AcoustIDRejectedError(
                 f"AcoustID rejected the lookup ({response.status_code})"
             )

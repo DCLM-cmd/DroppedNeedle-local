@@ -1,12 +1,11 @@
 /**
- * Integration coverage: every native-engine backend route must have a corresponding
- * frontend surface in the central `API` endpoint registry (which the TanStack Query
- * queries/mutations consume). This both proves coverage and catches path drift between
- * the backend routes and the frontend builders.
+ * Every native-engine backend route must have a matching entry in the central
+ * `API` endpoint registry that queries/mutations consume; this proves coverage
+ * and catches path drift between backend routes and frontend builders.
  *
- * The download-task `GET /downloads/{id}/files` route has no dedicated builder by
- * design - the file list is delivered inside the task-detail response and the live
- * SSE stream, not fetched separately - so it is intentionally excluded below.
+ * `GET /downloads/{id}/files` has no dedicated builder by design - the file list
+ * ships inside the task-detail response and the live SSE stream - so it is
+ * intentionally excluded below.
  */
 import { describe, expect, it } from 'vitest';
 

@@ -199,11 +199,10 @@
 		return () => unregisterPlaylistModal(ref);
 	});
 
-	// Everything auth-gated must track the session reactively, not be checked once at
-	// mount: an in-app login/logout is a goto() that never remounts this layout, so a
-	// mount-time check left integrations disabled (and these services stopped) until a
-	// hard refresh (#155). The bodies run untracked so only the auth flag re-triggers
-	// them - nowPlayingReporter.start() synchronously reads player $state, which would
+	// auth-gated work must track the session reactively: an in-app login/logout is a
+	// goto() that never remounts this layout, so mount-time checks left integrations
+	// disabled until hard refresh (#155). bodies run untracked so only the auth flag
+	// re-triggers them - nowPlayingReporter.start() reads player $state and would
 	// otherwise restart every service on each play/pause.
 	$effect(() => {
 		const sessionUserId = authStore.user?.id ?? null;

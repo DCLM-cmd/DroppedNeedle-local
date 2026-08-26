@@ -1,4 +1,4 @@
-"""P2 full-mirror tier (owner decision 2026-08-24) — widened non-official
+"""Full-mirror tier (owner decision 2026-08-24): widened non-official
 bounds, the rate_limit=0 "Unlimited" sentinel, and the absolute official clamp.
 
 Companion to test_musicbrainz_rate_cap.py, which keeps pinning the unchanged

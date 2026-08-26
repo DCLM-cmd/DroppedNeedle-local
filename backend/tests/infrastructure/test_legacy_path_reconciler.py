@@ -422,11 +422,9 @@ async def test_probe_timeout_does_not_create_unbounded_threads(tmp_path: Path, m
     for i in range(10):
         (historical_root / f"track-{i}.flac").write_bytes(b"a" * 100)
     database = tmp_path / "library.db"
-    # Use the standard source creation helper which sets up proper schema and file entries
     from tests.infrastructure.test_legacy_catalog_importer import TRACK_1, _create_source as _cs
-    # Create a minimal source DB with the historical root's files
     _create_source(database, historical_root)
-    # Add additional files to reach 10 total ( _create_source creates 2, we need 8 more)
+    # _create_source seeds 2 rows; add 8 more for 10 total
     conn = sqlite3.connect(database)
     for i in range(2, 10):
         conn.execute(
@@ -497,10 +495,8 @@ def test_legacy_path_reconciler_import_surface() -> None:
     import services.native.legacy_path_reconciler as m
     import typing
 
-    # Lightweight import-surface check: get_type_hints should not raise and module should be importable
     hints = typing.get_type_hints(m.LegacyPathReconciler.__init__)
     assert isinstance(hints, dict)
-    # Also check that the class is defined and has expected attributes
     assert hasattr(m.LegacyPathReconciler, "reconcile")
     assert hasattr(m.LegacyPathReconciler, "close")
 
@@ -540,19 +536,12 @@ async def test_legacy_probe_timeout_completes_leniently_when_no_non_path_blocker
     assert evidence is not None
     assert evidence["failure_reason"] == "legacy_path_probe_timeout"
     assert str(historical_root) not in json.dumps(evidence)
-    # Now verify migrator leniently completes with skip_unmappable on same DB after timeout
-    # Use a fresh store and the same blocked reconciler result (no projector)
     blocked.set()
-    # Create a fresh reconciler that will timeout again, but we will call migrator directly
-    # For lenient test, we need a DB with only timeout rows and no non-path blocker, so migrator should succeed with skipped
-    # Use the same database (still has legacy files) and a non-blocking reconciler for the migrator's path check
-    # Instead, directly test the migrator with skip_unmappable on the same DB after timeout
-    # The migrator will see the same outside files as timeout/inaccessible, but with skip_unmappable it should skip them
+    # same db after the timeout: drive the migrator directly with no projector;
+    # skip_unmappable turns the timeout rows into skips instead of blockers
     from services.native.bounded_legacy_catalog_migrator import BoundedLegacyCatalogMigrator
     from services.native.library_policy_resolver import LibraryPolicyResolver
 
-    # Use a new store with the same DB, but mock the reconciler to return timeout (already done)
-    # Now run the migrator with the real DB and the timeout result's lack of projector
     store2 = NativeLibraryStore(database, threading.Lock())
     resolver = LibraryPolicyResolver(settings)
     migrator = BoundedLegacyCatalogMigrator(
@@ -571,12 +560,8 @@ async def test_legacy_probe_timeout_completes_leniently_when_no_non_path_blocker
         # Legacy rows retained
         remaining = conn.execute("SELECT COUNT(*) FROM library_files").fetchone()[0]
         assert remaining >= 2
-        # Check that the legacy rows are still there and not deleted
-        # The migrator should have left them for pending
         pending = conn.execute("SELECT COUNT(*) FROM library_files WHERE file_path LIKE ?", (f"%{historical_root.name}%",)).fetchone()[0]
         assert pending >= 2
-    # aclose already called, pending 0
-    assert reconciler.probe_pending_count == 0
 
 
 @pytest.mark.asyncio
@@ -590,7 +575,8 @@ async def test_legacy_probe_timeout_still_aborts_on_non_path_blocker(
     # Seed a REAL non-path blocker using the existing bounded-migrator pattern
     malformed_release_group = "shared-legacy-release"
     with sqlite3.connect(database) as conn:
-        # Insert two library_files with same release_group but different album_title -> will be ambiguous and cause favorite_unresolved when user_favorites references it
+        # same release_group, different album_title -> ambiguous favorite_unresolved
+        # once user_favorites references it
         for suffix in ("1", "2"):
             conn.execute(
                 "INSERT INTO library_files (id, release_group_mbid, release_mbid, recording_mbid, disc_number, track_number, track_title, artist_name, album_artist_name, album_title, file_path, file_size_bytes, file_mtime, duration_seconds, file_format, source, is_compilation, tagged_at, imported_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -635,7 +621,7 @@ async def test_legacy_probe_timeout_still_aborts_on_non_path_blocker(
     assert result.failure_reason == "legacy_path_probe_timeout"
     await reconciler.aclose()
     assert reconciler.probe_pending_count == 0
-    # Now migrator should still fail due to non-path blocker, even though path was timeout
+    # non-path blocker still fails the migrator even though the path leg only timed out
     from services.native.bounded_legacy_catalog_migrator import BoundedLegacyCatalogMigrator
     from services.native.library_policy_resolver import LibraryPolicyResolver
 

@@ -60,9 +60,6 @@ async def seeded(store: TracedBrowseStore) -> TracedBrowseStore:
 
 
 
-# --- response equivalence -----------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_album_pages_match_contract_across_sorts_and_filters(
     seeded: TracedBrowseStore,
@@ -114,9 +111,6 @@ async def test_track_pages_match_recent_contract(seeded: TracedBrowseStore) -> N
     ]
     deep, deep_total = await store.list_target_tracks(offset=total + 5, limit=5)
     assert deep == [] and deep_total == total
-
-
-# --- projection reuse: page changes are cheap --------------------------------
 
 
 @pytest.mark.asyncio
@@ -186,9 +180,6 @@ async def test_artist_scoped_requests_build_only_their_relationship(
     ) or both_total >= max(album_total, contributor_total)
 
 
-# --- revision invalidation ----------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_catalog_revision_bump_invalidates_projection(
     seeded: TracedBrowseStore,
@@ -209,9 +200,6 @@ async def test_catalog_revision_bump_invalidates_projection(
     again, again_total = await store.list_target_albums(limit=50)
     assert again_total == 13 and len(again) == 13
     assert not any("GROUP BY a.id" in s for s in store.selects())
-
-
-# --- concurrency coalescing ---------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -243,9 +231,6 @@ async def test_concurrent_first_requests_coalesce_to_one_build(
     ]
 
 
-# --- bounded eviction ---------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_projection_cache_evicts_whole_entries_when_over_cap(
     seeded: TracedBrowseStore,
@@ -255,9 +240,6 @@ async def test_projection_cache_evicts_whole_entries_when_over_cap(
     for marker in range(cap + 6):
         await store.list_target_albums(search=f"distinct-{marker}", limit=5)
     assert len(store._browse_projections) <= cap
-
-
-# --- index plans --------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -301,9 +283,6 @@ async def test_query_plans_use_the_additive_browse_indexes(
             )
         }
         assert len(names) == 3
-
-
-# --- random bypass ------------------------------------------------------------
 
 
 @pytest.mark.asyncio

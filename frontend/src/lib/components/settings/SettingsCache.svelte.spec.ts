@@ -55,7 +55,7 @@ describe('SettingsCache', () => {
 		await expect.element(page.getByText(/admin access is required/i)).toBeVisible();
 		const alerts = await page.getByRole('alert').all();
 		expect(alerts.length).toBe(1);
-		expect(page.getByText('Memory Cache').query()).toBeNull();
+		expect(page.getByText('Memory cache').query()).toBeNull();
 	});
 
 	it('renders the same admin-required warning on 401', async () => {
@@ -74,10 +74,10 @@ describe('SettingsCache', () => {
 		render(SettingsCache);
 
 		await expect
-			.element(page.getByRole('button', { name: 'Full Wipe — Also Deletes 1550 Cover Files' }))
+			.element(page.getByRole('button', { name: 'Full wipe - also deletes 1550 cover files' }))
 			.toBeVisible();
 		await expect
-			.element(page.getByRole('button', { name: 'Metadata Only — Covers Preserved' }))
+			.element(page.getByRole('button', { name: 'Metadata only - covers preserved' }))
 			.toBeVisible();
 	});
 
@@ -87,7 +87,7 @@ describe('SettingsCache', () => {
 
 		render(SettingsCache);
 
-		await page.getByRole('button', { name: /Full Wipe/ }).click();
+		await page.getByRole('button', { name: /Full wipe/i }).click();
 
 		expect(confirmSpy).toHaveBeenCalledTimes(1);
 		const prompt = String(confirmSpy.mock.calls[0]?.[0] ?? '');

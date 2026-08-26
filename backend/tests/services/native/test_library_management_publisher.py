@@ -3164,7 +3164,7 @@ async def test_publish_logs_directory_fsync_failures_but_still_commits(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """F-146: a directory-fsync failure must be observable while availability
-    is preserved — the commit still lands and the warning names the directory."""
+    is preserved - the commit still lands and the warning names the directory."""
     real_fsync = os.fsync
     music_root = os.path.normpath(str(tmp_path / "music"))
 

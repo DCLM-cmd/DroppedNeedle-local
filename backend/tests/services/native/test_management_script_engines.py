@@ -506,7 +506,7 @@ def test_settings_round_trip_new_path_compatibility_controls() -> None:
 
 def test_format_management_literal_path_never_parses_template_bodies() -> None:
     """F-075/F-083: the literal-path entry point applies only output-side
-    normalization — brace-bearing directory names round-trip untouched and a
+    normalization - brace-bearing directory names round-trip untouched and a
     body like {title} stays literal instead of resolving as a variable."""
     compatibility = PathCompatibilitySettings()
     result = NamingTemplateEngine().format_management_literal_path(

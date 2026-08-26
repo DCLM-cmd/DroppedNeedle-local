@@ -131,7 +131,7 @@ export const COMMUNITY_CONFIRM_BUTTON_HINT = 'Acknowledge the risk notice to ena
 export const MIRROR_BANNER_LINES = [
 	'You are using a non-official MusicBrainz endpoint. Search results depend on that ' +
 		"server's reindex schedule - search indexes are not replicated.",
-	'Metadata freshness is bounded by the operator\u2019s replication cron.',
+	"Metadata freshness is bounded by the operator's replication cron.",
 	'Identity verification quality depends on the operator.'
 ];
 

@@ -125,9 +125,6 @@ async def test_real_errors_still_log(open_breaker, caplog, monkeypatch) -> None:
     open_breaker.assert_called_once()
 
 
-# --- F-056: malformed payloads are deterministic, not retriable ---------------
-
-
 @pytest.mark.asyncio
 async def test_malformed_json_raises_invalid_payload_without_retry(monkeypatch):
     """F-056 fuel removal: a 200 response with unparseable JSON raises the

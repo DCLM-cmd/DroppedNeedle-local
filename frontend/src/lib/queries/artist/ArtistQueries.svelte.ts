@@ -107,10 +107,9 @@ export const getArtistLastFmEnrichmentQuery = (
 
 const BATCH_SIZE = 50;
 
-// A3: while the backend background walker completes a large catalog, page 1 arrives
-// partial (warming=true, source_total_count=null). Poll page 0 modestly until any
-// response reports warming false/absent - then stop entirely. Old payloads without
-// the flag never poll, exactly as before.
+// A3: while the backend walker completes a large catalog, page 1 arrives partial
+// (warming=true, source_total_count=null). Poll page 0 until any response reports
+// warming false/absent, then stop. Payloads without the flag never poll.
 const WARMING_POLL_INTERVAL_MS = 2_000;
 
 export const getArtistReleasesInfiniteQuery = (getArtistId: Getter<string>) =>

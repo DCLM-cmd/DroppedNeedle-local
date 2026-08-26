@@ -8,8 +8,8 @@ import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { authStore } from '$lib/stores/authStore.svelte';
 import type { AlbumEditionsResponse, EditionAcquireResponse } from '$lib/types';
 
-// Album edition selection (CollectionManagement Feature E). The picker is an
-// admin/trusted surface; viewing the list is open to any authenticated user.
+// CollectionManagement Feature E: the picker is an admin/trusted surface,
+// viewing the list is open to any authenticated user.
 
 const editionsUrl = (mbid: string) => `/api/v1/albums/${encodeURIComponent(mbid)}/editions`;
 const pinUrl = (mbid: string) => `/api/v1/albums/${encodeURIComponent(mbid)}/edition`;

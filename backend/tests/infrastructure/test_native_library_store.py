@@ -2833,9 +2833,6 @@ async def test_defer_reidentification_work_requires_the_running_lease(
         )
 
 
-# --- F-TARGETCATALOG-06: batch canonical target resolution --------------------
-
-
 @pytest.mark.asyncio
 async def test_resolve_canonical_target_ids_covers_provider_alias_retired_and_ambiguous(
     store: NativeLibraryStore,
@@ -2935,9 +2932,6 @@ async def test_get_target_album_tracks_batch_groups_indexed_rows(
         connection.close()
     grouped_after = await store.get_target_album_tracks_batch(["album-2"])
     assert grouped_after["album-2"] == []
-
-
-# --- Cluster 5/6: F-041 F-046 F-048 F-056 store-level pins --------------------
 
 
 @pytest.mark.asyncio
@@ -3191,9 +3185,6 @@ async def _seed_track_for_outcomes(
             track_credits={track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]},
         )
     )
-
-
-# --- F-079: apply-start staleness verified inside the begin transaction -------
 
 
 @pytest.mark.asyncio

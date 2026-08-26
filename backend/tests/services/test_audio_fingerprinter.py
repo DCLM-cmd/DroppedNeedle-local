@@ -333,7 +333,7 @@ async def test_submits_compressed_fingerprint_not_raw(monkeypatch):
     assert http.post.call_args.kwargs["data"]["fingerprint"] == "AQADtMmSaEkSRYkG"
 
 
-# --- Cluster 6: F-040 resilience / F-043 memo / F-044 partial / F-048 gaps ----
+# Cluster 6: F-040 resilience / F-043 memo / F-044 partial / F-048 gaps
 
 
 @pytest.fixture(autouse=True)

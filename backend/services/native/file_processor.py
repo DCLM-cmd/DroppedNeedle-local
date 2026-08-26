@@ -1356,7 +1356,7 @@ class FileProcessor:
             replacement=replacement,
         )
 
-    # --- Replace-on-import (CollectionManagement D4/D18/D19) --------------------
+    # Replace-on-import (CollectionManagement D4/D18/D19)
     # Fires ONLY for an origin='upgrade' import, and only strictly-better. Two
     # shapes: same-path (mp3_192 -> mp3_320, identical filename - recycle BEFORE the
     # in-place publish) and different-path (mp3 -> flac - publish, soft-delete the

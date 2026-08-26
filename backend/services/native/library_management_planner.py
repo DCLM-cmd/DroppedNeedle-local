@@ -199,7 +199,7 @@ def _scrubbed_raw_tag_evidence(
 # process-lifetime pool keeps those abandoned calls away from asyncio's shared executor.
 # F-076: the pool size is independent of the per-root timeout budget, in-flight
 # submissions are tracked, and a saturated pool fails fast without poisoning a
-# root's fault budget — three hung mounts must not disable preview planning.
+# root's fault budget - three hung mounts must not disable preview planning.
 _INSPECTION_POOL_WORKERS = min(8, max(4, os.cpu_count() or 4))
 _SOURCE_INSPECTION_EXECUTOR = ThreadPoolExecutor(
     max_workers=_INSPECTION_POOL_WORKERS,
@@ -1121,7 +1121,7 @@ class LibraryManagementPlanner:
             return _SourceInspection(subject, None, None, "", FILE_UNREADABLE)
         if in_flight >= _INSPECTION_POOL_WORKERS:
             # F-076: saturation is a process-wide condition (hung mounts from
-            # any job), not a fault of this root — never consume its budget.
+            # any job), not a fault of this root - never consume its budget.
             logger.warning(
                 "Library Management source inspection pool saturated: "
                 "root_id=%s track_id=%s",
@@ -1973,7 +1973,7 @@ class LibraryManagementPlanner:
         collision_reason: str | None = None
         examined = 0
         matched_examined = 0
-        # F-085: the budget charges pattern-matched sidecar candidates only —
+        # F-085: the budget charges pattern-matched sidecar candidates only -
         # a directory with >10k unrelated files must not false-block a bundle.
         # A generous raw-walk guard still bounds pathological directories.
         walk_guard = MAX_SIDECAR_ENTRIES * 10

@@ -64,7 +64,7 @@ export function actOnLibraryReview(action: ReviewAction) {
 		onSuccess: async (_result, input) => {
 			// dismiss and keep_tagged mutate no catalog rows: both run only the
 			// common write set in NativeLibraryStore.apply_review_decision
-			// (backend/infrastructure/persistence/native_library_store.py) — the
+			// (backend/infrastructure/persistence/native_library_store.py) - the
 			// library_identification_reviews row, queued automatic-job
 			// cancellation in library_identification_jobs, a
 			// library_catalog_actions audit insert, and revision-counter bumps.

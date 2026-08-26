@@ -4,11 +4,11 @@ Wraps the existing ``MusicBrainzRepository`` to identify an album by fuzzy
 text match (``rapidfuzz.token_set_ratio``) when the file's tags carry no usable
 MusicBrainz IDs. Tier 1 (MBIDs in tags) is handled directly by the scanner;
 Tier 3 resolves an AcoustID recording MBID to a release group via
-``resolve_recording_to_release_group`` (added in Phase 4).
+``resolve_recording_to_release_group``.
 
-(AUD-13) The matcher owns **no** rate limiter and makes **no** raw MB HTTP
-calls - every lookup goes through ``MusicBrainzRepository``, which already
-applies the module-global limiter + circuit breaker + retry + dedup.
+(AUD-13) The matcher owns no rate limiter and makes no raw MB HTTP calls -
+every lookup goes through ``MusicBrainzRepository``, which already applies
+the module-global limiter + circuit breaker + retry + dedup.
 """
 
 import logging

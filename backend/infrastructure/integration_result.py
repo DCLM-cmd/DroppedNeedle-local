@@ -19,7 +19,7 @@ class IntegrationResult(Generic[T]):
     """Outcome of an external-service call.
 
     ``data`` is ``None`` only when ``status == "error"`` (upstream failed
-    completely).  For ``"degraded"`` the caller received *some* data —
+    completely).  For ``"degraded"`` the caller received *some* data -
     possibly stale or partial.
     """
 

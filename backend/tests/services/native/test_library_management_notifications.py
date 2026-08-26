@@ -300,7 +300,7 @@ async def test_reconciliation_failure_does_not_skip_durable_external_refresh(
     assert "Artist identity reconciliation enqueue failed" in caplog.text
 
 
-# -- F-209: post-commit delivery isolation and invalidation breadth --
+# F-209: post-commit delivery isolation and invalidation breadth
 
 
 def _local_membership(suffix: str) -> CatalogMembership:

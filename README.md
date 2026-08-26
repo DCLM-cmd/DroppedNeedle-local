@@ -34,9 +34,9 @@ DroppedNeedle is a self-hosted music request and discovery app with a **built-in
 
 ---
 
-## Quick Start
+## Quick start
 
-You need Docker, a music library, and a download client. The example below uses slskd; [SABnzbd](https://sabnzbd.org/) with Newznab indexers works too. DroppedNeedle does not ship or run either for you - see [slskd Setup](#slskd-setup) and [Usenet Setup](#usenet-setup).
+You need Docker, a music library, and a download client. The example below uses slskd; [SABnzbd](https://sabnzbd.org/) with Newznab indexers works too. DroppedNeedle does not ship or run either for you - see [slskd setup](#slskd-setup) and [Usenet setup](#usenet-setup).
 
 > **DroppedNeedle only orchestrates a user-provided download client over its local HTTP API; it never joins or distributes on the Soulseek/P2P network. You supply, run, and are responsible for your own download client and, for slskd, its shared folders.**
 
@@ -129,11 +129,11 @@ Open [http://localhost:8688](http://localhost:8688). On first launch you'll be p
 
 ---
 
-## Native Engine
+## Native engine
 
 DroppedNeedle replaces Lidarr with a built-in library and download engine. Library Scanning reads files, identifies them, and updates the catalog without changing the music on disk. Finished downloads are scored, verified, and published into the library through a staged writer. Library Management adds optional Picard-style tag, artwork, naming, and organization rules for existing files and future imports. It remains off until an administrator enables it. Lidarr is not used for library management.
 
-> **The slskd downloads path is required for imports.** DroppedNeedle must be able to see it read-write. A common container mount with the library enables a fast atomic move; separate mounts use a safe copy-and-remove fallback and briefly need space for both copies. See [slskd Setup](#slskd-setup).
+> **The slskd downloads path is required for imports.** DroppedNeedle must be able to see it read-write. A common container mount with the library enables a fast atomic move; separate mounts use a safe copy-and-remove fallback and briefly need space for both copies. See [slskd setup](#slskd-setup).
 
 ### Legality boundary
 
@@ -255,7 +255,7 @@ Library reads aggregate from `library_files` (`GROUP BY release_group_mbid`) and
 
 ## Setup
 
-This walks you from a running container to a library that imports downloads. The [Quick Start](#quick-start) above covers the compose file and first boot; this covers what to configure in the app afterwards.
+This walks you from a running container to a library that imports downloads. The [Quick start](#quick-start) above covers the compose file and first boot; this covers what to configure in the app afterwards.
 
 `fpcalc` and AcoustID fingerprinting are bundled in the image via `libchromaprint-tools`. An AcoustID API key is optional and enables Tier-3 identification.
 
@@ -271,7 +271,7 @@ Go to **Settings > Download Client** (admin):
 2. Enter your slskd API key.
 3. Click **Test**, then **Save**.
 
-The page shows whether the downloads path is writable and shares a rename boundary with the library. An unavailable or read-only path must be fixed before requesting downloads. A separate-mount warning means imports will work through the slower copy-and-remove fallback. See [slskd Setup](#slskd-setup).
+The page shows whether the downloads path is writable and shares a rename boundary with the library. An unavailable or read-only path must be fixed before requesting downloads. A separate-mount warning means imports will work through the slower copy-and-remove fallback. See [slskd setup](#slskd-setup).
 
 ### 3. Run a library scan
 
@@ -319,13 +319,13 @@ Browse or search the MusicBrainz catalogue, open an album, and click **Request**
 
 ---
 
-## slskd Setup
+## slskd setup
 
 > **Legality.** DroppedNeedle only orchestrates a user-provided slskd instance over its local HTTP API; it never joins or distributes on the Soulseek/P2P network. You supply, run, and are responsible for slskd and its shared folders.
 >
 > **Sharing on Soulseek.** Soulseek is a reciprocal network and slskd will not run as a leech-only client: without at least one shared directory (`slskd.yml` -> `shares.directories`), searches and downloads fail. That is a property of Soulseek and slskd, not a DroppedNeedle requirement. Anything you place in a shared directory is distributed to other users of the network. What you share, and whether you hold the right to distribute it, is your decision and your responsibility.
 
-slskd is one of two download sources DroppedNeedle supports. If you are using Usenet instead, skip this section and go to [Usenet Setup](#usenet-setup).
+slskd is one of two download sources DroppedNeedle supports. If you are using Usenet instead, skip this section and go to [Usenet setup](#usenet-setup).
 
 DroppedNeedle does not download from Soulseek itself. It talks to your own running slskd instance over slskd's local HTTP API (`X-API-Key`), asks it to search and download, then imports the finished files into your library. You bring slskd; DroppedNeedle drives it.
 
@@ -385,7 +385,7 @@ web:
 
 ---
 
-## Usenet Setup
+## Usenet setup
 
 DroppedNeedle's second download source is Usenet through SABnzbd with Newznab-compatible indexers. The engine searches indexers for albums and tracks, enqueues NZBs in SABnzbd, and imports the finished files using the same verification and import pipeline it uses for slskd.
 
@@ -415,7 +415,7 @@ slskd and Usenet can be enabled side by side - the source priority control decid
 
 ---
 
-## Recommended Stack
+## Recommended stack
 
 DroppedNeedle brings its own library and download engine; you supply the download client. For playback, connect Jellyfin, Navidrome, Plex, or mount your music folder directly into the container.
 
@@ -445,7 +445,7 @@ The first account you create at first-run setup is always an admin. After that, 
 
 You sign in with a username and password. Usernames are case-insensitive, and you can change yours later from your profile. Email is optional everywhere; add one if you want it for account linking, but it is never used to sign in.
 
-You can also sign in through Jellyfin, Plex, or any OIDC-compatible provider (Authelia, Keycloak, Authentik, and so on); see [Setting Up OIDC](#setting-up-oidc) below. If one of those is your only login, you can add a password from your profile and then sign in by username as well.
+You can also sign in through Jellyfin, Plex, or any OIDC-compatible provider (Authelia, Keycloak, Authentik, and so on); see [Setting up OIDC](#setting-up-oidc) below. If one of those is your only login, you can add a password from your profile and then sign in by username as well.
 
 Every login method is switched on or off from the web UI. No environment variables are needed.
 
@@ -461,7 +461,7 @@ A session lasts 30 days from login and is not extended by activity. Signing out 
 
 ## Features
 
-### Search and Request
+### Search and request
 
 Search the full MusicBrainz catalogue for any artist or album. Request a whole album or an individual track, and the native engine handles the download: it searches your download client, preflight-scores the candidates, picks the best, verifies the files, and imports them into your library. Admin and trusted users' requests start immediately; requests from standard users are held in an approval queue until an admin approves or rejects them. A persistent queue tracks all requests, and you can browse pending and fulfilled requests on a dedicated page with retry and cancel support.
 
@@ -473,13 +473,13 @@ When a download completes in your download client but DroppedNeedle cannot locat
 
 Failed and incomplete download requests are re-searched automatically by a background watcher on an age-based cadence. When it finds a verified match, the download is imported silently. The Wanted tab shows everything the watcher is tracking. You can stop or resume individual watches and mark new finds as seen.
 
-### Quality and Storage
+### Quality and storage
 
 Set a quality floor per format (FLAC, MP3, AAC, and others) under Settings > Download Client. Downloads below the cutoff are rejected. When a better copy of an album you already own turns up, the engine replaces the old files and moves the originals to a recycle bin.
 
 A global storage cap and per-user quotas keep the library from filling the disk. Album edition pinning locks a request to a particular release: the engine fills missing tracks from that edition and upgrades individual files as better copies surface. An optional background scan re-checks your library against available sources and imports improvements.
 
-### Built-in Player
+### Built-in player
 
 DroppedNeedle has a full audio player that supports multiple playback sources per track:
 
@@ -493,7 +493,7 @@ The player supports queue management, shuffle, seek, volume control, a 10-band e
 
 What you are playing is broadcast live over SSE. Other signed-in users see the current track in real time.
 
-### Connect Apps
+### Connect apps
 
 Third-party music apps can play your library straight from DroppedNeedle, which speaks both the OpenSubsonic and Jellyfin APIs. It is the inbound counterpart to the Jellyfin, Navidrome, and Plex sources: those let DroppedNeedle play from another server, while this lets other apps play from DroppedNeedle.
 
@@ -513,11 +513,11 @@ Until you link Last.fm or ListenBrainz, the rows that need your listening histor
 
 A per-user weekly mix playlist is built from your listening history and refreshed in the background. When auto-request is enabled (requires an admin standing grant), up to five missing albums from the mix are queued for download automatically.
 
-### Upcoming Events
+### Upcoming events
 
 Connect Ticketmaster and Skiddle (free API keys) and DroppedNeedle shows concerts near you. Each user picks as many cities as they like from a geocoded search, each with its own radius. A daily sweep pulls upcoming shows for the artists people follow - or, optionally, for every artist in the library - and a sidebar badge counts the gigs you have not seen yet.
 
-### Following Artists
+### Following artists
 
 Follow an artist to watch for new releases, and optionally auto-download them the moment they appear (standard users need a one-time admin grant per artist). Sidebar badges show how many releases and gigs you have not seen, backed by per-user seen markers that update via SSE; visiting the page clears them. The Following hub is a glanceable digest: a 30-day release log with in-library ticks, your next gigs, and your artist roster, each section one click from its full page.
 
@@ -533,7 +533,7 @@ Request an album and DroppedNeedle looks for it on the Internet Archive. If it i
 
 Nothing else is offered. An item with no licence, or an all-rights-reserved one, is never a candidate, so this works for the artists who chose to give their music away and not for anyone else. It is on by default, and one toggle in Settings turns it off.
 
-### Import Your Purchases
+### Import your purchases
 
 Buy music wherever you like - Bandcamp, the Qobuz store, a label's own shop - then hand the zip or the loose files to DroppedNeedle. Drag them onto the card on your home page or the Import tab on the Downloads page, or click either one to browse. Archives are extracted, and every album is identified by the same pipeline the library scanner uses: MusicBrainz tags first, then AcoustID fingerprints. The files are tagged, organised into your library under your naming template, and if anyone had requested that album, their request is resolved and they get a notification.
 
@@ -541,7 +541,7 @@ Anything DroppedNeedle cannot identify waits under "Needs a match", where you se
 
 Drop a better-quality copy of an album you already have and it upgrades in place: the old files go to the recycle bin. An equal or worse copy is skipped. Admin and trusted users can import.
 
-### Where to Buy
+### Where to buy
 
 Album and artist pages show you where to buy the music. Links come from MusicBrainz purchase relationships, with an iTunes fallback (set your region in Settings) and a Bandcamp search behind that, so there is always a way through. Digital, vinyl and CD, and free downloads are listed separately.
 
@@ -612,7 +612,7 @@ Running your own [MusicBrainz](https://musicbrainz.org/) mirror instead of using
 
 DroppedNeedle stores its config in `config/config.json` inside the mapped config volume. Everything is managed through the UI.
 
-### Environment Variables
+### Environment variables
 
 | Variable | Default | Description |
 |-|-|-|
@@ -638,7 +638,7 @@ it makes new files writable by every local account allowed by the underlying fil
 A move or metadata-preserving copy can retain a source file's existing mode, so `UMASK`
 is not a way to override permissions supplied by a download client.
 
-### In-App Settings
+### In-app settings
 
 | Setting | Location |
 |-|-|
@@ -660,17 +660,17 @@ is not a way to override permissions supplied by a download client.
 | HSTS header and HIBP password breach checking | Settings > Security |
 | User accounts, roles, and user import (Jellyfin/Plex) | Settings > Users |
 
-### Setting Up Last.fm
+### Setting up Last.fm
 
 1. **Admin, once per instance:** register an app at [last.fm/api/account/create](https://www.last.fm/api/account/create) to get an API key and shared secret, and enter them in Settings > Last.fm.
 2. **Each user:** open Profile > Scrobbling & Discovery, click Connect on Last.fm, authorise in the popup, then choose Finish. Your account is linked and the scrobble toggle is yours.
 
-### Setting Up ListenBrainz
+### Setting up ListenBrainz
 
 1. Copy your user token from [listenbrainz.org/profile](https://listenbrainz.org/profile/).
 2. In Profile > Scrobbling & Discovery, click Connect on ListenBrainz and paste your username + token.
 
-### Setting Up OIDC
+### Setting up OIDC
 
 Any OIDC provider that supports the authorization code flow works (Authelia, Keycloak, Authentik, etc.).
 
@@ -680,7 +680,7 @@ Any OIDC provider that supports the authorization code flow works (Authelia, Key
 
 Users who sign in via OIDC are created automatically on first login, given an auto-generated username, and assigned the **User** role by default. An admin can promote them from Settings > Users.
 
-### Security Settings
+### Security settings
 
 Settings > Security exposes two features (admin only):
 
@@ -696,13 +696,13 @@ Under Settings > Advanced, you can toggle AudioDB on or off, switch between dire
 
 ---
 
-## Playback Sources
+## Playback sources
 
 ### Jellyfin
 
 Audio is transcoded on the Jellyfin server and streamed to the browser. Supported codecs include AAC, MP3, Opus, FLAC, Vorbis, ALAC, WAV, and WMA. Bitrate is configurable between 32 kbps and 320 kbps. Playback start, progress, and stop events are reported back to Jellyfin.
 
-### Local Files
+### Local files
 
 Mount your music directory into the container and DroppedNeedle serves files directly. The mount path inside the container must match the Music Directory Path set in Settings > Local Files.
 
@@ -731,7 +731,7 @@ A note on reliability: YouTube playback depends on the embedded player, which ca
 
 ---
 
-## Volumes and Persistence
+## Volumes and persistence
 
 | Container path | Purpose |
 |-|-|
@@ -742,7 +742,7 @@ A note on reliability: YouTube playback depends on the embedded player, which ca
 | `/data/music` | Recommended music library root inside the common media mount |
 | `/data/slskd/complete` | Recommended slskd completed-downloads path inside the common media mount |
 
-Map `/app/config`, `/app/cache`, and `/app/plugins` to persistent host directories so they survive container restarts. For fast imports, expose the library and completed downloads through one common-parent mount such as `/data`; separate or nested binds use the safe copy-and-remove fallback and temporarily require room for both copies. Linux paths are case-sensitive, so host-path casing must match exactly. See [slskd Setup](#slskd-setup). `/app/imports` is optional, but leave it unmounted and large uploads land on the container's writable layer, while anything waiting for a manual match is lost when the container is recreated.
+Map `/app/config`, `/app/cache`, and `/app/plugins` to persistent host directories so they survive container restarts. For fast imports, expose the library and completed downloads through one common-parent mount such as `/data`; separate or nested binds use the safe copy-and-remove fallback and temporarily require room for both copies. Linux paths are case-sensitive, so host-path casing must match exactly. See [slskd setup](#slskd-setup). `/app/imports` is optional, but leave it unmounted and large uploads land on the container's writable layer, while anything waiting for a manual match is lost when the container is recreated.
 
 ---
 

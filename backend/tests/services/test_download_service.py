@@ -320,7 +320,7 @@ async def test_pick_candidate_missing_job_raises_not_found():
         await service.pick_candidate("u1", "job1", 0)
 
 
-# --- single-track identity threading + parked-task resume (2026-07-05 incident, P1) ---
+# single-track identity threading + parked-task resume (2026-07-05 incident, P1)
 
 
 def _single_album_service(*, tracks=None, total=1, fail=False):
@@ -972,7 +972,7 @@ def test_mount_reason_prefers_a_known_boundary_over_a_stat_error(tmp_path, monke
     assert status.reason == "different_filesystem"
 
 
-# -- held imports (import anyway / discard) --
+# held imports (import anyway / discard)
 
 
 def _held_service(store, file_processor, library_reconciler=None, album_service=None):

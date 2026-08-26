@@ -221,7 +221,7 @@ async def test_repository_single_read_and_correct_current_tier(
     assert artist_ids == {"pa-1": "Artist A", None: "Artist B"}
 
 
-# --- F-TARGETCATALOG-04: real-store keyset paging integration -----------------
+# F-TARGETCATALOG-04: real-store keyset paging integration
 
 
 @pytest.mark.asyncio

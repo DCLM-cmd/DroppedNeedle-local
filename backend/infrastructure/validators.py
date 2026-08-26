@@ -151,7 +151,7 @@ def sanitize_optional_string(value: Optional[str]) -> Optional[str]:
 def strip_html_tags(text: str | None) -> str:
     """Strip HTML tags from text, converting <br> to newlines.
 
-    Uses stdlib html.parser — no external dependencies needed.
+    Uses stdlib html.parser - no external dependencies needed.
     Returns plain text suitable for display.
     """
     if not text:

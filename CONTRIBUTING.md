@@ -2,15 +2,15 @@
 
 Thanks for your interest. Bug reports, feature requests, and pull requests are all welcome.
 
-## Reporting Bugs
+## Reporting bugs
 
 Use the [bug report template](https://github.com/DroppedNeedle/DroppedNeedle/issues/new?template=bug.yml). Include your DroppedNeedle version, steps to reproduce, and relevant logs from `docker compose logs droppedneedle`. The more detail you give, the faster things get fixed.
 
-## Requesting Features
+## Requesting features
 
 Use the [feature request template](https://github.com/DroppedNeedle/DroppedNeedle/issues/new?template=feature.yml). Check existing issues first to avoid duplicates.
 
-## Development Setup
+## Development setup
 
 The backend is Python 3.13 with FastAPI. The frontend is SvelteKit with Svelte 5, Tailwind CSS, and daisyUI.
 
@@ -20,7 +20,7 @@ The backend is Python 3.13 with FastAPI. The frontend is SvelteKit with Svelte 5
 - Node.js 22+
 - Docker (for building the full image)
 
-### Running Locally
+### Running locally
 
 Backend:
 
@@ -40,7 +40,7 @@ pnpm install
 pnpm run dev
 ```
 
-### Running Tests
+### Running tests
 
 ```bash
 make backend-test          # backend suite
@@ -56,7 +56,7 @@ Frontend browser tests use Playwright. Install the browser first:
 make frontend-browser-install
 ```
 
-## Pull Requests
+## Pull requests
 
 1. Fork the repo and create a branch from `main`.
 2. Give your branch a descriptive name: `fix-scrobble-timing`, `feature-playlist-export`, etc.
@@ -64,14 +64,14 @@ make frontend-browser-install
 4. Make sure tests pass before submitting.
 5. Keep changes focused. One PR per fix or feature.
 
-## Code Style
+## Code style
 
 - Backend: strong typing, async/await, no blocking I/O in async contexts.
 - Frontend: strict TypeScript, no `any`. Named exports. Async/await only.
 - Use existing design tokens (`primary`, `secondary`, etc.) for colours, not hardcoded values.
 - Run `pnpm run lint` and `pnpm run check` in the frontend before submitting.
 
-## AI-Assisted Contributions
+## AI-assisted contributions
 
 If you used AI tools (Copilot, ChatGPT, Claude, etc.) to write code in your PR, please mention it. This isn't a problem and won't get your PR rejected, but it helps reviewers calibrate how much scrutiny to apply. A quick note like "Claude helped with the caching logic" is enough.
 

@@ -77,9 +77,6 @@ class _RecordingStore:
         return None
 
 
-# --- hostile fixture: symlinks, escapes, non-audio ----------------------------
-
-
 @pytest.mark.asyncio
 async def test_walk_excludes_escaping_symlinks_and_non_audio_entries(
     tmp_path: Path,
@@ -145,9 +142,6 @@ class AsyncCheckpoint:
         return True
 
 
-# --- starter-map wiring contract ----------------------------------------------
-
-
 def test_watchdog_receives_the_real_four_starter_map() -> None:
     """The scan supervisor MUST be inside the watchdog's restart map alongside
     the three workers - parsed from target_application.py so the contract
@@ -188,9 +182,6 @@ def test_watchdog_receives_the_real_four_starter_map() -> None:
     assert len(watchdog_calls) == 1
     arg = watchdog_calls[0].args[0]
     assert isinstance(arg, ast.Name) and arg.id == "worker_starters"
-
-
-# --- upgrade rehearsal: same-size wrong-content destination (fail closed) ------
 
 
 def _sha256(path: Path) -> str:
@@ -266,9 +257,6 @@ async def test_same_size_wrong_content_destination_fails_closed(tmp_path: Path) 
         assert connection.execute(
             "SELECT id, file_path, file_size_bytes FROM library_files ORDER BY id"
         ).fetchall() == source_before
-
-
-# --- large partial-resume observation (bounded scope-level restart) ------------
 
 
 @pytest.mark.asyncio

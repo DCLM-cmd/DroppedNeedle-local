@@ -111,7 +111,7 @@ def pin_library_management_profile(
         raise ValueError(
             "A profile references an unknown management script."
         ) from error
-    # F-078: the pin must hold private deep copies — profile/scripts are
+    # F-078: the pin must hold private deep copies - profile/scripts are
     # mutable AppStructs and a shared reference would let a later mutator
     # corrupt an already-sealed preview between pin and serialization.
     return PinnedLibraryManagementProfile(

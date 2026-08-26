@@ -3631,7 +3631,7 @@ async def test_staged_collision_tokens_stay_two_albums_like_the_small_path(
 ) -> None:
     """F-MATCH-06: two distinct grouping tokens that resolve to the same
     directory, normalized consensus title, and artist must remain two local
-    albums on the staged path — matching the small path — and the staged keys
+    albums on the staged path - matching the small path - and the staged keys
     must be deterministic across pages, resumes, and repeated runs."""
     monkeypatch.setattr(
         "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD", 4
@@ -3871,7 +3871,7 @@ async def test_provision_rejects_duplicate_staged_targets_fail_closed() -> None:
         )
 
 
-# --- Cluster 5/6: F-057 F-042 F-041 F-043 behavioral pins ---------------------
+# Cluster 5/6: F-057 F-042 F-041 F-043 behavioral pins
 
 
 class _CountingEmptyProvider(FakeProvider):

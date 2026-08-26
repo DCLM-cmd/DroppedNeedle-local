@@ -172,7 +172,7 @@ def test_plain_user_is_forbidden(tmp_path):
         assert _get_current_curator(request).role == role
 
 
-# -- F-211: staged uploads are written atomically via a .part temp --
+# F-211: staged uploads are written atomically via a .part temp
 
 
 def test_copy_to_stages_through_part_file_without_residue(tmp_path):

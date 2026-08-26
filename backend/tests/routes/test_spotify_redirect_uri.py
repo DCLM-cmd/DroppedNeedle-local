@@ -139,9 +139,6 @@ def token_exchange(monkeypatch):
     return recorded
 
 
-# --- authorize URL derivation ---
-
-
 def test_unset_origin_falls_back_to_request_base_url(me_client, prefs):
     _configure_spotify(prefs)
     resp = me_client.get("/me/connections/spotify/auth/url")
@@ -159,9 +156,6 @@ def test_configured_origin_appears_in_authorize_url(me_client, prefs):
         ).query
     )
     assert query["redirect_uri"] == ["https://music.example.com" + CALLBACK_URI_PATH]
-
-
-# --- token exchange consistency ---
 
 
 def test_token_exchange_body_matches_authorize_url_with_origin(
@@ -205,9 +199,6 @@ def test_token_exchange_unset_origin_pins_base_url_behavior(
     assert posts[0]["data"]["redirect_uri"] == BASE_ORIGIN + CALLBACK_URI_PATH
 
 
-# --- admin display endpoint consistency ---
-
-
 @pytest.mark.parametrize("origin", ["", "https://music.example.com"])
 def test_admin_display_matches_embedded_authorize_uri(
     me_client, admin_client, prefs, origin
@@ -224,9 +215,6 @@ def test_admin_display_matches_embedded_authorize_uri(
         assert display.json()["redirect_uri"] == BASE_ORIGIN + CALLBACK_URI_PATH
     # the dashboard guidance must never drift from the generated value
     assert display.json()["redirect_uri"] == embedded
-
-
-# --- save-time normalization and validation ---
 
 
 def test_trailing_slash_normalized_once(admin_client, prefs):

@@ -43,11 +43,6 @@ def edition_date_key(date_str: str | None) -> tuple[int, int, int]:
     Missing or unparsable input shares one key pinned at year ``10000``
     that sorts after every valid date (+infinity equivalent); the input
     string is never rewritten.
-
-    This encodes exactly the ordering previously produced inline by
-    ``identity_repair_service._edition_date_key`` (validity flag +
-    presence-flagged components) as a plain ``(year, month, day)``
-    integer triple; relative order and ties are unchanged.
     """
     match = re.match(r"^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$", (date_str or "").strip())
     if not match:

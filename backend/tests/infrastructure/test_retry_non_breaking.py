@@ -269,7 +269,6 @@ async def test_circuit_open_error_carries_retry_after_and_is_fail_fast(monkeypat
     # Use a fixed time for determinism
     start = 1000.0
     monkeypatch.setattr("infrastructure.resilience.retry.time.time", lambda: start)
-    # Trip the breaker
     cb.record_failure()
     assert cb.state == CircuitState.OPEN
     # First call should be fail-fast with retry_after ~10
@@ -291,10 +290,7 @@ async def test_circuit_open_error_carries_retry_after_and_is_fail_fast(monkeypat
     assert exc2.value.retry_after_seconds < exc_info.value.retry_after_seconds
     # After timeout, breaker should be half-open and call should go through
     monkeypatch.setattr("infrastructure.resilience.retry.time.time", lambda: start + 11.0)
-    # Need to also mock time.time for the is_open transition
-    # The breaker should now be half-open, so the call should not raise CircuitOpenError
-    # But our with_retry will call atry_transition which will transition to half-open
-    # So we need to test that after timeout, the call is not fail-fast
+    # past the timeout with_retry's atry_transition flips OPEN -> HALF_OPEN, so the call goes through instead of fail-fast
     call_count = 0
 
     @with_retry(max_attempts=1, circuit_breaker=cb)

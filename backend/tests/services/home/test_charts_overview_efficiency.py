@@ -1,8 +1,8 @@
-"""B8 Part 1 — charts fetch efficiency.
+"""Charts fetch efficiency.
 
-1a: the three chart overviews fetch the SAME upstream window (count=26,
+The three chart overviews fetch the SAME upstream window (count=26,
 offset=0) that the range-expansion endpoints consume, so the first expansion of
-any range is a pure repo-cache hit. 1b: concurrent identical overviews coalesce
+any range is a pure repo-cache hit. Concurrent identical overviews coalesce
 through the house deduplicator - one leader per method."""
 
 import asyncio

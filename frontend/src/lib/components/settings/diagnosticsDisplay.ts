@@ -1,11 +1,10 @@
 /**
- * Pure view logic for the admin Diagnostics settings card (QW9 Part 5).
- * Label curation, formatting, grouping, and the polling gate live here so
- * specs can pin them in the fast node project without a browser.
+ * Pure view logic for the admin Diagnostics settings card (QW9 Part 5): label
+ * curation, formatting, grouping, and the polling gate - kept here so specs can
+ * pin them without a browser.
  *
- * Wire vocabulary note: the provider-counters `priority`/`outcome` strings come
- * from backend Parts 1/3, which landed concurrently with this card. Curated
- * labels cover the pinned values; everything else falls through to a readable
+ * Provider-counter `priority`/`outcome` strings come from backend Parts 1/3;
+ * curated labels cover the pinned values, everything else falls through to the
  * humanizer instead of breaking the panel.
  */
 import type { ProviderStatsRow, QueueStatsRow } from '$lib/queries/diagnostics/types';

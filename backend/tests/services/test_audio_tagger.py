@@ -29,7 +29,7 @@ def tmp_copy(tmp_path: Path):
     return _copy
 
 
-# -- read: Picard MBID mapping per format --
+# read: Picard MBID mapping per format
 
 
 def test_read_flac_release_group_id(tagger):
@@ -117,7 +117,7 @@ def test_read_m4a_info_has_no_bit_depth(tagger):
     assert info.bit_depth is None
 
 
-# -- read: compilation flag per format --
+# read: compilation flag per format
 
 
 def test_compilation_flag_flac(tagger):
@@ -131,7 +131,7 @@ def test_non_compilation_flag(tagger):
     assert tag.compilation is False
 
 
-# -- read: edge cases --
+# read: edge cases
 
 
 def test_mp3_recording_id_is_stored_as_ufid_not_release_track(tagger, tmp_copy):
@@ -170,7 +170,7 @@ def test_unreadable_file_raises(tagger, tmp_path):
         tagger.read_tags(junk)
 
 
-# -- multi-value genre reads surface every value --
+# multi-value genre reads surface every value
 
 
 def _set_genres(path: Path, genres: list[str]) -> None:
@@ -265,7 +265,7 @@ def test_single_scalar_artist_with_punctuation_remains_one_credit(tagger, tmp_co
     assert [credit.name for credit in tag.artists] == ["Alpha; Beta"]
 
 
-# --- F-EDITION-04: codec-aware MP4-family bit depth ---------------------------
+# F-EDITION-04: codec-aware MP4-family bit depth
 
 class _CodecInfo:
     """Mutagen-info double with controllable codec + bits_per_sample."""

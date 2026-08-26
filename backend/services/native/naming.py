@@ -295,7 +295,7 @@ class NamingTemplateEngine:
         """Normalize an already-literal relative path without template parsing.
 
         F-075: composed fallback paths (e.g. ``<album-dir>/cover.jpg``) must
-        never be re-parsed as template source — brace-bearing directory names
+        never be re-parsed as template source - brace-bearing directory names
         are legal filename characters, and treating them as template bodies
         silently redirects writes or fails with a misleading script error.
         Applies exactly the output-side pipeline of ``format_management_path``:

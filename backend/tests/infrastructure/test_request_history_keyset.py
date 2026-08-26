@@ -152,9 +152,6 @@ async def test_no_count_query_and_plan_uses_the_keyset_index(
     assert "TEMP B-TREE FOR ORDER BY" not in plan_text
 
 
-# --- DownloadStore.get_tasks -------------------------------------------------
-
-
 def _make_download_store(tmp_path: Path) -> DownloadStore:
     class TracedDownloads(DownloadStore):
         def __init__(self, *args, **kwargs):

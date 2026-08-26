@@ -3,14 +3,8 @@
 Each acquisition source (Soulseek via slskd, Usenet via Newznab+SABnzbd) differs in
 search, identity, enqueue, poll→status, completed-file enumeration and cleanup. Lidarr
 sprinkles ``if protocol == usenet`` across its download flow; we collapse those branches
-behind a ``SourceStrategy`` so the orchestrator never branches on source.
-
-Extracted in behaviour-preserving slices (each verbatim + suite-green):
-- slice 1: ``search_and_score`` (find candidates for this source).
-- slice 2a: ``import_files`` (per-file slskd import vs unpacked-folder Usenet import).
-- slice 2b: ``enqueue`` (build + persist the manifest, hand off to the client).
-Source-enablement stays on the orchestrator (it reads the live enable toggles). Later
-slices fold in identity + blocklist-on-failure and the failover-loop source branches.
+behind a ``SourceStrategy`` so the orchestrator never branches on source. Source
+enablement stays on the orchestrator (it reads the live enable toggles).
 """
 
 import asyncio

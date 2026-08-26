@@ -2842,7 +2842,7 @@ async def test_discover_queue_keeps_mismatched_provider_candidate_visible(
     assert RELEASE_GROUP_MBID not in by_mbid
 
 
-# --- F-TARGETCATALOG-06: batch canonical + album-track resolution --------------
+# F-TARGETCATALOG-06: batch canonical + album-track resolution
 
 
 def _resolve_item(rg: str | None, disc: int | None, track: int | None):

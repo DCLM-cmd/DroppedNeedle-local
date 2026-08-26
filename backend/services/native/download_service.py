@@ -1270,7 +1270,7 @@ class DownloadService:
         """The full auto-retry backoff schedule (minutes) for the queue UI's ladder."""
         return self._orchestrator.retry_ladder_minutes()
 
-    # -- held imports ("import anyway" review) --
+    # held imports ("import anyway" review)
 
     async def held_task_ids(self, user_id: str, user_role: str) -> set[str]:
         """Task ids paused for a held-track review, so the queue shows them as needing a

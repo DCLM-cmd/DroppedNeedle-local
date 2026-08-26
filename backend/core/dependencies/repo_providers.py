@@ -694,8 +694,9 @@ def get_newznab_indexer() -> "NewznabIndexer":
         )
         for s in raw
     ]
-    # Keep the search cache TTL BELOW the auto-retry interval (02-… §Rate-limiting) so a
-    # delayed re-search actually re-hits the indexer instead of serving a stale result -
+    # Keep the search cache TTL BELOW the auto-retry interval
+    # (02-newznab-indexer-reference.md §Rate-limiting) so a delayed re-search
+    # actually re-hits the indexer instead of serving a stale result -
     # honoured even when the admin sets a sub-5-minute retry interval.
     retry_interval_s = (
         prefs.get_download_policy().auto_retry_base_interval_minutes * 60.0

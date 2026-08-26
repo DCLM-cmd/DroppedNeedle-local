@@ -4,10 +4,9 @@ from models.library import LibraryAlbum
 
 
 class LibraryRepositoryProtocol(Protocol):
-    """Forward-looking contract for the native library.
+    """Contract for the native library.
 
-    Phase 3's ``LibraryManager`` implements this against ``library_files``.
-    Now satisfied by ``services.native.target_library_repository.TargetLibraryRepository``
+    Implemented by ``services.native.target_library_repository.TargetLibraryRepository``
     via ``NativeLibraryStore``.
     """
 

@@ -28,14 +28,14 @@ vi.mock('$lib/stores/search', () => ({
 
 import { actOnLibraryReview, type ReviewAction } from './LibraryReviewMutations.svelte';
 
-// Review-local layer keys — swept for every action.
+// Review-local layer keys - swept for every action.
 const REVIEW_LOCAL_KEYS = [
 	['library', 'reviews'],
 	['library', 'activity'],
 	['library', 'operations'],
 	['library', 'reviews', 'detail', 'review-1']
 ];
-// Catalog layer keys — only for catalog-mutating actions.
+// Catalog layer keys - only for catalog-mutating actions.
 const CATALOG_KEYS = [['library'], ['artist'], ['home'], ['discover']];
 
 beforeEach(() => {

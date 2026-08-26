@@ -2,8 +2,8 @@
 
 Reads tag metadata and cover art across the legacy scan formats:
 MP3 (ID3v2), FLAC/OGG (Vorbis comments), and M4A (MP4 atoms). The MusicBrainz
-fields use the Picard tag names. All writes now go through the staged management
-metadata engine and its tested per-format adapters.
+fields use the Picard tag names. All writes go through the staged management
+metadata engine and its per-format adapters.
 
 This is the mock seam for the scanner: tests mock ``AudioTagger`` (or
 ``mutagen.File``), never mutagen's per-format classes directly.
@@ -247,8 +247,6 @@ class AudioTagger:
                 return bytes(frame.data)
         return None
 
-    # -- ID3v2 (MP3) --
-
     def _read_id3(self, audio: Any) -> AudioTag:
         tags = audio.tags
         if tags is None:
@@ -308,8 +306,6 @@ class AudioTagger:
         )
         return out
 
-    # -- Vorbis (FLAC/OGG) --
-
     def _read_vorbis(self, audio: Any) -> AudioTag:
         def g(key: str) -> Any:
             return audio.get(key)
@@ -353,8 +349,6 @@ class AudioTagger:
             musicbrainz_album_artist_ids=album_artist_ids,
             **mb,
         )
-
-    # -- MP4 (M4A) --
 
     def _read_mp4(self, audio: Any) -> AudioTag:
         tags = audio.tags or {}
@@ -430,8 +424,6 @@ class AudioTagger:
             musicbrainz_album_artist_ids=album_artist_ids,
             **mb,
         )
-
-    # -- technical info --
 
     def _read_info(self, audio: Any, path: Path, fmt: str) -> AudioInfo:
         info = audio.info

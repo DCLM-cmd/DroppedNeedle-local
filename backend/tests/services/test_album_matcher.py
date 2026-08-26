@@ -585,7 +585,7 @@ async def test_identify_all_zero_count_editions_resolve_to_none():
     repo.get_release_by_id.assert_not_awaited()
 
 
-# -- fingerprint-seeded identification (prevents one folder scattering across RGs) --
+# fingerprint-seeded identification (prevents one folder scattering across RGs)
 
 
 def _comp_release(n_tracks):
@@ -701,7 +701,7 @@ async def test_seed_release_groups_none_preserves_tag_only_behaviour():
     assert unseeded is None and seeded is None
 
 
-# -- Phase 3: release-type preference (studio Album > compilation/live/EP) --
+# Phase 3: release-type preference (studio Album > compilation/live/EP)
 
 
 def _album_vs_ep_repo():
@@ -801,7 +801,7 @@ async def test_release_group_type_uses_background_priority():
     )
 
 
-# -- Phase 3 (EditionsEtc S-4): winner-margin floor across accepted candidates --
+# Phase 3 (EditionsEtc S-4): winner-margin floor across accepted candidates
 
 
 def _margin_locals():

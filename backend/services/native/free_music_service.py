@@ -65,7 +65,7 @@ class FreeMusicService:
         self._cancels: dict[str, asyncio.Event] = {}
         self._lifecycle_locks: dict[str, asyncio.Lock] = {}
 
-    # -- public API (mirrors DownloadService's dispatch surface) --
+    # mirrors DownloadService's dispatch surface
 
     def is_ready(self) -> bool:
         return self._prefs.get_free_music_settings().enabled
@@ -199,8 +199,6 @@ class FreeMusicService:
         )
         if failed:
             logger.info("free_music.stale_failed", extra={"tasks": failed})
-
-    # -- task lifecycle --
 
     async def _start(
         self,
@@ -443,8 +441,6 @@ class FreeMusicService:
             },
         )
 
-    # -- candidates --
-
     async def _find_candidates(
         self, task: FreeMusicTask, track_count: int
     ) -> list[FreeMusicCandidate]:
@@ -517,8 +513,6 @@ class FreeMusicService:
             tier_for(candidate.extension, None, None)
         )  # no depth evidence
         return (count_delta, not_preferred, quality, -candidate.size_bytes)
-
-    # -- download --
 
     async def _download_with_retry(
         self,
@@ -606,8 +600,6 @@ class FreeMusicService:
         if not updated:
             raise _Cancelled
         return written
-
-    # -- helpers --
 
     async def _fail(self, task_id: str, user_id: str, message: str) -> None:
         failed = await self._store.update(

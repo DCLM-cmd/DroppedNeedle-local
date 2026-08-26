@@ -7,13 +7,11 @@ from api.v1.schemas.settings import (
     _OFFICIAL_MB_CONCURRENT_SEARCHES,
 )
 
-# P2 full-mirror tier fixtures
 OFFICIAL = "https://musicbrainz.org/ws/2"
 MIRROR = "https://mirror.example.com/ws/2"
 
 
 class TestIsOfficialMusicBrainz:
-    """Test the URL detection helper."""
 
     def test_official_https(self):
         assert is_official_musicbrainz("https://musicbrainz.org/ws/2") is True
@@ -50,7 +48,6 @@ class TestIsOfficialMusicBrainz:
 
 
 class TestMusicBrainzSettingsClamping:
-    """Test that rate limits are clamped for official API."""
 
     def test_official_url_clamps_rate_limit(self):
         settings = MusicBrainzConnectionSettings(
@@ -103,7 +100,6 @@ class TestMusicBrainzSettingsClamping:
 
 
 class TestInstanceId:
-    """Test instance ID generation and retrieval."""
 
     def test_ensure_instance_id_generates_on_first_run(self, tmp_path):
         from core.config import Settings
@@ -126,7 +122,6 @@ class TestInstanceId:
         prefs1 = PreferencesService(settings)
         id1 = prefs1.get_instance_id()
 
-        # Create a new instance pointing to the same config
         prefs2 = PreferencesService(settings)
         id2 = prefs2.get_instance_id()
 
@@ -206,7 +201,7 @@ class TestNonOfficialWidenedBounds:
 class TestOfficialClampWarning:
     """Official ceilings are absolute; raised entries surface
     clamped_to_official_limits on the save/settings response (applied, never
-    refused). Channel choice: a field on MusicBrainzConnectionSettings itself —
+    refused). Channel choice: a field on MusicBrainzConnectionSettings itself -
     the PUT /settings/musicbrainz response already returns the mutated struct."""
 
     def test_official_raised_values_surface_clamp_warning(self):

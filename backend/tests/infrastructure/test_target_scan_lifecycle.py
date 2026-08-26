@@ -1923,7 +1923,7 @@ async def test_disabled_startup_narrowly_recovers_stopping_without_resuming_work
     # inventory_cleanup_pending should be set correctly (exists if inventory exists)
     # No resumable work should be returned while disabled
     assert recovered == [] or all(r.state != "cancelled" for r in recovered) or any(r.id == run.id for r in recovered)
-    # Scheduler and run_once should remain disabled — run_once returns None
+    # scheduler and run_once stay disabled - run_once returns None
     assert await coordinator.run_once({"root-a": root}) is None
     # Re-enable and verify queued follow-up can claim without restart
 @pytest.mark.asyncio
@@ -3098,9 +3098,6 @@ async def test_control_exit_scope_diagnostic_is_not_permission_denied(
             (run.id,),
         ).fetchone()
     assert scope_row == ("partially_read", None)
-
-
-# --- Cluster 4 WALK: F-021 / F-020 / F-031 lifecycle coverage -----------------
 
 
 @pytest.mark.asyncio

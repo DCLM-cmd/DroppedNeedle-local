@@ -141,7 +141,7 @@ def test_numbered_sequel_still_rejected_after_edition_additions():
     assert names_different_album("OK Computer", "Radiohead", "Radiohead Kid A")
 
 
-# --- title_containment_score: names the expected title AND NOTHING ELSE (P2/P3.4) ----
+# title_containment_score: names the expected title AND NOTHING ELSE (P2/P3.4)
 
 
 def test_containment_exact_and_numbered():
@@ -196,7 +196,7 @@ def test_containment_missing_expected_words_lower_coverage():
     assert title_containment_score("Houses of the Holy", "Houses") == pytest.approx(0.5)
 
 
-# --- artist_evidence: the tier='auto' identity gate (D2, 2026-07-05 incident) ---------
+# artist_evidence: the tier='auto' identity gate (D2, 2026-07-05 incident)
 
 
 def test_artist_evidence_incident_wrong_artist_path_is_not_evidence():
@@ -297,7 +297,7 @@ def test_boxset_compound_folds_but_bare_set_stays_an_album_word() -> None:
     ) is True
 
 
-# --- GH-284: digit-bearing artist names earn evidence safely --------------------
+# GH-284: digit-bearing artist names earn evidence safely
 
 
 @pytest.mark.parametrize(

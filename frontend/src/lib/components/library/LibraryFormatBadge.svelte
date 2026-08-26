@@ -1,8 +1,7 @@
 <script lang="ts">
-	// Album-level format badge. The album summary carries the normalized format
-	// for a homogeneous album, or the literal 'mixed' when its indexed tracks use
-	// more than one format (F-PERF-10 display policy - not a quality ranking).
-	// There is no bitrate here; the per-track AudioQualityBadge handles bitrate.
+	// The album summary carries a normalized format for homogeneous albums, or the
+	// literal 'mixed' when indexed tracks use more than one format (F-PERF-10 display
+	// policy, not a quality ranking). bitrate lives on per-track AudioQualityBadge.
 	interface Props {
 		format: string | null | undefined;
 		size?: string;

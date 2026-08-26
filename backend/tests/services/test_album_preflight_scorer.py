@@ -642,7 +642,7 @@ async def test_fedition03_reissue_folder_rankable_but_sequel_excluded():
     assert await scorer.rank(target, sequel) == []  # different album excluded
 
 
-# --- GH-284: digit-bearing artists earn evidence from their own paths ----------
+# GH-284: digit-bearing artists earn evidence from their own paths
 
 
 def _result_for(filename: str) -> DownloadSearchResult:

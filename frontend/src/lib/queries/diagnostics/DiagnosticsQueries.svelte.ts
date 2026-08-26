@@ -7,15 +7,13 @@ import { createQuery } from '@tanstack/svelte-query';
 import { DiagnosticsQueryKeyFactory } from './DiagnosticsQueryKeyFactory';
 import type { ProviderStats, QueueStats } from './types';
 
-/** Live gauges: a stale second is worth less than a spare request, but the
- * cadence stays modest - the backend counters are plain dict reads. */
+/** Gauges must stay fresh; polling is cheap - the backend counters are plain
+ * dict reads. */
 const POLL_INTERVAL_MS = 5_000;
 
 /**
- * Outbound queue-lane occupancy (QW9 Part 1). Polls every 5 s while the
- * Diagnostics section is on screen and the document is visible; `enabled` is
- * handed in by the caller so a closed settings tab or a hidden window issues
- * no requests at all.
+ * Outbound queue-lane occupancy (QW9 Part 1). `enabled` comes from the caller:
+ * a closed settings tab or hidden window must issue no requests at all.
  */
 export const getQueueStatsQuery = (getEnabled: Getter<boolean> = () => true) =>
 	createQuery(() => ({
@@ -23,7 +21,7 @@ export const getQueueStatsQuery = (getEnabled: Getter<boolean> = () => true) =>
 		enabled: getEnabled(),
 		staleTime: 0, // gauges must be live: never serve a persisted snapshot on re-entry
 		refetchInterval: POLL_INTERVAL_MS,
-		// default, stated explicitly: background-tab polling is part of the contract
+		// library default, spelled out: no polling while the tab is hidden
 		refetchIntervalInBackground: false,
 		refetchOnWindowFocus: false,
 		queryFn: ({ signal }) => api.global.get<QueueStats>(API.system.queueStats(), { signal })

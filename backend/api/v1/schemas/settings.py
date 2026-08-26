@@ -188,8 +188,8 @@ class DownloadPolicySettings(AppStruct):
     # Don't permanently blocklist a Usenet release younger than this; let it retry once it
     # has propagated across Usenet servers (review M4 / owner Q2).
     usenet_min_release_age_minutes: int = 30
-    # --- Acquisition-pipeline substrate (ArrRebuild). Source-agnostic; consumed by the
-    # decision specs. All default to "off" so behaviour is unchanged until opted in. ---
+    # Acquisition-pipeline substrate (ArrRebuild). Source-agnostic; consumed by the
+    # decision specs. All default to "off" so behaviour is unchanged until opted in.
     # Hard upper bound on a single album's total size (0 = unbounded). Rejects a mislabeled
     # boxset/discography before the bytes are spent.
     max_size_mb: int = 0
@@ -201,7 +201,7 @@ class DownloadPolicySettings(AppStruct):
     ignored_terms: list[str] = msgspec.field(default_factory=list)
     # When non-empty, a release must match at least one of these to be considered.
     required_terms: list[str] = msgspec.field(default_factory=list)
-    # --- Upgrade/cutoff substrate (full feature lives in CollectionManagement). ---
+    # Upgrade/cutoff substrate (full feature lives in CollectionManagement).
     # Stop upgrading once a release-group's worst track reaches this tier.
     quality_cutoff: str = "lossless"
     # Master opt-in for replacing held lower-quality files with better ones.
@@ -212,14 +212,14 @@ class DownloadPolicySettings(AppStruct):
     recycle_bin_path: str = ""
     # Recycled files older than this are pruned by the periodic task.
     recycle_retention_days: int = 30
-    # --- Cost control (CollectionManagement Feature C). 0 = unlimited. Caps BLOCK
+    # Cost control (CollectionManagement Feature C). 0 = unlimited. Caps BLOCK
     # new non-upgrade grabs at/over the ceiling; nothing is ever auto-evicted (A3).
     # Per-user values are defaults; user_quotas rows override them (NULL = inherit).
     max_library_size_gb: int = 0
     default_request_quota_count: int = 0
     default_request_quota_days: int = 7
     default_storage_quota_gb: int = 0
-    # --- Background upgrade scan (CollectionManagement Phase 5; opt-in, default OFF).
+    # Background upgrade scan (CollectionManagement Phase 5; opt-in, default OFF).
     # Runs only while upgrade_allowed is ALSO on; enqueues at most
     # background_upgrade_max_per_run origin='upgrade' grabs per sweep.
     background_upgrade_scan_enabled: bool = False
@@ -346,7 +346,7 @@ class SabnzbdConnectionSettings(AppStruct):
 
 class NewznabIndexerSettings(AppStruct):
     """One configured Newznab indexer (D6). ``api_key`` is a Fernet-encrypted
-    secret, masked on read and preserved on a masked save - **per array element**.
+    secret, masked on read and preserved on a masked save - per array element.
     DroppedNeedle ships no indexers; the user adds their own (guardrail 1)."""
 
     id: str = ""

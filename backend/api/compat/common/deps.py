@@ -1,8 +1,7 @@
 """Shared DI bundle for the compat shims.
 
-Resolve services through FastAPI Depends so tests can override individual
-providers via app.dependency_overrides; bundling keeps route signatures short
-while each inner Depends stays independently overridable.
+Each service resolves through Depends so tests can override it via
+app.dependency_overrides; bundling keeps route signatures short.
 """
 
 from __future__ import annotations

@@ -11,7 +11,7 @@ from services.discover.mbid_resolution_service import MbidResolutionService
 
 
 def _store():
-    """ST2 cutover: mock the canonical store's release_to_rg interface."""
+    """Mock the canonical store's release_to_rg interface."""
     store = MagicMock()
     store.get_release_to_rg_batch = AsyncMock(return_value={})
     saved: list[dict] = []

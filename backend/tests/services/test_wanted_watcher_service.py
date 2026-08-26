@@ -227,7 +227,7 @@ async def test_library_removal_opt_out_does_not_revive_a_stopped_watch(env):
     assert watch.state == "stopped"
 
 
-# --- enrolment classifier, tied to the orchestrator's constants (§4.5) ---
+# enrolment classifier, tied to the orchestrator's constants (§4.5)
 
 
 def test_orchestrator_messages_start_with_the_imported_constants(tmp_path):
@@ -343,7 +343,7 @@ async def test_release_date_falls_back_to_request_year(env):
     assert (await env.store.get_watch("rg-1")).first_release_date == "2026"
 
 
-# --- re-enrolment rules (§5.2.1) ---
+# re-enrolment rules (§5.2.1)
 
 
 @pytest.mark.asyncio
@@ -387,7 +387,7 @@ async def test_fulfilled_watch_rearms_only_on_a_newer_failed_request(env):
     assert watch.check_count == 0
 
 
-# --- quarantine untouched (D5) ---
+# quarantine untouched (D5)
 
 
 @pytest.mark.asyncio
@@ -467,7 +467,7 @@ async def test_request_album_with_retry_origin_skips_the_blocklist_clear():
     store.delete_quarantine_for_album.assert_not_awaited()
 
 
-# --- seen-candidate dedup (D2) ---
+# seen-candidate dedup (D2)
 
 
 @pytest.mark.asyncio
@@ -513,7 +513,7 @@ async def test_rejected_tier_results_count_as_no_results(env):
     env.sse.publish.assert_not_awaited()
 
 
-# --- auto-tier dispatch (D2/D8, §4.8) ---
+# auto-tier dispatch (D2/D8, §4.8)
 
 
 @pytest.mark.asyncio
@@ -567,7 +567,7 @@ async def test_already_in_library_dispatch_fulfils_the_watch(env):
     env.requests.async_update_download_task_id.assert_not_awaited()
 
 
-# --- partial wants (D6/D9) ---
+# partial wants (D6/D9)
 
 
 @pytest.mark.asyncio
@@ -647,7 +647,7 @@ async def test_partial_want_without_tracklist_fails_open(env):
     assert watch.next_check_at > time.time()
 
 
-# --- satisfaction-first (D6 edge case) ---
+# satisfaction-first (D6 edge case)
 
 
 @pytest.mark.asyncio
@@ -683,7 +683,7 @@ async def test_missing_want_without_tracklist_uses_library_presence(env):
     env.ds.scout_album.assert_not_awaited()
 
 
-# --- active-work guards (§4.9) ---
+# active-work guards (§4.9)
 
 
 @pytest.mark.asyncio
@@ -719,7 +719,7 @@ async def test_unresolved_held_import_guard_skips_the_scout(env):
     env.ds.scout_album.assert_not_awaited()
 
 
-# --- cadence + dormancy (D3) ---
+# cadence + dormancy (D3)
 
 
 def _date_days_ago(days: int) -> str:
@@ -757,7 +757,7 @@ async def test_want_goes_dormant_after_the_watch_window(env):
     assert watch.last_outcome == "no_results"
 
 
-# --- "None of these - keep watching" (owner decision 2026-07-06) ---
+# "None of these - keep watching" (owner decision 2026-07-06)
 
 
 def _parked_task(mbid: str = "rg-1", user_id: str = "user-a"):
@@ -859,7 +859,7 @@ async def test_dismiss_review_track_task_watches_as_partial(env):
     assert watch.kind == "partial"
 
 
-# --- read-only retrying rows (owner decision 2026-07-06) ---
+# read-only retrying rows (owner decision 2026-07-06)
 
 
 @pytest.mark.asyncio
@@ -910,7 +910,7 @@ async def test_list_retrying_scopes_to_the_caller_unless_admin(env):
     assert {i.release_group_mbid for i in everyone} == {"rg-mine", "rg-theirs"}
 
 
-# --- toggles + error isolation ---
+# toggles + error isolation
 
 
 @pytest.mark.asyncio
@@ -1004,28 +1004,16 @@ async def test_enrol_open_breaker_skips_provider_calls_and_uses_year_fallback_wi
 @pytest.mark.asyncio
 async def test_enrol_healthy_duplicate_mbid_calls_once_and_caches(env):
     env.watcher._provider_available = lambda: True  # type: ignore
-    recs = [_record(mbid="rg-dup", year=2020), _record(mbid="rg-dup", year=2020)]
-    # Need distinct records but same MBID, they will be separate history rows but same MBID;
-    # The second will be seen as already watching after first enrol, so to test cache we need two distinct MBIDs? Actually duplicate MBID across records: second record's _maybe_enrol will see existing watch and return False, so not testing cache.
-    # Instead test duplicate MBID in same sweep where both are eligible and not yet watched, but cache should cause one provider call.
-    # Use two different records with same MBID but distinct user? The second will be blocked by existing watch check, so to test cache we need to ensure both are processed before watch exists? The loop processes sequentially, so first creates watch, second sees existing watch and returns False, so cache not tested.
-    # To test cache, we need two records with same MBID where second is not blocked by existing watch check: we can make second record's existing watch check pass because first's watch is for different MBID? No.
-    # Better to test that two different eligible records with same MBID where the first's provider call is cached for second's *re-try*? Actually the cache is per sweep, so if we have two records with same MBID and both are eligible and first creates watch, second will be blocked, not calling provider again. That still proves no second call, but not cache of provider date.
-    # To truly test cache, we need to have provider return date and ensure second duplicate record would have used cache if it had reached provider call, but it doesn't because of existing watch.
-    # Instead we test that healthy provider with duplicate MBID across two separate enrolable records where the second is not blocked by watch existence because we use different MBIDs? Hmm.
-    # Simpler: test that for two eligible records with same MBID, where we bypass the existing-watch check by using distinct MBIDs? We need a different approach: test that cache prevents second provider call when two records with same MBID are both not yet watched but processed in same sweep, and the second record's watch creation would need provider date but should hit cache. However as noted, second will be blocked by existing watch, so we can't test cache via _maybe_enrol.
-    # Instead we can test cache directly via _first_release_date_for_mbid.
+    # duplicate MBIDs collapse into one watch on enrol, so exercise the provider
+    # cache directly via _first_release_date_for_mbid
     cache: dict[str, str | None] = {}
     env.mb.get_release_group_by_id.return_value = {"first-release-date": "2020-05-17"}
-    # First call
     d1 = await env.watcher._first_release_date_for_mbid("rg-dup", 1999, True, cache)
     assert d1 == "2020-05-17"
     assert env.mb.get_release_group_by_id.call_count == 1
-    # Second call same MBID should hit cache, no second provider call
     d2 = await env.watcher._first_release_date_for_mbid("rg-dup", 1999, True, cache)
     assert d2 == "2020-05-17"
     assert env.mb.get_release_group_by_id.call_count == 1
-    # Different MBID should call again
     env.mb.get_release_group_by_id.return_value = {"first-release-date": "2021-01-01"}
     d3 = await env.watcher._first_release_date_for_mbid("rg-other", 1999, True, cache)
     assert d3 == "2021-01-01"
@@ -1041,7 +1029,6 @@ async def test_enrol_caches_none_and_fallback_year(env):
     d1 = await env.watcher._first_release_date_for_mbid("rg-none", 2005, True, cache)
     assert d1 == "2005"
     assert env.mb.get_release_group_by_id.call_count == 1
-    # Second call same MBID should be cached, no second provider call, still fallback
     d2 = await env.watcher._first_release_date_for_mbid("rg-none", 2005, True, cache)
     assert d2 == "2005"
     assert env.mb.get_release_group_by_id.call_count == 1
@@ -1057,7 +1044,6 @@ async def test_enrol_caches_none_and_fallback_year(env):
 async def test_enrol_preserves_existing_exclusions_under_open(env, caplog):
     env.watcher._provider_available = lambda: False  # type: ignore
     caplog.set_level("WARNING")
-    # Mix of eligible and ineligible records under OPEN
     eligible = _record(mbid="rg-eligible", year=2020, status="failed", task_id="task-eligible")
     taskless = _record(mbid="rg-taskless", year=2020, status="failed", task_id=None)
     local_fault = _record(mbid="rg-fault", year=2020, status="failed", task_id="task-fault")
@@ -1102,7 +1088,6 @@ async def test_enrol_isolates_per_record_error_under_open(env, caplog):
     assert await env.store.get_watch("rg-good") is not None
     assert (await env.store.get_watch("rg-good")).first_release_date == "2020"
     assert await env.store.get_watch("rg-bad") is None
-    # Per-record error logged with traceback, outage signal still exactly one and without traceback
     outage = [r for r in caplog.records if "wanted.enrol_provider_outage" in r.message]
     per_record = [r for r in caplog.records if "wanted.enrol_failed" in r.message]
     assert len(outage) == 1
@@ -1127,12 +1112,10 @@ async def test_disabled_toggle_short_circuits_without_provider_call(env):
 
 @pytest.mark.asyncio
 async def test_outer_cadence_and_due_delay_preserved(env):
-    # Enrol part should not affect due-watch delay; ensure run_sweep still sleeps once per due check is separate
-    # This test verifies that _enrol does not add inter-record sleeps and that disabled path is fast
+    # _enrol must not add inter-record sleeps; run_sweep cadence stays intact
     env.watcher._provider_available = lambda: True  # type: ignore
     _serve_history(env, failed=[_record()])
     env.download_store.get_task.return_value = _task(error=_NO_MATCH_MSG)
-    # Also test that provider_available is called exactly once per sweep
     calls: list[int] = []
     orig = env.watcher._provider_available
     def counting():
@@ -1141,9 +1124,6 @@ async def test_outer_cadence_and_due_delay_preserved(env):
     env.watcher._provider_available = counting  # type: ignore
     await env.watcher.run_sweep()
     assert len(calls) == 1
-    # Inter-want delay is only for due wants, not enrolment; enrolment should not sleep
-    # We can't easily test sleep without mocking asyncio.sleep, but we verify enrolment completed quickly
-    assert True
 
 @pytest.mark.asyncio
 async def test_duplicate_mbid_differing_years_under_open_uses_per_record_year_and_zero_calls(env, caplog):
@@ -1179,7 +1159,6 @@ async def test_duplicate_mbid_differing_years_healthy_provider_returns_none_uses
     d2 = await env.watcher._first_release_date_for_mbid("rg-dup2", 2010, True, cache)
     assert d2 == "2010"  # per-record year, not cached 2000
     assert env.mb.get_release_group_by_id.call_count == 1  # still one call, second hit cache None
-    # Also test that provider date is cached and reused regardless of year
     cache2: dict[str, str | None] = {}
     env.mb.get_release_group_by_id.return_value = {"first-release-date": "1995-01-01"}
     d3 = await env.watcher._first_release_date_for_mbid("rg-dup3", 2000, True, cache2)
@@ -1190,7 +1169,7 @@ async def test_duplicate_mbid_differing_years_healthy_provider_returns_none_uses
     assert env.mb.get_release_group_by_id.call_count == 2
 
 
-# --- F-PERF-03: batched retrying-history reads -------------------------------
+# F-PERF-03: batched retrying-history reads
 
 
 @pytest.mark.asyncio
@@ -1264,7 +1243,7 @@ async def test_enrol_reuses_batched_task_data_without_single_reads(env):
     assert summary.enrolled == 1
 
 
-# --- F-PERF-09: one immutable membership snapshot per sweep --------------------
+# F-PERF-09: one immutable membership snapshot per sweep
 
 
 def _install_membership_counter(env, members: set[str]):

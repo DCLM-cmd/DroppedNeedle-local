@@ -232,9 +232,6 @@ async def test_exact_release_propagates_provider_failure_without_substitution() 
         )
 
 
-# --- F-062: single-source-of-truth edition selection across lanes -------------
-
-
 def test_select_edition_prefers_official_skips_zero_count_and_ties_stably():
     from repositories.musicbrainz_base import select_edition
 

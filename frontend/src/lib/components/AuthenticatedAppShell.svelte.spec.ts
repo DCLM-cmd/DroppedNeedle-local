@@ -4,11 +4,10 @@ import { render } from 'vitest-browser-svelte';
 import { createRawSnippet } from 'svelte';
 
 // GH-281: the desktop sidebar had no scroll boundary, so on short viewports the
-// bottom controls (Settings / Log out / Open toggle) sat below the fold and were
-// unreachable. These specs pin the viewport-bounded, scrollable inner nav
-// container in both the collapsed and expanded drawer states. The shell mounts
-// through +layout.svelte so it runs inside the production QueryProvider, and the
-// client project compiles src/app.css so the daisyUI drawer geometry is real.
+// bottom controls sat below the fold. These specs pin the viewport-bounded,
+// scrollable inner nav container in both drawer states. The shell mounts through
+// +layout.svelte so it runs inside the production QueryProvider, and src/app.css
+// is compiled so the daisyUI drawer geometry is real.
 
 const { routeState } = vi.hoisted(() => ({ routeState: { pathname: '/' } }));
 

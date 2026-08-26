@@ -1,7 +1,7 @@
 """F-TARGETCATALOG-04: artist MBID paging via the store keyset query.
 
 The repository delegates each page to
-``NativeLibraryStore.target_provider_artist_ids_page`` — one bounded keyset
+``NativeLibraryStore.target_provider_artist_ids_page`` - one bounded keyset
 SQL read per page, never the full-set ``target_provider_artist_ids``. The
 mocked-store tests below pin that delegation contract (casefolded ordering,
 strict cursor advancement, blank-ID skip handled by SQL, empty termination,

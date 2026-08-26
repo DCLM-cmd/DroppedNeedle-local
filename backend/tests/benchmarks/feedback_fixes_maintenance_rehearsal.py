@@ -702,7 +702,6 @@ def _write_audio_fixture(music_root: Path) -> None:
 def _seed_production_shape(
     database_path: Path, music_root: Path, *, total_files: int
 ) -> dict[str, object]:
-    """Extend the representative fixture to the approved 115,000-file shape."""
 
     existing_files = 4
     additional = total_files - existing_files

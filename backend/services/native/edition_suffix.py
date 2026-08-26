@@ -1,10 +1,9 @@
-"""Shared edition-suffix normalization for album title comparison.
+"""Shared edition-suffix normalization for album title comparison (F-MATCH-01).
 
-One maintained implementation of the provider-matching suffix convention
-(F-MATCH-01): ``musicbrainz_matcher`` and the target evidence engine must fold
-album titles through this helper so both surfaces compare the same base title.
-The suffix set is an existing provider-matching convention; extend it only with
-a separately evidenced provider qualifier.
+Both ``musicbrainz_matcher`` and the target evidence engine must fold album
+titles through this helper so both surfaces compare the same base title. The
+suffix set is an existing provider-matching convention; extend it only with a
+separately evidenced provider qualifier.
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ WHITESPACE = re.compile(r"\s+")
 
 
 def strip_edition_suffix(title: str) -> str:
-    """Remove edition qualifiers + leftover brackets, collapse whitespace."""
     stripped = EDITION_SUFFIXES.sub("", title)
     stripped = BRACKETS.sub(" ", stripped)
     return WHITESPACE.sub(" ", stripped).strip()

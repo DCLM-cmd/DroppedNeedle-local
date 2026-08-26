@@ -197,7 +197,6 @@ class CircuitOpenError(Exception):
     ):
         super().__init__(message)
         self.breaker_name = breaker_name
-        # Validate positive finite
         try:
             value = (
                 float(retry_after_seconds) if retry_after_seconds is not None else None
@@ -238,11 +237,9 @@ def with_retry(
         raise ValueError("max_attempts must be >= 1")
 
     def decorator(func: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
-        # QW11 Part 1: breaker outcomes are reported once per LOGICAL call.
-        # ``arecord_success``/``arecord_failure`` fire after the final attempt
-        # (or on first success), never once per retry attempt, so a 3-attempt
-        # failure chain increments ``failure_count`` by exactly 1. See the
-        # ``CircuitBreaker.record_failure`` docstring for HALF_OPEN policy.
+        # QW11 Part 1: report once per logical call - after the final attempt,
+        # not per retry, so a 3-attempt failure chain bumps failure_count once.
+        # See ``CircuitBreaker.record_failure`` for HALF_OPEN policy.
         @wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             service_name = circuit_breaker.name if circuit_breaker else "unknown"
@@ -258,7 +255,6 @@ def with_retry(
                             circuit_breaker.name,
                             extra={"service_name": service_name, "function": func_name},
                         )
-                    # Validate positive finite, fallback to timeout if needed
                     if (
                         retry_after is None
                         or not math.isfinite(retry_after)

@@ -87,9 +87,6 @@ def _client(tmp_path, *, role: str | None = "user", user_id: str = OWNER_ID):
     return client
 
 
-# --- auth matrix ---
-
-
 @pytest.mark.parametrize("method,path", _ENDPOINTS)
 def test_unauthenticated_gets_401(tmp_path, method, path):
     client = _client(tmp_path, role=None)
@@ -122,9 +119,6 @@ def test_unknown_watch_is_404(tmp_path):
 def test_invalid_mbid_is_400(tmp_path):
     client = _client(tmp_path)
     assert client.post("/requests/wanted/not-a-mbid/stop").status_code == 400
-
-
-# --- behaviour ---
 
 
 def test_list_scopes_to_the_caller(tmp_path):
@@ -252,7 +246,7 @@ def test_seen_clears_the_badge(tmp_path):
     assert body["items"][0]["new_candidate_count"] == 0
 
 
-# --- F-PERF-03: /requests/wanted over a multi-page real history ---------------
+# F-PERF-03: /requests/wanted over a multi-page real history
 
 
 def _real_stores_watcher(tmp_path, *, linked_rows: int):

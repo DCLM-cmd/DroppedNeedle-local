@@ -182,9 +182,6 @@ async def test_audiodb_monitored_persistent_vs_recent(tmp_path):
     assert recent_file.exists()
 
 
-# --- F-PERF-06: throttled access touches --------------------------------------
-
-
 def _album_payload(mbid: str) -> AlbumInfo:
     return AlbumInfo(
         title="The Moon Song",

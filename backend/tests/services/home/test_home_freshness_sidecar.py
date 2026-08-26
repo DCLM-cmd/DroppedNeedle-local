@@ -1,8 +1,8 @@
-"""B8 Part 2 — sweep-coherent home freshness bookkeeping (sidecar).
+"""Sweep-coherent home freshness bookkeeping (sidecar).
 
 The freshness timestamp lives in a cache entry under HOME_RESPONSE_PREFIX so it
-is swept together with the payload it describes. These tests pin the three
-behaviors the plan calls out: sweeps trigger immediate rebuilds, failed-build
+is swept together with the payload it describes. These tests pin three
+behaviors: sweeps trigger immediate rebuilds, failed-build
 backoff survives via the sidecar's ok=False marker, and a missing/swept sidecar
 never masks a missing payload."""
 

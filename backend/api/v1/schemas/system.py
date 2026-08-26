@@ -1,5 +1,4 @@
-"""Admin-gated runtime observability contracts (QW9 Parts 1 and 3, QW11
-Parts 2-3 exposure).
+"""Admin-gated runtime observability contracts.
 
 Pure gauges over in-process state: priority-lane occupancy from
 ``PriorityQueueManager.get_stats()``, outbound provider-call counters, and
@@ -34,9 +33,9 @@ class ProviderStatRow(AppStruct):
 
 
 class ProviderRateLimitStat(AppStruct):
-    """Latest observed upstream rate-limit headers for one provider
-    (QW11 Part 2). Pure telemetry - deliberately separate from the call
-    counters so observations can never perturb call outcomes."""
+    """Latest observed upstream rate-limit headers for one provider. Pure
+    telemetry - deliberately separate from the call counters so observations
+    can never perturb call outcomes."""
 
     provider: str
     limit: int | None = None
