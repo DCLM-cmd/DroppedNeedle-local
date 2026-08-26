@@ -190,6 +190,11 @@ class LibraryInventoryScanner:
         checkpoint: Checkpoint,
     ) -> ScanRun:
         current = run
+        # GH-296 skip-and-report accounting: a scope whose root cannot be
+        # resolved or probed is recorded honestly (failure row + unavailable
+        # scope) while remaining scopes keep walking. The run fails wholesale
+        # only when nothing was discoverable at all.
+        unavailable_scopes = 0
         for scope in scopes:
             if (
                 await self._store.get_scan_scope_discovery_state(
@@ -218,14 +223,10 @@ class LibraryInventoryScanner:
                     state="unavailable",
                     error_code="ROOT_UNAVAILABLE",
                 )
-                return await self._store.transition_scan_run(
-                    run.id,
-                    expected_state=current.state,
-                    expected_revision=current.row_revision,
-                    new_state="failed",
-                    now=self._clock(),
-                    terminal_code="ROOT_UNAVAILABLE",
-                )
+                # GH-296: report the unresolvable scope and continue with the
+                # remaining scopes instead of failing the whole run.
+                unavailable_scopes += 1
+                continue
             selected = (
                 root if scope.relative_path == "." else root / scope.relative_path
             )
@@ -428,14 +429,10 @@ class LibraryInventoryScanner:
                     state="unavailable",
                     error_code="ROOT_UNAVAILABLE",
                 )
-                return await self._store.transition_scan_run(
-                    run.id,
-                    expected_state=current.state,
-                    expected_revision=current.row_revision,
-                    new_state="failed",
-                    now=self._clock(),
-                    terminal_code="ROOT_UNAVAILABLE",
-                )
+                # GH-296: report the missing path and continue with the
+                # remaining scopes instead of failing the whole run.
+                unavailable_scopes += 1
+                continue
             while True:
                 discovery_generation = (
                     await self._store.get_scan_scope_discovery_generation(
@@ -485,6 +482,22 @@ class LibraryInventoryScanner:
                 scope.relative_path,
                 state="completed",
                 error_code=None,
+            )
+        if unavailable_scopes and unavailable_scopes == len(scopes):
+            # GH-296: every scope proved unreachable, so the run terminates
+            # honestly as failed instead of completing silently green.
+            logger.warning(
+                "library_scan event=all_scopes_unavailable run_id=%s count=%d",
+                run.id,
+                unavailable_scopes,
+            )
+            return await self._store.transition_scan_run(
+                run.id,
+                expected_state=current.state,
+                expected_revision=current.row_revision,
+                new_state="failed",
+                now=self._clock(),
+                terminal_code="ROOT_UNAVAILABLE",
             )
         return current
 

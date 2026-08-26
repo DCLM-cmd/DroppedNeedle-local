@@ -108,6 +108,22 @@ class LibraryScanCoordinator:
             scope.policy_revision != request.policy_revision for scope in request.scopes
         ):
             raise StaleRevisionError("The selected library policy has changed.")
+        if request.kind != "policy_reconcile":
+            # GH-296: a request may not queue scopes for unconfigured roots;
+            # such a queued run could never succeed and poisoned every later
+            # claim. Frozen policy-apply scopes are exempt: a removed root's
+            # frozen scope is the sanctioned F-TARGETCATALOG-02 Apply carrier
+            # and converges through scanner skip-and-report instead.
+            configured_roots = {
+                root.id for root in self._resolver_getter().settings.library_roots
+            }
+            unknown_roots = sorted(
+                {scope.root_id for scope in request.scopes} - configured_roots
+            )
+            if unknown_roots:
+                raise ValidationError(
+                    "One or more selected library scopes no longer exist."
+                )
         result = await self._store.request_scan_run(
             request, run_id=str(uuid.uuid4()), requested_at=self._clock()
         )

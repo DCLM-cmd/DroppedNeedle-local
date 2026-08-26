@@ -9515,18 +9515,32 @@ class NativeLibraryStore(PersistenceBase):
                     "WHERE id = ? AND stop_requested_at IS NOT NULL",
                     (now, run_id),
                 )
-            if new_state == "completed" and updated["kind"] == "policy_reconcile":
+            if (
+                new_state in {"completed", "failed"}
+                and updated["kind"] == "policy_reconcile"
+            ):
                 policy_state = connection.execute(
                     "SELECT * FROM library_policy_state WHERE singleton = 1"
                 ).fetchone()
                 scopes = connection.execute(
-                    "SELECT scope_id, policy_revision FROM library_scan_run_scopes "
-                    "WHERE run_id = ?",
+                    "SELECT scope_id, policy_revision, discovery_state, error_code "
+                    "FROM library_scan_run_scopes WHERE run_id = ?",
                     (run_id,),
                 ).fetchall()
+                # GH-296: a failed policy_apply whose every scope proved
+                # ROOT_UNAVAILABLE at the desired revision has settled its
+                # frozen scopes as far as they can ever be reached; keeping
+                # them pending would strand reconciliation forever. Any other
+                # failure (e.g. WALK_TIMEOUT) stays pending for retry.
+                settled_unreachable = bool(scopes) and all(
+                    scope["discovery_state"] == "unavailable"
+                    and scope["error_code"] == "ROOT_UNAVAILABLE"
+                    for scope in scopes
+                )
                 if (
                     policy_state is not None
                     and scopes
+                    and (new_state == "completed" or settled_unreachable)
                     and all(
                         scope["policy_revision"]
                         == policy_state["desired_policy_revision"]

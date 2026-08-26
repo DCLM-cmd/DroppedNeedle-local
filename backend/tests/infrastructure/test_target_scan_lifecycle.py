@@ -2134,7 +2134,10 @@ async def test_wedged_walk_timeout_with_filesystem_does_not_block_writer_and_nex
 
 @pytest.mark.asyncio
 async def test_failed_run_forgets_scan_revision_for_every_terminal_state(target_store: NativeLibraryStore, tmp_path: Path) -> None:
-    # First scope succeeds and records fence, second fails -> run failed, no retained revision
+    # First scope succeeds and records fence, second scope is missing ->
+    # GH-296 skip-and-report: the missing scope is reported unavailable and
+    # the run completes over the healthy scope. The terminal run must still
+    # retain no stale fence entry.
     root = tmp_path / "music"
     root.mkdir()
     (root / "Artist" / "Album").mkdir(parents=True)
@@ -2161,24 +2164,35 @@ async def test_failed_run_forgets_scan_revision_for_every_terminal_state(target_
         ],
     )
     await coordinator.request_run(request)
-    failed = await coordinator.run_once({"root-a": root})
-    assert failed is not None and failed.state == "failed"
-    # Verify durable failed state
-    stored, _, _ = await target_store.get_scan_run(failed.id)
-    assert stored.state == "failed"
+    finished = await coordinator.run_once({"root-a": root})
+    assert finished is not None and finished.state == "completed"
+    # Verify durable terminal state and the honest per-scope report
+    stored, _, _ = await target_store.get_scan_run(finished.id)
+    assert stored.state == "completed"
+    with sqlite3.connect(target_store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        scope_states = {
+            (row["relative_path"], row["discovery_state"], row["error_code"])
+            for row in connection.execute(
+                "SELECT relative_path, discovery_state, error_code FROM "
+                "library_scan_run_scopes WHERE run_id = ?",
+                (finished.id,),
+            ).fetchall()
+        }
+    assert scope_states == {(".", "completed", None), ("missing", "unavailable", "ROOT_UNAVAILABLE")}
     # Advance root revision via write lease
     async with filesystem.write("root-a"):
         pass
     # Public scan_revision should return current, not stale, and no entry for terminal run remains
-    current = filesystem.scan_revision(failed.id, "root-a")
+    current = filesystem.scan_revision(finished.id, "root-a")
     # Should be current revision, not the stale recorded one
     # The coordinator should have forgotten, so scan_revision returns current (or None if no current)
     # Check that the internal map has no entry for this run
-    assert (failed.id, "root-a") not in filesystem._scan_revisions
+    assert (finished.id, "root-a") not in filesystem._scan_revisions
     # After bumping, it should equal current revision
     async with filesystem.write("root-a"):
         pass
-    assert filesystem.scan_revision(failed.id, "root-a") == filesystem.revision("root-a")
+    assert filesystem.scan_revision(finished.id, "root-a") == filesystem.revision("root-a")
 
 @pytest.mark.asyncio
 async def test_repeated_failed_runs_do_not_grow_map(target_store: NativeLibraryStore, tmp_path: Path) -> None:
