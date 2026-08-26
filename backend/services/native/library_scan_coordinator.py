@@ -368,6 +368,7 @@ class LibraryScanCoordinator:
             if self._events is not None:
                 await self._events.publish(run, event="scan.transition")
 
+        if run.state == "indexing":
             self._log_progress(run, "phase_indexing_start", force=True)
             if not await self.checkpoint(run.id, frozen_policy_revision):
                 return (await self._store.get_scan_run(run.id))[0]
