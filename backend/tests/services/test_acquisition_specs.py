@@ -425,3 +425,41 @@ async def test_build_context_snapshots_quarantine_set():
     assert isinstance(ctx.quarantine_set, frozenset)
     assert ("usenet", "id-1") in ctx.quarantine_set
     assert ("soulseek", "id-2") in ctx.quarantine_set
+
+
+# --- F-EDITION-03: dotted box-set coverage ------------------------------------
+
+@pytest.mark.parametrize("spelling", ["Box.Set", "Box-Set", "Box_Set", "box set"])
+def test_wrong_edition_rejects_every_box_set_spelling_for_studio(spelling):
+    cand = Candidate(source="usenet", match_text=f"Led Zeppelin {spelling} (FLAC)")
+    decision = wrong_edition(cand, _LZ, _EMPTY, _POLICY)
+    assert isinstance(decision, Reject)
+    assert decision.code is RejectCode.WRONG_EDITION
+    assert decision.disposition is Disposition.PERMANENT
+
+
+def test_wrong_edition_box_set_requested_stays_eligible():
+    requested = TargetAlbum(
+        artist_name="Led Zeppelin", album_title="Led Zeppelin Box Set",
+        year=1969, track_count=9,
+    )
+    cand = Candidate(source="usenet", match_text="Led Zeppelin Box.Set (FLAC)")
+    assert isinstance(wrong_edition(cand, requested, _EMPTY, _POLICY), Accept)
+
+
+def test_wrong_album_ignores_fedition03_descriptors():
+    from services.native.acquisition.specs.wrong_album import wrong_album
+    for candidate_title in (
+        "Led Zeppelin (OKNOTOK)",
+        "Led Zeppelin - Immersion.Box.Set",
+        "Led Zeppelin Half Speed Master",
+    ):
+        cand = Candidate(source="soulseek", match_text=candidate_title)
+        assert isinstance(wrong_album(cand, _LZ, _EMPTY, _POLICY), Accept), candidate_title
+
+
+def test_wrong_album_still_rejects_different_album_same_artist():
+    from services.native.acquisition.specs.wrong_album import wrong_album
+    cand = Candidate(source="soulseek", match_text="Led Zeppelin - Physical Graffiti")
+    decision = wrong_album(cand, _LZ, _EMPTY, _POLICY)
+    assert isinstance(decision, Reject)

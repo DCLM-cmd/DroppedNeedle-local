@@ -251,3 +251,47 @@ def test_artist_evidence_all_stopword_artist_falls_back_to_full_name():
     # "The The" is entirely stopwords - fall back to the raw words rather than
     # having no evidence path at all.
     assert artist_evidence("The The", "@@x\\The The\\Soul Mining\\01.flac")
+
+
+def test_fedition03_valid_reissue_descriptors_are_not_wrong_album() -> None:
+    """F-EDITION-03: signed descriptor additions (OKNOTOK, MFSL, Immersion,
+    Half Speed Master, Audiophile) are harmless edition words - a self-titled
+    candidate carrying them must NOT read as a different album."""
+    for candidate in (
+        "Led Zeppelin (OKNOTOK)",
+        "Led Zeppelin (MFSL)",
+        "Led Zeppelin - Immersion.Box.Set",
+        "Led Zeppelin Half Speed Master",
+        "Led Zeppelin Audiophile",
+        "Led Zeppelin Super Deluxe Experience",
+    ):
+        assert names_different_album(
+            "Led Zeppelin", "Led Zeppelin", candidate
+        ) is False, candidate
+
+
+def test_fedition03_real_different_albums_still_reject() -> None:
+    for candidate in ("Led Zeppelin - Kid A", "Led Zeppelin - Physical Graffiti"):
+        assert names_different_album(
+            "Led Zeppelin", "Led Zeppelin", candidate
+        ) is True, candidate
+
+
+def test_fedition03_sequel_numbering_still_rejects() -> None:
+    assert names_different_album(
+        "Led Zeppelin", "Led Zeppelin", "Led Zeppelin II"
+    ) is True
+    assert names_different_album(
+        "Led Zeppelin", "Led Zeppelin", "Led Zeppelin III"
+    ) is True
+
+
+def test_boxset_compound_folds_but_bare_set_stays_an_album_word() -> None:
+    # box + set folds to the canonical boxset descriptor on both sides.
+    assert names_different_album(
+        "Led Zeppelin Box Set", "Led Zeppelin", "Led Zeppelin (Box-Set)"
+    ) is False
+    # A bare "set" remains an album word: "Set" alone IS a different album.
+    assert names_different_album(
+        "Led Zeppelin", "Led Zeppelin", "Led Zeppelin - Set"
+    ) is True

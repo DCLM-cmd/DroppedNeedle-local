@@ -85,7 +85,33 @@ _EDITION = frozenset({
     "limited", "collectors", "collector", "bonus", "reissue", "repack", "proper", "mono",
     "stereo", "original", "digipak", "version", "explicit", "clean", "extended", "standard",
     "promo", "disc",
+    # F-EDITION-03 signed additions: valid reissue/edition descriptors that
+    # must not read as foreign album words.
+    "immersion", "experience", "box", "boxset", "super", "oknotok", "mfsl",
+    "half", "speed", "master", "audiophile",
 })
+
+
+def _fold_box_set(tokens: list[str]) -> list[str]:
+    """Fold an adjacent ``box`` + ``set`` pair into the canonical ``boxset``
+    descriptor so dotted/hyphenated/underscored spellings behave identically
+    (F-EDITION-03). A bare ``set`` stays an album word."""
+    folded: list[str] = []
+    index = 0
+    while index < len(tokens):
+        if (
+            tokens[index] == "box"
+            and index + 1 < len(tokens)
+            and tokens[index + 1] == "set"
+        ):
+            folded.append("boxset")
+            index += 2
+        else:
+            folded.append(tokens[index])
+            index += 1
+    return folded
+
+
 # Sidecar / packaging extensions a per-file result or folder listing drags in.
 _SIDECAR = frozenset({
     "log", "cue", "nfo", "sfv", "m3u", "m3u8", "jpg", "jpeg", "png", "txt", "pdf", "par",
@@ -220,10 +246,13 @@ def names_different_album(album_title: str, artist_name: str, candidate_title: s
     and only when the artist is recognisably present (a fully obfuscated title is left to the
     indexer-match base score + import tag-match). Version descriptors are stripped from both
     sides so a deluxe/remaster of the requested album matches."""
+    # F-EDITION-03: fold the ``box`` + ``set`` compound to the canonical
+    # ``boxset`` descriptor on both sides so dotted/hyphenated/underscored
+    # spellings compare identically. A bare ``set`` stays an album word.
     artist = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2}
-    candidate = _tokens(candidate_title)
+    candidate = _fold_box_set(_tokens(candidate_title))
     if not _artist_present(candidate, artist):
         return False
-    wanted = _content_words(_tokens(album_title), artist)
+    wanted = _content_words(_fold_box_set(_tokens(album_title)), artist)
     got = _content_words(_album_region(candidate), artist)
     return bool(got - wanted)

@@ -615,3 +615,26 @@ def test_version_mismatch_penalised():
     conf_original = _file_confidence("Song", "Artist", None, original)
     assert conf_remix < conf_original
     assert conf_remix < 0.70  # off-version cannot auto-accept
+
+
+@pytest.mark.asyncio
+async def test_fedition03_reissue_folder_rankable_but_sequel_excluded():
+    """F-EDITION-03 smoke: a valid reissue folder (signed descriptors) stays
+    rankable on the Soulseek path while a same-artist different album is
+    excluded before acquisition."""
+    target = TargetAlbum(
+        artist_name="Led Zeppelin", album_title="Led Zeppelin", year=1969, track_count=9
+    )
+    reissue = [
+        _mk("Led Zeppelin - Led Zeppelin (OKNOTOK)", f"{n:02d} Track.flac")
+        for n in range(1, 10)
+    ]
+    scorer = AlbumPreflightScorer(_store())
+    candidates = await scorer.rank(target, reissue)
+    assert len(candidates) == 1  # rankable - descriptors are harmless
+
+    sequel = [
+        _mk("Led Zeppelin - Presence", f"{n:02d} Track.flac")
+        for n in range(1, 10)
+    ]
+    assert await scorer.rank(target, sequel) == []  # different album excluded

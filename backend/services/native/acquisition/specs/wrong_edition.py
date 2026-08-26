@@ -39,9 +39,11 @@ def wrong_edition(
     context: DecisionContext,
     policy: SpecPolicy,
 ) -> Decision:
-    # Flatten underscores to spaces first: ``_`` is a regex word char, so ``\blive\b`` would
-    # MISS ``Led_Zeppelin-Live_EP``. Dots/hyphens are already word boundaries.
-    title = (candidate.match_text or "").replace("_", " ")
+    # F-EDITION-03: flatten ALL separator variants to spaces before matching -
+    # ``_`` is a regex word char (so ``\blive\b`` would MISS
+    # ``Led_Zeppelin-Live_EP``), and ``Box.Set`` must read as ``box set`` so the
+    # dotted spelling cannot slip past the box-set product marker.
+    title = (candidate.match_text or "").replace("_", " ").replace(".", " ")
     wanted = f"{target.album_title} {target.artist_name}".lower()
     for match in _WRONG_EDITION_RE.finditer(title):
         term = " ".join(match.group(0).lower().replace("-", " ").split())
