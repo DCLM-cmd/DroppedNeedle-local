@@ -251,6 +251,7 @@ async def start_target_operational_runtime(
     from core.dependencies.service_providers import get_plugin_host
     from core.tasks import (
         start_acquisition_cleanup_task,
+        start_acquisition_orphan_reconcile_task,
         start_artist_discovery_cache_warming_task,
         start_audiodb_sweep_task,
         start_background_upgrade_scan_task,
@@ -281,6 +282,7 @@ async def start_target_operational_runtime(
     except Exception:  # noqa: BLE001 - durable worker continues recovery after startup
         logger.exception("Acquisition cleanup startup recovery failed")
     start_acquisition_cleanup_task(get_acquisition_cleanup_service)
+    start_acquisition_orphan_reconcile_task(get_acquisition_cleanup_service)
     start_download_resume_task(get_target_download_orchestrator())
     start_download_watchdog_task(get_target_download_orchestrator)
     start_download_auto_retry_task(get_target_download_orchestrator)

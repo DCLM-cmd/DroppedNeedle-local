@@ -295,3 +295,58 @@ async def test_cancellation_attaches_all_publisher_barriers_atomically(tmp_path:
     assert (await store.get_task(task.id)).status == "cancelled"
     assert refreshed.state == "cleanup_pending"
     assert refreshed.publisher_bundle_ids == ["bundle-a", "bundle-b"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_debt_query_blocks_until_every_owned_row_completes(
+    tmp_path: Path,
+):
+    store = _store(tmp_path)
+    task_id = "a" * 32
+    job_name = f"droppedneedle-{task_id}-0"
+    live = await store.create_download_attempt(
+        task_id=task_id,
+        source="usenet",
+        candidate_index=0,
+        job_name=job_name,
+        handle=TaskHandle(source="usenet", job_name=job_name),
+        now=1.0,
+    )
+
+    assert await store.has_download_cleanup_debt(
+        source="usenet", task_id=task_id, job_name=job_name
+    )
+
+    await store.transition_download_attempt(
+        live.id,
+        expected_row_revision=live.row_revision,
+        new_state="complete",
+        completed_at=2.0,
+        now=2.0,
+    )
+    assert not await store.has_download_cleanup_debt(
+        source="usenet", task_id=task_id, job_name=job_name
+    )
+
+    preserved = await store.create_download_attempt(
+        task_id=task_id,
+        source="usenet",
+        candidate_index=1,
+        job_name=f"droppedneedle-{task_id}-1",
+        handle=TaskHandle(source="usenet", job_name=f"droppedneedle-{task_id}-1"),
+        now=3.0,
+    )
+    await store.schedule_download_attempt_cleanup(
+        preserved.id, disposition="preserve", now=4.0
+    )
+    # Any non-terminal row under the task blocks every name variant of it,
+    # including suffixed collision folders whose base name has no row of its own.
+    assert await store.has_download_cleanup_debt(
+        source="usenet", task_id=task_id, job_name=job_name
+    )
+    assert await store.has_download_cleanup_debt(
+        source="usenet", task_id=task_id, job_name=f"droppedneedle-{task_id}-9"
+    )
+    assert not await store.has_download_cleanup_debt(
+        source="usenet", task_id="f" * 32, job_name=f"droppedneedle-{'f' * 32}-0"
+    )

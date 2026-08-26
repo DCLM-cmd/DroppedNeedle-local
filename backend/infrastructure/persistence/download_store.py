@@ -1225,6 +1225,30 @@ class DownloadStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def has_download_cleanup_debt(
+        self, *, source: str, task_id: str, job_name: str
+    ) -> bool:
+        """True when any attempt-journal row still owns this job's mount workspace.
+
+        Every non-terminal state blocks orphan reconciliation: acquiring/in_use
+        mean live work, cleanup_pending/workspace_removed mean pending or mid-flight
+        debt, preserved/needs_attention mean the bytes must stay. Only ``complete``
+        releases the name; a folder left behind under a completed name is debris no
+        claim query will ever pick up.
+        """
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                """SELECT 1 FROM download_attempts
+                   WHERE ((source=? AND job_name=?) OR task_id=?)
+                     AND state<>'complete'
+                   LIMIT 1""",
+                (source, job_name, task_id),
+            ).fetchone()
+            return row is not None
+
+        return await self._read(operation)
+
     async def get_download_attempt_for_candidate(
         self, task_id: str, source: str, candidate_index: int
     ) -> DownloadAttempt | None:

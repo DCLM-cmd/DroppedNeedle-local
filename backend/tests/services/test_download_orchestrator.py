@@ -30,7 +30,12 @@ from infrastructure.sse_publisher import SSEPublisher
 from models.common import ServiceStatus
 from models.download import DownloadTask, ScoredCandidate
 from models.download_identity import soulseek_identity
-from models.download_manifest import DownloadManifest, ExpectedFile, ManifestCodec
+from models.download_manifest import (
+    DownloadManifest,
+    ExpectedFile,
+    ExpectedTrack,
+    ManifestCodec,
+)
 from repositories.protocols.download_client import (
     DownloadSearchResult,
     DownloadTaskStatus,
@@ -3303,3 +3308,305 @@ async def test_partial_album_and_completed_track_do_not_fulfil_wanted_watch(
     )
 
     wanted_store.mark_fulfilled.assert_not_awaited()
+
+
+
+def _edition_tracks():
+    """Two-track exact edition map. The proxies double as the MB Track shape the
+    coverage matcher consumes and carry the release_track_id the enqueue path's
+    exact-map validation requires."""
+    return [
+        SimpleNamespace(
+            position=1,
+            disc_number=1,
+            title="One",
+            recording_id="rec-1",
+            length=200_000,
+            release_track_id="rt-1",
+        ),
+        SimpleNamespace(
+            position=2,
+            disc_number=1,
+            title="Two",
+            recording_id="rec-2",
+            length=300_000,
+            release_track_id="rt-2",
+        ),
+    ]
+
+
+class _StubAlbumService:
+    def __init__(self, tracks):
+        self._tracks = tracks
+
+    async def get_album_tracks_info(self, mbid, priority=None):
+        return SimpleNamespace(
+            tracks=list(self._tracks),
+            total_tracks=len(self._tracks),
+            selected_release_mbid="rel-1",
+        )
+
+    async def get_exact_edition_tracks_info(self, mbid, release_mbid, priority=None):
+        return SimpleNamespace(
+            tracks=list(self._tracks),
+            total_tracks=len(self._tracks),
+            selected_release_mbid=release_mbid or "rel-1",
+        )
+
+
+def _covered_rows():
+    """Library rows whose recording MBIDs cover both edition positions."""
+    return [
+        {
+            "id": f"r{i}",
+            "file_path": f"/lib/{i}.flac",
+            "recording_mbid": f"rec-{i}",
+            "track_number": i,
+            "disc_number": 1,
+            "duration_seconds": 200 if i == 1 else 300,
+            "track_title": "One" if i == 1 else "Two",
+            "file_format": "FLAC",
+        }
+        for i in (1, 2)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clean_full_import_completes_without_library_coverage(tmp_path: Path):
+    """#131 core acceptance: an attempt that publishes its WHOLE manifest cleanly
+    settles COMPLETED on the first pass even when library rows provide no matching
+    coverage (foreign RG stamping / edition drift). Exactly one client enqueue -
+    no failover, no 15-minute re-download loop."""
+    client = _StubClient()
+    store, orch, fp, lib = _build(
+        tmp_path,
+        client=client,
+        scorer_result=[_candidate(0.9, files=2)],
+        album_service=_StubAlbumService(_edition_tracks()),
+        imported_rows=[],
+    )
+    # Files publish cleanly but land under a FOREIGN release-group in the real
+    # drift case; the fake library models that as "no rows visible for rg-1".
+    fp.process_downloaded = AsyncMock(
+        return_value=ProcessResult(succeeded=["/lib/01.flac", "/lib/02.flac"], failed=[])
+    )
+    task = await _new_task(store, track_count=2)
+
+    await orch.process_task(task.id)
+
+    final = await store.get_task(task.id)
+    assert final.status == "completed"
+    assert client.enqueue.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_import_skips_never_arrived_and_exhausts_peer_folder(
+    tmp_path: Path,
+):
+    """A terminal outcome imports ONLY latest-succeeded transfers (#222): the file
+    whose transfer failed is never processed, so it can't be quarantined as a verify
+    failure - and the clean-but-short import marks the PEER folder exhausted for this
+    release-group (#255 defect 2) instead of leaving it top-ranked forever."""
+    client = _StubClient(
+        _status(
+            "partial",
+            succeeded=["peer/01.flac"],
+            files_total=2,
+            files_completed=1,
+            matched=2,
+        )
+    )
+    store, orch, fp, lib = _build(
+        tmp_path, client=client, scorer_result=[_candidate(0.9, files=2)]
+    )
+    _coupled_fp(fp, lib)
+    task = await _new_task(store, track_count=2)
+
+    await orch.process_task(task.id)
+
+    kwargs = fp.process_downloaded.await_args_list[-1].kwargs
+    assert kwargs["only_filenames"] == {"peer/01.flac"}
+    qset = await store.load_quarantine_set()
+    assert ("soulseek", "peer") in qset
+    assert ("soulseek", soulseek_identity("peer", "peer/02.flac")) not in qset
+    final = await store.get_task(task.id)
+    assert final.status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_auto_retry_sweep_settles_completed_when_library_covers(tmp_path: Path):
+    """The library already covers the request (an earlier attempt imported it, or a
+    hand import): the sweep settles COMPLETED instead of re-dispatching (#131)."""
+    store, orch, _fp, _lib = _build(
+        tmp_path,
+        album_service=_StubAlbumService(_edition_tracks()),
+        imported_rows=_covered_rows(),
+        auto_retry_base_interval_minutes=0.0005,
+    )
+    task = await _new_task(store, track_count=2, release_mbid="rel-1")
+    await store.finalize_task_and_attempt(
+        task.id,
+        DownloadStatus.FAILED,
+        task_fields={"completed_at": _t.time()},
+        attempt_id=None,
+        disposition=None,
+    )
+
+    await asyncio.sleep(0.05)
+    await orch.retry_failed_tasks()
+
+    final = await store.get_task(task.id)
+    assert final.status == "completed"
+    assert await store.list_retryable_tasks(orch.auto_retry_max) == []
+
+
+@pytest.mark.asyncio
+async def test_manual_retry_settles_completed_when_library_covers(tmp_path: Path):
+    """Manual retry on a PARTIAL whose album is fully covered completes in place -
+    no new task, no re-download."""
+    store, orch, _fp, _lib = _build(
+        tmp_path,
+        album_service=_StubAlbumService(_edition_tracks()),
+        imported_rows=_covered_rows(),
+    )
+    task = await _new_task(store, track_count=2, release_mbid="rel-1")
+    await store.finalize_task_and_attempt(
+        task.id,
+        DownloadStatus.PARTIAL,
+        task_fields={"completed_at": _t.time()},
+        attempt_id=None,
+        disposition=None,
+    )
+
+    new_id = await orch.retry_task(task.id, "user-a", "user")
+
+    assert new_id == task.id
+    final = await store.get_task(task.id)
+    assert final.status == "completed"
+    assert not (tmp_path / "staging" / task.id).exists()
+
+
+@pytest.mark.asyncio
+async def test_remaining_track_positions_reports_only_uncovered(tmp_path: Path):
+    """Positions are measured by the SHARED matcher against manifest.expected_tracks:
+    the per-file failover target set can never disagree with the completeness gate."""
+    store, orch, _fp, lib = _build(
+        tmp_path, album_service=_StubAlbumService(_edition_tracks())
+    )
+    lib.rows = [_covered_rows()[0]]
+    task_id = "t-remaining"
+    manifest = DownloadManifest(
+        task_id=task_id,
+        source_username="peer",
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        naming_template=_TEMPLATE,
+        target_files=[
+            ExpectedFile(filename=f"{i:02d}.flac", size=1) for i in (1, 2)
+        ],
+        expected_tracks=[
+            ExpectedTrack(
+                track_number=i,
+                disc_number=1,
+                duration_seconds=200.0 if i == 1 else 300.0,
+                recording_mbid=f"rec-{i}",
+                title="One" if i == 1 else "Two",
+                release_track_mbid=f"rt-{i}",
+            )
+            for i in (1, 2)
+        ],
+    )
+    staging = orch._staging / task_id
+    staging.mkdir(parents=True)
+    (staging / "manifest.json").write_bytes(orch._manifest_codec.encode(manifest))
+
+    target = SimpleNamespace(
+        id="t-remaining", download_type="album", release_group_mbid="rg-1"
+    )
+
+    assert await orch._remaining_track_positions(target) == {(1, 2)}
+
+
+@pytest.mark.asyncio
+async def test_failover_requests_only_missing_tracks_from_next_peer(tmp_path: Path):
+    """#292 acceptance: after attempt one delivers track one of two, the failover
+    candidate is asked for EXACTLY the still-missing track (not the whole album), and
+    its clean delivery completes via the delivery gate."""
+
+    def _timed_candidate(username, durations):
+        results = [
+            DownloadSearchResult(
+                username=username,
+                filename=f"{username}/{i:02d}.flac",
+                parent_directory=username,
+                size=100,
+                extension="flac",
+                duration=duration,
+            )
+            for i, duration in enumerate(durations, 1)
+        ]
+        return ScoredCandidate(
+            username=username,
+            parent_directory=username,
+            files=results,
+            coherence=0.9,
+            file_confidence=0.9,
+            final_score=0.9,
+            tier="auto",
+        )
+
+    first_status = _status(
+        "partial", succeeded=["p1/01.flac"], files_total=2, files_completed=1, matched=2
+    )
+    second_status = _status(
+        "completed", succeeded=["p2/02.flac"], files_total=1, files_completed=1, matched=1
+    )
+    client = _StubClient()
+    client.get_status = AsyncMock(side_effect=[first_status, second_status])
+    store, orch, fp, lib = _build(
+        tmp_path,
+        client=client,
+        scorer_result=[
+            _timed_candidate("p1", [200.0, 300.0]),
+            _timed_candidate("p2", [200.0, 300.0]),
+        ],
+        album_service=_StubAlbumService(_edition_tracks()),
+    )
+
+    async def _proc(manifest, only_filenames=None):
+        targets = manifest.target_files
+        if only_filenames is not None:
+            targets = [f for f in targets if f.filename in only_filenames]
+        succeeded = []
+        for expected in targets:
+            position = 1 if "01" in expected.filename else 2
+            path = f"/lib/{expected.filename}"
+            succeeded.append(path)
+            lib.rows.append(
+                {
+                    "id": f"r-{expected.filename}",
+                    "file_path": path,
+                    "recording_mbid": f"rec-{position}",
+                    "track_number": position,
+                    "disc_number": 1,
+                    "duration_seconds": 200 if position == 1 else 300,
+                    "track_title": "One" if position == 1 else "Two",
+                    "file_format": "FLAC",
+                }
+            )
+        return ProcessResult(succeeded=succeeded, failed=[])
+
+    fp.process_downloaded = AsyncMock(side_effect=_proc)
+    task = await _new_task(store, track_count=2, release_mbid="rel-1")
+
+    await orch.process_task(task.id)
+
+    enqueues = client.enqueue.await_args_list
+    assert len(enqueues) == 2
+    first_files = [ref.filename for ref in enqueues[0].args[0].files]
+    second_files = [ref.filename for ref in enqueues[1].args[0].files]
+    assert first_files == ["p1/01.flac", "p1/02.flac"]
+    assert second_files == ["p2/02.flac"]
+    final = await store.get_task(task.id)
+    assert final.status == "completed"

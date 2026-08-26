@@ -17,6 +17,7 @@ stay structurally identical to the protocol for the conformance contract test.
 import asyncio
 import logging
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from models.common import ServiceStatus
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 _DISC_DIR = re.compile(r"\b(?:Disc|CD)\s*\d+\b", re.IGNORECASE)
 _LOSSLESS_EXT = {"flac", "alac", "wav", "ape", "wv"}
+_NO_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
 
 
 class SlskdRepository:
@@ -625,10 +627,56 @@ class SlskdRepository:
         failed = set(names(result.failed))
         return [f for f in requested if f not in failed] if failed else requested
 
+    @staticmethod
+    def _transfer_recency(transfer: SlskdTransfer) -> datetime:
+        """Best-effort recency key for one transfer record: RequestedAt first,
+        falling back to StartedAt (requestedAt is absent/mixed across slskd
+        versions, PR #222). Absent or unparseable values rank as the oldest
+        possible instant, so any parseable timestamp beats a missing one; naive
+        timestamps read as UTC. slskd's ``id`` is a GUID - not monotonic - so it
+        carries no recency signal."""
+        for value in (transfer.requested_at, transfer.started_at):
+            if not value:
+                continue
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                continue
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return _NO_TIMESTAMP
+
+    @staticmethod
+    def _latest_transfer_per_file(
+        transfers: list[SlskdTransfer],
+    ) -> list[SlskdTransfer]:
+        """Collapse records to the LATEST attempt per unique file (#131/#253):
+        slskd appends one record per retry attempt, so raw counts double-count
+        retried files and let a stale Succeeded row shadow a newer TimedOut/
+        Errored one (and vice versa). Highest recency key wins; exact ties -
+        including two untimestamped/garbage-stamped records - fall through to
+        list order, where the later record wins. Filenames are keyed with path
+        separators normalised like every comparison in this module; winners keep
+        their original input order.
+        """
+        best: dict[str, tuple[datetime, int, SlskdTransfer]] = {}
+        for index, transfer in enumerate(transfers):
+            key = transfer.filename.replace("\\", "/")
+            recency = SlskdRepository._transfer_recency(transfer)
+            incumbent = best.get(key)
+            if incumbent is None or recency >= incumbent[0]:
+                best[key] = (recency, index, transfer)
+        return [entry[2] for entry in sorted(best.values(), key=lambda entry: entry[1])]
+
     def _aggregate_status(
         self, handle: TaskHandle, transfers: list[SlskdTransfer]
     ) -> DownloadTaskStatus:
+        """Per-file status from matched transfer records. File-level verdicts
+        (completed/failed counts, succeeded_filenames, terminal states) judge
+        each file ONLY by its LATEST attempt; byte totals deliberately stay
+        sum-over-all-records so cumulative progress keeps counting prior attempts."""
         files_total = len(handle.filenames)
+        # Byte totals stay sum-over-all-records (see docstring): each attempt's bytes
+        # count toward cumulative progress, sizes likewise sum across retry attempts.
         bytes_total = sum(t.size for t in transfers)
         bytes_downloaded = sum(t.bytes_transferred for t in transfers)
         completed = 0
@@ -636,7 +684,10 @@ class SlskdRepository:
         succeeded_filenames: list[str] = []
         has_active_transfer = False
         queue_positions: list[int] = []
-        for transfer in transfers:
+
+        # Judge each FILE by its LATEST attempt, never by raw record counts.
+        latest_per_file = SlskdRepository._latest_transfer_per_file(transfers)
+        for transfer in latest_per_file:
             flags = self._state_flags(transfer.state)
             if transfer.place_in_queue is not None and transfer.place_in_queue >= 0:
                 queue_positions.append(transfer.place_in_queue)
@@ -664,7 +715,7 @@ class SlskdRepository:
         # so a not-yet-materialised record can't trigger a premature terminal state.
         all_terminal = (
             bool(transfers)
-            and (completed + failed) == len(transfers)
+            and (completed + failed) == len(latest_per_file)
             and (completed + failed) >= files_total > 0
         )
         if all_terminal and failed == 0 and completed == files_total:

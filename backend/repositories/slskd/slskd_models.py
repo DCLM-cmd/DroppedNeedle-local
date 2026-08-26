@@ -74,6 +74,11 @@ class SlskdTransfer(msgspec.Struct, rename="camel", kw_only=True):
     direction: str = ""
     place_in_queue: int | None = None
     exception: str | None = None
+    # Retry-attempt timestamps (#131/#253): slskd appends ONE RECORD PER ATTEMPT per
+    # file, so recency-ordering records needs these. Absent on some slskd versions
+    # (PR #222) - left None there; msgspec ignores unknown wire keys either way.
+    requested_at: str | None = None
+    started_at: str | None = None
 
 
 class SlskdDirectories(msgspec.Struct, kw_only=True):

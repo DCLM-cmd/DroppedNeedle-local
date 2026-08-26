@@ -193,6 +193,52 @@ def start_acquisition_cleanup_task(get_cleanup_service) -> asyncio.Task:
     return task
 
 
+_ACQUISITION_ORPHAN_RECONCILE_INTERVAL = 3600.0
+_ACQUISITION_ORPHAN_RECONCILE_INITIAL_DELAY = 600.0
+
+
+async def run_acquisition_orphan_reconcile_periodically(
+    get_cleanup_service,
+    interval: float = _ACQUISITION_ORPHAN_RECONCILE_INTERVAL,
+    delay: float = _ACQUISITION_ORPHAN_RECONCILE_INITIAL_DELAY,
+) -> None:
+    """Close the pre-journal crash gap (#131): sweep complete-dir folders named for
+    DroppedNeedle jobs that no attempt journal owns. Sleep-first so startup
+    recovery journals legacy workspaces before the first destructive pass."""
+    await asyncio.sleep(delay)
+    while True:
+        try:
+            service = get_cleanup_service()
+            removed = await service.reconcile_orphan_folders()
+            if removed:
+                logger.info(
+                    "Acquisition orphan reconcile removed %d folder(s)", removed
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001 - durable worker survives one failed sweep
+            logger.exception("Acquisition orphan reconcile sweep failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+def start_acquisition_orphan_reconcile_task(get_cleanup_service) -> asyncio.Task:
+    task = asyncio.create_task(
+        run_acquisition_orphan_reconcile_periodically(get_cleanup_service)
+    )
+    TaskRegistry.get_instance().register("acquisition-orphan-reconcile", task)
+    task.add_done_callback(
+        lambda value: logger.error(
+            "Acquisition orphan reconcile task error: %s", value.exception()
+        )
+        if not value.cancelled() and value.exception()
+        else None
+    )
+    return task
+
+
 async def warm_library_cache(
     library_service: LibraryService,
     album_service: "AlbumService",

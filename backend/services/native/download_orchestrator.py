@@ -19,6 +19,7 @@ import shutil
 import time
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 
 import msgspec
 
@@ -52,7 +53,7 @@ from services.native.acquisition.strategy import (
 )
 from services.native.album_preflight_scorer import AlbumPreflightScorer
 from services.native.acquisition_cleanup_service import AcquisitionCleanupService
-from services.native.coverage import match_rows_to_tracks
+from services.native.coverage import match_rows_to_tracks, uncovered_tracks
 from services.native.quality_tiers import (
     candidate_tier,
     effective_extension,
@@ -603,6 +604,7 @@ class DownloadOrchestrator:
         *,
         strict_track_duration: bool = True,
         hold_on_wrong_track: bool = False,
+        remaining_positions: "frozenset[tuple[int, int]] | None" = None,
     ) -> None:
         candidates = await self._store.get_search_job_candidates(task.search_job_id)
         if task.candidate_index is None or task.candidate_index >= len(candidates):
@@ -613,6 +615,7 @@ class DownloadOrchestrator:
             candidate,
             strict_track_duration=strict_track_duration,
             hold_on_wrong_track=hold_on_wrong_track,
+            remaining_positions=remaining_positions,
         )
 
     async def _poll_until_done(self, task, *, expect_materialization: bool = False):  # noqa: ANN001, ANN201
@@ -787,6 +790,10 @@ class DownloadOrchestrator:
         wrong_track = False
         source_missing = False
         import_failed = False
+        # Per-file failover (#292): (disc, track) positions still missing after the
+        # last attempt; consumed by the next iteration's enqueue so the following
+        # candidate is asked for ONLY the missing tracks instead of the whole album.
+        pending_positions: frozenset[tuple[int, int]] | None = None
         while True:
             attempt_result = ProcessResult(
                 succeeded=[], failed=[], workspace_disposition="discard"
@@ -798,7 +805,7 @@ class DownloadOrchestrator:
             enqueued = True
             if did_enqueue:
                 try:
-                    await self._enqueue(task)
+                    await self._enqueue(task, remaining_positions=pending_positions)
                 except OrchestrationError:
                     logger.warning(
                         "Enqueue failed for task %s candidate %s",
@@ -806,8 +813,9 @@ class DownloadOrchestrator:
                         task.candidate_index,
                     )
                     enqueued = False
+            # Consumed: the NEXT shortfall recomputes positions from what landed.
+            pending_positions = None
             first = False
-
             if enqueued:
                 outcome, status = await self._poll_until_done(
                     task, expect_materialization=did_enqueue
@@ -890,13 +898,15 @@ class DownloadOrchestrator:
                     "status",
                     {"status": DownloadStatus.PROCESSING},
                 )
-                # On an interrupted (stalled/queued/deadline) outcome, import ONLY
-                # the transfers that actually succeeded - files that never arrived
-                # are not processed, so they can't be quarantined as verify failures
-                # (which would wrongly blacklist a slow-but-good peer). On a terminal
-                # outcome every transfer settled, so import the full manifest and let
-                # a genuinely failed source be quarantined as before.
-                if outcome in (_OUT_COMPLETED, _OUT_TERMINAL):
+                # Import ONLY the transfers whose LATEST per-file attempt succeeded
+                # (the aggregation dedups slskd's one-record-per-retry history, so a
+                # stale Succeeded can't shadow a final TimedOut - #253/PR #222). Files
+                # that never arrived are not processed: they can't be logged as
+                # mount misconfigurations or quarantined as verify failures, which
+                # wrongly blamed the mount and blacklisted slow-but-good peers (#131).
+                # On _OUT_COMPLETED every enqueued file succeeded, so the full manifest
+                # is exactly the succeeded set (kept None for the grace-period path).
+                if outcome == _OUT_COMPLETED or status is None:
                     only = None
                 else:
                     only = set(status.succeeded_filenames)
@@ -958,8 +968,7 @@ class DownloadOrchestrator:
                 # (Lidarr's "Redownload Failed" + blocklist). Skipped for an interrupted poll, a
                 # local/environment fault, or a local IMPORT fault (the files arrived but we
                 # failed to write them - not the release's fault, review H3). The strategy owns
-                # the source-specific blocklist (Usenet: age-guarded title+size; Soulseek: a
-                # no-op - its per-file quarantine already ran at import).
+                # the source-specific blocklist (Usenet: age-guarded title+size).
                 if (
                     not is_complete
                     and outcome in (_OUT_COMPLETED, _OUT_TERMINAL)
@@ -972,6 +981,42 @@ class DownloadOrchestrator:
                         completed=outcome == _OUT_COMPLETED,
                         enumerated_any=enumerated > 0,
                     )
+                    # Peer-folder exhaustion (#255 defect 2): a CLEAN import (zero file
+                    # failures of any kind) that still under-delivers means the shared
+                    # folder simply LACKS tracks - per-file quarantine never fired, so
+                    # without a peer-level row the scorer re-picks this folder by score
+                    # forever, re-downloading it each cycle. Block the PEER identity for
+                    # this release-group; a manual re-request/retry still clears
+                    # album-scoped rows (retry_task / request path semantics).
+                    if (
+                        task.source == "soulseek"
+                        and not attempt_result.failed
+                        and task.search_job_id is not None
+                        and task.candidate_index is not None
+                    ):
+                        pool = await self._store.get_search_job_candidates(
+                            task.search_job_id
+                        )
+                        if 0 <= task.candidate_index < len(pool):
+                            await self._store.record_quarantine(
+                                source="soulseek",
+                                identity=self._candidate_source_identity(
+                                    pool[task.candidate_index]
+                                ),
+                                reason="verify_failed",
+                                release_group_mbid=task.release_group_mbid,
+                            )
+                            logger.info(
+                                "download.quarantined",
+                                extra={
+                                    "task_id": task.id,
+                                    "source": "soulseek",
+                                    "reason": "folder_under_delivered",
+                                    "identity": self._candidate_source_identity(
+                                        pool[task.candidate_index]
+                                    ),
+                                },
+                            )
 
                 if local_fault:
                     preserved_result = ProcessResult(
@@ -1004,6 +1049,25 @@ class DownloadOrchestrator:
                 if attempts < self._max_failover
                 else None
             )
+            # Per-file failover (#292): measure what the library is still missing.
+            # An EMPTY remaining set means earlier attempts (or a manual import) already
+            # delivered everything - settle COMPLETED instead of re-downloading the
+            # album; None means unmeasurable, so the next attempt keeps whole-album
+            # semantics. Usenet keeps whole-album failover regardless: an NZB is the
+            # smallest addressable unit.
+            remaining = (
+                await self._remaining_track_positions(task)
+                if task.download_type == "album"
+                else None
+            )
+            if remaining is not None and not remaining:
+                logger.info(
+                    "download.cumulative_coverage_complete",
+                    extra={"task_id": task.id},
+                )
+                await self._finalize(task, DownloadStatus.COMPLETED)
+                return
+            pending_positions = remaining
             if entry is None:
                 # Every source for a single track failed the canonical-duration gate:
                 # the MB length is probably wrong (not the files), so re-pull the best
@@ -1040,6 +1104,51 @@ class DownloadOrchestrator:
                     **self._source_event_fields(task),
                 },
             )
+
+    async def _remaining_track_positions(
+        self, task
+    ) -> "frozenset[tuple[int, int]] | None":  # noqa: ANN001 - DownloadTask
+        """``(disc, track)`` positions of the manifest's expected edition that the
+        library does NOT cover yet - the per-file failover target set (#292). Judged
+        by the SAME matcher as the completeness gate/album annotation (shared P4
+        rules in ``coverage.py``), so per-file dispatch can never disagree with what
+        the gate accepts.
+
+        ``None`` when unmeasurable (no manifest yet, non-album task, or an empty
+        expected map): callers keep whole-album semantics rather than guess. An EMPTY
+        frozenset means every position is already covered."""
+        if task.download_type != "album" or not task.release_group_mbid:
+            return None
+        try:
+            manifest = self._read_manifest(task.id)
+        except OrchestrationError:
+            return None
+        tracks = list(manifest.expected_tracks)
+        if not tracks:
+            return None
+        try:
+            rows = await self._library.get_file_rows_for_album(task.release_group_mbid)
+        except Exception:  # noqa: BLE001 - rows trouble reads as "measure nothing"
+            return None
+        # Adapt ExpectedTrack to the matcher's MusicBrainz Track shape (position/
+        # disc_number/length-ms/recording_id/title) without a network round-trip:
+        # the manifest already IS the requested edition's tracklist.
+        proxies = [
+            SimpleNamespace(
+                position=value.track_number,
+                disc_number=value.disc_number,
+                length=(value.duration_seconds * 1000.0)
+                if value.duration_seconds
+                else None,
+                recording_id=value.recording_mbid,
+                title=value.title,
+            )
+            for value in tracks
+        ]
+        uncovered = uncovered_tracks(rows, proxies)
+        return frozenset(
+            (value.disc_number or 1, value.position) for value in uncovered
+        )
 
     async def _fallback_track_repull(self, task) -> None:  # noqa: ANN001 - DownloadTask
         """Last resort for a per-track download whose every candidate was rejected on
@@ -1505,19 +1614,67 @@ class DownloadOrchestrator:
     ) -> bool:  # noqa: ANN001
         """Whether the download has delivered what it set out to. A per-track
         download is one file - complete the moment it imports (Soulseek rips rarely
-        carry the recording MBID, so a tag-based check can't be trusted). An album is
-        complete once the library COVERS the requested release's tracklist (P4:
-        recording/position+duration/title matching - a wrong file at some position
-        can no longer satisfy the request the way the 2026-07-05 single was
-        satisfied), cumulative across failover attempts. When the tracklist is
-        unavailable the pre-P4 count check is the fallback: at least ``track_count``
-        distinct positions present."""
+        carry the recording MBID, so a tag-based check can't be trusted).
+
+        An album is complete once the library COVERS the requested release's tracklist
+        (P4: recording/position+duration/title matching), cumulative across failover
+        attempts. ONE delivery-trust exception guards against tracker drift (#131
+        family, 2026-08): a CLEAN full delivery of the attempt's whole manifest while
+        the requested release-group has ZERO library rows means the rows were stamped
+        under a different RG (import-time identity drift) - holding that against the
+        download loops failover + whole-album re-downloads forever. Rows PRESENT but
+        short or mismatched keep the full P4 veto: a wrong file at a covered position
+        must never satisfy a request (the 2026-07-05 wrong-single incident), and an
+        edition tracklist with bonus tracks keeps failing over for a fuller source.
+
+        When the tracklist itself is unavailable the pre-P4 count check is the
+        fallback: at least ``track_count`` distinct positions present."""
         if task.download_type == "track":
             return imported_any
         coverage = await self._coverage(task, context="completeness")
         if coverage is not None:
             covered, expected_total, _orphans = coverage
-            return covered >= expected_total
+            if covered >= expected_total:
+                return True
+            if (
+                covered == 0
+                and result is not None
+                and result.succeeded
+                and not result.failed
+                and result.management_hold_reason_code is None
+            ):
+                try:
+                    asked = len(self._read_manifest(task.id).target_files)
+                except OrchestrationError:
+                    asked = None
+                rows = []
+                if asked is not None:
+                    try:
+                        rows = await self._library.get_file_rows_for_album(
+                            task.release_group_mbid
+                        )
+                    except Exception:  # noqa: BLE001 - rows trouble reads as "some"
+                        rows = ["unknown"]
+                # A candidate folder smaller than the requested tracklist UNDER-
+                # DELIVERED even when it published cleanly: 'everything asked of THIS
+                # source' is not 'everything requested' (whole-album-repull guard).
+                if (
+                    asked is not None
+                    and not rows
+                    and len(result.succeeded) >= asked
+                    and not (task.track_count and asked < task.track_count)
+                ):
+                    logger.info(
+                        "download.delivery_complete",
+                        extra={
+                            "task_id": task.id,
+                            "delivered": len(result.succeeded),
+                            "manifest_files": asked,
+                            "reason": "no_rows_for_release_group",
+                        },
+                    )
+                    return True
+            return False
         expected = self._expected_track_count(task)
         present = await self._imported_track_count(task)
         if expected > 0:
@@ -2102,6 +2259,25 @@ class DownloadOrchestrator:
                 "Only failed, cancelled or partial downloads can be retried"
             )
 
+        # The library may already cover the request (an earlier attempt imported it
+        # while the task stayed partial, or the user moved files in by hand): settling
+        # COMPLETED is honest and beats re-downloading the whole album (#131).
+        if task.download_type == "album" and task.release_group_mbid:
+            coverage = await self._coverage(task, context="manual_retry_skip")
+            if coverage is not None:
+                covered, expected_total, _orphans = coverage
+                if expected_total > 0 and covered >= expected_total:
+                    logger.info(
+                        "download.retry_already_satisfied",
+                        extra={
+                            "task_id": task.id,
+                            "expected": expected_total,
+                            "covered": covered,
+                        },
+                    )
+                    await self._finalize(task, DownloadStatus.COMPLETED)
+                    return task.id
+
         # Manual retry is an explicit "try again": clear the album's blocklist so a release
         # quarantined by the failed attempt is reconsidered. Album downloads only - a
         # per-track retry must not wipe the whole album's blocklist. Auto-retry
@@ -2314,6 +2490,13 @@ class DownloadOrchestrator:
             origin=task.origin if task.origin == "upgrade" else "retry",
             retry_count=task.retry_count + 1,
         )
+        # The retried task owns its staging dir from birth (#285 class): every
+        # manifest write in the enqueue path targets <staging>/<new_id>/, and a
+        # missing parent must never be able to fail a retry before its transfer
+        # even starts. Strategies mkdir too; this is the belt to their braces.
+        await asyncio.to_thread(
+            lambda: (self._staging / new_task.id).mkdir(parents=True, exist_ok=True)
+        )
         await self._relink_request(task, new_task.id)
         self.dispatch(new_task.id)
         return new_task.id
@@ -2429,6 +2612,25 @@ class DownloadOrchestrator:
                     "release_group_mbid": task.release_group_mbid,
                 },
             )
+            # The library may already cover the request (#131): an earlier attempt
+            # imported the album while the task stayed partial, or the user moved the
+            # files in by hand. Settling COMPLETED here is honest and stops the
+            # 15-minute re-download loop at its trigger instead of after it.
+            if task.download_type == "album" and task.release_group_mbid:
+                coverage = await self._coverage(task, context="auto_retry_skip")
+                if coverage is not None:
+                    covered, expected_total, _orphans = coverage
+                    if expected_total > 0 and covered >= expected_total:
+                        logger.info(
+                            "download.auto_retry_already_satisfied",
+                            extra={
+                                "task_id": task.id,
+                                "expected": expected_total,
+                                "covered": covered,
+                            },
+                        )
+                        await self._finalize(task, DownloadStatus.COMPLETED)
+                        continue
             await self._bus.publish(
                 f"download:{task.id}",
                 "auto_retry",

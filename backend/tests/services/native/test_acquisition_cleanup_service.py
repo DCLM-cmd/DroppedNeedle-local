@@ -1057,3 +1057,204 @@ async def test_reconciliation_configured_category_descends_only_there(
         )
         is None
     )
+
+
+def _age_folder(path: Path) -> None:
+    stale = 1_000_000_000.0  # 2001 - always older than ORPHAN_MIN_AGE_SECONDS
+    os.utime(path, (stale, stale))
+
+
+def _orphan_service(
+    tmp_path: Path,
+    root: Path,
+    store: DownloadStore,
+    client: _Client,
+    library: _LibraryStore | None = None,
+) -> AcquisitionCleanupService:
+    return AcquisitionCleanupService(
+        store,
+        library or _LibraryStore(),
+        lambda source: client,
+        lambda: root,
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_reconcile_removes_unowned_stale_dn_folder(tmp_path: Path):
+    root = tmp_path / "sab"
+    workspace = root / f"droppedneedle-{'a' * 32}-0"
+    workspace.mkdir(parents=True)
+    (workspace / "album.flac").write_bytes(b"x")
+    _age_folder(workspace)
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = _orphan_service(tmp_path, root, _store(tmp_path), client)
+
+    assert await service.reconcile_orphan_folders() == 1
+    assert not workspace.exists()
+    assert client.discarded == 1
+
+
+@pytest.mark.asyncio
+async def test_orphan_reconcile_leaves_folder_owned_by_attention_journal(
+    tmp_path: Path,
+):
+    root = tmp_path / "sab"
+    task_id = "b" * 32
+    job_name = f"droppedneedle-{task_id}-0"
+    workspace = root / job_name
+    workspace.mkdir(parents=True)
+    _age_folder(workspace)
+    store = _store(tmp_path)
+    attempt = await store.create_download_attempt(
+        task_id=task_id,
+        source="usenet",
+        candidate_index=0,
+        job_name=job_name,
+        handle=TaskHandle(source="usenet", job_name=job_name),
+        now=1.0,
+    )
+    await store.transition_download_attempt(
+        attempt.id,
+        expected_row_revision=attempt.row_revision,
+        new_state="needs_attention",
+        now=2.0,
+    )
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = _orphan_service(tmp_path, root, store, client)
+
+    assert await service.reconcile_orphan_folders() == 0
+    assert workspace.exists()
+    assert client.discarded == 0
+
+
+@pytest.mark.asyncio
+async def test_orphan_reconcile_leaves_active_task_workspace_without_journal_row(
+    tmp_path: Path,
+):
+    root = tmp_path / "sab"
+    store = _store(tmp_path)
+    active = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="Active",
+    )
+    await store.update_status(active.id, "downloading", started_at=10.0)
+    workspace = root / f"droppedneedle-{active.id}-0"
+    workspace.mkdir(parents=True)
+    _age_folder(workspace)
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = _orphan_service(tmp_path, root, store, client)
+
+    assert await service.reconcile_orphan_folders() == 0
+    assert workspace.exists()
+
+
+@pytest.mark.asyncio
+async def test_orphan_reconcile_leaves_young_folder_alone(tmp_path: Path):
+    root = tmp_path / "sab"
+    workspace = root / f"droppedneedle-{'c' * 32}-0"
+    workspace.mkdir(parents=True)  # fresh mtime, below the age floor
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = _orphan_service(tmp_path, root, _store(tmp_path), client)
+
+    assert await service.reconcile_orphan_folders() == 0
+    assert workspace.exists()
+    assert client.discarded == 0
+
+
+@pytest.mark.asyncio
+async def test_orphan_reconcile_never_touches_foreign_folder_names(tmp_path: Path):
+    root = tmp_path / "sab"
+    foreign = root / "sonarr.something"
+    foreign.mkdir(parents=True)
+    (foreign / "episode.mkv").write_bytes(b"x")
+    _age_folder(foreign)
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = _orphan_service(tmp_path, root, _store(tmp_path), client)
+
+    assert await service.reconcile_orphan_folders() == 0
+    assert foreign.exists()
+
+
+@pytest.mark.asyncio
+async def test_orphan_reconcile_handles_sab_collision_suffixes(tmp_path: Path):
+    root = tmp_path / "sab"
+    owned_task = "d" * 32
+    owned_job = f"droppedneedle-{owned_task}-0"
+    orphan_suffixed = root / f"droppedneedle-{'c' * 32}-0.1"
+    kept_suffixed = root / f"{owned_job}.2"
+    orphan_suffixed.mkdir(parents=True)
+    kept_suffixed.mkdir(parents=True)
+    _age_folder(orphan_suffixed)
+    _age_folder(kept_suffixed)
+    store = _store(tmp_path)
+    attempt = await store.create_download_attempt(
+        task_id=owned_task,
+        source="usenet",
+        candidate_index=0,
+        job_name=owned_job,
+        handle=TaskHandle(source="usenet", job_name=owned_job),
+        now=1.0,
+    )
+    await store.transition_download_attempt(
+        attempt.id,
+        expected_row_revision=attempt.row_revision,
+        new_state="needs_attention",
+        now=2.0,
+    )
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = _orphan_service(tmp_path, root, store, client)
+
+    assert await service.reconcile_orphan_folders() == 1
+    assert not orphan_suffixed.exists()
+    assert kept_suffixed.exists()
+
+
+@pytest.mark.asyncio
+async def test_orphan_reconcile_honours_publisher_barrier(tmp_path: Path):
+    root = tmp_path / "sab"
+    held_task = "e" * 32
+    workspace = root / f"droppedneedle-{held_task}-0"
+    workspace.mkdir(parents=True)
+    _age_folder(workspace)
+    library = _LibraryStore()
+    library.task_bundles[held_task] = [
+        SimpleNamespace(id="held-bundle", state="needs_attention")
+    ]
+    client = _Client(
+        DownloadMaterialization(
+            state="missing", mount_root=str(root), mount_healthy=True
+        )
+    )
+    service = _orphan_service(
+        tmp_path, root, _store(tmp_path), client, library=library
+    )
+
+    assert await service.reconcile_orphan_folders() == 0
+    assert workspace.exists()
+    assert client.discarded == 0

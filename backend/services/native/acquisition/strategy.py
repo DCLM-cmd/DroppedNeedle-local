@@ -33,7 +33,9 @@ from services.native.file_processor import (
     QUARANTINE_REASONS,
     FileFailure,
     ProcessResult,
+    _TAG_TITLE_WEAK,
 )
+from services.native.title_match import title_containment_score
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +145,38 @@ async def _expected_tracks_for_task(  # noqa: ANN001, ANN201
     return selected_release, expected
 
 
+def _file_serves_expected(value, tracks) -> bool:  # noqa: ANN001
+    """Whether one search-result file plausibly serves any of ``tracks`` - the
+    per-file failover filter (#292). Search-side evidence only (filename stem +
+    advertised duration), judged by the SAME thresholds the post-download matcher
+    applies (coverage's ``row_covers_track`` rules): containment-strong title,
+    duration within max(15s, 10%). Evidence is tri-state per track: a disagreeing
+    title only excludes when duration cannot rescue it (peer paths like ``02.flac``
+    carry no title signal), a hard duration miss always excludes, and a track with
+    no usable signal cannot be discriminated - its files pass rather than strand
+    the position on every candidate."""
+    stem = value.filename.replace("\\", "/").rsplit("/", 1)[-1]
+    base, dot, _ext = stem.rpartition(".")
+    if dot and base:
+        stem = base
+    for track in tracks:
+        title_ok = None
+        if track.title and stem:
+            title_ok = title_containment_score(track.title, stem) >= _TAG_TITLE_WEAK
+        duration_ok = None
+        if track.duration_seconds and value.duration:
+            duration_ok = (
+                abs(value.duration - track.duration_seconds)
+                <= max(15.0, 0.10 * track.duration_seconds)
+            )
+        if duration_ok is False:
+            continue
+        if title_ok is False and duration_ok is not True:
+            continue
+        return True
+    return False
+
+
 @runtime_checkable
 class SourceStrategy(Protocol):
     """One acquisition source's behaviour. The orchestrator holds a ``{name: strategy}``
@@ -201,10 +235,14 @@ class SourceStrategy(Protocol):
         *,
         strict_track_duration: bool,
         hold_on_wrong_track: bool = False,  # noqa: ANN001
+        remaining_positions: "frozenset[tuple[int, int]] | None" = None,
     ) -> None:
         """Build + persist the crash-recovery manifest, then hand the pick to the client.
         ``hold_on_wrong_track`` (the last-resort track re-pull, D9): a canonical-duration
-        failure at import then holds the file for review instead of failing it."""
+        failure at import then holds the file for review instead of failing it.
+        ``remaining_positions`` (per-file failover, #292): when given, ask ONLY for the
+        still-missing (disc, track) positions instead of the whole album; Usenet ignores
+        it (an NZB is the smallest addressable unit)."""
         ...
 
     async def import_files(
@@ -352,7 +390,13 @@ class SoulseekStrategy:
         )
 
     async def enqueue(
-        self, task, candidate, *, strict_track_duration, hold_on_wrong_track=False
+        self,
+        task,
+        candidate,
+        *,
+        strict_track_duration,
+        hold_on_wrong_track=False,
+        remaining_positions=None,
     ):  # noqa: ANN001, ANN201
         # For a per-track download - or a 1-track album (a single, whose identity was
         # threaded at request time) - verify the imported file against the CANONICAL
@@ -374,13 +418,33 @@ class SoulseekStrategy:
         ):
             raise OrchestrationError("could not resolve the exact album tracklist")
 
+        # Per-file failover (#292): when the orchestrator says only some (disc, track)
+        # positions are still missing, ask this peer for JUST those - expected_tracks
+        # shrinks to them, and only files that plausibly serve one get enqueued. slskd
+        # keeps partial bytes per file, so re-requesting a missing track RESUMES its
+        # earlier errored attempt instead of starting over.
+        serving = candidate.files
+        if remaining_positions is not None:
+            expected_tracks = [
+                value
+                for value in expected_tracks
+                if (value.disc_number or 1, value.track_number) in remaining_positions
+            ]
+            if not expected_tracks:
+                raise OrchestrationError("nothing left to acquire from this source")
+            serving = [
+                value
+                for value in candidate.files
+                if _file_serves_expected(value, expected_tracks)
+            ]
+
         files = [
             DownloadFileRef(
                 username=candidate.username, filename=f.filename, size=f.size
             )
-            for f in candidate.files
+            for f in serving
         ]
-        total_size = sum(f.size for f in candidate.files)
+        total_size = sum(f.size for f in serving)
         await self._store.update_status(
             task.id,
             "downloading",
@@ -397,7 +461,7 @@ class SoulseekStrategy:
         initial_handle = TaskHandle(
             source="soulseek",
             username=candidate.username,
-            filenames=[f.filename for f in candidate.files],
+            filenames=[f.filename for f in serving],
         )
         attempt = await self._store.create_download_attempt(
             task_id=task.id,
@@ -428,7 +492,7 @@ class SoulseekStrategy:
                     if use_canonical
                     else f.duration,
                 )
-                for f in candidate.files
+                for f in serving
             ],
             # Complete selected-edition map. Transfer filenames remain the correlation
             # keys; import maps each audio file to one exact release position and then
@@ -661,13 +725,23 @@ class UsenetStrategy:
         )
 
     async def enqueue(
-        self, task, candidate, *, strict_track_duration, hold_on_wrong_track=False
+        self,
+        task,
+        candidate,
+        *,
+        strict_track_duration,
+        hold_on_wrong_track=False,
+        remaining_positions=None,
     ):  # noqa: ANN001, ANN201, ARG002
         # Hand the chosen album NZB to SABnzbd. The manifest carries the expected MB
         # tracklist (not pre-known filenames) - the folder import matches the unpacked files
         # to it (D18). For a per-track grab (D4) the tracklist is the single track.
         # hold_on_wrong_track is a slskd re-pull concern; the folder import has its own
         # per-track matcher, so it is accepted for protocol conformance and unused.
+        # remaining_positions is likewise accepted-and-ignored (#292): an NZB is the
+        # smallest addressable Usenet unit, so failover stays whole-album here; the
+        # release-level blocklist above already stops re-grabbing an under-delivering
+        # release.
         release = candidate.usenet_release
         if release is None:
             raise OrchestrationError("usenet candidate has no release")

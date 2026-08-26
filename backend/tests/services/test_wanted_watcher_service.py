@@ -438,6 +438,35 @@ async def test_request_album_with_wanted_origin_skips_the_blocklist_clear():
     store.delete_quarantine_for_album.assert_awaited_once_with("rg-1")
 
 
+@pytest.mark.asyncio
+async def test_request_album_with_retry_origin_skips_the_blocklist_clear():
+    """#255 defect 1: automated re-dispatch (origin='retry') must not re-arm the
+    sources the blocklist just condemned - only explicit human actions clear."""
+    store = AsyncMock()
+    store.get_active_task_for_album.return_value = None
+    store.delete_quarantine_for_album.return_value = 2
+    store.create_task.return_value = SimpleNamespace(id="t-1")
+    library = AsyncMock()
+    library.album_quality_tier.return_value = None
+    service = DownloadService(
+        download_client=Mock(),
+        indexer=AsyncMock(),
+        scorer=AsyncMock(),
+        library_manager=library,
+        download_store=store,
+        event_bus=AsyncMock(),
+        orchestrator=Mock(),
+    )
+    await service.request_album(
+        user_id="u",
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        origin="retry",
+    )
+    store.delete_quarantine_for_album.assert_not_awaited()
+
+
 # --- seen-candidate dedup (D2) ---
 
 

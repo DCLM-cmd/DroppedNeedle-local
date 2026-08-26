@@ -28,7 +28,13 @@ from repositories.protocols.download_client import (
 
 logger = logging.getLogger(__name__)
 
-_JOB_NAME = re.compile(r"^droppedneedle-([0-9a-f]{32})-(0|[1-9][0-9]*)$")
+_JOB_NAME_BODY = r"droppedneedle-([0-9a-f]{32})-(0|[1-9][0-9]*)"
+_JOB_NAME = re.compile(rf"^{_JOB_NAME_BODY}$")
+# SABnzbd renames colliding complete-dir entries to "<job>.N" (see the failover
+# comment on strategy.enqueue); journal rows only ever carry the unsuffixed name,
+# so orphan reconciliation matches the suffixed variants while journal identity
+# validation keeps using _JOB_NAME.
+_JOB_NAME_ORPHAN = re.compile(rf"^{_JOB_NAME_BODY}(\.[1-9][0-9]*)?$")
 _TERMINAL_CLEANABLE = frozenset({"completed", "partial", "cancelled"})
 _ACTIVE_TASK_STATES = frozenset({"queued", "downloading", "processing"})
 _HEALTH_SERVICE = "acquisition_cleanup"
@@ -37,6 +43,13 @@ _RECONCILIATION_BATCH = 100
 _MAX_TREE_ENTRIES = 100_000
 _ATTENTION_RECHECK_SECONDS = 3600.0
 _UNRESOLVED_JOB_RETRIES = 4
+
+# A folder qualifies as orphan debris only when no attempt journal owns it; the age
+# floor must comfortably exceed any crash window between SABnzbd materialising a
+# job and its attempt row being journaled (plus a full download+unpack), so a live
+# download can never look abandoned just because its row landed late (#131
+# duplicate folders).
+ORPHAN_MIN_AGE_SECONDS = 6 * 3600
 
 
 class _RetryableCleanup(Exception):
@@ -573,6 +586,134 @@ class AcquisitionCleanupService:
             )
         else:
             service_health.heal(_HEALTH_SERVICE, _HEALTH_CAPABILITY)
+
+    async def reconcile_orphan_folders(self) -> int:
+        """Delete DN-named complete-dir folders that no attempt journal owns (#131).
+
+        A folder is removed only when its name matches the job pattern, every
+        ownership lookup (journal rows, live task, publisher bundles) proves it
+        unclaimed, it is older than ``ORPHAN_MIN_AGE_SECONDS``, and the client
+        confirms the job is not active. Any failed lookup skips the folder:
+        deletion decisions fail closed. Returns the number of folders removed.
+        """
+        mount = Path(self._sab_mount_getter())
+        if not mount.is_absolute() or mount == Path(mount.anchor):
+            logger.warning(
+                "Skipped acquisition orphan reconciliation for unsafe mount"
+            )
+            return 0
+        if not await asyncio.to_thread(_mount_healthy, mount):
+            return 0
+
+        category = self._sab_category_getter()
+        root_entries = await asyncio.to_thread(_directory_entries, mount)
+        search_roots: list[tuple[Path, list[tuple[str, bool, bool]]]] = [
+            (mount, root_entries)
+        ]
+        for name, is_directory, is_symlink in root_entries:
+            if (
+                is_directory
+                and not is_symlink
+                and _JOB_NAME_ORPHAN.fullmatch(name) is None
+                and _descend_allowed(name, category)
+            ):
+                child = mount / name
+                search_roots.append(
+                    (child, await asyncio.to_thread(_directory_entries, child))
+                )
+
+        removed = 0
+        for root, entries in search_roots:
+            for name, is_directory, is_symlink in entries:
+                if not is_directory or is_symlink:
+                    continue
+                if _JOB_NAME_ORPHAN.fullmatch(name) is None:
+                    continue
+                if await self._reconcile_orphan_folder(mount, root / name):
+                    removed += 1
+        return removed
+
+    async def _reconcile_orphan_folder(self, mount: Path, workspace: Path) -> bool:
+        """One conservative orphan decision; every ambiguous answer keeps the folder."""
+        match = _JOB_NAME_ORPHAN.fullmatch(workspace.name)
+        if match is None:
+            return False
+        task_id, _, suffix = match.groups()
+        job_name = workspace.name.removesuffix(suffix) if suffix else workspace.name
+        now = self._clock()
+        try:
+            if await self._store.has_download_cleanup_debt(
+                source="usenet", task_id=task_id, job_name=job_name
+            ):
+                return False
+            task = await self._store.get_task(task_id)
+            if task is not None and task.status in _ACTIVE_TASK_STATES:
+                return False
+            bundles = (
+                await self._library_store.list_acquisition_import_bundles_for_download_task(
+                    task_id
+                )
+            )
+        except Exception:  # noqa: BLE001 - fail-closed: lookup errors never delete
+            logger.warning(
+                "Acquisition orphan reconcile skipped %s: ownership lookup failed",
+                workspace,
+                exc_info=True,
+            )
+            return False
+        if any(bundle.state != "completed" for bundle in bundles):
+            return False
+        try:
+            modified_at = workspace.stat(follow_symlinks=False).st_mtime
+        except OSError:
+            return False
+        if now - modified_at < ORPHAN_MIN_AGE_SECONDS:
+            return False
+
+        handle = TaskHandle(source="usenet", job_name=job_name)
+        client = self._client_getter("usenet")
+        try:
+            materialization = await client.inspect_materialization(handle)
+        except Exception:  # noqa: BLE001 - fail-closed: client errors never delete
+            logger.warning(
+                "Acquisition orphan reconcile skipped %s: materialization "
+                "inspection failed",
+                workspace,
+                exc_info=True,
+            )
+            return False
+        if not materialization.mount_healthy or materialization.state == "active":
+            return False
+        try:
+            discarded = await client.discard_client_artifacts(handle)
+        except Exception:  # noqa: BLE001 - record cleanup stays best-effort once unowned
+            logger.warning(
+                "Acquisition orphan reconcile could not discard client artifacts "
+                "for %s",
+                workspace,
+                exc_info=True,
+            )
+            discarded = False
+        if not discarded:
+            logger.warning(
+                "Acquisition orphan reconcile found no client records for %s",
+                workspace,
+            )
+        try:
+            await asyncio.to_thread(_remove_workspace_safely, mount, workspace)
+        except OSError as error:
+            logger.warning(
+                "Acquisition orphan reconcile could not remove %s: %s",
+                workspace,
+                error,
+            )
+            return False
+        logger.info(
+            "Acquisition orphan reconcile removed %s (%s)",
+            workspace,
+            "orphan_reconcile",
+        )
+        return True
 
     async def reconcile_legacy_mount(
         self, *, limit: int = _RECONCILIATION_BATCH
