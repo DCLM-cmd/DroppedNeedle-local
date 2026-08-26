@@ -3172,6 +3172,40 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def target_provider_artist_ids_page(
+        self, after_mbid: str, *, limit: int
+    ) -> list[str]:
+        """F-TARGETCATALOG-04: one bounded keyset page of active provider
+        artist IDs.
+
+        Same active credited-artist population as
+        ``target_provider_artist_ids`` (non-retired album + indexed track),
+        but ordered and compared by the NORMALIZED (lower-case) provider ID so
+        a strict ``> cursor`` cannot skip or repeat case variants. Blank IDs
+        are skipped, casefold-equivalent IDs deduplicate via DISTINCT, and the
+        limit is floored at one. Returned values are lower-case.
+        """
+
+        def operation(connection: sqlite3.Connection) -> list[str]:
+            rows = connection.execute(
+                "SELECT DISTINCT LOWER(identity.provider_artist_id) AS mbid "
+                "FROM local_artist_external_identities identity "
+                "WHERE TRIM(COALESCE(identity.provider_artist_id, '')) != '' "
+                "AND (:cursor = '' OR LOWER(identity.provider_artist_id) "
+                "> LOWER(:cursor)) "
+                "AND EXISTS (SELECT 1 FROM local_album_artists credit "
+                "JOIN local_albums album ON album.id = credit.local_album_id "
+                "JOIN local_tracks track ON track.local_album_id = credit.local_album_id "
+                "WHERE credit.local_artist_id = identity.local_artist_id "
+                "AND album.retired_into_album_id IS NULL "
+                "AND track.availability = 'indexed') "
+                "ORDER BY mbid LIMIT :limit",
+                {"cursor": after_mbid or "", "limit": max(1, limit)},
+            ).fetchall()
+            return [str(row["mbid"]) for row in rows]
+
+        return await self._read(operation)
+
     async def target_existing_provider_artist_ids(
         self, identifiers: list[str]
     ) -> set[str]:

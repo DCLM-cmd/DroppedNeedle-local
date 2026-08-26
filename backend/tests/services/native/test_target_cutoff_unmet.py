@@ -219,3 +219,131 @@ async def test_repository_single_read_and_correct_current_tier(
     assert tiers == {"rg-a": "mp3_192", "rg-b": "low"}
     artist_ids = {row["artist_mbid"]: row["artist_name"] for row in result}
     assert artist_ids == {"pa-1": "Artist A", None: "Artist B"}
+
+
+# --- F-TARGETCATALOG-04: real-store keyset paging integration -----------------
+
+
+@pytest.mark.asyncio
+async def test_artist_keyset_pages_are_ordered_deduped_and_active_only(
+    store: NativeLibraryStore,
+) -> None:
+    """F-TARGETCATALOG-04: keyset pages over the SAME active credited-artist
+    population as target_provider_artist_ids - strictly ordered by normalized
+    ID, deduplicating case variants, skipping blanks, excluding retired albums
+    and non-indexed tracks."""
+    from models.local_catalog import LocalArtistExternalIdentity
+
+    async def seed_artist(suffix: str, mbid: str | None) -> None:
+        membership = _membership(suffix)
+        await store.create_catalog_membership(membership)
+        if mbid is not None:
+            await store.attach_artist_identity_with_aliases(
+                LocalArtistExternalIdentity(
+                    local_artist_id=f"artist-{suffix}",
+                    provider_artist_id=mbid,
+                    decision_source="automatic",
+                    selected_at=2,
+                ),
+                [],
+                expected_artist_revision=1,
+            )
+
+    # Active artists (mixed case + duplicate case variant of the same ID).
+    await seed_artist("p01", "40000000-0000-4000-8000-00000000000A")
+    await seed_artist("p02", "40000000-0000-4000-8000-00000000000B")
+    await seed_artist("p03", "40000000-0000-4000-8000-00000000000C")
+    # Duplicate case variant of p03's MBID on a different local artist row.
+    dup = _membership("p04")
+    await store.create_catalog_membership(dup)
+    await store.attach_artist_identity_with_aliases(
+        LocalArtistExternalIdentity(
+            local_artist_id="artist-p04",
+            provider_artist_id="40000000-0000-4000-8000-00000000000c",
+            decision_source="automatic",
+            selected_at=2,
+        ),
+        [],
+        expected_artist_revision=1,
+    )
+    # Retired-album artist: seeded then its album retired via SQL.
+    await seed_artist("r01", "50000000-0000-4000-8000-00000000000R")
+    with sqlite3.connect(Path(str(store.db_path))) as connection:
+        connection.execute(
+            "UPDATE local_albums SET retired_into_album_id='album-p01' "
+            "WHERE id='album-r01'"
+        )
+    # Missing / excluded track artists.
+    await seed_artist("m01", "60000000-0000-4000-8000-00000000000M")
+    await seed_artist("x01", "70000000-0000-4000-8000-00000000000X")
+    with sqlite3.connect(Path(str(store.db_path))) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET availability='missing' WHERE id='track-m01'"
+        )
+        connection.execute(
+            "UPDATE local_tracks SET availability='excluded' WHERE id='track-x01'"
+        )
+
+    full_set = await store.target_provider_artist_ids()
+    normalized_full = {value.casefold() for value in full_set}
+
+    # Walk every page at limit=2 and assert strict ordering + completeness.
+    collected: list[str] = []
+    cursor = ""
+    pages: list[list[str]] = []
+    while True:
+        page = await store.target_provider_artist_ids_page(cursor, limit=2)
+        pages.append(page)
+        for value in page:
+            assert value == value.lower()  # returned normalized
+            assert not collected or value > collected[-1]  # strict order
+        assert len(set(page)) == len(page)  # no repeats within a page
+        assert all(value not in collected for value in page)  # no cross-page repeats
+        collected.extend(page)
+        cursor = page[-1] if page else cursor
+        if not page:
+            break
+
+    expected_sorted = sorted(normalized_full)
+    assert collected == expected_sorted
+    # Case variant of 000...00C must appear exactly once (as its lower form).
+    assert sum(1 for v in collected if v.endswith("00000000000c")) == 1
+    # Excluded populations never appear.
+    assert not any(v.startswith("5") for v in collected)  # retired
+    assert not any(v.startswith("6") for v in collected)  # missing
+    assert not any(v.startswith("7") for v in collected)  # excluded
+
+    # Cursor semantics: resuming from the last ID skips nothing and starts after it.
+    mid_cursor = collected[1]
+    resumed = await store.target_provider_artist_ids_page(mid_cursor, limit=100)
+    assert resumed == [v for v in expected_sorted if v > mid_cursor]
+
+    # Full-set method still works and covers the same normalized population.
+    assert {v.casefold() for v in full_set} == set(collected)
+
+
+@pytest.mark.asyncio
+async def test_artist_keyset_limit_floor_and_blank_skip(store: NativeLibraryStore):
+    """Blank IDs are skipped; the limit is floored at one."""
+    from models.local_catalog import LocalArtistExternalIdentity
+
+    async def seed_with_blank(suffix: str, mbid: str | None) -> None:
+        membership = _membership(suffix)
+        await store.create_catalog_membership(membership)
+        if mbid is not None:
+            await store.attach_artist_identity_with_aliases(
+                LocalArtistExternalIdentity(
+                    local_artist_id=f"artist-{suffix}",
+                    provider_artist_id=mbid,
+                    decision_source="automatic",
+                    selected_at=2,
+                ),
+                [],
+                expected_artist_revision=1,
+            )
+
+    await seed_with_blank("b01", "")
+    await seed_with_blank("b02", "90000000-0000-4000-8000-000000000001")
+
+    rows = await store.target_provider_artist_ids_page("", limit=0)
+    assert rows == ["90000000-0000-4000-8000-000000000001"]

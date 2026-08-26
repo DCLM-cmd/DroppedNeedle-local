@@ -165,19 +165,23 @@ class TargetLibraryRepository:
         return albums | await self._store.target_provider_release_ids()
 
     async def get_artist_mbids(self) -> set[str]:
+        """Full active provider-ID set snapshot (F-TARGETCATALOG-04: retained
+        for callers that explicitly need the whole set; paging callers use
+        ``get_artist_mbid_page`` instead)."""
         return await self._store.target_provider_artist_ids()
 
     async def get_artist_mbid_page(self, *, after_mbid: str, limit: int) -> list[str]:
         """Keyset page over artist MBIDs, ordered case-insensitively.
 
-        Mirrors ``LibraryDB.get_artist_mbid_page`` so background tasks that page the
+        F-TARGETCATALOG-04: one bounded keyset SQL query per page (strict
+        ``> cursor`` on the normalized ID, blank IDs skipped, casefold
+        duplicates deduplicated, limit floored at one). Mirrors
+        ``LibraryDB.get_artist_mbid_page`` so background tasks that page the
         library work against either repository.
         """
-        cursor = after_mbid.casefold()
-        mbids = sorted(
-            value.casefold() for value in await self.get_artist_mbids() if value
+        return await self._store.target_provider_artist_ids_page(
+            after_mbid, limit=limit
         )
-        return [mbid for mbid in mbids if mbid > cursor][: max(1, limit)]
 
     async def existing_album_mbids(self, identifiers: list[str]) -> set[str]:
         normalized = {
