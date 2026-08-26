@@ -1863,13 +1863,16 @@ async def test_perform_target_migration_carries_probe_timeout_evidence_and_alway
                 local_only_tracks=0,
                 artists=0,
                 reference_counts=[],
-                invariants={},
                 network_calls=0,
                 tag_reads=0,
                 fingerprints=0,
                 embedded_art_reads=0,
             )
-            return BoundedMigrationOutcome(report=report, skipped_counts={"library_file": 2, "review_row": 4})
+            return BoundedMigrationOutcome(
+                report=report,
+                skipped_counts={"library_file": 2, "review_row": 4},
+                blocker_count=0,
+            )
 
     monkeypatch.setattr("services.native.bounded_legacy_catalog_migrator.BoundedLegacyCatalogMigrator", FakeMigrator)
 
@@ -1879,7 +1882,11 @@ async def test_perform_target_migration_carries_probe_timeout_evidence_and_alway
     monkeypatch.setattr(TargetStartupValidator, "validate", AsyncMock(return_value={"invariants": {}}))
     # Mock get_library_policy_resolver to avoid cache
     monkeypatch.setattr("core.dependencies.service_providers.get_library_policy_resolver", lambda: LibraryPolicyResolver(mock_preferences.get_typed_library_settings.return_value))
-    monkeypatch.setattr("maintenance.automatic_upgrade.get_library_policy_resolver", lambda: LibraryPolicyResolver(mock_preferences.get_typed_library_settings.return_value))
+    # GH-300 gate fix: _perform_target_migration imports the resolver from
+    # core.dependencies.service_providers at call time (NEW-MIG-02 refactor),
+    # so patch that binding; the old maintenance.automatic_upgrade attribute
+    # no longer exists.
+
     try:
         evidence = await automatic_upgrade._perform_target_migration()
         assert aclose_called, "reconciler.aclose should be awaited even on timeout"
