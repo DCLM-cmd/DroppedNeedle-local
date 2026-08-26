@@ -423,7 +423,10 @@ def _fingerprint_disagrees(fp, expected_track, expected_artist: str | None) -> b
     false-rejects valid tracks (e.g. a 2011 reissue + its BBC-session bonuses). Lidarr
     verifies recording identity, not edition, and fails OPEN - a non-pass result never
     rejects, leaving the tag/duration match to stand. ``expected_track`` may be None (the
-    slskd path has no per-file title), in which case only the artist is checked."""
+    slskd path has no per-file title), in which case only the artist is checked. When both
+    sides provide a recording ID, a PASS fingerprint mismatch rejects before artist
+    allowances and an exact match permits display-credit differences after the title veto.
+    Without both IDs, the existing conservative artist gate remains in force."""
     if getattr(fp, "status", None) != "pass":
         return False
     fp_title = (getattr(fp, "title", None) or "").strip()
@@ -437,6 +440,18 @@ def _fingerprint_disagrees(fp, expected_track, expected_artist: str | None) -> b
         and fuzz.token_set_ratio(fp_title, expected_title) < 50
     ):
         return True  # clearly the wrong song
+
+    fp_recording_id = (getattr(fp, "recording_id", None) or "").strip().casefold()
+    expected_recording_id = (
+        (getattr(expected_track, "recording_mbid", None) or "").strip().casefold()
+        if expected_track is not None
+        else ""
+    )
+    if fp_recording_id and expected_recording_id:
+        if fp_recording_id != expected_recording_id:
+            return True
+        return False
+
     # Wrong artist - but skip for various-artists compilations, where the album artist
     # legitimately differs from a track's performing artist.
     if fp_artist and expected_artist and "various" not in expected_artist.lower():

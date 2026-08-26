@@ -962,12 +962,13 @@ def test_recording_mbid_overrides_a_title_conflict(tmp_path):
 # --- fingerprint recording-identity check (release-group is NOT gated) ------------
 
 
-def _fp(status="pass", title=None, artist=None, rgs=None):
+def _fp(status="pass", title=None, artist=None, rgs=None, recording_id=None):
     from models.audio import FingerprintResult
 
     return FingerprintResult(
         status=status,
         score=0.95,
+        recording_id=recording_id,
         title=title,
         artist=artist,
         release_group_ids=rgs or [],
@@ -1021,6 +1022,114 @@ def test_fingerprint_skips_artist_check_for_various_artists():
 
     fp = _fp(title="Some Song", artist="Specific Band")
     assert _fingerprint_disagrees(fp, None, "Various Artists") is False
+
+
+def test_fingerprint_exact_recording_allows_collab_display_credit():
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=1, title="Electricity", recording_mbid="recording-collab"
+    )
+    fp = _fp(
+        title="Electricity",
+        artist="Silk City; Dua Lipa",
+        recording_id="recording-collab",
+    )
+    assert _fingerprint_disagrees(fp, track, "Dua Lipa") is False
+
+
+def test_fingerprint_exact_recording_allows_remix_display_credit():
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=1,
+        title="Higher Love (Kygo Remix)",
+        recording_mbid="recording-remix",
+    )
+    fp = _fp(
+        title="Higher Love",
+        artist="Whitney Houston",
+        recording_id="recording-remix",
+    )
+    assert _fingerprint_disagrees(fp, track, "Kygo") is False
+
+
+def test_fingerprint_recording_mismatch_rejects_before_various_artist_allowance():
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=1, title="Compilation Song", recording_mbid="recording-wanted"
+    )
+    fp = _fp(
+        title="Compilation Song",
+        artist="Specific Band",
+        recording_id="recording-other",
+    )
+    assert _fingerprint_disagrees(fp, track, "Various Artists")
+
+
+def test_fingerprint_recording_mismatch_rejects_base_audio_for_requested_remix():
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=1,
+        title="Higher Love (Kygo Remix)",
+        recording_mbid="recording-remix",
+    )
+    # The base recording's title is a fuzzy match for the requested remix title, but
+    # its exact recording identity must still reject the import.
+    fp = _fp(
+        title="Higher Love",
+        artist="Whitney Houston",
+        recording_id="recording-original",
+    )
+    assert _fingerprint_disagrees(fp, track, "Kygo")
+
+
+def test_fingerprint_title_veto_precedes_exact_recording_match():
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=1, title="Requested Song", recording_mbid="recording-wanted"
+    )
+    fp = _fp(
+        title="Clearly Different Song",
+        artist="Unrelated Artist",
+        recording_id="recording-wanted",
+    )
+    assert _fingerprint_disagrees(fp, track, "Requested Artist")
+
+
+@pytest.mark.parametrize(
+    ("fingerprint_recording_id", "expected_recording_id"),
+    [
+        (None, "recording-remix"),
+        ("recording-remix", None),
+        (None, None),
+    ],
+)
+def test_fingerprint_keeps_artist_gate_without_exact_recording_proof(
+    fingerprint_recording_id, expected_recording_id
+):
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=1,
+        title="Higher Love (Kygo Remix)",
+        recording_mbid=expected_recording_id,
+    )
+    fp = _fp(
+        title="Higher Love",
+        artist="Whitney Houston",
+        recording_id=fingerprint_recording_id,
+    )
+    assert _fingerprint_disagrees(fp, track, "Kygo")
 
 
 # --- import-time wrong-album guard (#1, tagless-safe) -------------------------------------

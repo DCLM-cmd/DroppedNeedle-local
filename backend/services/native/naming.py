@@ -351,25 +351,136 @@ class NamingTemplateEngine:
             rendered_characters=len(relative),
         )
 
-    def _render(self, template: str, tag: AudioTag, ext: str) -> Path:
-        result: list[str] = []
-        for part in self._TOKEN.split(template):
-            if not part:
+    @staticmethod
+    def _legacy_segments(template: str) -> list[tuple[str, bool]]:
+        """Split a legacy template into literal and variable segments.
+
+        A nested ``{variable}`` inside an outer brace pair is kept as the
+        variable segment, which makes a template-authored ``{}`` decoration
+        distinguishable from the variable's own braces.  Braces that do not
+        contain a non-empty variable remain literal text, as they did with
+        ``_TOKEN``.
+        """
+        segments: list[tuple[str, bool]] = []
+        literal_start = 0
+        index = 0
+        length = len(template)
+        while index < length:
+            if template[index] != "{":
+                index += 1
                 continue
-            if part.startswith("{") and part.endswith("}"):
-                var, _, fmt = part[1:-1].partition(":")
-                value = self._lookup(var, tag, ext)
-                if fmt and var in self._FORMATTED:
-                    try:
-                        value = format(int(value), fmt)
-                    except (ValueError, TypeError):
-                        value = "00"
-                # Sanitise substituted values so a value containing "/" (or other
-                # invalid chars) can't inject path components - only the template's
-                # literal separators define structure.
-                result.append(self._INVALID_FS_CHARS.sub("_", value))
-            else:
-                result.append(part)
+            end = index + 1
+            while end < length and template[end] not in "{}":
+                end += 1
+            if end >= length:
+                break
+            if template[end] == "{":
+                index = end
+                continue
+            if end == index + 1:
+                index = end + 1
+                continue
+            segments.append((template[literal_start:index], False))
+            segments.append((template[index : end + 1], True))
+            index = end + 1
+            literal_start = index
+        segments.append((template[literal_start:], False))
+        return segments
+
+    @staticmethod
+    def _empty_group_boundaries(
+        segments: list[tuple[str, bool]], token_index: int
+    ) -> tuple[int, int] | None:
+        """Return offsets for a matching empty, non-nested decoration."""
+        if token_index == 0 or token_index + 1 >= len(segments):
+            return None
+        before, before_is_token = segments[token_index - 1]
+        after, after_is_token = segments[token_index + 1]
+        if before_is_token or after_is_token:
+            return None
+
+        opening_index = len(before) - 1
+        while opening_index >= 0 and before[opening_index].isspace():
+            opening_index -= 1
+        if opening_index < 0:
+            return None
+        outer_opening_index = opening_index - 1
+        while outer_opening_index >= 0 and before[outer_opening_index].isspace():
+            outer_opening_index -= 1
+        if outer_opening_index >= 0 and before[outer_opening_index] in "([{":
+            return None
+        opening = before[opening_index]
+        closing = {"(": ")", "[": "]", "{": "}"}.get(opening)
+        if closing is None:
+            return None
+
+        closing_index = 0
+        while closing_index < len(after) and after[closing_index].isspace():
+            closing_index += 1
+        if closing_index >= len(after) or after[closing_index] != closing:
+            return None
+
+        outer_closing_index = closing_index + 1
+        while outer_closing_index < len(after) and after[outer_closing_index].isspace():
+            outer_closing_index += 1
+        if outer_closing_index < len(after) and after[outer_closing_index] in ")]}":
+            return None
+
+        before_start = opening_index
+        while before_start > 0 and before[before_start - 1].isspace():
+            before_start -= 1
+        return before_start, closing_index + 1
+
+    def _render(self, template: str, tag: AudioTag, ext: str) -> Path:
+        segments = self._legacy_segments(template)
+        rendered_values: dict[int, str] = {}
+        dropped_tokens: set[int] = set()
+        literal_prefix_ends: dict[int, int] = {}
+        literal_suffix_starts: dict[int, int] = {}
+
+        for index, (part, is_token) in enumerate(segments):
+            if not is_token:
+                continue
+            var, _, fmt = part[1:-1].partition(":")
+            value = self._lookup(var, tag, ext)
+            if fmt and var in self._FORMATTED:
+                try:
+                    value = format(int(value), fmt)
+                except (ValueError, TypeError):
+                    value = "00"
+            rendered_values[index] = value
+            if value:
+                continue
+            boundaries = self._empty_group_boundaries(segments, index)
+            if boundaries is None:
+                continue
+            before_start, after_end = boundaries
+            dropped_tokens.add(index)
+            before_index = index - 1
+            after_index = index + 1
+            literal_suffix_starts[before_index] = min(
+                literal_suffix_starts.get(before_index, len(segments[before_index][0])),
+                before_start,
+            )
+            literal_prefix_ends[after_index] = max(
+                literal_prefix_ends.get(after_index, 0),
+                after_end,
+            )
+
+        result: list[str] = []
+        for index, (part, is_token) in enumerate(segments):
+            if is_token:
+                if index in dropped_tokens:
+                    continue
+                # Sanitise substituted values so a value containing "/" (or
+                # other invalid chars) can't inject path components - only
+                # the template's literal separators define structure.
+                result.append(self._INVALID_FS_CHARS.sub("_", rendered_values[index]))
+                continue
+            start = literal_prefix_ends.get(index, 0)
+            end = literal_suffix_starts.get(index, len(part))
+            if start < end:
+                result.append(part[start:end])
         # Literals already carry the "/" separators; Path() splits them into
         # components, which _normalize then cleans individually.
         return Path("".join(result))
