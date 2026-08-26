@@ -661,7 +661,8 @@
 							<button
 								class="btn btn-primary gap-2"
 								disabled={start.isPending}
-								onclick={() => void begin()}
+								onclick={() =>
+									void begin(album.musicbrainz_release_id ?? null)}
 							>
 								{#if start.isPending}<span class="loading loading-spinner loading-sm"
 									></span>{:else}<Fingerprint class="h-4 w-4" />{/if}

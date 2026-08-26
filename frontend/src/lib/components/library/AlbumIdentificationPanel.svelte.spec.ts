@@ -720,3 +720,42 @@ describe('AlbumIdentificationPanel', () => {
 		await expect.element(confirmation.getByRole('alert')).toHaveTextContent(/the album changed/i);
 	});
 });
+
+
+	describe('GH-286: attached identity passes the release MBID', () => {
+		it('Check attached identity sends the durable release_mbid', async () => {
+			h.start.mockClear();
+			const attached = {
+				...album,
+				musicbrainz_release_id: '11111111-2222-4333-8444-555555555555'
+			};
+			render(AlbumIdentificationPanel, {
+				props: { album: attached }
+			} as unknown as Parameters<typeof render>[1]);
+			await page.getByRole('button', { name: 'Re-identify…' }).click();
+			await page
+				.getByRole('button', { name: 'Check attached identity' })
+				.click();
+
+			expect(h.start).toHaveBeenCalledWith(
+				expect.objectContaining({
+					releaseMbid: '11111111-2222-4333-8444-555555555555'
+				})
+			);
+		});
+
+		it('Start identification without an attached release sends null', async () => {
+			h.start.mockClear();
+			render(AlbumIdentificationPanel, {
+				props: { album }
+			} as unknown as Parameters<typeof render>[1]);
+			await page.getByRole('button', { name: 'Re-identify…' }).click();
+			await page
+				.getByRole('button', { name: 'Start identification' })
+				.click();
+
+			expect(h.start).toHaveBeenCalledWith(
+				expect.objectContaining({ releaseMbid: null })
+			);
+		});
+	});
