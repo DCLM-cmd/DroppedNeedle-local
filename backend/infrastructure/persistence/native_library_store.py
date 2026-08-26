@@ -3514,6 +3514,96 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def target_enrichment_candidates(
+        self, *, after_mbid: str | None, limit: int
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """GH-280: bounded keyset page of provider-identified artists and
+        albums for the AudioDB sweep. Mirrors the legacy
+        ``LibraryDB.get_enrichment_candidates`` contract: tuples of
+        ``(entity_type, mbid_lower, metadata)`` ordered by
+        ``entity_type, mbid_lower``; ``after_mbid`` accepts either the
+        ``"<entity_type>:<mbid>"`` cursor or a legacy bare MBID."""
+
+        cursor_type = ""
+        cursor_mbid = ""
+        legacy_cursor = (after_mbid or "").casefold()
+        if after_mbid and ":" in after_mbid:
+            candidate_type, candidate_mbid = after_mbid.split(":", 1)
+            if candidate_type in {"artist", "album"}:
+                cursor_type = candidate_type
+                cursor_mbid = candidate_mbid.casefold()
+                legacy_cursor = ""
+
+        def operation(connection: sqlite3.Connection):
+            artist_rows = connection.execute(
+                "SELECT 'artist' AS entity_type, "
+                "LOWER(identity.provider_artist_id) AS mbid_lower, "
+                "artist.display_name AS name "
+                "FROM local_artist_external_identities identity "
+                "JOIN local_artists artist ON artist.id = identity.local_artist_id "
+                "WHERE identity.provider = 'musicbrainz' "
+                "AND artist.retired_into_artist_id IS NULL"
+            ).fetchall()
+            album_rows = connection.execute(
+                "SELECT 'album' AS entity_type, "
+                "LOWER(ae.release_group_mbid) AS mbid_lower, "
+                "a.title AS name, a.album_artist_name AS artist_name "
+                "FROM local_album_external_identities ae "
+                "JOIN local_albums a ON a.id = ae.local_album_id "
+                "WHERE ae.provider = 'musicbrainz' "
+                "AND a.retired_into_album_id IS NULL "
+                "AND EXISTS (SELECT 1 FROM local_tracks track "
+                "WHERE track.local_album_id = a.id "
+                "AND track.availability = 'indexed')"
+            ).fetchall()
+            merged: list[tuple[str, str, dict[str, Any]]] = []
+            for row in [*artist_rows, *album_rows]:
+                mbid = str(row["mbid_lower"] or "")
+                if not mbid:
+                    continue
+                if cursor_type:
+                    if (row["entity_type"], mbid) <= (cursor_type, cursor_mbid) and (
+                        row["entity_type"] != cursor_type or mbid <= cursor_mbid
+                    ):
+                        continue
+                elif legacy_cursor and mbid <= legacy_cursor:
+                    continue
+                payload: dict[str, Any] = {"name": str(row["name"] or "")}
+                if row["entity_type"] == "album":
+                    payload["artist_name"] = str(row["artist_name"] or "")
+                merged.append((str(row["entity_type"]), mbid, payload))
+            merged.sort(key=lambda item: (item[0], item[1]))
+            return merged[: max(1, limit)]
+
+        return await self._read(operation)
+
+    async def target_existing_library_mbids(self, identifiers: list[str]) -> set[str]:
+        """GH-280: case-insensitive membership for Discover queue validation.
+
+        Returns the subset of ``identifiers`` that exist as release-group
+        MBIDs on active indexed albums."""
+        normalized = list(
+            dict.fromkeys(value.strip().casefold() for value in identifiers if value.strip())
+        )
+        if not normalized:
+            return set()
+        placeholders = ",".join("?" for _ in normalized)
+
+        def operation(connection: sqlite3.Connection) -> set[str]:
+            rows = connection.execute(
+                "SELECT DISTINCT LOWER(ae.release_group_mbid) FROM "
+                "local_album_external_identities ae "
+                "JOIN local_albums a ON a.id = ae.local_album_id "
+                f"WHERE LOWER(ae.release_group_mbid) IN ({placeholders}) "
+                "AND a.retired_into_album_id IS NULL "
+                "AND EXISTS (SELECT 1 FROM local_tracks t "
+                "WHERE t.local_album_id = a.id AND t.availability = 'indexed')",
+                normalized,
+            ).fetchall()
+            return {str(row[0]) for row in rows}
+
+        return await self._read(operation)
+
     async def target_provider_artist_ids_page(
         self, after_mbid: str, *, limit: int
     ) -> list[str]:

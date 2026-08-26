@@ -240,6 +240,20 @@ class TargetLibraryRepository:
             ),
         }
 
+    async def get_enrichment_candidates(
+        self, *, after_mbid: str | None, limit: int
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """GH-280: target-native AudioDB sweep candidates (bounded keyset)."""
+        return await self._store.target_enrichment_candidates(
+            after_mbid=after_mbid, limit=limit
+        )
+
+    async def existing_library_mbids(self, identifiers: list[str]) -> set[str]:
+        """GH-280: case-insensitive release-group membership for Discover
+        queue validation; replaces the legacy/Lidarr fallback on the target
+        composition."""
+        return await self._store.target_existing_library_mbids(identifiers)
+
     async def get_artists(self) -> list[dict[str, Any]]:
         rows, _ = await self._store.list_target_artists(
             limit=100_000, offset=0, sort_order="asc"
