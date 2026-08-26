@@ -1,3 +1,6 @@
+import sqlite3
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,7 +13,19 @@ from api.v1.schemas.library_management import (
     ProfileNotificationSettings,
 )
 from core.exceptions import ExternalServiceError, JellyfinAuthError
+from infrastructure.cache.cache_keys import library_identification_prefixes
+from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.library_management import LibraryManagementExternalRefreshDelivery
+from models.local_catalog import (
+    CatalogMembership,
+    LocalAlbum,
+    LocalAlbumExternalIdentity,
+    LocalArtist,
+    LocalArtistCredit,
+    LocalArtistExternalIdentity,
+    LocalTrack,
+    LocalTrackExternalIdentity,
+)
 from models.library_management_planning import PinnedLibraryManagementProfile
 from services.native.library_management_notification_service import (
     LibraryManagementNotificationService,
@@ -279,3 +294,233 @@ async def test_reconciliation_failure_does_not_skip_durable_external_refresh(
     store.ensure_library_management_external_refresh.assert_awaited_once()
     reconcile_album.assert_awaited_once_with("album-1")
     assert "Artist identity reconciliation enqueue failed" in caplog.text
+
+
+# -- F-209: post-commit delivery isolation and invalidation breadth --
+
+
+def _local_membership(suffix: str) -> CatalogMembership:
+    artist = LocalArtist(
+        id=f"artist-{suffix}",
+        display_name=suffix.upper(),
+        folded_name=suffix,
+        normalized_name=suffix,
+        kind="group",
+        created_at=1.0,
+        updated_at=1.0,
+    )
+    album = LocalAlbum(
+        id=f"album-{suffix}",
+        root_id="root-1",
+        grouping_key=f"group-{suffix}",
+        title="Release",
+        album_artist_id=artist.id,
+        album_artist_name=suffix.upper(),
+        created_at=1,
+        updated_at=1,
+    )
+    track = LocalTrack(
+        id=f"track-{suffix}",
+        local_album_id=album.id,
+        root_id="root-1",
+        file_path=f"/music/{suffix}.flac",
+        relative_path=f"{suffix}.flac",
+        path_hash=f"hash-{suffix}",
+        file_size_bytes=100,
+        file_mtime_ns=200,
+        stat_revision=f"stat-{suffix}",
+        title="Track",
+        artist_name=suffix.upper(),
+        album_title="Release",
+        album_artist_name=suffix.upper(),
+        file_format="flac",
+        imported_at=1,
+    )
+    credit = LocalArtistCredit(local_artist_id=artist.id, position=0)
+    return CatalogMembership(
+        album=album,
+        artists=[artist],
+        tracks=[track],
+        album_credits=[credit],
+        track_credits={track.id: [credit]},
+    )
+
+
+async def _seed_two_subjects(store) -> tuple[str, str]:
+    """Two managed tracks in two operations, each with provider identities."""
+    for suffix in ("a", "b"):
+        await store.create_catalog_membership(_local_membership(suffix))
+        await store.attach_album_identity(
+            LocalAlbumExternalIdentity(
+                local_album_id=f"album-{suffix}",
+                release_group_mbid=f"rg-{suffix}",
+                release_mbid=f"rel-{suffix}",
+                selected_at=2,
+            ),
+            expected_album_revision=1,
+        )
+        await store.attach_track_identity(
+            LocalTrackExternalIdentity(
+                local_track_id=f"track-{suffix}",
+                recording_mbid=f"rec-{suffix}",
+                release_mbid=f"rel-{suffix}",
+                release_track_mbid=f"rt-{suffix}",
+                medium_position=1,
+                release_track_position=1,
+                selected_at=2,
+            ),
+            expected_track_revision=1,
+        )
+        await store.attach_artist_identity_with_aliases(
+            LocalArtistExternalIdentity(
+                local_artist_id=f"artist-{suffix}",
+                provider_artist_id=f"amb-{suffix}",
+                decision_source="automatic",
+                selected_at=2,
+            ),
+            [],
+            expected_artist_revision=1,
+        )
+
+
+@pytest.fixture
+def real_store(tmp_path: Path):
+    database = tmp_path / "library.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO auth_users VALUES ('admin')")
+    return NativeLibraryStore(database, threading.Lock())
+
+
+def _wire_two_operations(real_store) -> None:
+    with sqlite3.connect(real_store.db_path) as connection:
+        for suffix in ("a", "b"):
+            connection.execute(
+                "INSERT INTO library_operation_jobs "
+                "(id, kind, state, expected_work_count, completed_count, "
+                "succeeded_count, failed_count, skipped_count, control_request, "
+                "reidentification_attempt_count, created_at, phase_timings_json, "
+                "updated_at, row_revision, event_revision) VALUES "
+                "(?, 'library_management', 'running', 1, 0, 0, 0, 0, 'none', 0, "
+                "100, '{}', 100, 1, 0)",
+                (f"operation-{suffix}",),
+            )
+            connection.execute(
+                "INSERT INTO library_track_management_state "
+                "(local_track_id, last_operation_job_id, row_revision) "
+                "VALUES (?, ?, 1)",
+                (f"track-{suffix}", f"operation-{suffix}"),
+            )
+            connection.execute(
+                "INSERT INTO library_management_job_snapshots "
+                "(job_id, mode, origin, phase, selection_json, profile_revision, "
+                "settings_revision, naming_revision, policy_revision, "
+                "catalog_revision, profile_snapshot_json, intent_json, summary_json, "
+                "warnings_json, created_at, updated_at, row_revision) VALUES "
+                "(?, 'apply', 'manual', 'applying', '{}', 'profile-rev', "
+                "'settings-rev', 'naming-rev', 'policy-rev', 0, ?, '{}', '{}', '[]', "
+                "100, 100, 1)",
+                (f"operation-{suffix}", _refresh_profile_snapshot_json()),
+            )
+
+
+def _refresh_profile_snapshot_json() -> str:
+    pinned = PinnedLibraryManagementProfile(
+        profile=LibraryManagementProfile(
+            id="profile-1",
+            name="Profile",
+            notification=ProfileNotificationSettings(refresh_external_servers=True),
+        ),
+        naming_script=NamingScriptSettings(
+            id="naming-1", name="Naming", source="$title"
+        ),
+    )
+    return msgspec.json.encode(pinned).decode()
+
+
+def _post_commit_service(real_store, **overrides):
+    preferences = MagicMock()
+    preferences.get_library_management_settings_raw.return_value = SimpleNamespace(
+        external_refresh=SimpleNamespace(
+            enabled=True,
+            jellyfin_enabled=True,
+            plex_enabled=False,
+            navidrome_enabled=False,
+            retry_attempts=3,
+            retry_delay_seconds=30,
+        )
+    )
+    return LibraryManagementPostCommitService(
+        real_store,
+        preferences,
+        overrides.get("memory_cache", AsyncMock()),
+        overrides.get("disk_cache", AsyncMock()),
+        overrides.get("discovery", AsyncMock()),
+        lambda: overrides.get("jellyfin", MagicMock()),
+        overrides.get("reconcile_album"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalidation_breadth_covers_every_prefix_and_subject(real_store):
+    """Breadth pin: after a move/restore commit EVERY identification cache
+    prefix is cleared and every affected release-group/artist disk entry is
+    dropped - not just the first subject's."""
+    await _seed_two_subjects(real_store)
+    _wire_two_operations(real_store)
+    original_ensure = real_store.ensure_library_management_external_refresh
+    real_store.ensure_library_management_external_refresh = AsyncMock(
+        side_effect=original_ensure
+    )
+    memory_cache, disk_cache, discovery = AsyncMock(), AsyncMock(), AsyncMock()
+    service = _post_commit_service(
+        real_store,
+        memory_cache=memory_cache,
+        disk_cache=disk_cache,
+        discovery=discovery,
+    )
+
+    await service.after_commit({"track-a", "track-b"}, set())
+
+    cleared = [call.args[0] for call in memory_cache.clear_prefix.await_args_list]
+    assert sorted(cleared) == sorted(library_identification_prefixes())
+    deleted_albums = {
+        call.args[0] for call in disk_cache.delete_album.await_args_list
+    }
+    assert deleted_albums == {"rg-a", "rg-b"}
+    deleted_artists = {
+        call.args[0] for call in disk_cache.delete_artist.await_args_list
+    }
+    assert deleted_artists == {"amb-a", "amb-b"}
+    discovery.mark_discover_stale.assert_awaited_once()
+    # both operations got a durable delivery row
+    assert real_store.ensure_library_management_external_refresh.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_delivery_enqueue_failure_leaves_invalidation_complete(real_store):
+    """Isolation pin: a raising external-refresh enqueue must never starve the
+    cache invalidation that already ran - stale UI is the failure mode this
+    guards against, so invalidator counts must be complete when it blows up."""
+    await _seed_two_subjects(real_store)
+    _wire_two_operations(real_store)
+    memory_cache, disk_cache, discovery = AsyncMock(), AsyncMock(), AsyncMock()
+    service = _post_commit_service(
+        real_store,
+        memory_cache=memory_cache,
+        disk_cache=disk_cache,
+        discovery=discovery,
+    )
+    real_store.ensure_library_management_external_refresh = AsyncMock(
+        side_effect=OSError("delivery queue down")
+    )
+    prefixes = library_identification_prefixes()
+
+    with pytest.raises(OSError, match="delivery queue down"):
+        await service.after_commit({"track-a", "track-b"}, set())
+
+    cleared = [call.args[0] for call in memory_cache.clear_prefix.await_args_list]
+    assert cleared == prefixes
+    assert disk_cache.delete_album.await_count == 2
+    assert disk_cache.delete_artist.await_count == 2
+    discovery.mark_discover_stale.assert_awaited_once()

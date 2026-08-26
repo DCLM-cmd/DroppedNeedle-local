@@ -5,6 +5,7 @@ Drives a REAL LibraryDB + LibraryManager with on-disk temp files so the disk
 unlink and the soft-delete are genuinely exercised, not mocked.
 """
 
+import asyncio
 import os
 import threading
 from pathlib import Path
@@ -310,3 +311,101 @@ async def test_removal_clears_native_track_cache(db):
     await service._invalidate_caches_after_removal("release-group-1", None)
 
     memory_cache.delete.assert_any_await(f"{ALBUM_TRACKS_INFO_PREFIX}release-group-1")
+
+
+# -- F-206: recycle-intended removal fails closed when no bin resolves --
+
+
+def _recycle_service(db: LibraryDB, roots: list[Path], bin_path: str = ""):
+    """LibraryService whose preferences resolve the recycle bin from ``roots``."""
+
+    class _Policy:
+        recycle_bin_path = bin_path
+
+    class _Root:
+        def __init__(self, path: Path) -> None:
+            self.path = str(path)
+
+    class _LibSettings:
+        library_roots = [_Root(root) for root in roots]
+
+    prefs = MagicMock()
+    prefs.get_download_policy.return_value = _Policy()
+    prefs.get_typed_library_settings.return_value = _LibSettings()
+    return LibraryService(
+        library_repo=LibraryManager(db),
+        library_db=db,
+        cover_repo=None,
+        preferences_service=prefs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recycle_album_with_unresolved_bin_fails_closed(db, tmp_path):
+    # Zero configured roots and no explicit bin: a to_recycle request must touch
+    # nothing (no silent hard delete), leave bytes on disk, and surface failure.
+    manager = LibraryManager(db)
+    f1 = tmp_path / "lib" / "Album" / "01.flac"
+    f2 = tmp_path / "lib" / "Album" / "02.flac"
+    f1.parent.mkdir(parents=True)
+    await _seed(manager, f1, rg="rg-1", artist_mbid="art-1", track=1)
+    await _seed(manager, f2, rg="rg-1", artist_mbid="art-1", track=2)
+    service = _recycle_service(db, roots=[])
+
+    with pytest.raises(ExternalServiceError, match="Couldn't remove this album"):
+        await service.remove_album("rg-1", to_recycle=True)
+
+    assert f1.exists() and f2.exists()
+    rows = await db.get_library_files_for_album("rg-1")
+    assert [row["file_path"] for row in rows] == [str(f1), str(f2)]
+
+
+@pytest.mark.asyncio
+async def test_recycle_album_still_recycles_when_default_bin_resolves(
+    db, tmp_path
+):
+    manager = LibraryManager(db)
+    root = tmp_path / "lib"
+    f1 = root / "Album" / "01.flac"
+    f1.parent.mkdir(parents=True)
+    await _seed(manager, f1, rg="rg-1", artist_mbid="art-1", track=1)
+    service = _recycle_service(db, roots=[root])
+
+    resp = await service.remove_album("rg-1", to_recycle=True)
+
+    assert resp.success is True
+    assert not f1.exists()
+    bins = list((root / ".recycle").iterdir())
+    assert len(bins) == 1  # one <stamp>-<uuid> entry directory
+    recycled = list(bins[0].iterdir())
+    assert [p.name for p in recycled] == ["01.flac"]
+    assert await db.get_library_files_for_album("rg-1") == []
+
+
+@pytest.mark.asyncio
+async def test_recycle_paths_reports_all_paths_failed_when_bin_unresolved(
+    db, tmp_path
+):
+    service = _recycle_service(db, roots=[])
+    target = tmp_path / "keep-me.flac"
+    target.write_bytes(b"x")
+
+    moved, failed = await asyncio.to_thread(service._recycle_paths, [str(target)])
+
+    assert moved == []
+    assert failed == [str(target)]
+    assert target.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_files_lane_keeps_explicit_hard_delete(db, tmp_path):
+    # The deliberate user-initiated hard-delete design is untouched by F-206.
+    manager = LibraryManager(db)
+    f1 = tmp_path / "lib" / "Album" / "01.flac"
+    f1.parent.mkdir(parents=True)
+    await _seed(manager, f1, rg="rg-1", artist_mbid="art-1", track=1)
+
+    resp = await _service(db).remove_album("rg-1", delete_files=True)
+
+    assert resp.success is True
+    assert not f1.exists()

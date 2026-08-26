@@ -7,6 +7,7 @@ request -> a curator imports -> they get notified.
 
 import asyncio
 import logging
+import os
 import shutil
 import uuid
 from pathlib import Path
@@ -39,8 +40,20 @@ def _copy_to(src, dest: Path) -> None:  # noqa: ANN001 - SpooledTemporaryFile
     # rewind this would stage zero-byte files
     src.seek(0)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest, "wb") as out:
-        shutil.copyfileobj(src, out)
+    # Atomic-temp convention (mirrors the publisher's _write_temp_bytes): copy
+    # into a sibling .part file, then rename into place, so a crash can never
+    # leave a half-written upload that looks like a real staged file.
+    part = dest.with_suffix(".part")
+    try:
+        with open(part, "wb") as out:
+            shutil.copyfileobj(src, out)
+        os.replace(part, dest)
+    except OSError:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove partial upload %s", part)
+        raise
 
 
 @router.post("/uploads", response_model=DropImportJobResponse, status_code=202)

@@ -170,3 +170,60 @@ def test_plain_user_is_forbidden(tmp_path):
     for role in ("trusted", "admin"):
         request = SimpleNamespace(state=SimpleNamespace(user=mock_user(role=role)))
         assert _get_current_curator(request).role == role
+
+
+# -- F-211: staged uploads are written atomically via a .part temp --
+
+
+def test_copy_to_stages_through_part_file_without_residue(tmp_path):
+    dest = tmp_path / "incoming" / "abc123"
+    import_drop._copy_to(io.BytesIO(b"payload"), dest)
+
+    assert dest.read_bytes() == b"payload"
+    # the .part temp is gone; the staged upload is the only file left
+    assert [p.name for p in dest.parent.iterdir()] == ["abc123"]
+
+
+def test_copy_to_leaves_nothing_when_the_copy_fails(tmp_path, monkeypatch):
+    dest = tmp_path / "incoming" / "abc123"
+
+    def boom(_src, out):
+        out.write(b"half")
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(import_drop.shutil, "copyfileobj", boom)
+
+    with pytest.raises(OSError):
+        import_drop._copy_to(io.BytesIO(b"payload"), dest)
+
+    # neither a half-written staged file nor an opaque .part survives
+    assert not dest.exists()
+    assert not (tmp_path / "incoming").exists() or not any(
+        (tmp_path / "incoming").iterdir()
+    )
+
+
+def test_copy_to_cleans_part_when_rename_fails(tmp_path, monkeypatch):
+    dest = tmp_path / "incoming" / "abc123"
+
+    def refuse(_a, _b):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(import_drop.os, "replace", refuse)
+
+    with pytest.raises(OSError):
+        import_drop._copy_to(io.BytesIO(b"payload"), dest)
+
+    assert not dest.exists()
+    assert not any((tmp_path / "incoming").iterdir())
+
+
+def test_upload_never_leaves_part_files_in_incoming(tmp_path):
+    client, _ = _client(tmp_path)
+    response = client.post(
+        "/api/v1/import/uploads",
+        files=[("files", ("album.zip", _zip_bytes(), "application/zip"))],
+    )
+    assert response.status_code == 202
+    incoming = tmp_path / "incoming"
+    assert [p.name for p in incoming.iterdir() if p.suffix == ".part"] == []

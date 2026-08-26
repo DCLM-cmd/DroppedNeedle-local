@@ -1,6 +1,5 @@
 """Regression guards for the staged Library Management mutation boundary."""
 
-import inspect
 
 from core.dependencies.service_providers import (
     get_download_orchestrator,
@@ -35,21 +34,35 @@ def test_import_services_have_no_legacy_publication_implementation() -> None:
         assert not hasattr(DropImportService, name)
 
 
-def test_all_download_and_drop_providers_converge_on_target_publication() -> None:
-    assert "return get_target_file_processor()" in inspect.getsource(get_file_processor)
-    target_source = inspect.getsource(get_target_file_processor)
-    assert "publish_import_bundle=import_library.publish_import_bundle" in target_source
-    assert "return get_target_drop_import_service()" in inspect.getsource(
-        get_drop_import_service
-    )
-    target_drop_source = inspect.getsource(get_target_drop_import_service)
-    assert (
-        "publish_import_bundle=import_library.publish_import_bundle"
-        in target_drop_source
-    )
-    assert "return get_target_download_orchestrator()" in inspect.getsource(
-        get_download_orchestrator
-    )
-    assert "return get_target_download_service()" in inspect.getsource(
-        get_download_service
-    )
+def test_download_and_drop_providers_converge_on_target_publication() -> None:
+    """Functional replacement for the retired source-substring checks: every
+    download/drop provider must hand back the TARGET service wired to the
+    shared staged publisher (``publish_import_bundle``). A lane that loses the
+    publisher hook raises at import time instead of writing files directly, so
+    a None hook here means imports stopped going through E10's chain."""
+    try:
+        processor = get_file_processor()
+        assert isinstance(processor, FileProcessor)
+        # get_file_processor is a pure alias of the target builder.
+        assert processor is get_target_file_processor()
+        assert processor._publish_import_bundle is not None
+        assert processor._policy_revision_getter is not None
+
+        drop = get_drop_import_service()
+        assert isinstance(drop, DropImportService)
+        assert drop is get_target_drop_import_service()
+        assert drop._publish_import_bundle is not None
+
+        # The download lanes import through the SAME processor singleton.
+        orchestrator = get_download_orchestrator()
+        assert any(
+            getattr(strategy, "_file_processor", None) is processor
+            for strategy in orchestrator._strategies.values()
+        )
+        assert get_download_service()._file_processor is processor
+    finally:
+        from core.dependencies._registry import clear_all_singletons
+
+        clear_all_singletons()
+
+

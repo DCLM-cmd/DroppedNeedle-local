@@ -352,3 +352,149 @@ async def test_keep_existing_duplicate_is_durable_without_filesystem_publish() -
     assert values["result_json"] == (
         '{"filesystem_writes":0,"resolution":"kept_existing"}'
     )
+
+
+# -- F-210: concurrent-applier drill on one operation job --
+
+
+@pytest.fixture
+def real_store(tmp_path):
+    import sqlite3
+    import threading
+
+    from infrastructure.persistence.native_library_store import (
+        NativeLibraryStore as _Store,
+    )
+
+    database = tmp_path / "library.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO auth_users VALUES ('admin')")
+    return _Store(database, threading.Lock())
+
+
+def _seed_claimed_apply_job(real_store, *, job_id: str, lease_owner: str) -> None:
+    import sqlite3
+
+    with sqlite3.connect(real_store.db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_operation_jobs "
+            "(id, kind, state, lease_owner, lease_expires_at, heartbeat_at, "
+            "expected_work_count, completed_count, succeeded_count, failed_count, "
+            "skipped_count, control_request, reidentification_attempt_count, "
+            "created_at, phase_timings_json, updated_at, row_revision, "
+            "event_revision) VALUES (?, 'library_management', 'running', ?, 1000, "
+            "100, 1, 0, 0, 0, 0, 'none', 0, 100, '{}', 100, 1, 0)",
+            (job_id, lease_owner),
+        )
+        connection.execute(
+            "INSERT INTO library_management_job_snapshots "
+            "(job_id, mode, origin, phase, selection_json, profile_revision, "
+            "settings_revision, naming_revision, policy_revision, catalog_revision, "
+            "profile_snapshot_json, intent_json, summary_json, warnings_json, "
+            "created_at, updated_at, row_revision) VALUES "
+            "(?, 'apply', 'manual', 'applying', '{}', 'profile', 'settings', "
+            "'naming', 'policy', 1, '{}', '{}', '{}', '[]', 100, 100, 1)",
+            (job_id,),
+        )
+        connection.execute(
+            "INSERT INTO library_operation_work "
+            "(job_id, ordinal, local_album_id, expected_subject_revision, "
+            "expected_input_revision, "
+            "action, idempotency_key, state, row_revision, updated_at) VALUES "
+            "(?, 0, 'album-1', 1, 1, 'library_management', ?, 'pending', 1, 100)",
+            (job_id, f"{job_id}:bundle:0"),
+        )
+
+
+def _real_store_worker(store) -> tuple[LibraryManagementWorker, AsyncMock]:
+    publisher = AsyncMock(spec=LibraryManagementPublisher)
+    worker = LibraryManagementWorker(
+        store,
+        AsyncMock(spec=LibraryManagementPlanner),
+        publisher,
+        AsyncMock(spec=LibraryManagementUndoService),
+        AsyncMock(spec=LibraryManagementBaselineService),
+        AsyncMock(spec=LibraryManagementDuplicateService),
+    )
+    return worker, publisher
+
+
+@pytest.mark.asyncio
+async def test_concurrent_appliers_publish_one_bundle_without_duplicate_work(
+    real_store,
+) -> None:
+    """Two workers drive run_claimed on the SAME claimed job concurrently. The
+    store's lease claim is the only mutual exclusion: exactly one may publish
+    the bundle; the loser must exit without publishing or duplicating work."""
+    _seed_claimed_apply_job(real_store, job_id="management-race", lease_owner="worker-a")
+    worker_a, publisher_a = _real_store_worker(real_store)
+    worker_b, publisher_b = _real_store_worker(real_store)
+    job = {"id": "management-race"}
+
+    # The real publisher's catalog commit settles its bundle's work row
+    # (commit_library_management_bundle); the stand-in mirrors exactly that
+    # store contract so finish_library_management_apply sees a terminal item.
+    import sqlite3 as _sqlite3
+
+    async def _settle_work(job_id: str, ordinal: int, worker_id: str) -> None:
+        def run() -> None:
+            with _sqlite3.connect(real_store.db_path) as connection:
+                connection.execute(
+                    "UPDATE library_operation_work SET state='succeeded', "
+                    "row_revision=row_revision+1 WHERE job_id=? AND ordinal=? "
+                    "AND state='running'",
+                    (job_id, ordinal),
+                )
+                connection.execute(
+                    "UPDATE library_operation_jobs SET completed_count="
+                    "completed_count+1, succeeded_count=succeeded_count+1 "
+                    "WHERE id=? AND state='running' AND lease_owner=?",
+                    (job_id, worker_id),
+                )
+
+        await asyncio.to_thread(run)
+
+    for publisher in (publisher_a, publisher_b):
+        publisher.publish_bundle.side_effect = _settle_work
+
+    results = await asyncio.gather(
+        worker_a.run_claimed(job, "worker-a"),
+        worker_b.run_claimed(job, "worker-b"),
+        return_exceptions=True,
+    )
+
+    winner_results = [
+        result
+        for result in results
+        if not isinstance(result, BaseException)
+        and result.get("state") == "succeeded"
+    ]
+    # exactly one worker published the single bundle
+    total_publishes = publisher_a.publish_bundle.await_count + (
+        publisher_b.publish_bundle.await_count
+    )
+    assert total_publishes == 1
+    assert len(winner_results) == 1
+    # the work item reached a terminal state through ONE CAS transition
+    with __import__("sqlite3").connect(real_store.db_path) as connection:
+        states = [
+            row[0]
+            for row in connection.execute(
+                "SELECT state FROM library_operation_work WHERE job_id=?",
+                ("management-race",),
+            ).fetchall()
+        ]
+        attempts = connection.execute(
+            "SELECT succeeded_count FROM library_operation_jobs WHERE id=?",
+            ("management-race",),
+        ).fetchone()[0]
+    assert states == ["succeeded"]
+    assert attempts == 1
+    # the non-owner can never terminalize the job it does not hold
+    losers = [
+        result
+        for result in results
+        if isinstance(result, StaleRevisionError)
+    ]
+    assert len(losers) == 1
