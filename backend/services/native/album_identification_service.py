@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
 import msgspec
@@ -30,7 +31,10 @@ from services.native.conditional_fingerprint_service import (
     FINGERPRINTER_VERSION,
     ConditionalFingerprintService,
 )
-from services.native.identification_queue_service import IdentificationQueueService
+from services.native.identification_queue_service import (
+    LEASE_SECONDS,
+    IdentificationQueueService,
+)
 from services.native.identification_revisions import (
     album_identity_revision,
     album_input_revisions,
@@ -401,6 +405,23 @@ class AlbumIdentificationService:
         decision: IdentificationDecision | None = None
 
         async def checkpoint() -> bool:
+            # F-057: renew the 60s claim lease on every phase checkpoint so a
+            # long recall + fpcalc pass cannot outlive the lease if a second
+            # claimant ever appears; failures stay inert while the
+            # single-claimer invariant holds (finish matches owner+revision).
+            try:
+                fresh_revision = await self._store.heartbeat_identification_job(
+                    str(job["id"]),
+                    worker_id,
+                    now=time.time(),
+                    lease_seconds=LEASE_SECONDS,
+                )
+                if fresh_revision is not None:
+                    job["row_revision"] = fresh_revision
+            except Exception:  # noqa: BLE001 - heartbeat must never fail a run
+                logger.debug(
+                    "Identification lease heartbeat failed", exc_info=True
+                )
             return not await self._queue.is_paused()
 
         try:
@@ -441,6 +462,7 @@ class AlbumIdentificationService:
                     )
                     return "provider_deferred"
                 cached_release_groups: list[str] = []
+                cached_outcomes: dict[str, object] = {}
                 for track, row in zip(tracks, raw_tracks, strict=True):
                     cached = await self._store.get_fingerprint_outcome(
                         track.local_track_id,
@@ -449,6 +471,7 @@ class AlbumIdentificationService:
                     )
                     if cached is not None:
                         cached_release_groups.extend(cached.release_group_ids)
+                        cached_outcomes[track.local_track_id] = cached
                         if (
                             not track.recording_mbid
                             and cached.state == "matched"
@@ -464,15 +487,13 @@ class AlbumIdentificationService:
                     checkpoint=checkpoint,
                 )
                 if await self._queue.is_paused():
-                    await self._pause(job, worker_id, "candidate_search", [])
+                    await self._pause(job, worker_id, "candidate_search")
                     return "paused"
                 decision = self._evidence_engine.decide(tracks, recalled)
                 if decision.outcome in ("ambiguous", "insufficient_evidence"):
                     requested = 0
                     new_release_groups: list[str] = []
                     for track, row in zip(tracks, raw_tracks, strict=True):
-                        if requested >= MAX_NEW_FINGERPRINTS_PER_ATTEMPT:
-                            break
                         supported_recordings = {
                             item.recording_mbid
                             for candidate in decision.candidates
@@ -484,6 +505,18 @@ class AlbumIdentificationService:
                         needed = (
                             not track.recording_mbid and len(supported_recordings) != 1
                         )
+                        if not needed:
+                            continue
+                        cached = cached_outcomes.get(track.local_track_id)
+                        cache_hit = (
+                            cached is not None
+                            and getattr(cached, "state", "")
+                            in ("matched", "no_match", "skipped")
+                        )
+                        if not cache_hit and (
+                            requested >= MAX_NEW_FINGERPRINTS_PER_ATTEMPT
+                        ):
+                            break
                         outcome = await self._fingerprints.fingerprint_if_needed(
                             local_track_id=track.local_track_id,
                             path=Path(str(row["file_path"])),
@@ -492,16 +525,13 @@ class AlbumIdentificationService:
                             now=timestamp,
                             checkpoint=checkpoint,
                         )
-                        if not needed:
-                            continue
-                        requested += 1
+                        # F-042: an instant terminal cache hit did no fpcalc or
+                        # lookup work, so it must not consume budget slots that
+                        # later tracks need.
+                        if not cache_hit:
+                            requested += 1
                         if await self._queue.is_paused():
-                            await self._pause(
-                                job,
-                                worker_id,
-                                "fingerprinting",
-                                decision.candidates,
-                            )
+                            await self._pause(job, worker_id, "fingerprinting")
                             return "paused"
                         if outcome is not None and outcome.state == "failed":
                             # F-MATCH-04: a local fpcalc failure is NOT a
@@ -538,9 +568,7 @@ class AlbumIdentificationService:
                             checkpoint=checkpoint,
                         )
                         if await self._queue.is_paused():
-                            await self._pause(
-                                job, worker_id, "candidate_search", decision.candidates
-                            )
+                            await self._pause(job, worker_id, "candidate_search")
                             return "paused"
                         decision = self._evidence_engine.decide(tracks, recalled)
 
@@ -605,10 +633,17 @@ class AlbumIdentificationService:
                 started_at=timestamp,
                 completed_at=timestamp,
             )
+            current_job = await self._store.get_identification_job_row(
+                str(job["id"])
+            )
             await self._store.finish_identification_job(
                 str(job["id"]),
                 worker_id=worker_id,
-                expected_job_revision=int(job["row_revision"]),
+                expected_job_revision=int(
+                    current_job["row_revision"]
+                    if current_job is not None
+                    else job["row_revision"]
+                ),
                 expected_album_revision=int(context["album"]["row_revision"]),
                 expected_input_revision=":".join(
                     (tag_revision, file_revision, policy_revision)
@@ -635,6 +670,16 @@ class AlbumIdentificationService:
                         "Automatic scan-discovered management scheduling failed",
                         exc_info=True,
                     )
+                    # F-061: durable marker so the gap is queryable (and can be
+                    # swept later) instead of silently relying on a full rescan.
+                    try:
+                        await self._store.mark_management_schedule_pending(
+                            str(job["local_album_id"])
+                        )
+                    except Exception:  # noqa: BLE001 - never mask the original
+                        logger.exception(
+                            "Failed to record management_schedule_pending"
+                        )
             if self._invalidate is not None:
                 await self._invalidate(
                     {
@@ -663,19 +708,19 @@ class AlbumIdentificationService:
         finally:
             clear_degradation_context()
 
-    async def _pause(
-        self,
-        job: dict,
-        worker_id: str,
-        phase: str,
-        evidence: list[CandidateEvidence],
-    ) -> None:
+    async def _pause(self, job: dict, worker_id: str, phase: str) -> None:
+        """F-058: the pause checkpoint keeps ONLY the phase label and matcher
+        version for observability. The serialized candidate evidence was dead
+        weight implying replay semantics that do not exist - restoring
+        ``AlbumCandidate`` objects from post-decision ``CandidateEvidence``
+        would be lossy (no candidate-side titles/durations), so resume
+        deliberately re-runs recall under the queue's backoff bounds."""
+        current = await self._store.get_identification_job_row(str(job["id"]))
         await self._queue.checkpoint_pause(
             job,
             worker_id,
-            {
-                "phase": phase,
-                "evidence": msgspec.to_builtins(evidence),
-                "matcher_version": MATCHER_VERSION,
-            },
+            {"phase": phase, "matcher_version": MATCHER_VERSION},
+            expected_job_revision_override=(
+                int(current["row_revision"]) if current is not None else None
+            ),
         )

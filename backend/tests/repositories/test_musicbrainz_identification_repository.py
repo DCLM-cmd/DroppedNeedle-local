@@ -228,3 +228,206 @@ async def test_exact_release_propagates_provider_failure_without_substitution() 
         await repository.get_exact_release_candidate(
             "release-1", RequestPriority.USER_INITIATED
         )
+
+
+# --- F-062: single-source-of-truth edition selection across lanes -------------
+
+
+def test_select_edition_prefers_official_skips_zero_count_and_ties_stably():
+    from repositories.musicbrainz_base import select_edition
+
+    releases = [
+        # zero-track-count promo: skipped even though it is listed first
+        {"id": "rel-promo", "status": "Official", "media": [{}]},
+        # unofficial at the exact target count...
+        {
+            "id": "rel-unofficial",
+            "status": "Promotion",
+            "date": "1970-01-01",
+            "media": [{"track-count": 3}],
+        },
+        # ...and an Official sibling equally close: Official wins.
+        {
+            "id": "rel-official",
+            "status": "Official",
+            "date": "1970-01-01",
+            "media": [{"track-count": 3}],
+        },
+    ]
+    assert select_edition(releases, 3) == "rel-official"
+    # all-zero-count input has nothing to rank
+    assert (
+        select_edition(
+            [{"id": "rel-a", "media": [{}]}, {"id": "rel-b", "status": "Official"}],
+            5,
+        )
+        is None
+    )
+    # closest track count beats everything else
+    assert (
+        select_edition(
+            [
+                {"id": "far", "status": "Official", "media": [{"track-count": 30}]},
+                {"id": "near", "status": "Promotion", "media": [{"track-count": 4}]},
+            ],
+            4,
+        )
+        == "near"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_album_candidate_selects_counted_official_edition() -> None:
+    """F-062 convergence (native lane): with a zero-count promo listed first
+    and a counted Official edition second, get_album_candidate resolves to
+    the SAME edition MBID the folder/drop-import matcher picks."""
+    musicbrainz = SimpleNamespace(
+        get_release_group_by_id=AsyncMock(
+            return_value={
+                "id": "rg-converge",
+                "title": "Album",
+                "primary-type": "Album",
+                "secondary-types": [],
+                "artist-credit": [{"name": "Artist", "artist": {"id": "artist-1"}}],
+                "releases": [
+                    {"id": "rel-promo", "status": "Promotion", "media": [{}]},
+                    {
+                        "id": "rel-official-counted",
+                        "status": "Official",
+                        "date": "1970-01-01",
+                        "media": [{"track-count": 1}],
+                    },
+                ],
+            }
+        ),
+        get_release_by_id=AsyncMock(
+            return_value={
+                "date": "1970-01-01",
+                "media": [
+                    {
+                        "position": 1,
+                        "tracks": [
+                            {
+                                "position": 1,
+                                "title": "Track",
+                                "length": 180_000,
+                                "recording": {"id": "recording-1"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+    )
+    repository = MusicBrainzIdentificationRepository(musicbrainz)
+
+    candidate = await repository.get_album_candidate(
+        "rg-converge", 1, RequestPriority.BACKGROUND_SYNC
+    )
+
+    assert isinstance(candidate, AlbumCandidate)
+    assert candidate.release_mbid == "rel-official-counted"
+    musicbrainz.get_release_by_id.assert_awaited_once()
+    assert (
+        musicbrainz.get_release_by_id.await_args.args[0] == "rel-official-counted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_album_candidate_all_zero_count_editions_return_none() -> None:
+    """F-062: no ranked edition possible -> honest None instead of guessing."""
+    musicbrainz = SimpleNamespace(
+        get_release_group_by_id=AsyncMock(
+            return_value={
+                "id": "rg-empty",
+                "title": "Album",
+                "releases": [
+                    {"id": "rel-zero", "status": "Official", "media": [{}]}
+                ],
+            }
+        ),
+        get_release_by_id=AsyncMock(),
+    )
+    repository = MusicBrainzIdentificationRepository(musicbrainz)
+
+    assert (
+        await repository.get_album_candidate(
+            "rg-empty", 1, RequestPriority.BACKGROUND_SYNC
+        )
+        is None
+    )
+    musicbrainz.get_release_by_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_both_lanes_resolve_same_group_to_same_edition_mbid() -> None:
+    """F-062 convergence proof: ONE release-group fixture (zero-count promo
+    listed first, counted Official edition second) fed through BOTH the
+    native identification lane and the folder/drop-import matcher resolves
+    to the identical edition MBID."""
+    from services.native.album_matcher import AlbumIdentifier
+
+    releases = [
+        {"id": "rel-promo", "status": "Promotion", "media": [{}]},
+        {
+            "id": "rel-official-counted",
+            "status": "Official",
+            "date": "1970-01-01",
+            "media": [{"track-count": 1}],
+        },
+    ]
+    release_detail = {
+        "date": "1970-01-01",
+        "media": [
+            {
+                "position": 1,
+                "tracks": [
+                    {
+                        "position": 1,
+                        "title": "Track",
+                        "length": 180_000,
+                        "recording": {"id": "recording-1"},
+                    }
+                ],
+            }
+        ],
+    }
+
+    # Lane 1: native identification repository.
+    musicbrainz = SimpleNamespace(
+        get_release_group_by_id=AsyncMock(
+            return_value={
+                "id": "rg-shared",
+                "title": "Album",
+                "primary-type": "Album",
+                "secondary-types": [],
+                "artist-credit": [{"name": "Artist", "artist": {"id": "artist-1"}}],
+                "releases": releases,
+            }
+        ),
+        get_release_by_id=AsyncMock(return_value=release_detail),
+    )
+    native = MusicBrainzIdentificationRepository(musicbrainz)
+    candidate = await native.get_album_candidate(
+        "rg-shared", 1, RequestPriority.BACKGROUND_SYNC
+    )
+    assert candidate is not None
+
+    # Lane 2: folder / drop-import matcher.
+    folder_repo = SimpleNamespace(
+        get_release_group_by_id=AsyncMock(
+            return_value={
+                "id": "rg-shared",
+                "title": "Album",
+                "artist-credit": [{"name": "Artist", "artist": {"id": "artist-1"}}],
+                "releases": releases,
+            }
+        ),
+        get_release_by_id=AsyncMock(return_value=release_detail),
+    )
+    identifier = AlbumIdentifier(folder_repo)
+    meta, tracks = await identifier.release_tracks("rg-shared", 1)
+
+    assert candidate.release_mbid == "rel-official-counted"
+    assert meta.release_mbid == "rel-official-counted"
+    assert [t.recording_mbid for t in tracks] == ["recording-1"]

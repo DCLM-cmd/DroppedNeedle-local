@@ -702,6 +702,8 @@ async def test_apply_requires_exact_current_token_and_is_idempotent(
         expected_job_revision=2,
         idempotency_key="apply-once",
         now=100.0,
+        current_settings_revision=snapshot.settings_revision,
+        current_policy_revision=snapshot.policy_revision,
     )
 
     snapshot.mode = "apply"

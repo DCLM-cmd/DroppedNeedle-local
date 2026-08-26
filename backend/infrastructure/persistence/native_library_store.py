@@ -1221,7 +1221,8 @@ class NativeLibraryStore(PersistenceBase):
             for statement in (
                 "ALTER TABLE library_identification_jobs ADD COLUMN checkpoint_json TEXT",
                 "ALTER TABLE library_work_control ADD COLUMN high_priority_claim_count INTEGER NOT NULL DEFAULT 0",
-                "ALTER TABLE local_tracks ADD COLUMN embedded_release_group_mbid TEXT",
+                "ALTER TABLE library_identification_jobs ADD COLUMN provider_reset_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE local_albums ADD COLUMN management_schedule_pending INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE local_tracks ADD COLUMN embedded_release_mbid TEXT",
                 "ALTER TABLE local_tracks ADD COLUMN embedded_recording_mbid TEXT",
                 "ALTER TABLE local_tracks ADD COLUMN embedded_release_track_mbid TEXT",
@@ -7458,25 +7459,75 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._write(operation)
 
+    async def get_identification_job_row(self, job_id: str) -> dict[str, Any] | None:
+        """F-057: callers renewing leases mid-run need the CURRENT row_revision
+        for the finish CAS instead of the claim-time snapshot."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            row = connection.execute(
+                "SELECT * FROM library_identification_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+        return await self._read(operation)
+
+    async def mark_management_schedule_pending(self, local_album_id: str) -> None:
+        """F-061: durable marker for a swallowed post-identification
+        management-scheduling failure; cleared by any later successful
+        scheduling pass for the same album."""
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "UPDATE local_albums SET management_schedule_pending = 1, "
+                "row_revision = row_revision + 1 WHERE id = ?",
+                (local_album_id,),
+            )
+
+        await self._write(operation)
+
+    async def clear_management_schedule_pending(self, local_album_id: str) -> None:
+        """F-061: called when management scheduling later succeeds."""
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "UPDATE local_albums SET management_schedule_pending = 0 "
+                "WHERE id = ? AND management_schedule_pending != 0",
+                (local_album_id,),
+            )
+
+        await self._write(operation)
+
     async def heartbeat_identification_job(
         self, job_id: str, worker_id: str, *, now: float, lease_seconds: float
-    ) -> bool:
-        def operation(connection: sqlite3.Connection) -> bool:
+    ) -> int | None:
+        """F-057: renew one running claim's lease. Returns the NEW row_revision
+        so the caller can keep its CAS expectations current (heartbeats bump
+        the revision by design), or None when the lease is lost."""
+
+        def operation(connection: sqlite3.Connection) -> int | None:
             cursor = connection.execute(
-                "UPDATE library_identification_jobs SET heartbeat_at = ?, lease_expires_at = ?, "
-                "updated_at = ?, row_revision = row_revision + 1 WHERE id = ? "
-                "AND state = 'running' AND lease_owner = ? AND row_revision < ?",
-                (now, now + lease_seconds, now, job_id, worker_id, MAX_REVISION),
+                "UPDATE library_identification_jobs SET heartbeat_at = ?, "
+                "lease_expires_at = ?, updated_at = ?, row_revision = row_revision + 1 "
+                "WHERE id = ? AND state = 'running' AND lease_owner = ? AND row_revision < ? "
+                "RETURNING row_revision",
+                (
+                    now,
+                    now + lease_seconds,
+                    now,
+                    job_id,
+                    worker_id,
+                    MAX_REVISION,
+                ),
             )
-            if cursor.rowcount == 1:
-                return True
+            row = cursor.fetchone()
+            if row is not None:
+                return int(row["row_revision"])
             self._refuse_max_revision(
                 connection,
                 table="library_identification_jobs",
                 predicate="id = ? AND state = 'running' AND lease_owner = ?",
                 parameters=(job_id, worker_id),
             )
-            return False
+            return None
 
         return await self._write(operation)
 
@@ -8183,26 +8234,45 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._write(operation)
 
-    async def reset_provider_identification_deferrals(self, *, now: float) -> int:
-        """Clear backoff on provider-deferred queued jobs after recovery.
+    async def reset_provider_identification_deferrals(
+        self, *, now: float, staleness_seconds: float
+    ) -> int:
+        """Release provider-deferred jobs after an outage-recovery edge.
 
-        Only rows deferred for PROVIDER_TEMPORARILY_UNAVAILABLE are reset; other
-        deferral reasons keep their backoff untouched.
+        F-056: resets preserve failure history. A PROVIDER_TEMPORARILY_
+        UNAVAILABLE row that has sat for at least one full backoff quantum
+        gets its attempt counter wiped at most TWICE per failure streak
+        (provider_reset_count); afterwards only a far-future ``not_before``
+        is released, so deterministically-poison payloads still reach
+        MAX_DEFERRAL_ATTEMPTS and attention instead of churning forever.
         """
 
         def operation(connection: sqlite3.Connection) -> int:
-            cursor = connection.execute(
+            wiped = connection.execute(
                 "UPDATE library_identification_jobs SET attempt_count = 0, "
-                "not_before = 0, last_failure_code = NULL, updated_at = ?, "
+                "not_before = 0, last_failure_code = NULL, "
+                "provider_reset_count = provider_reset_count + 1, updated_at = ?, "
                 "row_revision = row_revision + 1, event_revision = event_revision + 1 "
                 "WHERE state = 'queued' "
                 "AND last_failure_code = 'PROVIDER_TEMPORARILY_UNAVAILABLE' "
+                "AND provider_reset_count < 2 "
+                "AND updated_at < ? - ? "
                 "AND row_revision < ? AND event_revision < ?",
-                (now, MAX_REVISION, MAX_REVISION),
+                (now, now, staleness_seconds, MAX_REVISION, MAX_REVISION),
             )
-            if cursor.rowcount:
+            released = connection.execute(
+                "UPDATE library_identification_jobs SET not_before = 0, updated_at = ?, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE state = 'queued' "
+                "AND last_failure_code = 'PROVIDER_TEMPORARILY_UNAVAILABLE' "
+                "AND not_before > ? + ? "
+                "AND row_revision < ? AND event_revision < ?",
+                (now, now, staleness_seconds, MAX_REVISION, MAX_REVISION),
+            )
+            touched = wiped.rowcount + released.rowcount
+            if touched:
                 self._bump_stream(connection, "identification")
-            return cursor.rowcount
+            return touched
 
         result = await self._write(operation)
         if result:
@@ -8471,6 +8541,15 @@ class NativeLibraryStore(PersistenceBase):
         return await self._read(operation)
 
     async def record_fingerprint_outcome(self, outcome: FingerprintOutcome) -> int:
+        """Upsert one outcome; terminal states (matched/no_match/skipped)
+        short-circuit to the stored row_revision.
+
+        F-046 concurrency invariant: two racing writers for one key both pass
+        the SELECT guard only while the row is non-terminal, and the upsert's
+        ``attempt_count = attempt_count + 1`` makes the stored count monotonic
+        under interleaving even though last-write-wins picks one payload -
+        bounded workers make double-generation rare and idempotent.
+        """
         def operation(connection: sqlite3.Connection) -> int:
             existing = connection.execute(
                 "SELECT state, row_revision FROM audio_fingerprint_outcomes "
@@ -8481,10 +8560,12 @@ class NativeLibraryStore(PersistenceBase):
                     outcome.fingerprinter_version,
                 ),
             ).fetchone()
+            # F-041: "disabled" is NOT terminal - it must be overwritable so
+            # tracks locked out by an absent AcoustID key recover when the key
+            # is configured later.
             if existing is not None and existing["state"] in (
                 "matched",
                 "no_match",
-                "disabled",
                 "skipped",
             ):
                 return int(existing["row_revision"])
@@ -20699,8 +20780,16 @@ class NativeLibraryStore(PersistenceBase):
         expected_job_revision: int,
         idempotency_key: str,
         now: float,
+        current_settings_revision: str | None = None,
+        current_policy_revision: str | None = None,
     ) -> dict[str, Any]:
-        """Atomically convert one exact sealed preview into its apply operation."""
+        """Atomically convert one exact sealed preview into its apply operation.
+
+        F-079: pass the caller's freshly-read settings/policy revisions to
+        have them verified INSIDE this transaction alongside the catalog
+        revision, so drift surfaces as one clean rejection instead of N
+        per-bundle stage failures later.
+        """
 
         if not idempotency_key.strip():
             raise ValidationError("An apply idempotency key is required.")
@@ -20727,15 +20816,6 @@ class NativeLibraryStore(PersistenceBase):
                         "The Library Management preview is already being applied."
                     )
                 return dict(job)
-            reused = connection.execute(
-                "SELECT job_id FROM library_management_job_snapshots "
-                "WHERE apply_idempotency_key=?",
-                (idempotency_key,),
-            ).fetchone()
-            if reused is not None:
-                raise ConflictError(
-                    "The apply idempotency key belongs to another operation."
-                )
             if (
                 str(job["state"]) != "ready"
                 or int(job["row_revision"]) != expected_job_revision
@@ -20764,6 +20844,23 @@ class NativeLibraryStore(PersistenceBase):
             if catalog_revision != int(snapshot["catalog_revision"]):
                 raise StaleRevisionError(
                     "The library catalog changed after the preview."
+                )
+            # F-079: settings/policy drift verified inside the same
+            # transaction (values freshly read by the caller) so the apply is
+            # rejected once, cleanly, instead of failing per bundle later.
+            if (
+                current_settings_revision is not None
+                and str(snapshot["settings_revision"]) != current_settings_revision
+            ):
+                raise StaleRevisionError(
+                    "Library Management settings changed before apply."
+                )
+            if (
+                current_policy_revision is not None
+                and str(snapshot["policy_revision"]) != current_policy_revision
+            ):
+                raise StaleRevisionError(
+                    "The library policy changed before apply."
                 )
             if (
                 connection.execute(
@@ -21314,6 +21411,10 @@ class NativeLibraryStore(PersistenceBase):
                 "SUM(eligibility = 'eligible') eligible_count, "
                 "SUM(eligibility = 'warning') warning_count, "
                 "SUM(eligibility = 'blocked') blocked_count, "
+                # F-080: 'stale' IS written - by the duplicate-resolution lane
+                # (library_management_duplicate_service persists items with
+                # eligibility="stale") and those rows flow through this same
+                # finalize; stale_count is therefore reachable telemetry.
                 "SUM(eligibility = 'stale') stale_count, "
                 "COALESCE(SUM(estimated_temporary_bytes), 0) estimated_temporary_bytes, "
                 "SUM(COALESCE(json_extract(diff_json, '$.requires_write'), 0) = 0) "
@@ -26531,6 +26632,14 @@ class NativeLibraryStore(PersistenceBase):
         evidence: list[IdentificationEvidenceRecord],
         now: float,
     ) -> dict[str, Any]:
+        """Commit one explicit re-identification evaluation terminally.
+
+        F-055/F-IDENT-03: degradation-flag outages no longer reach here on
+        their first pass - the worker defers them like raised outages. This
+        finish records the honest PROVIDER_TEMPORARILY_UNAVAILABLE failure
+        only once the bounded retry budget is exhausted.
+        """
+
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             snapshot = connection.execute(
                 "SELECT * FROM library_reidentification_snapshots WHERE job_id = ?",

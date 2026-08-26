@@ -515,7 +515,51 @@ async def test_identify_returns_none_when_no_candidate_accepts():
 
 
 @pytest.mark.asyncio
-async def test_identify_falls_back_when_release_track_counts_missing():
+async def test_identify_skips_zero_count_editions_but_uses_counted_sibling():
+    """F-062 convergence: editions without medium track-counts are SKIPPED
+    consistently across lanes instead of winning a blind first-listed
+    fallback; a counted sibling edition still identifies normally."""
+    repo = AsyncMock()
+    repo.search_release_groups = AsyncMock(
+        return_value=[
+            SearchResult(
+                type="album",
+                title="Santana",
+                musicbrainz_id="rg-debut",
+                artist="Santana",
+            ),
+        ]
+    )
+    repo.search_recordings = AsyncMock(return_value=[])
+    repo.get_release_group_by_id = AsyncMock(
+        return_value=_rg_detail(
+            "Santana",
+            "Santana",
+            [
+                {"id": "rel-promo", "status": "Promotion", "media": [{}]},
+                {
+                    "id": "rel-debut-counted",
+                    "status": "Official",
+                    "media": [{"track-count": len(_SANTANA)}],
+                },
+            ],
+        )
+    )
+    repo.get_release_by_id = AsyncMock(return_value=_release_tracks([_SANTANA]))
+    identifier = AlbumIdentifier(repo)
+    match = await identifier.identify(_locals(_SANTANA, album="Santana"))
+    assert match is not None and match.release_group_mbid == "rg-debut"
+    # the counted Official edition was selected, not the zero-count promo
+    assert match.release_mbid == "rel-debut-counted"
+    assert len(match.assignments) == 9
+    repo.get_release_by_id.assert_awaited_once()
+    assert repo.get_release_by_id.await_args.args[0] == "rel-debut-counted"
+
+
+@pytest.mark.asyncio
+async def test_identify_all_zero_count_editions_resolve_to_none():
+    """F-062: with ONLY zero-track-count editions there is nothing to rank -
+    the lane reports unresolved instead of guessing an arbitrary edition."""
     repo = AsyncMock()
     repo.search_release_groups = AsyncMock(
         return_value=[
@@ -538,8 +582,8 @@ async def test_identify_falls_back_when_release_track_counts_missing():
     repo.get_release_by_id = AsyncMock(return_value=_release_tracks([_SANTANA]))
     identifier = AlbumIdentifier(repo)
     match = await identifier.identify(_locals(_SANTANA, album="Santana"))
-    assert match is not None and match.release_group_mbid == "rg-debut"
-    assert len(match.assignments) == 9
+    assert match is None
+    repo.get_release_by_id.assert_not_awaited()
 
 
 # -- fingerprint-seeded identification (prevents one folder scattering across RGs) --

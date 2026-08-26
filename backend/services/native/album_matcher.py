@@ -9,7 +9,10 @@ from rapidfuzz.distance import Levenshtein
 
 from infrastructure.msgspec_fastapi import AppStruct
 from infrastructure.queue.priority_queue import RequestPriority
-from repositories.musicbrainz_base import extract_artist_name
+from repositories.musicbrainz_base import (
+    extract_artist_name,
+    select_edition,
+)
 from services.native.musicbrainz_matcher import MusicBrainzMatcher
 
 if TYPE_CHECKING:
@@ -517,29 +520,11 @@ class AlbumIdentifier:
             rg_artist_mbid = rg_artist_mbid or resolved_mbid
         is_various = self._is_various(detail, rg_artist_mbid, rg_artist)
 
-        scored: list[tuple[int, int, str, str]] = []
-        fallback_id: str | None = None
-        for rel in detail.get("releases") or []:
-            rel_id = rel.get("id")
-            if not rel_id:
-                continue
-            if fallback_id is None:
-                fallback_id = rel_id
-            count = sum(
-                int(m.get("track-count") or 0) for m in (rel.get("media") or [])
-            )
-            if count <= 0:
-                continue
-            official = 0 if rel.get("status") == "Official" else 1
-            scored.append(
-                (abs(count - target_count), official, rel.get("date") or "9999", rel_id)
-            )
-        if scored:
-            scored.sort()
-            release_id = scored[0][3]
-        elif fallback_id is not None:
-            release_id = fallback_id
-        else:
+        # F-062: shared best-edition policy - identical ranking to the native
+        # identification lane, including the consistent zero-track-count skip
+        # (the old first-listed fallback is what made lanes drift).
+        release_id = select_edition(detail.get("releases") or [], target_count)
+        if release_id is None:
             return None
 
         try:

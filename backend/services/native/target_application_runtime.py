@@ -10,6 +10,7 @@ import socket
 import time
 from collections.abc import Awaitable, Callable
 
+from core.exceptions import StaleRevisionError
 from core.task_registry import TaskRegistry
 from infrastructure.queue.durable_work_wakeup import DurableWorkWakeups
 from infrastructure.resilience.retry import CircuitOpenError, CircuitState
@@ -71,6 +72,10 @@ async def run_target_identification_worker(
     owner = worker_id or _worker_id("identification")
     wakeups = work_wakeups or DurableWorkWakeups()
     last_provider_sweep_at = 0.0
+    # F-056: the reset fires on the OPEN/HALF_OPEN -> CLOSED recovery edge
+    # (plus once at startup), never on every idle tick where state is CLOSED.
+    last_provider_state: CircuitState | None = None
+    provider_reset_pending = True
     while True:
         revision = wakeups.revision("identification")
         processed = False
@@ -111,6 +116,21 @@ async def run_target_identification_worker(
                     await queue.defer(job, owner, "UNEXPECTED_ERROR", retry_after_seconds=retry_after_for_defer)
                 except Exception:  # noqa: BLE001 - a crashed job must not kill the worker
                     logger.exception("Failed to defer crashed identification job")
+        except StaleRevisionError as exc:
+            # F-060: files legitimately changing mid-run is an expected race
+            # the revision checks exist for - defer under its own code instead
+            # of burning the crash budget as UNEXPECTED_ERROR.
+            logger.warning(
+                "Target identification job %s hit stale input: %s",
+                str(job["id"]) if job else "<unknown>",
+                exc,
+            )
+            if job is not None:
+                try:
+                    await queue.defer(job, owner, "STALE_INPUT")
+                except Exception:  # noqa: BLE001 - a crashed job must not kill the worker
+                    logger.exception("Failed to defer stale identification job")
+            wait_seconds = ERROR_RETRY_INTERVAL_SECONDS
         except Exception:  # noqa: BLE001 - a durable worker must survive one failed item
             logger.exception("Target identification worker iteration failed")
             if job is not None:
@@ -127,14 +147,24 @@ async def run_target_identification_worker(
                 last_provider_sweep_at = now
                 try:
                     state = provider_state_getter()
-                    if state is CircuitState.CLOSED:
-                        # Provider recovered: immediately release provider-deferred
-                        # jobs instead of waiting out up to 6h of stale backoff.
+                    recovered_edge = (
+                        state is CircuitState.CLOSED
+                        and (
+                            provider_reset_pending
+                            or last_provider_state
+                            in (CircuitState.OPEN, CircuitState.HALF_OPEN)
+                        )
+                    )
+                    if state is CircuitState.CLOSED and recovered_edge:
+                        # Provider recovered (or startup): release provider-
+                        # deferred jobs per F-056's bounded-reset policy.
                         await queue_getter().reset_provider_deferrals(now=now)
+                        provider_reset_pending = False
                     elif state is CircuitState.HALF_OPEN and probe_provider is not None:
                         # Without traffic the breaker would sit HALF_OPEN forever;
                         # one bounded background probe resolves it either way.
                         await probe_provider()
+                    last_provider_state = state
                 except Exception:  # noqa: BLE001 - a durable worker must survive one failed item
                     logger.exception("Identification provider health sweep failed")
         try:

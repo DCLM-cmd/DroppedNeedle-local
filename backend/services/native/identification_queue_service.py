@@ -22,6 +22,8 @@ LEASE_SECONDS = 60.0
 # timeout; provider recovery is gated separately by resurrection eligibility.
 MAX_DEFERRAL_ATTEMPTS = 10
 MAX_BACKOFF_SECONDS = 30 * 2 ** min(MAX_DEFERRAL_ATTEMPTS - 2, 10)
+# F-056: attempt caps are monotonic modulo the store's bounded two-wipe
+# provider-reset budget; recovery releases only reset-stale or far-future rows.
 SUBJECT_NOT_AVAILABLE_GRACE_SECONDS = 24 * 60 * 60
 
 
@@ -214,8 +216,11 @@ class IdentificationQueueService:
         )
 
     async def reset_provider_deferrals(self, *, now: float | None = None) -> int:
+        """F-056: recovery-edge release with preserved failure history; the
+        staleness window is one full backoff quantum."""
         return await self._store.reset_provider_identification_deferrals(
-            now=time.time() if now is None else now
+            now=time.time() if now is None else now,
+            staleness_seconds=MAX_BACKOFF_SECONDS,
         )
 
     async def pause(
@@ -238,11 +243,18 @@ class IdentificationQueueService:
         checkpoint: dict,
         *,
         now: float | None = None,
+        expected_job_revision_override: int | None = None,
     ) -> int:
+        """F-057: lease heartbeats bump row_revision mid-run, so pausing uses
+        the freshest known revision when the caller supplies one."""
         return await self._store.checkpoint_identification_pause(
             str(job["id"]),
             worker_id=worker_id,
-            expected_job_revision=int(job["row_revision"]),
+            expected_job_revision=(
+                expected_job_revision_override
+                if expected_job_revision_override is not None
+                else int(job["row_revision"])
+            ),
             checkpoint=checkpoint,
             now=time.time() if now is None else now,
         )

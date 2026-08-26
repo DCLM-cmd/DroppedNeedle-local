@@ -6,7 +6,10 @@ from models.identification import (
     CandidateTrack,
     ReleaseEditionSearchPage,
 )
-from repositories.musicbrainz_base import extract_artist_name
+from repositories.musicbrainz_base import (
+    extract_artist_name,
+    select_edition,
+)
 from repositories.musicbrainz_repository import MusicBrainzRepository
 
 
@@ -121,26 +124,11 @@ class MusicBrainzIdentificationRepository:
         )
         if not group:
             return None
-        releases: list[tuple[int, int, str, str]] = []
-        for release in group.get("releases") or []:
-            release_id = release.get("id")
-            if not release_id:
-                continue
-            track_count = sum(
-                int(medium.get("track-count") or 0)
-                for medium in release.get("media") or []
-            )
-            releases.append(
-                (
-                    abs(track_count - target_track_count) if track_count else 1_000_000,
-                    0 if release.get("status") == "Official" else 1,
-                    release.get("date") or "9999",
-                    release_id,
-                )
-            )
-        if not releases:
+        # F-062: shared best-edition policy - same helper as the folder/
+        # drop-import lane so both resolve one group to the same edition.
+        release_id = select_edition(group.get("releases") or [], target_track_count)
+        if release_id is None:
             return None
-        release_id = min(releases)[3]
         release = await self._musicbrainz.get_release_by_id(
             release_id,
             includes=["recordings", "artist-credits"],

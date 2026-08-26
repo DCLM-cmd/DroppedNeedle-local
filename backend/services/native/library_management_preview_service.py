@@ -482,18 +482,27 @@ class LibraryManagementPreviewService:
             raise ValidationError("The Library Management preview token is invalid.")
         if snapshot.proposed_settings_revision is not None:
             raise ValidationError("An activation preview cannot be applied.")
-        if snapshot.phase == "ready":
-            detail = await self.detail(job_id)
-            if not detail.ready_for_confirmation:
-                raise StaleRevisionError(
-                    "The Library Management preview is not current and ready to apply."
-                )
+        # F-079: staleness is enforced INSIDE begin_library_management_apply
+        # (catalog in-transaction; settings/policy via the freshly-read
+        # revisions below), so drift rejects once instead of per bundle.
+        stale_reasons = await self._stale_reasons(snapshot)
+        if snapshot.phase == "ready" and stale_reasons:
+            raise StaleRevisionError(
+                "The Library Management preview is not current and ready to apply."
+            )
+        policy = LibraryPolicyResolver(
+            self._preferences.get_typed_library_settings_raw()
+        )
         row = await self._store.begin_library_management_apply(
             job_id,
             preview_token_hash=token_hash,
             expected_job_revision=request.expected_operation_row_revision,
             idempotency_key=request.idempotency_key,
             now=self._clock(),
+            current_settings_revision=settings_revision(
+                self._preferences.get_library_management_settings_raw()
+            ),
+            current_policy_revision=policy.policy_revision,
         )
         return LibraryOperationService._response(row)
 

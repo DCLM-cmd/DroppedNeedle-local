@@ -47,15 +47,23 @@ from services.native.album_candidate_service import (
     AlbumCandidateService,
 )
 from services.native.album_coverage_service import AlbumCoverageService
-from services.native.album_evidence_engine import AlbumEvidenceEngine
-from services.native.album_identification_service import AlbumIdentificationService
+from services.native.album_evidence_engine import (
+    MATCHER_VERSION,
+    AlbumEvidenceEngine,
+)
+from services.native.album_identification_service import (
+    MAX_NEW_FINGERPRINTS_PER_ATTEMPT,
+    AlbumIdentificationService,
+)
 from services.native.conditional_fingerprint_service import (
+    FINGERPRINTER_VERSION,
     ConditionalFingerprintService,
 )
 from services.native.identification_evidence_projector import (
     IdentificationEvidenceProjector,
 )
 from services.native.identification_queue_service import (
+    LEASE_SECONDS,
     MAX_BACKOFF_SECONDS,
     MAX_DEFERRAL_ATTEMPTS,
     IdentificationQueueService,
@@ -1410,7 +1418,18 @@ async def test_reset_provider_deferrals_clears_backoff_and_leaves_other_reasons(
     await queue.defer(subject_job, "worker", "SUBJECT_NOT_AVAILABLE", now=3)
     assert await queue.claim("worker", now=4) is None
 
-    assert await queue.reset_provider_deferrals(now=100) == 1
+    # F-056: a FRESH provider deferral is NOT wiped inside the staleness
+    # window - only outage-aged rows (or far-future backoff) get released.
+    assert await queue.reset_provider_deferrals(now=100) == 0
+    with sqlite3.connect(db_path) as connection:
+        fresh_row = connection.execute(
+            "SELECT attempt_count, not_before, last_failure_code "
+            "FROM library_identification_jobs WHERE id = ?",
+            (provider_job["id"],),
+        ).fetchone()
+    assert fresh_row == (1, 32, "PROVIDER_TEMPORARILY_UNAVAILABLE")
+
+    assert await queue.reset_provider_deferrals(now=20_000) == 1
 
     with sqlite3.connect(db_path) as connection:
         provider_row = connection.execute(
@@ -1425,7 +1444,7 @@ async def test_reset_provider_deferrals_clears_backoff_and_leaves_other_reasons(
         ).fetchone()
     assert provider_row == (0, 0, None)
     assert subject_row == (1, 33, "SUBJECT_NOT_AVAILABLE")
-    reclaimed = await queue.claim("worker", now=100)
+    reclaimed = await queue.claim("worker", now=20_000)
     assert reclaimed is not None
     assert reclaimed["id"] == provider_job["id"]
 
@@ -2793,7 +2812,9 @@ async def test_provider_reset_and_enqueue_never_resurrect_unmappable_rows(
     ).run_claimed_job(job, "worker", now=3)
 
     queue = IdentificationQueueService(store)
-    reset_count = await store.reset_provider_identification_deferrals(now=100)
+    reset_count = await store.reset_provider_identification_deferrals(
+        now=100, staleness_seconds=50
+    )
     assert reset_count == 0  # exact-code gate: unmappable rows are untouched
     with sqlite3.connect(db_path) as connection:
         not_before, failure_code = connection.execute(
@@ -3236,7 +3257,12 @@ async def test_automatic_worker_defers_local_fingerprint_failure_honestly(
         ).fetchone()
     assert row[0] == "FINGERPRINT_LOCAL_FAILURE"
     # Provider-only sweep leaves the local-failure row's backoff untouched.
-    assert await store.reset_provider_identification_deferrals(now=100_000) == 0
+    assert (
+        await store.reset_provider_identification_deferrals(
+            now=100_000, staleness_seconds=60
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -3485,3 +3511,361 @@ async def test_provision_rejects_duplicate_staged_targets_fail_closed() -> None:
         await guard_store.provision_staged_grouping_groups(
             "run-guard", "root", "dir", duplicate_groups, now=5.0
         )
+
+
+# --- Cluster 5/6: F-057 F-042 F-041 F-043 behavioral pins ---------------------
+
+
+class _CountingEmptyProvider(FakeProvider):
+    """Zero candidates, no degradation - the pure 'nothing found' lane."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.search_calls = 0
+
+    async def search_album_candidate_ids(self, artist, title, limit, priority):
+        self.search_calls += 1
+        return []
+
+
+def _multi_track_album(store: NativeLibraryStore, count: int) -> None:
+    from models.local_catalog import (
+        CatalogMembership,
+        LocalAlbum,
+        LocalArtist,
+        LocalArtistCredit,
+        LocalTrack,
+    )
+
+    artist = LocalArtist(
+        id="artist-multi",
+        display_name="Artist",
+        folded_name="artist",
+        normalized_name="artist",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id="album-multi",
+        root_id="root",
+        grouping_key="group-multi",
+        title="Album",
+        album_artist_id=artist.id,
+        album_artist_name="Artist",
+        created_at=1,
+        updated_at=1,
+    )
+    tracks = []
+    credits = {}
+    for index in range(1, count + 1):
+        track = LocalTrack(
+            id=f"track-multi-{index}",
+            local_album_id=album.id,
+            root_id="root",
+            file_path=f"/music/multi-{index}.flac",
+            relative_path=f"multi-{index}.flac",
+            path_hash=f"hash-multi-{index}",
+            file_size_bytes=100,
+            file_mtime_ns=index,
+            stat_revision=f"stat-multi-{index}",
+            tag_revision=f"tag-multi-{index}",
+            title="Track",
+            artist_name="Artist",
+            album_title="Album",
+            album_artist_name="Artist",
+            track_number=index,
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+        )
+        tracks.append(track)
+        credits[track.id] = [
+            LocalArtistCredit(local_artist_id=artist.id, position=0)
+        ]
+    return CatalogMembership(
+        album=album,
+        artists=[artist],
+        tracks=tracks,
+        album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+        track_credits=credits,
+    )
+
+
+def _multi_track_candidate(
+    *, group: str, release: str, recording_prefix: str, count: int
+) -> AlbumCandidate:
+    return AlbumCandidate(
+        release_group_mbid=group,
+        release_mbid=release,
+        album_title="Album",
+        album_artist_name="Artist",
+        artist_mbid="artist-mbid",
+        tracks=[
+            CandidateTrack(
+                title="Track",
+                position=index,
+                absolute_position=index,
+                duration_seconds=180,
+                recording_mbid=f"{recording_prefix}-{index}",
+            )
+            for index in range(1, count + 1)
+        ],
+    )
+
+
+async def _seed_multi_track_album(store: NativeLibraryStore, count: int) -> None:
+    await store.create_catalog_membership(_multi_track_album(store, count))
+
+
+@pytest.mark.asyncio
+async def test_cached_no_match_does_not_starve_later_tracks(
+    store: NativeLibraryStore,
+) -> None:
+    """F-042: a terminal no_match on track 1 must not consume budget slots -
+    tracks 2 and 3 still get fingerprinted in the same attempt."""
+    from models.identification import FingerprintOutcome
+
+    await _seed_multi_track_album(store, 3)
+    await store.record_fingerprint_outcome(
+        FingerprintOutcome(
+            id="seed-1",
+            local_track_id="track-multi-1",
+            stat_revision="stat-multi-1",
+            fingerprinter_version=FINGERPRINTER_VERSION,
+            state="no_match",
+            first_attempt_at=1,
+            last_attempt_at=1,
+        )
+    )
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+    # Two fully-supported three-track candidates with equal scores -> an
+    # ambiguous decision whose per-track supported sets hold two recordings,
+    # so every track needs a fingerprint.
+    provider = FakeProvider(
+        [
+            _multi_track_candidate(
+                group="rg-a",
+                release="release-a",
+                recording_prefix="recording-a",
+                count=3,
+            ),
+            _multi_track_candidate(
+                group="rg-b",
+                release="release-b",
+                recording_prefix="recording-b",
+                count=3,
+            ),
+        ]
+    )
+    service = _service(store, provider, fake)
+    job = await _claimed_job(store, "album-multi")
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    # All three tracks were processed: two fresh generations (tracks 2+3)
+    # plus the free cache hit on track 1.
+    # ambiguous survives enforcement on this fully-matched album
+    assert outcome == "ambiguous"
+    assert fake.generate_calls == 2
+    third = await store.get_fingerprint_outcome(
+        "track-multi-3", "stat-multi-3", FINGERPRINTER_VERSION
+    )
+    assert third is not None and third.state == "no_match"
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_budget_still_caps_fresh_work(
+    store: NativeLibraryStore,
+) -> None:
+    """F-042 regression guard: four un-fingerprinted tracks produce exactly
+    MAX_NEW_FINGERPRINTS_PER_ATTEMPT generations on one attempt."""
+    await _seed_multi_track_album(store, 4)
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+    # Four-track twins keep every local track supported (decision ambiguous),
+    # so all four tracks are needed and the cap bounds fresh work at 2.
+    provider = FakeProvider(
+        [
+            _multi_track_candidate(
+                group="rg-a",
+                release="release-a",
+                recording_prefix="recording-a",
+                count=4,
+            ),
+            _multi_track_candidate(
+                group="rg-b",
+                release="release-b",
+                recording_prefix="recording-b",
+                count=4,
+            ),
+        ]
+    )
+    service = _service(store, provider, fake)
+    job = await _claimed_job(store, "album-multi")
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    assert fake.generate_calls == MAX_NEW_FINGERPRINTS_PER_ATTEMPT
+
+
+@pytest.mark.asyncio
+async def test_disabled_outcome_recovers_once_acoustid_enabled(
+    store: NativeLibraryStore,
+) -> None:
+    """F-041: a disabled outcome is reused only while AcoustID stays
+    disabled; enabling the key regenerates and lands matched."""
+    await _seed_album(store)
+    disabled_fake = FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False)
+    enabled_fake = FakeFingerprinter(
+        FingerprintResult(status="pass", recording_id="rec-1", score=0.9),
+        enabled=True,
+    )
+    service = ConditionalFingerprintService(store, disabled_fake)
+    first = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=1,
+    )
+    assert first is not None and first.state == "disabled"
+
+    upgraded = ConditionalFingerprintService(store, enabled_fake)
+    second = await upgraded.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=2,
+    )
+    assert second is not None and second.state == "matched"
+    assert enabled_fake.generate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_seeded_deferred_outcome_skips_generation_on_resume(
+    store: NativeLibraryStore,
+) -> None:
+    """F-043 bridge: a deferred row carrying a known fingerprint resumes at
+    the lookup without re-running fpcalc."""
+    from models.identification import FingerprintOutcome
+
+    await _seed_album(store)
+    await store.record_fingerprint_outcome(
+        FingerprintOutcome(
+            id="seed-deferred",
+            local_track_id="track-1",
+            stat_revision="stat-1",
+            fingerprinter_version=FINGERPRINTER_VERSION,
+            state="deferred",
+            fingerprint="known-fingerprint",
+            duration_seconds=180.0,
+            failure_code="LOOKUP_PENDING",
+            first_attempt_at=1,
+            last_attempt_at=1,
+            retry_after=1,
+        )
+    )
+    fake = FakeFingerprinter(
+        FingerprintResult(status="pass", recording_id="rec-known", score=0.95)
+    )
+    service = ConditionalFingerprintService(store, fake)
+    outcome = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=5,
+    )
+
+    assert outcome is not None and outcome.state == "matched"
+    assert outcome.recording_mbid == "rec-known"
+    assert fake.generate_calls == 0
+    assert fake.lookup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_renews_lease_on_phase_checkpoints(
+    store: NativeLibraryStore,
+) -> None:
+    """F-057: the dormant lease heartbeat fires during a run."""
+    await _seed_album(store)
+    provider = FakeProvider([_candidate()])
+    heartbeat_calls: list[tuple[str, str]] = []
+    original = store.heartbeat_identification_job
+
+    async def spy(job_id: str, worker_id: str, *, now: float, lease_seconds: float):
+        heartbeat_calls.append((job_id, worker_id))
+        return await original(job_id, worker_id, now=now, lease_seconds=lease_seconds)
+
+    store.heartbeat_identification_job = spy  # type: ignore[method-assign]
+    service = _service(store, provider, FakeFingerprinter(FingerprintResult(status="skip")))
+    job = await _claimed_job(store)
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    assert outcome == "identified"
+    assert heartbeat_calls and heartbeat_calls[0] == (job["id"], "worker")
+
+
+@pytest.mark.asyncio
+async def test_pause_checkpoint_keeps_phase_label_only(
+    store: NativeLibraryStore,
+) -> None:
+    """F-058/F-063: the pause checkpoint stores ONLY the phase label and
+    matcher version - the candidate-evidence blob implied replay semantics
+    that do not exist, and post-decision evidence cannot reconstruct recall
+    candidates losslessly."""
+    import json as _json
+
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+    job = await _claimed_job(store)
+    service = _service(
+        store,
+        FakeProvider([_candidate()]),
+        FakeFingerprinter(FingerprintResult(status="skip")),
+    )
+
+    async def pause_after_first_track() -> bool:
+        return False
+
+    # Pause the queue so the run hits its candidate_search checkpoint...
+    await queue.pause(None, now=2)
+
+    async def flip_back() -> bool:
+        await queue.resume(now=3)
+        return True
+
+    calls = {"n": 0}
+
+    async def checkpoint() -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await pause_after_first_track()
+        return await flip_back()
+
+    outcome = await service.run_claimed_job(job, "worker", now=10)
+    assert outcome in {"identified", "no_candidate", "paused"}
+
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute(
+            "SELECT checkpoint_json FROM library_identification_jobs WHERE id=?",
+            (job["id"],),
+        ).fetchone()[0]
+    if row is not None:
+        payload = _json.loads(row)
+        assert set(payload) <= {"phase", "matcher_version"}
+        assert "evidence" not in payload
+
+
+class _RecallSpyProvider(FakeProvider):
+    def __init__(self, inner: FakeProvider) -> None:
+        super().__init__(inner.candidates)
+        self.album_search_calls = 0
+
+    async def search_album_candidate_ids(self, artist, title, limit, priority):
+        self.album_search_calls += 1
+        return await inner_search(self, artist, title, limit, priority)
+
+

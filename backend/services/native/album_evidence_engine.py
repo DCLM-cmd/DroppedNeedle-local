@@ -7,6 +7,8 @@ import unicodedata
 from collections import Counter
 from difflib import SequenceMatcher
 
+from unidecode import unidecode
+
 from models.identification import (
     AlbumCandidate,
     CandidateEvidence,
@@ -30,13 +32,26 @@ DURATION_HARD_LIMIT_SECONDS = 30.0
 MAX_CANDIDATES = 10
 
 _NON_WORD = re.compile(r"[^\w]+", re.UNICODE)
+# F-059: mirrors musicbrainz_matcher's CJK guard - transliterating CJK/Kana is
+# lossy and hurts matching (D3), so those stay verbatim through the fold.
+_CJK = re.compile("[\u4e00-\u9fff\u3040-\u304f\u30a0-\u30ff]")
 
 
 def _fold(value: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", value.strip())
-    without_marks = "".join(
-        character for character in decomposed if not unicodedata.combining(character)
-    )
+    """Comparison fold aligned with the recall-side matchers (F-059): NFKD
+    strips combining marks, then non-CJK text is transliterated through
+    unidecode so ligatures (\u00e6/\u00f8/\u00df) compare equal to the ASCII
+    forms that cleared recall, instead of degrading to review."""
+    stripped = value.strip()
+    if _CJK.search(stripped):
+        decomposed = unicodedata.normalize("NFKD", stripped)
+        without_marks = "".join(
+            character
+            for character in decomposed
+            if not unicodedata.combining(character)
+        )
+    else:
+        without_marks = unidecode(unicodedata.normalize("NFKD", stripped))
     return _NON_WORD.sub("", without_marks.casefold())
 
 

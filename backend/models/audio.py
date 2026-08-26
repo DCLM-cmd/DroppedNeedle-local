@@ -101,3 +101,8 @@ class FingerprintResult(AppStruct):
     # download-verify release-group check (D15/B2) compares the requested
     # release group against this set.
     release_group_ids: list[str] = msgspec.field(default_factory=list)
+    # F-044: True when fpcalc exited non-zero yet still emitted a fingerprint
+    # (a truncated/corrupt decode produced a PREFIX fingerprint). Callers that
+    # act on a confident match may require corroboration; genuine short
+    # tracks keep the historical tolerance.
+    partial_decode: bool = False

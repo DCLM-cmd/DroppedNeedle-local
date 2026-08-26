@@ -10,10 +10,13 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Protocol
 
+import logging
+
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.audio import FingerprintResult
 from models.identification import FingerprintOutcome
 
+logger = logging.getLogger(__name__)
 FINGERPRINTER_VERSION = "fpcalc-acoustid-v1"
 MAX_CONCURRENT_FINGERPRINTS = 2
 TRANSIENT_RETRY_SECONDS = 60.0
@@ -57,7 +60,13 @@ class ConditionalFingerprintService:
             local_track_id, stat_revision, FINGERPRINTER_VERSION
         )
         timestamp = time.time() if now is None else now
-        if cached is not None and (
+        if cached is not None and cached.state == "disabled":
+            # F-041: reuse a disabled row ONLY while AcoustID stays disabled;
+            # once a key exists, fall through so generation proceeds instead
+            # of freezing this stat_revision forever.
+            if not self._fingerprinter.is_enabled():
+                return cached
+        elif cached is not None and (
             cached.state not in ("failed", "deferred")
             or cached.retry_after is None
             or cached.retry_after > timestamp
@@ -70,6 +79,7 @@ class ConditionalFingerprintService:
                 stat_revision=stat_revision,
                 fingerprinter_version=FINGERPRINTER_VERSION,
                 state="disabled",
+                failure_code="ACOUSTID_KEY_ABSENT",
                 first_attempt_at=(cached.first_attempt_at if cached else timestamp),
                 last_attempt_at=timestamp,
             )

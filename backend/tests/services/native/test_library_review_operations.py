@@ -72,6 +72,10 @@ from repositories.musicbrainz_management_models import (
     MbManagementReleaseGroup,
     MbManagementTrack,
 )
+from infrastructure.degradation import (
+    IntegrationResult,
+    try_get_degradation_context,
+)
 from services.native.album_candidate_service import AlbumCandidateService
 from services.native.album_evidence_engine import AlbumEvidenceEngine
 from services.native.background_workload_gate import BackgroundWorkloadGate
@@ -7820,3 +7824,160 @@ async def test_invalid_or_empty_dates_sort_last_and_provider_absent_uses_evidenc
         )
     ).items[0]
     assert finding2.reason_code == "EXACT_EDITION_SUGGESTED"
+
+
+# --- F-055: degradation-flag outages defer like raised ones -------------------
+
+
+class _DegradedEmptyProvider(_IdentificationProvider):
+    """Records a transient degradation and returns empty recall - exactly how
+    musicbrainz_album swallows an outage (breaker open / transient 5xx)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def search_album_candidate_ids(self, artist, title, limit, priority):
+        self.calls += 1
+        context = try_get_degradation_context()
+        assert context is not None
+        context.record(IntegrationResult.error("musicbrainz", "breaker open"))
+        return []
+
+    async def get_album_candidate(
+        self, release_group_mbid, target_track_count, priority
+    ):
+        return None
+
+
+class _DeterministicEmptyProvider(_DegradedEmptyProvider):
+    async def search_album_candidate_ids(self, artist, title, limit, priority):
+        self.calls += 1
+        context = try_get_degradation_context()
+        assert context is not None
+        context.record(
+            IntegrationResult(
+                data=None,
+                source="musicbrainz",
+                status="error",
+                error_message="bad payload",
+                deterministic=True,
+            )
+        )
+        return []
+
+
+async def _claim_explicit(store: NativeLibraryStore, album_suffix: str) -> dict:
+    claimed = await store.claim_operation_job(
+        "worker",
+        now=12,
+        lease_seconds=60,
+        kind="explicit_reidentification",
+    )
+    assert claimed is not None
+    return claimed
+
+
+@pytest.mark.asyncio
+async def test_degraded_empty_explicit_pass_defers_instead_of_terminalizing(
+    store: NativeLibraryStore,
+) -> None:
+    await _seed_album(store, "1")
+    created = await ReidentificationService(store).create_or_coalesce(
+        "album-1", "admin", now=10
+    )
+    claimed = await _claim_explicit(store, "1")
+    worker = ExplicitReidentificationWorker(
+        store,
+        AlbumCandidateService(_DegradedEmptyProvider()),
+        AlbumEvidenceEngine(),
+    )
+
+    result = await worker.run_claimed(claimed, "worker", now=12)
+
+    # The work item went back to pending with the honest outage code instead
+    # of terminal-failing on the first degraded pass.
+    assert result["state"] == "queued"
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        job = connection.execute(
+            "SELECT state, reidentification_attempt_count FROM "
+            "library_operation_jobs WHERE id = ?",
+            (str(claimed["id"]),),
+        ).fetchone()
+        work = connection.execute(
+            "SELECT state, failure_code FROM library_operation_work "
+            "WHERE job_id = ?",
+            (str(claimed["id"]),),
+        ).fetchone()
+        attempt_rows = connection.execute(
+            "SELECT COUNT(*) FROM library_identification_attempts"
+        ).fetchone()[0]
+    assert job["state"] == "queued"
+    assert job["reidentification_attempt_count"] == 1
+    assert work["state"] == "pending"
+    assert work["failure_code"] == "PROVIDER_TEMPORARILY_UNAVAILABLE"
+    assert attempt_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_degraded_empty_explicit_pass_terminalizes_at_the_bound(
+    store: NativeLibraryStore,
+) -> None:
+    await _seed_album(store, "1")
+    created = await ReidentificationService(store).create_or_coalesce(
+        "album-1", "admin", now=10
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_operation_jobs SET reidentification_attempt_count = ? "
+            "WHERE kind = 'explicit_reidentification'",
+            (MAX_REIDENTIFICATION_ATTEMPTS,),
+        )
+    claimed = await _claim_explicit(store, "1")
+    worker = ExplicitReidentificationWorker(
+        store,
+        AlbumCandidateService(_DegradedEmptyProvider()),
+        AlbumEvidenceEngine(),
+    )
+
+    result = await worker.run_claimed(claimed, "worker", now=12)
+
+    assert result["state"] == "failed"
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        terminal = connection.execute(
+            "SELECT terminal_code FROM library_operation_jobs WHERE id = ?",
+            (str(claimed["id"]),),
+        ).fetchone()
+    assert terminal["terminal_code"] == "PROVIDER_TEMPORARILY_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_empty_payload_stays_terminal_first_pass(
+    store: NativeLibraryStore,
+) -> None:
+    await _seed_album(store, "1")
+    created = await ReidentificationService(store).create_or_coalesce(
+        "album-1", "admin", now=10
+    )
+    claimed = await _claim_explicit(store, "1")
+    worker = ExplicitReidentificationWorker(
+        store,
+        AlbumCandidateService(_DeterministicEmptyProvider()),
+        AlbumEvidenceEngine(),
+    )
+
+    result = await worker.run_claimed(claimed, "worker", now=12)
+
+    # Shipped deterministic-path semantics: the operation completes (no
+    # retry slots consumed) carrying the honest unmappable-payload code.
+    assert result["state"] == "succeeded"
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT terminal_code, reidentification_attempt_count FROM "
+            "library_operation_jobs WHERE id = ?",
+            (str(claimed["id"]),),
+        ).fetchone()
+    assert row["terminal_code"] == "UNMAPPABLE_PROVIDER_PAYLOAD"
+    assert row["reidentification_attempt_count"] == 0

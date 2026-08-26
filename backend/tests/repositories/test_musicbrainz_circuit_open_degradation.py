@@ -1,3 +1,4 @@
+from core.exceptions import InvalidExternalPayloadError
 """While the MusicBrainz circuit breaker is open, repository methods degrade
 quietly: the DegradationContext record is the error signal (per AGENTS.md), not
 a per-call error log - a backed-off queue must not spam thousands of lines."""
@@ -122,3 +123,35 @@ async def test_real_errors_still_log(open_breaker, caplog, monkeypatch) -> None:
         assert await _Repo().get_recording_by_id("recording-1") is None
     assert len(caplog.records) == 1
     open_breaker.assert_called_once()
+
+
+# --- F-056: malformed payloads are deterministic, not retriable ---------------
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_raises_invalid_payload_without_retry(monkeypatch):
+    """F-056 fuel removal: a 200 response with unparseable JSON raises the
+    honest deterministic error exactly once - no retry, no breaker failure."""
+    import httpx as _httpx
+
+    calls = {"n": 0}
+
+    class _Client:
+        async def get(self, *_args, **_kwargs):
+            calls["n"] += 1
+            return _httpx.Response(
+                200,
+                content=b"{not-json",
+                headers={"content-type": "application/json"},
+                request=_httpx.Request("GET", "https://musicbrainz.org/ws/2/x"),
+            )
+
+    from repositories import musicbrainz_base
+
+    monkeypatch.setattr(musicbrainz_base, "_http_client", _Client())
+    monkeypatch.setattr(musicbrainz_base.mb_rate_limiter, "acquire", AsyncMock())
+
+    with pytest.raises(InvalidExternalPayloadError):
+        await musicbrainz_base.mb_api_get("/release/xxx")
+
+    assert calls["n"] == 1

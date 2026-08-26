@@ -38,6 +38,7 @@ from models.library_work import (
     ScanRun,
     ScanScope,
 )
+FINGERPRINTER_VERSION = "fpcalc-acoustid-v1"
 from models.local_catalog import (
     CatalogMembership,
     LocalAlbum,
@@ -2934,3 +2935,323 @@ async def test_get_target_album_tracks_batch_groups_indexed_rows(
         connection.close()
     grouped_after = await store.get_target_album_tracks_batch(["album-2"])
     assert grouped_after["album-2"] == []
+
+
+# --- Cluster 5/6: F-041 F-046 F-048 F-056 store-level pins --------------------
+
+
+@pytest.mark.asyncio
+async def test_disabled_fingerprint_outcome_is_overwritable_but_matched_is_not(
+    store: NativeLibraryStore,
+) -> None:
+    """F-041: 'disabled' rows must yield to newer outcomes so tracks locked
+    out by an absent AcoustID key recover; matched stays terminal (F-048)."""
+    from models.identification import FingerprintOutcome
+
+    await _seed_track_for_outcomes(store)
+
+    def outcome(state: str, *, attempt: int = 1) -> FingerprintOutcome:
+        return FingerprintOutcome(
+            id="outcome-1",
+            local_track_id="track-1",
+            stat_revision="stat-1",
+            fingerprinter_version=FINGERPRINTER_VERSION,
+            state=state,
+            recording_mbid="rec-new" if state == "matched" else None,
+            attempt_count=attempt,
+            first_attempt_at=1,
+            last_attempt_at=2,
+        )
+
+    first_revision = await store.record_fingerprint_outcome(outcome("disabled"))
+    assert first_revision >= 1
+
+    # disabled -> matched overwrites
+    second_revision = await store.record_fingerprint_outcome(outcome("matched"))
+    stored = await store.get_fingerprint_outcome(
+        "track-1", "stat-1", FINGERPRINTER_VERSION
+    )
+    assert stored is not None and stored.state == "matched"
+    assert second_revision > first_revision
+
+    # matched -> matched is a terminal short-circuit (revision unchanged)
+    third_revision = await store.record_fingerprint_outcome(
+        outcome("matched", attempt=9)
+    )
+    assert third_revision == second_revision
+
+
+@pytest.mark.asyncio
+async def test_racing_outcome_writes_keep_attempt_count_monotonic(
+    store: NativeLibraryStore,
+) -> None:
+    """F-046: interleaved non-terminal writes bump attempt_count via SQL so
+    the stored count drifts monotonically even under last-write-wins."""
+    import asyncio as _asyncio
+
+    from models.identification import FingerprintOutcome
+
+    await _seed_track_for_outcomes(store)
+    base = dict(
+        id="outcome-race",
+        local_track_id="track-1",
+        stat_revision="stat-1",
+        fingerprinter_version=FINGERPRINTER_VERSION,
+        state="deferred",
+        failure_code="LOOKUP_PENDING",
+        first_attempt_at=1,
+        last_attempt_at=2,
+        retry_after=None,
+    )
+
+    async def write(suffix: str) -> int:
+        payload = dict(base)
+        payload["id"] = f"outcome-{suffix}"
+        return await store.record_fingerprint_outcome(FingerprintOutcome(**payload))
+
+    await write("a")
+    await _asyncio.gather(write("b"), write("c"))
+
+    row = await store.get_fingerprint_outcome(
+        "track-1", "stat-1", FINGERPRINTER_VERSION
+    )
+    assert row is not None
+    assert row.attempt_count >= 3  # seed + two racing writes, never reset
+
+
+@pytest.mark.asyncio
+async def test_provider_reset_wipes_are_bounded_and_stale_gated(
+    store: NativeLibraryStore,
+) -> None:
+    """F-056: provider-coded deferrals lose their attempt history at most
+    TWICE per streak and only after the staleness window; afterwards only a
+    far-future not_before is released."""
+    await _seed_track_for_outcomes(store, album_id="album-1", track_id="track-reset", stat_revision="stat-reset")
+    job = IdentificationJob(id="job-reset", dedupe_key="d-reset", local_album_id="album-1")
+    await store.enqueue_identification_job(job)
+    claimed = await store.claim_identification_job("worker", now=10, lease_seconds=60)
+    assert claimed is not None
+    await store.defer_identification_job(
+        "job-reset",
+        worker_id="worker",
+        expected_job_revision=int(claimed["row_revision"]),
+        failure_code="PROVIDER_TEMPORARILY_UNAVAILABLE",
+        not_before=20,
+        now=11,
+    )
+
+    # Fresh row inside the staleness window: untouched.
+    assert (
+        await store.reset_provider_identification_deferrals(
+            now=100, staleness_seconds=7680
+        )
+        == 0
+    )
+
+    async def redeferrable_state() -> tuple[int, int]:
+        with sqlite3.connect(store.db_path) as connection:
+            row = connection.execute(
+                "SELECT attempt_count, provider_reset_count FROM "
+                "library_identification_jobs WHERE id='job-reset'"
+            ).fetchone()
+        return row
+
+    # Age the row past the window: wipe #1 zeroes attempts.
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_identification_jobs SET updated_at = ? WHERE id='job-reset'",
+            (100 - 8000,),
+        )
+    assert (
+        await store.reset_provider_identification_deferrals(
+            now=100, staleness_seconds=7680
+        )
+        == 1
+    )
+    attempt_count, reset_count = await redeferrable_state()
+    assert (attempt_count, reset_count) == (0, 1)
+
+    # Wipe #2 is still allowed.
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_identification_jobs SET state='queued', "
+            "last_failure_code='PROVIDER_TEMPORARILY_UNAVAILABLE', updated_at=? "
+            "WHERE id='job-reset'",
+            (100 - 8000,),
+        )
+    await store.claim_identification_job("worker", now=110, lease_seconds=60)
+    await store.defer_identification_job(
+        "job-reset",
+        worker_id="worker",
+        expected_job_revision=_current_revision(store, "job-reset"),
+        failure_code="PROVIDER_TEMPORARILY_UNAVAILABLE",
+        not_before=200,
+        now=111,
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_identification_jobs SET updated_at=? WHERE id='job-reset'",
+            (100 - 8000,),
+        )
+    assert (
+        await store.reset_provider_identification_deferrals(
+            now=100, staleness_seconds=7680
+        )
+        == 1
+    )
+    attempt_count, reset_count = await redeferrable_state()
+    assert (attempt_count, reset_count) == (0, 2)
+
+    # Third cycle: no more wipes - attempts are preserved going forward.
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_identification_jobs SET state='queued', "
+            "last_failure_code='PROVIDER_TEMPORARILY_UNAVAILABLE', updated_at=? "
+            "WHERE id='job-reset'",
+            (100 - 8000,),
+        )
+    before = await redeferrable_state()
+    touched = await store.reset_provider_identification_deferrals(
+        now=100_000, staleness_seconds=7680
+    )
+    after = await redeferrable_state()
+    assert after[1] == 2 and touched in (0, 1)
+
+
+def _current_revision(store: NativeLibraryStore, job_id: str) -> int:
+    with sqlite3.connect(store.db_path) as connection:
+        return int(
+            connection.execute(
+                "SELECT row_revision FROM library_identification_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()[0]
+        )
+
+
+async def _seed_track_for_outcomes(
+    store: NativeLibraryStore,
+    *,
+    album_id: str = "album-1",
+    track_id: str = "track-1",
+    stat_revision: str = "stat-1",
+) -> None:
+    from models.local_catalog import (
+        CatalogMembership,
+        LocalAlbum,
+        LocalArtist,
+        LocalArtistCredit,
+        LocalTrack,
+    )
+
+    artist = LocalArtist(
+        id=f"artist-{album_id}",
+        display_name="Artist",
+        folded_name="artist",
+        normalized_name="artist",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id=album_id,
+        root_id="root",
+        grouping_key=f"group-{album_id}",
+        title="Album",
+        album_artist_id=artist.id,
+        album_artist_name="Artist",
+        created_at=1,
+        updated_at=1,
+    )
+    track = LocalTrack(
+        id=track_id,
+        local_album_id=album.id,
+        root_id="root",
+        file_path=f"/music/{track_id}.flac",
+        relative_path=f"{track_id}.flac",
+        path_hash=f"hash-{track_id}",
+        file_size_bytes=1,
+        file_mtime_ns=2,
+        stat_revision=stat_revision,
+        tag_revision=f"tag-{track_id}",
+        title="Track",
+        artist_name="Artist",
+        album_title="Album",
+        album_artist_name="Artist",
+        track_number=1,
+        duration_seconds=180,
+        file_format="flac",
+        imported_at=1,
+    )
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=[track],
+            album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+            track_credits={track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]},
+        )
+    )
+
+
+# --- F-079: apply-start staleness verified inside the begin transaction -------
+
+
+@pytest.mark.asyncio
+async def test_begin_apply_rejects_settings_drift_in_transaction(
+    store: NativeLibraryStore,
+) -> None:
+    """F-079: settings/policy drift is rejected by begin_library_management_apply
+    itself (one clean rejection) instead of surfacing as per-bundle failures."""
+    from core.exceptions import StaleRevisionError as _Stale
+
+    job_id = "job-drift"
+    with sqlite3.connect(store.db_path) as connection:
+        current_catalog = int(
+            connection.execute(
+                "SELECT value FROM library_catalog_revision WHERE singleton=1"
+            ).fetchone()[0]
+        )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_operation_jobs "
+            "(id, kind, state, lease_owner, expected_work_count, completed_count, "
+            "succeeded_count, failed_count, skipped_count, control_request, "
+            "reidentification_attempt_count, created_at, phase_timings_json, "
+            "updated_at, row_revision, event_revision) VALUES "
+            "(?, 'library_management', 'ready', 'worker', 1, 0, 0, 0, 0, 'none', 0, "
+            "100, '{}', 100, 1, 0)",
+            (job_id,),
+        )
+        connection.execute(
+            "INSERT INTO library_management_job_snapshots "
+            "(job_id, mode, origin, phase, selection_json, preview_token_hash, profile_revision, "
+            "settings_revision, naming_revision, policy_revision, catalog_revision, "
+            "profile_snapshot_json, intent_json, summary_json, warnings_json, "
+            "created_at, updated_at, row_revision, preview_expires_at) VALUES "
+            "(?, 'preview', 'manual', 'ready', '{}', 'token', 'p1', "
+            "'settings-v1', 'n1', 'pol-v1', ?, '{}', '{}', '{}', '[]', "
+            "100, 100, 1, 999999)",
+            (job_id, current_catalog),
+        )
+
+    with pytest.raises(_Stale, match="settings changed before apply"):
+        await store.begin_library_management_apply(
+            job_id,
+            preview_token_hash="token",
+            expected_job_revision=1,
+            idempotency_key="idem-1",
+            now=150,
+            current_settings_revision="settings-drifted",
+            current_policy_revision="pol-v1",
+        )
+
+    with pytest.raises(_Stale, match="policy changed before apply"):
+        await store.begin_library_management_apply(
+            job_id,
+            preview_token_hash="token",
+            expected_job_revision=1,
+            idempotency_key="idem-2",
+            now=150,
+            current_settings_revision="settings-v1",
+            current_policy_revision="pol-drifted",
+        )

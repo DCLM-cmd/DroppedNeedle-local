@@ -115,8 +115,12 @@ async def mb_api_get(
                 f"MusicBrainz returned an unexpected payload shape for {path}: {exc}"
             ) from exc
         except (msgspec.DecodeError, TypeError) as exc:
-            raise ExternalServiceError(
-                f"MusicBrainz returned invalid JSON payload for {path}: {exc}"
+            # F-056: a malformed-but-deterministic payload says nothing about
+            # service health - it must not count toward the breaker and must
+            # not be retriable, or poison payloads churn forever as
+            # PROVIDER_TEMPORARILY_UNAVAILABLE.
+            raise InvalidExternalPayloadError(
+                f"MusicBrainz returned an unparseable payload for {path}: {exc}"
             ) from exc
 
 
@@ -178,6 +182,44 @@ def get_score(item: dict[str, Any]) -> int:
         return int(score) if score else 0
     except (ValueError, TypeError):
         return 0
+
+
+def select_edition(
+    releases: list[dict[str, Any]], target_track_count: int
+) -> str | None:
+    """Single source of truth for best-edition selection inside one release
+    group (F-062): every identification lane must resolve the SAME group to
+    the SAME edition MBID.
+
+    Ranking: closest medium track-count to ``target_track_count`` first;
+    Official status before unofficial; earliest release date; stable MBID
+    order last. Editions with zero track-count are skipped CONSISTENTLY -
+    they carry no medium data to match against and previously drifted the
+    scanner/drop-import lane away from the native pipeline. Returns None
+    only when no release carries a usable id or any track data at all.
+    """
+    scored: list[tuple[int, int, str, str]] = []
+    for release in releases:
+        release_id = release.get("id")
+        if not release_id:
+            continue
+        track_count = sum(
+            int(medium.get("track-count") or 0)
+            for medium in release.get("media") or []
+        )
+        if track_count <= 0:
+            continue
+        scored.append(
+            (
+                abs(track_count - target_track_count),
+                0 if release.get("status") == "Official" else 1,
+                release.get("date") or "9999",
+                release_id,
+            )
+        )
+    if not scored:
+        return None
+    return min(scored)[3]
 
 
 def dedupe_by_id(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

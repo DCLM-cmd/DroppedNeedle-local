@@ -465,6 +465,46 @@ async def test_identification_worker_probes_once_per_rate_limit_when_half_open()
 
 
 @pytest.mark.asyncio
+async def test_provider_reset_fires_only_on_recovery_edge_not_steady_closed(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+    """F-056: the reset is edge-triggered - startup plus every OPEN/HALF_OPEN
+    -> CLOSED transition; steady-state CLOSED sweeps never wipe history."""
+    queue, service, _ = _idle_identification_harness()
+    probe = AsyncMock()
+    states = iter(
+        [
+            CircuitState.CLOSED,   # startup edge -> reset
+            CircuitState.CLOSED,   # steady state -> no reset
+            CircuitState.OPEN,     # outage begins -> no reset
+            CircuitState.CLOSED,   # recovery edge -> reset
+            CircuitState.CLOSED,   # steady again -> no reset
+        ]
+    )
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=[None] * 5 + [asyncio.CancelledError()]),
+    )
+    # Advance the sweep clock past the 60s interval for each iteration.
+    ticks = iter([0.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0])
+    monkeypatch.setattr(
+        "services.native.target_application_runtime.time",
+        SimpleNamespace(time=lambda: next(ticks)),
+    )
+
+    await run_target_identification_worker(
+        lambda: queue,
+        lambda: service,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+        provider_state_getter=lambda: next(states),
+        probe_provider=probe,
+    )
+
+    assert queue.reset_provider_deferrals.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_identification_worker_skips_provider_sweep_when_breaker_open() -> None:
     queue, service, wakeups = _idle_identification_harness()
     probe = AsyncMock()
