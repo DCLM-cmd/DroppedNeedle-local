@@ -318,6 +318,7 @@ class LibraryManagementPublisher:
         self._on_commit = on_commit
         self._clock = clock
         self._active_import_bundles: dict[str, int] = {}
+        self._import_publication_locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
     async def _finish_critical_task[ResultT](
@@ -349,14 +350,24 @@ class LibraryManagementPublisher:
         self._active_import_bundles[bundle_id] = (
             self._active_import_bundles.get(bundle_id, 0) + 1
         )
+        # F-175: serialize duplicate publications of one bundle id so a second
+        # caller cannot interleave staging/rollback under the winner's critical
+        # section; it awaits the lock and re-runs the state machine instead.
+        lock = self._import_publication_locks.setdefault(
+            bundle_id, asyncio.Lock()
+        )
         try:
-            return await self._publish_import_bundle(bundle, catalog_commit)
+            async with lock:
+                return await self._publish_import_bundle(bundle, catalog_commit)
         finally:
             remaining = self._active_import_bundles[bundle_id] - 1
             if remaining:
                 self._active_import_bundles[bundle_id] = remaining
             else:
                 del self._active_import_bundles[bundle_id]
+                # No holder or waiter remains (each bumped the count before
+                # awaiting the lock); drop the guard so the name can be reused.
+                self._import_publication_locks.pop(bundle_id, None)
 
     async def _publish_import_bundle(
         self,
@@ -1315,6 +1326,8 @@ class LibraryManagementPublisher:
                 value.request.replacement_root_id,
                 journal.replacement_backup_relative_path,
             )
+            # F-179: durable directory entry before the journal row records it.
+            await asyncio.to_thread(self._fsync_directory, value.replacement_backup)
             journal = await self._store.transition_library_management_import_journal(
                 journal.bundle_id,
                 journal.ordinal,
@@ -1332,6 +1345,8 @@ class LibraryManagementPublisher:
             value.request.destination_root_id,
             value.request.destination_relative_path,
         )
+        # F-179: durable directory entry before the published journal row.
+        await asyncio.to_thread(self._fsync_directory, value.destination)
         await self._publish_import_artifacts(value, roots)
         value.journal = await self._store.transition_library_management_import_journal(
             journal.bundle_id,
@@ -1358,6 +1373,10 @@ class LibraryManagementPublisher:
                     artifact.temporary_relative_path,
                     artifact.destination_root_id,
                     artifact.destination_relative_path,
+                )
+                # F-179: durable directory entry before its journal advances.
+                await asyncio.to_thread(
+                    self._fsync_directory, artifact.destination
                 )
             elif (
                 not artifact.destination.exists()
@@ -1740,6 +1759,15 @@ class LibraryManagementPublisher:
                         await asyncio.to_thread(artifact_source.unlink)
                 completed.append(request.ordinal)
             except (OSError, ConflictError, StaleRevisionError, ValidationError):
+                # F-178: startup drains these cleanups, so a persistent failure
+                # must be observable instead of landing as a silent ordinal.
+                logger.warning(
+                    "Library Management import cleanup failed for bundle %s "
+                    "ordinal %s",
+                    record.id,
+                    request.ordinal,
+                    exc_info=True,
+                )
                 failed.append(request.ordinal)
         return await self._store.finish_library_management_import_cleanup(
             record.id,
@@ -1850,6 +1878,9 @@ class LibraryManagementPublisher:
                 catalog_revision=snapshot.catalog_revision,
                 snapshot_revision=snapshot.row_revision,
                 committed_journal_ids=tuple(sorted(value.id for value in existing)),
+                committed_journal_revisions={
+                    value.id: value.row_revision for value in existing
+                },
             )
 
         self._validate_pinned_configuration(snapshot, pinned)
@@ -1949,7 +1980,9 @@ class LibraryManagementPublisher:
                 mutations,
                 now=self._clock(),
             )
-            await self._cleanup_committed(prepared, roots)
+            await self._cleanup_committed(
+                prepared, roots, result.committed_journal_revisions
+            )
             if (
                 pinned.profile.organization.remove_empty_directories
                 and pinned.profile.organization.source_cleanup
@@ -3365,6 +3398,8 @@ class LibraryManagementPublisher:
                 journal.backup_root_id,
                 journal.backup_relative_path,
             )
+            # F-179: durable directory entry before the journal row records it.
+            await asyncio.to_thread(self._fsync_directory, value.backup)
             value.source_backed_up = True
             journal = await self._store.transition_file_mutation_journal(
                 journal.id,
@@ -3388,6 +3423,8 @@ class LibraryManagementPublisher:
                 journal.backup_root_id,
                 journal.backup_relative_path,
             )
+            # F-179: durable directory entry before the journal row records it.
+            await asyncio.to_thread(self._fsync_directory, value.backup)
             value.source_backed_up = True
             journal = await self._store.transition_file_mutation_journal(
                 journal.id,
@@ -3417,6 +3454,8 @@ class LibraryManagementPublisher:
             journal.destination_root_id,
             journal.destination_relative_path,
         )
+        # F-179: durable directory entry before the published journal row.
+        await asyncio.to_thread(self._fsync_directory, value.destination)
         value.published = True
         value.journal = await self._store.transition_file_mutation_journal(
             journal.id,
@@ -3479,10 +3518,17 @@ class LibraryManagementPublisher:
                         pass
 
     async def _cleanup_committed(
-        self, prepared: list[_PreparedMutation], roots: dict[str, Path]
+        self,
+        prepared: list[_PreparedMutation],
+        roots: dict[str, Path],
+        committed_journal_revisions: dict[str, int],
     ) -> None:
         for value in prepared:
             journal = value.journal
+            # F-184: the commit transaction returns each journal's exact
+            # post-commit revision, so this CAS never depends on the commit's
+            # internal row_revision arithmetic.
+            expected_row_revision = committed_journal_revisions[journal.id]
             try:
                 await asyncio.to_thread(
                     self._cleanup_committed_filesystem, value, roots
@@ -3491,15 +3537,20 @@ class LibraryManagementPublisher:
                     journal.id,
                     expected_state="catalog_committed",
                     new_state="completed",
-                    expected_row_revision=journal.row_revision + 1,
+                    expected_row_revision=expected_row_revision,
                     updated_at=self._clock(),
                 )
-            except (OSError, ConflictError, StaleRevisionError):
+            except (
+                OSError,
+                ConflictError,
+                StaleRevisionError,
+                ValidationError,
+            ):
                 value.journal = await self._store.transition_file_mutation_journal(
                     journal.id,
                     expected_state="catalog_committed",
                     new_state="cleanup_pending",
-                    expected_row_revision=journal.row_revision + 1,
+                    expected_row_revision=expected_row_revision,
                     updated_at=self._clock(),
                     failure_code="SOURCE_CLEANUP_FAILED",
                 )
@@ -3715,6 +3766,21 @@ class LibraryManagementPublisher:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        """Best-effort fsync of one renamed file's directory (F-179)."""
+
+        try:
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            logger.warning(
+                "Library Management publication could not fsync %s", path.parent
+            )
 
     @staticmethod
     def _fsync_directories(prepared: list[_PreparedMutation]) -> None:

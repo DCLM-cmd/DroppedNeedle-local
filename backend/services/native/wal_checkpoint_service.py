@@ -96,6 +96,7 @@ class WalCheckpointService:
                 busy, log_frames, checkpointed_frames = connection.execute(
                     "PRAGMA wal_checkpoint(PASSIVE)"
                 ).fetchone()
+                measured = True
             except sqlite3.OperationalError as error:
                 message = str(error).lower()
                 if "locked" in message or "busy" in message:
@@ -103,6 +104,9 @@ class WalCheckpointService:
                         "WAL checkpoint busy while a writer holds a lock: %s", error
                     )
                     busy, log_frames, checkpointed_frames = 1, 0, 0
+                    # F-181: a lock-error pass carries no frame evidence; the
+                    # fabricated zeros must not become the progress baseline.
+                    measured = False
                 else:
                     logger.exception("WAL checkpoint failed with a non-lock error")
                     return {
@@ -116,10 +120,15 @@ class WalCheckpointService:
                         "error": str(error),
                     }
             page_size = connection.execute("PRAGMA page_size").fetchone()[0]
-            active_frames = max(
-                0, int(log_frames) - int(checkpointed_frames)
-            )
-            active_bytes = active_frames * int(page_size)
+            if measured:
+                active_frames = max(
+                    0, int(log_frames) - int(checkpointed_frames)
+                )
+                active_bytes = active_frames * int(page_size)
+            else:
+                # F-181: unmeasured pass; -1 mirrors the non-lock error branch
+                # and never crosses the high/low water marks.
+                active_bytes = -1
             duration = self._monotonic() - started
             wal_path = Path(str(self._db_path) + "-wal")
             wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
@@ -139,6 +148,7 @@ class WalCheckpointService:
                     checkpointed_frames=int(checkpointed_frames),
                     active_bytes=active_bytes,
                     now=self._monotonic(),
+                    measured=measured,
                 )
             )
             with self._lock:
@@ -156,6 +166,7 @@ class WalCheckpointService:
         checkpointed_frames: int,
         active_bytes: int,
         now: float,
+        measured: bool = True,
     ) -> dict[str, object]:
         """Backpressure state machine (pure, deterministic, unit-testable).
 
@@ -172,15 +183,21 @@ class WalCheckpointService:
           foreground writes are never gated.
         """
         with self._lock:
-            progress = (
-                self._last_log_frames is not None
-                and log_frames < self._last_log_frames
-            ) or (
-                self._last_checkpointed_frames is not None
-                and checkpointed_frames > self._last_checkpointed_frames
-            )
-            self._last_log_frames = log_frames
-            self._last_checkpointed_frames = checkpointed_frames
+            if measured:
+                progress = (
+                    self._last_log_frames is not None
+                    and log_frames < self._last_log_frames
+                ) or (
+                    self._last_checkpointed_frames is not None
+                    and checkpointed_frames > self._last_checkpointed_frames
+                )
+                self._last_log_frames = log_frames
+                self._last_checkpointed_frames = checkpointed_frames
+            else:
+                # F-181: an unmeasured (lock-error) pass never feeds the
+                # fabricated zeros into the comparison baseline, never counts
+                # as progress, and cannot clear suspension via a water mark.
+                progress = False
             if busy:
                 if self._busy_since is None:
                     self._busy_since = now
@@ -207,7 +224,7 @@ class WalCheckpointService:
             elif (
                 self._suspended
                 and (
-                    active_bytes <= self._low_water_bytes
+                    (0 <= active_bytes <= self._low_water_bytes)
                     or progress
                 )
             ):

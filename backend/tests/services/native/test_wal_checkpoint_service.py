@@ -335,3 +335,88 @@ async def test_run_forever_survives_isolated_checkpoint_errors(
     except asyncio.CancelledError:
         pass
     assert calls[0] >= 2  # the task kept looping after the isolated failure
+
+
+def test_run_once_lock_error_keeps_measured_baseline(tmp_path: Path, monkeypatch) -> None:
+    """F-181: a lock-error busy pass reports active_bytes=-1 and never feeds the
+    fabricated zeros into the progress comparison baseline."""
+    db = tmp_path / "library.db"
+    _seed_rows(db)
+    service = WalCheckpointService(
+        db, high_water_bytes=1024, low_water_bytes=1024
+    )
+    measured = service.run_once()
+
+    class _LockedConnection(sqlite3.Connection):
+        def execute(self, sql, *params):
+            if str(sql).strip().upper().startswith("PRAGMA WAL_CHECKPOINT"):
+                raise sqlite3.OperationalError("database is locked")
+            return super().execute(sql, *params)
+
+    monkeypatch.setattr(
+        wal_module.sqlite3,
+        "connect",
+        lambda *args, **kwargs: _LockedConnection(*args, **kwargs),
+    )
+    busy = service.run_once()
+    assert busy["busy"] == 1
+    assert busy["active_bytes"] == -1
+    assert busy["progress"] is False
+    # fabricated zeros did not become the comparison baseline
+    assert service._last_log_frames == measured["log_frames"]
+    assert service._last_checkpointed_frames == measured["checkpointed_frames"]
+
+    monkeypatch.undo()
+    following = service.run_once()
+    expected = (
+        following["log_frames"] < measured["log_frames"]
+        or following["checkpointed_frames"] > measured["checkpointed_frames"]
+    )
+    assert following["progress"] is expected
+
+
+def test_run_once_lock_error_does_not_clear_suspension(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """F-181: an unmeasured pass cannot resume background producers via the low
+    water mark because it carries no real active-byte measurement."""
+    db = tmp_path / "library.db"
+    reader = sqlite3.connect(db)
+    writer = sqlite3.connect(db)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE t (x INTEGER)")
+        writer.commit()
+        # open a read transaction: its snapshot mark pins what PASSIVE may
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        writer.executemany(
+            "INSERT INTO t VALUES (?)", [(value,) for value in range(4000)]
+        )
+        # commit AFTER the reader's snapshot: the new frames sit beyond the
+        # reader mark and PASSIVE cannot copy them while the reader is open.
+        writer.commit()
+        service = WalCheckpointService(
+            db, high_water_bytes=1024, low_water_bytes=0
+        )
+        suspended = service.run_once()
+        assert suspended["active_bytes"] > 1024
+        assert suspended["suspended"] is True
+
+        class _LockedConnection(sqlite3.Connection):
+            def execute(self, sql, *params):
+                if str(sql).strip().upper().startswith("PRAGMA WAL_CHECKPOINT"):
+                    raise sqlite3.OperationalError("database is locked")
+                return super().execute(sql, *params)
+
+        monkeypatch.setattr(
+            wal_module.sqlite3,
+            "connect",
+            lambda *args, **kwargs: _LockedConnection(*args, **kwargs),
+        )
+        busy = service.run_once()
+        assert busy["active_bytes"] == -1
+        assert service.background_suspended is True
+    finally:
+        reader.close()
+        writer.close()

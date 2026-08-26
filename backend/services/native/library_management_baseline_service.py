@@ -7,6 +7,7 @@ import base64
 from collections.abc import Callable
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import stat
@@ -43,6 +44,8 @@ from models.audio_metadata import (
     SemanticTagSnapshot,
 )
 from models.library_management import (
+    BASELINE_SNAPSHOT_CORRUPT,
+    BASELINE_SNAPSHOT_MISSING,
     BASELINE_UNAVAILABLE,
     FILE_CHANGED,
     IDENTITY_NOT_ACCEPTED,
@@ -73,6 +76,7 @@ from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.preferences_service import PreferencesService
 
 _BASELINE_RESTORE_NAMESPACE = uuid.UUID("42ad30b8-fb3b-4edb-998a-cbfc4896a43e")
+logger = logging.getLogger(__name__)
 
 
 def _json(value: object) -> str:
@@ -443,12 +447,37 @@ class LibraryManagementBaselineService:
                         self._hash_file, source
                     )
                     current = await asyncio.to_thread(self._audio.read, source)
-                    restore_bytes = await self._blobs.read_bytes(
-                        baseline.semantic_snapshot_blob_sha256
-                    )
-                    restore_snapshot = msgspec.json.decode(
-                        restore_bytes, type=SemanticTagSnapshot
-                    )
+                    try:
+                        restore_bytes = await self._blobs.read_bytes(
+                            baseline.semantic_snapshot_blob_sha256
+                        )
+                        restore_snapshot = msgspec.json.decode(
+                            restore_bytes, type=SemanticTagSnapshot
+                        )
+                    except ValidationError as error:
+                        # F-177: a lost snapshot blob is baseline-data loss,
+                        # not an edited audio file; report it honestly.
+                        reason = reason or BASELINE_SNAPSHOT_MISSING
+                        logger.warning(
+                            "Baseline restore preview lost its semantic "
+                            "snapshot blob: baseline_id=%s sha256=%s",
+                            baseline.id,
+                            baseline.semantic_snapshot_blob_sha256,
+                        )
+                        raise
+                    except (
+                        ConflictError,
+                        msgspec.DecodeError,
+                        msgspec.ValidationError,
+                    ) as error:
+                        reason = reason or BASELINE_SNAPSHOT_CORRUPT
+                        logger.warning(
+                            "Baseline restore preview found a corrupt "
+                            "semantic snapshot blob: baseline_id=%s sha256=%s",
+                            baseline.id,
+                            baseline.semantic_snapshot_blob_sha256,
+                        )
+                        raise
                     if (
                         restore_snapshot.probe.detected_format
                         != current.probe.detected_format

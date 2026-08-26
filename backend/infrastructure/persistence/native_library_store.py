@@ -24686,7 +24686,13 @@ class NativeLibraryStore(PersistenceBase):
         failure_code: str,
         now: float,
     ) -> None:
-        """Make a recovery failure visible and prevent an unsafe automatic retry."""
+        """Make one bundle's recovery failure visible without failing its siblings.
+
+        E30 scopes a recovery failure to every still-active row in the bundle;
+        E31 keeps unrelated bundles continuing. The operation job therefore
+        stays live while sibling work rows remain resumable and settles
+        terminal only when this was its last active bundle.
+        """
 
         def operation(connection: sqlite3.Connection) -> None:
             work = connection.execute(
@@ -24702,6 +24708,15 @@ class NativeLibraryStore(PersistenceBase):
                     "updated_at=?,row_revision=row_revision+1 WHERE job_id=? AND ordinal=?",
                     (failure_code, now, job_id, bundle_ordinal),
                 )
+            siblings = connection.execute(
+                "SELECT COUNT(*) AS active FROM library_operation_work "
+                "WHERE job_id=? AND ordinal<>? AND state IN ('pending','running')",
+                (job_id, bundle_ordinal),
+            ).fetchone()
+            if int(siblings["active"] or 0):
+                # Sibling bundles stay resumable; only this work row failed.
+                self._bump_stream(connection, "operation")
+                return
             connection.execute(
                 "UPDATE library_operation_jobs SET state='failed',terminal_code=?,"
                 "terminal_at=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,"
@@ -25128,6 +25143,10 @@ class NativeLibraryStore(PersistenceBase):
                     catalog_revision=int(snapshot["catalog_revision"]),
                     snapshot_revision=int(snapshot["row_revision"]),
                     committed_journal_ids=tuple(sorted(journal_by_id)),
+                    committed_journal_revisions={
+                        str(row["id"]): int(row["row_revision"])
+                        for row in journal_rows
+                    },
                 )
             if not journal_rows or any(
                 str(row["state"]) != "published" for row in journal_rows
@@ -25772,6 +25791,16 @@ class NativeLibraryStore(PersistenceBase):
                 + ") AND state='published'",
                 (now, *journal_ids),
             )
+            committed_revision_rows = connection.execute(
+                "SELECT id,row_revision FROM library_file_mutation_journal WHERE id IN ("
+                + placeholders
+                + ")",
+                journal_ids,
+            ).fetchall()
+            committed_journal_revisions = {
+                str(row["id"]): int(row["row_revision"])
+                for row in committed_revision_rows
+            }
             connection.execute(
                 "UPDATE library_operation_work SET state='succeeded', result_json=?, "
                 "failure_code=NULL, updated_at=?, row_revision=row_revision+1 "
@@ -25812,6 +25841,7 @@ class NativeLibraryStore(PersistenceBase):
                 catalog_revision=new_catalog_revision,
                 snapshot_revision=int(updated_snapshot["row_revision"]),
                 committed_journal_ids=journal_ids,
+                committed_journal_revisions=committed_journal_revisions,
             )
 
         return await self._write(operation)

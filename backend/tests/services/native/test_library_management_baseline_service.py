@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+from pathlib import Path
 
 import msgspec
 import pytest
@@ -19,6 +20,8 @@ from core.exceptions import ValidationError
 from infrastructure.audio.metadata_engine import AudioMetadataEngine
 from infrastructure.library_management_blob_store import LibraryManagementBlobStore
 from models.library_management import (
+    BASELINE_SNAPSHOT_CORRUPT,
+    BASELINE_SNAPSHOT_MISSING,
     BASELINE_UNAVAILABLE,
     PATH_COLLISION_DIFFERENT,
     ROOT_UNAVAILABLE,
@@ -584,3 +587,111 @@ async def test_baseline_restore_preview_blocks_occupied_original_path(tmp_path) 
     assert items[0].reason_code == PATH_COLLISION_DIFFERENT
     assert original_path.read_bytes() == b"third-party replacement"
     assert root.is_dir()
+
+
+def _blob_object_path(blobs_root: Path, sha256: str) -> Path:
+    return blobs_root / "objects" / sha256[:2] / sha256[2:4] / f"{sha256}.blob"
+
+
+async def _baseline_with_restore_setup(tmp_path: Path):
+    root, original_path, store, audio, publisher, job_id = (
+        await _ready_apply_operation(tmp_path)
+    )
+    await publisher.publish_bundle(job_id, 0, "apply-worker")
+    _finish_job(store, job_id, 115.0)
+    baseline = await store.get_management_baseline("track-1")
+    assert baseline is not None
+    settings_revision = (
+        publisher._preferences.get_library_management_settings().settings_revision
+    )
+    policy_revision = LibraryPolicyResolver(
+        publisher._preferences.get_typed_library_settings_raw()
+    ).policy_revision
+    service = _baseline_service(
+        tmp_path, store, publisher._preferences, audio, now=130.0
+    )
+    return (
+        root,
+        original_path,
+        store,
+        publisher._preferences,
+        baseline,
+        settings_revision,
+        policy_revision,
+        service,
+    )
+
+
+@pytest.mark.asyncio
+async def test_baseline_restore_reports_missing_snapshot_ledger_row(tmp_path) -> None:
+    (
+        _root,
+        original_path,
+        store,
+        preferences,
+        baseline,
+        settings_revision,
+        policy_revision,
+        service,
+    ) = await _baseline_with_restore_setup(tmp_path)
+    sha = baseline.semantic_snapshot_blob_sha256
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "DELETE FROM library_management_blobs WHERE sha256=?", (sha,)
+        )
+
+    preview = await _create_and_run_restore_preview(
+        service,
+        store,
+        settings_revision=settings_revision,
+        policy_revision=policy_revision,
+        idempotency_key="missing-snapshot-ledger-preview",
+    )
+    items = await store.list_library_management_plan_items(preview.job_id)
+
+    assert len(items) == 1
+    assert items[0].eligibility == "blocked"
+    assert items[0].reason_code == BASELINE_SNAPSHOT_MISSING
+    row = await store.get_target_track("track-1")
+    assert row is not None and Path(str(row["file_path"])).is_file()
+    del preferences
+
+
+@pytest.mark.parametrize("corruption", ["delete-file", "truncate-file"])
+@pytest.mark.asyncio
+async def test_baseline_restore_reports_corrupt_snapshot_bytes(
+    tmp_path, corruption: str
+) -> None:
+    (
+        _root,
+        original_path,
+        store,
+        preferences,
+        baseline,
+        settings_revision,
+        policy_revision,
+        service,
+    ) = await _baseline_with_restore_setup(tmp_path)
+    del preferences
+    sha = baseline.semantic_snapshot_blob_sha256
+    blob_path = _blob_object_path(tmp_path / "blobs", sha)
+    assert blob_path.is_file()
+    if corruption == "delete-file":
+        blob_path.unlink()
+    else:
+        blob_path.write_bytes(blob_path.read_bytes()[:16])
+
+    preview = await _create_and_run_restore_preview(
+        service,
+        store,
+        settings_revision=settings_revision,
+        policy_revision=policy_revision,
+        idempotency_key=f"corrupt-snapshot-{corruption}-preview",
+    )
+    items = await store.list_library_management_plan_items(preview.job_id)
+
+    assert len(items) == 1
+    assert items[0].eligibility == "blocked"
+    assert items[0].reason_code == BASELINE_SNAPSHOT_CORRUPT
+    row = await store.get_target_track("track-1")
+    assert row is not None and Path(str(row["file_path"])).is_file()

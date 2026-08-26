@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import unicodedata
 from pathlib import Path
 from collections.abc import Callable
 from unittest.mock import AsyncMock
@@ -2364,6 +2365,83 @@ async def test_publisher_moves_validated_real_audio_and_is_idempotent(
     assert not list(root.rglob(".droppedneedle-management-*"))
 
 
+def _nfd_source_directory(root: Path, _preferences, store) -> None:
+    """Move the source into an NFD-composed parent directory so staging reads
+    FROM a decomposed-unicode path (the NFD-parent hazard of F-207)."""
+    name = unicodedata.normalize("NFD", "ゴールド")
+    assert not unicodedata.is_normalized("NFC", name)  # guard: truly decomposed
+    nested = root / name
+    nested.mkdir()
+    source = root / "source.flac"
+    source.replace(nested / "source.flac")
+    relative = f"{name}/source.flac"
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET file_path=?,relative_path=?,path_hash=? "
+            "WHERE id='track-1'",
+            (str(nested / "source.flac"), relative, hashlib.sha256(relative.encode()).hexdigest()),
+        )
+
+
+def _unicode_release_configuration(planner) -> None:
+    """Canonical release whose album/artist/track names mix NFD-decomposable
+    katakana with invariant CJK; the naming engine must publish NFC."""
+    payload = json.loads(
+        (FIXTURES / "musicbrainz" / "management_release.json").read_bytes()
+    )
+    payload["title"] = unicodedata.normalize("NFD", "ゴールド") + "変奏曲"
+    payload["artist-credit"] = [
+        {
+            "name": "作曲者",
+            "joinphrase": "",
+            "artist": {
+                "id": "24e1b53c-3085-33e9-8f3c-52404792e9a8",
+                "name": "作曲者",
+                "sort-name": "作曲者",
+            },
+        }
+    ]
+    track = payload["media"][0]["tracks"][0]
+    track["title"] = unicodedata.normalize("NFD", "ダリア")
+    track["recording"]["title"] = track["title"]
+    planner._canonical._musicbrainz.get_canonical_release.return_value = (
+        msgspec.json.decode(json.dumps(payload).encode(), type=MbManagementRelease)
+    )
+
+
+@pytest.mark.asyncio
+async def test_publisher_publishes_nfd_sources_to_nfc_cjk_destinations(
+    tmp_path: Path,
+) -> None:
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        configure=_nfd_source_directory,
+        customize_planner=_unicode_release_configuration,
+    )
+
+    result = await publisher.publish_bundle(job_id, 0, "apply-worker")
+    repeated = await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    album = unicodedata.normalize("NFC", unicodedata.normalize("NFD", "ゴールド")) + "変奏曲"
+    title = unicodedata.normalize("NFC", unicodedata.normalize("NFD", "ダリア"))
+    destination = root / "作曲者" / f"{album} (1982)" / f"01 - {title}.flac"
+    assert destination.is_file()
+    # every published component is NFC, not the NFD the metadata arrived in
+    for part in destination.relative_to(root).parts:
+        assert unicodedata.is_normalized("NFC", part)
+    assert source.exists() is False
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert [journal.state for journal in journals] == ["completed"]
+    assert (
+        journals[0].staged_fingerprint
+        == hashlib.sha256(destination.read_bytes()).hexdigest()
+    )
+    row = await store.get_target_track("track-1")
+    assert row is not None
+    assert row["relative_path"] == destination.relative_to(root).as_posix()
+    assert result.catalog_revision == repeated.catalog_revision == 1
+
+
 @pytest.mark.asyncio
 async def test_publisher_breaks_hardlinks_without_mutating_the_other_name(
     tmp_path: Path,
@@ -2529,6 +2607,49 @@ async def test_publisher_prepares_and_commits_multi_file_album_as_one_bundle(
     )
     assert len(journals) == 2
     assert all(journal.state == "completed" for journal in journals)
+
+
+@pytest.mark.asyncio
+async def test_manual_bundle_staging_failure_mid_album_rolls_back_every_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual-lane mirror of the import lane's preparation-failure drill: an
+    OSError while staging the SECOND file of a two-file album must compensate
+    the whole bundle - no published destination, both journals rolled back,
+    catalog untouched."""
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path,
+        prepare_store=_add_second_album_track,
+        customize_planner=_add_second_canonical_track,
+        selection=LibraryManagementSelection(kind="albums", ids=("album-1",)),
+    )
+    before_first = await store.get_target_track("track-1")
+    before_second = await store.get_target_track("track-2")
+    original = publisher._stage_audio
+    calls = 0
+
+    def fail_second_stage(*args) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated staging failure")
+        original(*args)
+
+    monkeypatch.setattr(publisher, "_stage_audio", fail_second_stage)
+
+    with pytest.raises(OSError, match="simulated staging failure"):
+        await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert [journal.state for journal in journals] == ["rolled_back", "rolled_back"]
+    assert source.is_file()
+    assert (root / "source2.flac").is_file()
+    organized = root / "Johann Sebastian Bach; Glenn Gould"
+    assert not organized.exists() or not any(organized.rglob("*.flac"))
+    assert await store.get_target_track("track-1") == before_first
+    assert await store.get_target_track("track-2") == before_second
+    assert not list(root.rglob(".droppedneedle-management-*"))
 
 
 @pytest.mark.asyncio
@@ -2877,3 +2998,65 @@ async def test_import_publisher_defers_repeated_cancellation_through_catalog_com
     assert row is not None
     assert record is not None and record.state == "completed"
     assert [journal.state for journal in journals] == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_import_publications_serialize_per_bundle(
+    tmp_path: Path,
+) -> None:
+    """F-175: a second caller with the same idempotency key awaits the per-bundle
+    lock and replays the state machine instead of interleaving staging under the
+    winner's critical section."""
+    root, catalog_source, store, audio, publisher, service, policy_revision = (
+        _import_publication_fixture(tmp_path)
+    )
+    incoming = tmp_path / "duplicate-import.flac"
+    shutil.copy2(catalog_source, incoming)
+    request = _import_file(
+        audio,
+        incoming,
+        ordinal=0,
+        relative_path="Import Artist/Import Album/01 Duplicate.flac",
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:duplicate-lane:minimal",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original = publisher._publish_import_file
+    publish_calls: list[int] = []
+
+    async def slow_first_publish(value, roots):
+        publish_calls.append(value.journal.ordinal)
+        if not release.is_set():
+            started.set()
+            await release.wait()
+        return await original(value, roots)
+
+    publisher._publish_import_file = slow_first_publish
+
+    async def release_after_queue():
+        await started.wait()
+        # give the duplicate caller a chance to queue on the bundle lock
+        await asyncio.sleep(0.05)
+        release.set()
+
+    results = await asyncio.gather(
+        service.publish_import_bundle(bundle),
+        service.publish_import_bundle(bundle),
+        release_after_queue(),
+    )
+    publisher._publish_import_file = original
+
+    first, second = results[0], results[1]
+    assert sorted(publish_calls) == [0]
+    assert first.local_track_ids == second.local_track_ids
+    assert first.paths == second.paths
+    assert second.repeated is True
+    journals = await store.list_library_management_import_journals(first.bundle_id)
+    assert [journal.state for journal in journals] == ["completed"]
+    assert incoming.exists() is False
+    assert (root / request.destination_relative_path).is_file()
