@@ -74,9 +74,7 @@ async def build_similar_artist_pools(
                         timeout=30,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        "Timeout getting releases for similar artist %s", sim_mbid[:8]
-                    )
+                    logger.warning("Timeout getting releases for similar artist %s", sim_mbid[:8])
                     continue
                 except Exception as e:  # noqa: BLE001
                     logger.debug(f"Failed to get releases for similar artist: {e}")
@@ -124,9 +122,7 @@ async def build_similar_artist_pools_lastfm(
         try:
             similar = await asyncio.wait_for(
                 lfm_repo.get_similar_artists(
-                    "",
-                    mbid=seed_mbid,
-                    limit=similar_limit,
+                    "", mbid=seed_mbid, limit=similar_limit,
                 ),
                 timeout=30,
             )
@@ -138,21 +134,15 @@ async def build_similar_artist_pools_lastfm(
                 try:
                     top_albums = await asyncio.wait_for(
                         lfm_repo.get_artist_top_albums(
-                            sim_artist.name,
-                            mbid=sim_artist.mbid,
-                            limit=albums_per,
+                            sim_artist.name, mbid=sim_artist.mbid, limit=albums_per,
                         ),
                         timeout=30,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        "Timeout getting Last.fm top albums for %s", sim_artist.name
-                    )
+                    logger.warning("Timeout getting Last.fm top albums for %s", sim_artist.name)
                     continue
                 except Exception as e:  # noqa: BLE001
-                    logger.debug(
-                        f"Failed to get top albums for Last.fm similar artist: {e}"
-                    )
+                    logger.debug(f"Failed to get top albums for Last.fm similar artist: {e}")
                     continue
 
                 artist_albums_pair = [(sim_artist, top_albums)]
@@ -166,13 +156,9 @@ async def build_similar_artist_pools_lastfm(
                     pools[i].append(item)
                     pool_seen.add(item.release_group_mbid.lower())
         except asyncio.TimeoutError:
-            logger.warning(
-                "Timeout getting Last.fm similar artists for seed %s", seed_mbid[:8]
-            )
+            logger.warning("Timeout getting Last.fm similar artists for seed %s", seed_mbid[:8])
         except Exception as e:  # noqa: BLE001
-            logger.debug(
-                f"Failed to get Last.fm similar artists for seed {seed_mbid[:8]}: {e}"
-            )
+            logger.debug(f"Failed to get Last.fm similar artists for seed {seed_mbid[:8]}: {e}")
 
     await asyncio.gather(*[_process_seed(i, mbid) for i, mbid in enumerate(seed_mbids)])
     return pools
@@ -247,9 +233,7 @@ async def get_artist_deep_cuts(
             count=25,
         )
     except Exception:  # noqa: BLE001
-        logger.warning(
-            "Failed to fetch top release groups from ListenBrainz for deep cuts"
-        )
+        logger.warning("Failed to fetch top release groups from ListenBrainz for deep cuts")
         return []
 
     if not top_release_groups:
@@ -428,18 +412,16 @@ async def get_trending_filler(
                 artist_mbid = rg.artist_mbids[0] if rg.artist_mbids else ""
                 if artist_mbid.lower() == VARIOUS_ARTISTS_MBID:
                     continue
-                wildcards.append(
-                    DiscoverQueueItemLight(
-                        release_group_mbid=rg_mbid,
-                        album_name=rg.release_group_name,
-                        artist_name=rg.artist_name,
-                        artist_mbid=artist_mbid,
-                        cover_url=f"/api/v1/covers/release-group/{rg_mbid}?size=500",
-                        recommendation_reason="Trending This Week",
-                        is_wildcard=True,
-                        in_library=False,
-                    )
-                )
+                wildcards.append(DiscoverQueueItemLight(
+                    release_group_mbid=rg_mbid,
+                    album_name=rg.release_group_name,
+                    artist_name=rg.artist_name,
+                    artist_mbid=artist_mbid,
+                    cover_url=f"/api/v1/covers/release-group/{rg_mbid}?size=500",
+                    recommendation_reason="Trending This Week",
+                    is_wildcard=True,
+                    in_library=False,
+                ))
                 exclude.add(rg_mbid.lower())
     except Exception as e:  # noqa: BLE001
         logger.debug(f"Failed to get wildcard albums: {e}")
@@ -463,30 +445,24 @@ async def get_trending_filler(
                     offset=0,
                 )
             except Exception:  # noqa: BLE001
-                logger.warning(
-                    "Failed to search release groups for decade tag %s", decade
-                )
+                logger.warning("Failed to search release groups for decade tag %s", decade)
                 continue
             for release in decade_releases:
                 if len(wildcards) >= target:
                     break
-                rg_mbid = mbid_svc.normalize_mbid(
-                    getattr(release, "musicbrainz_id", None)
-                )
+                rg_mbid = mbid_svc.normalize_mbid(getattr(release, "musicbrainz_id", None))
                 if not rg_mbid or rg_mbid.lower() in exclude:
                     continue
-                wildcards.append(
-                    DiscoverQueueItemLight(
-                        release_group_mbid=rg_mbid,
-                        album_name=getattr(release, "title", "Unknown"),
-                        artist_name=getattr(release, "artist", "Unknown") or "Unknown",
-                        artist_mbid="",
-                        cover_url=f"/api/v1/covers/release-group/{rg_mbid}?size=500",
-                        recommendation_reason="Trending",
-                        is_wildcard=True,
-                        in_library=False,
-                    )
-                )
+                wildcards.append(DiscoverQueueItemLight(
+                    release_group_mbid=rg_mbid,
+                    album_name=getattr(release, "title", "Unknown"),
+                    artist_name=getattr(release, "artist", "Unknown") or "Unknown",
+                    artist_mbid="",
+                    cover_url=f"/api/v1/covers/release-group/{rg_mbid}?size=500",
+                    recommendation_reason="Trending",
+                    is_wildcard=True,
+                    in_library=False,
+                ))
                 exclude.add(rg_mbid.lower())
 
     if not wildcards:

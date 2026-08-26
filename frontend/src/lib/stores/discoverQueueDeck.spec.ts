@@ -149,6 +149,53 @@ describe('discoverQueueDeck state machine', () => {
 			);
 		}
 	);
+	it('resumes the cached current item after deduping earlier duplicates', async () => {
+		cacheMock.getQueueCachedData.mockReturnValue({
+			data: {
+				items: [
+					makeItem('rg-dup'),
+					makeItem('rg-dup'),
+					makeItem('rg-current'),
+					makeItem('rg-later')
+				],
+				currentIndex: 2,
+				queueId: 'q-cached'
+			},
+			timestamp: Date.now()
+		});
+		apiMock.global.post.mockResolvedValue({ in_library: [] });
+
+		await discoverQueueDeck.init();
+
+		expect(discoverQueueDeck.queue.map((i) => i.release_group_mbid)).toEqual([
+			'rg-dup',
+			'rg-current',
+			'rg-later'
+		]);
+		expect(discoverQueueDeck.currentIndex).toBe(1);
+		expect(discoverQueueDeck.current?.release_group_mbid).toBe('rg-current');
+	});
+
+	it('clamps the original index when the cached current item has no release group ID', async () => {
+		cacheMock.getQueueCachedData.mockReturnValue({
+			data: {
+				items: [makeItem('rg-dup'), makeItem('rg-dup'), makeItem(''), makeItem('rg-later')],
+				currentIndex: 2,
+				queueId: 'q-cached'
+			},
+			timestamp: Date.now()
+		});
+		apiMock.global.post.mockResolvedValue({ in_library: [] });
+
+		await discoverQueueDeck.init();
+
+		expect(discoverQueueDeck.queue.map((i) => i.release_group_mbid)).toEqual([
+			'rg-dup',
+			'rg-later'
+		]);
+		expect(discoverQueueDeck.currentIndex).toBe(1);
+		expect(discoverQueueDeck.current?.release_group_mbid).toBe('rg-later');
+	});
 
 	it('validation drops items that entered the library', async () => {
 		cacheMock.getQueueCachedData.mockReturnValue({

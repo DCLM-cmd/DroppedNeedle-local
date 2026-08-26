@@ -242,10 +242,19 @@ function createDiscoverQueueDeck() {
 			discoverQueueStatusStore.stopPolling();
 
 			const cached = getQueueCachedData(userId());
+			const cachedCurrentMbid = cached
+				? cached.data.items[cached.data.currentIndex]?.release_group_mbid
+				: undefined;
 			const cachedItems = cached ? dedupeByMbid(cached.data.items) : [];
 			if (cached && cachedItems.length > 0) {
 				queue = cachedItems;
-				currentIndex = Math.max(0, Math.min(cached.data.currentIndex, queue.length - 1));
+				const resumedIndex = cachedCurrentMbid
+					? queue.findIndex((item) => item.release_group_mbid === cachedCurrentMbid)
+					: -1;
+				currentIndex =
+					resumedIndex >= 0
+						? resumedIndex
+						: Math.max(0, Math.min(cached.data.currentIndex, queue.length - 1));
 				queueId = cached.data.queueId;
 				phase = 'ready';
 				await validateCachedQueue();
