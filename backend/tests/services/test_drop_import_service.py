@@ -59,7 +59,7 @@ def _meta(rg: str = "rg-1") -> _ReleaseMeta:
     )
 
 
-def _tracks() -> list[MBTrack]:
+def _tracks(*, with_release_track_mbids: bool = True) -> list[MBTrack]:
     return [
         MBTrack(
             title="Song One",
@@ -68,6 +68,7 @@ def _tracks() -> list[MBTrack]:
             absolute_position=1,
             length_ms=200_000,
             recording_mbid="rec-1",
+            release_track_mbid="rt-1" if with_release_track_mbids else None,
         ),
         MBTrack(
             title="Song Two",
@@ -76,6 +77,7 @@ def _tracks() -> list[MBTrack]:
             absolute_position=2,
             length_ms=200_000,
             recording_mbid="rec-2",
+            release_track_mbid="rt-2" if with_release_track_mbids else None,
         ),
     ]
 
@@ -203,7 +205,10 @@ def _build_service(
         library_manager=library,
         preferences_service=prefs,
         request_history=AsyncMock(async_get_record=AsyncMock(return_value=None)),
-        wanted_store=AsyncMock(get_watch=AsyncMock(return_value=None)),
+        wanted_store=AsyncMock(
+            get_watch=AsyncMock(return_value=SimpleNamespace(id="w-1")),
+            mark_fulfilled=AsyncMock(),
+        ),
         sse_publisher=AsyncMock(),
         on_import=AsyncMock(),
         staging_root=tmp_path / "imports",
@@ -517,6 +522,8 @@ async def test_import_resolves_open_request_and_notifies_requester(tmp_path):
     args = service._requests.async_update_status.await_args
     assert args.args[0] == "rg-1"
     assert args.args[1] == "imported"
+    # F-NL-05 positive control: complete authoritative coverage fulfils the watch.
+    service._wanted.mark_fulfilled.assert_awaited_once_with("rg-1", "satisfied")
     events = [c.args[1] for c in service._sse.publish.await_args_list]
     assert "request_imported" in events
     channel = [
@@ -526,6 +533,240 @@ async def test_import_resolves_open_request_and_notifies_requester(tmp_path):
     ][0]
     assert channel == "user:requester-9"
     service._on_import.assert_awaited_once()
+
+
+# -- F-NL-05: request fulfillment gates on complete authoritative coverage --
+
+
+def _configure_fulfillment_spy(service) -> None:
+    """Make every fulfillment side effect observable and default-open."""
+    record = SimpleNamespace(status="approved", user_id="requester-9")
+    service._requests.async_get_record = AsyncMock(return_value=record)
+    service._requests.async_update_status = AsyncMock()
+    service._wanted.get_watch = AsyncMock(
+        return_value=SimpleNamespace(id="w-1")
+    )
+    service._wanted.mark_fulfilled = AsyncMock()
+
+
+def _fulfillment_calls(service) -> dict:
+    events = [c.args[1] for c in service._sse.publish.await_args_list]
+    return {
+        "request_updated": service._requests.async_update_status.await_count,
+        "watch_fulfilled": service._wanted.mark_fulfilled.await_count,
+        "notified": "request_imported" in events,
+    }
+
+
+@pytest.mark.asyncio
+async def test_import_with_unreadable_file_does_not_fulfil_request(tmp_path):
+    """One published track plus one unreadable file leaves the request and
+    wanted watch open; the detail names both symptoms."""
+    tagger = FakeTagger(
+        {
+            # "02 Song Two.flac" is deliberately absent -> unreadable on read.
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, library, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+    # The survivor's fingerprint resolves to the first canonical position, so
+    # it publishes as a mapped track while its sibling stays unreadable.
+    service._fingerprinter.fingerprint = AsyncMock(
+        return_value=SimpleNamespace(status="pass", score=1.0, recording_id="rec-1")
+    )
+    service._mb_matcher.resolve_recording_to_release_group = AsyncMock(
+        return_value="rg-1"
+    )
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/01 Song One.flac", b"a" * 64)
+        zf.writestr("album/02 Song Two.flac", b"b" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    item = done.items[0]
+    assert item.status == ItemStatus.IMPORTED
+    assert item.files_imported == 1
+    assert "unreadable" in (item.detail or "")
+    assert "covers 1 of 2 album tracks" in (item.detail or "")
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
+    service._on_import.assert_awaited_once()  # catalog refresh still happens
+
+
+@pytest.mark.asyncio
+async def test_import_with_skipped_mapped_position_does_not_fulfil_request(tmp_path):
+    """An equal-quality copy at one position is a skipped mapped position - the
+    other track publishes but nothing fulfils the request."""
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    identifier.identify = AsyncMock(return_value=_accepted_match())
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, library, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+
+    async def position(rg, disc, pos):
+        if pos == 2:
+            return {
+                "file_path": str(tmp_path / f"existing-{pos}.flac"),
+                "recording_mbid": f"rec-{pos}",
+                "file_format": "flac",
+                "bit_rate": 1000,
+            }
+        return None
+
+    library.get_file_at_position = AsyncMock(side_effect=position)
+
+    upload = tmp_path / "upload.zip"
+    _zip_album(upload)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    item = done.items[0]
+    assert item.status == ItemStatus.IMPORTED
+    assert item.files_imported == 1
+    assert "already in your library" in (item.detail or "")
+    assert "covers 1 of 2 album tracks" in (item.detail or "")
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
+
+
+@pytest.mark.asyncio
+async def test_bonus_only_import_never_fulfils_request(tmp_path):
+    """A single unmapped bonus file publishes unmanaged and stays IMPORTED, but
+    an album request and wanted watch must remain open."""
+    tagger = FakeTagger({"99 Bonus.flac": (_tag("Some Other Song", 9), _info())})
+    identifier = AsyncMock()
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, _, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/99 Bonus.flac", b"c" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    if done.items[0].status == ItemStatus.NEEDS_REVIEW:
+        # the auto match was rejected; the user's manual choice is authoritative
+        await service.match_item(done.items[0].id, "rg-1", user_id="user-1", is_admin=False)
+
+    refreshed = await store.get_item(done.items[0].id)
+    assert refreshed.status == ItemStatus.IMPORTED
+    assert refreshed.files_imported == 1
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
+
+
+@pytest.mark.asyncio
+async def test_complete_mapped_import_alongside_bonus_still_fulfils(tmp_path):
+    """Bonus files ride along with a fully covered mapped import without
+    blocking or reducing fulfillment."""
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+            "03 Extra Bonus.flac": (_tag("Extra Bonus", 3), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    identifier.identify = AsyncMock(return_value=_accepted_match())
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, _, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/01 Song One.flac", b"a" * 64)
+        zf.writestr("album/02 Song Two.flac", b"b" * 64)
+        zf.writestr("album/03 Extra Bonus.flac", b"c" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    await _wait_job(store, job.id)
+
+    item = (await store.get_job(job.id)).items[0]
+    assert item.status == ItemStatus.IMPORTED
+    assert item.files_imported == 3
+    calls = _fulfillment_calls(service)
+    assert calls["request_updated"] == 1
+    assert calls["watch_fulfilled"] == 1
+    assert calls["notified"] is True
+
+
+@pytest.mark.asyncio
+async def test_missing_canonical_position_does_not_fulfil_request(tmp_path):
+    """Only one of two canonical positions arrives: covered 1 of 2, request and
+    watch stay open even though a file published successfully."""
+    tagger = FakeTagger({"01 Song One.flac": (_tag("Song One", 1), _info())})
+    identifier = AsyncMock()
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, _, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+    service._fingerprinter.fingerprint = AsyncMock(
+        return_value=SimpleNamespace(status="pass", score=1.0, recording_id="rec-1")
+    )
+    service._mb_matcher.resolve_recording_to_release_group = AsyncMock(
+        return_value="rg-1"
+    )
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/01 Song One.flac", b"a" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    item = done.items[0]
+    assert item.status == ItemStatus.IMPORTED
+    assert item.files_imported == 1
+    assert "covers 1 of 2 album tracks" in (item.detail or "")
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
+
+
+@pytest.mark.asyncio
+async def test_no_canonical_tracklist_never_fulfils_request(tmp_path):
+    """Without a canonical tracklist there is no completeness to infer - files
+    may publish, but the request and watch stay open."""
+    tagger = FakeTagger({"01 Song One.flac": (_tag("Song One", 1), _info())})
+    identifier = AsyncMock()
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), []))
+    service, store, _, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/01 Song One.flac", b"a" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    if done.items[0].status == ItemStatus.NEEDS_REVIEW:
+        await service.match_item(done.items[0].id, "rg-1", user_id="user-1", is_admin=False)
+
+    refreshed = await store.get_item(done.items[0].id)
+    assert refreshed.status == ItemStatus.IMPORTED
+    assert refreshed.files_imported == 1
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
 
 
 # -- duplicates and upgrades --

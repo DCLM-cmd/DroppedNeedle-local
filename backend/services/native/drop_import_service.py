@@ -95,11 +95,48 @@ class _Identified(NamedTuple):
     match: "AlbumMatch"
 
 
+class _Coverage(NamedTuple):
+    """F-NL-05: authoritative release-position coverage for one organised unit.
+
+    ``expected`` counts the canonical mapped positions from ``ident.tracks``;
+    ``covered`` counts the distinct positions accepted for publication by a
+    mapped (authoritative) plan; ``skipped_mapped`` records that at least one
+    mapped position was skipped (equal/worse copy, collision, missing recycle
+    bin). ``ambiguous`` marks a canonical tracklist with duplicated positions,
+    which must never be declared covered."""
+
+    expected: int
+    covered: int
+    skipped_mapped: bool
+    ambiguous: bool
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.expected > 0
+            and not self.ambiguous
+            and self.covered == self.expected
+            and not self.skipped_mapped
+        )
+
+
+_NO_COVERAGE = _Coverage(expected=0, covered=0, skipped_mapped=False, ambiguous=False)
+
+
+def _position_key(track) -> tuple:  # noqa: ANN001 - MBTrack from album_matcher
+    """Stable identity for an expected canonical position: the release-track
+    MBID when present, else the local ``(disc, position)`` pair."""
+    if track.release_track_mbid:
+        return ("rt", track.release_track_mbid)
+    return ("dp", track.disc, track.position)
+
+
 class _OrganiseResult(NamedTuple):
     imported: int
     upgraded: int
     skipped: int
     bonus: int
+    coverage: _Coverage = _NO_COVERAGE
 
 
 class _PlannedDropImport(NamedTuple):
@@ -580,6 +617,14 @@ class DropImportService:
             status = ItemStatus.SKIPPED
         else:
             status = ItemStatus.FAILED
+        # F-NL-05: request fulfillment requires complete authoritative coverage -
+        # every expected canonical position published, no unreadable file, and no
+        # skipped mapped position. Bonus files never count toward coverage.
+        fulfills_request = (
+            result.imported > 0
+            and result.coverage.complete
+            and unreadable == 0
+        )
         parts: list[str] = []
         if result.imported:
             parts.append(f"imported {result.imported}")
@@ -593,6 +638,17 @@ class DropImportService:
             parts.append(
                 f"{unreadable} unreadable {'file' if unreadable == 1 else 'files'} ignored"
             )
+        if (
+            not fulfills_request
+            and result.coverage.expected > 0
+            and result.coverage.covered < result.coverage.expected
+        ):
+            parts.append(
+                f"covers {result.coverage.covered} of {result.coverage.expected} "
+                "album tracks"
+            )
+        elif not fulfills_request and result.coverage.expected > 0:
+            parts.append("album tracks are incomplete in this import")
         await self._store.update_item(
             item_id,
             status=status,
@@ -604,7 +660,7 @@ class DropImportService:
             staging_paths=[],
         )
         if result.imported > 0:
-            await self._after_import(job, ident)
+            await self._after_import(job, ident, fulfills_request=fulfills_request)
 
         # staged sources are consumed by the moves; clear any cross-mount leftovers
         def _tidy() -> None:
@@ -812,6 +868,14 @@ class DropImportService:
         meta, match = ident.meta, ident.match
         planned: list[_PlannedDropImport] = []
         skipped = 0
+        # F-NL-05: expected positions come from the canonical tracklist keyed by
+        # the authoritative assignments; duplicated positions are ambiguous and
+        # can never be declared covered.
+        raw_keys = [_position_key(track) for track in ident.tracks]
+        expected_keys = set(raw_keys)
+        ambiguous = len(expected_keys) != len(raw_keys)
+        covered_keys: set[tuple] = set()
+        skipped_mapped = False
         for entry in entries:
             recording = match.assignments.get(str(entry.path))
             track = track_by_recording.get(recording) if recording else None
@@ -824,10 +888,22 @@ class DropImportService:
             )
             if value is None:
                 skipped += 1
-            else:
-                planned.append(value)
+                if track is not None:
+                    skipped_mapped = True
+                continue
+            if track is not None:
+                covered_keys.add(_position_key(track))
+            planned.append(value)
+        coverage = _Coverage(
+            expected=len(expected_keys),
+            covered=len(covered_keys),
+            skipped_mapped=skipped_mapped,
+            ambiguous=ambiguous,
+        )
         if not planned:
-            return _OrganiseResult(imported=0, upgraded=0, skipped=skipped, bonus=0)
+            return _OrganiseResult(
+                imported=0, upgraded=0, skipped=skipped, bonus=0, coverage=coverage
+            )
 
         settings = self._prefs.get_typed_library_settings_raw()
         roots = {
@@ -898,6 +974,7 @@ class DropImportService:
             upgraded=sum(value.replacement is not None for value in planned),
             skipped=skipped,
             bonus=sum(value.bonus for value in planned),
+            coverage=coverage,
         )
 
     async def _plan_shared_mapped(
@@ -1015,7 +1092,9 @@ class DropImportService:
 
     # -- post-import hooks --
 
-    async def _after_import(self, job: DropImportJob, ident: _Identified) -> None:
+    async def _after_import(
+        self, job: DropImportJob, ident: _Identified, *, fulfills_request: bool
+    ) -> None:
         meta = ident.meta
         rg = meta.release_group_mbid
         try:
@@ -1028,6 +1107,11 @@ class DropImportService:
             )
         except Exception:  # noqa: BLE001 - invalidation is best-effort
             logger.warning("Import invalidation failed for %s", rg)
+
+        # F-NL-05: a partial import keeps the catalog fresh but leaves the
+        # durable request and wanted watch open for normal recovery.
+        if not fulfills_request:
+            return
 
         record = None
         try:
