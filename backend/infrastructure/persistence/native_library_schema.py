@@ -1670,6 +1670,9 @@ CREATE INDEX IF NOT EXISTS idx_local_tracks_availability ON local_tracks(availab
 CREATE INDEX IF NOT EXISTS idx_local_tracks_policy ON local_tracks(root_id, applied_policy, desired_policy_revision, relative_path);
 CREATE INDEX IF NOT EXISTS idx_local_tracks_search ON local_tracks(title_folded, artist_name_folded, album_title_folded);
 CREATE INDEX IF NOT EXISTS idx_local_tracks_path_hash ON local_tracks(path_hash);
+CREATE INDEX IF NOT EXISTS idx_local_tracks_recent ON local_tracks(availability, imported_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_local_album_artists_reverse ON local_album_artists(local_artist_id, local_album_id);
+CREATE INDEX IF NOT EXISTS idx_local_track_artists_reverse ON local_track_artists(local_artist_id, local_track_id);
 CREATE INDEX IF NOT EXISTS idx_local_album_identity_rg ON local_album_external_identities(release_group_mbid);
 CREATE INDEX IF NOT EXISTS idx_local_album_identity_rg_lower ON local_album_external_identities(lower(release_group_mbid));
 CREATE INDEX IF NOT EXISTS idx_local_album_identity_release_lower ON local_album_external_identities(lower(release_mbid));

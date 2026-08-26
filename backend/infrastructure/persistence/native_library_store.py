@@ -10,6 +10,7 @@ import os
 import sqlite3
 import unicodedata
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
 import threading
@@ -680,7 +681,16 @@ class NativeLibraryStore(PersistenceBase):
         self._scan_catalog_dirty = False
         self._provider_album_snapshot: tuple[int, frozenset[str]] | None = None
         self._provider_album_snapshot_lock = asyncio.Lock()
+        # F-PERF-05: bounded revision-keyed browse projections. The catalog
+        # revision inside each key is the invalidation authority - an entry can
+        # never outlive the data it was built from. Whole entries are evicted
+        # (stale revisions first, then oldest-touched) under a small cap, and
+        # per-key asyncio locks coalesce simultaneous first builds.
         self.work_wakeups = work_wakeups or DurableWorkWakeups()
+        self._browse_projections: OrderedDict[tuple, tuple[int, Any]] = OrderedDict()
+        self._browse_projection_lock = threading.Lock()
+        self._browse_key_locks: dict[tuple, asyncio.Lock] = {}
+        self._browse_touch_counter = 0
         super().__init__(db_path, write_lock)
 
     async def _write(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
@@ -1601,6 +1611,75 @@ class NativeLibraryStore(PersistenceBase):
         ).fetchall()
         if any(int(row[column]) >= MAX_REVISION for row in rows for column in columns):
             raise RevisionOverflowError("A library revision reached its maximum value.")
+
+    _BROWSE_PROJECTION_MAX_ENTRIES = 24
+    _BROWSE_PROJECTION_MAX_IDS = 20_000
+
+    def _browse_cache_get(self, key: tuple, revision: int) -> Any | None:
+        with self._browse_projection_lock:
+            entry = self._browse_projections.get(key)
+            if entry is None or entry[0] != revision:
+                return None
+            self._browse_touch_counter += 1
+            self._browse_projections[key] = (entry[0], entry[1])
+            self._browse_projections.move_to_end(key)
+            return entry[1]
+
+    def _browse_cache_put(self, key: tuple, revision: int, projection: Any) -> None:
+        """Insert a fresh entry and evict whole entries only: stale-revision
+        keys first (they can never be served again), then oldest-touched until
+        the cap holds. Projections above the ID budget are served but never
+        cached. Unreferenced per-key locks are pruned alongside."""
+        with self._browse_projection_lock:
+            stale = [
+                existing_key
+                for existing_key, (entry_revision, _) in self._browse_projections.items()
+                if entry_revision != revision
+            ]
+            for existing_key in stale:
+                del self._browse_projections[existing_key]
+            rows = projection[0] if isinstance(projection, tuple) else ()
+            row_count = len(rows) if isinstance(rows, list) else 0
+            if row_count <= self._BROWSE_PROJECTION_MAX_IDS:
+                self._browse_projections[key] = (revision, projection)
+                self._browse_projections.move_to_end(key)
+            while len(self._browse_projections) > self._BROWSE_PROJECTION_MAX_ENTRIES:
+                self._browse_projections.popitem(last=False)
+            for lock_key in list(self._browse_key_locks):
+                if lock_key in self._browse_projections:
+                    continue
+                candidate_lock = self._browse_key_locks[lock_key]
+                if not candidate_lock.locked():
+                    del self._browse_key_locks[lock_key]
+
+    async def _via_browse_projection(
+        self,
+        key_tail: tuple,
+        revision: int,
+        build: Callable[[], Awaitable[Any]],
+    ) -> tuple[Any, bool]:
+        """Serve a browse projection keyed by endpoint/filters/revision.
+
+        Concurrent first requests coalesce onto one build through a per-key
+        asyncio lock; later callers find the finished entry. A failed builder
+        does not poison the key - the next caller rebuilds under the same
+        lock. Returns ``(projection, from_cache)``."""
+        key = key_tail + (revision,)
+        cached = self._browse_cache_get(key, revision)
+        if cached is not None:
+            return cached, True
+        with self._browse_projection_lock:
+            key_lock = self._browse_key_locks.get(key)
+            if key_lock is None:
+                key_lock = asyncio.Lock()
+                self._browse_key_locks[key] = key_lock
+        async with key_lock:
+            cached = self._browse_cache_get(key, revision)
+            if cached is not None:
+                return cached, True
+            projection = await build()
+            self._browse_cache_put(key, revision, projection)
+            return projection, False
 
     async def get_catalog_revision(self) -> int:
         def operation(connection: sqlite3.Connection) -> int:
@@ -2665,114 +2744,144 @@ class NativeLibraryStore(PersistenceBase):
         album_ids: list[str] | None = None,
         file_format: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
-        def operation(
-            connection: sqlite3.Connection,
-        ) -> tuple[list[dict[str, Any]], int]:
-            clauses = ["a.retired_into_album_id IS NULL", "t.availability = 'indexed'"]
-            parameters: list[Any] = []
-            if search:
-                folded = f"%{_fold(search) or ''}%"
-                clauses.append(
-                    "(a.title_folded LIKE ? OR a.album_artist_name_folded LIKE ?)"
-                )
-                parameters.extend((folded, folded))
-            if from_year is not None:
-                clauses.append("a.year >= ?")
-                parameters.append(from_year)
-            if to_year is not None:
-                clauses.append("a.year <= ?")
-                parameters.append(to_year)
-            if genre:
-                clauses.append(
-                    "EXISTS (SELECT 1 FROM local_track_genres genre "
-                    "WHERE genre.local_track_id = t.id AND genre.folded_name = ?)"
-                )
-                parameters.append(_fold(genre))
-            if file_format:
-                clauses.append("LOWER(t.file_format) = LOWER(?)")
-                parameters.append(file_format)
-            if album_ids:
-                resolved_albums = list(
-                    dict.fromkeys(
-                        album_id
-                        for value in album_ids
-                        for album_id in self._resolve_target_membership_ids(
-                            connection, kind="album", identifier=value
+        """F-PERF-05: revision-keyed ordered album projection + page slice.
+
+        The grouped aggregate for the whole filtered catalog is built once per
+        (endpoint, normalized filters, sort, catalog revision); page requests
+        slice that ordered projection, so changing ``page`` no longer repeats
+        the count/group pass. Rows and totals equal the previous per-page SQL.
+        ``random`` keeps its exact pre-ticket behavior by bypassing the cache
+        (albums randomized over ``a.id``)."""
+
+        async def build() -> tuple[list[dict[str, Any]], int]:
+            def operation(
+                connection: sqlite3.Connection,
+            ) -> tuple[list[dict[str, Any]], int]:
+                clauses = [
+                    "a.retired_into_album_id IS NULL",
+                    "t.availability = 'indexed'",
+                ]
+                parameters: list[Any] = []
+                if search:
+                    folded = f"%{_fold(search) or ''}%"
+                    clauses.append(
+                        "(a.title_folded LIKE ? OR a.album_artist_name_folded LIKE ?)"
+                    )
+                    parameters.extend((folded, folded))
+                if from_year is not None:
+                    clauses.append("a.year >= ?")
+                    parameters.append(from_year)
+                if to_year is not None:
+                    clauses.append("a.year <= ?")
+                    parameters.append(to_year)
+                if genre:
+                    clauses.append(
+                        "EXISTS (SELECT 1 FROM local_track_genres genre "
+                        "WHERE genre.local_track_id = t.id AND genre.folded_name = ?)"
+                    )
+                    parameters.append(_fold(genre))
+                if file_format:
+                    clauses.append("LOWER(t.file_format) = LOWER(?)")
+                    parameters.append(file_format)
+                if album_ids:
+                    resolved_albums = list(
+                        dict.fromkeys(
+                            album_id
+                            for value in album_ids
+                            for album_id in self._resolve_target_membership_ids(
+                                connection, kind="album", identifier=value
+                            )
                         )
                     )
-                )
-                if not resolved_albums:
-                    return [], 0
-                placeholders = ",".join("?" for _ in resolved_albums)
-                clauses.append(f"a.id IN ({placeholders})")
-                parameters.extend(resolved_albums)
-            if artist_id:
-                resolved_artists = self._resolve_target_membership_ids(
-                    connection, kind="artist", identifier=artist_id
-                )
-                if not resolved_artists:
-                    return [], 0
-                placeholders = ",".join("?" for _ in resolved_artists)
-                clauses.append(
-                    "EXISTS (SELECT 1 FROM local_album_artists laa "
-                    "WHERE laa.local_album_id = a.id "
-                    f"AND laa.local_artist_id IN ({placeholders}))"
-                )
-                parameters.extend(resolved_artists)
-            where = " AND ".join(clauses)
-            total = int(
-                connection.execute(
-                    "SELECT COUNT(DISTINCT a.id) FROM local_albums a "
-                    "JOIN local_tracks t ON t.local_album_id = a.id WHERE " + where,
+                    if not resolved_albums:
+                        return [], 0
+                    placeholders = ",".join("?" for _ in resolved_albums)
+                    clauses.append(f"a.id IN ({placeholders})")
+                    parameters.extend(resolved_albums)
+                if artist_id:
+                    resolved_artists = self._resolve_target_membership_ids(
+                        connection, kind="artist", identifier=artist_id
+                    )
+                    if not resolved_artists:
+                        return [], 0
+                    placeholders = ",".join("?" for _ in resolved_artists)
+                    clauses.append(
+                        "EXISTS (SELECT 1 FROM local_album_artists laa "
+                        "WHERE laa.local_album_id = a.id "
+                        f"AND laa.local_artist_id IN ({placeholders}))"
+                    )
+                    parameters.extend(resolved_artists)
+                where = " AND ".join(clauses)
+                ordering = {
+                    "recent": "MAX(t.imported_at) DESC, a.id",
+                    "newest": "COALESCE(a.year, 0) DESC, a.title_folded, a.id",
+                    "oldest": "COALESCE(a.year, 0), a.title_folded, a.id",
+                    "name": "a.title_folded, a.id",
+                    "artist": "a.album_artist_name_folded, a.title_folded, a.id",
+                    "random": "a.id",
+                }.get(sort, "MAX(t.imported_at) DESC, a.id")
+                rows = connection.execute(
+                    "SELECT a.id AS release_group_mbid, a.title AS album_title, "
+                    "a.album_artist_name, a.album_artist_id AS album_artist_mbid, "
+                    "a.year, a.is_compilation, a.original_release_date, "
+                    "a.album_artist_sort_name, COUNT(t.id) AS track_count, "
+                    "SUM(t.file_size_bytes) AS total_size_bytes, "
+                    "SUM(COALESCE(t.duration_seconds, 0)) AS total_duration_seconds, "
+                    "MAX(t.imported_at) AS last_imported_at, "
+                    "MAX(t.file_format) AS file_format, MAX(t.album_sort) AS album_sort_name, "
+                    "GROUP_CONCAT(DISTINCT NULLIF(t.genre, '')) AS genres, "
+                    "ae.release_group_mbid AS provider_release_group_mbid, "
+                    "ae.release_mbid AS provider_release_mbid, "
+                    "custom.manifest_id AS custom_manifest_id, "
+                    "aie.provider_artist_id AS provider_artist_mbid, artwork.cover_url, "
+                    "artwork.source AS artwork_source, contribution.id AS contribution_id, "
+                    "contribution.state AS contribution_state "
+                    "FROM local_albums a JOIN local_tracks t ON t.local_album_id = a.id "
+                    "LEFT JOIN local_album_external_identities ae "
+                    "ON ae.local_album_id = a.id AND ae.provider = 'musicbrainz' "
+                    "LEFT JOIN local_artist_external_identities aie "
+                    "ON aie.local_artist_id = a.album_artist_id "
+                    "AND aie.provider = 'musicbrainz' "
+                    "LEFT JOIN library_custom_edition_active custom "
+                    "ON custom.local_album_id = a.id "
+                    "LEFT JOIN local_album_artwork artwork ON artwork.local_album_id = a.id "
+                    "LEFT JOIN library_contribution_drafts contribution "
+                    "ON contribution.local_album_id = a.id "
+                    "AND contribution.state NOT IN ('linked','cancelled','stale') "
+                    "WHERE "
+                    + where
+                    + " GROUP BY a.id ORDER BY "
+                    + ordering,
                     parameters,
-                ).fetchone()[0]
-            )
-            ordering = {
-                "recent": "MAX(t.imported_at) DESC, a.id",
-                "newest": "COALESCE(a.year, 0) DESC, a.title_folded, a.id",
-                "oldest": "COALESCE(a.year, 0), a.title_folded, a.id",
-                "name": "a.title_folded, a.id",
-                "artist": "a.album_artist_name_folded, a.title_folded, a.id",
-                "random": "a.id",
-            }.get(sort, "MAX(t.imported_at) DESC, a.id")
-            rows = connection.execute(
-                "SELECT a.id AS release_group_mbid, a.title AS album_title, "
-                "a.album_artist_name, a.album_artist_id AS album_artist_mbid, "
-                "a.year, a.is_compilation, a.original_release_date, "
-                "a.album_artist_sort_name, COUNT(t.id) AS track_count, "
-                "SUM(t.file_size_bytes) AS total_size_bytes, "
-                "SUM(COALESCE(t.duration_seconds, 0)) AS total_duration_seconds, "
-                "MAX(t.imported_at) AS last_imported_at, "
-                "MAX(t.file_format) AS file_format, MAX(t.album_sort) AS album_sort_name, "
-                "GROUP_CONCAT(DISTINCT NULLIF(t.genre, '')) AS genres, "
-                "ae.release_group_mbid AS provider_release_group_mbid, "
-                "ae.release_mbid AS provider_release_mbid, "
-                "custom.manifest_id AS custom_manifest_id, "
-                "aie.provider_artist_id AS provider_artist_mbid, artwork.cover_url, "
-                "artwork.source AS artwork_source, contribution.id AS contribution_id, "
-                "contribution.state AS contribution_state "
-                "FROM local_albums a JOIN local_tracks t ON t.local_album_id = a.id "
-                "LEFT JOIN local_album_external_identities ae "
-                "ON ae.local_album_id = a.id AND ae.provider = 'musicbrainz' "
-                "LEFT JOIN local_artist_external_identities aie "
-                "ON aie.local_artist_id = a.album_artist_id "
-                "AND aie.provider = 'musicbrainz' "
-                "LEFT JOIN library_custom_edition_active custom "
-                "ON custom.local_album_id = a.id "
-                "LEFT JOIN local_album_artwork artwork ON artwork.local_album_id = a.id "
-                "LEFT JOIN library_contribution_drafts contribution "
-                "ON contribution.local_album_id = a.id "
-                "AND contribution.state NOT IN ('linked','cancelled','stale') "
-                "WHERE "
-                + where
-                + " GROUP BY a.id ORDER BY "
-                + ordering
-                + " LIMIT ? OFFSET ?",
-                (*parameters, max(1, limit), max(0, offset)),
-            ).fetchall()
-            return [dict(row) for row in rows], total
+                ).fetchall()
+                return [dict(row) for row in rows], len(rows)
 
-        return await self._read(operation)
+            return await self._read(operation)
+
+        if sort == "random":
+            # Pre-ticket random semantics preserved: never cached.
+            rows, total = await build()
+            start = max(0, offset)
+            return rows[start : start + max(1, limit)], total
+
+        revision = await self.get_catalog_revision()
+        key_tail = (
+            "albums",
+            sort,
+            _fold(search) or "" if search else "",
+            from_year,
+            to_year,
+            _fold(genre) if genre else None,
+            _fold(artist_id) if artist_id else None,
+            tuple(album_ids or ()),
+            (file_format or "").lower() or None,
+        )
+        projection, _from_cache = await self._via_browse_projection(
+            key_tail, revision, build
+        )
+        rows, total = projection
+        start = max(0, offset)
+        return rows[start : start + max(1, limit)], total
 
     async def list_target_cutoff_unmet(
         self, cutoff_rank: int, *, limit: int = 100_000
@@ -2849,153 +2958,244 @@ class NativeLibraryStore(PersistenceBase):
         artist_ids: list[str] | None = None,
         scope: str = "album",
     ) -> tuple[list[dict[str, Any]], int]:
-        def operation(
-            connection: sqlite3.Connection,
-        ) -> tuple[list[dict[str, Any]], int]:
-            normalized_scope = (
-                scope if scope in {"album", "contributors", "all"} else "album"
-            )
-            clauses = ["ar.retired_into_artist_id IS NULL"]
-            parameters: list[Any] = []
-            if search:
-                clauses.append("ar.folded_name LIKE ?")
-                parameters.append(f"%{_fold(search) or ''}%")
-            if artist_ids:
-                resolved_artists = list(
-                    dict.fromkeys(
-                        artist_id
-                        for value in artist_ids
-                        for artist_id in self._resolve_target_membership_ids(
-                            connection, kind="artist", identifier=value
+        """F-PERF-05: scoped, revision-keyed artist relationship projection.
+
+        Only the relationship CTE the requested scope needs is ever built:
+        ``album`` builds album credits, ``contributors`` builds track
+        contributors, ``all`` builds both. The ordered rows plus total are
+        built once per (filters, scope, sort, catalog revision) and sliced per
+        page; ``target_artist_scope_counts`` reuses the same revision so an
+        artist browse request never runs a second full relationship scan.
+        Classification, membership resolution, ordering tie-breaks, and row
+        fields are unchanged."""
+
+        normalized_scope = (
+            scope if scope in {"album", "contributors", "all"} else "album"
+        )
+
+        async def build() -> tuple[list[dict[str, Any]], int]:
+            def operation(
+                connection: sqlite3.Connection,
+            ) -> tuple[list[dict[str, Any]], int]:
+                clauses = ["ar.retired_into_artist_id IS NULL"]
+                parameters: list[Any] = []
+                if search:
+                    clauses.append("ar.folded_name LIKE ?")
+                    parameters.append(f"%{_fold(search) or ''}%")
+                if artist_ids:
+                    resolved_artists = list(
+                        dict.fromkeys(
+                            artist_id
+                            for value in artist_ids
+                            for artist_id in self._resolve_target_membership_ids(
+                                connection, kind="artist", identifier=value
+                            )
                         )
                     )
-                )
-                if not resolved_artists:
-                    return [], 0
-                placeholders = ",".join("?" for _ in resolved_artists)
-                clauses.append(f"ar.id IN ({placeholders})")
-                parameters.extend(resolved_artists)
-            if normalized_scope == "album":
-                clauses.append("album_rel.artist_id IS NOT NULL")
-            elif normalized_scope == "contributors":
-                clauses.append("contributor_rel.artist_id IS NOT NULL")
-            else:
-                clauses.append(
-                    "(album_rel.artist_id IS NOT NULL OR contributor_rel.artist_id IS NOT NULL)"
-                )
-            where = " AND ".join(clauses)
-            common = (
-                "WITH album_rel AS ("
-                "SELECT credit.local_artist_id AS artist_id, "
-                "COUNT(DISTINCT credit.local_album_id) AS album_count, "
-                "COUNT(DISTINCT track.id) AS track_count, "
-                "MIN(track.imported_at) AS album_date_added "
-                "FROM local_album_artists credit "
-                "JOIN local_albums album ON album.id = credit.local_album_id "
-                "JOIN local_tracks track ON track.local_album_id = album.id "
-                "WHERE album.retired_into_album_id IS NULL "
-                "AND track.availability = 'indexed' GROUP BY credit.local_artist_id"
-                "), contributor_rel AS ("
-                "SELECT credit.local_artist_id AS artist_id, "
-                "COUNT(DISTINCT track.local_album_id) AS appearance_release_count, "
-                "COUNT(DISTINCT track.id) AS appearance_track_count, "
-                "MIN(track.imported_at) AS appearance_date_added "
-                "FROM local_track_artists credit "
-                "JOIN local_tracks track ON track.id = credit.local_track_id "
-                "JOIN local_albums album ON album.id = track.local_album_id "
-                "WHERE album.retired_into_album_id IS NULL "
-                "AND track.availability = 'indexed' "
-                "AND NOT EXISTS (SELECT 1 FROM local_album_artists album_credit "
-                "WHERE album_credit.local_album_id = track.local_album_id "
-                "AND album_credit.local_artist_id = credit.local_artist_id) "
-                "GROUP BY credit.local_artist_id"
-                ") "
-            )
-            joins = (
-                " FROM local_artists ar "
-                "LEFT JOIN album_rel ON album_rel.artist_id = ar.id "
-                "LEFT JOIN contributor_rel ON contributor_rel.artist_id = ar.id "
-                "LEFT JOIN local_artist_external_identities aie "
-                "ON aie.local_artist_id = ar.id AND aie.provider = 'musicbrainz' "
-            )
-            total = int(
-                connection.execute(
-                    common + "SELECT COUNT(*)" + joins + "WHERE " + where,
-                    parameters,
-                ).fetchone()[0]
-            )
-            direction = "DESC" if sort_order == "desc" else "ASC"
-            order_expression = {
-                "album_count": "COALESCE(album_rel.album_count, 0)",
-                "appearance_count": "COALESCE(contributor_rel.appearance_track_count, 0)",
-                "date_added": "date_added",
-            }.get(sort_by, "ar.folded_name")
-            date_added = (
-                "contributor_rel.appearance_date_added"
-                if normalized_scope == "contributors"
-                else "album_rel.album_date_added"
-                if normalized_scope == "album"
-                else "MIN(COALESCE(album_rel.album_date_added, contributor_rel.appearance_date_added), "
-                "COALESCE(contributor_rel.appearance_date_added, album_rel.album_date_added))"
-            )
-            rows = connection.execute(
-                common + "SELECT ar.id AS artist_mbid, ar.display_name AS artist_name, "
-                "ar.row_revision, "
-                "ar.sort_name, COALESCE(album_rel.album_count, 0) AS album_count, "
-                "COALESCE(album_rel.track_count, 0) AS track_count, "
-                "COALESCE(contributor_rel.appearance_release_count, 0) "
-                "AS appearance_release_count, "
-                "COALESCE(contributor_rel.appearance_track_count, 0) "
-                "AS appearance_track_count, " + date_added + " AS date_added, "
-                "CASE WHEN album_rel.artist_id IS NOT NULL "
-                "AND contributor_rel.artist_id IS NOT NULL THEN 'both' "
-                "WHEN album_rel.artist_id IS NOT NULL THEN 'album_artist' "
-                "ELSE 'contributor' END AS library_relationship, "
-                "aie.provider_artist_id AS provider_artist_mbid"
-                + joins
-                + "WHERE "
-                + where
-                + f" ORDER BY {order_expression} {direction}, "
-                f"ar.folded_name {direction}, ar.id {direction} "
-                "LIMIT ? OFFSET ?",
-                (*parameters, max(1, limit), max(0, offset)),
-            ).fetchall()
-            return [dict(row) for row in rows], total
+                    if not resolved_artists:
+                        return [], 0
+                    placeholders = ",".join("?" for _ in resolved_artists)
+                    clauses.append(f"ar.id IN ({placeholders})")
+                    parameters.extend(resolved_artists)
 
-        return await self._read(operation)
-
-    async def target_artist_scope_counts(self) -> tuple[int, int]:
-        def operation(connection: sqlite3.Connection) -> tuple[int, int]:
-            album_count = int(
-                connection.execute(
-                    "SELECT COUNT(DISTINCT credit.local_artist_id) "
+                album_cte = (
+                    "album_rel AS ("
+                    "SELECT credit.local_artist_id AS artist_id, "
+                    "COUNT(DISTINCT credit.local_album_id) AS album_count, "
+                    "COUNT(DISTINCT track.id) AS track_count, "
+                    "MIN(track.imported_at) AS album_date_added "
                     "FROM local_album_artists credit "
-                    "JOIN local_artists artist ON artist.id = credit.local_artist_id "
                     "JOIN local_albums album ON album.id = credit.local_album_id "
-                    "WHERE artist.retired_into_artist_id IS NULL "
-                    "AND album.retired_into_album_id IS NULL AND EXISTS ("
-                    "SELECT 1 FROM local_tracks track WHERE track.local_album_id = album.id "
-                    "AND track.availability = 'indexed')"
-                ).fetchone()[0]
-            )
-            contributor_count = int(
-                connection.execute(
-                    "SELECT COUNT(DISTINCT credit.local_artist_id) "
+                    "JOIN local_tracks track ON track.local_album_id = album.id "
+                    "WHERE album.retired_into_album_id IS NULL "
+                    "AND track.availability = 'indexed' GROUP BY credit.local_artist_id)"
+                )
+                contributor_cte = (
+                    "contributor_rel AS ("
+                    "SELECT credit.local_artist_id AS artist_id, "
+                    "COUNT(DISTINCT track.local_album_id) AS appearance_release_count, "
+                    "COUNT(DISTINCT track.id) AS appearance_track_count, "
+                    "MIN(track.imported_at) AS appearance_date_added "
                     "FROM local_track_artists credit "
-                    "JOIN local_artists artist ON artist.id = credit.local_artist_id "
                     "JOIN local_tracks track ON track.id = credit.local_track_id "
                     "JOIN local_albums album ON album.id = track.local_album_id "
-                    "WHERE artist.retired_into_artist_id IS NULL "
-                    "AND album.retired_into_album_id IS NULL "
-                    "AND track.availability = 'indexed' AND NOT EXISTS ("
-                    "SELECT 1 FROM local_album_artists album_credit "
+                    "WHERE album.retired_into_album_id IS NULL "
+                    "AND track.availability = 'indexed' "
+                    "AND NOT EXISTS (SELECT 1 FROM local_album_artists album_credit "
                     "WHERE album_credit.local_album_id = track.local_album_id "
-                    "AND album_credit.local_artist_id = credit.local_artist_id)"
-                ).fetchone()[0]
-            )
-            return album_count, contributor_count
+                    "AND album_credit.local_artist_id = credit.local_artist_id) "
+                    "GROUP BY credit.local_artist_id)"
+                )
+                want_album = normalized_scope in ("album", "all")
+                want_contributor = normalized_scope in ("contributors", "all")
+                cte_parts = [
+                    part
+                    for part, wanted in (
+                        (album_cte, want_album),
+                        (contributor_cte, want_contributor),
+                    )
+                    if wanted
+                ]
+                common = (
+                    "WITH " + ", ".join(cte_parts) + " " if cte_parts else ""
+                )
+                joins = " FROM local_artists ar "
+                if want_album:
+                    joins += (
+                        "LEFT JOIN album_rel ON album_rel.artist_id = ar.id "
+                    )
+                if want_contributor:
+                    joins += (
+                        "LEFT JOIN contributor_rel ON contributor_rel.artist_id = ar.id "
+                    )
+                joins += (
+                    "LEFT JOIN local_artist_external_identities aie "
+                    "ON aie.local_artist_id = ar.id AND aie.provider = 'musicbrainz' "
+                )
+                if normalized_scope == "album":
+                    clauses.append("album_rel.artist_id IS NOT NULL")
+                elif normalized_scope == "contributors":
+                    clauses.append("contributor_rel.artist_id IS NOT NULL")
+                else:
+                    clauses.append(
+                        "(album_rel.artist_id IS NOT NULL OR contributor_rel.artist_id IS NOT NULL)"
+                    )
+                where = " AND ".join(clauses)
+                total = int(
+                    connection.execute(
+                        common + "SELECT COUNT(*)" + joins + "WHERE " + where,
+                        parameters,
+                    ).fetchone()[0]
+                )
+                direction = "DESC" if sort_order == "desc" else "ASC"
+                order_expression = {
+                    "album_count": "COALESCE(album_rel.album_count, 0)",
+                    "appearance_count": (
+                        "COALESCE(contributor_rel.appearance_track_count, 0)"
+                    ),
+                    "date_added": "date_added",
+                }.get(sort_by, "ar.folded_name")
+                date_added = {
+                    "album": "album_rel.album_date_added",
+                    "contributors": "contributor_rel.appearance_date_added",
+                    "all": (
+                        "MIN(COALESCE(album_rel.album_date_added, contributor_rel.appearance_date_added), "
+                        "COALESCE(contributor_rel.appearance_date_added, album_rel.album_date_added))"
+                    ),
+                }[normalized_scope]
+                if normalized_scope == "album":
+                    aggregate_columns = (
+                        "COALESCE(album_rel.album_count, 0) AS album_count, "
+                        "COALESCE(album_rel.track_count, 0) AS track_count, "
+                        "0 AS appearance_release_count, 0 AS appearance_track_count, "
+                    )
+                    relationship_column = "'album_artist' AS library_relationship"
+                elif normalized_scope == "contributors":
+                    aggregate_columns = (
+                        "0 AS album_count, 0 AS track_count, "
+                        "COALESCE(contributor_rel.appearance_release_count, 0) "
+                        "AS appearance_release_count, "
+                        "COALESCE(contributor_rel.appearance_track_count, 0) "
+                        "AS appearance_track_count, "
+                    )
+                    relationship_column = "'contributor' AS library_relationship"
+                else:
+                    aggregate_columns = (
+                        "COALESCE(album_rel.album_count, 0) AS album_count, "
+                        "COALESCE(album_rel.track_count, 0) AS track_count, "
+                        "COALESCE(contributor_rel.appearance_release_count, 0) "
+                        "AS appearance_release_count, "
+                        "COALESCE(contributor_rel.appearance_track_count, 0) "
+                        "AS appearance_track_count, "
+                    )
+                    relationship_column = (
+                        "CASE WHEN album_rel.artist_id IS NOT NULL "
+                        "AND contributor_rel.artist_id IS NOT NULL THEN 'both' "
+                        "WHEN album_rel.artist_id IS NOT NULL THEN 'album_artist' "
+                        "ELSE 'contributor' END AS library_relationship"
+                    )
+                rows = connection.execute(
+                    common
+                    + "SELECT ar.id AS artist_mbid, ar.display_name AS artist_name, "
+                    "ar.row_revision, "
+                    "ar.sort_name, "
+                    + aggregate_columns
+                    + date_added
+                    + " AS date_added, "
+                    + relationship_column
+                    + ", aie.provider_artist_id AS provider_artist_mbid"
+                    + joins
+                    + "WHERE "
+                    + where
+                    + f" ORDER BY {order_expression} {direction}, "
+                    f"ar.folded_name {direction}, ar.id {direction}",
+                    parameters,
+                ).fetchall()
+                return [dict(row) for row in rows], len(rows)
 
-        return await self._read(operation)
+            return await self._read(operation)
+
+        revision = await self.get_catalog_revision()
+        key_tail = (
+            "artists",
+            normalized_scope,
+            sort_by,
+            sort_order,
+            _fold(search) or "" if search else "",
+            tuple(artist_ids or ()),
+        )
+        projection, _from_cache = await self._via_browse_projection(
+            key_tail, revision, build
+        )
+        rows, total = projection
+        start = max(0, offset)
+        return rows[start : start + max(1, limit)], total
+
+    async def target_artist_scope_counts(self) -> tuple[int, int]:
+        """F-PERF-05: revision-keyed album/contributor artist totals.
+
+        One shared cache entry per catalog revision so repeated artist-browse
+        requests do not rescan both relationship tables each time."""
+        revision = await self.get_catalog_revision()
+        key_tail = ("artist_scope_counts",)
+
+        async def build() -> tuple[int, int]:
+            def operation(connection: sqlite3.Connection) -> tuple[int, int]:
+                album_count = int(
+                    connection.execute(
+                        "SELECT COUNT(DISTINCT credit.local_artist_id) "
+                        "FROM local_album_artists credit "
+                        "JOIN local_artists artist ON artist.id = credit.local_artist_id "
+                        "JOIN local_albums album ON album.id = credit.local_album_id "
+                        "WHERE artist.retired_into_artist_id IS NULL "
+                        "AND album.retired_into_album_id IS NULL AND EXISTS ("
+                        "SELECT 1 FROM local_tracks track WHERE track.local_album_id = album.id "
+                        "AND track.availability = 'indexed')"
+                    ).fetchone()[0]
+                )
+                contributor_count = int(
+                    connection.execute(
+                        "SELECT COUNT(DISTINCT credit.local_artist_id) "
+                        "FROM local_track_artists credit "
+                        "JOIN local_artists artist ON artist.id = credit.local_artist_id "
+                        "JOIN local_tracks track ON track.id = credit.local_track_id "
+                        "JOIN local_albums album ON album.id = track.local_album_id "
+                        "WHERE artist.retired_into_artist_id IS NULL "
+                        "AND album.retired_into_album_id IS NULL "
+                        "AND track.availability = 'indexed' AND NOT EXISTS ("
+                        "SELECT 1 FROM local_album_artists album_credit "
+                        "WHERE album_credit.local_album_id = track.local_album_id "
+                        "AND album_credit.local_artist_id = credit.local_artist_id)"
+                    ).fetchone()[0]
+                )
+                return album_count, contributor_count
+
+            return await self._read(operation)
+
+        cached, _from_cache = await self._via_browse_projection(
+            key_tail, revision, build
+        )
+        return cached
 
     async def list_target_artist_appearances(
         self, artist_id: str, *, limit: int = 20, offset: int = 0
@@ -3125,86 +3325,116 @@ class NativeLibraryStore(PersistenceBase):
         artist_ids: list[str] | None = None,
         album_artist_only: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
-        def operation(
-            connection: sqlite3.Connection,
-        ) -> tuple[list[dict[str, Any]], int]:
-            clauses = ["t.availability = 'indexed'", "a.retired_into_album_id IS NULL"]
-            parameters: list[Any] = []
-            if search:
-                folded = f"%{_fold(search) or ''}%"
-                clauses.append(
-                    "(t.title_folded LIKE ? OR t.artist_name_folded LIKE ? "
-                    "OR t.album_title_folded LIKE ?)"
-                )
-                parameters.extend((folded, folded, folded))
-            if genre:
-                clauses.append(
-                    "EXISTS (SELECT 1 FROM local_track_genres genre "
-                    "WHERE genre.local_track_id = t.id AND genre.folded_name = ?)"
-                )
-                parameters.append(_fold(genre))
-            if from_year is not None:
-                clauses.append("t.year >= ?")
-                parameters.append(from_year)
-            if to_year is not None:
-                clauses.append("t.year <= ?")
-                parameters.append(to_year)
-            if artist_name:
-                clauses.append("t.artist_name_folded = ?")
-                parameters.append(_fold(artist_name))
-            if artist_ids:
-                resolved = list(
-                    dict.fromkeys(
-                        artist_id
-                        for value in artist_ids
-                        for artist_id in self._resolve_target_membership_ids(
-                            connection, kind="artist", identifier=value
+        """F-PERF-05: revision-keyed ordered track projection + page slice.
+
+        One full filtered/orderable projection per
+        (endpoint, normalized filters, sort, catalog revision); page requests
+        slice it instead of repeating COUNT plus OFFSET scans. Recent sorting
+        rides ``idx_local_tracks_recent`` during the single ordered build.
+        ``random`` keeps its pre-ticket re-randomized-per-call behavior by
+        bypassing the cache."""
+
+        async def build() -> tuple[list[dict[str, Any]], int]:
+            def operation(
+                connection: sqlite3.Connection,
+            ) -> tuple[list[dict[str, Any]], int]:
+                clauses = [
+                    "t.availability = 'indexed'",
+                    "a.retired_into_album_id IS NULL",
+                ]
+                parameters: list[Any] = []
+                if search:
+                    folded = f"%{_fold(search) or ''}%"
+                    clauses.append(
+                        "(t.title_folded LIKE ? OR t.artist_name_folded LIKE ? "
+                        "OR t.album_title_folded LIKE ?)"
+                    )
+                    parameters.extend((folded, folded, folded))
+                if genre:
+                    clauses.append(
+                        "EXISTS (SELECT 1 FROM local_track_genres genre "
+                        "WHERE genre.local_track_id = t.id AND genre.folded_name = ?)"
+                    )
+                    parameters.append(_fold(genre))
+                if from_year is not None:
+                    clauses.append("t.year >= ?")
+                    parameters.append(from_year)
+                if to_year is not None:
+                    clauses.append("t.year <= ?")
+                    parameters.append(to_year)
+                if artist_name:
+                    clauses.append("t.artist_name_folded = ?")
+                    parameters.append(_fold(artist_name))
+                if artist_ids:
+                    resolved = list(
+                        dict.fromkeys(
+                            artist_id
+                            for value in artist_ids
+                            for artist_id in self._resolve_target_membership_ids(
+                                connection, kind="artist", identifier=value
+                            )
                         )
                     )
-                )
-                if not resolved:
-                    return [], 0
-                placeholders = ",".join("?" for _ in resolved)
-                if album_artist_only:
-                    clauses.append(f"a.album_artist_id IN ({placeholders})")
-                else:
-                    clauses.append(
-                        "(a.album_artist_id IN ("
-                        + placeholders
-                        + ") OR EXISTS (SELECT 1 FROM local_track_artists fta "
-                        "WHERE fta.local_track_id = t.id AND fta.local_artist_id IN ("
-                        + placeholders
-                        + ")))"
-                    )
+                    if not resolved:
+                        return [], 0
+                    placeholders = ",".join("?" for _ in resolved)
+                    if album_artist_only:
+                        clauses.append(f"a.album_artist_id IN ({placeholders})")
+                    else:
+                        clauses.append(
+                            "(a.album_artist_id IN ("
+                            + placeholders
+                            + ") OR EXISTS (SELECT 1 FROM local_track_artists fta "
+                            "WHERE fta.local_track_id = t.id AND fta.local_artist_id IN ("
+                            + placeholders
+                            + ")))"
+                        )
+                        parameters.extend(resolved)
                     parameters.extend(resolved)
-                parameters.extend(resolved)
-            where = " AND ".join(clauses)
-            total = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM local_tracks t "
-                    "JOIN local_albums a ON a.id = t.local_album_id WHERE " + where,
+                where = " AND ".join(clauses)
+                ordering = {
+                    "recent": "t.imported_at DESC, t.id",
+                    "title": "t.title_folded, t.id",
+                    "artist": "t.artist_name_folded, t.title_folded, t.id",
+                    "album": "t.album_title_folded, t.disc_number, t.track_number, t.id",
+                    "random": "RANDOM()",
+                }.get(sort, "t.imported_at DESC, t.id")
+                rows = connection.execute(
+                    _TARGET_TRACK_SELECT
+                    + " WHERE "
+                    + where
+                    + " ORDER BY "
+                    + ordering,
                     parameters,
-                ).fetchone()[0]
-            )
-            ordering = {
-                "recent": "t.imported_at DESC, t.id",
-                "title": "t.title_folded, t.id",
-                "artist": "t.artist_name_folded, t.title_folded, t.id",
-                "album": "t.album_title_folded, t.disc_number, t.track_number, t.id",
-                "random": "RANDOM()",
-            }.get(sort, "t.imported_at DESC, t.id")
-            rows = connection.execute(
-                _TARGET_TRACK_SELECT
-                + " WHERE "
-                + where
-                + " ORDER BY "
-                + ordering
-                + " LIMIT ? OFFSET ?",
-                (*parameters, max(1, limit), max(0, offset)),
-            ).fetchall()
-            return [dict(row) for row in rows], total
+                ).fetchall()
+                return [dict(row) for row in rows], len(rows)
 
-        return await self._read(operation)
+            return await self._read(operation)
+
+        if sort == "random":
+            # Pre-ticket random semantics preserved: fresh RANDOM() every call.
+            rows, total = await build()
+            start = max(0, offset)
+            return rows[start : start + max(1, limit)], total
+
+        revision = await self.get_catalog_revision()
+        key_tail = (
+            "tracks",
+            sort,
+            _fold(search) or "" if search else "",
+            _fold(genre) if genre else None,
+            from_year,
+            to_year,
+            _fold(artist_name) if artist_name else None,
+            tuple(artist_ids or ()),
+            bool(album_artist_only),
+        )
+        projection, _from_cache = await self._via_browse_projection(
+            key_tail, revision, build
+        )
+        rows, total = projection
+        start = max(0, offset)
+        return rows[start : start + max(1, limit)], total
 
     async def target_provider_album_snapshot(self) -> tuple[int, set[str]]:
         """Return one coalesced provider-album snapshot per catalog revision."""
