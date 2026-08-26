@@ -560,6 +560,10 @@ class LibraryInventoryScanner:
         completed = True
         discard_remaining = False
         detached = False
+        # F-INDEXREC-06: a checkpoint-false exit is pause/stop/policy-supersede,
+        # not a filesystem error - the partial scope must not inherit a
+        # permission code.
+        control_exit = False
         walk_failure_code: str | None = None
         discovered = 0
         stale_cleanup_pending = True
@@ -604,6 +608,7 @@ class LibraryInventoryScanner:
                         completed = False
                         stopped.set()
                         discard_remaining = True
+                        control_exit = True
                     last_checkpoint = time.monotonic()
                     continue
                 if item is None:
@@ -657,12 +662,14 @@ class LibraryInventoryScanner:
                         completed = False
                         stopped.set()
                         discard_remaining = True
+                        control_exit = True
                     last_checkpoint = time.monotonic()
                 elif time.monotonic() - last_checkpoint >= 0.25:
                     if not await checkpoint(run.id, scope.policy_revision):
                         completed = False
                         stopped.set()
                         discard_remaining = True
+                        control_exit = True
                     last_checkpoint = time.monotonic()
                 if time.monotonic() - last_log >= 30.0:
                     logger.info(
@@ -701,12 +708,19 @@ class LibraryInventoryScanner:
             if not detached and not producer_task.done():
                 await producer_task
         if not completed:
+            if control_exit and walk_failure_code is None:
+                # F-INDEXREC-06: paused/cancelled/superseded is not a filesystem
+                # failure - the durable run state is the control diagnostic.
+                scope_error: str | None = None
+            else:
+                # Defensive fallback keeps an unclassified real failure visible.
+                scope_error = walk_failure_code or "ROOT_PERMISSION_DENIED"
             await self._store.complete_scan_scope_discovery(
                 run.id,
                 scope.root_id,
                 scope.relative_path,
                 state="partially_read",
-                error_code=walk_failure_code or "ROOT_PERMISSION_DENIED",
+                error_code=scope_error,
             )
         return current, completed, walk_failure_code
 

@@ -20,7 +20,10 @@ from infrastructure.queue.durable_work_wakeup import DurableWorkWakeups
 from models.library_work import ScanRun, ScanRunSnapshot, ScanScope
 from services.compat.target_scan_service import TargetCompatScanService
 from services.native.library_scan_events import LibraryScanEventPublisher
-from services.native.library_inventory_scanner import LibraryInventoryScanner
+from services.native.library_inventory_scanner import (
+    INVENTORY_BATCH_SIZE,
+    LibraryInventoryScanner,
+)
 from services.native.library_scan_coordinator import LibraryScanCoordinator
 from services.native.library_operation_supervisor import LibraryOperationSupervisor
 from services.native.library_scan_scheduler import LibraryAutomaticScanScheduler
@@ -2355,3 +2358,70 @@ async def test_discovery_walk_failure_uses_fresh_clock(tmp_path: Path) -> None:
     assert kwargs["now"] == fresh
     assert kwargs["now"] > stale
     assert kwargs["terminal_code"] == "WALK_TIMEOUT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["pause", "stop", "supersede"])
+async def test_control_exit_partial_scope_has_no_permission_code(
+    control, tmp_path: Path
+) -> None:
+    """F-INDEXREC-06: a checkpoint-false exit (pause/stop/policy-supersede) is
+    not a filesystem failure - the partial scope must carry error_code=None."""
+    store = AsyncMock()
+    store.complete_scan_scope_discovery = AsyncMock()
+    store.record_scan_failures = AsyncMock()
+    settled = ScanRun(
+        id="run-1",
+        kind="incremental",
+        trigger="manual",
+        state={"pause": "paused", "stop": "cancelled", "supersede": "superseded_policy_changed"}[control],
+        phase="discovering",
+        row_revision=2,
+    )
+    store.get_scan_run = AsyncMock(return_value=(settled, [], {}))
+    root = tmp_path / "music"
+    root.mkdir()
+    for index in range(INVENTORY_BATCH_SIZE * 2 + 4):
+        (root / f"track-{index}.flac").write_bytes(b"audio")
+
+    class ControlledScanner(LibraryInventoryScanner):
+        async def _persist_batch(self, run, scope, root, batch, resolver, generation):
+            return run
+
+    calls = {"n": 0}
+
+    async def checkpoint(_run_id: str, _revision: str) -> bool:
+        calls["n"] += 1
+        return calls["n"] <= 1  # second in-walk checkpoint is the control exit
+
+    scanner = ControlledScanner(store)
+    run = ScanRun(
+        id="run-1",
+        kind="incremental",
+        trigger="manual",
+        state="discovering",
+        phase="discovering",
+        row_revision=1,
+    )
+    scope = ScanScope(root_id="root-a", relative_path=".", policy_revision="rev-1")
+
+    def many_files_walker(*_args, **_kwargs):
+        base = str(root)
+        for index in range(INVENTORY_BATCH_SIZE * 2 + 4):
+            yield (base, [], [f"track-{index}.flac"])
+        # real files exist so resolved.stat() succeeds
+
+    scanner._directory_walker = many_files_walker  # type: ignore[assignment]
+    current, completed, code = await scanner._walk_scope(
+        run, scope, root, root, SimpleNamespace(policy_revision="rev-1"), checkpoint, 1
+    )
+
+    assert completed is False
+    assert code is None  # control exit, not a walk failure
+    store.complete_scan_scope_discovery.assert_awaited_once_with(
+        "run-1",
+        "root-a",
+        ".",
+        state="partially_read",
+        error_code=None,
+    )

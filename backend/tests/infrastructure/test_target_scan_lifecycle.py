@@ -2984,3 +2984,39 @@ async def test_recent_ordering_follows_scan_time_not_future_mtime(
     # The genuinely later scan wins Recently Added even though the second file
     # carries a one-year-out mtime.
     assert order == ["track-2.flac", "track-1.flac"]
+
+
+@pytest.mark.asyncio
+async def test_control_exit_scope_diagnostic_is_not_permission_denied(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    for index in range(INVENTORY_BATCH_SIZE * 2 + 4):
+        (root / f"track-{index}.flac").write_bytes(b"audio")
+    resolver = _resolver(root)
+    scanner = LibraryInventoryScanner(target_store)
+    requested = await target_store.request_scan_run(
+        _request(resolver), run_id="run-ctrl", requested_at=10.0
+    )
+    run = await target_store.claim_next_scan_run(now=11.0)
+    assert run is not None
+    scopes = (await target_store.get_scan_run(run.id))[1]
+    calls = {"n": 0}
+
+    async def checkpoint(_run_id: str, _revision: str) -> bool:
+        calls["n"] += 1
+        return calls["n"] <= 1  # second in-walk checkpoint: control exit
+
+    current, completed, code = await scanner._walk_scope(
+        run, scopes[0], root, root, resolver, checkpoint, 1
+    )
+    assert completed is False
+    assert code is None
+    with sqlite3.connect(target_store.db_path) as connection:
+        scope_row = connection.execute(
+            "SELECT discovery_state, error_code FROM library_scan_run_scopes "
+            "WHERE run_id = ? AND relative_path = '.'",
+            (run.id,),
+        ).fetchone()
+    assert scope_row == ("partially_read", None)
