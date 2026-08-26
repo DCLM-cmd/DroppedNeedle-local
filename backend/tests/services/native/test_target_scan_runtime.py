@@ -365,6 +365,197 @@ async def test_worker_watchdog_restarts_dead_worker_only(
         with suppress(asyncio.CancelledError):
             await asyncio.gather(alive_task, *restarted)
 
+@pytest.mark.asyncio
+async def test_worker_watchdog_restarts_dead_supervisor_exactly_once_and_not_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = TaskRegistry()
+    monkeypatch.setattr(TaskRegistry, "get_instance", classmethod(lambda cls: registry))
+
+    async def run_forever() -> None:
+        await asyncio.Event().wait()
+
+    alive_task = asyncio.get_running_loop().create_task(run_forever())
+    registry.register("target-library-identification-worker", alive_task)
+    dead_task = asyncio.get_running_loop().create_task(run_forever())
+    registry.register(SUPERVISOR_TASK_NAME, dead_task)
+    dead_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await dead_task
+
+    restarted: list[asyncio.Task[None]] = []
+
+    def supervisor_starter() -> asyncio.Task[None]:
+        task = asyncio.get_running_loop().create_task(run_forever())
+        registry.register(SUPERVISOR_TASK_NAME, task)
+        restarted.append(task)
+        return task
+
+    alive_calls = 0
+
+    def alive_starter() -> asyncio.Task[None]:
+        nonlocal alive_calls
+        alive_calls += 1
+        return alive_task
+
+    async def stop_after_first_iteration(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_first_iteration)
+    try:
+        await run_target_worker_watchdog(
+            {
+                SUPERVISOR_TASK_NAME: supervisor_starter,
+                "target-library-identification-worker": alive_starter,
+            }
+        )
+        assert len(restarted) == 1
+        assert alive_calls == 0
+        assert registry.is_running(SUPERVISOR_TASK_NAME)
+        assert registry.get_all()[SUPERVISOR_TASK_NAME] is restarted[0]
+        assert not restarted[0].done()
+    finally:
+        alive_task.cancel()
+        for task in restarted:
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.gather(alive_task, *restarted)
+        registry.reset()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_restart_resumes_getter_driven_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = TaskRegistry()
+    monkeypatch.setattr(TaskRegistry, "get_instance", classmethod(lambda cls: registry))
+
+    first_coord = AsyncMock()
+    first_coord.run_once.return_value = None
+    first_coord.recover = AsyncMock()
+    second_coord = AsyncMock()
+    second_coord.run_once.return_value = None
+    second_coord.recover = AsyncMock()
+    current = {"coord": first_coord}
+
+    def coordinator_getter():  # type: ignore[no-untyped-def]
+        return current["coord"]
+
+    scheduler = AsyncMock()
+    resolver = SimpleNamespace(settings=SimpleNamespace(enabled=True))
+    work_wakeups = DurableWorkWakeups()
+
+    task1 = start_target_scan_supervisor(
+        coordinator_getter,
+        lambda: {"root-a": Path("/scratch")},
+        work_wakeups,
+        scheduler_getter=lambda: scheduler,
+        resolver_getter=lambda: resolver,
+        schedule_settings_getter=lambda: {
+            "frequency": "manual",
+            "daily_time": "03:00",
+            "timezone_name": "UTC",
+        },
+    )
+    assert registry.is_running(SUPERVISOR_TASK_NAME)
+    await asyncio.sleep(0)
+    task1.cancel()
+    with suppress(asyncio.CancelledError):
+        await task1
+    assert not registry.is_running(SUPERVISOR_TASK_NAME)
+    first_coord.recover.assert_awaited_once()
+
+    current["coord"] = second_coord
+
+    def supervisor_starter() -> asyncio.Task[None]:
+        return start_target_scan_supervisor(
+            coordinator_getter,
+            lambda: {"root-a": Path("/scratch")},
+            work_wakeups,
+            scheduler_getter=lambda: scheduler,
+            resolver_getter=lambda: resolver,
+            schedule_settings_getter=lambda: {
+                "frequency": "manual",
+                "daily_time": "03:00",
+                "timezone_name": "UTC",
+            },
+        )
+
+    task2 = supervisor_starter()
+    assert registry.is_running(SUPERVISOR_TASK_NAME)
+    assert registry.get_all()[SUPERVISOR_TASK_NAME] is task2
+    await asyncio.sleep(0)
+    task2.cancel()
+    with suppress(asyncio.CancelledError):
+        await task2
+    second_coord.recover.assert_awaited_once()
+    # fresh getter behavior - resolver and scheduler still resolved via getters
+    assert task2.done()
+    # duplicate registration guard remains intact
+    task3 = start_target_scan_supervisor(
+        coordinator_getter,
+        lambda: {},
+        DurableWorkWakeups(),
+    )
+    assert registry.is_running(SUPERVISOR_TASK_NAME)
+    with pytest.raises(RuntimeError):
+        start_target_scan_supervisor(coordinator_getter, lambda: {}, DurableWorkWakeups())
+    task3.cancel()
+    with suppress(asyncio.CancelledError):
+        await task3
+    registry.reset()
+
+
+@pytest.mark.asyncio
+async def test_worker_watchdog_does_not_resurrect_supervisor_after_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = TaskRegistry()
+    monkeypatch.setattr(TaskRegistry, "get_instance", classmethod(lambda cls: registry))
+
+    async def run_forever() -> None:
+        await asyncio.Event().wait()
+
+    starter_calls: list[str] = []
+
+    def supervisor_starter() -> asyncio.Task[None]:
+        starter_calls.append("called")
+        task = asyncio.get_running_loop().create_task(run_forever())
+        registry.register(SUPERVISOR_TASK_NAME, task)
+        return task
+
+    dead_task = asyncio.get_running_loop().create_task(run_forever())
+    registry.register(SUPERVISOR_TASK_NAME, dead_task)
+    dead_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await dead_task
+    assert not registry.is_running(SUPERVISOR_TASK_NAME)
+
+    watchdog_task = asyncio.create_task(
+        run_target_worker_watchdog(
+            {SUPERVISOR_TASK_NAME: supervisor_starter},
+            interval_seconds=0.02,
+        )
+    )
+    registry.register("target-worker-watchdog", watchdog_task)
+    await asyncio.sleep(0.04)
+    assert len(starter_calls) == 1
+    assert registry.is_running(SUPERVISOR_TASK_NAME)
+    replacement = registry.get_all()[SUPERVISOR_TASK_NAME]
+    watchdog_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await watchdog_task
+    assert not registry.is_running("target-worker-watchdog")
+    replacement.cancel()
+    with suppress(asyncio.CancelledError):
+        await replacement
+    assert not registry.is_running(SUPERVISOR_TASK_NAME)
+    starter_calls.clear()
+    await asyncio.sleep(0.06)
+    assert starter_calls == []
+    assert not registry.is_running(SUPERVISOR_TASK_NAME)
+    registry.reset()
+
 
 @pytest.mark.asyncio
 async def test_identification_worker_starts_no_new_unit_while_scan_is_active() -> None:

@@ -205,7 +205,10 @@ from middleware import (
     PerformanceMiddleware,
     RateLimitMiddleware,
 )
-from services.native.library_scan_supervisor import start_target_scan_supervisor
+from services.native.library_scan_supervisor import (
+    SUPERVISOR_TASK_NAME,
+    start_target_scan_supervisor,
+)
 from services.native.target_application_runtime import (
     CONTRIBUTION_VERIFICATION_WORKER_TASK_NAME,
     IDENTIFICATION_WORKER_TASK_NAME,
@@ -616,14 +619,15 @@ async def production_target_lifespan(app: FastAPI):
         def library_enabled() -> bool:
             return get_preferences_service().get_typed_library_settings().enabled
 
-        start_target_scan_supervisor(
-            get_target_library_scan_coordinator,
-            root_paths,
-            work_wakeups,
-            scheduler_getter=get_target_library_scan_scheduler,
-            resolver_getter=get_library_policy_resolver,
-            schedule_settings_getter=schedule_settings,
-        )
+        def start_scan_supervisor() -> asyncio.Task[None]:
+            return start_target_scan_supervisor(
+                get_target_library_scan_coordinator,
+                root_paths,
+                work_wakeups,
+                scheduler_getter=get_target_library_scan_scheduler,
+                resolver_getter=get_library_policy_resolver,
+                schedule_settings_getter=schedule_settings,
+            )
 
         def mb_provider_state() -> CircuitState:
             from repositories.musicbrainz_base import mb_circuit_breaker
@@ -666,8 +670,8 @@ async def production_target_lifespan(app: FastAPI):
                 get_library_contribution_verification_worker,
                 work_wakeups,
             )
-
         worker_starters = {
+            SUPERVISOR_TASK_NAME: start_scan_supervisor,
             IDENTIFICATION_WORKER_TASK_NAME: start_identification_worker,
             OPERATION_WORKER_TASK_NAME: start_operation_worker,
             CONTRIBUTION_VERIFICATION_WORKER_TASK_NAME: start_contribution_worker,

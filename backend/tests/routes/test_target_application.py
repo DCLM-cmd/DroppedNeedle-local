@@ -542,10 +542,15 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
     monkeypatch.setattr(
         target_module, "start_disk_cache_cleanup_task", lambda *a, **k: None
     )
+    def _capture_supervisor(*args: object, **kwargs: object) -> object:
+        scan_supervisor_arguments["__args"] = args  # type: ignore[assignment]
+        scan_supervisor_arguments.update(kwargs)  # type: ignore[arg-type]
+        return None
+
     monkeypatch.setattr(
         target_module,
         "start_target_scan_supervisor",
-        lambda *args, **kwargs: scan_supervisor_arguments.update(kwargs),
+        _capture_supervisor,
     )
     identification_worker_arguments: dict[str, object] = {}
     monkeypatch.setattr(
@@ -636,7 +641,16 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
     assert schedule_settings_getter()["timezone_name"] == "Europe/London"
     assert schedule_settings_getter()["timezone_name"] == "Europe/London"
     timezone_name.assert_called_once_with()
+    supervisor_args = scan_supervisor_arguments.get("__args")  # type: ignore[assignment]
+    assert isinstance(supervisor_args, tuple) and len(supervisor_args) == 3
+    assert callable(supervisor_args[0])
+    assert callable(supervisor_args[1])
+    assert supervisor_args[2] is work_wakeups
+    assert callable(scan_supervisor_arguments.get("scheduler_getter"))
+    assert callable(scan_supervisor_arguments.get("resolver_getter"))
+    assert callable(scan_supervisor_arguments.get("schedule_settings_getter"))
     assert set(watchdog_starters) == {
+        "target-library-scan-supervisor",
         "target-library-identification-worker",
         "target-library-operation-worker",
         "library-contribution-verification-worker",
