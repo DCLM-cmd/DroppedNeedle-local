@@ -6,7 +6,8 @@ import msgspec
 import pytest
 from fastapi import FastAPI, HTTPException
 
-from api.v1.routes.library import router as legacy_library_router
+# F-NL-03 removed api.v1.routes.library; the direct-writer guard now checks
+# the target router only.
 from api.v1.routes.library_management import router
 from api.v1.routes.library_target import router as target_library_router
 from api.v1.schemas.library_management import (
@@ -762,12 +763,9 @@ def test_management_route_inventory_is_complete() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "library_router", [legacy_library_router, target_library_router]
-)
-def test_direct_track_tag_writer_is_not_exposed(library_router: object) -> None:
+def test_direct_track_tag_writer_is_not_exposed() -> None:
     assert not any(
         route.path == "/library/tracks/{track_id}"
         and "POST" in getattr(route, "methods", set())
-        for route in library_router.routes
+        for route in target_library_router.routes
     )
