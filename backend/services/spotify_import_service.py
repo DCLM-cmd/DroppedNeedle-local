@@ -85,7 +85,11 @@ async def fetch_spotify_playlist_cover(
         if not content_type.startswith("image/"):
             return None
         declared = response.headers.get("content-length")
-        if declared and declared.lstrip().isdigit() and int(declared) > MAX_COVER_FETCH_BYTES:
+        if (
+            declared
+            and declared.lstrip().isdigit()
+            and int(declared) > MAX_COVER_FETCH_BYTES
+        ):
             return None
         buffer = bytearray()
         async for chunk in response.aiter_bytes():
@@ -329,6 +333,15 @@ class SpotifyImportService:
                 recordings: list[dict] = data.get("recordings") or []
                 if isinstance(recordings, dict):
                     recordings = [recordings]
+                # ST2 P1: bank ISRC -> recording ids durably (write-through).
+                canonical_store = getattr(self._mb_repo, "mb_canonical_store", None)
+                if canonical_store is not None:
+                    try:
+                        await canonical_store.save_isrc_recordings(
+                            [(isrc, rec["id"]) for rec in recordings if rec.get("id")]
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass  # write-through must never break the import
                 for rec in recordings:
                     rec_id = rec.get("id")
                     if not rec_id:

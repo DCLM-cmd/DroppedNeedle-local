@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 # capping at max_lookups - so a section like Top Picks fully personalises in one pass rather
 # than banking only ~10 albums per build and being frozen partially-personalised by the cache.
 # On-visit builds leave it False (stay fast + tightly budgeted).
-discover_build_thorough: ContextVar[bool] = ContextVar("discover_build_thorough", default=False)
+discover_build_thorough: ContextVar[bool] = ContextVar(
+    "discover_build_thorough", default=False
+)
 
 
 class MbidResolutionService:
@@ -30,12 +32,16 @@ class MbidResolutionService:
         listenbrainz_repo: ListenBrainzRepositoryProtocol,
         library_db: LibraryDB | None = None,
         mbid_store: MBIDStore | None = None,
+        mb_canonical_store=None,
     ) -> None:
         self._mb_repo = musicbrainz_repo
         self._library_repo = library_repo
         self._lb_repo = listenbrainz_repo
         self._library_db = library_db
         self._mbid_store = mbid_store
+        # ST2 cutover: durable canonical map replaces mbid_resolution_map as
+        # the persistent tier for discover-lane release->RG.
+        self._mb_canonical_store = mb_canonical_store
 
     @staticmethod
     def normalize_mbid(mbid: str | None) -> str | None:
@@ -78,23 +84,30 @@ class MbidResolutionService:
                 continue
             pending.append(mbid)
 
-        if pending and self._mbid_store:
+        if pending and self._mb_canonical_store:
+            # ST2 cutover: the durable canonical map replaces
+            # mbid_resolution_map as the persistent read tier.
             try:
-                persisted = await self._mbid_store.get_mbid_resolution_map(pending)
+                persisted = await self._mb_canonical_store.get_release_to_rg_batch(
+                    pending
+                )
                 still_pending: list[str] = []
                 for mbid in pending:
-                    if mbid in persisted:
-                        rg_mbid = persisted[mbid]
-                        cache[mbid] = rg_mbid
+                    if mbid.casefold() in persisted:
+                        rg_mbid = persisted[mbid.casefold()]
                         if rg_mbid:
                             resolved[mbid] = rg_mbid
+                            cache[mbid] = rg_mbid
                         elif allow_passthrough:
                             resolved[mbid] = mbid
+                            cache[mbid] = mbid
+                        else:
+                            cache[mbid] = None
                     else:
                         still_pending.append(mbid)
                 pending = still_pending
             except Exception:  # noqa: BLE001
-                logger.warning("Failed to load MBID resolution from persistent cache")
+                logger.warning("Failed to load from canonical store")
 
         if not pending:
             return resolved
@@ -151,7 +164,9 @@ class MbidResolutionService:
         rg_checks = await asyncio.gather(
             *[
                 self._mb_repo.get_release_group_by_id(
-                    mbid, includes=["artist-credits"], priority=RequestPriority.BACKGROUND_SYNC
+                    mbid,
+                    includes=["artist-credits"],
+                    priority=RequestPriority.BACKGROUND_SYNC,
                 )
                 for mbid in unresolved
             ],
@@ -181,18 +196,31 @@ class MbidResolutionService:
 
         return resolved
 
-    async def _persist_resolutions(self, new_resolutions: dict[str, str | None]) -> None:
-        """Durably bank resolved LB->RG mappings so the cache warms across builds.
+    async def _persist_resolutions(
+        self, new_resolutions: dict[str, str | None]
+    ) -> None:
+        """Durably bank resolved LB->RG mappings into the canonical store so
+        the cache warms across builds.
 
         Shielded: the discover build that drives this resolver may cancel it on a
         budget timeout (Top Picks / radio / queue) while MB lookups are still draining
         at 1 req/s. The SQLite write that records the lookups already completed must
         finish regardless, or a starved build banks nothing and the next build re-does
-        the same 1/s resolutions from scratch."""
-        if not new_resolutions or not self._mbid_store:
+        the same 1/s resolutions from scratch.
+
+        ST2 cutover: writes go to ``release_to_rg`` in the canonical store via
+        ``save_release_to_rg`` (empty-string = authoritative negative). The
+        legacy ``mbid_resolution_map`` table remains for request_service."""
+        if not new_resolutions or not self._mb_canonical_store:
             return
         try:
-            await asyncio.shield(self._mbid_store.save_mbid_resolution_map(dict(new_resolutions)))
+            source_host = ""
+            await asyncio.shield(
+                self._mb_canonical_store.save_release_to_rg(
+                    {mbid: rg or "" for mbid, rg in new_resolutions.items()},
+                    source_host,
+                )
+            )
         except Exception:  # noqa: BLE001
             logger.warning("Failed to persist MBID resolutions")
 
@@ -211,7 +239,8 @@ class MbidResolutionService:
         for _, albums in artist_albums_pairs:
             all_album_mbids.extend(a.mbid for a in albums if a.mbid)
         rg_mbid_map = await self.resolve_lastfm_release_group_mbids(
-            all_album_mbids, resolver_cache=resolver_cache,
+            all_album_mbids,
+            resolver_cache=resolver_cache,
         )
         items: list[DiscoverQueueItemLight] = []
         seen_rg_mbids: set[str] = {mbid.lower() for mbid in (exclude or set())}
@@ -231,17 +260,23 @@ class MbidResolutionService:
                 rg_mbid_lower = rg_mbid.lower()
                 if rg_mbid_lower in seen_rg_mbids:
                     continue
-                artist_name = (album.artist_name or artist.name) if use_album_artist_name else artist.name
-                items.append(DiscoverQueueItemLight(
-                    release_group_mbid=rg_mbid,
-                    album_name=album.name,
-                    artist_name=artist_name,
-                    artist_mbid=artist_mbid or "",
-                    cover_url=f"/api/v1/covers/release-group/{rg_mbid}?size=500",
-                    recommendation_reason=reason,
-                    is_wildcard=is_wildcard,
-                    in_library=False,
-                ))
+                artist_name = (
+                    (album.artist_name or artist.name)
+                    if use_album_artist_name
+                    else artist.name
+                )
+                items.append(
+                    DiscoverQueueItemLight(
+                        release_group_mbid=rg_mbid,
+                        album_name=album.name,
+                        artist_name=artist_name,
+                        artist_mbid=artist_mbid or "",
+                        cover_url=f"/api/v1/covers/release-group/{rg_mbid}?size=500",
+                        recommendation_reason=reason,
+                        is_wildcard=is_wildcard,
+                        in_library=False,
+                    )
+                )
                 seen_rg_mbids.add(rg_mbid_lower)
         return items
 
@@ -250,7 +285,8 @@ class MbidResolutionService:
         release_ids: list[str],
     ) -> dict[str, str]:
         return await self.resolve_lastfm_release_group_mbids(
-            release_ids, allow_passthrough=False,
+            release_ids,
+            allow_passthrough=False,
         )
 
     async def get_library_artist_mbids(
@@ -305,7 +341,9 @@ class MbidResolutionService:
                 count=100,
             )
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to fetch user listened release groups from ListenBrainz")
+            logger.warning(
+                "Failed to fetch user listened release groups from ListenBrainz"
+            )
             return set()
         return {
             rg.release_group_mbid.lower()

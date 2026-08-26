@@ -20,6 +20,7 @@ from .cache_providers import (  # noqa: F401
     get_genre_index,
     get_youtube_store,
     get_mbid_store,
+    get_mb_canonical_store,
     get_sync_state_store,
     get_discovery_snapshot_store,
     get_persistence_write_lock,

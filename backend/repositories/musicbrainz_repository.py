@@ -11,6 +11,7 @@ from repositories.musicbrainz_base import (
     mb_rate_limiter,
     set_mb_http_client,
     set_mb_api_base,
+    set_mb_rate_limiter_bypass,
 )
 from repositories.musicbrainz_artist import MusicBrainzArtistMixin
 from repositories.musicbrainz_album import MusicBrainzAlbumMixin
@@ -24,11 +25,22 @@ class MusicBrainzRepository(MusicBrainzArtistMixin, MusicBrainzAlbumMixin):
         http_client: httpx.AsyncClient,
         cache: CacheInterface,
         preferences_service: PreferencesService,
+        mb_canonical_store=None,
     ):
         self._cache = cache
         self._preferences_service = preferences_service
+        # ST2 P1: durable canonical maps (optional; None keeps every existing
+        # test fixture working without SQLite). Production passes the shared
+        # MbCanonicalStore singleton.
+        self._mb_canonical_store = mb_canonical_store
         set_mb_http_client(http_client)
         self._apply_settings()
+
+    @property
+    def mb_canonical_store(self):
+        """Public read for collaborators (e.g. Spotify import ISRC banking)
+        that ride the same durable tier without their own DI plumbing."""
+        return self._mb_canonical_store
 
     def _apply_settings(self) -> None:
         from api.v1.schemas.settings import (
@@ -43,8 +55,15 @@ class MusicBrainzRepository(MusicBrainzArtistMixin, MusicBrainzAlbumMixin):
             settings.concurrent_searches = min(
                 settings.concurrent_searches, _OFFICIAL_MB_CONCURRENT_SEARCHES
             )
+            # the Unlimited sentinel is off-official only
+            if settings.rate_limit <= 0:
+                settings.rate_limit = _OFFICIAL_MB_RATE_LIMIT
         set_mb_api_base(settings.api_url)
-        mb_rate_limiter.update_rate(settings.rate_limit)
+        if settings.rate_limit == 0:
+            set_mb_rate_limiter_bypass(True)
+        else:
+            set_mb_rate_limiter_bypass(False)
+            mb_rate_limiter.update_rate(settings.rate_limit)
         if mb_rate_limiter.capacity != settings.concurrent_searches:
             mb_rate_limiter.update_capacity(settings.concurrent_searches)
 

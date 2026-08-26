@@ -25,6 +25,7 @@ from infrastructure.persistence import (
     NativeLibraryStore,
     SyncStateStore,
 )
+from infrastructure.persistence.mb_canonical_store import MbCanonicalStore
 from infrastructure.persistence._database import PriorityWriteLock
 
 from ._registry import singleton
@@ -141,7 +142,16 @@ def get_youtube_store() -> YouTubeStore:
 def get_mbid_store() -> MBIDStore:
     settings = get_settings()
     lock = get_persistence_write_lock()
-    return MBIDStore(db_path=settings.library_db_path, write_lock=lock)
+
+
+@singleton
+def get_mb_canonical_store() -> MbCanonicalStore:
+    """ST2 P1: durable canonical maps (release->rg, recording redirects,
+    ISRC index). Shares the library DB file and write lock; survives
+    musicbrainz_prefixes() sweeps by design (no prefix-list entry)."""
+    settings = get_settings()
+    lock = get_persistence_write_lock()
+    return MbCanonicalStore(db_path=settings.library_db_path, write_lock=lock)
 
 
 @singleton

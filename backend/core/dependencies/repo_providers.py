@@ -19,6 +19,7 @@ from .cache_providers import (
     get_cache,
     get_disk_cache,
     get_library_db,
+    get_mb_canonical_store,
     get_mbid_store,
     get_native_library_store,
     get_preferences_service,
@@ -48,6 +49,7 @@ def get_library_repository() -> "LibraryRepositoryProtocol":
         get_native_library_store(), get_request_history_store()
     )
 
+
 @singleton
 def get_musicbrainz_repository() -> "MusicBrainzRepository":
     from repositories.musicbrainz_repository import MusicBrainzRepository
@@ -55,7 +57,12 @@ def get_musicbrainz_repository() -> "MusicBrainzRepository":
     cache = get_cache()
     preferences_service = get_preferences_service()
     http_client = _get_configured_http_client()
-    return MusicBrainzRepository(http_client, cache, preferences_service)
+    return MusicBrainzRepository(
+        http_client,
+        cache,
+        preferences_service,
+        mb_canonical_store=get_mb_canonical_store(),
+    )
 
 
 @singleton
