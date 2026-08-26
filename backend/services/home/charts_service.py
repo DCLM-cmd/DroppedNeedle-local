@@ -31,6 +31,8 @@ from infrastructure.persistence.user_listening_prefs_store import (
     UserListeningPrefsStore,
 )
 
+from infrastructure.http.deduplication import deduplicate
+
 from .integration_helpers import HomeIntegrationHelpers, resolve_source_value
 
 if TYPE_CHECKING:
@@ -38,6 +40,13 @@ if TYPE_CHECKING:
     from services.home.genre_artwork_service import GenreArtworkService
 
 logger = logging.getLogger(__name__)
+
+# B8 1a: overview and first expansion must read the same upstream window. The
+# expand path requests limit=25 (+1 sentinel) at offset 0, so the overview
+# fetches that exact count per range instead of a narrow limit+1 slice; the
+# repo cache keys embed range:count:offset, making the first expansion of any
+# range a pure cache hit within TTL.
+CHARTS_FETCH_WINDOW = 26
 
 
 class HomeChartsService:
@@ -236,6 +245,9 @@ class HomeChartsService:
             total_count=len(popular_artists),
         )
 
+    @deduplicate(
+        lambda self, limit=10, source=None: f"charts-overview:trending:{limit}:{source}"
+    )
     async def get_trending_artists(
         self, limit: int = 10, source: str | None = None
     ) -> TrendingArtistsResponse:
@@ -245,7 +257,9 @@ class HomeChartsService:
 
         ranges = ["this_week", "this_month", "this_year", "all_time"]
         tasks = {
-            r: self._lb_repo.get_sitewide_top_artists(range_=r, count=limit + 1)
+            r: self._lb_repo.get_sitewide_top_artists(
+                range_=r, count=CHARTS_FETCH_WINDOW, offset=0
+            )
             for r in ranges
         }
         results = await self._execute_tasks(tasks)
@@ -355,6 +369,9 @@ class HomeChartsService:
             if artist.mbid and artist.mbid.casefold() in owned:
                 artist.in_library = True
 
+    @deduplicate(
+        lambda self, limit=10, source=None: f"charts-overview:popular:{limit}:{source}"
+    )
     async def get_popular_albums(
         self, limit: int = 10, source: str | None = None
     ) -> PopularAlbumsResponse:
@@ -364,7 +381,9 @@ class HomeChartsService:
 
         ranges = ["this_week", "this_month", "this_year", "all_time"]
         tasks = {
-            r: self._lb_repo.get_sitewide_top_release_groups(range_=r, count=limit + 1)
+            r: self._lb_repo.get_sitewide_top_release_groups(
+                range_=r, count=CHARTS_FETCH_WINDOW, offset=0
+            )
             for r in ranges
         }
         results = await self._execute_tasks(tasks)
@@ -372,8 +391,7 @@ class HomeChartsService:
         for r in ranges:
             lb_albums = results.get(r) or []
             transformed[r] = [
-                self._transformers.lb_release_to_home(a, set())
-                for a in lb_albums
+                self._transformers.lb_release_to_home(a, set()) for a in lb_albums
             ]
         await self._mark_album_ownership(
             [album for albums in transformed.values() for album in albums]
@@ -417,9 +435,7 @@ class HomeChartsService:
         lb_albums = await self._lb_repo.get_sitewide_top_release_groups(
             range_=range_key, count=limit + 1, offset=offset
         )
-        albums = [
-            self._transformers.lb_release_to_home(a, set()) for a in lb_albums
-        ]
+        albums = [self._transformers.lb_release_to_home(a, set()) for a in lb_albums]
         await self._mark_album_ownership(albums)
         has_more = len(albums) > limit
         items = albums[:limit]
@@ -610,6 +626,11 @@ class HomeChartsService:
             has_more=end < len(albums),
         )
 
+    @deduplicate(
+        lambda self, user_id, limit=10, source=None: (
+            f"charts-overview:your-top:{user_id}:{limit}:{source}"
+        )
+    )
     async def get_your_top_albums(
         self, user_id: str, limit: int = 10, source: str | None = None
     ) -> PopularAlbumsResponse:
@@ -640,7 +661,7 @@ class HomeChartsService:
         ranges = ["this_week", "this_month", "this_year", "all_time"]
         tasks = {
             r: lb_client.get_user_top_release_groups(
-                username=lb_username, range_=r, count=limit + 1
+                username=lb_username, range_=r, count=CHARTS_FETCH_WINDOW, offset=0
             )
             for r in ranges
         }
@@ -711,9 +732,7 @@ class HomeChartsService:
         rgs = await lb_client.get_user_top_release_groups(
             username=lb_username, range_=range_key, count=limit + 1, offset=offset
         )
-        albums = [
-            self._transformers.lb_release_to_home(rg, set()) for rg in rgs
-        ]
+        albums = [self._transformers.lb_release_to_home(rg, set()) for rg in rgs]
         await self._mark_album_ownership(albums)
         has_more = len(albums) > limit
         items = albums[:limit]

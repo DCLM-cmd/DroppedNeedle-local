@@ -161,14 +161,18 @@ async def test_release_verification_accepts_live_null_packaging(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_url_resolution_accepts_live_null_status_and_packaging(monkeypatch) -> None:
+async def test_url_resolution_accepts_live_null_status_and_packaging(
+    monkeypatch,
+) -> None:
     import repositories.musicbrainz_album as module
 
     monkeypatch.setattr(
         module,
         "mb_api_get",
         AsyncMock(
-            return_value=_decoded("contribution_url_release_null.json", MbContributionUrl)
+            return_value=_decoded(
+                "contribution_url_release_null.json", MbContributionUrl
+            )
         ),
     )
     resolution = await _Repo().resolve_url(
@@ -180,14 +184,18 @@ async def test_url_resolution_accepts_live_null_status_and_packaging(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_duplicate_search_omitted_optional_fields_decode_to_none(monkeypatch) -> None:
+async def test_duplicate_search_omitted_optional_fields_decode_to_none(
+    monkeypatch,
+) -> None:
     import repositories.musicbrainz_album as module
 
     monkeypatch.setattr(
         module,
         "mb_api_get",
         AsyncMock(
-            return_value=_decoded("contribution_search.json", MbContributionReleaseSearch)
+            return_value=_decoded(
+                "contribution_search.json", MbContributionReleaseSearch
+            )
         ),
     )
     results = await _Repo().search_duplicate_releases(
@@ -292,6 +300,8 @@ def test_contribution_methods_conform_to_protocol() -> None:
         "get_release_for_verification",
         "search_duplicate_releases",
         "search_release_groups",
+        # A2: priority threading on the artist detail leg.
+        "get_artist_by_id",
     ):
         assert inspect.signature(
             getattr(MusicBrainzRepositoryProtocol, name)

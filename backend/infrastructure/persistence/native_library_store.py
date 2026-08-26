@@ -1646,7 +1646,10 @@ class NativeLibraryStore(PersistenceBase):
         with self._browse_projection_lock:
             stale = [
                 existing_key
-                for existing_key, (entry_revision, _) in self._browse_projections.items()
+                for existing_key, (
+                    entry_revision,
+                    _,
+                ) in self._browse_projections.items()
                 if entry_revision != revision
             ]
             for existing_key in stale:
@@ -2642,8 +2645,7 @@ class NativeLibraryStore(PersistenceBase):
             connection: sqlite3.Connection,
         ) -> dict[str, list[dict[str, Any]]]:
             rows = connection.execute(
-                _TARGET_TRACK_SELECT
-                + f" WHERE a.id IN ({placeholders}) "
+                _TARGET_TRACK_SELECT + f" WHERE a.id IN ({placeholders}) "
                 "AND t.availability = 'indexed' "
                 "ORDER BY a.id, t.disc_number, t.track_number, t.id",
                 unique,
@@ -2652,9 +2654,7 @@ class NativeLibraryStore(PersistenceBase):
                 album_id: [] for album_id in unique
             }
             for row in rows:
-                grouped.setdefault(
-                    str(row["local_album_id"]), []
-                ).append(dict(row))
+                grouped.setdefault(str(row["local_album_id"]), []).append(dict(row))
             return grouped
 
         return await self._read(operation)
@@ -2864,10 +2864,7 @@ class NativeLibraryStore(PersistenceBase):
                     "LEFT JOIN library_contribution_drafts contribution "
                     "ON contribution.local_album_id = a.id "
                     "AND contribution.state NOT IN ('linked','cancelled','stale') "
-                    "WHERE "
-                    + where
-                    + " GROUP BY a.id ORDER BY "
-                    + ordering,
+                    "WHERE " + where + " GROUP BY a.id ORDER BY " + ordering,
                     parameters,
                 ).fetchall()
                 return [dict(row) for row in rows], len(rows)
@@ -3052,18 +3049,12 @@ class NativeLibraryStore(PersistenceBase):
                     )
                     if wanted
                 ]
-                common = (
-                    "WITH " + ", ".join(cte_parts) + " " if cte_parts else ""
-                )
+                common = "WITH " + ", ".join(cte_parts) + " " if cte_parts else ""
                 joins = " FROM local_artists ar "
                 if want_album:
-                    joins += (
-                        "LEFT JOIN album_rel ON album_rel.artist_id = ar.id "
-                    )
+                    joins += "LEFT JOIN album_rel ON album_rel.artist_id = ar.id "
                 if want_contributor:
-                    joins += (
-                        "LEFT JOIN contributor_rel ON contributor_rel.artist_id = ar.id "
-                    )
+                    joins += "LEFT JOIN contributor_rel ON contributor_rel.artist_id = ar.id "
                 joins += (
                     "LEFT JOIN local_artist_external_identities aie "
                     "ON aie.local_artist_id = ar.id AND aie.provider = 'musicbrainz' "
@@ -3419,11 +3410,7 @@ class NativeLibraryStore(PersistenceBase):
                     "random": "RANDOM()",
                 }.get(sort, "t.imported_at DESC, t.id")
                 rows = connection.execute(
-                    _TARGET_TRACK_SELECT
-                    + " WHERE "
-                    + where
-                    + " ORDER BY "
-                    + ordering,
+                    _TARGET_TRACK_SELECT + " WHERE " + where + " ORDER BY " + ordering,
                     parameters,
                 ).fetchall()
                 return [dict(row) for row in rows], len(rows)
@@ -3596,7 +3583,9 @@ class NativeLibraryStore(PersistenceBase):
         Returns the subset of ``identifiers`` that exist as release-group
         MBIDs on active indexed albums."""
         normalized = list(
-            dict.fromkeys(value.strip().casefold() for value in identifiers if value.strip())
+            dict.fromkeys(
+                value.strip().casefold() for value in identifiers if value.strip()
+            )
         )
         if not normalized:
             return set()
@@ -3728,6 +3717,38 @@ class NativeLibraryStore(PersistenceBase):
                 is not None
             )
             return owned, appears
+
+        return await self._read(operation)
+
+    async def album_catalog_scope_ids(
+        self, local_album_id: str
+    ) -> tuple[set[str], set[str]]:
+        """ST1: provider ids a committed album contributes to catalog-scope
+        invalidation - (release-group mbids, artist mbids). The album identity
+        row supplies the RG; artist mbids come from the indexed tracks'
+        musicbrainz identities. Empty sets are valid (nothing to delete)."""
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> tuple[set[str], set[str]]:
+            rg_row = connection.execute(
+                "SELECT release_group_mbid FROM local_album_external_identities "
+                "WHERE local_album_id = ? AND provider = 'musicbrainz'",
+                (local_album_id,),
+            ).fetchone()
+            rg_ids = (
+                {str(rg_row["release_group_mbid"])} if rg_row is not None else set()
+            )
+            artist_rows = connection.execute(
+                "SELECT DISTINCT te.provider_artist_id FROM "
+                "local_track_external_identities te "
+                "JOIN local_tracks t ON t.id = te.local_track_id "
+                "WHERE t.local_album_id = ? AND te.provider = 'musicbrainz' "
+                "AND te.provider_artist_id IS NOT NULL",
+                (local_album_id,),
+            ).fetchall()
+            artist_ids = {str(row["provider_artist_id"]) for row in artist_rows}
+            return rg_ids, artist_ids
 
         return await self._read(operation)
 
@@ -7476,6 +7497,7 @@ class NativeLibraryStore(PersistenceBase):
         """F-061: durable marker for a swallowed post-identification
         management-scheduling failure; cleared by any later successful
         scheduling pass for the same album."""
+
         def operation(connection: sqlite3.Connection) -> None:
             connection.execute(
                 "UPDATE local_albums SET management_schedule_pending = 1, "
@@ -7487,6 +7509,7 @@ class NativeLibraryStore(PersistenceBase):
 
     async def clear_management_schedule_pending(self, local_album_id: str) -> None:
         """F-061: called when management scheduling later succeeds."""
+
         def operation(connection: sqlite3.Connection) -> None:
             connection.execute(
                 "UPDATE local_albums SET management_schedule_pending = 0 "
@@ -8550,6 +8573,7 @@ class NativeLibraryStore(PersistenceBase):
         under interleaving even though last-write-wins picks one payload -
         bounded workers make double-generation rare and idempotent.
         """
+
         def operation(connection: sqlite3.Connection) -> int:
             existing = connection.execute(
                 "SELECT state, row_revision FROM audio_fingerprint_outcomes "
@@ -9105,7 +9129,9 @@ class NativeLibraryStore(PersistenceBase):
                     for row in existing
                     if any(
                         str(row["root_id"]) == scope.root_id
-                        and self._scan_scope_covers_path(scope.relative_path, str(row["relative_path"]))
+                        and self._scan_scope_covers_path(
+                            scope.relative_path, str(row["relative_path"])
+                        )
                         and str(row["relative_path"]) != scope.relative_path
                         for scope in additions
                     )
@@ -9114,7 +9140,10 @@ class NativeLibraryStore(PersistenceBase):
                     connection.executemany(
                         "DELETE FROM library_scan_run_scopes WHERE run_id = ? "
                         "AND root_id = ? AND relative_path = ?",
-                        [(str(queued["id"]), root_id, path) for root_id, path in superseded],
+                        [
+                            (str(queued["id"]), root_id, path)
+                            for root_id, path in superseded
+                        ],
                     )
                 self._insert_scan_scopes(connection, str(queued["id"]), additions)
                 updated = connection.execute(
@@ -10074,6 +10103,7 @@ class NativeLibraryStore(PersistenceBase):
             return [self._scan_state_from_row(row) for row in rows]
 
         return await super()._background_write(operation)
+
     async def recover_stopping_scan_runs(self, *, now: float) -> list[ScanRun]:
         def operation(connection: sqlite3.Connection) -> list[ScanRun]:
             stopping = connection.execute(
@@ -10106,7 +10136,6 @@ class NativeLibraryStore(PersistenceBase):
             return []
 
         return await super()._background_write(operation)
-
 
     async def cleanup_terminal_scan_inventory(
         self, *, limit: int = 5_000
@@ -10248,8 +10277,7 @@ class NativeLibraryStore(PersistenceBase):
                         index
                         for index, row in enumerate(rows)
                         if any(
-                            isinstance(value, str)
-                            and _has_surrogates(value)
+                            isinstance(value, str) and _has_surrogates(value)
                             for value in row
                         )
                     ),
@@ -10810,7 +10838,6 @@ class NativeLibraryStore(PersistenceBase):
         NEW-SCAN-04: indexing failures arrive as detailed ``ScanFailureRecord``
         values; the same detail is written to the inventory failure code and the
         failure-table row in this one transaction."""
-
 
         def operation(connection: sqlite3.Connection) -> ScanRun:
             catalog_changed = False
@@ -17435,7 +17462,14 @@ class NativeLibraryStore(PersistenceBase):
                     "row_revision = row_revision + 1, event_revision = event_revision + 1 "
                     "WHERE state = 'failed' AND input_revision = ? AND "
                     "((local_album_id = ? AND ? IS NOT NULL) OR (local_track_id = ? AND ? IS NOT NULL))",
-                    (now, review["input_revision"], album_id, album_id, track_id, track_id),
+                    (
+                        now,
+                        review["input_revision"],
+                        album_id,
+                        album_id,
+                        track_id,
+                        track_id,
+                    ),
                 )
             updated = connection.execute(
                 "UPDATE library_identification_reviews SET state = ?, reason_code = ?, "
@@ -20859,9 +20893,7 @@ class NativeLibraryStore(PersistenceBase):
                 current_policy_revision is not None
                 and str(snapshot["policy_revision"]) != current_policy_revision
             ):
-                raise StaleRevisionError(
-                    "The library policy changed before apply."
-                )
+                raise StaleRevisionError("The library policy changed before apply.")
             if (
                 connection.execute(
                     "SELECT 1 FROM library_operation_work WHERE job_id=? LIMIT 1",
@@ -25278,8 +25310,7 @@ class NativeLibraryStore(PersistenceBase):
                     snapshot_revision=int(snapshot["row_revision"]),
                     committed_journal_ids=tuple(sorted(journal_by_id)),
                     committed_journal_revisions={
-                        str(row["id"]): int(row["row_revision"])
-                        for row in journal_rows
+                        str(row["id"]): int(row["row_revision"]) for row in journal_rows
                     },
                 )
             if not journal_rows or any(
@@ -26861,8 +26892,7 @@ class NativeLibraryStore(PersistenceBase):
             if (
                 job["state"] != "ready"
                 and not (
-                    job["state"] == "succeeded"
-                    and decision_mode == "leave_unmanaged"
+                    job["state"] == "succeeded" and decision_mode == "leave_unmanaged"
                 )
             ) or int(job["row_revision"]) != expected_job_revision:
                 raise StaleRevisionError(
@@ -27722,9 +27752,7 @@ class NativeLibraryStore(PersistenceBase):
             self.work_wakeups.notify("operation")
         return result
 
-    async def probe_operation_control(
-        self, job_id: str, worker_id: str
-    ) -> bool:
+    async def probe_operation_control(self, job_id: str, worker_id: str) -> bool:
         """Read-only per-unit control check (no write lock, no transaction).
 
         (GH-293) Workers check control at pass cadence with a real transition,
@@ -29037,9 +29065,7 @@ class NativeLibraryStore(PersistenceBase):
                 (job_id,),
             ).fetchone()
             if materialization is None:
-                self._repair_materialization_backfill_tx(
-                    connection, job_id, now=now
-                )
+                self._repair_materialization_backfill_tx(connection, job_id, now=now)
                 materialization = connection.execute(
                     "SELECT * FROM library_repair_materialization WHERE job_id = ?",
                     (job_id,),
@@ -29125,7 +29151,9 @@ class NativeLibraryStore(PersistenceBase):
                 else int(materialization["staged_ordinal"])
             )
             new_count = int(materialization["staged_count"]) + len(page)
-            new_cursor = str(page[-1]["id"]) if page else materialization["staging_cursor"]
+            new_cursor = (
+                str(page[-1]["id"]) if page else materialization["staging_cursor"]
+            )
             connection.execute(
                 "UPDATE library_repair_materialization SET staging_cursor = ?, "
                 "staged_ordinal = ?, staged_count = ?, sealed = ?, updated_at = ? "
@@ -29239,7 +29267,8 @@ class NativeLibraryStore(PersistenceBase):
             scope = json.loads(str(snapshot["scope_json"]))
             purpose = str(materialization["purpose"])
             from_sql, where_sql, parameters = self._repair_scope_sql(
-                scope, purpose=purpose,
+                scope,
+                purpose=purpose,
                 source_matcher_version=snapshot["source_matcher_version"],
             )
             current_revision = int(
@@ -29367,17 +29396,13 @@ class NativeLibraryStore(PersistenceBase):
                 (job_id,),
             ).fetchone()
             if materialization is None:
-                self._repair_materialization_backfill_tx(
-                    connection, job_id, now=now
-                )
+                self._repair_materialization_backfill_tx(connection, job_id, now=now)
                 materialization = connection.execute(
                     "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
                     (job_id,),
                 ).fetchone()
             if materialization is None or int(materialization["sealed"]) != 1:
-                raise StaleRevisionError(
-                    "The repair worklist is not sealed yet."
-                )
+                raise StaleRevisionError("The repair worklist is not sealed yet.")
             active = connection.execute(
                 "SELECT COUNT(*) FROM library_operation_work WHERE job_id = ? "
                 "AND state IN ('pending','running')",
@@ -29607,6 +29632,7 @@ class NativeLibraryStore(PersistenceBase):
         stale subject instead, the tx already marked it stale. Returns
         ``"saved"``, ``"auto_applied"`` or ``"auto_stale"``.
         """
+
         def operation(connection: sqlite3.Connection) -> str:
             work = connection.execute(
                 "SELECT * FROM library_operation_work WHERE job_id = ? AND ordinal = ? "
@@ -29794,10 +29820,8 @@ class NativeLibraryStore(PersistenceBase):
                     "WHERE local_album_id = ? AND decision_source = 'automatic'",
                     (local_album_id,),
                 ).fetchone()
-                if (
-                    identity is None
-                    or int(identity["row_revision"])
-                    != int(snapshot["expected_post_identity_revision"])
+                if identity is None or int(identity["row_revision"]) != int(
+                    snapshot["expected_post_identity_revision"]
                 ):
                     continue
                 album = connection.execute(
@@ -30012,17 +30036,13 @@ class NativeLibraryStore(PersistenceBase):
             ).fetchone()
             if materialization is None:
                 # Pre-GH-293 jobs carry their work inline; retro-seal them.
-                self._repair_materialization_backfill_tx(
-                    connection, job_id, now=now
-                )
+                self._repair_materialization_backfill_tx(connection, job_id, now=now)
                 materialization = connection.execute(
                     "SELECT sealed FROM library_repair_materialization WHERE job_id = ?",
                     (job_id,),
                 ).fetchone()
             if materialization is None or int(materialization["sealed"]) != 1:
-                raise StaleRevisionError(
-                    "The repair worklist is not sealed yet."
-                )
+                raise StaleRevisionError("The repair worklist is not sealed yet.")
             pending = connection.execute(
                 "SELECT COUNT(*) FROM library_operation_work WHERE job_id = ? "
                 "AND state IN ('pending','running')",
@@ -30324,7 +30344,9 @@ class NativeLibraryStore(PersistenceBase):
                         now=now,
                     )
                 else:
-                    current_revisions = tuple(_album_input_revision(track_rows).split(":"))
+                    current_revisions = tuple(
+                        _album_input_revision(track_rows).split(":")
+                    )
                     proposed = {
                         item.local_track_id: item
                         for item in (evidence.track_evidence if evidence else [])
@@ -30372,7 +30394,8 @@ class NativeLibraryStore(PersistenceBase):
                                 )
                                 or (
                                     row["release_track_mbid"]
-                                    and row["release_track_mbid"] != item.release_track_mbid
+                                    and row["release_track_mbid"]
+                                    != item.release_track_mbid
                                 )
                                 or (
                                     row["embedded_release_group_mbid"]
@@ -30783,11 +30806,7 @@ class NativeLibraryStore(PersistenceBase):
                     else None,
                     json.dumps([dict(row) for row in prior_tracks], sort_keys=True),
                     int(album["row_revision"]),
-                    (
-                        int(identity["row_revision"]) + 1
-                        if identity is not None
-                        else 1
-                    ),
+                    (int(identity["row_revision"]) + 1 if identity is not None else 1),
                     evidence.reason_code,
                     now,
                 ),
@@ -32163,9 +32182,7 @@ class NativeLibraryStore(PersistenceBase):
     async def catalog_has_tracks(self) -> bool:
         def operation(connection: sqlite3.Connection) -> bool:
             return (
-                connection.execute(
-                    "SELECT 1 FROM local_tracks LIMIT 1"
-                ).fetchone()
+                connection.execute("SELECT 1 FROM local_tracks LIMIT 1").fetchone()
                 is not None
             )
 

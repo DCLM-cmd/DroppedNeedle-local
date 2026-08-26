@@ -98,6 +98,10 @@ def _make_service(
     )
 
 
+def _collected_list(collected):
+    return list(collected.values())
+
+
 class TestFilterAwarePagination:
     @pytest.mark.asyncio
     async def test_single_page_fits_filter(self):
@@ -122,19 +126,39 @@ class TestFilterAwarePagination:
             _make_release_group(f"rg-{i}", f"Broadcast {i}", "Broadcast")
             for i in range(5)
         ]
-        batch2 = [_make_release_group("rg-album", "Real Album", "Album")]
+        _rg_album = _make_release_group("rg-album", "Real Album", "Album")
+        batch2 = [_rg_album]
+        cache, store = _make_dict_cache()
         svc = _make_service(
             mb_release_pages=[
                 (batch1, 6),
                 (batch2, 6),
-            ]
+            ],
+            memory_cache=cache,
         )
 
+        # ST4/A3: page 1 is all-Broadcast -> incomplete slice, warming=true,
+        # null total. The background walker finishes batch 2; the follow-up
+        # read then serves the real album with exact totals.
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert result.albums == []
+        assert result.warming is True
+        assert result.source_total_count is None
 
-        assert result.albums[0].title == "Real Album"
-        assert result.returned_count == 1
-        assert result.source_total_count == 1
+        collected = {f"rg-{i}": g for i, g in enumerate(batch1)}
+        collected["rg-album"] = _rg_album
+        await svc._warm_release_group_pages(
+            ARTIST_MBID,
+            collected,
+            total=6,
+            raw_offset=6,
+        )
+
+        warmed = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert [a.title for a in warmed.albums] == ["Real Album"]
+        assert warmed.warming is False
+        assert warmed.source_total_count == 1
+        assert warmed.returned_count == 1
 
     @pytest.mark.asyncio
     async def test_empty_result_set(self):
@@ -145,7 +169,10 @@ class TestFilterAwarePagination:
         assert result.returned_count == 0
         assert result.has_more is False
         assert result.next_offset is None
+        # A3: a definitive "no release groups at all" answer is complete,
+        # not warming.
         assert result.source_total_count == 0
+        assert result.warming is False
 
     @pytest.mark.asyncio
     async def test_offset_reflects_client_param(self):
@@ -242,18 +269,30 @@ class TestFilterAwarePagination:
     async def test_global_sort_across_batches(self):
         batch1 = [_make_release_group("rg-a", "Old Album", "Album", "2010-01-01")]
         batch2 = [_make_release_group("rg-b", "New Album", "Album", "2020-01-01")]
+        cache, store = _make_dict_cache()
         svc = _make_service(
             mb_release_pages=[
                 (batch1, 2),
                 (batch2, 2),
-            ]
+            ],
+            memory_cache=cache,
         )
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert result.warming is True
 
-        assert len(result.albums) == 2
-        assert result.albums[0].title == "New Album"
-        assert result.albums[1].title == "Old Album"
+        collected = {
+            "rg-a": batch1[0],
+            "rg-b": batch2[0],
+        }
+        await svc._warm_release_group_pages(
+            ARTIST_MBID, collected, total=2, raw_offset=2
+        )
+
+        warmed = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert len(warmed.albums) == 2
+        assert warmed.albums[0].title == "New Album"
+        assert warmed.albums[1].title == "Old Album"
 
     @pytest.mark.asyncio
     async def test_next_offset_is_arithmetic(self):
@@ -300,7 +339,9 @@ class TestFilterAwarePagination:
             for i in range(5)
         ]
         svc = _make_service(mb_release_pages=[(batch1, 200), (batch2, 200)])
-        is_disconnected = AsyncMock(side_effect=[False, False, True])
+        # A3 contract: disconnects are checked before the page-1 fetch; once
+        # page 1 succeeds the request returns (warming) and never checks again.
+        is_disconnected = AsyncMock(return_value=True)
 
         with pytest.raises(ClientDisconnectedError):
             await svc.get_artist_releases(
@@ -328,16 +369,35 @@ class TestFilterAwarePagination:
         )
 
         first = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
-        second = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
 
-        assert first.returned_count == 50
-        assert first.source_total_count == 109
+        # A3: first view serves page 1 with warming=true / null total...
+        assert first.warming is True
+        assert first.source_total_count is None
+
+        # ...the background walker completes the remaining pages...
+        collected = {
+            str(g["id"]).casefold(): g for page in (batch1, batch2) for g in page
+        }
+        # The spawned walker (registry name mb-rg-warm-*) is still pending;
+        # cancel it so only our explicit completion write lands.
+        from core.task_registry import TaskRegistry
+
+        await TaskRegistry.get_instance().cancel(f"mb-rg-warm-{ARTIST_MBID.casefold()}")
+
+        # ...then complete the walk deterministically ourselves.
+        await svc._warm_release_group_pages(
+            ARTIST_MBID, collected, total=109, raw_offset=109
+        )
+
+        # ...and the second view is served from the shared cache with exact
+        # totals, byte-for-byte the old full-walk contract.
+        second = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert second.warming is False
         assert second.returned_count == 50
         assert second.source_total_count == 109
-        assert svc._mb_repo.get_artist_release_groups.await_count == 2
-        svc._cache.set.assert_awaited_once()
-        cached = store[mb_artist_release_groups_key(ARTIST_MBID)]
-        assert len(cached) == 109
+        assert store[mb_artist_release_groups_key(ARTIST_MBID)] == _collected_list(
+            collected
+        )
 
     @pytest.mark.asyncio
     async def test_partial_fetch_not_cached(self):
@@ -348,9 +408,16 @@ class TestFilterAwarePagination:
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
 
-        assert result.returned_count == 50
-        assert result.source_total_count == 100
-        svc._cache.set.assert_not_awaited()
+        # A3: partial slice served with warming=true / null total; the shared
+        # key stays unwritten (outage-safety rule).
+        assert result.warming is True
+        assert result.source_total_count is None
+        store_writes = [
+            call.args[0]
+            for call in svc._cache.set.await_args_list
+            if call.args and call.args[0].startswith("mb:artist_rgs:")
+        ]
+        assert store_writes == []
 
     @pytest.mark.asyncio
     async def test_gid_sorted_pages_no_drop_regression(self):
@@ -359,7 +426,9 @@ class TestFilterAwarePagination:
         # anywhere in a page, and scan-position pagination dropped it.
         negative_spaces_id = "fe83cc29-01a9-4650-95ca-d3e135c07278"
         page1 = [
-            _make_release_group(f"aaaaaaaa-0000-4000-8000-{i:012d}", f"Album {i}", "Album")
+            _make_release_group(
+                f"aaaaaaaa-0000-4000-8000-{i:012d}", f"Album {i}", "Album"
+            )
             for i in range(99)
         ] + [
             _make_release_group(
@@ -367,7 +436,9 @@ class TestFilterAwarePagination:
             )
         ]
         page2 = [
-            _make_release_group(f"bbbbbbbb-0000-4000-8000-{i:012d}", f"Album B{i}", "Album")
+            _make_release_group(
+                f"bbbbbbbb-0000-4000-8000-{i:012d}", f"Album B{i}", "Album"
+            )
             for i in range(9)
         ]
         cache, _ = _make_dict_cache()
@@ -391,10 +462,25 @@ class TestFilterAwarePagination:
         rgs = [_make_release_group(f"rg-{i}", f"Album {i}", "Album") for i in range(15)]
         page1 = rgs[:10]
         page2 = rgs[5:]  # overlaps page1 by 50%
-        svc = _make_service(mb_release_pages=[(page1, 15), (page2, 15)])
+        cache, store = _make_dict_cache()
+        svc = _make_service(
+            mb_release_pages=[(page1, 15), (page2, 15)], memory_cache=cache
+        )
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert result.warming is True
 
-        ids = [item.id for item in result.albums]
+        collected = {}
+        raw = 0
+        for page in (page1, page2):
+            for g in page:
+                collected.setdefault(str(g["id"]).casefold(), g)
+            raw += len(page)
+        await svc._warm_release_group_pages(
+            ARTIST_MBID, collected, total=15, raw_offset=raw
+        )
+
+        warmed = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        ids = [item.id for item in warmed.albums]
         assert len(ids) == 15
         assert len(ids) == len(set(ids))

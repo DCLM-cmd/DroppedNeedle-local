@@ -26,6 +26,7 @@ from core.exceptions import (
 )
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from infrastructure.cache.cache_keys import library_identification_prefixes
+from infrastructure.cache.catalog_invalidation import invalidate_catalog_scope
 from infrastructure.cache.memory_cache import CacheInterface
 from models.library_contribution import (
     ContributionRecord,
@@ -516,7 +517,12 @@ class LibraryContributionService:
         )
         if await self._purge_provider_data_row(row, now=now):
             row = await self._store.get_library_contribution(contribution_id) or row
-        await self._invalidate_catalog_cache()
+        # ST1: entity ids are in hand (verified) - delete exactly the touched
+        # identity-bearing keys synchronously BEFORE returning so a
+        # re-identification can never serve the previous identity. Lists still
+        # sweep (cheap local rebuilds). The wholesale variant remains for the
+        # public wrapper callers that carry no ids.
+        await self._invalidate_scope_for_commit(verified)
         await self.after_identified(current.local_album_id, policy_revision)
         return await self._record(row)
 
@@ -694,6 +700,20 @@ class LibraryContributionService:
 
     async def invalidate_catalog_cache(self) -> None:
         await self._invalidate_catalog_cache()
+
+    async def _invalidate_scope_for_commit(self, verified) -> None:
+        """ST1: delete exactly the touched identity-bearing keys synchronously
+        BEFORE the commit path returns - a re-identification must never serve
+        the previous identity. Lists still sweep (cheap local rebuilds). The
+        wholesale variant remains for public callers without ids."""
+        if self._cache is None:
+            return
+        await invalidate_catalog_scope(
+            self._cache,
+            album_mbids={verified.release_group_mbid},
+            artist_mbids={verified.artist_mbid},
+            include_lists=True,
+        )
 
     async def after_identified(
         self, local_album_id: str, input_policy_revision: str

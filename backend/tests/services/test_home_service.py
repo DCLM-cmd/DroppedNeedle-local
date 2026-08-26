@@ -33,7 +33,9 @@ def _make_prefs(
     )
     prefs.get_lastfm_connection.return_value = lfm_settings
     prefs.is_lastfm_enabled.return_value = lfm_enabled
-    prefs.get_primary_music_source.return_value = PrimaryMusicSourceSettings(source=primary_source)
+    prefs.get_primary_music_source.return_value = PrimaryMusicSourceSettings(
+        source=primary_source
+    )
 
     jf_settings = MagicMock()
     jf_settings.enabled = False
@@ -95,13 +97,21 @@ def _make_service(
     )
 
     factory = MagicMock()
-    factory.resolve_listenbrainz = AsyncMock(return_value=lb_repo if lb_enabled else None)
+    factory.resolve_listenbrainz = AsyncMock(
+        return_value=lb_repo if lb_enabled else None
+    )
     factory.resolve_lastfm = AsyncMock(return_value=lfm_repo if lfm_enabled else None)
-    factory.resolve_listenbrainz_username = AsyncMock(return_value="lbuser" if lb_enabled else None)
-    factory.resolve_lastfm_username = AsyncMock(return_value="lfmuser" if lfm_enabled else None)
+    factory.resolve_listenbrainz_username = AsyncMock(
+        return_value="lbuser" if lb_enabled else None
+    )
+    factory.resolve_lastfm_username = AsyncMock(
+        return_value="lfmuser" if lfm_enabled else None
+    )
 
     prefs_store = MagicMock()
-    prefs_store.get = AsyncMock(return_value=SimpleNamespace(primary_music_source=primary_source))
+    prefs_store.get = AsyncMock(
+        return_value=SimpleNamespace(primary_music_source=primary_source)
+    )
 
     play_history_store = MagicMock()
     play_history_store.recent = AsyncMock(return_value=[])
@@ -232,17 +242,27 @@ class TestHomeServiceSourceSelection:
                 )
             ],
         )
-        service._mb_repo.get_release_group_id_from_release.return_value = "release-group-1"
+        service._mb_repo.get_release_group_id_from_release.return_value = (
+            "release-group-1"
+        )
 
         response = await service.get_home_data("u1")
 
         assert response.weekly_exploration is not None
-        assert response.weekly_exploration.source_url == "https://listenbrainz.org/playlist/weekly-123"
+        assert (
+            response.weekly_exploration.source_url
+            == "https://listenbrainz.org/playlist/weekly-123"
+        )
         assert len(response.weekly_exploration.tracks) == 1
-        assert response.weekly_exploration.tracks[0].release_group_mbid == "release-group-1"
+        assert (
+            response.weekly_exploration.tracks[0].release_group_mbid
+            == "release-group-1"
+        )
 
     @pytest.mark.asyncio
-    async def test_weekly_exploration_uses_batched_recording_metadata_before_musicbrainz(self):
+    async def test_weekly_exploration_uses_batched_recording_metadata_before_musicbrainz(
+        self,
+    ):
         service, lb_repo, _, _ = _make_service(
             lb_enabled=True, lfm_enabled=True, primary_source="listenbrainz"
         )
@@ -274,7 +294,10 @@ class TestHomeServiceSourceSelection:
 
         response = await service.get_home_data("u1")
 
-        assert response.weekly_exploration.tracks[0].release_group_mbid == "release-group-1"
+        assert (
+            response.weekly_exploration.tracks[0].release_group_mbid
+            == "release-group-1"
+        )
         service._mb_repo.get_release_group_id_from_release.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -373,21 +396,32 @@ class TestWhatsHotAlwaysBuilt:
 
     @pytest.mark.asyncio
     async def test_disabled_sections_filtered_at_read_time(self):
-        from api.v1.schemas.home import HomeResponse, HomeSection, HomeArtist, HomeIntegrationStatus
+        from api.v1.schemas.home import (
+            HomeResponse,
+            HomeSection,
+            HomeArtist,
+            HomeIntegrationStatus,
+        )
         from services.section_catalog import apply_section_prefs
 
         built = HomeResponse(
             integration_status=HomeIntegrationStatus(
-                listenbrainz=True, jellyfin=False, download_client=False,
-                youtube=False, lastfm=True,
+                listenbrainz=True,
+                jellyfin=False,
+                download_client=False,
+                youtube=False,
+                lastfm=True,
             ),
             trending_artists=HomeSection(
-                title="Trending", type="artist",
+                title="Trending",
+                type="artist",
                 items=[HomeArtist(name="Artist1")],
             ),
             popular_albums=HomeSection(title="Popular", type="album", items=[]),
         )
-        filtered = apply_section_prefs(built, "home", {"trending_artists", "popular_albums"})
+        filtered = apply_section_prefs(
+            built, "home", {"trending_artists", "popular_albums"}
+        )
         assert filtered.trending_artists is None
         assert filtered.popular_albums is None
         assert filtered.integration_status is not None
@@ -405,18 +439,23 @@ class TestHomeServeFastRevalidate:
         store: dict = {}
         cache = MagicMock()
         cache.get = AsyncMock(side_effect=lambda k: store.get(k))
-        cache.set = AsyncMock(side_effect=lambda k, v, ttl=None: store.__setitem__(k, v))
+        cache.set = AsyncMock(
+            side_effect=lambda k, v, ttl=None: store.__setitem__(k, v)
+        )
         service._memory_cache = cache
-        # pretend a warm was just attempted so the fast path doesn't spawn a task
-        service._built_at = {"anything": 0.0}
+        # pretend the last build attempt FAILED just now: the sidecar backoff
+        # keeps the miss path from spawning a rebuild task (ok=False within 300s)
         import time as _time
+
         music = await service._resolve_user_music("u1", None)
         key = service._get_home_cache_key("u1", music.lb_enabled, music.lfm_enabled)
-        service._built_at[key] = _time.time()
+        store[service._home_built_sidecar_key(key)] = {"at": _time.time(), "ok": False}
 
         resp = await service.get_home_data("u1")
 
-        assert resp.refreshing is False or resp.refreshing is True  # struct field exists
+        assert (
+            resp.refreshing is False or resp.refreshing is True
+        )  # struct field exists
         # the fast path never awaits sitewide trending
         lb_repo.get_sitewide_top_artists.assert_not_awaited()
 
@@ -428,33 +467,43 @@ class TestHomeServeFastRevalidate:
         store: dict = {}
         cache = MagicMock()
         cache.get = AsyncMock(side_effect=lambda k: store.get(k))
-        cache.set = AsyncMock(side_effect=lambda k, v, ttl=None: store.__setitem__(k, v))
+        cache.set = AsyncMock(
+            side_effect=lambda k, v, ttl=None: store.__setitem__(k, v)
+        )
         service._memory_cache = cache
 
         await service.warm_cache("u1")
 
-        # the full build fetched trending and the result landed in the cache
+        # the full build fetched trending; payload + freshness sidecar landed
         lb_repo.get_sitewide_top_artists.assert_awaited_once()
-        assert len(store) == 1
-        cached = next(iter(store.values()))
-        assert cached.refreshing is False
+        assert len(store) == 2
+        music = await service._resolve_user_music("u1", None)
+        key = service._get_home_cache_key("u1", music.lb_enabled, music.lfm_enabled)
+        assert store[key].refreshing is False
+        sidecar = store[service._home_built_sidecar_key(key)]
+        assert sidecar["ok"] is True
+        assert isinstance(sidecar["at"], float)
 
     @pytest.mark.asyncio
     async def test_cached_copy_served_verbatim(self):
+        import time as _time
+
         from api.v1.schemas.home import HomeResponse
 
         service, lb_repo, _, _ = _make_service(
             lb_enabled=True, lfm_enabled=True, primary_source="listenbrainz"
         )
-        import time as _time
         music = await service._resolve_user_music("u1", None)
         key = service._get_home_cache_key("u1", music.lb_enabled, music.lfm_enabled)
-        store = {key: HomeResponse()}
+        store = {
+            key: HomeResponse(),
+            # fresh successful build -> no revalidation trigger
+            service._home_built_sidecar_key(key): {"at": _time.time(), "ok": True},
+        }
         cache = MagicMock()
         cache.get = AsyncMock(side_effect=lambda k: store.get(k))
         cache.set = AsyncMock()
         service._memory_cache = cache
-        service._built_at = {key: _time.time()}  # fresh -> no revalidation
 
         resp = await service.get_home_data("u1")
 

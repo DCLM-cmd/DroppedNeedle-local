@@ -106,9 +106,10 @@ class HomeService:
         self._transformers = HomeDataTransformers(jellyfin_repo)
 
         self._helpers = HomeIntegrationHelpers(preferences_service)
-        # SWR bookkeeping: per-user in-flight guard + last build-attempt times
+        # SWR bookkeeping: per-user in-flight guard. Last-attempt times live in a
+        # cache sidecar swept with the payload (see _home_built_sidecar_key) so
+        # freshness bookkeeping shares fate with the data it describes.
         self._building: set[str] = set()
-        self._built_at: dict[str, float] = {}
         self._builders = HomeSectionBuilders(self._transformers)
         self._weekly_exploration = WeeklyExplorationService(
             listenbrainz_repo, musicbrainz_repo
@@ -202,6 +203,75 @@ class HomeService:
         # No source dimension: the page is unified, both services build into one response.
         return f"{HOME_RESPONSE_PREFIX}{user_id}:{lb_enabled}:{lfm_enabled}"
 
+    @staticmethod
+    def _home_built_sidecar_key(cache_key: str) -> str:
+        # Freshness sidecar keyed under the SAME prefix as the payload, so every
+        # sweep that clears home_response:* payloads clears the bookkeeping too:
+        # f"{HOME_RESPONSE_PREFIX}built:{user_id}:{lb_enabled}:{lfm_enabled}".
+        # No new cache-prefix membership; swept everywhere the payload is swept.
+        return f"{HOME_RESPONSE_PREFIX}built:{cache_key[len(HOME_RESPONSE_PREFIX) :]}"
+
+    async def _read_built_at(self, cache_key: str) -> float:
+        """Timestamp of the last build attempt for this payload, 0.0 when the
+        sidecar is absent (= infinitely stale, matching the pre-sidecar
+        fallback so an untracked payload still revalidates)."""
+        if not self._memory_cache:
+            return 0.0
+        entry = await self._memory_cache.get(self._home_built_sidecar_key(cache_key))
+        if isinstance(entry, dict):
+            at = entry.get("at")
+            if isinstance(at, (int, float)):
+                return float(at)
+        return 0.0
+
+    async def _recent_failed_attempt(self, cache_key: str) -> bool:
+        """True only when a recorded attempt FAILED within the backoff window.
+        A missing/swept sidecar never suppresses a rebuild - a wiped payload
+        must rebuild immediately instead of serving a silent empty shell."""
+        if not self._memory_cache:
+            return False
+        entry = await self._memory_cache.get(self._home_built_sidecar_key(cache_key))
+        if not isinstance(entry, dict) or entry.get("ok") is not False:
+            return False
+        at = entry.get("at")
+        if not isinstance(at, (int, float)):
+            return False
+        return time.time() - float(at) <= HOME_STALE_REVALIDATE_SECONDS
+
+    async def warm_cache(self, user_id: str) -> None:
+        if self._workload_gate is not None:
+            await self._workload_gate.wait_until_available()
+        if user_id in self._building:
+            return
+        self._building.add(user_id)
+        cache_key: str | None = None
+        built_ok = False
+        try:
+            # resolve INSIDE the try: a transient token-decrypt or locked-SQLite read
+            # here must still clear the building flag, or the user is stranded in a
+            # permanent refreshing state (every later poll sees building=True)
+            music = await self._resolve_user_music(user_id, None)
+            cache_key = self._get_home_cache_key(
+                user_id, music.lb_enabled, music.lfm_enabled
+            )
+            response = await self._build_full(user_id, music)
+            if self._memory_cache:
+                await self._memory_cache.set(cache_key, response, HOME_CACHE_TTL)
+            built_ok = True
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to build home data: {e}")
+        finally:
+            self._building.discard(user_id)
+            # record every completed attempt (success or failure) in the sidecar
+            # so the miss path backs off after a doomed build, while sweeps of
+            # the payload take the bookkeeping with them (sweep-coherent SWR)
+            if cache_key is not None and self._memory_cache:
+                await self._memory_cache.set(
+                    self._home_built_sidecar_key(cache_key),
+                    {"at": time.time(), "ok": built_ok},
+                    HOME_CACHE_TTL,
+                )
+
     async def _resolve_user_music(
         self, user_id: str, source: str | None
     ) -> _HomeUserMusic:
@@ -283,33 +353,6 @@ class HomeService:
             return
         await self._workload_gate.run_warmer_unit(lambda: self.warm_cache(user_id))
 
-    async def warm_cache(self, user_id: str) -> None:
-        if self._workload_gate is not None:
-            await self._workload_gate.wait_until_available()
-        if user_id in self._building:
-            return
-        self._building.add(user_id)
-        cache_key: str | None = None
-        try:
-            # resolve INSIDE the try: a transient token-decrypt or locked-SQLite read
-            # here must still clear the building flag, or the user is stranded in a
-            # permanent refreshing state (every later poll sees building=True)
-            music = await self._resolve_user_music(user_id, None)
-            cache_key = self._get_home_cache_key(
-                user_id, music.lb_enabled, music.lfm_enabled
-            )
-            response = await self._build_full(user_id, music)
-            if self._memory_cache:
-                await self._memory_cache.set(cache_key, response, HOME_CACHE_TTL)
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to build home data: {e}")
-        finally:
-            self._building.discard(user_id)
-            # record every completed attempt (success or failure) so the miss path
-            # backs off instead of re-triggering a doomed build on every poll
-            if cache_key is not None:
-                self._built_at[cache_key] = time.time()
-
     @deduplicate(lambda self, user_id: f"{HOME_RESPONSE_PREFIX}dedup:{user_id}")
     async def get_home_data(self, user_id: str) -> HomeResponse:
         """Never blocks on external services: a cached copy is served immediately
@@ -328,7 +371,7 @@ class HomeService:
         building = user_id in self._building
         cached = await self._memory_cache.get(cache_key)
         if cached is not None:
-            age = time.time() - self._built_at.get(cache_key, 0.0)
+            age = time.time() - await self._read_built_at(cache_key)
             if not building and age > HOME_STALE_REVALIDATE_SECONDS:
                 self._trigger_warm(user_id)
                 building = True
@@ -336,11 +379,11 @@ class HomeService:
             await self._apply_genre_artwork(response)
             return response
 
-        attempted_recently = (
-            time.time() - self._built_at.get(cache_key, 0.0)
-            <= HOME_STALE_REVALIDATE_SECONDS
-        )
-        if not building and not attempted_recently:
+        # Suppress the rebuild ONLY for a recent FAILED attempt (backoff). A
+        # swept sidecar can no longer mask a missing payload: post-sweep and
+        # post-restart misses both rebuild immediately.
+        recent_failure = await self._recent_failed_attempt(cache_key)
+        if not building and not recent_failure:
             self._trigger_warm(user_id)
             building = True
         return await self._build_fast(user_id, music, refreshing=building)

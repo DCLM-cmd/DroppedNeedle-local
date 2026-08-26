@@ -86,8 +86,12 @@ async def update_preferences(
     settings_service: SettingsService = Depends(get_settings_service),
 ):
     try:
+        previous = preferences_service.get_preferences()
         preferences_service.save_preferences(preferences)
-        await settings_service.clear_caches_for_preference_change()
+        # ST1 phase 1: identical payload -> no sweep at all; changed types ->
+        # no prefix sweeps either (search results embed sorted types in their
+        # cache key now; raw MB caches filter per request).
+        await settings_service.apply_preference_change(previous, preferences)
         return preferences
     except ConfigurationError as e:
         logger.warning(f"Configuration error updating preferences: {e}")

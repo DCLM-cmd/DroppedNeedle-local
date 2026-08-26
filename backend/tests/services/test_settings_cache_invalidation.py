@@ -31,25 +31,90 @@ async def _populate(cache: InMemoryCache, keys: list[str]) -> None:
         await cache.set(key, "v", ttl_seconds=300)
 
 
+def _prefs(primary: list[str], secondary: list[str]):
+    from api.v1.schemas.settings import UserPreferences
+
+    return UserPreferences(primary_types=primary, secondary_types=secondary)
+
+
 @pytest.mark.asyncio(loop_scope="function")
-async def test_clear_musicbrainz_cache():
+async def test_identical_preference_change_is_a_no_op():
+    """ST1: an unchanged PUT /settings/preferences payload must not clear any
+    cache entries (previously it wiped artist_info/album_info/artist_albums +
+    every musicbrainz prefix)."""
     service, cache = await _build_service()
 
-    mb_keys = [f"{p}dummy" for p in musicbrainz_prefixes()]
-    extra_keys = [f"{ARTIST_INFO_PREFIX}art1", f"{ALBUM_INFO_PREFIX}alb1"]
-    library_keys = [
-        f"{LIBRARY_ARTIST_ALBUMS_PREFIX}mbid1",
-        f"{LIBRARY_ARTIST_ALBUMS_PREFIX}mbid2",
+    keys = [
+        ARTIST_INFO_PREFIX + "art1",
+        ALBUM_INFO_PREFIX + "alb1",
+        *[f"{p}mb{i}" for i, p in enumerate(musicbrainz_prefixes())],
+        "unrelated:key",
     ]
-    unrelated = ["unrelated:key"]
-    await _populate(cache, mb_keys + extra_keys + library_keys + unrelated)
+    await _populate(cache, keys)
 
-    cleared = await service.clear_caches_for_preference_change()
+    same = _prefs(["album", "ep", "single"], ["studio"])
+    cleared = await service.apply_preference_change(same, same)
 
-    assert cleared == len(mb_keys) + len(extra_keys) + len(library_keys)
-    for key in mb_keys + extra_keys + library_keys:
-        assert await cache.get(key) is None
-    assert await cache.get("unrelated:key") == "v"
+    assert cleared == 0
+    for key in keys:
+        assert await cache.get(key) == "v"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_changed_preference_types_flush_search_cache_only(monkeypatch):
+    """ST1: changed type filters require ZERO prefix sweeps - raw MB caches
+    filter per request and search results embed sorted types in their key.
+    The in-process search cache is still flushed as transition insurance."""
+    from services.search_service import SearchService
+
+    service, cache = await _build_service()
+    mb_keys = [f"{p}keep" for p in musicbrainz_prefixes()]
+    await _populate(cache, mb_keys)
+
+    flushed = {"n": 0}
+    original = SearchService.clear_cached_results.__func__
+
+    def spy_clear(cls):
+        flushed["n"] += 1
+        return original(cls)
+
+    monkeypatch.setattr(SearchService, "clear_cached_results", classmethod(spy_clear))
+
+    previous = _prefs(["album", "ep", "single"], ["studio"])
+    changed = _prefs(["album"], ["live", "studio"])
+    cleared = await service.apply_preference_change(previous, changed)
+
+    assert cleared == 0
+    assert flushed["n"] == 1
+    for key in mb_keys:
+        # Zero prefix sweeps: MB-derived caches stay warm across pref changes.
+        assert await cache.get(key) == "v"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_unknown_previous_treated_as_changed():
+    service, _cache = await _build_service()
+
+    flushed = {"n": 0}
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        from services.search_service import SearchService
+
+        original = SearchService.clear_cached_results.__func__
+
+        def spy_clear(cls):
+            flushed["n"] += 1
+            return original(cls)
+
+        monkeypatch.setattr(
+            SearchService, "clear_cached_results", classmethod(spy_clear)
+        )
+        cleared = await service.apply_preference_change(None, _prefs(["album"], []))
+    finally:
+        monkeypatch.undo()
+
+    assert cleared == 0
+    assert flushed["n"] == 1
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -378,11 +443,15 @@ async def test_musicbrainz_settings_endpoint_change_resets_and_clears(
     reset, clear = _spy_mb_side_effects(monkeypatch)
 
     mb_keys = [f"{p}endpoint" for p in musicbrainz_prefixes()]
-    await _populate(cache, mb_keys)
+    # QW10/C2 regression guard: ALBUM_INFO must be part of the bulk sweep.
+    assert ALBUM_INFO_PREFIX in musicbrainz_prefixes()
+    album_info_key = f"{ALBUM_INFO_PREFIX}rg-endpoint"
+    await _populate(cache, mb_keys + [album_info_key])
 
     await service.on_musicbrainz_settings_changed(
         _mb_settings("https://mb-b.example/ws/2", 2.0, 4)
     )
+    assert await cache.get(album_info_key) is None
 
     from repositories.musicbrainz_base import get_mb_api_base
 

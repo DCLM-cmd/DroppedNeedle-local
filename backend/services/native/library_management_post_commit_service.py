@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 
 import msgspec
 
-from infrastructure.cache.cache_keys import library_identification_prefixes
+from infrastructure.cache.catalog_invalidation import invalidate_catalog_scope
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.persistence import DiscoverySnapshotStore
@@ -85,22 +85,10 @@ class LibraryManagementPostCommitService:
         from services.search_service import SearchService
 
         SearchService.clear_cached_results()
-        results = await asyncio.gather(
-            *(
-                self._memory_cache.clear_prefix(prefix)
-                for prefix in library_identification_prefixes()
-            ),
-            self._discovery_snapshots.mark_discover_stale(),
-            return_exceptions=True,
-        )
-        for result in results:
-            if isinstance(result, Exception):
-                # F-108: operators need the cause, not just the fact.
-                logger.warning(
-                    "Library Management cache invalidation failed",
-                    exc_info=result,
-                )
 
+        # ST1: ids were already extracted from the affected tracks - delete
+        # exactly the touched entity keys (memory + disk) and sweep only the
+        # cheap list snapshots, instead of wiping all MB-derived caches.
         release_group_mbids = {
             str(track["provider_release_group_mbid"])
             for track in tracks.values()
@@ -115,6 +103,23 @@ class LibraryManagementPostCommitService:
             )
             if value
         }
+
+        try:
+            await invalidate_catalog_scope(
+                self._memory_cache,
+                album_mbids=release_group_mbids,
+                artist_mbids=artist_mbids,
+                include_lists=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - boundary logging, re-raised never
+            # F-108: operators need the cause, not just the fact. Kept as a
+            # separate leg from the disk deletes below so each failure mode
+            # reports its own exception.
+            logger.warning(
+                "Library Management cache invalidation failed",
+                exc_info=exc,
+            )
+
         disk_results = await asyncio.gather(
             *(self._disk_cache.delete_album(value) for value in release_group_mbids),
             *(self._disk_cache.delete_artist(value) for value in artist_mbids),
@@ -126,6 +131,13 @@ class LibraryManagementPostCommitService:
                     "Library Management disk cache invalidation failed",
                     exc_info=result,
                 )
+
+        try:
+            await self._discovery_snapshots.mark_discover_stale()
+        except Exception as exc:  # noqa: BLE001 - same F-108 boundary
+            logger.warning(
+                "Library Management discover-stale marking failed", exc_info=exc
+            )
 
     async def _enqueue_external_refreshes(self, operation_id: str) -> None:
         snapshot = await self._store.get_library_management_job_snapshot(operation_id)

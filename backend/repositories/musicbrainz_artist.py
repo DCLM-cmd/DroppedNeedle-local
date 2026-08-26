@@ -166,7 +166,11 @@ class MusicBrainzArtistMixin:
             _record_mb_degradation(f"artist tag search failed: {e}")
             return []
 
-    async def get_artist_by_id(self, mbid: str) -> dict | None:
+    async def get_artist_by_id(
+        self,
+        mbid: str,
+        priority: RequestPriority = RequestPriority.USER_INITIATED,
+    ) -> dict[str, Any] | None:
         cache_key = mb_artist_detail_key(mbid)
 
         cached = await self._cache.get(cache_key)
@@ -175,7 +179,8 @@ class MusicBrainzArtistMixin:
 
         dedupe_key = f"mb:artist:{mbid}"
         return await mb_deduplicator.dedupe(
-            dedupe_key, lambda: self._fetch_artist_by_id(mbid, cache_key)
+            dedupe_key,
+            lambda: self._fetch_artist_by_id(mbid, cache_key, priority),
         )
 
     async def get_artist_relations(self, mbid: str) -> dict | None:
@@ -193,6 +198,78 @@ class MusicBrainzArtistMixin:
         return await mb_deduplicator.dedupe(
             dedupe_key, lambda: self._fetch_artist_relations(mbid, rels_key)
         )
+
+    async def _fetch_artist_relations(self, mbid: str, cache_key: str) -> dict | None:
+        try:
+            result = await mb_api_get(
+                f"/artist/{mbid}",
+                params={"inc": "url-rels"},
+                priority=RequestPriority.IMAGE_FETCH,
+            )
+            if not result:
+                return None
+            await self._cache.set(cache_key, result, ttl_seconds=86400)
+            return result
+        except (CircuitOpenError, httpx.HTTPError, ExternalServiceError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to fetch artist relations {mbid}: {e}")
+            _record_mb_degradation(f"artist relations failed: {e}")
+            return None
+
+    async def _fetch_artist_by_id(
+        self,
+        mbid: str,
+        cache_key: str,
+        priority: RequestPriority = RequestPriority.USER_INITIATED,
+    ) -> dict[str, Any] | None:
+        try:
+            limit = 50
+
+            artist_result, browse_result = await asyncio.gather(
+                mb_api_get(
+                    f"/artist/{mbid}",
+                    params={"inc": "tags+aliases+url-rels"},
+                    priority=priority,
+                ),
+                mb_api_get(
+                    "/release-group",
+                    params={"artist": mbid, "limit": limit, "offset": 0},
+                    priority=priority,
+                    decode_type=_ArtistReleaseGroupsPayload,
+                ),
+            )
+
+            if not artist_result:
+                return None
+
+            all_release_groups = browse_result.release_groups
+            total_count = int(browse_result.release_group_count)
+
+            if all_release_groups:
+                artist_result["release-group-list"] = all_release_groups
+
+            artist_result["release-group-count"] = total_count
+
+            await self._cache.set(cache_key, artist_result, ttl_seconds=21600)
+
+            from core.task_registry import TaskRegistry
+
+            registry = TaskRegistry.get_instance()
+            if not registry.is_running("mb-release-group-warmup"):
+                _rg_task = asyncio.create_task(
+                    self._warm_release_group_cache(all_release_groups[:6])
+                )
+                try:
+                    registry.register("mb-release-group-warmup", _rg_task)
+                except RuntimeError:
+                    pass
+
+            return artist_result
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to fetch artist {mbid}: {e}")
+            _record_mb_degradation(f"artist fetch failed: {e}")
+            return None
 
     async def _fetch_artist_relations(self, mbid: str, cache_key: str) -> dict | None:
         try:

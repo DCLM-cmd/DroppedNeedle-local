@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from infrastructure.cache.cache_keys import (
     library_raw_albums_key,
@@ -18,6 +18,7 @@ from infrastructure.cache.cache_keys import (
     LIBRARY_ALBUM_DETAILS_PREFIX,
     library_identification_prefixes,
 )
+from infrastructure.cache.catalog_invalidation import invalidate_catalog_scope
 from infrastructure.persistence.request_history import RequestHistoryRecord
 
 from ._registry import singleton
@@ -78,6 +79,11 @@ async def _schedule_scanned_album_work(local_album_id: str) -> str | None:
 
 
 async def _invalidate_artist_reconciliation_catalog() -> None:
+    # ST1: this callback is invoked from enqueue contexts that do not carry
+    # the touched entity ids (threading them stalled in phase 1), so it keeps
+    # the WHOLE library_identification sweep. Bounded blast radius: fires only
+    # on artist-reconciliation commits. Phase 2 may thread ids like the
+    # album-identification hook does.
     from services.search_service import SearchService
 
     SearchService.clear_cached_results()
@@ -471,7 +477,9 @@ def get_target_library_scan_coordinator() -> "LibraryScanCoordinator":
         LibraryIndexer(
             store,
             get_audio_tagger(),
-            grouping=LocalAlbumGroupingService(store, get_target_identification_queue()),
+            grouping=LocalAlbumGroupingService(
+                store, get_target_identification_queue()
+            ),
             filesystem_coordinator=filesystem,
         ),
         LibraryReconciler(store, filesystem),
@@ -534,13 +542,46 @@ def get_target_album_identification_service() -> "AlbumIdentificationService":
     store = get_native_library_store()
     cache = get_cache()
 
-    async def invalidate(_domains: set[str]) -> None:
-        await asyncio.gather(
-            *(
-                cache.clear_prefix(prefix)
-                for prefix in library_identification_prefixes()
+    async def invalidate(
+        domains: set[str], local_album_ids: Sequence[str] | None = None
+    ) -> None:
+        # ST1: resolve entity ids from the committed rows and delete exactly
+        # the touched identity-bearing keys; lists still sweep wholesale.
+        rg_ids: set[str] = set()
+        artist_ids: set[str] = set()
+        resolved_any = False
+        for local_album_id in local_album_ids or ():
+            try:
+                rg_scope, artist_scope = store.album_catalog_scope_ids(
+                    str(local_album_id)
+                )
+            except Exception:  # noqa: BLE001 - resolution failure falls back to bulk sweep
+                logger.warning(
+                    "Failed to resolve catalog scope ids for %s",
+                    str(local_album_id)[:8],
+                    exc_info=True,
+                )
+                continue
+            resolved_any = True
+            rg_ids |= rg_scope
+            artist_ids |= artist_scope
+
+        if not resolved_any:
+            # Defensive fallback: a commit with no resolvable identity keeps
+            # the old bulk behavior rather than deleting nothing.
+            await asyncio.gather(
+                *(
+                    cache.clear_prefix(prefix)
+                    for prefix in library_identification_prefixes()
+                )
             )
-        )
+        else:
+            await invalidate_catalog_scope(
+                cache,
+                album_mbids=rg_ids,
+                artist_mbids=artist_ids,
+                include_lists=True,
+            )
         await get_discovery_snapshot_store().mark_discover_stale()
 
     return AlbumIdentificationService(
@@ -673,8 +714,7 @@ def get_target_identity_repair_service() -> "IdentityRepairService":
         wal_checkpoint=get_wal_checkpoint_service(),
         # D-EDITION-AUTO S-3: profile-level opt-in with per-root override.
         edition_opt_in=(
-            get_library_management_profile_service()
-            .automatic_edition_acceptance_enabled
+            get_library_management_profile_service().automatic_edition_acceptance_enabled
         ),
     )
 
@@ -1940,6 +1980,7 @@ def get_home_service() -> "HomeService":
         target.ownership,
         get_genre_artwork_service(),
     )
+
 
 @singleton
 def get_target_home_service() -> "HomeService":

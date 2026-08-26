@@ -10,7 +10,11 @@ from fastapi import FastAPI
 
 from api.v1.routes.artists import router
 from api.v1.schemas.artist import ArtistReleases
-from core.dependencies import get_artist_service, get_artist_discovery_service, get_artist_enrichment_service
+from core.dependencies import (
+    get_artist_service,
+    get_artist_discovery_service,
+    get_artist_enrichment_service,
+)
 from core.exceptions import ClientDisconnectedError
 from models.artist import ReleaseItem
 from tests.helpers import build_test_client
@@ -54,14 +58,20 @@ def client(mock_artist_service, mock_discovery_service, mock_enrichment_service)
     app = FastAPI()
     app.include_router(router, prefix="/api/v1")
     app.dependency_overrides[get_artist_service] = lambda: mock_artist_service
-    app.dependency_overrides[get_artist_discovery_service] = lambda: mock_discovery_service
-    app.dependency_overrides[get_artist_enrichment_service] = lambda: mock_enrichment_service
+    app.dependency_overrides[get_artist_discovery_service] = (
+        lambda: mock_discovery_service
+    )
+    app.dependency_overrides[get_artist_enrichment_service] = (
+        lambda: mock_enrichment_service
+    )
     return build_test_client(app)
 
 
 class TestGetArtistReleasesRoute:
     def test_pagination_params_forwarded(self, client, mock_artist_service):
-        response = client.get(f"/api/v1/artists/{VALID_MBID}/releases?offset=50&limit=50")
+        response = client.get(
+            f"/api/v1/artists/{VALID_MBID}/releases?offset=50&limit=50"
+        )
 
         assert response.status_code == 200
         mock_artist_service.get_artist_releases.assert_awaited_once_with(
@@ -69,7 +79,9 @@ class TestGetArtistReleasesRoute:
         )
 
     def test_new_pagination_fields_propagated(self, client):
-        response = client.get(f"/api/v1/artists/{VALID_MBID}/releases?offset=0&limit=50")
+        response = client.get(
+            f"/api/v1/artists/{VALID_MBID}/releases?offset=0&limit=50"
+        )
         body = response.json()
 
         assert response.status_code == 200
@@ -103,3 +115,35 @@ class TestGetArtistReleasesRoute:
         response = client.get(f"/api/v1/artists/{VALID_MBID}/releases")
 
         assert response.status_code == 204
+
+
+def test_releases_response_exposes_warming_field(client, mock_artist_service):
+    """A3/ST4 route-layer contract: the additive `warming` flag is serialized
+    on every /releases response (default False; True only mid-warm)."""
+    mock_artist_service.get_artist_releases.return_value = ArtistReleases(
+        albums=[
+            ReleaseItem(id="rg-warm", title="Warming Album", type="Album", year=2024)
+        ],
+        singles=[],
+        eps=[],
+        offset=0,
+        limit=50,
+        returned_count=1,
+        next_offset=None,
+        has_more=False,
+        source_total_count=None,
+        warming=True,
+    )
+
+    response = client.get(f"/api/v1/artists/{VALID_MBID}/releases")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["warming"] is True
+    assert body["source_total_count"] is None
+
+    # Default (complete) shape flips the flag back off.
+    mock_artist_service.get_artist_releases.return_value = ArtistReleases()
+    response = client.get(f"/api/v1/artists/{VALID_MBID}/releases")
+    body = response.json()
+    assert body["warming"] is False

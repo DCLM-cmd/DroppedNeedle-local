@@ -57,6 +57,50 @@ describe('artist release pagination query', () => {
 			undefined
 		);
 	});
+
+	it('keeps next_offset/has_more math unchanged for mid-warm partial pages (A3)', () => {
+		const query = getArtistReleasesInfiniteQuery(() => 'artist-1') as unknown as {
+			getNextPageParam: (lastPage: ArtistReleases) => number | undefined;
+		};
+
+		// mid-warm page 1 beyond the known slice: no trustworthy total, but pagination
+		// math must not change shape
+		const warmPartial = releasePage({
+			warming: true,
+			source_total_count: null,
+			next_offset: null,
+			has_more: true
+		});
+		expect(query.getNextPageParam(warmPartial)).toBe(undefined);
+
+		const warmWithOffset = releasePage({
+			warming: true,
+			source_total_count: null,
+			next_offset: 50,
+			has_more: true
+		});
+		expect(query.getNextPageParam(warmWithOffset)).toBe(50);
+	});
+
+	it('polls only while the cached page-0 payload reports warming (A3)', () => {
+		const query = getArtistReleasesInfiniteQuery(() => 'artist-1') as unknown as {
+			refetchInterval: (q: {
+				state: { data?: { pages?: Array<{ warming?: boolean }> } };
+			}) => number | false;
+		};
+
+		const state = (warming?: boolean) => ({
+			state: { data: { pages: [{ warming }] } }
+		});
+
+		expect(query.refetchInterval(state(true))).toBe(2_000);
+		// first response with warming false/absent stops the poll entirely
+		expect(query.refetchInterval(state(false))).toBe(false);
+		expect(query.refetchInterval(state(undefined))).toBe(false);
+		// pre-A3 payloads and empty caches never poll
+		expect(query.refetchInterval({ state: { data: undefined } })).toBe(false);
+		expect(query.refetchInterval({ state: {} })).toBe(false);
+	});
 });
 
 describe('extended artist query', () => {

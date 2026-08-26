@@ -243,13 +243,24 @@ class SearchService:
         limit_albums: int = 10,
         buckets: Optional[list[str]] = None,
     ) -> SearchResponse:
-        cache_key = f"{query.strip().lower()}:{limit_artists}:{limit_albums}:{','.join(sorted(buckets)) if buckets else ''}"
+        # ST1: the response bakes the user's primary/secondary type filters,
+        # so they MUST join the cache key - this closes the one proven
+        # prefs-baked gap that forced wholesale sweeps on preference saves.
+        prefs = self._preferences_service.get_preferences()
+        primary_types = ",".join(sorted(t.strip().lower() for t in prefs.primary_types))
+        secondary_types = ",".join(
+            sorted(t.strip().lower() for t in prefs.secondary_types)
+        )
+        cache_key = (
+            f"{query.strip().lower()}:{limit_artists}:{limit_albums}:"
+            f"{','.join(sorted(buckets)) if buckets else ''}"
+            f":{primary_types}|{secondary_types}"
+        )
         now = time.monotonic()
         cached = self._search_cache.get(cache_key)
         if cached and (now - cached[0]) < SEARCH_CACHE_TTL:
             return cached[1]
 
-        prefs = self._preferences_service.get_preferences()
         included_secondary_types = set(t.lower() for t in prefs.secondary_types)
         included_primary_types = set(t.lower() for t in prefs.primary_types)
 

@@ -9,6 +9,7 @@ from infrastructure.cache.cache_metrics import InstrumentedCache
 from infrastructure.cache.memory_cache import InMemoryCache, CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.cache.cache_keys import (
+    catalog_list_prefixes,
     home_prefixes,
     library_identification_prefixes,
     ARTIST_DISCOVERY_PREFIX,
@@ -77,11 +78,11 @@ def get_native_library_store() -> NativeLibraryStore:
 
         SearchService.clear_cached_results()
         cache = get_cache()
+        # ST1 phase 1: context-free commits (favorites, play history, ...) no
+        # longer destroy MB-derived entity caches - only cheap locally-rebuilt
+        # lists sweep here. Phase 2 may thread affected entity ids.
         await asyncio.gather(
-            *(
-                cache.clear_prefix(prefix)
-                for prefix in library_identification_prefixes()
-            )
+            *(cache.clear_prefix(prefix) for prefix in catalog_list_prefixes())
         )
         await get_discovery_snapshot_store().mark_discover_stale()
 
@@ -89,6 +90,9 @@ def get_native_library_store() -> NativeLibraryStore:
         from services.search_service import SearchService
 
         SearchService.clear_cached_results()
+        # ST1 phase 1: scan batches keep their debounce/flush semantics but
+        # only sweep the list partition; MB-derived entity caches survive
+        # unrelated scan writes. Deferred set unchanged.
         deferred = set(home_prefixes()) | {
             ARTIST_DISCOVERY_PREFIX,
             DISCOVER_QUEUE_ENRICH_PREFIX,
@@ -97,7 +101,7 @@ def get_native_library_store() -> NativeLibraryStore:
         await asyncio.gather(
             *(
                 cache.clear_prefix(prefix)
-                for prefix in library_identification_prefixes()
+                for prefix in catalog_list_prefixes()
                 if prefix not in deferred
             )
         )

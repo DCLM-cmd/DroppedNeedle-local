@@ -13,6 +13,10 @@ from api.v1.schemas.library_management import (
     ProfileNotificationSettings,
 )
 from core.exceptions import ExternalServiceError, JellyfinAuthError
+from infrastructure.cache.catalog_invalidation import (
+    catalog_entity_prefixes,
+    catalog_list_prefixes,
+)
 from infrastructure.cache.cache_keys import library_identification_prefixes
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.library_management import LibraryManagementExternalRefreshDelivery
@@ -482,11 +486,19 @@ async def test_invalidation_breadth_covers_every_prefix_and_subject(real_store):
 
     await service.after_commit({"track-a", "track-b"}, set())
 
+    # ST1 contract: entity keys are DELETED (cross-product of the touched
+    # rg/artist ids x catalog_entity_prefixes), only list snapshots are
+    # clear_prefix-ed; the wholesale identification sweep is gone.
     cleared = [call.args[0] for call in memory_cache.clear_prefix.await_args_list]
-    assert sorted(cleared) == sorted(library_identification_prefixes())
-    deleted_albums = {
-        call.args[0] for call in disk_cache.delete_album.await_args_list
+    assert sorted(cleared) == sorted(catalog_list_prefixes())
+    deleted_entity_keys = {call.args[0] for call in memory_cache.delete.await_args_list}
+    expected_entity_keys = {
+        f"{prefix}{mbid}"
+        for prefix in catalog_entity_prefixes()
+        for mbid in {"rg-a", "rg-b", "amb-a", "amb-b"}
     }
+    assert deleted_entity_keys == expected_entity_keys
+    deleted_albums = {call.args[0] for call in disk_cache.delete_album.await_args_list}
     assert deleted_albums == {"rg-a", "rg-b"}
     deleted_artists = {
         call.args[0] for call in disk_cache.delete_artist.await_args_list
@@ -514,13 +526,13 @@ async def test_delivery_enqueue_failure_leaves_invalidation_complete(real_store)
     real_store.ensure_library_management_external_refresh = AsyncMock(
         side_effect=OSError("delivery queue down")
     )
-    prefixes = library_identification_prefixes()
-
     with pytest.raises(OSError, match="delivery queue down"):
         await service.after_commit({"track-a", "track-b"}, set())
 
+    # ST1: only list snapshots are clear_prefix-ed now; entity keys ride the
+    # delete path asserted above.
     cleared = [call.args[0] for call in memory_cache.clear_prefix.await_args_list]
-    assert cleared == prefixes
+    assert sorted(cleared) == sorted(catalog_list_prefixes())
     assert disk_cache.delete_album.await_count == 2
     assert disk_cache.delete_artist.await_count == 2
     discovery.mark_discover_stale.assert_awaited_once()

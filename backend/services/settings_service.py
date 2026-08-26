@@ -20,9 +20,6 @@ from core.config import get_settings
 from core.exceptions import ValidationError
 from models.common import ServiceStatus
 from infrastructure.cache.cache_keys import (
-    ARTIST_INFO_PREFIX,
-    ALBUM_INFO_PREFIX,
-    LIBRARY_ARTIST_ALBUMS_PREFIX,
     JELLYFIN_PREFIX,
     LOCAL_FILES_PREFIX,
     SOURCE_RESOLUTION_PREFIX,
@@ -159,15 +156,41 @@ class SettingsService:
                 valid=False, message="Couldn't finish the connection test"
             )
 
-    async def clear_caches_for_preference_change(self) -> int:
-        total = 0
-        total += await self._cache.clear_prefix(ARTIST_INFO_PREFIX)
-        total += await self._cache.clear_prefix(ALBUM_INFO_PREFIX)
-        total += await self._cache.clear_prefix(LIBRARY_ARTIST_ALBUMS_PREFIX)
-        for prefix in musicbrainz_prefixes():
-            total += await self._cache.clear_prefix(prefix)
-        logger.info(f"Cleared {total} cache entries for preference change")
-        return total
+    @staticmethod
+    def _type_filters(prefs) -> tuple[list[str], list[str]]:
+        return (
+            sorted(t.casefold() for t in prefs.primary_types),
+            sorted(t.casefold() for t in prefs.secondary_types),
+        )
+
+    async def apply_preference_change(self, previous, incoming) -> int:
+        """ST1 phase 1 diff gate for PUT /settings/preferences.
+
+        - Identical payload (same normalized type filters): NO sweep at all -
+          a no-change save no longer destroys artist/album/MB caches.
+        - Changed types: ZERO prefix sweeps. Raw MB caches apply filters at
+          request time from live preferences (artist_service), and the one
+          proven baked consumer (SearchService.search) now embeds the sorted
+          type sets in its cache key, so stale results are unreachable
+          immediately; the in-process search cache is still flushed as
+          belt-and-braces for the transition window.
+
+        Returns the number of cleared entries (always 0 in phase 1; kept for
+        call-site/logging compatibility).
+        """
+        if previous is not None and self._type_filters(previous) == self._type_filters(
+            incoming
+        ):
+            logger.info(
+                "Preferences payload unchanged; skipping catalog cache invalidation"
+            )
+            return 0
+
+        from services.search_service import SearchService
+
+        SearchService.clear_cached_results()
+        logger.info("Preference types changed; search cache flushed (no prefix sweeps)")
+        return 0
 
     async def clear_home_cache(self) -> int:
         total = 0

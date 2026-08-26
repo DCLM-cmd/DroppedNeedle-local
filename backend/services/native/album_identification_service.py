@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 
 import msgspec
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 from infrastructure.degradation import (
@@ -45,6 +46,12 @@ from services.native.identification_revisions import (
 )
 
 CacheInvalidator = Callable[[set[str]], Awaitable[None]]
+# ST1: scoped hooks also receive the local album ids whose commits triggered
+# the invalidation, so providers can resolve entity ids post-commit.
+ScopedCacheInvalidator = (
+    Callable[[set[str]], Awaitable[None]]
+    | Callable[[set[str], Sequence[str] | None], Awaitable[None]]
+)
 PostIdentificationCallback = Callable[[str, str], Awaitable[object]]
 MAX_NEW_FINGERPRINTS_PER_ATTEMPT = 2
 
@@ -406,7 +413,7 @@ class AlbumIdentificationService:
         candidates: AlbumCandidateService,
         evidence_engine: AlbumEvidenceEngine,
         fingerprints: ConditionalFingerprintService,
-        invalidate: CacheInvalidator | None = None,
+        invalidate: ScopedCacheInvalidator | None = None,
         on_identified: PostIdentificationCallback | None = None,
         provider_available: Callable[[], bool] | None = None,
     ) -> None:
@@ -465,9 +472,7 @@ class AlbumIdentificationService:
                 if fresh_revision is not None:
                     job["row_revision"] = fresh_revision
             except Exception:  # noqa: BLE001 - heartbeat must never fail a run
-                logger.debug(
-                    "Identification lease heartbeat failed", exc_info=True
-                )
+                logger.debug("Identification lease heartbeat failed", exc_info=True)
             return not await self._queue.is_paused()
 
         try:
@@ -554,11 +559,9 @@ class AlbumIdentificationService:
                         if not needed:
                             continue
                         cached = cached_outcomes.get(track.local_track_id)
-                        cache_hit = (
-                            cached is not None
-                            and getattr(cached, "state", "")
-                            in ("matched", "no_match", "skipped")
-                        )
+                        cache_hit = cached is not None and getattr(
+                            cached, "state", ""
+                        ) in ("matched", "no_match", "skipped")
                         if not cache_hit and (
                             requested >= MAX_NEW_FINGERPRINTS_PER_ATTEMPT
                         ):
@@ -653,10 +656,7 @@ class AlbumIdentificationService:
 
             _enforce_raw_track_identities(decision, raw_tracks)
             degraded = degradation.degraded_summary()
-            if (
-                degradation.has_deterministic_failure()
-                and not decision.candidates
-            ):
+            if degradation.has_deterministic_failure() and not decision.candidates:
                 # F-IDENT-02: a typed payload-shape failure is deterministic,
                 # not an outage. Defer under the honest code so the row keeps
                 # the ordinary bounded backoff but never provider-resurrects.
@@ -712,9 +712,7 @@ class AlbumIdentificationService:
                 started_at=timestamp,
                 completed_at=timestamp,
             )
-            current_job = await self._store.get_identification_job_row(
-                str(job["id"])
-            )
+            current_job = await self._store.get_identification_job_row(str(job["id"]))
             await self._store.finish_identification_job(
                 str(job["id"]),
                 worker_id=worker_id,
@@ -756,10 +754,10 @@ class AlbumIdentificationService:
                             str(job["local_album_id"])
                         )
                     except Exception:  # noqa: BLE001 - never mask the original
-                        logger.exception(
-                            "Failed to record management_schedule_pending"
-                        )
+                        logger.exception("Failed to record management_schedule_pending")
             if self._invalidate is not None:
+                # ST1: thread the local album id so the provider hook can
+                # resolve rg/artist entity ids from the committed row.
                 await self._invalidate(
                     {
                         "library",
@@ -770,7 +768,8 @@ class AlbumIdentificationService:
                         "compatibility",
                         "artwork",
                         "review",
-                    }
+                    },
+                    [str(job["local_album_id"])],
                 )
             return str(decision.outcome)
         except CircuitOpenError as exc:

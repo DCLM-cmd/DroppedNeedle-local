@@ -24,6 +24,11 @@ class ArtistReleases(AppStruct):
     has_more: bool = False
 
     source_total_count: int | None = None
+    # A3/ST4: True while the background walker is still fetching pages beyond
+    # the served slice. source_total_count is null alongside warming=true
+    # (a partial count would truncate the pagination UI). Additive default
+    # keeps old payloads a strict prefix.
+    warming: bool = False
 
 
 class LastFmSimilarArtistSchema(AppStruct):

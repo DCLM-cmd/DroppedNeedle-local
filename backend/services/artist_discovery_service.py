@@ -140,6 +140,14 @@ class ArtistDiscoveryService:
         self._library_db = library_db
         self._library_repo = library_repo
         self._cache = memory_cache
+        # A2 part 4 (B5): stampede maps for the artist-page satellites,
+        # mirroring ArtistService._artist_basic_in_flight lifecycle.
+        self._similar_in_flight: dict[
+            tuple[str, str, int, str], asyncio.Future[SimilarArtistsResponse]
+        ] = {}
+        self._top_albums_in_flight: dict[
+            tuple[str, str, int, str], asyncio.Future[TopAlbumsResponse]
+        ] = {}
         self._lastfm_repo = lastfm_repo
         self._preferences_service = preferences_service
         self._client_factory = client_factory
@@ -259,6 +267,56 @@ class ArtistDiscoveryService:
         if cached is not None:
             return cached
 
+        # A2 part 4 (B5): coalesce concurrent cold renders onto one leader
+        # chain - shielded follower wait, set_result/set_exception on both
+        # paths, finally pop. Keyed identically to the cache entry.
+        stampede_key: tuple[str, str, int, str] = (
+            "similar",
+            artist_mbid,
+            count,
+            effective_source,
+        )
+        current_task = asyncio.current_task()
+        existing = self._similar_in_flight.get(stampede_key)
+        if existing is not None:
+            future, owner = existing
+            if owner is current_task:
+                # A2: recursive re-entry from inside this leader (the Last.fm
+                # fallback calls back into get_similar_artists with a
+                # different source that _resolve_source may fold back onto the
+                # same key). Bypass the map and compute directly - awaiting
+                # our own pending future here would self-deadlock.
+                return await self._load_similar_artists(
+                    artist_mbid, count, effective_source, user_id, cache_key
+                )
+            return await asyncio.shield(future)
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[SimilarArtistsResponse] = loop.create_future()
+        self._similar_in_flight[stampede_key] = (future, current_task)
+        try:
+            result = await self._load_similar_artists(
+                artist_mbid, count, effective_source, user_id, cache_key
+            )
+            if not future.done():
+                future.set_result(result)
+            return result
+        except BaseException as exc:
+            if not future.done():
+                future.set_exception(exc)
+                future.exception()
+            raise
+        finally:
+            self._similar_in_flight.pop(stampede_key, None)
+
+    async def _load_similar_artists(
+        self,
+        artist_mbid: str,
+        count: int,
+        effective_source: Literal["listenbrainz", "lastfm"],
+        user_id: str | None,
+        cache_key: str,
+    ) -> SimilarArtistsResponse:
         lb_unavailable = False
         if effective_source == "lastfm":
             lastfm_repo = await self._resolve_lastfm(user_id)
@@ -462,6 +520,49 @@ class ArtistDiscoveryService:
         if cached is not None:
             return cached
 
+        # A2 part 4 (B5): same stampede map as /similar above.
+        stampede_key: tuple[str, str, int, str] = (
+            "top_albums",
+            artist_mbid,
+            count,
+            effective_source,
+        )
+        current_task = asyncio.current_task()
+        existing = self._top_albums_in_flight.get(stampede_key)
+        if existing is not None:
+            future, owner = existing
+            if owner is current_task:
+                return await self._load_top_albums(
+                    artist_mbid, count, effective_source, user_id, cache_key
+                )
+            return await asyncio.shield(future)
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[TopAlbumsResponse] = loop.create_future()
+        self._top_albums_in_flight[stampede_key] = (future, current_task)
+        try:
+            result = await self._load_top_albums(
+                artist_mbid, count, effective_source, user_id, cache_key
+            )
+            if not future.done():
+                future.set_result(result)
+            return result
+        except BaseException as exc:
+            if not future.done():
+                future.set_exception(exc)
+                future.exception()
+            raise
+        finally:
+            self._top_albums_in_flight.pop(stampede_key, None)
+
+    async def _load_top_albums(
+        self,
+        artist_mbid: str,
+        count: int,
+        effective_source: Literal["listenbrainz", "lastfm"],
+        user_id: str | None,
+        cache_key: str,
+    ) -> TopAlbumsResponse:
         lb_unavailable = False
         if effective_source == "lastfm":
             lastfm_repo = await self._resolve_lastfm(user_id)

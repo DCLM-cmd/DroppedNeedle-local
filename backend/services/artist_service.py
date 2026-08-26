@@ -38,12 +38,23 @@ from core.exceptions import ClientDisconnectedError, ResourceNotFoundError
 from services.audiodb_image_service import AudioDBImageService
 from repositories.audiodb_models import AudioDBArtistImages
 from repositories.musicbrainz_base import extract_artist_name, mb_deduplicator
+from core.task_registry import TaskRegistry
 
 if TYPE_CHECKING:
     from infrastructure.persistence import LibraryDB
     from services.native.library_ownership_service import LibraryOwnershipService
 
 logger = logging.getLogger(__name__)
+
+
+def _log_task_error(task: "asyncio.Task[None]") -> None:
+    """A3/ST4: background release-group warming failures must surface in logs
+    without ever touching a response path (coverart_repository pattern)."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Background release-group warm failed", exc_info=exc)
 
 
 def _log_deferred_disk_write_failure(task: "asyncio.Task[None]") -> None:
@@ -632,7 +643,10 @@ class ArtistService:
                 source_total_count=None,
             )
 
-        full_list = await self._fetch_all_release_groups(artist_id, is_disconnected)
+        full_list, complete = await self._fetch_all_release_groups(
+            artist_id, is_disconnected
+        )
+        warming = not complete
 
         if self._ownership is not None:
             album_mbids, requested_mbids = await self._target_release_group_flags(
@@ -661,6 +675,9 @@ class ArtistService:
         page_eps = [item for kind, item in page if kind == "eps"]
 
         next_offset = offset + limit if offset + limit < len(tagged) else None
+        # A3/ST4: while the catalog is only partially known (walker running),
+        # a partial total would render "N of N" and hide Load-more - report
+        # null instead, plus the explicit warming flag.
         return ArtistReleases(
             albums=page_albums,
             singles=page_singles,
@@ -670,49 +687,135 @@ class ArtistService:
             returned_count=len(page),
             next_offset=next_offset,
             has_more=next_offset is not None,
-            source_total_count=len(tagged),
+            source_total_count=None if warming else len(tagged),
+            warming=warming,
         )
 
     async def _fetch_all_release_groups(
         self, artist_id: str, is_disconnected: DisconnectCallable | None
-    ) -> list[dict[str, Any]]:
-        """Cached, request-coalesced full release-group browse.
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Cached, request-coalesced release-group browse (A3/ST4).
 
-        Stores raw MB dicts only; in_library/requested flags are recomputed
-        per request from library state, so library changes never invalidate it.
+        Returns ``(known_slice, complete)``. A catalog that fits page 1 is
+        cached and returned complete - byte-identical to the pre-A3 walk.
+        Larger catalogs return only the first page with ``complete=False``
+        while a background walker finishes the remaining pages; the shared
+        key stays unwritten until that walk completes (outage-safety rule).
+        Raw MB dicts only; in_library/requested flags are recomputed per
+        request from library state, so library changes never invalidate it.
         """
         cache_key = mb_artist_release_groups_key(artist_id)
         cached = await self._cache.get(cache_key)
         if cached is not None:
-            return cached
-        return await mb_deduplicator.dedupe(
+            return cached, True
+
+        page_items, total = await mb_deduplicator.dedupe(
             cache_key,
-            lambda: self._fetch_all_release_groups_uncached(artist_id, is_disconnected),
+            lambda: self._fetch_first_release_group_page(artist_id, is_disconnected),
         )
-
-    async def _fetch_all_release_groups_uncached(
-        self, artist_id: str, is_disconnected: DisconnectCallable | None
-    ) -> list[dict[str, Any]]:
-        """Fetch all release-group pages (max _MAX_RG_PAGES), first-wins dedupe.
-
-        MB re-sorts each browse page by GID against a different materialized
-        order, so pages can overlap or drift mid-fetch; dedupe by id survives
-        that. Only complete fetches are cached so an outage never poisons it.
-        """
-        cache_key = mb_artist_release_groups_key(artist_id)
-        collected: dict[str, dict[str, Any]] = {}
-        raw_offset = 0
-        total = 0
-        pages = 0
-
-        while pages < _MAX_RG_PAGES:
-            await check_disconnected(is_disconnected)
-            release_groups, mb_total = await self._mb_repo.get_artist_release_groups(
-                artist_id,
-                raw_offset,
-                100,
-                priority=RequestPriority.USER_INITIATED,
+        if total > 0 and len(page_items) >= total:
+            await self._cache.set(
+                cache_key,
+                page_items,
+                ttl_seconds=self._get_artist_ttl(in_library=False),
             )
+            return page_items, True
+        if not page_items and not total:
+            # Definitive zero-RG catalog: complete, not warming.
+            return page_items, True
+
+        self._spawn_release_group_warm(artist_id, page_items, total)
+        return page_items, False
+
+    async def _fetch_first_release_group_page(
+        self, artist_id: str, is_disconnected: DisconnectCallable | None
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Offset-0 browse page (limit 100) at USER_INITIATED - the only leg
+        still riding the user's request. First-wins id dedupe survives MB
+        page re-sorting; the caller decides completeness from ``total``."""
+        await check_disconnected(is_disconnected)
+        release_groups, total = await self._mb_repo.get_artist_release_groups(
+            artist_id,
+            0,
+            100,
+            priority=RequestPriority.USER_INITIATED,
+        )
+        collected: dict[str, dict[str, Any]] = {}
+        for group in release_groups or []:
+            group_id = group.get("id")
+            if not group_id:
+                continue
+            collected.setdefault(str(group_id).casefold(), group)
+        return list(collected.values()), total or 0
+
+    def _spawn_release_group_warm(
+        self,
+        artist_id: str,
+        seed_items: list[dict[str, Any]],
+        total: int,
+        *,
+        raw_offset: int | None = None,
+    ) -> None:
+        """Spawn the BACKGROUND_SYNC walker unless one is already running for
+        this artist (TaskRegistry name collision -> RuntimeError -> ignore)."""
+        registry = TaskRegistry.get_instance()
+        task_name = f"mb-rg-warm-{artist_id.casefold()}"
+        if registry.is_running(task_name):
+            return
+        collected: dict[str, dict[str, Any]] = {}
+        for group in seed_items:
+            group_id = group.get("id")
+            if group_id:
+                collected.setdefault(str(group_id).casefold(), group)
+        if raw_offset is None:
+            raw_offset = len(seed_items)
+        task = asyncio.create_task(
+            self._warm_release_group_pages(
+                artist_id, collected, total, raw_offset=raw_offset
+            )
+        )
+        task.add_done_callback(_log_task_error)
+        try:
+            registry.register(task_name, task)
+        except RuntimeError:
+            pass  # walker already running - nothing to do
+
+    async def _warm_release_group_pages(
+        self,
+        artist_id: str,
+        collected: dict[str, dict[str, Any]],
+        total: int,
+        *,
+        raw_offset: int,
+    ) -> None:
+        """A3 Part 2 / ST4: finish the browse walk off the user's critical
+        path on the repo's default BACKGROUND_SYNC lane (yields to interactive
+        traffic via the 2 s gate instead of competing with it).
+
+        The shared cache key is written ONLY when the walk completed
+        (total > 0 and raw_offset >= total): CancelledError or any failure
+        breaks out leaving the key untouched, exactly like today's failed
+        walk - an outage can never pin a truncated catalog."""
+        cache_key = mb_artist_release_groups_key(artist_id)
+        pages_done = 1 if raw_offset else 0
+
+        while pages_done < _MAX_RG_PAGES and raw_offset < max(total, 1):
+            try:
+                (
+                    release_groups,
+                    mb_total,
+                ) = await self._mb_repo.get_artist_release_groups(
+                    artist_id, raw_offset, 100
+                )
+            except asyncio.CancelledError:
+                logger.info("Release-group warm cancelled for %s", artist_id[:8])
+                return
+            except Exception:
+                logger.error(
+                    "Release-group warm failed for %s", artist_id[:8], exc_info=True
+                )
+                return
+
             total = mb_total or total
             if not release_groups:
                 break
@@ -722,18 +825,17 @@ class ArtistService:
                     continue
                 collected.setdefault(str(group_id).casefold(), group)
             raw_offset += len(release_groups)
-            pages += 1
+            pages_done += 1
             if raw_offset >= total:
                 break
 
-        full_list = list(collected.values())
         if total > 0 and raw_offset >= total:
+            full_list = list(collected.values())
             await self._cache.set(
                 cache_key,
                 full_list,
                 ttl_seconds=self._get_artist_ttl(in_library=False),
             )
-        return full_list
 
     async def _fetch_artist_data(
         self,
@@ -822,7 +924,69 @@ class ArtistService:
         if not mb_artist:
             raise ResourceNotFoundError("Artist not found")
 
+        # A3/ST4 Part 3: convert the accidental prefetch into intentional
+        # coverage. The artist-detail payload embeds browse page 1 (+count)
+        # whether freshly fetched or served from the detail cache - either
+        # way it is exactly the contiguous offset-0 window. Seed the walker
+        # with it: page-1 costs zero extra MB calls, <=page-1 catalogs
+        # complete inline with no task, larger ones warm in the background.
+        embedded = (
+            mb_artist.get("release-group-list") if isinstance(mb_artist, dict) else None
+        ) or []
+        rg_count = (
+            int(mb_artist.get("release-group-count") or 0)
+            if isinstance(mb_artist, dict)
+            else 0
+        )
+        if embedded:
+            try:
+                await self._seed_release_group_warm_from_embedded(
+                    artist_id, embedded, rg_count
+                )
+            except Exception:  # noqa: BLE001 - warming must never break the build
+                logger.warning(
+                    "Failed to seed release-group warm for %s",
+                    artist_id[:8],
+                    exc_info=True,
+                )
+
         return mb_artist, library_mbids, album_mbids, requested_mbids
+
+    async def _seed_release_group_warm_from_embedded(
+        self, artist_id: str, embedded: list[dict[str, Any]], rg_count: int
+    ) -> None:
+        cache_key = mb_artist_release_groups_key(artist_id)
+        if await self._cache.get(cache_key) is not None:
+            return  # already fully cached by an earlier walk
+        registry = TaskRegistry.get_instance()
+        task_name = f"mb-rg-warm-{artist_id.casefold()}"
+        if registry.is_running(task_name):
+            return  # walker already covering this artist
+
+        seed_items = [g for g in embedded if isinstance(g, dict) and g.get("id")]
+        if not seed_items:
+            return
+
+        if rg_count > 0 and len(seed_items) >= rg_count:
+            # Catalog fits the embedded page: complete inline - no task,
+            # byte-identical write to what the old walk would have cached.
+            deduped: dict[str, dict[str, Any]] = {}
+            for group in seed_items:
+                gid = str(group["id"]).casefold()
+                deduped.setdefault(gid, group)
+            await self._cache.set(
+                cache_key,
+                list(deduped.values()),
+                ttl_seconds=self._get_artist_ttl(in_library=False),
+            )
+            return
+
+        self._spawn_release_group_warm(
+            artist_id,
+            seed_items,
+            rg_count,
+            raw_offset=len(seed_items),
+        )
 
     async def _target_release_group_flags(
         self,

@@ -144,9 +144,22 @@ class TestBasicInfoDeferralEquivalence:
         result = await svc.get_artist_info_basic(ARTIST_MBID)
 
         # Memory cache holds the exact object returned, inline on return.
-        svc.test_memory_cache.set.assert_awaited_once()
-        cached_value = svc.test_memory_cache.set.await_args.args[1]
+        # (A3 adds a second, separate write: the seeded mb:artist_rgs page-1
+        # entry from the embedded detail payload.)
+        artist_info_writes = [
+            call
+            for call in svc.test_memory_cache.set.await_args_list
+            if call.args[0].startswith("artist_info:")
+        ]
+        assert len(artist_info_writes) == 1
+        cached_value = artist_info_writes[0].args[1]
         assert msgspec.json.encode(cached_value) == msgspec.json.encode(result)
+        rgs_writes = [
+            call
+            for call in svc.test_memory_cache.set.await_args_list
+            if call.args[0].startswith("mb:artist_rgs:")
+        ]
+        assert len(rgs_writes) == 1  # A3 seeding wrote the embedded page-1
 
         # Disk mirror is deferred but completes with the same payload.
         await asyncio.sleep(0)

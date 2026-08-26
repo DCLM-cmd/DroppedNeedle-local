@@ -21,7 +21,9 @@ def _make_prefs() -> MagicMock:
         api_key="k", shared_secret="s", session_key="sk", username="u", enabled=False
     )
     prefs.is_lastfm_enabled.return_value = False
-    prefs.get_primary_music_source.return_value = PrimaryMusicSourceSettings(source="listenbrainz")
+    prefs.get_primary_music_source.return_value = PrimaryMusicSourceSettings(
+        source="listenbrainz"
+    )
     jf = MagicMock()
     jf.enabled = False
     jf.jellyfin_url = ""
@@ -75,7 +77,12 @@ class TestEnrichSingleflight:
         call_count = 0
         original_do_enrich = service._enrichment._do_enrich_queue_item
 
-        async def counting_enrich(release_group_mbid: str, cache_key: str):
+        async def counting_enrich(
+            release_group_mbid: str,
+            cache_key: str,
+            *,
+            priority=None,
+        ):
             nonlocal call_count
             call_count += 1
             await asyncio.sleep(0.05)
@@ -98,7 +105,12 @@ class TestEnrichSingleflight:
         runs the pipeline again (useful if the first result wasn't cached)."""
         service, _ = _make_service(memory_cache=None)
 
-        async def quick_enrich(release_group_mbid: str, cache_key: str):
+        async def quick_enrich(
+            release_group_mbid: str,
+            cache_key: str,
+            *,
+            priority=None,
+        ):
             return FAKE_ENRICHMENT
 
         service._enrichment._do_enrich_queue_item = quick_enrich
@@ -111,7 +123,7 @@ class TestEnrichSingleflight:
         """If enrichment raises, all concurrent callers should receive the same exception."""
         service, _ = _make_service(memory_cache=None)
 
-        async def failing_enrich(release_group_mbid: str, cache_key: str):
+        async def failing_enrich(release_group_mbid: str, cache_key: str, **kwargs):
             await asyncio.sleep(0.05)
             raise RuntimeError("MB rate limit")
 
@@ -156,7 +168,7 @@ class TestEnrichSingleflight:
         cache.set = AsyncMock()
         service, _ = _make_service(memory_cache=cache)
 
-        async def simple_enrich(release_group_mbid: str, cache_key: str):
+        async def simple_enrich(release_group_mbid: str, cache_key: str, **kwargs):
             return FAKE_ENRICHMENT
 
         service._enrichment._do_enrich_queue_item = simple_enrich
@@ -170,7 +182,7 @@ class TestEnrichSingleflight:
         service, _ = _make_service(memory_cache=None)
         call_mbids: list[str] = []
 
-        async def tracking_enrich(release_group_mbid: str, cache_key: str):
+        async def tracking_enrich(release_group_mbid: str, cache_key: str, **kwargs):
             call_mbids.append(release_group_mbid)
             await asyncio.sleep(0.02)
             return FAKE_ENRICHMENT

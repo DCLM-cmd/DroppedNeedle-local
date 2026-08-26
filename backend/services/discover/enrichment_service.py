@@ -6,6 +6,7 @@ from urllib.parse import quote_plus
 from api.v1.schemas.discover import DiscoverQueueEnrichment
 from infrastructure.cache.cache_keys import DISCOVER_QUEUE_ENRICH_PREFIX
 from infrastructure.cache.memory_cache import CacheInterface
+from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.validators import clean_lastfm_bio
 from repositories.protocols import (
     ListenBrainzRepositoryProtocol,
@@ -36,8 +37,20 @@ class QueueEnrichmentService:
         self._wikidata_repo = wikidata_repo
         self._lfm_repo = lastfm_repo
         self._enrich_in_flight: dict[str, asyncio.Future[DiscoverQueueEnrichment]] = {}
+        # A2 part 3: LB popularity batch coalescer state (single-process).
+        self._popularity_pending: dict[str, "asyncio.Future[int | None]"] = {}
+        self._popularity_flush_handle: asyncio.TimerHandle | None = None
+        self._popularity_flush_task: asyncio.Task | None = None
 
-    async def enrich_queue_item(self, release_group_mbid: str) -> DiscoverQueueEnrichment:
+    async def enrich_queue_item(
+        self,
+        release_group_mbid: str,
+        *,
+        priority: RequestPriority = RequestPriority.BACKGROUND_SYNC,
+    ) -> DiscoverQueueEnrichment:
+        """A2 part 1: ``priority`` defaults to BACKGROUND_SYNC - queue
+        hydration is background composition and must neither occupy user
+        slots nor re-mark user activity (which self-starved its own legs)."""
         cache_key = f"{DISCOVER_QUEUE_ENRICH_PREFIX}{release_group_mbid}"
         if self._memory_cache:
             cached = await self._memory_cache.get(cache_key)
@@ -51,7 +64,9 @@ class QueueEnrichmentService:
         future: asyncio.Future[DiscoverQueueEnrichment] = loop.create_future()
         self._enrich_in_flight[release_group_mbid] = future
         try:
-            result = await self._do_enrich_queue_item(release_group_mbid, cache_key)
+            result = await self._do_enrich_queue_item(
+                release_group_mbid, cache_key, priority=priority
+            )
             if not future.done():
                 future.set_result(result)
             return result
@@ -63,22 +78,29 @@ class QueueEnrichmentService:
             self._enrich_in_flight.pop(release_group_mbid, None)
 
     async def _do_enrich_queue_item(
-        self, release_group_mbid: str, cache_key: str
+        self,
+        release_group_mbid: str,
+        cache_key: str,
+        *,
+        priority: RequestPriority = RequestPriority.BACKGROUND_SYNC,
     ) -> DiscoverQueueEnrichment:
-
         enrichment = DiscoverQueueEnrichment()
 
         rg_data = await self._mb_repo.get_release_group_by_id(
             release_group_mbid,
             includes=["artist-credits", "releases", "tags", "url-rels"],
+            priority=priority,
         )
 
         artist_mbid = ""
         youtube_url = None
+        first_release_id: str | None = None
 
         if rg_data:
             tags_raw = rg_data.get("tags", [])
-            enrichment.tags = [t.get("name", "") for t in tags_raw if t.get("name")][:10]
+            enrichment.tags = [t.get("name", "") for t in tags_raw if t.get("name")][
+                :10
+            ]
 
             youtube_raw = self._mb_repo.extract_youtube_url_from_relations(rg_data)
             if youtube_raw:
@@ -96,50 +118,7 @@ class QueueEnrichmentService:
             if releases:
                 first_release = releases[0]
                 enrichment.release_date = first_release.get("date")
-
-                if not youtube_url:
-                    release_data = await self._mb_repo.get_release_by_id(
-                        first_release["id"],
-                        includes=["recordings", "url-rels"],
-                    )
-                    if release_data:
-                        yt_raw = self._mb_repo.extract_youtube_url_from_relations(release_data)
-                        if yt_raw:
-                            youtube_url = self._mb_repo.youtube_url_to_embed(yt_raw)
-
-                        if not youtube_url:
-                            tracks = release_data.get("media") or release_data.get("medium-list", [])
-                            rec_ids: list[str] = []
-                            for medium in tracks:
-                                for track in medium.get("tracks") or medium.get("track-list", []):
-                                    rec_id = track.get("recording", {}).get("id")
-                                    if rec_id:
-                                        rec_ids.append(rec_id)
-                                    if len(rec_ids) >= 3:
-                                        break
-                                if len(rec_ids) >= 3:
-                                    break
-                            if rec_ids:
-                                rec_results = await asyncio.gather(
-                                    *[
-                                        self._mb_repo.get_recording_by_id(rid, includes=["url-rels"])
-                                        for rid in rec_ids
-                                    ],
-                                    return_exceptions=True,
-                                )
-                                for rec_data in rec_results:
-                                    if isinstance(rec_data, Exception) or not rec_data:
-                                        continue
-                                    yt_raw = self._mb_repo.extract_youtube_url_from_relations(rec_data)
-                                    if yt_raw:
-                                        youtube_url = self._mb_repo.youtube_url_to_embed(yt_raw)
-                                        break
-
-        enrichment.youtube_url = youtube_url
-
-        if not youtube_url:
-            yt_settings = self._preferences.get_youtube_connection()
-            enrichment.youtube_search_available = yt_settings.enabled and yt_settings.api_enabled and yt_settings.has_valid_api_key()
+                first_release_id = first_release.get("id")
 
         album_name = rg_data.get("title", "") if rg_data else ""
         artist_name_for_search = ""
@@ -150,27 +129,79 @@ class QueueEnrichmentService:
                 if a.get("name"):
                     artist_name_for_search = a["name"]
                     break
-        enrichment.youtube_search_url = (
-            f"https://www.youtube.com/results?search_query={quote_plus(f'{artist_name_for_search} {album_name}')}"
-        )
+
+        async def _hunt_youtube() -> str | None:
+            """A2 part 2: release -> <=3 recordings YouTube hunt. Runs
+            concurrently with the enrichment legs instead of stacking after
+            them."""
+            if not first_release_id or youtube_url:
+                return None
+            release_data = await self._mb_repo.get_release_by_id(
+                first_release_id,
+                includes=["recordings", "url-rels"],
+                priority=priority,
+            )
+            if not release_data:
+                return None
+            yt_raw = self._mb_repo.extract_youtube_url_from_relations(release_data)
+            if yt_raw:
+                return self._mb_repo.youtube_url_to_embed(yt_raw)
+
+            tracks = release_data.get("media") or release_data.get("medium-list", [])
+            rec_ids: list[str] = []
+            for medium in tracks:
+                for track in medium.get("tracks") or medium.get("track-list", []):
+                    rec_id = track.get("recording", {}).get("id")
+                    if rec_id:
+                        rec_ids.append(rec_id)
+                    if len(rec_ids) >= 3:
+                        break
+                if len(rec_ids) >= 3:
+                    break
+            if not rec_ids:
+                return None
+            rec_results = await asyncio.gather(
+                *[
+                    self._mb_repo.get_recording_by_id(rid, includes=["url-rels"])
+                    for rid in rec_ids
+                ],
+                return_exceptions=True,
+            )
+            for rec_data in rec_results:
+                if isinstance(rec_data, Exception) or not rec_data:
+                    continue
+                yt_raw = self._mb_repo.extract_youtube_url_from_relations(rec_data)
+                if yt_raw:
+                    return self._mb_repo.youtube_url_to_embed(yt_raw)
+            return None
 
         async def _get_artist_and_bio():
             if not artist_mbid:
                 return
             try:
-                mb_artist = await self._mb_repo.get_artist_by_id(artist_mbid)
+                mb_artist = await self._mb_repo.get_artist_by_id(
+                    artist_mbid, priority=priority
+                )
                 if mb_artist:
-                    enrichment.country = mb_artist.get("country") or mb_artist.get("area", {}).get("name", "")
+                    enrichment.country = mb_artist.get("country") or mb_artist.get(
+                        "area", {}
+                    ).get("name", "")
                     if self._wikidata_repo:
                         url_rels = mb_artist.get("relations", [])
                         wiki_url = None
                         for rel in url_rels:
                             if rel.get("type") in ("wikipedia", "wikidata"):
                                 url_obj = rel.get("url", {})
-                                wiki_url = url_obj.get("resource", "") if isinstance(url_obj, dict) else ""
+                                wiki_url = (
+                                    url_obj.get("resource", "")
+                                    if isinstance(url_obj, dict)
+                                    else ""
+                                )
                                 break
                         if wiki_url:
-                            bio = await self._wikidata_repo.get_wikipedia_extract(wiki_url)
+                            bio = await self._wikidata_repo.get_wikipedia_extract(
+                                wiki_url
+                            )
                             if bio:
                                 enrichment.artist_description = bio
             except Exception as e:  # noqa: BLE001
@@ -178,11 +209,16 @@ class QueueEnrichmentService:
 
         async def _get_listen_count():
             try:
-                counts = await self._lb_repo.get_release_group_popularity_batch(
-                    [release_group_mbid]
+                # A2 part 3: route through the windowed batch coalescer so a
+                # whole build collapses into one or two LB POSTs. The repo
+                # method itself is per-MBID cached + deduped (B4).
+                count = await asyncio.shield(
+                    self._coalesce_popularity(release_group_mbid)
                 )
-                if counts:
-                    enrichment.listen_count = counts.get(release_group_mbid)
+                if count is not None:
+                    enrichment.listen_count = count
+            except asyncio.CancelledError:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to get listen count: {e}")
 
@@ -199,7 +235,9 @@ class QueueEnrichmentService:
                 )
                 if album_info:
                     if not enrichment.tags and album_info.tags:
-                        enrichment.tags = [tag.name for tag in album_info.tags if tag.name][:10]
+                        enrichment.tags = [
+                            tag.name for tag in album_info.tags if tag.name
+                        ][:10]
                     if not enrichment.artist_description and album_info.summary:
                         cleaned_summary = clean_lastfm_bio(album_info.summary)
                         if cleaned_summary:
@@ -220,7 +258,9 @@ class QueueEnrichmentService:
                 if not enrichment.artist_mbid and artist_info.mbid:
                     enrichment.artist_mbid = artist_info.mbid
                 if not enrichment.tags and artist_info.tags:
-                    enrichment.tags = [tag.name for tag in artist_info.tags if tag.name][:10]
+                    enrichment.tags = [
+                        tag.name for tag in artist_info.tags if tag.name
+                    ][:10]
                 if not enrichment.artist_description and artist_info.bio_summary:
                     cleaned_bio = clean_lastfm_bio(artist_info.bio_summary)
                     if cleaned_bio:
@@ -228,10 +268,123 @@ class QueueEnrichmentService:
             except Exception as e:  # noqa: BLE001
                 logger.debug("Failed Last.fm artist fallback for discover queue: %s", e)
 
-        await asyncio.gather(_get_artist_and_bio(), _get_listen_count(), _apply_lastfm_fallback())
+        async def _bio_then_lastfm():
+            # A2 part 2 deviation (documented): the Last.fm fallback keeps its
+            # fill-the-gaps precedence by sequencing AFTER the wiki bio, while
+            # still overlapping the MB-artist RTT with the YouTube hunt and
+            # the LB POST. Guarantees order-stable results under overlap.
+            await _get_artist_and_bio()
+            await _apply_lastfm_fallback()
+
+        # A2 part 2: overlap the independent workstreams. Every task writes
+        # disjoint fields (except the sequenced bio->lastfm pair above), and
+        # the finally-cancel below leaves no orphan futures.
+        tasks: list[asyncio.Task[Any]] = [
+            asyncio.create_task(_hunt_youtube()),
+            asyncio.create_task(_get_listen_count()),
+            asyncio.create_task(_bio_then_lastfm()),
+        ]
+        try:
+            results = await asyncio.gather(*tasks)
+            hunted = results[0]
+            if hunted:
+                youtube_url = hunted
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+        if not youtube_url:
+            yt_settings = self._preferences.get_youtube_connection()
+            enrichment.youtube_search_available = (
+                yt_settings.enabled
+                and yt_settings.api_enabled
+                and yt_settings.has_valid_api_key()
+            )
+
+        enrichment.youtube_url = youtube_url
+        enrichment.youtube_search_url = f"https://www.youtube.com/results?search_query={quote_plus(f'{artist_name_for_search} {album_name}')}"
 
         if self._memory_cache:
             enrich_ttl = self._integration.get_queue_settings().enrich_ttl
             await self._memory_cache.set(cache_key, enrichment, enrich_ttl)
 
         return enrichment
+
+    # ------------------------------------------------------------------
+    # A2 part 3: LB popularity batch coalescer.
+    #
+    # Collapses concurrent 1-item popularity calls within one build into a
+    # single get_release_group_popularity_batch POST (window OR size cap,
+    # whichever fires first). Caching/dedup lives downstream in the repo
+    # method (B4 landed lb_rg_popularity keys + _metadata_deduplicator) -
+    # this layer only batches, never caches.
+    # ------------------------------------------------------------------
+
+    _POPULARITY_WINDOW_SECONDS = 0.5
+    _POPULARITY_MAX_BATCH = 50
+
+    def _enqueue_popularity(self, mbid: str) -> "asyncio.Future[int | None]":
+        loop = asyncio.get_running_loop()
+        existing = self._popularity_pending.get(mbid)
+        if existing is not None:
+            return existing
+
+        future: asyncio.Future[int | None] = loop.create_future()
+        self._popularity_pending[mbid] = future
+
+        if len(self._popularity_pending) >= self._POPULARITY_MAX_BATCH:
+            # Size cap reached: flush immediately (no timer needed).
+            self._flush_popularity_now()
+        elif self._popularity_flush_handle is None:
+            self._popularity_flush_handle = loop.call_later(
+                self._POPULARITY_WINDOW_SECONDS, self._flush_popularity_now
+            )
+        return future
+
+    def _flush_popularity_now(self) -> None:
+        handle = self._popularity_flush_handle
+        self._popularity_flush_handle = None
+        if handle is not None:
+            handle.cancel()
+        pending = self._popularity_pending
+        self._popularity_pending = {}
+        if pending:
+            self._popularity_flush_task = asyncio.create_task(
+                self._deliver_popularity(pending)
+            )
+
+    async def _deliver_popularity(
+        self, pending: dict[str, "asyncio.Future[int | None]"]
+    ) -> None:
+        mbids = sorted(pending)
+        try:
+            counts = await self._lb_repo.get_release_group_popularity_batch(mbids)
+        except asyncio.CancelledError:
+            # Window task cancelled mid-flight: fail every waiter explicitly
+            # so nobody awaits a future that will never resolve.
+            for future in pending.values():
+                if not future.done():
+                    future.set_exception(asyncio.CancelledError())
+            raise
+        except Exception as exc:  # noqa: BLE001 - fanned out to every waiter below
+            # Leader exception fans out to ALL waiters before returning.
+            for future in pending.values():
+                if not future.done():
+                    future.set_exception(exc)
+            logger.debug(
+                "Popularity coalescer flush failed (%s mbids): %s",
+                len(mbids),
+                exc,
+            )
+            return
+
+        counts = counts if isinstance(counts, dict) else {}
+        for mbid, future in pending.items():
+            if not future.done():
+                future.set_result(counts.get(mbid))
+
+    async def _coalesce_popularity(self, mbid: str) -> int | None:
+        future = self._enqueue_popularity(mbid)
+        # Shield: this waiter's cancellation must not poison the shared future.
+        return await asyncio.shield(future)
