@@ -232,9 +232,14 @@ def with_retry(
     retriable_exceptions: tuple = (Exception,),
     non_breaking_exceptions: tuple = (),
     non_retriable_exceptions: tuple = (),
+    retry_budget_seconds: float | None = None,
 ):
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
+    if retry_budget_seconds is not None and (
+        not math.isfinite(retry_budget_seconds) or retry_budget_seconds <= 0
+    ):
+        raise ValueError("retry_budget_seconds must be a positive finite number")
 
     def decorator(func: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
         # QW11 Part 1: report once per logical call - after the final attempt,
@@ -270,8 +275,12 @@ def with_retry(
                     )
 
             last_exception = None
+            attempts_made = 0
+            started_at = time.monotonic()
+            should_log_failure = False
 
             for attempt in range(1, max_attempts + 1):
+                attempts_made = attempt
                 try:
                     result = await func(*args, **kwargs)
 
@@ -286,17 +295,14 @@ def with_retry(
                     if non_retriable_exceptions and isinstance(
                         e, non_retriable_exceptions
                     ):
-                        # deterministic failure (e.g. a payload that can never
-                        # decode); retrying it only wastes provider quota
+                        should_log_failure = not (
+                            non_breaking_exceptions
+                            and isinstance(e, non_breaking_exceptions)
+                        )
                         break
 
                     if attempt >= max_attempts:
-                        logger.error(
-                            "%s failed after %d attempts: %s",
-                            func_name,
-                            max_attempts,
-                            e,
-                        )
+                        should_log_failure = True
                         break
 
                     retry_after_override = _get_retry_after_seconds(e)
@@ -304,14 +310,35 @@ def with_retry(
                         delay = retry_after_override
                     else:
                         delay = min(
-                            base_delay * (exponential_base ** (attempt - 1)), max_delay
+                            base_delay * (exponential_base ** (attempt - 1)),
+                            max_delay,
                         )
                         if jitter:
                             delay *= 0.5 + random.random()
 
+                    if retry_budget_seconds is not None:
+                        elapsed = time.monotonic() - started_at
+                        remaining = retry_budget_seconds - elapsed
+                        if remaining <= 0 or delay >= remaining:
+                            should_log_failure = True
+                            break
+
                     await asyncio.sleep(delay)
 
-            if circuit_breaker and last_exception:
+            if last_exception is None:
+                raise RuntimeError(f"{func_name} retry loop ended without an exception")
+
+            if should_log_failure:
+                logger.error(
+                    "%s failed after %d attempt%s (%s): %s",
+                    func_name,
+                    attempts_made,
+                    "" if attempts_made == 1 else "s",
+                    type(last_exception).__name__,
+                    last_exception,
+                )
+
+            if circuit_breaker:
                 is_non_breaking = (
                     isinstance(last_exception, non_breaking_exceptions)
                     if non_breaking_exceptions

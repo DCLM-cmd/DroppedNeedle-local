@@ -7,13 +7,22 @@
 	import SearchArtistCard from '$lib/components/SearchArtistCard.svelte';
 	import ArtistCardSkeleton from '$lib/components/ArtistCardSkeleton.svelte';
 	import SearchTopResult from '$lib/components/SearchTopResult.svelte';
-	import type { Artist, EnrichmentSource } from '$lib/types';
+	import type {
+		Artist,
+		EnrichmentSource,
+		SearchBucketResponse,
+		SearchRemoteStatus
+	} from '$lib/types';
 	import { colors } from '$lib/colors';
 	import { searchStore } from '$lib/stores/search';
 	import { fetchEnrichmentBatch, applyArtistEnrichment } from '$lib/utils/enrichment';
 	import { createSearchEnrichmentBatcher } from '$lib/utils/searchEnrichmentBatcher';
 	import { isAbortError } from '$lib/utils/errorHandling';
 	import { api } from '$lib/api/client';
+	import { API } from '$lib/constants';
+	import { getSearchStatusNotice } from '$lib/utils/searchStatus';
+	import { updatePaginatedSearchResults } from '$lib/utils/paginatedSearchResults';
+	import { RefreshCw } from 'lucide-svelte';
 
 	interface Props {
 		data: { query: string };
@@ -32,6 +41,9 @@
 	let observer: IntersectionObserver | null = null;
 	let enrichmentSource: EnrichmentSource = $state('none');
 	let lastQuery = $state('');
+	let remoteStatus: SearchRemoteStatus = $state('ok');
+	let replaceOnNextLoad = false;
+	let statusNotice = $derived(getSearchStatusNotice(remoteStatus, 'artists', false));
 
 	function navigateBack() {
 		if (data.query) {
@@ -43,6 +55,13 @@
 		if (data.query) {
 			goto(`/search/${bucket}?q=${encodeURIComponent(data.query)}`);
 		}
+	}
+	function retryRemoteSearch() {
+		if (loading || !data.query) return;
+		replaceOnNextLoad = true;
+		offset = 0;
+		hasMore = true;
+		void loadMore();
 	}
 
 	const enrichmentBatcher = createSearchEnrichmentBatcher({
@@ -58,6 +77,8 @@
 		if (loading || !hasMore || !data.query) return;
 
 		loading = true;
+		const requestOffset = offset;
+		const replaceResults = replaceOnNextLoad && requestOffset === 0;
 
 		if (abortController) {
 			abortController.abort();
@@ -65,43 +86,53 @@
 		abortController = new AbortController();
 
 		try {
-			const responseData = await api.get<{ results?: Artist[]; top_result?: Artist | null }>(
-				`/api/v1/search/artists?q=${encodeURIComponent(data.query)}&limit=${limit}&offset=${offset}`,
+			const responseData = await api.global.get<SearchBucketResponse<Artist>>(
+				API.search.artists(data.query, limit, requestOffset),
 				{ signal: abortController.signal }
 			);
 
 			const newArtists: Artist[] = responseData.results || [];
-			if (offset === 0) {
-				topArtist = responseData.top_result ?? null;
-			}
-			if (newArtists.length < limit) {
-				hasMore = false;
-			}
+			const failedWithoutResults =
+				replaceResults &&
+				newArtists.length === 0 &&
+				(responseData.status === 'error' || responseData.status === 'timeout');
 
-			if (offset === 0 && artists.length > 0) {
-				const existingIds = new Set(artists.map((a) => a.musicbrainz_id));
-				const uniqueNewArtists = newArtists.filter(
-					(a: Artist) => !existingIds.has(a.musicbrainz_id)
-				);
-				artists = [...artists, ...uniqueNewArtists];
-				offset = artists.length;
+			if (failedWithoutResults) {
+				remoteStatus = artists.length > 0 ? 'stale' : responseData.status;
+				hasMore = false;
 			} else {
-				artists = [...artists, ...newArtists];
-				offset += newArtists.length;
+				remoteStatus = responseData.status;
+				if (requestOffset === 0) {
+					topArtist = responseData.top_result ?? null;
+				}
+				hasMore = newArtists.length >= limit;
+
+				const update = updatePaginatedSearchResults(
+					artists,
+					newArtists,
+					requestOffset,
+					replaceResults
+				);
+				artists = update.items;
+				offset = update.nextOffset;
+				searchStore.updateArtists(artists);
 			}
-			searchStore.updateArtists(artists);
 		} catch (error) {
 			if (isAbortError(error)) {
 				return;
 			}
+			remoteStatus = artists.length > 0 ? 'stale' : 'error';
 			hasMore = false;
 		} finally {
+			replaceOnNextLoad = false;
 			loading = false;
 		}
 	}
 
 	function resetAndLoad() {
 		enrichmentBatcher.reset();
+		remoteStatus = 'ok';
+		replaceOnNextLoad = false;
 		if (abortController) {
 			abortController.abort();
 			abortController = null;
@@ -119,6 +150,7 @@
 			offset = cache.artists.length;
 			hasMore = cache.artists.length >= limit;
 			if (searchStore.isStale(cache.timestamp)) {
+				replaceOnNextLoad = true;
 				offset = 0;
 				hasMore = true;
 				void loadMore();
@@ -205,6 +237,14 @@
 </div>
 
 <section class="px-8 py-4">
+	{#if data.query && statusNotice}
+		<div class="alert {statusNotice.className} mb-3" role="status">
+			<span>{statusNotice.message}</span>
+			<button class="btn btn-sm" onclick={retryRemoteSearch}>
+				<RefreshCw class="h-4 w-4" /> Retry
+			</button>
+		</div>
+	{/if}
 	{#if !data.query}
 		<p class="text-center mt-32 text-gray-400">Enter a search query to get started.</p>
 	{:else if loading && artists.length === 0}

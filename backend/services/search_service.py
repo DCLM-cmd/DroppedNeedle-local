@@ -3,6 +3,7 @@ import logging
 import re
 import time
 import unicodedata
+import msgspec
 from math import ceil
 from typing import Optional, TYPE_CHECKING
 from api.v1.schemas.search import (
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 COVER_PREFETCH_LIMIT = 12
 SEARCH_CACHE_TTL = 90
 SEARCH_CACHE_MAX_SIZE = 200
+SEARCH_STALE_CACHE_TTL = 6 * 60 * 60
+SEARCH_STALE_CACHE_MAX_SIZE = 200
 TOP_RESULT_SCORE_THRESHOLD = 90
 FULL_SEARCH_TIMEOUT_SECONDS = 6.0
 SUGGEST_TIMEOUT_SECONDS = 3.0
@@ -39,10 +42,71 @@ SUGGEST_TIMEOUT_SECONDS = 3.0
 
 class SearchService:
     _search_cache: dict[str, tuple[float, SearchResponse]] = {}
+    _stale_bucket_cache: dict[
+        str,
+        tuple[float, tuple[SearchResult, ...]],
+    ] = {}
 
     @classmethod
     def clear_cached_results(cls) -> None:
         cls._search_cache.clear()
+        cls._stale_bucket_cache.clear()
+
+    @staticmethod
+    def _bucket_stale_cache_key(
+        bucket: str,
+        query: str,
+        limit: int,
+        offset: int,
+        included_primary_types: set[str],
+        included_secondary_types: set[str],
+    ) -> str:
+        primary = ",".join(sorted(included_primary_types))
+        secondary = ",".join(sorted(included_secondary_types))
+        return (
+            f"{bucket}:{query.strip().casefold()}:{limit}:{offset}:"
+            f"{primary}|{secondary}"
+        )
+
+    @classmethod
+    def _get_stale_bucket(
+        cls,
+        cache_key: str,
+        now: float,
+    ) -> list[SearchResult] | None:
+        cached = cls._stale_bucket_cache.get(cache_key)
+        if cached is None:
+            return None
+        cached_at, results = cached
+        if now - cached_at >= SEARCH_STALE_CACHE_TTL:
+            del cls._stale_bucket_cache[cache_key]
+            return None
+        return [msgspec.structs.replace(item) for item in results]
+
+    @classmethod
+    def _store_stale_bucket(
+        cls,
+        cache_key: str,
+        results: list[SearchResult],
+        now: float,
+    ) -> None:
+        cls._stale_bucket_cache[cache_key] = (
+            now,
+            tuple(msgspec.structs.replace(item) for item in results),
+        )
+        expired = [
+            key
+            for key, (cached_at, _) in cls._stale_bucket_cache.items()
+            if now - cached_at >= SEARCH_STALE_CACHE_TTL
+        ]
+        for key in expired:
+            del cls._stale_bucket_cache[key]
+        while len(cls._stale_bucket_cache) > SEARCH_STALE_CACHE_MAX_SIZE:
+            oldest_key = min(
+                cls._stale_bucket_cache,
+                key=lambda key: cls._stale_bucket_cache[key][0],
+            )
+            del cls._stale_bucket_cache[oldest_key]
 
     def __init__(
         self,
@@ -388,6 +452,14 @@ class SearchService:
         prefs = self._preferences_service.get_preferences()
         included_secondary_types = set(t.lower() for t in prefs.secondary_types)
         included_primary_types = set(t.lower() for t in prefs.primary_types)
+        stale_cache_key = self._bucket_stale_cache_key(
+            bucket,
+            query,
+            limit,
+            offset,
+            included_primary_types,
+            included_secondary_types,
+        )
 
         try:
             async with asyncio.timeout(FULL_SEARCH_TIMEOUT_SECONDS):
@@ -412,15 +484,27 @@ class SearchService:
             logger.warning(
                 "MusicBrainz %s search exceeded the response deadline", bucket
             )
-            return [], None, "timeout"
+            results = self._get_stale_bucket(stale_cache_key, time.monotonic())
+            if results is None:
+                return [], None, "timeout"
+            status: SearchRemoteStatus = "stale"
         except Exception as error:  # noqa: BLE001 - provider failures degrade one bucket
             self._record_musicbrainz_error("Search bucket provider request failed")
             logger.warning(
                 "MusicBrainz %s search failed: %s", bucket, type(error).__name__
             )
-            return [], None, "error"
-
-        status = self._remote_status(bool(results))
+            results = self._get_stale_bucket(stale_cache_key, time.monotonic())
+            if results is None:
+                return [], None, "error"
+            status = "stale"
+        else:
+            status = self._remote_status(bool(results))
+            if status == "ok" and results:
+                self._store_stale_bucket(
+                    stale_cache_key,
+                    results,
+                    time.monotonic(),
+                )
 
         if bucket == "albums":
             library_mbids_raw = None

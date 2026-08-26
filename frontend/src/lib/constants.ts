@@ -572,10 +572,10 @@ export const API = {
 			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/items/${ordinal}/artwork/${encodeURIComponent(sha256)}`
 	},
 	search: {
-		artists: (query: string, limit = 50) =>
-			`/api/v1/search/artists?q=${encodeURIComponent(query)}&limit=${limit}`,
-		albums: (query: string, limit = 50) =>
-			`/api/v1/search/albums?q=${encodeURIComponent(query)}&limit=${limit}`,
+		artists: (query: string, limit = 50, offset = 0) =>
+			`/api/v1/search/artists?q=${encodeURIComponent(query)}&limit=${limit}${offset ? `&offset=${offset}` : ''}`,
+		albums: (query: string, limit = 50, offset = 0) =>
+			`/api/v1/search/albums?q=${encodeURIComponent(query)}&limit=${limit}${offset ? `&offset=${offset}` : ''}`,
 		enrichment: () => '/api/v1/search/enrich/batch',
 		suggest: (query: string, limit = 5) =>
 			`/api/v1/search/suggest?q=${encodeURIComponent(query.trim())}&limit=${limit}`

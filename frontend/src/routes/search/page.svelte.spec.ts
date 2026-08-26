@@ -170,7 +170,7 @@ describe('search result enrichment demand', () => {
 			})
 		);
 		await expect
-			.element(page.getByText(/MusicBrainz artists are temporarily unavailable/))
+			.element(page.getByText(/MusicBrainz artist search is temporarily unavailable/))
 			.toBeInTheDocument();
 		await expect
 			.element(page.getByLabelText('Artist search results'))
@@ -233,5 +233,56 @@ describe('search result enrichment demand', () => {
 		await expect
 			.element(page.getByRole('link', { name: /Local Survivor/ }))
 			.toHaveAttribute('href', '/artist/local-artist');
+	});
+
+	it('keeps cached remote results visible during an outage', async () => {
+		globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.startsWith('/api/v1/library/artists?')) {
+				return jsonResponse({ items: [], total: 0, album_artist_total: 0, contributor_total: 0 });
+			}
+			if (url.startsWith('/api/v1/library/albums?')) {
+				return jsonResponse({ items: [], total: 0 });
+			}
+			if (url.startsWith('/api/v1/search/artists?')) {
+				return jsonResponse({
+					bucket: 'artists',
+					limit: 6,
+					offset: 0,
+					results: [
+						{
+							type: 'artist',
+							title: 'Cached Muse',
+							musicbrainz_id: 'cached-artist',
+							in_library: false,
+							score: 90
+						}
+					],
+					top_result: null,
+					status: 'stale'
+				});
+			}
+			if (url.startsWith('/api/v1/search/albums?')) {
+				return jsonResponse({
+					bucket: 'albums',
+					limit: 24,
+					offset: 0,
+					results: [],
+					top_result: null,
+					status: 'ok'
+				});
+			}
+			throw new Error(`Unexpected request: ${url}`);
+		}) as typeof fetch;
+
+		render(SearchPageTestHarness, { data: { query: 'cached muse' } });
+
+		await expect.element(page.getByText('Cached Muse')).toBeInTheDocument();
+		await expect
+			.element(
+				page.getByText(/showing cached artist results alongside any matches in your library/)
+			)
+			.toBeInTheDocument();
+		await expect.element(page.getByText('No artists found')).not.toBeInTheDocument();
 	});
 });

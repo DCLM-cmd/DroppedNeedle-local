@@ -58,7 +58,7 @@ export type SuggestResult = {
 	local_id?: string | null;
 };
 
-export type SearchRemoteStatus = 'ok' | 'partial' | 'timeout' | 'error';
+export type SearchRemoteStatus = 'ok' | 'partial' | 'timeout' | 'error' | 'stale';
 
 export type SearchBucketResponse<T extends Artist | Album> = {
 	bucket: 'artists' | 'albums';

@@ -100,7 +100,12 @@ def get_mb_http_client() -> httpx.AsyncClient:
     circuit_breaker=mb_circuit_breaker,
     retriable_exceptions=(httpx.HTTPError, ExternalServiceError),
     non_breaking_exceptions=(InvalidExternalPayloadError,),
-    non_retriable_exceptions=(InvalidExternalPayloadError,),
+    non_retriable_exceptions=(
+        InvalidExternalPayloadError,
+        httpx.ConnectError,
+        httpx.ProtocolError,
+    ),
+    retry_budget_seconds=2.5,
 )
 async def mb_api_get(
     path: str,
@@ -112,7 +117,7 @@ async def mb_api_get(
     semaphore = await priority_mgr.acquire_slot(priority)
     async with semaphore:
         if not _mb_limiter_bypassed:
-            await mb_rate_limiter.acquire()
+            await mb_rate_limiter.acquire(priority=int(priority))
         client = get_mb_http_client()
         url = f"{get_mb_api_base()}{path}"
         request_params = dict(params) if params else {}

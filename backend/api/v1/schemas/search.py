@@ -4,7 +4,7 @@ from models.search import SearchResult as SearchResult
 from infrastructure.msgspec_fastapi import AppStruct
 
 EnrichmentSource = Literal["listenbrainz", "lastfm", "none"]
-SearchRemoteStatus = Literal["ok", "partial", "timeout", "error"]
+SearchRemoteStatus = Literal["ok", "partial", "timeout", "error", "stale"]
 
 
 class SearchResponse(AppStruct):
