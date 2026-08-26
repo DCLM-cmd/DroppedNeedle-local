@@ -815,3 +815,68 @@ async def test_pending_migration_keeps_wrong_size_destination_pending(
     assert track_count == 0  # nothing was guessed
     counts = await store.get_pending_legacy_counts()
     assert counts["library_file"] == 2  # rows remain pending and retryable
+
+
+@pytest.mark.asyncio
+async def test_policy_revision_change_during_pending_run_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """F1 characterization: a roots/policy save racing an in-flight pending
+    run today completes SILENTLY under the projector captured before the
+    flip, permanently pinning stale placements. Documents the gap fixed by
+    H1; the post-fix version of this test asserts fail-closed behavior."""
+    historical_root = tmp_path / "Historical" / "Music"
+    _write_catalog_files(historical_root)
+    database = tmp_path / "library.db"
+    _create_source(database, historical_root)
+    store = _store(database)
+
+    # Lenient cutover with an unrelated root: durable marker exists and every
+    # legacy row stays pending (established A→B seeding pattern).
+    await BoundedLegacyCatalogMigrator(
+        store,
+        _resolver(("root", tmp_path / "Unrelated")),
+        emit_progress=lambda _message: None,
+        batch_size=1,
+        skip_unmappable_paths=True,
+    ).migrate("lenient-migration", now=100)
+    counts = await store.get_pending_legacy_counts()
+    assert counts["library_file"] == 2
+    assert counts["review_row"] == 4
+
+    resolver = _resolver(("root", historical_root))
+    policy_a = resolver.policy_revision
+    revision = await store.get_bounded_legacy_source_revision()
+    stale_run_id = pending_run_id(policy_a, revision)
+
+    original_apply = store.apply_reference_provenance_batch
+    applied = {"batches": 0}
+
+    async def spying_apply(rows, **kwargs):
+        result = await original_apply(rows, **kwargs)
+        applied["batches"] += 1
+        if applied["batches"] == 1:
+            # The roots save lands right after the first applied bundle.
+            resolver.policy_revision = "policy-b"
+        return result
+
+    store.apply_reference_provenance_batch = spying_apply  # type: ignore[method-assign]
+
+    migrator = BoundedLegacyCatalogMigrator(
+        store,
+        resolver,
+        emit_progress=lambda _message: None,
+        batch_size=1,
+        skip_unmappable_paths=True,
+    )
+    # Pre-H1: no revision gate exists, so the run completes anyway.
+    await migrator.migrate_pending(stale_run_id)
+
+    with sqlite3.connect(database) as connection:
+        state = connection.execute(
+            "SELECT state FROM library_migration_runs WHERE id = ?",
+            (stale_run_id,),
+        ).fetchone()[0]
+    assert state == "completed"
+    counts = await store.get_pending_legacy_counts()
+    assert counts["review_row"] == 0  # imported under the stale projector
