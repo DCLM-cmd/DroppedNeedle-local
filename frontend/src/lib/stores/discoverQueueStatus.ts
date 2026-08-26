@@ -1,7 +1,7 @@
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
 import { API } from '$lib/constants';
-import { getCacheTTLs } from '$lib/stores/cacheTtl';
+import { getCacheTTLs } from '$lib/stores/cacheTtl.svelte';
 import { api, ApiError } from '$lib/api/client';
 
 export type QueueBuildStatus = 'idle' | 'building' | 'ready' | 'error' | 'unknown';

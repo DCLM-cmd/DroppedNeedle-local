@@ -162,10 +162,14 @@
 
 	// Edition selection (admin/trusted, CollectionManagement Feature E): pick the
 	// MB release the album page + acquisition follow (D16), and acquire it (D13).
+	// ST7 W2: the query warms as soon as the album identity is known - the old
+	// !loadingTracks term serialized a depth-3 chain for no data dependency
+	// (editions key off the RG mbid alone). The picker section below still waits
+	// on !loadingTracks so the visible behavior is unchanged.
 	const editionsMbid = $derived(releaseGroupMbid || album.musicbrainz_id);
 	const editionsQuery = getAlbumEditionsQuery(
 		() => editionsMbid,
-		() => authStore.isTrusted && downloadClientConfigured && !loadingTracks
+		() => authStore.isTrusted && downloadClientConfigured && Boolean(editionsMbid)
 	);
 	const editions = $derived(editionsQuery.data?.items ?? []);
 	const pinnedEdition = $derived(editions.find((edition) => edition.is_pinned) ?? null);
@@ -347,7 +351,7 @@
 				{/if}
 			</div>
 
-			{#if authStore.isTrusted && downloadClientConfigured && editions.length > 0}
+			{#if authStore.isTrusted && downloadClientConfigured && !loadingTracks && editions.length > 0}
 				<div class="flex flex-wrap items-center gap-2">
 					<div class="dropdown">
 						<button type="button" class="btn btn-ghost btn-xs gap-1" tabindex="0">

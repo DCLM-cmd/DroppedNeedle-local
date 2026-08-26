@@ -1,6 +1,7 @@
 import { api } from '$lib/api/client';
 import { API, CACHE_TTL } from '$lib/constants';
 import { authStore } from '$lib/stores/authStore.svelte';
+import { ttl } from '$lib/stores/cacheTtl.svelte';
 import type { HomeResponse } from '$lib/types';
 import { createQuery, queryOptions } from '@tanstack/svelte-query';
 import { HomeQueryKeyFactory } from './HomeQueryKeyFactory';
@@ -40,7 +41,7 @@ async function fetchHome(
 
 export const getHomeQueryOptions = (userId: string | null | undefined) =>
 	queryOptions({
-		staleTime: CACHE_TTL.HOME,
+		staleTime: ttl('home', CACHE_TTL.HOME),
 		queryKey: HomeQueryKeyFactory.home(userId),
 		queryFn: ({ signal }) => fetchHome(userId, signal)
 	});

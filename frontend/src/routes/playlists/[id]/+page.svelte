@@ -15,7 +15,7 @@
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { getCacheTTL } from '$lib/stores/cacheTtl';
+	import { getCacheTTL } from '$lib/stores/cacheTtl.svelte';
 	import { getPlaylistDetailQuery } from '$lib/queries/playlists/PlaylistQuery.svelte';
 	import { createSetPlaylistPublicMutation } from '$lib/queries/playlists/PlaylistMutations.svelte';
 	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';

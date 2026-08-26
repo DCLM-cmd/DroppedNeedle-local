@@ -83,7 +83,7 @@ const { followingEventsMock } = vi.hoisted(() => ({
 vi.mock('$lib/queries/following/FollowingEvents', () => ({
 	createFollowingEvents: vi.fn(() => followingEventsMock)
 }));
-vi.mock('$lib/stores/cacheTtl', () => ({ initCacheTTLs: vi.fn() }));
+vi.mock('$lib/stores/cacheTtl.svelte', () => ({ initCacheTTLs: vi.fn() }));
 const { syncStatusMock } = vi.hoisted(() => ({
 	syncStatusMock: { connect: vi.fn(), disconnect: vi.fn() }
 }));

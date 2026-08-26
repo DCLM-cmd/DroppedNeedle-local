@@ -9,7 +9,7 @@
 	import { errorModal } from '$lib/stores/errorModal';
 	import { libraryStore } from '$lib/stores/library';
 	import { integrationStore } from '$lib/stores/integration';
-	import { initCacheTTLs } from '$lib/stores/cacheTtl';
+	import { initCacheTTLs } from '$lib/stores/cacheTtl.svelte';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { launchYouTubePlayback } from '$lib/player/launchYouTubePlayback';
 	import { playbackToast } from '$lib/stores/playbackToast.svelte';

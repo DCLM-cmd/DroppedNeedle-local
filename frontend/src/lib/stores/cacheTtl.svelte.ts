@@ -43,8 +43,30 @@ const DEFAULTS: CacheTTLs = {
 	discoverQueueAutoGenerate: true
 };
 
-let resolved: CacheTTLs = { ...DEFAULTS };
+// ST6 dual-TTL unification: `$state` so TanStack option closures that read it
+// re-evaluate when initCacheTTLs() resolves (or a later settings save lands).
+let resolved = $state<CacheTTLs>({ ...DEFAULTS });
 let initialized = false;
+
+/**
+ * Reactive TTL lookup for query options (core group: home, discover satellites,
+ * library-native lists, recently-added, search). Semantics: a settings save
+ * affects freshness decisions from then on - it never retro-refetches already
+ * fresh data; queries simply consult the new window at their next mount /
+ * focus / staleness check.
+ *
+ * Until initCacheTTLs() resolves (deferred post-mount at AuthenticatedAppShell),
+ * the caller's static CACHE_TTL constant wins, keeping pre-init behavior
+ * byte-identical to the shipped defaults; after a failed fetch the store holds
+ * those same defaults. The fallback argument must be the consuming query's
+ * shipped constant so pre-init and default states agree.
+ */
+export function ttl<K extends keyof CacheTTLs>(key: K, fallback?: CacheTTLs[K]): CacheTTLs[K] {
+	// Read through the $state proxy even on the fallback path so closures stay
+	// subscribed and re-run once initialization replaces the values.
+	const current = resolved[key];
+	return initialized ? current : (fallback ?? current);
+}
 
 function applyTTLs(ttls: CacheTTLs): void {
 	updateHomeCacheTTL(ttls.home);

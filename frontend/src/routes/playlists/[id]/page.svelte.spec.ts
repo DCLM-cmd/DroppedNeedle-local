@@ -101,10 +101,6 @@ vi.mock('$app/navigation', () => ({
 	goto: (...args: unknown[]) => mockGoto(...args)
 }));
 
-vi.mock('$lib/stores/cacheTtl', () => ({
-	getCacheTTL: () => 15 * 60 * 1000
-}));
-
 import DetailPage from './+page.svelte';
 
 function renderDetail(playlistId = 'pl-1') {

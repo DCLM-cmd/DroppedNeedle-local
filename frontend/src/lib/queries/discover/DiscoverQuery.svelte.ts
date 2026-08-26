@@ -1,6 +1,7 @@
 import { api } from '$lib/api/client';
 import { API, CACHE_TTL } from '$lib/constants';
 import { authStore } from '$lib/stores/authStore.svelte';
+import { ttl } from '$lib/stores/cacheTtl.svelte';
 import { discoverHasContent } from '$lib/utils/discoverContent';
 import type { DiscoverResponse, HomeSection, PlaylistSuggestionsResponse } from '$lib/types';
 import { createQuery, queryOptions } from '@tanstack/svelte-query';
@@ -62,7 +63,7 @@ export const getRadioQuery = (
 	getParams: Getter<{ seedType: string; seedId: string; enabled?: boolean }>
 ) =>
 	createQuery(() => ({
-		staleTime: CACHE_TTL.DISCOVER,
+		staleTime: ttl('discover', CACHE_TTL.DISCOVER),
 		queryKey: DiscoverQueryKeyFactory.radio(
 			authStore.user?.id,
 			getParams().seedType,
@@ -88,7 +89,7 @@ export const getPlaylistSuggestionsQuery = (
 	}>
 ) =>
 	createQuery(() => ({
-		staleTime: CACHE_TTL.DISCOVER,
+		staleTime: ttl('discover', CACHE_TTL.DISCOVER),
 		queryKey: DiscoverQueryKeyFactory.playlistSuggestions(
 			authStore.user?.id,
 			getParams().playlistId

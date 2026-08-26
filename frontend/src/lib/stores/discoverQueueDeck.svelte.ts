@@ -10,7 +10,7 @@ import { API } from '$lib/constants';
 import { api } from '$lib/api/client';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { discoverQueueStatusStore } from '$lib/stores/discoverQueueStatus';
-import { getCacheTTLs } from '$lib/stores/cacheTtl';
+import { getCacheTTLs } from '$lib/stores/cacheTtl.svelte';
 import {
 	getQueueCachedData,
 	removeQueueCachedData,

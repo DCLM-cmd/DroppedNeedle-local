@@ -5,6 +5,7 @@ import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { api } from '$lib/api/client';
 import { API, CACHE_TTL } from '$lib/constants';
 import { authStore } from '$lib/stores/authStore.svelte';
+import { ttl } from '$lib/stores/cacheTtl.svelte';
 import type {
 	Album,
 	Artist,
@@ -25,16 +26,21 @@ const enabled = (query: string) => Boolean(authStore.user?.id && query.trim().le
 // success paths are byte-identical (full SEARCH window).
 export const SEARCH_FAILURE_STALE_TIME_MS = 60_000;
 export const successfulSearchStaleTime = (query: { state: { data?: { status?: string } } }) =>
-	query.state.data?.status === 'ok' ? CACHE_TTL.SEARCH : SEARCH_FAILURE_STALE_TIME_MS;
+	query.state.data?.status === 'ok'
+		? ttl('search', CACHE_TTL.SEARCH)
+		: SEARCH_FAILURE_STALE_TIME_MS;
 export const successfulSuggestStaleTime = (query: {
 	state: { data?: { remote_status?: string } };
-}) => (query.state.data?.remote_status === 'ok' ? CACHE_TTL.SEARCH : SEARCH_FAILURE_STALE_TIME_MS);
+}) =>
+	query.state.data?.remote_status === 'ok'
+		? ttl('search', CACHE_TTL.SEARCH)
+		: SEARCH_FAILURE_STALE_TIME_MS;
 
 // B7 prefetch surface: the two LOCAL buckets are warmed from routes/search/+page.ts.
 export const getLocalArtistSearchQueryOptions = (query: string, limit = 24) =>
 	queryOptions({
 		enabled: enabled(query),
-		staleTime: CACHE_TTL.SEARCH,
+		staleTime: ttl('search', CACHE_TTL.SEARCH),
 		queryKey: SearchQueryKeyFactory.localArtists(authStore.user?.id, query, limit),
 		queryFn: ({ signal }) =>
 			api.global.get<NativeArtistsResponse>(API.library.artists(limit, 0, 'name', 'asc', query), {
@@ -48,7 +54,7 @@ export const getLocalArtistSearchQuery = (getQuery: Getter<string>, limit = 24) 
 export const getLocalAlbumSearchQueryOptions = (query: string, limit = 24) =>
 	queryOptions({
 		enabled: enabled(query),
-		staleTime: CACHE_TTL.SEARCH,
+		staleTime: ttl('search', CACHE_TTL.SEARCH),
 		queryKey: SearchQueryKeyFactory.localAlbums(authStore.user?.id, query, limit),
 		queryFn: ({ signal }) =>
 			api.global.get<NativeAlbumsResponse>(

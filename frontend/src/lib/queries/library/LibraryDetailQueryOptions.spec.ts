@@ -18,8 +18,11 @@ import { HomeQueryKeyFactory } from '../HomeQueryKeyFactory';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 
 import {
+	getLibraryAlbumCopiesQuery,
+	getLibraryAlbumCopiesQueryOptions,
 	getLibraryAlbumDetailQuery,
 	getLibraryAlbumDetailQueryOptions,
+	getLibraryAlbumStatusQueryOptions,
 	getLibraryArtistDetailQuery,
 	getLibraryArtistDetailQueryOptions
 } from './LibraryQueries.svelte';
@@ -78,5 +81,29 @@ describe('library/home detail queryOptions factories (B7)', () => {
 		}) => number | false;
 		expect(interval({ state: { data: { refreshing: true } } })).toBe(10_000);
 		expect(interval({ state: { data: { refreshing: false } } })).toBe(false);
+	});
+});
+
+describe('ST7 W1 album prefetch surface', () => {
+	it('copies factory: key byte-equal to the mounted query, wrapper keeps enabled gate', () => {
+		const prefetchOpts = getLibraryAlbumCopiesQueryOptions('alb-1');
+		expect(prefetchOpts.queryKey).toEqual(LibraryQueryKeyFactory.albumCopies('alb-1'));
+		expect(prefetchOpts.queryKey).toEqual(['library', 'album-copies', 'alb-1']);
+		expect(prefetchOpts.staleTime).toBe(CACHE_TTL.LIBRARY_NATIVE);
+		expect(typeof prefetchOpts.queryFn).toBe('function');
+
+		const wrapped = getLibraryAlbumCopiesQuery(() => 'alb-1') as unknown as Record<string, unknown>;
+		expect(wrapped.queryKey).toEqual(prefetchOpts.queryKey);
+		expect(wrapped.staleTime).toBe(prefetchOpts.staleTime);
+		expect(wrapped.enabled).toBe(true);
+		expect(
+			(getLibraryAlbumCopiesQuery(() => '') as unknown as Record<string, unknown>).enabled
+		).toBe(false);
+	});
+
+	it('status factory stays byte-equal to the album status key', () => {
+		const opts = getLibraryAlbumStatusQueryOptions('alb-1');
+		expect(opts.queryKey).toEqual(LibraryQueryKeyFactory.album('alb-1'));
+		expect(opts.staleTime).toBe(CACHE_TTL.LIBRARY_NATIVE);
 	});
 });

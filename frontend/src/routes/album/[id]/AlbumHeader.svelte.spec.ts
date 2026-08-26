@@ -170,18 +170,20 @@ function renderHeader({
 	libraryTrackCount = 20,
 	libraryBelowCutoff = false,
 	localCopies = [],
-	trackData = tracksInfo
+	trackData = tracksInfo,
+	loadingTracks = false
 }: {
 	onrefresh?: () => void;
 	libraryTrackCount?: number;
 	libraryBelowCutoff?: boolean;
 	localCopies?: LibraryAlbumSummary[];
 	trackData?: AlbumTracksInfo;
+	loadingTracks?: boolean;
 } = {}) {
 	render(AlbumHeader, {
 		album,
 		tracksInfo: trackData,
-		loadingTracks: false,
+		loadingTracks,
 		inLibrary: true,
 		isRequested: false,
 		requesting: false,
@@ -301,6 +303,17 @@ describe('AlbumHeader automatic edition selection', () => {
 		renderHeader({ libraryBelowCutoff: true });
 
 		await expect.element(page.getByRole('button', { name: 'Upgrade this edition' })).toBeVisible();
+	});
+
+	it('ST7 W2: keeps the picker hidden while tracks load even though the query warms', async () => {
+		renderHeader({ loadingTracks: true });
+		await expect.element(page.getByRole('button', { name: /Edition: / })).not.toBeInTheDocument();
+
+		// tracks resolve -> picker appears with editions data that warmed earlier
+		renderHeader({ loadingTracks: false });
+		await expect
+			.element(page.getByRole('button', { name: 'Edition: Automatic · 2008 · US · 20 tracks' }))
+			.toBeVisible();
 	});
 
 	it('exposes local re-identification beside the canonical release controls', async () => {
