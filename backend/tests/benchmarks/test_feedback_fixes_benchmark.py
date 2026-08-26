@@ -203,11 +203,15 @@ async def test_complete_manifest_migration_startup_and_rollback_rehearsal(
     assert target_smoke["cached_native_artwork_status"] == 200
     assert target_smoke["restored_artwork_bytes_match"] is True
     assert report["full_rollback"]["smoke"]["native_playback_prefix_ok"] is True
-    assert len(report["process_transcript"]) == 8
+    # F-NL-03: only the target_main admission process runs now (was 8 entries
+    # when legacy main:app source/rollback legs still launched processes).
+    assert len(report["process_transcript"]) == 2
     stopped = [
         event for event in report["process_transcript"] if event["event"] == "stopped"
     ]
-    assert len(stopped) == 4
+    # F-NL-03: only the target_main admission process stops now; the three
+    # legacy main:app scratch legs were converted to durable-state checks.
+    assert len(stopped) == 1
     assert all(event["process_exited"] for event in stopped)
     assert all(event["database_writer_lock_available"] for event in stopped)
     assert report["no_runtime_selector"] is True

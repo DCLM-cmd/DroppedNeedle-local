@@ -372,8 +372,11 @@ async def test_retry_creates_a_fresh_task(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_orphan_staging_swept_on_startup(tmp_path: Path):
-    """main._cleanup_orphan_staging deletes only stale dirs with no download_tasks row."""
-    from main import _cleanup_orphan_staging
+    """F-NL-03: main:app was removed; the orphan-staging sweep now lives in
+    target_application_lifecycle. Same behavior, new home."""
+    from services.native.target_application_lifecycle import (
+        _cleanup_orphan_staging,
+    )
 
     db_path = tmp_path / "library.db"
     store = DownloadStore(db_path=db_path, write_lock=threading.Lock())

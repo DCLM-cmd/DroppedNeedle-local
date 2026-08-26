@@ -1053,6 +1053,42 @@ def get_target_import_library_service() -> "TargetImportLibraryService":
     )
 
 
+def _build_file_processor(
+    library_manager,
+    library_paths,
+    *,
+    library_root_ids=None,
+    publish_import_bundle=None,
+    policy_revision_getter=None,
+) -> "FileProcessor":
+    from core.config import get_settings
+    from pathlib import Path
+
+    from services.native.file_processor import FileProcessor
+    from services.native.recycle_bin import resolve_bin_path
+
+    from .repo_providers import get_download_client_repository, get_download_store
+
+    policy = get_preferences_service().get_download_policy()
+    settings = get_settings()
+    return FileProcessor(
+        get_audio_tagger(),
+        naming_engine=get_naming_template_engine(),
+        library_manager=library_manager,
+        library_paths=[Path(path) for path in library_paths],
+        client=get_download_client_repository(),
+        slskd_downloads_path=Path(settings.slskd_downloads_path),
+        fingerprinter=get_audio_fingerprinter(),
+        verify_downloads=policy.verify_downloads,
+        download_store=get_download_store(),
+        held_dir=Path(get_settings().cache_dir) / "held",
+        recycle_bin=resolve_bin_path(policy.recycle_bin_path, library_paths),
+        library_root_ids=library_root_ids,
+        publish_import_bundle=publish_import_bundle,
+        policy_revision_getter=policy_revision_getter,
+    )
+
+
 @singleton
 def get_target_file_processor() -> "FileProcessor":
     resolver = get_library_policy_resolver()
