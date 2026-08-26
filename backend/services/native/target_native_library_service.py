@@ -353,7 +353,7 @@ class TargetNativeLibraryService:
             else (await self.canonical_id("album", album_id) or album_id)
         )
         for track in tracks:
-            track.current_tier = tier_for(track.format, track.bit_rate)
+            track.current_tier = tier_for(track.format, track.bit_rate, track.bit_depth)
             track.below_cutoff = bool(
                 upgrade_allowed
                 and quality_cutoff

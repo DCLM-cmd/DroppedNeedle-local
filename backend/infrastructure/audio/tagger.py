@@ -71,9 +71,25 @@ _SUFFIX_FORMATS = {
     ".mp4": "m4a",
 }
 
-# Only these report a meaningful bit depth. MP4Info.bits_per_sample is 16 even
-# for lossy AAC, so bit_depth must be suppressed for lossy formats.
-_LOSSLESS_FORMATS = {"flac"}
+# Only these containers report a meaningful bit depth. MP4Info.bits_per_sample
+# is 16 even for lossy AAC, so bit_depth must be suppressed for lossy formats.
+_LOSSLESS_FORMATS = {"flac", "wav"}
+_MP4_ALAC_CODECS = {"alac"}
+
+
+def _bit_depth_for(fmt: str, info: Any) -> int | None:
+    """Meaningful bit depth, or None when the container/codec proves nothing.
+
+    F-EDITION-04: an MP4-family file (m4a/mp4/mov) is ALAC - and therefore
+    lossless with a real bit depth - only when Mutagen's codec evidence says
+    so. AAC's synthetic 16-bit value stays suppressed."""
+    if fmt in _LOSSLESS_FORMATS:
+        return getattr(info, "bits_per_sample", None) or None
+    if fmt in {"m4a", "mp4", "mov"}:
+        codec = str(getattr(info, "codec", "") or "").lower()
+        if codec in _MP4_ALAC_CODECS:
+            return getattr(info, "bits_per_sample", None) or None
+    return None
 
 
 def _first(value: Any) -> str | None:
@@ -419,11 +435,7 @@ class AudioTagger:
 
     def _read_info(self, audio: Any, path: Path, fmt: str) -> AudioInfo:
         info = audio.info
-        bit_depth = (
-            (getattr(info, "bits_per_sample", None) or None)
-            if fmt in _LOSSLESS_FORMATS
-            else None
-        )
+        bit_depth = _bit_depth_for(fmt, info)
         return AudioInfo(
             duration_seconds=float(getattr(info, "length", 0.0) or 0.0),
             bitrate=int(getattr(info, "bitrate", 0) or 0) // 1000,

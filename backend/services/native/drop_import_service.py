@@ -999,9 +999,17 @@ class DropImportService:
             title=track.title,
             duration_seconds=entry.info.duration_seconds,
         ):
-            new_rank = tier_rank(tier_for(entry.info.file_format, entry.info.bitrate))
+            new_rank = tier_rank(
+            tier_for(
+                entry.info.file_format, entry.info.bitrate, entry.info.bit_depth
+            )
+        )
             old_rank = tier_rank(
-                tier_for(present.get("file_format") or "", present.get("bit_rate"))
+                tier_for(
+                present.get("file_format") or "",
+                present.get("bit_rate"),
+                present.get("bit_depth"),
+            )
             )
             settings = self._prefs.get_typed_library_settings_raw()
             recycle_bin = resolve_bin_path(

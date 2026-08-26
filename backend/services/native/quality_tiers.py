@@ -55,11 +55,23 @@ def effective_extension(file: DownloadSearchResult) -> str:
     )
 
 
-def tier_for(ext: str, bitrate: int | None) -> str:
-    """Quality tier from a codec extension + bitrate. Shared by the per-file search-result
-    classifier (``file_tier``) and the library held-quality lookup (a ``library_files`` row's
-    ``file_format`` + ``bit_rate``), so both judge tier identically."""
-    if (ext or "").lower().lstrip(".") in _LOSSLESS_EXT:
+_MP4_LOSSLESS_CAPABLE_EXT = {"m4a", "mp4", "mov"}
+# F-EDITION-04: an MP4-family container is lossless ONLY when trusted non-None
+# bit-depth evidence is present (proven ALAC); lossy AAC stays bitrate-tiered.
+
+
+def tier_for(ext: str, bitrate: int | None, bit_depth: int | None = None) -> str:
+    """Quality tier from a codec extension + bitrate (+ optional bit depth).
+    Shared by the per-file search-result classifier (``file_tier``) and the
+    library held-quality lookup (a ``library_files`` row's ``file_format`` +
+    ``bit_rate`` + ``bit_depth``), so both judge tier identically.
+
+    F-EDITION-04: ``m4a``/``mp4``/``mov`` are lossless only with non-None
+    bit-depth evidence; without it (lossy AAC) they stay on the bitrate bands."""
+    normalized = (ext or "").lower().lstrip(".")
+    if normalized in _LOSSLESS_EXT:
+        return "lossless"
+    if normalized in _MP4_LOSSLESS_CAPABLE_EXT and bit_depth is not None:
         return "lossless"
     b = bitrate or 0
     if b >= 320:
@@ -72,7 +84,7 @@ def tier_for(ext: str, bitrate: int | None) -> str:
 
 
 def file_tier(file: DownloadSearchResult) -> str:
-    return tier_for(effective_extension(file), file.bitrate)
+    return tier_for(effective_extension(file), file.bitrate, file.bit_depth)
 
 
 def candidate_tier(files: list[DownloadSearchResult]) -> str:

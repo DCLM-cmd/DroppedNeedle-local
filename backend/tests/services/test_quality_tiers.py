@@ -1,6 +1,8 @@
 """Unit tests for the audio quality tier helpers."""
 
 from repositories.protocols.download_client import DownloadSearchResult
+import pytest
+
 from services.native.quality_tiers import (
     candidate_tier,
     file_tier,
@@ -121,3 +123,42 @@ def test_should_acquire_upgrades_on_only_below_cutoff():
     assert should_acquire("low", "mp3_320", upgrade_allowed=True) is True
     assert should_acquire("lossless", "lossless", upgrade_allowed=True) is False
     assert should_acquire("mp3_320", "mp3_320", upgrade_allowed=True) is False
+
+
+# --- F-EDITION-04: MP4-family lossless requires bit-depth evidence ------------
+
+def test_tier_for_alac_m4a_with_depth_is_lossless():
+    from repositories.protocols.download_client import DownloadSearchResult
+    file = DownloadSearchResult(
+        username="u", filename="a.m4a", parent_directory="p",
+        size=30_000_000, extension="m4a", bitrate=900, bit_depth=16,
+    )
+    assert file_tier(file) == "lossless"
+    assert tier_for("m4a", 900, 16) == "lossless"
+
+
+def test_tier_for_aac_m4a_without_depth_stays_bitrate_tiered():
+    from repositories.protocols.download_client import DownloadSearchResult
+    file = DownloadSearchResult(
+        username="u", filename="a.m4a", parent_directory="p",
+        size=10_000_000, extension="m4a", bitrate=256, bit_depth=None,
+    )
+    assert file_tier(file) == "mp3_256"
+    assert tier_for("m4a", 256, None) == "mp3_256"
+
+
+@pytest.mark.parametrize("ext", ["m4a", "mp4", "mov"])
+def test_tier_for_mp4_family_with_depth_is_lossless(ext):
+    assert tier_for(ext, 900, 24) == "lossless"
+    assert tier_for(ext, None, 16) == "lossless"
+
+
+def test_tier_for_flac_mp3_only_gate_unchanged_for_alac_m4a():
+    # flac_mp3_only is enforced elsewhere (is_flac_or_mp3); an ALAC M4A may be
+    # classified lossless here but stays outside the FLAC/MP3-only set.
+    from repositories.protocols.download_client import DownloadSearchResult
+    file = DownloadSearchResult(
+        username="u", filename="a.m4a", parent_directory="p",
+        size=30_000_000, extension="m4a", bitrate=900, bit_depth=16,
+    )
+    assert is_flac_or_mp3(file) is False

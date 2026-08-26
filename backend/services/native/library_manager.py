@@ -193,7 +193,14 @@ class LibraryManager:
         from services.native.quality_tiers import tier_for, tier_rank
 
         rows = await self._db.get_library_files_for_album(release_group_mbid)
-        tiers = [tier_for(row.get("file_format") or "", row.get("bit_rate")) for row in rows]
+        tiers = [
+            tier_for(
+                row.get("file_format") or "",
+                row.get("bit_rate"),
+                row.get("bit_depth"),
+            )
+            for row in rows
+        ]
         return min(tiers, key=tier_rank) if tiers else None
 
     async def list_cutoff_unmet(self, cutoff: str) -> list[dict]:
@@ -215,7 +222,14 @@ class LibraryManager:
         from services.native.quality_tiers import tier_for, tier_rank
 
         rows = await self._db.get_library_files_for_recording(recording_mbid)
-        tiers = [tier_for(row.get("file_format") or "", row.get("bit_rate")) for row in rows]
+        tiers = [
+            tier_for(
+                row.get("file_format") or "",
+                row.get("bit_rate"),
+                row.get("bit_depth"),
+            )
+            for row in rows
+        ]
         return max(tiers, key=tier_rank) if tiers else None
 
     async def has_track(self, recording_mbid: str) -> bool:
@@ -395,7 +409,9 @@ class LibraryManager:
 
         tracks = await self.get_tracks(release_group_mbid)
         for track in tracks:
-            track.current_tier = tier_for(track.file_format or "", track.bit_rate)
+            track.current_tier = tier_for(
+                track.file_format or "", track.bit_rate, track.bit_depth
+            )
             track.below_cutoff = (
                 upgrade_allowed
                 and quality_cutoff is not None

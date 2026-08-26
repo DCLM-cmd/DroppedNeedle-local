@@ -105,7 +105,12 @@ class TargetLibraryRepository:
 
         rows = await self._store.get_target_album_tracks(album_id)
         tiers = [
-            tier_for(row.get("file_format") or "", row.get("bit_rate")) for row in rows
+            tier_for(
+                row.get("file_format") or "",
+                row.get("bit_rate"),
+                row.get("bit_depth"),
+            )
+            for row in rows
         ]
         return min(tiers, key=tier_rank) if tiers else None
 
@@ -114,7 +119,12 @@ class TargetLibraryRepository:
 
         rows = await self._store.get_target_recording_tracks(track_id)
         tiers = [
-            tier_for(row.get("file_format") or "", row.get("bit_rate")) for row in rows
+            tier_for(
+                row.get("file_format") or "",
+                row.get("bit_rate"),
+                row.get("bit_depth"),
+            )
+            for row in rows
         ]
         return max(tiers, key=tier_rank) if tiers else None
 

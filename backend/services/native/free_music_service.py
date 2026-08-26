@@ -513,7 +513,9 @@ class FreeMusicService:
         """
         count_delta = abs(candidate.track_count - track_count) if track_count else 0
         not_preferred = 0 if candidate.extension == preferred else 1
-        quality = -tier_rank(tier_for(candidate.extension, None))
+        quality = -tier_rank(
+            tier_for(candidate.extension, None, None)
+        )  # no depth evidence
         return (count_delta, not_preferred, quality, -candidate.size_bytes)
 
     # -- download --

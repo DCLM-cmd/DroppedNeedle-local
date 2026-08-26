@@ -263,3 +263,59 @@ def test_single_scalar_artist_with_punctuation_remains_one_credit(tagger, tmp_co
     tag, _ = tagger.read_tags(path)
 
     assert [credit.name for credit in tag.artists] == ["Alpha; Beta"]
+
+
+# --- F-EDITION-04: codec-aware MP4-family bit depth ---------------------------
+
+class _CodecInfo:
+    """Mutagen-info double with controllable codec + bits_per_sample."""
+
+    def __init__(self, codec: str | None, bits: int | None) -> None:
+        self.length = 200.0
+        self.bitrate = 256_000
+        self.sample_rate = 44_100
+        self.channels = 2
+        self.codec = codec
+        self.bits_per_sample = bits
+
+
+class _CodecAudio:
+    def __init__(self, info: _CodecInfo) -> None:
+        self.info = info
+        self.tags = {}
+
+
+def test_fedition04_alac_m4a_keeps_real_bit_depth(tagger):
+    audio = _CodecAudio(_CodecInfo(codec="alac", bits=16))
+    info = tagger._read_info(audio, Path("/music/x.m4a"), "m4a")
+    assert info.file_format == "m4a"
+    assert info.bit_depth == 16
+
+
+def test_fedition04_aac_m4a_suppresses_synthetic_depth(tagger):
+    # Mutagen reports 16 even for lossy AAC - must stay suppressed.
+    audio = _CodecAudio(_CodecInfo(codec="mp4a", bits=16))
+    info = tagger._read_info(audio, Path("/music/x.m4a"), "m4a")
+    assert info.file_format == "m4a"
+    assert info.bit_depth is None
+
+
+def test_fedition04_unknown_codec_m4a_has_no_depth(tagger):
+    audio = _CodecAudio(_CodecInfo(codec=None, bits=16))
+    info = tagger._read_info(audio, Path("/music/x.m4a"), "m4a")
+    assert info.bit_depth is None
+
+
+def test_fedition04_alac_mov_container_keeps_depth(tagger):
+    audio = _CodecAudio(_CodecInfo(codec="alac", bits=24))
+    info = tagger._read_info(audio, Path("/music/x.mov"), "mov")
+    assert info.file_format == "mov"
+    assert info.bit_depth == 24
+
+
+def test_fedition04_flac_wav_behavior_unchanged(tagger):
+    flac_info = _CodecInfo(codec="flac", bits=24)
+    from infrastructure.audio.tagger import _bit_depth_for
+    assert _bit_depth_for("flac", flac_info) == 24
+    wav_info = _CodecInfo(codec="", bits=16)
+    assert _bit_depth_for("wav", wav_info) == 16

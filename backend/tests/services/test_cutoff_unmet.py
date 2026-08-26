@@ -110,3 +110,48 @@ async def test_soft_deleted_files_do_not_count(manager: LibraryManager):
     await manager._db.soft_delete_library_file("/music/d/01.mp3")
 
     assert await manager.list_cutoff_unmet("lossless") == []
+
+
+@pytest.mark.asyncio
+async def test_fedition04_sql_and_tier_for_agree_on_mp4_family_depth(manager: LibraryManager):
+    """F-EDITION-04: the SQL mirror and tier_for must agree on the MP4-family
+    grid - m4a/mp4/mov with bit depth are lossless; without it they stay on
+    their bitrate band."""
+    cases = [
+        ("m4a", 900, 16, "lossless"),
+        ("m4a", None, 24, "lossless"),
+        ("mp4", 900, 24, "lossless"),
+        ("mov", 900, 16, "lossless"),
+        ("m4a", 256, None, "mp3_256"),
+        ("m4a", 128, None, "low"),
+        ("mp4", 192, None, "mp3_192"),
+        ("mov", 320, None, "mp3_320"),
+    ]
+    expected: dict[str, str] = {}
+    for index, (fmt, bitrate, depth, _tier) in enumerate(cases):
+        rg = f"rg-mp4-{index}"
+        info = AudioInfo(
+            duration_seconds=200.0,
+            bitrate=bitrate or 0,
+            sample_rate=44100,
+            channels=2,
+            file_format=fmt,
+            file_size_bytes=1000,
+            bit_depth=depth,
+        )
+        await manager.upsert_file(
+            Path(f"/music/{rg}/01.{fmt}"), _tag(rg), info,
+            release_group_mbid=rg, recording_mbid=f"rec-{rg}",
+        )
+        expected[rg] = tier_for(fmt, bitrate, depth)
+
+    listed = {row["release_group_mbid"]: row["current_tier"]
+              for row in await manager.list_cutoff_unmet("lossless")}
+
+    for rg, tier in expected.items():
+        if tier == "lossless":
+            assert rg not in listed, f"{rg} ({tier}) wrongly listed as cutoff-unmet"
+        else:
+            assert listed.get(rg) == tier, (
+                f"{rg}: SQL said {listed.get(rg)!r}, tier_for said {tier!r}"
+            )

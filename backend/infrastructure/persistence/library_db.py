@@ -87,10 +87,15 @@ _LIBRARY_FILE_VALUE_COLUMNS = (
 
 # SQL mirror of quality_tiers.tier_for (lossless extension set + kbps bands), ranked
 # like quality_tiers._RANK (low=0 .. lossless=4). test_cutoff_unmet asserts this CASE
-# agrees with tier_for for every (format, bitrate) band - change BOTH together.
+# agrees with tier_for for every (format, bitrate, bit_depth) combination -
+# change BOTH together. F-EDITION-04: an MP4-family container ranks lossless
+# only with non-NULL bit_depth evidence (proven ALAC); lossy AAC stays on the
+# bitrate bands.
 _TIER_RANK_CASE = """
     CASE
         WHEN LOWER(COALESCE(file_format, '')) IN ('flac', 'alac', 'wav', 'ape', 'wv') THEN 4
+        WHEN LOWER(COALESCE(file_format, '')) IN ('m4a', 'mp4', 'mov')
+             AND bit_depth IS NOT NULL THEN 4
         WHEN COALESCE(bit_rate, 0) >= 320 THEN 3
         WHEN COALESCE(bit_rate, 0) >= 256 THEN 2
         WHEN COALESCE(bit_rate, 0) >= 192 THEN 1

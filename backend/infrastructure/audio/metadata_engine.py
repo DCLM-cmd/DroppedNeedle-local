@@ -2328,6 +2328,23 @@ class AudioMetadataEngine:
         return restore_snapshot(self, staged_path, snapshot)
 
 
+def _lossless_bit_depth(detected_format: str | None, technical) -> int | None:
+    """Meaningful bit depth, or None when the container/codec proves nothing.
+
+    F-EDITION-04: FLAC/WAV always carry a real depth. An MP4-family file
+    (m4a/mp4/mov) is ALAC - and therefore lossless - only when the codec
+    evidence says so; AAC's synthetic 16-bit Mutagen value stays suppressed.
+    """
+    fmt = detected_format or ""
+    if fmt in {"flac", "wav"}:
+        return technical.bit_depth
+    if fmt in {"m4a", "mp4", "mov"}:
+        codec = str(getattr(technical, "codec", "") or "").lower()
+        if codec.startswith("alac"):
+            return technical.bit_depth
+    return None
+
+
 def legacy_audio_projection(
     document: ReadAudioDocument,
 ) -> tuple[AudioTag, AudioInfo]:
@@ -2440,10 +2457,8 @@ def legacy_audio_projection(
         channels=technical.channels,
         file_format=document.probe.detected_format or "unknown",
         file_size_bytes=technical.file_size_bytes,
-        bit_depth=(
-            technical.bit_depth
-            if document.probe.detected_format in {"flac", "wav"}
-            else None
+        bit_depth=_lossless_bit_depth(
+            document.probe.detected_format, technical
         ),
     )
     return tag, info

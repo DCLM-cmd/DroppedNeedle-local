@@ -1105,7 +1105,9 @@ class DownloadService:
                 continue
             if not self._upgrade_allowed:
                 continue
-            held_tier = tier_for(row.get("file_format") or "", row.get("bit_rate"))
+            held_tier = tier_for(
+            row.get("file_format") or "", row.get("bit_rate"), row.get("bit_depth")
+        )
             if tier_rank(held_tier) >= tier_rank(self._quality_cutoff):
                 continue
             recording = row.get("recording_mbid") or track.recording_id
