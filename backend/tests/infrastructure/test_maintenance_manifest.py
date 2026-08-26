@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,37 @@ from infrastructure.persistence.maintenance_manifest import (
 
 
 _REPOSITORY_ROOT = Path(__file__).parents[3]
+
+
+def _synthetic_repository(tmp_path: Path) -> Path:
+    """Hermetic git worktree: one commit plus one untracked file, so
+    capture_source_identity legitimately reports a dirty tree on any checkout."""
+
+    root = tmp_path / "repository"
+    root.mkdir()
+
+    def git(*arguments: str) -> None:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.email=manifest-test@example.com",
+                "-c",
+                "user.name=Manifest Test",
+                *arguments,
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    git("init", "-q")
+    git("commit", "-q", "--allow-empty", "-m", "synthetic baseline")
+    (root / "app.py").write_text(
+        "APPLICATION_REVISION = 'untracked'\n", encoding="utf-8"
+    )
+    return root
 
 
 def _prior_application() -> dict[str, object]:
@@ -60,7 +92,11 @@ def _source(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
     return root, database, config, environment, covers
 
 
-def _capture(tmp_path: Path) -> tuple[Path, dict]:
+def _capture(
+    tmp_path: Path,
+    *,
+    application_source_root: Path = _REPOSITORY_ROOT,
+) -> tuple[Path, dict]:
     root, database, config, environment, covers = _source(tmp_path)
     destination = tmp_path / "closed-source-manifest"
     report = capture_complete_manifest(
@@ -69,7 +105,7 @@ def _capture(tmp_path: Path) -> tuple[Path, dict]:
         config_path=config,
         environment_path=environment,
         destination=destination,
-        application_source_root=_REPOSITORY_ROOT,
+        application_source_root=application_source_root,
         prior_application=_prior_application(),
         closed_source_confirmed=True,
     )
@@ -228,8 +264,9 @@ def test_manifest_derives_assets_and_rejects_missing_database_reference(
 
 
 def test_validation_pins_source_tree_and_prior_application(tmp_path: Path) -> None:
-    manifest, report = _capture(tmp_path)
-    current_identity = capture_source_identity(_REPOSITORY_ROOT)
+    repository = _synthetic_repository(tmp_path)
+    manifest, report = _capture(tmp_path, application_source_root=repository)
+    current_identity = capture_source_identity(repository)
 
     validate_complete_manifest(
         manifest,

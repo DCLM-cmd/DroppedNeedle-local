@@ -1581,7 +1581,7 @@ async def test_shared_operation_supervisor_dispatches_reconciliation_repair() ->
         }
     }
     operations = Mock()
-    operations._response.return_value = "response"
+    operations.response_for.return_value = "response"
     reconciliation = AsyncMock()
     reconciliation.run_claimed.return_value = {"id": job["id"], "state": "succeeded"}
     supervisor = LibraryOperationSupervisor(

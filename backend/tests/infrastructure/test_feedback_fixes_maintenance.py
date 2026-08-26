@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -9,6 +10,44 @@ from maintenance import feedback_fixes
 
 
 _REPOSITORY_ROOT = Path(__file__).parents[3]
+
+
+def _synthetic_repository(tmp_path: Path) -> Path:
+    """Hermetic git worktree: one commit plus one untracked file, so
+    capture_source_identity legitimately reports a dirty tree on any checkout."""
+
+    root = tmp_path / "repository"
+    root.mkdir()
+
+    def git(*arguments: str) -> None:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.email=feedback-fixes@example.com",
+                "-c",
+                "user.name=Feedback Fixes Test",
+                *arguments,
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    git("init", "-q")
+    (root / "docker-compose.yml").write_text(
+        "services:\n  droppedneedle:\n    image: droppedneedle:local\n",
+        encoding="utf-8",
+    )
+    git("add", "docker-compose.yml")
+    git("commit", "-q", "--allow-empty", "-m", "synthetic baseline")
+    (root / "app.py").write_text(
+        "APPLICATION_REVISION = 'untracked'\n", encoding="utf-8"
+    )
+    return root
+
+
 _SOURCE_IMAGE = "sha256:" + "1" * 64
 _TARGET_IMAGE = "sha256:" + "2" * 64
 _ENTRYPOINT = ["tini", "--", "/entrypoint.sh"]
@@ -169,7 +208,7 @@ def test_staged_runner_pins_source_captures_migrates_starts_and_rolls_back(
     docker = FakeDocker()
     prepared = feedback_fixes.prepare(
         state_path=state_path,
-        repository_root=_REPOSITORY_ROOT,
+        repository_root=_synthetic_repository(tmp_path),
         data_root=data_root,
         manifest_root=manifest_root,
         runner=docker,
