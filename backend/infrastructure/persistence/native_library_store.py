@@ -9893,8 +9893,11 @@ class NativeLibraryStore(PersistenceBase):
                 "embedded_album_artist_mbid = ?, duration_seconds = ?, file_format = ?, bit_rate = ?, "
                 "sample_rate = ?, bit_depth = ?, channels = ?, replaygain_track_gain = ?, "
                 "replaygain_album_gain = ?, replaygain_track_peak = ?, replaygain_album_peak = ?, "
+                # F-INDEXREC-05: a rescan preserves the original import time; only
+                # new inserts take the incoming scan-time value.
                 "availability = 'indexed', missing_since = NULL, excluded_at = NULL, "
-                "ingest_source = ?, download_task_id = ?, source_path = ?, imported_at = ?, "
+                "ingest_source = ?, download_task_id = ?, source_path = ?, "
+                "imported_at = COALESCE(local_tracks.imported_at, ?), "
                 "desired_policy_revision = ?, applied_policy_revision = ?, applied_policy = ?, "
                 "row_revision = row_revision + 1 WHERE id = ?",
                 (

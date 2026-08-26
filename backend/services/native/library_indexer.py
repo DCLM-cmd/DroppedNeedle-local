@@ -74,6 +74,7 @@ class LibraryIndexer:
         *,
         tag_read_timeout_seconds: float = TAG_READ_TIMEOUT_SECONDS,
         max_detached_tag_reads: int = MAX_DETACHED_TAG_READS,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if tag_read_timeout_seconds <= 0:
             raise ValueError("The tag-read timeout must be positive.")
@@ -87,6 +88,9 @@ class LibraryIndexer:
         self._filesystem = filesystem_coordinator
         self._tag_read_timeout_seconds = tag_read_timeout_seconds
         self._max_detached_tag_reads = max_detached_tag_reads
+        # F-INDEXREC-05: catalog creation/import timestamps come from the scan
+        # event (wall clock), never from the file's mtime.
+        self._clock = clock
         self._detached_tag_reads: set[
             asyncio.Task[tuple[AudioTag, AudioInfo, os.stat_result]]
         ] = set()
@@ -184,7 +188,11 @@ class LibraryIndexer:
                         "file_mtime_ns": stat.st_mtime_ns,
                         "stat_revision": revision_from_stat(stat),
                     }
-                    writes.append(self._prepare_tagged(run.id, tagged_item, tag, info))
+                    writes.append(
+                        self._prepare_tagged(
+                            run.id, tagged_item, tag, info, now=self._clock()
+                        )
+                    )
                     if checkpoint is not None and not await checkpoint(
                         run.id, frozen_policy_revision
                     ):
@@ -331,10 +339,11 @@ class LibraryIndexer:
         item: dict[str, object],
         tag: AudioTag,
         info: AudioInfo,
+        *,
+        now: float,
     ) -> ScannedTrackWrite:
         root_id = str(item["root_id"])
         relative_path = str(item["relative_path"])
-        now = float(item["file_mtime_ns"]) / 1_000_000_000
         directory = grouping_directory(relative_path)
         album_title = tag.album.strip()
         if not album_title:

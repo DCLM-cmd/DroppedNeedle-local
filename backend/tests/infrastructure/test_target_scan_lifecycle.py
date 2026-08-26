@@ -2812,3 +2812,175 @@ async def test_genuine_missing_still_marks_and_publication_stays_protected(
         run.id, "root-a", ".", now=21, limit=100, allow_missing=False
     )
     assert counts_protected["missing"] == 0
+
+
+@pytest.mark.asyncio
+async def test_catalog_timestamps_use_scan_time_not_file_mtime(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    old_file = root / "track-1.flac"
+    old_file.write_bytes(b"audio")
+    future_file = root / "track-2.flac"
+    future_file.write_bytes(b"audio")
+    old_mtime = time.time() - 86400 * 365
+    future_mtime = time.time() + 86400 * 30
+    os.utime(old_file, (old_mtime, old_mtime))
+    os.utime(future_file, (future_mtime, future_mtime))
+    resolver = _resolver(root)
+    scan_clock_value = 1_800_000_000.0
+
+    class ClockReader(_TagReader):
+        pass
+
+    indexer = LibraryIndexer(target_store, _TagReader(), clock=lambda: scan_clock_value)
+    scanner = LibraryInventoryScanner(target_store)
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        scanner,
+        indexer,
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: scan_clock_value,
+    )
+    requested = await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        rows = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT relative_path, imported_at FROM local_tracks"
+            ).fetchall()
+        }
+        artist_created = connection.execute(
+            "SELECT created_at FROM local_artists WHERE display_name='Local Artist' "
+            "AND created_at > 0"
+        ).fetchone()[0]
+        album_created = connection.execute(
+            "SELECT created_at FROM local_albums WHERE title='Local Album'"
+        ).fetchone()[0]
+        stat_rows = {
+            row[0]: (row[1], row[2])
+            for row in connection.execute(
+                "SELECT relative_path, file_mtime_ns, stat_revision FROM local_tracks"
+            ).fetchall()
+        }
+    # First scan: creation/import timestamps are the injected wall-clock scan
+    # time for BOTH the old-mtime and future-mtime files.
+    assert rows["track-1.flac"] == scan_clock_value
+    assert rows["track-2.flac"] == scan_clock_value
+    assert artist_created == scan_clock_value
+    assert album_created == scan_clock_value
+    # mtime/stat evidence remains source-stat derived (float ns rounding via
+    # os.utime is tolerated; the two files must still differ).
+    assert abs(stat_rows["track-1.flac"][0] - int(old_mtime * 1e9)) < 1000
+    assert abs(stat_rows["track-2.flac"][0] - int(future_mtime * 1e9)) < 1000
+    assert stat_rows["track-1.flac"][1] != stat_rows["track-2.flac"][1]
+
+    # Rescan at a later clock value without touching mtimes.
+    rescan_clock_value = scan_clock_value + 5_000.0
+
+    class RescanIndexer(LibraryIndexer):
+        def __init__(self, store, reader):
+            super().__init__(store, reader, clock=lambda: rescan_clock_value)
+
+    rescan_indexer = RescanIndexer(target_store, _TagReader())
+    rescan_coordinator = LibraryScanCoordinator(
+        target_store,
+        LibraryInventoryScanner(target_store),
+        rescan_indexer,
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: rescan_clock_value,
+    )
+    await rescan_coordinator.request_run(
+        _request(resolver, kind="rescan_files", trigger="manual")
+    )
+    rescanned = await rescan_coordinator.run_once({"root-a": root})
+    assert rescanned is not None and rescanned.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        after = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT relative_path, imported_at FROM local_tracks"
+            ).fetchall()
+        }
+        tags_read = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT relative_path, tags_read_at FROM local_tracks"
+            ).fetchall()
+        }
+        artist_after = connection.execute(
+            "SELECT created_at, updated_at FROM local_artists "
+            "WHERE display_name='Local Artist' AND created_at > 0"
+        ).fetchone()
+        album_after = connection.execute(
+            "SELECT created_at, updated_at FROM local_albums WHERE title='Local Album'"
+        ).fetchone()
+    # imported_at and created_at preserved across the rescan.
+    assert after["track-1.flac"] == scan_clock_value
+    assert after["track-2.flac"] == scan_clock_value
+    assert artist_after[0] == scan_clock_value
+    assert album_after[0] == scan_clock_value
+    # updated_at and tags_read_at advance to the rescan time. The artist row is
+    # resolved (not re-created) on rescan, so its updated_at is governed by the
+    # artist upsert conflict behavior, not this ticket's contract; the album row
+    # does refresh its updated_at from the incoming write.
+    assert tags_read["track-1.flac"] == rescan_clock_value
+    assert tags_read["track-2.flac"] == rescan_clock_value
+    assert album_after[1] == rescan_clock_value
+
+
+@pytest.mark.asyncio
+async def test_recent_ordering_follows_scan_time_not_future_mtime(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    first = root / "track-1.flac"
+    first.write_bytes(b"audio")
+    resolver = _resolver(root)
+    current_clock = {"value": 1_800_000_000.0}
+
+    class SeqIndexer(LibraryIndexer):
+        def __init__(self, store, reader):
+            super().__init__(store, reader, clock=lambda: current_clock["value"])
+
+    coordinator = LibraryScanCoordinator(
+        target_store,
+        LibraryInventoryScanner(target_store),
+        SeqIndexer(target_store, _TagReader()),
+        LibraryReconciler(target_store),
+        lambda: resolver,
+        clock=lambda: current_clock["value"],
+    )
+    # First scan sees only the first file; the second arrives with a far-future
+    # mtime before the second scan. Scopes are directories (a file path fails
+    # the root probe).
+    await coordinator.request_run(_request(resolver))
+    completed_first = await coordinator.run_once({"root-a": root})
+    assert completed_first is not None and completed_first.state == "completed"
+    second = root / "track-2.flac"
+    second.write_bytes(b"audio")
+    future_mtime = time.time() + 86400 * 365
+    os.utime(second, (future_mtime, future_mtime))
+    current_clock["value"] = 1_800_005_000.0
+    await coordinator.request_run(_request(resolver))
+    completed_second = await coordinator.run_once({"root-a": root})
+    assert completed_second is not None and completed_second.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        order = [
+            row[0]
+            for row in connection.execute(
+                "SELECT relative_path FROM local_tracks ORDER BY imported_at DESC"
+            ).fetchall()
+        ]
+    # The genuinely later scan wins Recently Added even though the second file
+    # carries a one-year-out mtime.
+    assert order == ["track-2.flac", "track-1.flac"]
