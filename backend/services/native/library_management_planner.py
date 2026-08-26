@@ -1277,9 +1277,15 @@ class LibraryManagementPlanner:
             if source.subject.bundle_first
             else msgspec.structs.replace(profile.artwork, external_enabled=False)
         )
+        # F-PERF-07: one bounded pass cache per album planning pass so the
+        # projection reuses this inspection instead of walking the directory
+        # twice. Discarded immediately after the projection completes.
+        artwork_pass_cache = self._artwork.new_pass_cache()
         existing_external = (
             await self._artwork.inspect_existing_external(
-                artwork_settings, source.path.parent
+                artwork_settings,
+                source.path.parent,
+                pass_cache=artwork_pass_cache,
             )
             if source.subject.bundle_first
             else ()
@@ -1289,6 +1295,7 @@ class LibraryManagementPlanner:
             release_mbid=canonical_release.identifiers.release_mbid,
             release_group_mbid=canonical_release.identifiers.release_group_mbid,
             album_directory=source.path.parent,
+            pass_cache=artwork_pass_cache,
             existing_embedded=tuple(
                 ExistingArtworkDescriptor(
                     image_type=value.image_type,

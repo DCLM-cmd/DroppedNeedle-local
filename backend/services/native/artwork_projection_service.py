@@ -34,6 +34,7 @@ from repositories.protocols.coverart_management import (
 )
 
 _SOURCE = "library_management_artwork"
+_CACHE_MISS = object()
 _MAX_LOCAL_ENTRIES = 10_000
 
 
@@ -77,6 +78,37 @@ def _record_degradation(message: str) -> None:
         context.record(IntegrationResult.error(source=_SOURCE, msg=message))
 
 
+class _LocalArtworkPassEntry:
+    """One enumerated directory snapshot plus per-candidate outcomes."""
+
+    __slots__ = ("candidates", "inspections")
+
+    def __init__(
+        self,
+        candidates: tuple[ArtworkCandidate, ...],
+        inspections: dict[str, "InspectedArtwork | None"],
+    ) -> None:
+        self.candidates = candidates
+        # candidate_id -> validated inspection, or None when inspection
+        # failed and the failure must be reused instead of retried.
+        self.inspections = inspections
+
+
+class _LocalArtworkPassCache:
+    """F-PERF-07 bounded per-pass local artwork reuse.
+
+    Created by a management caller for ONE album planning/import pass;
+    carries the local-candidate enumeration and validated inspections so
+    ``project`` avoids the second walk/read/inspect. Keyed by resolved
+    boundary root and pattern tuple; never shared across passes, albums,
+    or process restarts."""
+
+    __slots__ = ("entries",)
+
+    def __init__(self) -> None:
+        self.entries: dict[tuple[str, tuple[str, ...]], _LocalArtworkPassEntry] = {}
+
+
 class ArtworkProjectionService:
     def __init__(
         self,
@@ -86,24 +118,79 @@ class ArtworkProjectionService:
         self._repository = repository
         self._processor = processor
 
+    def new_pass_cache(self) -> _LocalArtworkPassCache:
+        """F-PERF-07: create one bounded pass-local artwork cache."""
+        return _LocalArtworkPassCache()
+
+    @staticmethod
+    def _scoped_pass_entry(
+        pass_cache: _LocalArtworkPassCache,
+        album_directory: Path | None,
+        patterns: tuple[str, ...],
+    ) -> _LocalArtworkPassEntry | None:
+        """The pass entry for this directory/pattern scope, if enumerated."""
+        if album_directory is None:
+            return None
+        try:
+            key = ArtworkProjectionService._pass_cache_key(album_directory, patterns)
+        except (ArtworkProcessingError, OSError):
+            return None
+        return pass_cache.entries.get(key)
+
+    @staticmethod
+    def _pass_cache_key(
+        album_directory: Path, patterns
+    ) -> tuple[str, tuple[str, ...]]:
+        """Resolved boundary root plus normalized pattern tuple."""
+        root = str(album_directory.resolve(strict=True))
+        normalized = tuple(pattern.casefold() for pattern in patterns)
+        return root, normalized
+
     async def inspect_existing_external(
         self,
         settings: ArtworkManagementSettings,
         album_directory: Path | None,
+        *,
+        pass_cache: _LocalArtworkPassCache | None = None,
     ) -> tuple[ExistingArtworkDescriptor, ...]:
-        """Inspect matching local artwork so replacement policy has real dimensions."""
+        """Inspect matching local artwork so replacement policy has real dimensions.
+
+        F-PERF-07: with a ``pass_cache`` the enumeration and per-candidate
+        inspections happen once and are reused by the following ``project``
+        call within the same management pass."""
 
         if album_directory is None or not settings.external_enabled:
             return ()
+        patterns = tuple(settings.local_file_patterns)
+        cache_key: tuple[str, tuple[str, ...]] | None = None
+        if pass_cache is not None:
+            try:
+                cache_key = self._pass_cache_key(album_directory, patterns)
+            except (ArtworkProcessingError, OSError):
+                _record_degradation("existing external artwork could not be enumerated")
+                return ()
+            entry = pass_cache.entries.get(cache_key)
+            if entry is not None:
+                descriptors: list[ExistingArtworkDescriptor] = []
+                for candidate in entry.candidates:
+                    image = entry.inspections.get(candidate.candidate_id)
+                    if image is None:
+                        continue
+                    for image_type in candidate.image_types:
+                        descriptors.append(
+                            self._existing_descriptor(candidate, image_type, image)
+                        )
+                return tuple(descriptors)
         try:
             candidates = await asyncio.to_thread(
                 self._local_candidates,
                 album_directory,
-                tuple(settings.local_file_patterns),
+                patterns,
             )
         except (ArtworkProcessingError, OSError):
             _record_degradation("existing external artwork could not be enumerated")
             return ()
+        inspections: dict[str, "InspectedArtwork | None"] = {}
         inspected: list[ExistingArtworkDescriptor] = []
         for candidate in candidates:
             try:
@@ -115,19 +202,33 @@ class ArtworkProjectionService:
                 image = await self._processor.inspect(candidate, content)
             except (ArtworkProcessingError, OSError):
                 _record_degradation("existing external artwork could not be inspected")
+                inspections[candidate.candidate_id] = None
                 continue
+            inspections[candidate.candidate_id] = image
             for image_type in candidate.image_types:
                 inspected.append(
-                    ExistingArtworkDescriptor(
-                        image_type=image_type,
-                        mime_type=image.mime_type,
-                        width=image.width,
-                        height=image.height,
-                        byte_size=image.byte_size,
-                        sha256=image.sha256,
-                    )
+                    self._existing_descriptor(candidate, image_type, image)
                 )
+        if pass_cache is not None and cache_key is not None:
+            pass_cache.entries[cache_key] = _LocalArtworkPassEntry(
+                candidates=candidates, inspections=inspections
+            )
         return tuple(inspected)
+
+    @staticmethod
+    def _existing_descriptor(
+        candidate: ArtworkCandidate,
+        image_type,
+        image: "InspectedArtwork",
+    ) -> ExistingArtworkDescriptor:
+        return ExistingArtworkDescriptor(
+            image_type=image_type,
+            mime_type=image.mime_type,
+            width=image.width,
+            height=image.height,
+            byte_size=image.byte_size,
+            sha256=image.sha256,
+        )
 
     async def project(
         self,
@@ -141,6 +242,7 @@ class ArtworkProjectionService:
         embedded_fallback: Sequence[InspectedArtwork] = (),
         selected_cache: dict[ArtworkImageType, InspectedArtwork] | None = None,
         priority: RequestPriority,
+        pass_cache: _LocalArtworkPassCache | None = None,
     ) -> ArtworkProjection:
         if not settings.embedded_enabled and not settings.external_enabled:
             return ArtworkProjection(preserved_existing=True)
@@ -173,6 +275,11 @@ class ArtworkProjectionService:
             if provider == "audiodb":
                 self._defer(provider, deferred, "AudioDB artwork is unavailable")
                 continue
+            local_entry: _LocalArtworkPassEntry | None = None
+            if provider == "local_files" and pass_cache is not None:
+                local_entry = self._scoped_pass_entry(
+                    pass_cache, album_directory, tuple(settings.local_file_patterns)
+                )
             try:
                 candidates = await self._candidates(
                     provider=provider,
@@ -181,6 +288,7 @@ class ArtworkProjectionService:
                     release_group_mbid=release_group_mbid,
                     album_directory=album_directory,
                     priority=priority,
+                    pass_cache=pass_cache,
                 )
             except (ArtworkProcessingError, ExternalServiceError, OSError):
                 self._defer(provider, deferred, "artwork provider failed")
@@ -192,6 +300,7 @@ class ArtworkProjectionService:
                 priority=priority,
                 decisions=decisions,
                 deferred=deferred,
+                local_entry=local_entry,
             )
 
         embedded_outputs: list[ArtworkOutput] = []
@@ -245,6 +354,7 @@ class ArtworkProjectionService:
         release_group_mbid: str,
         album_directory: Path | None,
         priority: RequestPriority,
+        pass_cache: _LocalArtworkPassCache | None = None,
     ) -> tuple[ArtworkCandidate, ...]:
         if provider == "cover_art_archive_release":
             return await self._repository.list_management_artwork(
@@ -263,11 +373,27 @@ class ArtworkProjectionService:
         if provider == "local_files":
             if album_directory is None:
                 return ()
-            return await asyncio.to_thread(
+            cache_key: tuple[str, tuple[str, ...]] | None = None
+            entry = None
+            if pass_cache is not None:
+                # Resolution failures here defer the provider exactly like an
+                # enumeration failure did before the pass cache existed.
+                cache_key = self._pass_cache_key(
+                    album_directory, tuple(settings.local_file_patterns)
+                )
+                entry = pass_cache.entries.get(cache_key)
+                if entry is not None:
+                    return entry.candidates
+            candidates = await asyncio.to_thread(
                 self._local_candidates,
                 album_directory,
                 tuple(settings.local_file_patterns),
             )
+            if pass_cache is not None and cache_key is not None:
+                pass_cache.entries[cache_key] = _LocalArtworkPassEntry(
+                    candidates=candidates, inspections={}
+                )
+            return candidates
         return ()
 
     async def _select_candidates(
@@ -279,6 +405,7 @@ class ArtworkProjectionService:
         priority: RequestPriority,
         decisions: list[ArtworkDecision],
         deferred: list[ArtworkSource],
+        local_entry: _LocalArtworkPassEntry | None = None,
     ) -> None:
         configured_types = set(settings.image_types)
         for candidate in candidates:
@@ -301,21 +428,41 @@ class ArtworkProjectionService:
                         )
                     )
                 continue
-            try:
-                content, declared_mime = await self._load(candidate, priority)
-                inspected = await self._processor.inspect(
-                    candidate, content, declared_mime_type=declared_mime
-                )
-            except ExternalServiceError:
-                self._defer(
-                    candidate.source,
-                    deferred,
-                    "artwork provider download failed",
-                )
-                continue
-            except (ArtworkProcessingError, OSError):
-                _record_degradation("an artwork candidate could not be validated")
-                continue
+            reuse_inspection: InspectedArtwork | None | object = _CACHE_MISS
+            if local_entry is not None and candidate.source == "local_files":
+                stored = local_entry.inspections.get(candidate.candidate_id)
+                if stored is not None or candidate.candidate_id in local_entry.inspections:
+                    # F-PERF-07: reuse this pass's earlier inspection result,
+                    # including an explicit failure marker, instead of
+                    # re-reading and re-inspecting the same local file.
+                    reuse_inspection = stored
+            inspected: InspectedArtwork
+            if reuse_inspection is not _CACHE_MISS:
+                if isinstance(reuse_inspection, InspectedArtwork):
+                    inspected = reuse_inspection
+                else:
+                    _record_degradation("an artwork candidate could not be validated")
+                    continue
+            else:
+                try:
+                    content, declared_mime = await self._load(candidate, priority)
+                    inspected = await self._processor.inspect(
+                        candidate, content, declared_mime_type=declared_mime
+                    )
+                except ExternalServiceError:
+                    self._defer(
+                        candidate.source,
+                        deferred,
+                        "artwork provider download failed",
+                    )
+                    continue
+                except (ArtworkProcessingError, OSError):
+                    if local_entry is not None and candidate.source == "local_files":
+                        local_entry.inspections[candidate.candidate_id] = None
+                    _record_degradation("an artwork candidate could not be validated")
+                    continue
+                if local_entry is not None and candidate.source == "local_files":
+                    local_entry.inspections[candidate.candidate_id] = inspected
             if (
                 inspected.width is not None and inspected.width < settings.minimum_width
             ) or (

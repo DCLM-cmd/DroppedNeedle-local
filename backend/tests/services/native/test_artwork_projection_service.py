@@ -9,7 +9,12 @@ from api.v1.schemas.library_management import (
     complete_library_organizer_profile,
 )
 from core.exceptions import ExternalServiceError
+import os
+
+import msgspec
+
 from infrastructure.audio.artwork_processor import ArtworkProcessor
+from infrastructure.audio.artwork_processor import ArtworkProcessingError
 from infrastructure.queue.priority_queue import RequestPriority
 from models.audio_metadata import EmbeddedArtworkDescriptor
 from models.library_management_artwork import (
@@ -472,3 +477,282 @@ async def test_pdf_local_artwork_is_external_only(tmp_path: Path) -> None:
     assert len(projection.external) == 1
     assert projection.external[0].mime_type == "application/pdf"
     assert projection.external[0].image_type == "booklet"
+
+
+# --- F-PERF-07: per-pass local artwork inspection reuse ------------------------
+
+
+class _FsCounters:
+    def __init__(self) -> None:
+        self.walk = 0
+        self.read = 0
+        self.inspect = 0
+
+
+def _instrument_filesystem(service: ArtworkProjectionService, counters: _FsCounters):
+    real_walk = os.walk
+    real_read = type(service)._read_local_artwork
+    real_inspect = type(service._processor).inspect
+
+    def counting_walk(*args, **kwargs):
+        counters.walk += 1
+        return real_walk(*args, **kwargs)
+
+    def counting_read(*args, **kwargs):
+        counters.read += 1
+        return real_read(*args[1:], **kwargs)
+
+    async def counting_inspect(self, *args, **kwargs):
+        counters.inspect += 1
+        return await real_inspect(self, *args, **kwargs)
+
+    os.walk = counting_walk  # type: ignore[assignment]
+    type(service)._read_local_artwork = counting_read  # type: ignore[method-assign]
+    type(service._processor).inspect = counting_inspect  # type: ignore[method-assign]
+
+    def restore():
+        os.walk = real_walk  # type: ignore[assignment]
+        # _read_local_artwork is a @staticmethod: restore the descriptor, not
+        # the bare function, or later instance calls gain a phantom ``self``.
+        type(service)._read_local_artwork = staticmethod(real_read)  # type: ignore[method-assign]
+        type(service._processor).inspect = real_inspect  # type: ignore[method-assign]
+
+    return restore
+
+
+@pytest.mark.asyncio
+async def test_shared_pass_walks_once_and_loads_each_candidate_once(
+    tmp_path: Path,
+) -> None:
+    album = tmp_path / "album"
+    album.mkdir()
+    (album / "cover.jpg").write_bytes(_png(64, 64, (1, 2, 3)))
+    repository = StubArtworkRepository()
+    service = ArtworkProjectionService(repository, ArtworkProcessor())
+    settings = ArtworkManagementSettings(providers=["local_files", "embedded"])
+
+    pass_cache = service.new_pass_cache()
+    counters = _FsCounters()
+    restore = _instrument_filesystem(service, counters)
+    try:
+        existing = await service.inspect_existing_external(
+            settings, album, pass_cache=pass_cache
+        )
+        projection = await service.project(
+            settings=settings,
+            release_mbid=_RELEASE,
+            release_group_mbid=_RG,
+            album_directory=album,
+            existing_embedded=(),
+            existing_external=existing,
+            priority=RequestPriority.BACKGROUND_SYNC,
+            pass_cache=pass_cache,
+        )
+    finally:
+        restore()
+
+    assert len(existing) == 1 and len(projection.embedded) == 1
+    assert counters.walk == 1, "one enumeration serves both public calls"
+    assert counters.read == 1, "candidate bytes loaded at most once"
+    assert counters.inspect == 1, "candidate inspected at most once"
+
+
+@pytest.mark.asyncio
+async def test_cached_projection_equals_uncached_projection(tmp_path: Path) -> None:
+    album = tmp_path / "album"
+    album.mkdir()
+    (album / "cover.jpg").write_bytes(_png(100, 80, (9, 8, 7)))
+    settings = ArtworkManagementSettings(providers=["local_files", "embedded"])
+    repository = StubArtworkRepository()
+
+    async def run(use_cache: bool):
+        service = ArtworkProjectionService(repository, ArtworkProcessor())
+        pass_cache = service.new_pass_cache() if use_cache else None
+        cache_argument = (
+            {"pass_cache": pass_cache} if use_cache else {}
+        )
+        existing = await service.inspect_existing_external(
+            settings, album, **cache_argument
+        )
+        projection = await service.project(
+            settings=settings,
+            release_mbid=_RELEASE,
+            release_group_mbid=_RG,
+            album_directory=album,
+            existing_embedded=(),
+            existing_external=existing,
+            priority=RequestPriority.BACKGROUND_SYNC,
+            **cache_argument,
+        )
+        return existing, projection
+
+    cached_existing, cached_projection = await run(True)
+    plain_existing, plain_projection = await run(False)
+
+    assert cached_existing == plain_existing
+    assert cached_projection.decisions == plain_projection.decisions
+    assert [output.content for output in cached_projection.embedded] == [
+        output.content for output in plain_projection.embedded
+    ]
+    assert [
+        (output.image_type, output.width, output.byte_size)
+        for output in cached_projection.embedded
+    ] == [
+        (output.image_type, output.width, output.byte_size)
+        for output in plain_projection.embedded
+    ]
+    assert cached_projection.deferred_sources == plain_projection.deferred_sources
+    assert (
+        cached_projection.preserved_existing == plain_projection.preserved_existing
+    )
+
+
+@pytest.mark.asyncio
+async def test_cache_scope_isolated_by_root_and_patterns(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "front.jpg").write_bytes(_png(30, 30, (1, 1, 1)))
+    (second / "front.jpg").write_bytes(_png(40, 40, (2, 2, 2)))
+    service = ArtworkProjectionService(StubArtworkRepository(), ArtworkProcessor())
+    settings = ArtworkManagementSettings(
+        providers=["local_files"], external_enabled=True
+    )
+    pass_cache = service.new_pass_cache()
+
+    first_rows = await service.inspect_existing_external(
+        settings, first, pass_cache=pass_cache
+    )
+    second_rows = await service.inspect_existing_external(
+        settings, second, pass_cache=pass_cache
+    )
+    assert first_rows[0].width == 30 and second_rows[0].width == 40
+
+    # a different pattern tuple is an independent scope over the same root
+    narrowed = msgspec.structs.replace(
+        settings, local_file_patterns=["booklet.pdf"]
+    )
+    narrowed_rows = await service.inspect_existing_external(
+        narrowed, first, pass_cache=pass_cache
+    )
+    assert narrowed_rows == ()
+
+    # the original scope still serves its cached candidates untouched
+    again = await service.inspect_existing_external(
+        settings, first, pass_cache=pass_cache
+    )
+    assert again == first_rows
+
+
+@pytest.mark.asyncio
+async def test_failed_local_candidate_is_not_retried_within_one_pass(
+    tmp_path: Path,
+) -> None:
+    album = tmp_path / "album"
+    album.mkdir()
+    (album / "cover.png").write_bytes(_png(50, 50, (5, 5, 5)))
+    repository = StubArtworkRepository()
+    service = ArtworkProjectionService(repository, ArtworkProcessor())
+    settings = ArtworkManagementSettings(providers=["local_files", "embedded"])
+    pass_cache = service.new_pass_cache()
+
+    counters = _FsCounters()
+    restore = _instrument_filesystem(service, counters)
+    try:
+        # force the inspection itself to fail once during the inspect phase
+        real_processor_inspect = type(service._processor).inspect
+
+        async def failing_inspect(self, candidate, content, **kwargs):
+            if str(candidate.locator).endswith("cover.png"):
+                raise ArtworkProcessingError("corrupt image")
+            return await real_processor_inspect(self, candidate, content, **kwargs)
+
+        type(service._processor).inspect = failing_inspect  # type: ignore[method-assign]
+        existing = await service.inspect_existing_external(
+            settings, album, pass_cache=pass_cache
+        )
+        assert existing == ()
+
+        type(service._processor).inspect = real_processor_inspect  # type: ignore[method-assign]
+        projection = await service.project(
+            settings=settings,
+            release_mbid=_RELEASE,
+            release_group_mbid=_RG,
+            album_directory=album,
+            existing_embedded=(),
+            existing_external=existing,
+            priority=RequestPriority.BACKGROUND_SYNC,
+            pass_cache=pass_cache,
+        )
+    finally:
+        restore()
+
+    # The failure was recorded once during inspection and REUSED by project:
+    # project neither re-read nor re-inspected the same file after recovery
+    # (the counting inspector was restored, yet never ran again).
+    assert counters.read == 1
+    assert counters.inspect == 0
+    assert projection.embedded == ()
+    assert any(
+        decision.action == "skip" or decision.action == "preserve"
+        for decision in projection.decisions
+    ) or projection.decisions == ()
+
+
+@pytest.mark.asyncio
+async def test_callers_without_a_pass_cache_keep_the_uncached_behavior(
+    tmp_path: Path,
+) -> None:
+    album = tmp_path / "album"
+    album.mkdir()
+    (album / "cover.jpg").write_bytes(_png(64, 64, (3, 2, 1)))
+    service = ArtworkProjectionService(StubArtworkRepository(), ArtworkProcessor())
+    settings = ArtworkManagementSettings(providers=["local_files", "embedded"])
+
+    counters = _FsCounters()
+    restore = _instrument_filesystem(service, counters)
+    try:
+        existing = await service.inspect_existing_external(settings, album)
+        await service.project(
+            settings=settings,
+            release_mbid=_RELEASE,
+            release_group_mbid=_RG,
+            album_directory=album,
+            existing_embedded=(),
+            existing_external=existing,
+            priority=RequestPriority.BACKGROUND_SYNC,
+        )
+    finally:
+        restore()
+
+    assert counters.walk == 2  # unchanged when no pass cache is supplied
+    assert counters.read == 2 and counters.inspect == 2
+
+
+@pytest.mark.asyncio
+async def test_cached_candidates_still_respect_symlink_safety(tmp_path: Path) -> None:
+    album = tmp_path / "album"
+    album.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(_png(200, 200, (7, 7, 7)))
+    (album / "cover.jpg").write_bytes(_png(64, 64, (6, 6, 6)))
+
+    service = ArtworkProjectionService(StubArtworkRepository(), ArtworkProcessor())
+    settings = ArtworkManagementSettings(providers=["local_files"], external_enabled=True)
+    pass_cache = service.new_pass_cache()
+
+    first = await service.inspect_existing_external(
+        settings, album, pass_cache=pass_cache
+    )
+    assert len(first) == 1
+
+    # swap in a symlinked cover between passes: a NEW pass must reject it,
+    # while the old pass cache cannot leak stale candidates across scopes.
+    (album / "cover.jpg").unlink()
+    (album / "cover.jpg").symlink_to(outside)
+    fresh_cache = service.new_pass_cache()
+    rows = await service.inspect_existing_external(
+        settings, album, pass_cache=fresh_cache
+    )
+    assert rows == ()  # symlinked file excluded by the unchanged safety rules

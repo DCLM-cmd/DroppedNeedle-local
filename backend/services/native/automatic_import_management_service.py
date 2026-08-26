@@ -596,14 +596,20 @@ class AutomaticImportManagementService:
             canonical_available=True,
         )
         desired_metadata = self._metadata_document(effective)
+        # F-PERF-07: one bounded pass cache per automatic import so the
+        # projection reuses this inspection instead of walking twice.
+        artwork_pass_cache = self._artwork.new_pass_cache()
         existing_external = await self._artwork.inspect_existing_external(
-            profile.artwork, Path(request.input_path).parent
+            profile.artwork,
+            Path(request.input_path).parent,
+            pass_cache=artwork_pass_cache,
         )
         artwork = await self._artwork.project(
             settings=profile.artwork,
             release_mbid=canonical_release.identifiers.release_mbid,
             release_group_mbid=canonical_release.identifiers.release_group_mbid,
             album_directory=Path(request.input_path).parent,
+            pass_cache=artwork_pass_cache,
             existing_embedded=tuple(
                 ExistingArtworkDescriptor(
                     image_type=value.image_type,
