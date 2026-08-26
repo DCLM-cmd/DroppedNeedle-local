@@ -8150,6 +8150,15 @@ class NativeLibraryStore(PersistenceBase):
         return parent == "." or parent == child or child.startswith(f"{parent}/")
 
     @staticmethod
+    def _scan_scope_covers_path(ancestor: str, descendant: str) -> bool:
+        """True when ancestor path covers descendant within the same root."""
+        return (
+            ancestor == "."
+            or ancestor == descendant
+            or descendant.startswith(f"{ancestor}/")
+        )
+
+    @staticmethod
     def _scan_state_from_row(row: sqlite3.Row) -> ScanRun:
         counter_names = (
             "total_count",
@@ -8340,11 +8349,31 @@ class NativeLibraryStore(PersistenceBase):
                     "SELECT root_id, relative_path FROM library_scan_run_scopes WHERE run_id = ?",
                     (queued["id"],),
                 ).fetchall()
+                # Signed F-INDEXREC-01 rule: normalize the union of existing queued
+                # scopes and the request inside this transaction. For each root and
+                # matching policy revision retain the broadest ancestor and drop its
+                # descendants; a root "." supersedes every scope for that root.
                 additions = [
                     scope
                     for scope in request.scopes
                     if not any(self._scan_scope_covers(row, scope) for row in existing)
                 ]
+                superseded = [
+                    (str(row["root_id"]), str(row["relative_path"]))
+                    for row in existing
+                    if any(
+                        str(row["root_id"]) == scope.root_id
+                        and self._scan_scope_covers_path(scope.relative_path, str(row["relative_path"]))
+                        and str(row["relative_path"]) != scope.relative_path
+                        for scope in additions
+                    )
+                ]
+                if superseded:
+                    connection.executemany(
+                        "DELETE FROM library_scan_run_scopes WHERE run_id = ? "
+                        "AND root_id = ? AND relative_path = ?",
+                        [(str(queued["id"]), root_id, path) for root_id, path in superseded],
+                    )
                 self._insert_scan_scopes(connection, str(queued["id"]), additions)
                 updated = connection.execute(
                     "UPDATE library_scan_runs SET aggregate_scope = ?, updated_at = ?, "
@@ -12060,7 +12089,13 @@ class NativeLibraryStore(PersistenceBase):
                 "track.availability,track.manual_excluded,track.applied_policy,"
                 "track.applied_policy_revision,inventory.effective_policy AS "
                 "inventory_effective_policy,inventory.policy_revision AS "
-                "inventory_policy_revision FROM local_tracks AS track LEFT JOIN "
+                "inventory_policy_revision, EXISTS(SELECT 1 FROM library_scan_inventory "
+                "AS sibling WHERE sibling.run_id=? "
+                "AND sibling.root_id=track.root_id "
+                "AND sibling.relative_path=track.relative_path "
+                "AND sibling.discovery_generation=? "
+                "AND sibling.scope_relative_path != ?) AS "
+                "same_run_other_scope FROM local_tracks AS track LEFT JOIN "
                 "library_scan_inventory AS inventory ON inventory.run_id=? "
                 "AND inventory.root_id=track.root_id "
                 "AND inventory.relative_path=track.relative_path "
@@ -12069,6 +12104,9 @@ class NativeLibraryStore(PersistenceBase):
                 f"AND ({path_clause}) AND track.relative_path > COALESCE(?, '') "
                 "ORDER BY track.relative_path LIMIT ?",
                 (
+                    run_id,
+                    scope["discovery_generation"],
+                    relative_path,
                     run_id,
                     relative_path,
                     scope["discovery_generation"],
@@ -12119,6 +12157,11 @@ class NativeLibraryStore(PersistenceBase):
                 inventory_policy = track["inventory_effective_policy"]
                 inventory_revision = track["inventory_policy_revision"]
                 if inventory_policy is None:
+                    # F-INDEXREC-01 defense in depth: a same-run, same-root,
+                    # same-generation row under another scope means the path WAS
+                    # observed by this run; never mark it missing on scope label alone.
+                    if int(track["same_run_other_scope"] or 0):
+                        continue
                     if not allow_missing:
                         continue
                     missing_track_ids.add(str(track["id"]))

@@ -2579,3 +2579,236 @@ async def test_delayed_probe_failure_persists_fresh_terminal_and_scheduler_ancho
     reopened_run, _, _ = await reopened.get_scan_run(failed.id)
     assert reopened_run.terminal_at == fresh
     assert reopened_run.updated_at == fresh
+
+
+@pytest.mark.asyncio
+async def test_queued_child_then_ancestor_request_keeps_broadest_scope(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    await coordinator.request_run(
+        _request(resolver, relative_path="Other", trigger="manual")
+    )
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None
+    child = await coordinator.request_run(
+        _request(resolver, relative_path="Artist/Live", trigger="manual")
+    )
+    assert child.disposition == "queued"
+    parent = await coordinator.request_run(
+        _request(resolver, relative_path="Artist", trigger="automatic")
+    )
+    assert parent.disposition == "expanded"
+    assert parent.run_id == child.run_id
+    # The active run keeps its own unrelated scope; the queued run normalizes to
+    # the broadest ancestor only.
+    active_scopes = (await target_store.get_scan_run(active.id))[1]
+    assert {scope.relative_path for scope in active_scopes} == {"Other"}
+    _, scopes, _ = await target_store.get_scan_run(child.run_id)
+    paths = {scope.relative_path for scope in scopes}
+    assert paths == {"Artist"}
+
+
+@pytest.mark.asyncio
+async def test_queued_root_request_supersedes_descendants_and_keeps_other_roots(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "roots.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    store = NativeLibraryStore(db_path=db_path, write_lock=threading.Lock())
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(id="root-a", path=str(root_a), label="A", policy="automatic"),
+                LibraryRootSettings(id="root-b", path=str(root_b), label="B", policy="automatic"),
+            ]
+        )
+    )
+
+    def request(relative_path: str, root_id: str, trigger: str) -> ScanRequest:
+        return ScanRequest(
+            kind="incremental",
+            trigger=trigger,
+            policy_revision=resolver.policy_revision,
+            scopes=[
+                ScanScope(
+                    root_id=root_id,
+                    relative_path=relative_path,
+                    policy_revision=resolver.policy_revision,
+                )
+            ],
+        )
+
+    other = await store.request_scan_run(
+        request("Other", "root-a", "manual"), run_id="run-active", requested_at=1.0
+    )
+    assert other.disposition == "started"
+    active = await store.claim_next_scan_run(now=2.0)
+    assert active is not None
+    child = await store.request_scan_run(
+        request("Artist/Live", "root-b", "manual"), run_id="run-queued", requested_at=3.0
+    )
+    assert child.disposition == "queued"
+    unrelated = await store.request_scan_run(
+        request("Unrelated", "root-b", "automatic"), run_id="run-queued-2", requested_at=4.0
+    )
+    assert unrelated.disposition == "expanded"
+    root_req = await store.request_scan_run(
+        request(".", "root-b", "subsonic"), run_id="run-queued-3", requested_at=5.0
+    )
+    assert root_req.disposition == "expanded"
+    # The queued run only ever holds root-b work; root-a belongs to the active run.
+    active_scopes = (await store.get_scan_run(active.id))[1]
+    assert {scope.relative_path for scope in active_scopes} == {"Other"}
+    _, scopes, _ = await store.get_scan_run(child.run_id)
+    paths = {scope.relative_path for scope in scopes}
+    assert paths == {"."}
+    assert {scope.root_id for scope in scopes} == {"root-b"}
+
+
+@pytest.mark.asyncio
+async def test_requested_descendant_of_queued_ancestor_remains_suppressed(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    await coordinator.request_run(
+        _request(resolver, relative_path="Other", trigger="manual")
+    )
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None
+    parent = await coordinator.request_run(
+        _request(resolver, relative_path="Artist", trigger="manual")
+    )
+    assert parent.disposition == "queued"
+    child = await coordinator.request_run(
+        _request(resolver, relative_path="Artist/Live", trigger="automatic")
+    )
+    # The queued ancestor already covers the requested descendant: coalesced.
+    assert child.disposition == "coalesced"
+    _, scopes, _ = await target_store.get_scan_run(parent.run_id)
+    assert {scope.relative_path for scope in scopes} == {"Artist"}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_same_run_other_scope_row_is_not_marked_missing(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist" / "Live").mkdir(parents=True)
+    (root / "Artist" / "Live" / "track-1.flac").write_bytes(b"audio")
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    requested = await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=10)
+    assert run is not None
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+    tracks = await target_store.search_local_tracks("Track")
+    assert len(tracks) == 1
+    track = tracks[0]
+    # Simulate the overlap race: the same-run inventory row now carries a
+    # different scope label than the scope being reconciled.
+    with sqlite3.connect(target_store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_scan_inventory SET scope_relative_path = 'Artist' "
+            "WHERE run_id = ?",
+            (run.id,),
+        )
+        connection.execute(
+            "UPDATE library_scan_run_scopes SET discovery_generation = 1 "
+            "WHERE run_id = ? AND relative_path = '.'",
+            (run.id,),
+        )
+        connection.execute(
+            "UPDATE library_scan_inventory SET discovery_generation = 1 "
+            "WHERE run_id = ?",
+            (run.id,),
+        )
+        connection.execute(
+            "INSERT INTO library_scan_run_scopes "
+            "(run_id, scope_sequence, root_id, relative_path, effective_policy, "
+            "policy_revision, discovery_state, discovery_generation) "
+            "VALUES (?, 1, 'root-a', 'Artist/Live', 'automatic', ?, 'completed', 1)",
+            (run.id, resolver.policy_revision),
+        )
+        connection.commit()
+    # The scope row itself must be completed for reconcile to run; the guard
+    # applies when discovery_state is completed but the inventory label differs.
+    with sqlite3.connect(target_store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_scan_run_scopes SET discovery_state = 'completed' "
+            "WHERE run_id = ? AND relative_path = 'Artist/Live'",
+            (requested.run_id,),
+        )
+        connection.commit()
+    counts = await target_store.reconcile_scan_scope_batch(
+        run.id,
+        "root-a",
+        "Artist/Live",
+        now=20,
+        limit=100,
+        allow_missing=True,
+    )
+    assert counts["missing"] == 0
+    stored = await target_store.get_local_track(str(track["id"]))
+    assert stored is not None and stored["availability"] != "missing"
+
+
+@pytest.mark.asyncio
+async def test_genuine_missing_still_marks_and_publication_stays_protected(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist").mkdir()
+    (root / "Artist" / "track-1.flac").write_bytes(b"audio")
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    requested = await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=10)
+    assert run is not None
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+    tracks = await target_store.search_local_tracks("Track")
+    assert len(tracks) == 1
+    track_id = str(tracks[0]["id"])
+    # Genuine absence: no inventory row at all for the path. Reset the scope's
+    # reconciliation cursor so the completed run's own progress does not skip
+    # the only candidate track.
+    with sqlite3.connect(target_store.db_path) as connection:
+        connection.execute(
+            "DELETE FROM library_scan_inventory WHERE run_id = ?", (run.id,)
+        )
+        connection.execute(
+            "UPDATE library_scan_run_scopes SET reconciliation_cursor = NULL "
+            "WHERE run_id = ?", (run.id,),
+        )
+        connection.commit()
+    counts_probe = await target_store.reconcile_scan_scope_batch(
+        run.id, "root-a", ".", now=19, limit=100, allow_missing=True
+    )
+    counts = counts_probe
+    assert counts["missing"] == 1
+    stored = await target_store.get_local_track(track_id)
+    assert stored is not None and stored["availability"] == "missing"
+    # Concurrent-publication protection: allow_missing=False skips missing marking.
+    counts_protected = await target_store.reconcile_scan_scope_batch(
+        run.id, "root-a", ".", now=21, limit=100, allow_missing=False
+    )
+    assert counts_protected["missing"] == 0
