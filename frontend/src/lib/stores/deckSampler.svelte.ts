@@ -14,17 +14,23 @@
  */
 import { API } from '$lib/constants';
 import { api } from '$lib/api/client';
+import { SvelteSet } from 'svelte/reactivity';
 import { audioFocus } from '$lib/stores/audioFocus.svelte';
 import { playbackToast } from '$lib/stores/playbackToast.svelte';
 import type { AlbumPreviewResponse, PreviewTrackItem, TrackPreviewResponse } from '$lib/types';
 
 const FOCUS_ID = 'deck-sampler';
-const CROSSFADE_S = 2;
+const CROSSFADE_S = 0.5;
 const TICK_MS = 100;
-const VOLUME_KEY = 'droppedneedle_sampler_volume';
+// Playing this fixed private silent clip once on each pooled element during the
+// starting gesture lets later timer-driven source swaps pass browser autoplay
+// policy without ever exposing a remote unlock URL.
+const SILENT_CLIP =
+	'data:audio/wav;base64,UklGRjQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YRAAAAAAAAAAAAAAAAAAAAAAAAAA';
 // clips per album when playing a multi-entry station (keeps a lean-back station
 // moving); a single-album sample plays everything the backend returns
 const STATION_CLIPS_PER_ALBUM = 2;
+const VOLUME_KEY = 'droppedneedle_sampler_volume';
 
 function storedVolume(): number {
 	try {
@@ -62,34 +68,183 @@ function createDeckSampler() {
 	let volume = $state(storedVolume());
 	let stationTitle = $state('');
 
-	let audioA: HTMLAudioElement | null = null;
-	let audioB: HTMLAudioElement | null = null;
-	let activeEl: HTMLAudioElement | null = null;
-	let useA = true;
-	let ticker: ReturnType<typeof setInterval> | null = null;
-	let session = 0;
+	type IntervalHandle = ReturnType<typeof setInterval>;
+	type TimeoutHandle = ReturnType<typeof setTimeout>;
+	type SlotOwner = 'free' | 'unlock' | 'clip';
 
-	function clearTicker() {
+	interface PoolSlot {
+		el: HTMLAudioElement;
+		generation: number;
+		owner: SlotOwner;
+		fadeTimers: Set<IntervalHandle>;
+	}
+
+	interface AudioLease {
+		slot: PoolSlot;
+		element: HTMLAudioElement;
+		generation: number;
+		session: number;
+		owner: SlotOwner;
+	}
+
+	let poolA: PoolSlot | null = null;
+	let poolB: PoolSlot | null = null;
+	let activeLease: AudioLease | null = null;
+	let useA = true;
+	let ticker: IntervalHandle | null = null;
+	const transitionTimers = new SvelteSet<TimeoutHandle>();
+	let session = 0;
+	let playAttempt = 0;
+
+	function poolSlots(): PoolSlot[] {
+		const slots: PoolSlot[] = [];
+		if (poolA) slots.push(poolA);
+		if (poolB) slots.push(poolB);
+		return slots;
+	}
+
+	function clearTicker(expected?: IntervalHandle) {
+		if (expected !== undefined && ticker !== expected) {
+			clearInterval(expected);
+			return;
+		}
 		if (ticker) {
 			clearInterval(ticker);
 			ticker = null;
 		}
 	}
 
-	function teardownAudio() {
-		for (const el of [audioA, audioB]) {
-			if (el) {
-				el.pause();
-				el.src = '';
+	function clearTransitionTimers() {
+		for (const timer of transitionTimers) clearTimeout(timer);
+		transitionTimers.clear();
+	}
+
+	function clearSlotFades(slot: PoolSlot) {
+		for (const timer of slot.fadeTimers) clearInterval(timer);
+		slot.fadeTimers.clear();
+	}
+
+	function clearFade(slot: PoolSlot, timer: IntervalHandle) {
+		clearInterval(timer);
+		slot.fadeTimers.delete(timer);
+	}
+
+	function resetSlot(slot: PoolSlot) {
+		clearSlotFades(slot);
+		slot.generation++;
+		slot.owner = 'free';
+		slot.el.pause();
+		slot.el.removeAttribute('src');
+		slot.el.load();
+		slot.el.muted = false;
+		slot.el.volume = volume;
+	}
+
+	function ensurePool() {
+		if (!poolA) {
+			const el = new Audio();
+			el.preload = 'auto';
+			poolA = { el, generation: 0, owner: 'free', fadeTimers: new Set() };
+		}
+		if (!poolB) {
+			const el = new Audio();
+			el.preload = 'auto';
+			poolB = { el, generation: 0, owner: 'free', fadeTimers: new Set() };
+		}
+	}
+
+	function isCurrentLease(lease: AudioLease, mySession: number): boolean {
+		return (
+			mySession === session &&
+			lease.session === mySession &&
+			lease.slot.el === lease.element &&
+			lease.slot.generation === lease.generation &&
+			lease.slot.owner === lease.owner
+		);
+	}
+
+	function currentLease(slot: PoolSlot, mySession: number): AudioLease {
+		return {
+			slot,
+			element: slot.el,
+			generation: slot.generation,
+			session: mySession,
+			owner: slot.owner
+		};
+	}
+
+	function isCurrentPlayback(lease: AudioLease, mySession: number, attempt: number): boolean {
+		return isCurrentLease(lease, mySession) && activeLease === lease && playAttempt === attempt;
+	}
+
+	function claimSlot(slot: PoolSlot, mySession: number, owner: SlotOwner): AudioLease {
+		resetSlot(slot);
+		slot.owner = owner;
+		return {
+			slot,
+			element: slot.el,
+			generation: slot.generation,
+			session: mySession,
+			owner
+		};
+	}
+
+	/**
+	 * This is deliberately the only unlock path. `beginStation` calls it while
+	 * handling the user's starting click; `nextEl`/`claimSlot` only create or
+	 * replace resources and never attempt a gesture-only play.
+	 */
+	function unlockPool(mySession: number) {
+		ensurePool();
+		for (const slot of poolSlots()) {
+			const lease = claimSlot(slot, mySession, 'unlock');
+			const el = lease.element;
+			if (!isCurrentLease(lease, mySession)) continue;
+			el.muted = true;
+			el.src = SILENT_CLIP;
+			try {
+				const playPromise = el.play();
+				void playPromise.then(
+					() => {
+						if (!isCurrentLease(lease, mySession)) return;
+						el.pause();
+						el.muted = false;
+					},
+					() => {
+						if (!isCurrentLease(lease, mySession)) return;
+						el.muted = false;
+					}
+				);
+			} catch {
+				if (isCurrentLease(lease, mySession)) el.muted = false;
 			}
 		}
-		audioA = audioB = activeEl = null;
+	}
+
+	function clearAllFadeTimers() {
+		for (const slot of poolSlots()) clearSlotFades(slot);
+	}
+
+	function resetPool() {
+		for (const slot of poolSlots()) resetSlot(slot);
+	}
+
+	function pausePool(mySession: number) {
+		for (const slot of poolSlots()) {
+			const lease = currentLease(slot, mySession);
+			if (isCurrentLease(lease, mySession)) lease.element.pause();
+		}
 	}
 
 	function stopInternal() {
 		session++;
+		playAttempt++;
 		clearTicker();
-		teardownAudio();
+		clearTransitionTimers();
+		clearAllFadeTimers();
+		activeLease = null;
+		resetPool();
+		useA = true;
 		status = 'idle';
 		station = [];
 		entryIndex = 0;
@@ -105,49 +260,116 @@ function createDeckSampler() {
 		audioFocus.release(FOCUS_ID);
 	}
 
-	function nextEl(): HTMLAudioElement {
-		const el = new Audio();
-		el.preload = 'auto';
-		if (useA) {
-			audioB = el;
-		} else {
-			audioA = el;
-		}
-		return el;
+	function nextLease(mySession: number): AudioLease {
+		ensurePool();
+		const slot = useA ? poolA! : poolB!;
+		useA = !useA;
+		return claimSlot(slot, mySession, 'clip');
 	}
 
-	function applyVolumeRamp(el: HTMLAudioElement, fadeIn: boolean, crossfading: boolean) {
-		if (fadeIn && el.volume < volume) {
-			el.volume = Math.min(volume, el.volume + (volume * TICK_MS) / (CROSSFADE_S * 1000));
-		} else if (!fadeIn && el.volume > volume) {
-			// live slider adjustments apply immediately
-			el.volume = volume;
-		} else if (!crossfading && el.volume < volume) {
+	function applyVolumeRamp(
+		lease: AudioLease,
+		mySession: number,
+		fadeIn: boolean,
+		crossfading: boolean
+	) {
+		if (!isCurrentLease(lease, mySession)) return;
+		const el = lease.element;
+		if (fadeIn) {
+			const target = volume;
+			const step = (target * TICK_MS) / (CROSSFADE_S * 1000);
+			if (el.volume < target) {
+				el.volume = Math.min(target, el.volume + step);
+			} else if (!crossfading && el.volume > target) {
+				el.volume = target;
+			}
+		} else if (!crossfading && el.volume !== volume) {
 			el.volume = volume;
 		}
 	}
 
-	function runTicker(el: HTMLAudioElement, mySession: number, fadeIn: boolean) {
-		clearTicker();
-		let crossfading = false;
-		ticker = setInterval(() => {
-			if (mySession !== session || status === 'paused') {
-				clearTicker();
+	function fadeOut(lease: AudioLease, mySession: number) {
+		if (!isCurrentLease(lease, mySession)) return;
+		const slot = lease.slot;
+		const el = lease.element;
+		clearSlotFades(slot);
+		const startVolume = Math.max(0, Math.min(1, el.volume));
+		if (startVolume <= 0) {
+			el.pause();
+			return;
+		}
+		const stepsTotal = Math.max(1, Math.ceil((CROSSFADE_S * 1000) / TICK_MS));
+		let steps = 0;
+		const fade = setInterval(() => {
+			if (!slot.fadeTimers.has(fade)) {
+				clearInterval(fade);
 				return;
 			}
-			const duration = el.duration && isFinite(el.duration) ? el.duration : 30;
+			if (!isCurrentLease(lease, mySession) || (status !== 'playing' && status !== 'loading')) {
+				clearFade(slot, fade);
+				return;
+			}
+			steps++;
+			if (steps >= stepsTotal) {
+				el.volume = 0;
+				clearFade(slot, fade);
+				el.pause();
+				return;
+			}
+			el.volume = Math.max(0, startVolume * (1 - steps / stepsTotal));
+		}, TICK_MS);
+		slot.fadeTimers.add(fade);
+	}
+
+	function scheduleTransition(mySession: number, sourceLease: AudioLease, action: () => void) {
+		const timer = setTimeout(() => {
+			transitionTimers.delete(timer);
+			if (mySession !== session || !isCurrentLease(sourceLease, mySession)) return;
+			action();
+		}, CROSSFADE_S * 1000);
+		transitionTimers.add(timer);
+	}
+
+	function runTicker(lease: AudioLease, mySession: number, fadeIn: boolean, attempt: number) {
+		if (!isCurrentPlayback(lease, mySession, attempt)) return;
+		clearTicker();
+		let crossfading = false;
+		const interval = setInterval(() => {
+			if (!isCurrentPlayback(lease, mySession, attempt) || status !== 'playing') {
+				clearTicker(interval);
+				return;
+			}
+			const el = lease.element;
+			const duration = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : 30;
 			progress = Math.min(1, el.currentTime / duration);
-			applyVolumeRamp(el, fadeIn, crossfading);
+			applyVolumeRamp(lease, mySession, fadeIn, crossfading);
 			const remaining = duration - el.currentTime;
 			if (!crossfading && remaining <= CROSSFADE_S && remaining > 0) {
 				crossfading = true;
-				void advance(mySession, el);
+				void advance(mySession, lease, true);
 			}
 			if (el.ended) {
-				clearTicker();
-				if (!crossfading) void advance(mySession);
+				clearTicker(interval);
+				if (!crossfading) void advance(mySession, lease);
 			}
 		}, TICK_MS);
+		ticker = interval;
+	}
+
+	function isNotAllowedError(error: unknown): boolean {
+		if (typeof error !== 'object' || error === null || !('name' in error)) return false;
+		return (error as { name?: unknown }).name === 'NotAllowedError';
+	}
+
+	function pauseForBlockedPlayback(lease: AudioLease, mySession: number, attempt: number) {
+		if (!isCurrentPlayback(lease, mySession, attempt)) return;
+		clearTicker();
+		clearTransitionTimers();
+		clearAllFadeTimers();
+		playAttempt++;
+		pausePool(mySession);
+		status = 'paused';
+		playbackToast.show('Tap the preview play button to keep sampling', 'warning');
 	}
 
 	async function playTrack(index: number, mySession: number, fadeIn: boolean): Promise<void> {
@@ -156,59 +378,64 @@ function createDeckSampler() {
 		trackIndex = index;
 		progress = 0;
 
-		const el = nextEl();
-		useA = !useA;
+		const lease = nextLease(mySession);
+		const attempt = ++playAttempt;
+		activeLease = lease;
+		const el = lease.element;
+		if (!isCurrentPlayback(lease, mySession, attempt)) return;
 		el.src = track.preview_url;
+		el.muted = false;
 		el.volume = fadeIn ? 0 : volume;
-		activeEl = el;
 		try {
 			await el.play();
-		} catch {
-			// unplayable preview (expired URL, codec): skip forward
-			if (mySession === session) void advance(mySession);
-			return;
-		}
-		runTicker(el, mySession, fadeIn);
-	}
-
-	function fadeOut(el: HTMLAudioElement) {
-		const fade = setInterval(() => {
-			el.volume = Math.max(0, el.volume - (volume * TICK_MS) / (CROSSFADE_S * 1000));
-			if (el.volume <= 0) {
-				clearInterval(fade);
-				el.pause();
-			}
-		}, TICK_MS);
-	}
-
-	async function advance(mySession: number, fadeOutEl?: HTMLAudioElement): Promise<void> {
-		if (mySession !== session) return;
-		if (fadeOutEl) fadeOut(fadeOutEl);
-
-		// more clips in this entry -> crossfade within the album
-		if (trackIndex + 1 < tracks.length) {
-			await playTrack(trackIndex + 1, mySession, !!fadeOutEl);
-			return;
-		}
-
-		// entry exhausted -> next entry in the station (hard cut between albums)
-		if (entryIndex + 1 < station.length) {
-			if (fadeOutEl) {
-				// let the last clip fade out, then load the next entry
-				setTimeout(() => {
-					if (mySession === session) void loadEntry(entryIndex + 1, mySession);
-				}, CROSSFADE_S * 1000);
+		} catch (error) {
+			if (!isCurrentPlayback(lease, mySession, attempt)) return;
+			if (isNotAllowedError(error)) {
+				pauseForBlockedPlayback(lease, mySession, attempt);
 			} else {
-				await loadEntry(entryIndex + 1, mySession);
+				void advance(mySession, lease, false, true);
+			}
+			return;
+		}
+		if (!isCurrentPlayback(lease, mySession, attempt) || status !== 'playing') return;
+		runTicker(lease, mySession, fadeIn, attempt);
+	}
+
+	async function advance(
+		mySession: number,
+		sourceLease?: AudioLease,
+		shouldFade = false,
+		failedPlayback = false
+	): Promise<void> {
+		if (mySession !== session) return;
+		if (sourceLease && (!isCurrentLease(sourceLease, mySession) || activeLease !== sourceLease)) {
+			return;
+		}
+		const fadeOutLease = shouldFade ? sourceLease : undefined;
+		if (fadeOutLease) fadeOut(fadeOutLease, mySession);
+
+		if (trackIndex + 1 < tracks.length) {
+			await playTrack(trackIndex + 1, mySession, !!fadeOutLease);
+			return;
+		}
+
+		if (entryIndex + 1 < station.length) {
+			const nextIndex = entryIndex + 1;
+			if (fadeOutLease) {
+				scheduleTransition(mySession, fadeOutLease, () => {
+					void loadEntry(nextIndex, mySession);
+				});
+			} else {
+				await loadEntry(nextIndex, mySession);
 			}
 			return;
 		}
 
-		// natural end of the whole station
-		if (fadeOutEl) {
-			setTimeout(() => {
-				if (mySession === session) stopAll();
-			}, CROSSFADE_S * 1000);
+		const currentEntry = station[entryIndex];
+		if (failedPlayback && currentEntry) {
+			failOrEnd(currentEntry);
+		} else if (fadeOutLease) {
+			scheduleTransition(mySession, fadeOutLease, stopAll);
 		} else {
 			stopAll();
 		}
@@ -245,7 +472,10 @@ function createDeckSampler() {
 
 	async function loadEntry(index: number, mySession: number): Promise<void> {
 		if (mySession !== session) return;
-		clearTicker(); // a stale ticker from the previous entry must not double-fire
+		clearTicker();
+		clearTransitionTimers();
+		playAttempt++;
+		activeLease = null;
 		const entry = station[index];
 		if (!entry) {
 			stopAll();
@@ -256,12 +486,11 @@ function createDeckSampler() {
 		trackIndex = 0;
 		progress = 0;
 		provider = null;
-		status = status === 'idle' ? 'loading' : status;
+		status = 'loading';
 		try {
 			const result = await fetchEntryTracks(entry);
 			if (mySession !== session) return;
 			if (result.tracks.length === 0) {
-				// nothing playable for this entry -> try the next one
 				if (index + 1 < station.length) {
 					await loadEntry(index + 1, mySession);
 				} else {
@@ -275,7 +504,6 @@ function createDeckSampler() {
 			await playTrack(0, mySession, false);
 		} catch {
 			if (mySession !== session) return;
-			// transient fetch failure: skip to the next entry, or give up
 			if (index + 1 < station.length) {
 				await loadEntry(index + 1, mySession);
 			} else {
@@ -284,26 +512,31 @@ function createDeckSampler() {
 		}
 	}
 
-	/** End the run; on a single-item preview, tell the user it was unavailable
-	 * (the widget hides on 'error', so a toast is the only feedback). */
+	/** End the run; the widget hides on stop, so a toast is the only feedback. */
 	function failOrEnd(entry: SampleEntry) {
 		const wasSingle = station.length === 1;
 		stopAll();
-		if (wasSingle) {
-			status = 'error';
-			playbackToast.show(
-				entry.kind === 'album'
+		status = 'error';
+		playbackToast.show(
+			wasSingle
+				? entry.kind === 'album'
 					? `No preview available for ${entry.title}`
-					: `No preview available for that track`,
-				'warning'
-			);
-		}
+					: `No preview available for that track`
+				: 'Preview station ended: no more playable clips',
+			'warning'
+		);
 	}
 
 	function beginStation(title: string, entries: SampleEntry[]): void {
 		stopInternal();
-		if (entries.length === 0) return;
-		const mySession = ++session;
+		if (entries.length === 0) {
+			audioFocus.release(FOCUS_ID);
+			return;
+		}
+		const mySession = session;
+		// This call stays in the starting click so both persistent elements inherit
+		// the gesture before any fetch/timer can try a real preview.
+		unlockPool(mySession);
 		audioFocus.claim(FOCUS_ID, stopAll);
 		status = 'loading';
 		station = entries;
@@ -353,8 +586,10 @@ function createDeckSampler() {
 		},
 
 		setVolume(v: number): void {
-			volume = Math.min(1, Math.max(0, v));
-			if (activeEl) activeEl.volume = volume;
+			if (Number.isFinite(v)) volume = Math.min(1, Math.max(0, v));
+			if (activeLease && isCurrentLease(activeLease, session)) {
+				activeLease.element.volume = volume;
+			}
 			try {
 				localStorage.setItem(VOLUME_KEY, String(volume));
 			} catch {
@@ -394,25 +629,46 @@ function createDeckSampler() {
 		pause(): void {
 			if (status !== 'playing') return;
 			clearTicker();
-			for (const el of [audioA, audioB]) el?.pause();
+			clearTransitionTimers();
+			clearAllFadeTimers();
+			playAttempt++;
+			pausePool(session);
 			status = 'paused';
 		},
 
 		resume(): void {
-			if (status !== 'paused' || !activeEl) return;
-			status = 'playing';
-			const el = activeEl;
+			if (status !== 'paused' || !activeLease || !isCurrentLease(activeLease, session)) {
+				return;
+			}
+			const lease = activeLease;
 			const mySession = session;
-			el.play().then(
-				() => {
-					if (mySession === session && status === 'playing') runTicker(el, mySession, false);
-				},
-				() => {
-					// resume rejected (e.g. the preview URL expired while paused): skip
-					// forward instead of stalling a ticker on a dead element
-					if (mySession === session && status === 'playing') void advance(mySession);
+			const attempt = ++playAttempt;
+			status = 'playing';
+			if (!isCurrentPlayback(lease, mySession, attempt)) return;
+			try {
+				const playPromise = lease.element.play();
+				void playPromise.then(
+					() => {
+						if (!isCurrentPlayback(lease, mySession, attempt)) return;
+						runTicker(lease, mySession, false, attempt);
+					},
+					(error: unknown) => {
+						if (!isCurrentPlayback(lease, mySession, attempt)) return;
+						if (isNotAllowedError(error)) {
+							pauseForBlockedPlayback(lease, mySession, attempt);
+						} else {
+							void advance(mySession, lease, false, true);
+						}
+					}
+				);
+			} catch (error) {
+				if (!isCurrentPlayback(lease, mySession, attempt)) return;
+				if (isNotAllowedError(error)) {
+					pauseForBlockedPlayback(lease, mySession, attempt);
+				} else {
+					void advance(mySession, lease, false, true);
 				}
-			);
+			}
 		},
 
 		togglePlay(): void {
@@ -423,13 +679,16 @@ function createDeckSampler() {
 		/** Skip to the next station entry (no-op on the last one). */
 		next(): void {
 			if (entryIndex + 1 < station.length) {
+				const oldSession = session;
 				clearTicker();
-				for (const el of [audioA, audioB]) el?.pause(); // cut the current clip cleanly
+				clearTransitionTimers();
+				clearAllFadeTimers();
+				playAttempt++;
+				pausePool(oldSession);
 				const nextIndex = entryIndex + 1;
-				// bump the session so any in-flight loadEntry/advance chain (a rapid
-				// second skip, or a pending crossfade setTimeout) is invalidated and
-				// can't start a second <audio> alongside this one (one-sound rule)
 				const mySession = ++session;
+				activeLease = null;
+				status = 'loading';
 				void loadEntry(nextIndex, mySession);
 			}
 		},
