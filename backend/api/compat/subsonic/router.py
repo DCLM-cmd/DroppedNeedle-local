@@ -478,17 +478,16 @@ async def _album_list(c: Ctx):
     to_year = None
     genre = None
     if typ == "byYear":
-        # GH-294: Feishin and Navidrome treat toYear=0 as an open upper bound.
-        first = c.pint("fromYear", minimum=1, maximum=9999)
-        raw_last = c.pint("toYear", minimum=0, maximum=9999)
-        if first is None or raw_last is None:
+        # OpenSubsonic orders by the raw endpoint direction. Clients use year 0
+        # as an unbounded lower endpoint because real release years start at 1.
+        first = c.pint("fromYear", minimum=0, maximum=9999)
+        last = c.pint("toYear", minimum=0, maximum=9999)
+        if first is None or last is None:
             raise SubsonicError(10, "fromYear and toYear are required for byYear")
-        if raw_last == 0:
-            # GH-294: Feishin/Navidrome treat toYear=0 as an open upper bound.
-            from_year, to_year, sort = first, 9999, "year_asc"
-        else:
-            from_year, to_year = min(first, raw_last), max(first, raw_last)
-            sort = "year_asc" if first <= raw_last else "year_desc"
+        sort = "year_asc" if first <= last else "year_desc"
+        nonzero_bounds = [year for year in (first, last) if year != 0]
+        from_year = min(nonzero_bounds) if len(nonzero_bounds) == 2 else None
+        to_year = max(nonzero_bounds) if nonzero_bounds else None
     elif c.p("fromYear") is not None or c.p("toYear") is not None:
         raise SubsonicError(10, "fromYear and toYear require type=byYear")
     if typ == "byGenre":
