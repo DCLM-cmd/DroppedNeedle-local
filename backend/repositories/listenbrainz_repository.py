@@ -15,8 +15,9 @@ from infrastructure.cache.cache_keys import (
     listenbrainz_management_genres_key,
 )
 from infrastructure.cache.memory_cache import CacheInterface
-from infrastructure.resilience.retry import with_retry, CircuitBreaker
+from infrastructure.resilience.retry import CircuitOpenError, CircuitBreaker, with_retry
 from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
+from infrastructure.observability.provider_counters import record_provider_call
 from repositories.listenbrainz_models import (
     ListenBrainzArtist,
     ListenBrainzReleaseGroup,
@@ -242,6 +243,9 @@ class ListenBrainzRepository:
                     timeout=15.0,
                 )
 
+                # QW9 Part 3: one increment per wire attempt, classified from
+                # the status; this funnel has no priority lane -> "unlaned"
+                record_provider_call("listenbrainz", None, response.status_code)
                 if response.status_code == 204:
                     return None
 
@@ -287,6 +291,7 @@ class ListenBrainzRepository:
                     return None
 
             except httpx.HTTPError as e:
+                record_provider_call("listenbrainz", None, None)
                 raise ExternalServiceError(f"ListenBrainz request failed: {str(e)}")
 
     async def _get(
@@ -520,6 +525,26 @@ class ListenBrainzRepository:
             for item in result.get("payload", {}).get("recordings", [])
         ]
 
+    async def _stale_chart(self, cache_key: str, label: str) -> list:
+        """QW11 Part 3: breaker-open fallback for chart/stats getters.
+
+        Serves the expired entry past its TTL (peek reads without TTL
+        enforcement) so home/discover render last-known-good rankings instead
+        of empty sections during an LB outage. AGENTS.md Errors rule: a
+        fallback WITHOUT a degradation record is the anti-pattern, so the
+        staleness is always recorded. When no stale entry exists either the
+        original CircuitOpenError propagates - callers keep their current
+        empty-render behavior.
+        """
+        stale = await self._cache.peek(cache_key)
+        if stale:
+            _record_degradation(f"Circuit open: serving stale ListenBrainz {label}")
+            return stale
+        raise CircuitOpenError(
+            f"Circuit breaker 'listenbrainz' is OPEN and no stale data for {label}",
+            breaker_name="listenbrainz",
+        )
+
     async def get_user_genre_activity(
         self, username: str | None = None
     ) -> list[ListenBrainzGenreActivity]:
@@ -532,7 +557,10 @@ class ListenBrainzRepository:
         if cached:
             return cached
 
-        result = await self._get(f"/1/stats/user/{user}/genre-activity")
+        try:
+            result = await self._get(f"/1/stats/user/{user}/genre-activity")
+        except CircuitOpenError:
+            return await self._stale_chart(cache_key, f"user genre activity ({user})")
 
         if not result:
             return []
@@ -564,7 +592,12 @@ class ListenBrainzRepository:
             return cached
 
         params = {"count": min(count, 100), "offset": offset, "range": range_}
-        result = await self._get("/1/stats/sitewide/artists", params=params)
+        try:
+            result = await self._get("/1/stats/sitewide/artists", params=params)
+        except CircuitOpenError:
+            return await self._stale_chart(
+                cache_key, f"sitewide top artists ({range_})"
+            )
         if not result:
             return []
         artists = [
@@ -586,7 +619,12 @@ class ListenBrainzRepository:
             return cached
 
         params = {"count": min(count, 100), "offset": offset, "range": range_}
-        result = await self._get("/1/stats/sitewide/release-groups", params=params)
+        try:
+            result = await self._get("/1/stats/sitewide/release-groups", params=params)
+        except CircuitOpenError:
+            return await self._stale_chart(
+                cache_key, f"sitewide top release-groups ({range_})"
+            )
         if not result:
             return []
         groups = [
@@ -609,7 +647,12 @@ class ListenBrainzRepository:
             return cached
 
         params = {"count": min(count, 100), "offset": offset, "range": range_}
-        result = await self._get("/1/stats/sitewide/recordings", params=params)
+        try:
+            result = await self._get("/1/stats/sitewide/recordings", params=params)
+        except CircuitOpenError:
+            return await self._stale_chart(
+                cache_key, f"sitewide top recordings ({range_})"
+            )
         if not result:
             return []
         recordings = [

@@ -21,6 +21,7 @@ from infrastructure.cache.cache_keys import (
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
 from infrastructure.resilience.retry import CircuitBreaker, with_retry
+from infrastructure.observability.provider_counters import record_provider_call
 from repositories.lastfm_models import (
     ALLOWED_LASTFM_PERIOD,
     LastFmAlbum,
@@ -225,6 +226,11 @@ class LastFmRepository:
                     timeout=15.0,
                 )
 
+            # QW9 Part 3: one increment per wire attempt; Last.fm reports
+            # application errors as HTTP 200 bodies, which stay "ok" here by
+            # design (classification is status-based). Unlaned funnel.
+            record_provider_call("lastfm", None, response.status_code)
+
             if response.status_code != 200:
                 raise ExternalServiceError(
                     f"Last.fm request failed ({response.status_code})",
@@ -239,10 +245,10 @@ class LastFmRepository:
             self._handle_error_response(data)
             _lastfm_circuit_breaker.record_success()
             return data
-
         except (ConfigurationError, ExternalServiceError, ResourceNotFoundError):
             raise
         except httpx.HTTPError as e:
+            record_provider_call("lastfm", None, None)
             raise ExternalServiceError(f"Last.fm request failed: {e}")
 
     async def get_token(self) -> LastFmToken:

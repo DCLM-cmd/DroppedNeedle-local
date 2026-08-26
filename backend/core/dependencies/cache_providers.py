@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from core.config import get_settings
+from infrastructure.cache.cache_metrics import InstrumentedCache
 from infrastructure.cache.memory_cache import InMemoryCache, CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.cache.cache_keys import (
@@ -33,7 +34,9 @@ def get_cache() -> CacheInterface:
     preferences_service = get_preferences_service()
     advanced = preferences_service.get_advanced_settings()
     max_entries = advanced.memory_cache_max_entries
-    return InMemoryCache(max_entries=max_entries)
+    # QW9 Part 2: single injection point - every CacheInterface consumer gets
+    # the instrumented singleton, so hit/miss/set/delete recording is fleet-wide.
+    return InstrumentedCache(InMemoryCache(max_entries=max_entries))
 
 
 @singleton

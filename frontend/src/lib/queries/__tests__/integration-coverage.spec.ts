@@ -589,6 +589,9 @@ const COVERAGE: Array<[string, string, string]> = [
 	],
 	// external-service health for the header status indicator
 	['system health', API.system.health(), '/api/v1/system/health'],
+	// QW9 runtime observability (admin diagnostics card)
+	['system queue stats', API.system.queueStats(), '/api/v1/system/queue-stats'],
+	['system provider stats', API.system.providerStats(), '/api/v1/system/provider-stats'],
 	// keyless 30s previews (user-scoped)
 	[
 		'track preview',

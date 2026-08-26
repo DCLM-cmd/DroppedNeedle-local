@@ -36,6 +36,7 @@ from repositories.coverart_disk_cache import CoverDiskCache
 from infrastructure.degradation import try_get_degradation_context
 from infrastructure.integration_result import IntegrationResult
 from infrastructure.service_health import report_breaker_health
+from infrastructure.observability.provider_counters import record_provider_call
 from models.library_management_artwork import ArtworkCandidate, ArtworkImageType
 from repositories.coverart_management_models import CaaManagementResponse
 
@@ -443,7 +444,16 @@ class CoverArtRepository:
         self, url: str, priority: RequestPriority, **kwargs
     ) -> httpx.Response:
         await _coverart_rate_limiter.acquire()
-        return await self._perform_http_get(url, priority, "coverart", **kwargs)
+        try:
+            response = await self._perform_http_get(url, priority, "coverart", **kwargs)
+        except (httpx.HTTPError, ExternalServiceError, RateLimitedError):
+            # QW9 Part 3: 429/5xx raise inside _perform_http_get (via
+            # _raise_retryable_status) and transport errors raise from the
+            # client; record them so http_error does not undercount.
+            record_provider_call("coverart", priority, None)
+            raise
+        record_provider_call("coverart", priority, response.status_code)
+        return response
 
     @with_retry(
         max_attempts=3,
@@ -708,35 +718,42 @@ class CoverArtRepository:
         priority_mgr = get_priority_queue()
         semaphore = await priority_mgr.acquire_slot(priority)
         async with semaphore:
-            async with self._client.stream("GET", url) as response:
-                self._raise_retryable_status(response, "coverart", url)
-                content_type = response.headers.get("Content-Type")
-                if content_type is not None:
-                    content_type = (
-                        content_type.partition(";")[0].strip().casefold() or None
-                    )
-                if response.status_code != 200:
-                    return response.status_code, b"", content_type
-                declared_length = response.headers.get("Content-Length")
-                if declared_length is not None:
-                    try:
-                        too_large = int(declared_length) > maximum_bytes
-                    except ValueError:
-                        too_large = False
-                    if too_large:
-                        raise ArtworkProcessingError(
-                            "Artwork download exceeds the byte safety limit."
+            try:
+                async with self._client.stream("GET", url) as response:
+                    self._raise_retryable_status(response, "coverart", url)
+                    # QW9 Part 3: record once the status is known; 429/5xx
+                    # raise above and land in the except below instead.
+                    record_provider_call("coverart", priority, response.status_code)
+                    content_type = response.headers.get("Content-Type")
+                    if content_type is not None:
+                        content_type = (
+                            content_type.partition(";")[0].strip().casefold() or None
                         )
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in response.aiter_bytes():
-                    total += len(chunk)
-                    if total > maximum_bytes:
-                        raise ArtworkProcessingError(
-                            "Artwork download exceeds the byte safety limit."
-                        )
-                    chunks.append(chunk)
-                return response.status_code, b"".join(chunks), content_type
+                    if response.status_code != 200:
+                        return response.status_code, b"", content_type
+                    declared_length = response.headers.get("Content-Length")
+                    if declared_length is not None:
+                        try:
+                            too_large = int(declared_length) > maximum_bytes
+                        except ValueError:
+                            too_large = False
+                        if too_large:
+                            raise ArtworkProcessingError(
+                                "Artwork download exceeds the byte safety limit."
+                            )
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > maximum_bytes:
+                            raise ArtworkProcessingError(
+                                "Artwork download exceeds the byte safety limit."
+                            )
+                        chunks.append(chunk)
+                    return response.status_code, b"".join(chunks), content_type
+            except (httpx.HTTPError, ExternalServiceError, RateLimitedError):
+                record_provider_call("coverart", priority, None)
+                raise
 
     async def get_release_group_cover_etag(
         self,

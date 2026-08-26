@@ -3,9 +3,18 @@ header health indicator). Signal-driven from the in-process ServiceHealthRegistr
 
 from fastapi import APIRouter
 
+from api.v1.schemas.system import (
+    ProviderRateLimitStat,
+    ProviderStatRow,
+    ProviderStatsResponse,
+    QueueStatsResponse,
+    QueueStatsRow,
+)
 from infrastructure.msgspec_fastapi import AppStruct, MsgSpecRoute
+from infrastructure.observability import provider_counters
+from infrastructure.queue.priority_queue import get_priority_queue
 from infrastructure.service_health import service_health
-from middleware import CurrentUserDep
+from middleware import CurrentAdminDep, CurrentUserDep
 
 
 class ServiceHealthItem(AppStruct):
@@ -39,4 +48,24 @@ async def get_system_health(current_user: CurrentUserDep) -> SystemHealthRespons
             )
             for e in entries
         ]
+    )
+
+
+@router.get("/queue-stats", response_model=QueueStatsResponse)
+async def get_queue_stats(_: CurrentAdminDep) -> QueueStatsResponse:
+    """Pure in-memory gauge of priority-lane occupancy; no service layer."""
+    return QueueStatsResponse(stats=QueueStatsRow(**get_priority_queue().get_stats()))
+
+
+@router.get("/provider-stats", response_model=ProviderStatsResponse)
+async def get_provider_stats(_: CurrentAdminDep) -> ProviderStatsResponse:
+    rows = provider_counters.snapshot_provider_rows()
+    return ProviderStatsResponse(
+        providers=[ProviderStatRow(**row) for row in rows],
+        window_seconds=provider_counters.DEFAULT_WINDOW_SECONDS,
+        counters_since=provider_counters.counters_since(),
+        rate_limits=[
+            ProviderRateLimitStat(**row)
+            for row in provider_counters.snapshot_rate_limit_rows()
+        ],
     )

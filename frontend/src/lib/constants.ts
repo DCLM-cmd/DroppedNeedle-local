@@ -580,7 +580,9 @@ export const API = {
 			`/api/v1/search/suggest?q=${encodeURIComponent(query.trim())}&limit=${limit}`
 	},
 	system: {
-		health: () => '/api/v1/system/health'
+		health: () => '/api/v1/system/health',
+		queueStats: () => '/api/v1/system/queue-stats',
+		providerStats: () => '/api/v1/system/provider-stats'
 	},
 	home: () => '/api/v1/home',
 	homeGenre: (genre: string, limit = 50, artistOffset = 0, albumOffset = 0) => {

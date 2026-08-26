@@ -38,6 +38,17 @@ async def clear_disk_cache(
     return result
 
 
+@router.post("/clear/metadata", response_model=CacheClearResponse)
+async def clear_metadata_cache(
+    _: CurrentAdminDep,
+    cache_service: CacheService = Depends(get_cache_service),
+):
+    result = await cache_service.clear_metadata_cache()
+    if not result.success:
+        raise HTTPException(status_code=500, detail=result.message)
+    return result
+
+
 @router.post("/clear/all", response_model=CacheClearResponse)
 async def clear_all_cache(
     _: CurrentAdminDep,

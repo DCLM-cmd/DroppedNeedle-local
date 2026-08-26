@@ -9,6 +9,10 @@ from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
 from infrastructure.queue.priority_queue import RequestPriority, get_priority_queue
 from infrastructure.http.deduplication import RequestDeduplicator
 from infrastructure.service_health import report_breaker_health
+from infrastructure.observability.provider_counters import (
+    record_provider_call,
+    record_rate_limit_headers,
+)
 from repositories.edition_policy import recall_key
 
 _mb_api_base: str = "https://musicbrainz.org/ws/2"
@@ -93,7 +97,17 @@ async def mb_api_get(
         url = f"{get_mb_api_base()}{path}"
         request_params = dict(params) if params else {}
         request_params["fmt"] = "json"
-        response = await client.get(url, params=request_params)
+        try:
+            response = await client.get(url, params=request_params)
+        except httpx.HTTPError:
+            # transport-level failure (e.g. h2 stream reset): never produced a
+            # response, so record http_error with no status and re-raise
+            record_provider_call("musicbrainz", priority, None)
+            raise
+        record_provider_call("musicbrainz", priority, response.status_code)
+        # QW11 Part 2: free early-warning telemetry from the same response.
+        # Separate gauge - this cannot perturb the call counters above.
+        record_rate_limit_headers("musicbrainz", response.headers)
         if response.status_code == 404:
             if decode_type is not None:
                 return decode_type()

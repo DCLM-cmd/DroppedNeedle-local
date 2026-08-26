@@ -162,7 +162,6 @@ vi.mock('$lib/components/lazyComponentLoaders', () => ({
 
 import Layout from '../../routes/+layout.svelte';
 import { authStore, type AuthUser } from '$lib/stores/authStore.svelte';
-import { resetPlaylistModal } from '$lib/stores/playlistModal.svelte';
 import { discographyDownloadStore } from '$lib/stores/discographyDownload.svelte';
 import { batchDownloadStore } from '$lib/stores/batchDownloadStatus.svelte';
 

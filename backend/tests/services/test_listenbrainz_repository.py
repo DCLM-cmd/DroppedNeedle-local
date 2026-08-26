@@ -8,10 +8,13 @@ from infrastructure.degradation import (
     clear_degradation_context,
     init_degradation_context,
 )
+from infrastructure.resilience.retry import CircuitOpenError
 from repositories.listenbrainz_repository import ListenBrainzRepository
 
 
-def _make_repo(username: str = "user", user_token: str = "tok-abc") -> tuple[ListenBrainzRepository, AsyncMock]:
+def _make_repo(
+    username: str = "user", user_token: str = "tok-abc"
+) -> tuple[ListenBrainzRepository, AsyncMock]:
     http_client = AsyncMock(spec=httpx.AsyncClient)
     cache = MagicMock()
     cache.get = AsyncMock(return_value=None)
@@ -38,9 +41,7 @@ class TestSubmitNowPlaying:
     async def test_posts_playing_now_payload(self):
         repo, http_client = _make_repo()
         http_client.request = AsyncMock(return_value=_ok_response())
-        result = await repo.submit_now_playing(
-            artist_name="Artist", track_name="Track"
-        )
+        result = await repo.submit_now_playing(artist_name="Artist", track_name="Track")
         assert result is True
         call_args = http_client.request.call_args
         assert call_args.args[0] == "POST"
@@ -78,7 +79,9 @@ class TestSubmitNowPlaying:
         repo, http_client = _make_repo()
         http_client.request = AsyncMock(return_value=_ok_response())
         await repo.submit_now_playing(artist_name="A", track_name="T")
-        track_meta = http_client.request.call_args.kwargs["json"]["payload"][0]["track_metadata"]
+        track_meta = http_client.request.call_args.kwargs["json"]["payload"][0][
+            "track_metadata"
+        ]
         assert "release_name" not in track_meta
         assert "additional_info" not in track_meta
 
@@ -126,7 +129,9 @@ class TestSubmitSingleListen:
             release_name="Album",
             duration_ms=180000,
         )
-        track_meta = http_client.request.call_args.kwargs["json"]["payload"][0]["track_metadata"]
+        track_meta = http_client.request.call_args.kwargs["json"]["payload"][0][
+            "track_metadata"
+        ]
         assert track_meta["release_name"] == "Album"
         assert track_meta["additional_info"]["duration_ms"] == 180000
 
@@ -137,7 +142,9 @@ class TestSubmitSingleListen:
         await repo.submit_single_listen(
             artist_name="A", track_name="T", listened_at=1700000000
         )
-        track_meta = http_client.request.call_args.kwargs["json"]["payload"][0]["track_metadata"]
+        track_meta = http_client.request.call_args.kwargs["json"]["payload"][0][
+            "track_metadata"
+        ]
         assert "release_name" not in track_meta
         assert "additional_info" not in track_meta
 
@@ -214,7 +221,8 @@ class TestUpstreamPolicyBlocks:
         repo, http_client = _make_repo()
         http_client.request = AsyncMock(
             return_value=self._resp(
-                500, '{"code":500,"error":"Popularity API currently disabled due to high load..."}'
+                500,
+                '{"code":500,"error":"Popularity API currently disabled due to high load..."}',
             )
         )
 
@@ -303,3 +311,136 @@ class TestBorrowedReadToken:
         with pytest.raises(ExternalServiceError):
             await repo.submit_now_playing("Artist", "Track")
         http_client.request.assert_not_called()
+
+
+class TestStaleChartServing:
+    """QW11 Part 3: while the 'listenbrainz' breaker is OPEN, chart/stats
+    getters serve the expired cache entry (flagged via DegradationContext)
+    instead of rendering empty; without any stale entry the CircuitOpenError
+    propagates exactly as before."""
+
+    def _breaker_open_repo(self) -> tuple[ListenBrainzRepository, MagicMock]:
+        repo, http_client = _make_repo()
+        cache = MagicMock()
+        cache.get = AsyncMock(return_value=None)  # ordinary read misses
+        cache.peek = AsyncMock(return_value=None)
+        repo._cache = cache
+
+        async def circuit_open(*args, **kwargs):
+            raise CircuitOpenError(
+                "Circuit breaker 'listenbrainz' is OPEN",
+                breaker_name="listenbrainz",
+                retry_after_seconds=42.0,
+            )
+
+        repo._get = circuit_open
+        return repo, cache
+
+    def _recording_context(self, monkeypatch) -> list:
+        """Install a real DegradationContext wrapped by a record-spy, since
+        DegradationContext is slotted and its methods cannot be patched."""
+        recorded: list = []
+
+        class _RecordSpy:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def record(self, result):
+                recorded.append(result)
+                self._inner.record(result)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        ctx = init_degradation_context()
+        monkeypatch.setattr(
+            "repositories.listenbrainz_repository.try_get_degradation_context",
+            lambda: _RecordSpy(ctx),
+        )
+        return recorded
+
+    @pytest.mark.asyncio
+    async def test_open_breaker_serves_stale_sitewide_artists_with_record(
+        self, monkeypatch
+    ):
+        recorded = self._recording_context(monkeypatch)
+        repo, cache = self._breaker_open_repo()
+        stale_payload = [MagicMock(name="stale-artist")]
+        cache.peek = AsyncMock(return_value=stale_payload)
+
+        result = await repo.get_sitewide_top_artists()
+
+        assert result is stale_payload
+        # The degradation record IS the stale flag: a fallback without one is
+        # the anti-pattern this test exists to prevent.
+        assert len(recorded) == 1
+        assert "stale" in recorded[0].error_message.lower()
+        assert recorded[0].source == "listenbrainz"
+
+    @pytest.mark.asyncio
+    async def test_open_breaker_serves_stale_release_groups_and_recordings(
+        self, monkeypatch
+    ):
+        recorded = self._recording_context(monkeypatch)
+        repo, cache = self._breaker_open_repo()
+        stale_groups = [MagicMock(name="stale-rg")]
+        cache.peek = AsyncMock(return_value=stale_groups)
+
+        assert await repo.get_sitewide_top_release_groups() is stale_groups
+        assert "release-groups" in recorded[-1].error_message
+
+        stale_recs = [MagicMock(name="stale-recording")]
+        cache.peek = AsyncMock(return_value=stale_recs)
+        assert await repo.get_sitewide_top_recordings() is stale_recs
+        assert "recordings" in recorded[-1].error_message
+
+    @pytest.mark.asyncio
+    async def test_open_breaker_serves_stale_user_genre_activity(self, monkeypatch):
+        recorded = self._recording_context(monkeypatch)
+        repo, cache = self._breaker_open_repo()
+        stale_genres = [MagicMock(name="stale-genre")]
+        cache.peek = AsyncMock(return_value=stale_genres)
+
+        result = await repo.get_user_genre_activity(username="user")
+        assert result is stale_genres
+        assert "genre activity" in recorded[-1].error_message
+
+    @pytest.mark.asyncio
+    async def test_no_stale_entry_reraises_circuit_open_error(self, monkeypatch):
+        self._recording_context(monkeypatch)
+        repo, cache = self._breaker_open_repo()
+        cache.peek = AsyncMock(return_value=None)
+
+        with pytest.raises(CircuitOpenError):
+            await repo.get_sitewide_top_artists()
+
+    @pytest.mark.asyncio
+    async def test_fallback_without_degradation_record_fails_the_contract(
+        self, monkeypatch
+    ):
+        """Guard the AGENTS.md rule directly: if a stale payload is served,
+        a degradation record MUST exist. Simulate a broken implementation by
+        asserting on both sides of the contract."""
+        recorded = self._recording_context(monkeypatch)
+        repo, cache = self._breaker_open_repo()
+        stale_payload = [MagicMock()]
+        cache.peek = AsyncMock(return_value=stale_payload)
+
+        result = await repo.get_sitewide_top_artists()
+
+        served_stale = result is stale_payload
+        recorded_stale = any("stale" in r.error_message.lower() for r in recorded)
+        # Contract: stale service and degradation record are inseparable.
+        assert served_stale == recorded_stale == True  # noqa: E712
+
+    @pytest.mark.asyncio
+    async def test_ordinary_hit_short_circuits_before_breaker_path(self):
+        repo, cache = self._breaker_open_repo()
+        fresh_payload = [MagicMock(name="fresh")]
+        cache.get = AsyncMock(return_value=fresh_payload)
+
+        assert await repo.get_sitewide_top_artists() is fresh_payload
+        cache.peek.assert_not_awaited()
+
+    def teardown_method(self):
+        clear_degradation_context()

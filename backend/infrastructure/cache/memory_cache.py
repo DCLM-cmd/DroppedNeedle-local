@@ -10,39 +10,43 @@ class CacheInterface(ABC):
     @abstractmethod
     async def get(self, key: str) -> Optional[Any]:
         pass
-    
+
     @abstractmethod
     async def set(self, key: str, value: Any, ttl_seconds: int = 60) -> None:
         pass
-    
+
     @abstractmethod
     async def delete(self, key: str) -> None:
         pass
-    
+
     @abstractmethod
     async def clear(self) -> None:
         pass
-    
-    @abstractmethod
-    async def clear_prefix(self, prefix: str) -> int:
-        pass
-    
+
     @abstractmethod
     async def cleanup_expired(self) -> int:
         pass
-    
+
+    @abstractmethod
+    async def peek(self, key: str) -> Optional[Any]:
+        """Expired-tolerant read: return the entry value even when its TTL has
+        passed, without evicting it, refreshing LRU order, or extending TTL.
+        Returns None only when the key is absent. Used for stale-serving
+        fallbacks (QW11 Part 3); ordinary reads must use get()."""
+        pass
+
     @abstractmethod
     def size(self) -> int:
         pass
-    
+
     @abstractmethod
     def estimate_memory_bytes(self) -> int:
         pass
 
 
 class CacheEntry:
-    __slots__ = ('value', 'expires_at')
-    
+    __slots__ = ("value", "expires_at")
+
     def __init__(self, value: Any, ttl_seconds: int):
         self.value = value
         self.expires_at = time.time() + ttl_seconds
@@ -76,12 +80,21 @@ class InMemoryCache(CacheInterface):
             self._hits += 1
             return entry.value
 
+    async def peek(self, key: str) -> Optional[Any]:
+        # Deliberately no move_to_end (LRU untouched) and no pop: a peek is a
+        # read-only observation, even of expired entries.
+        async with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            return entry.value
+
     async def set(self, key: str, value: Any, ttl_seconds: int = 60) -> None:
         async with self._lock:
             if key not in self._cache and len(self._cache) >= self._max_entries:
                 oldest_key, _ = self._cache.popitem(last=False)
                 self._evictions += 1
-            
+
             self._cache[key] = CacheEntry(value, ttl_seconds)
             self._cache.move_to_end(key)
 
@@ -98,25 +111,24 @@ class InMemoryCache(CacheInterface):
             keys_to_remove = [k for k in self._cache.keys() if k.startswith(prefix)]
             for key in keys_to_remove:
                 self._cache.pop(key, None)
-        
+
         return len(keys_to_remove)
 
     async def cleanup_expired(self) -> int:
         now = time.time()
-        
+
         async with self._lock:
             expired_keys = [
-                key for key, entry in self._cache.items()
-                if now > entry.expires_at
+                key for key, entry in self._cache.items() if now > entry.expires_at
             ]
             for key in expired_keys:
                 self._cache.pop(key, None)
-        
+
         return len(expired_keys)
-    
+
     def size(self) -> int:
         return len(self._cache)
-    
+
     def estimate_memory_bytes(self) -> int:
         total_size = 0
 
@@ -139,5 +151,5 @@ class InMemoryCache(CacheInterface):
             "misses": self._misses,
             "hit_rate_percent": round(hit_rate, 2),
             "evictions": self._evictions,
-            "memory_bytes": self.estimate_memory_bytes()
+            "memory_bytes": self.estimate_memory_bytes(),
         }

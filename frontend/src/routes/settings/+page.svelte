@@ -31,7 +31,8 @@
 		ShoppingBag,
 		Landmark,
 		Blocks,
-		PanelLeft
+		PanelLeft,
+		Activity
 	} from 'lucide-svelte';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';
@@ -103,7 +104,8 @@
 					{ id: 'users', label: 'Users', tier: 'system', icon: Users },
 					{ id: 'security', label: 'Security', tier: 'system', icon: ShieldCheck },
 					{ id: 'plugins', label: 'Plugins', tier: 'system', icon: Blocks },
-					{ id: 'wrapped', label: 'Wrapped API', tier: 'system', icon: Gift }
+					{ id: 'wrapped', label: 'Wrapped API', tier: 'system', icon: Gift },
+					{ id: 'diagnostics', label: 'Diagnostics', tier: 'system', icon: Activity }
 				]
 			: []),
 		{ id: 'advanced', label: 'Advanced', tier: 'system', icon: Settings },

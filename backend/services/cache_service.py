@@ -6,10 +6,11 @@ import time
 from pathlib import Path
 
 from infrastructure.cache.memory_cache import CacheInterface
+from infrastructure.cache.cache_metrics import InstrumentedCache
 from infrastructure.cache.cache_keys import AUDIODB_PREFIX
 from infrastructure.persistence import LibraryDB
 from infrastructure.cache.disk_cache import DiskMetadataCache
-from api.v1.schemas.cache import CacheStats, CacheClearResponse
+from api.v1.schemas.cache import CacheStats, CacheClearResponse, CachePrefixStat
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,22 @@ class CacheService:
                 return self._cached_stats
 
             memory_entries = self._cache.size()
+
+            memory_hits = 0
+            memory_misses = 0
+            memory_hit_rate_percent = 0.0
+            per_prefix: list[CachePrefixStat] = []
+            counters_since: int | None = None
+            if isinstance(self._cache, InstrumentedCache):
+                observability = self._cache.observability()
+                memory_hits = observability["memory_hits"]
+                memory_misses = observability["memory_misses"]
+                memory_hit_rate_percent = observability["memory_hit_rate_percent"]
+                per_prefix = [
+                    CachePrefixStat(**row) for row in observability["per_prefix"]
+                ]
+                counters_since = observability["counters_since"]
+
             memory_bytes = self._cache.estimate_memory_bytes()
             memory_mb = memory_bytes / (1024 * 1024)
 
@@ -149,6 +166,11 @@ class CacheService:
                 total_size_mb=round(total_mb, 2),
                 disk_audiodb_artist_count=metadata_stats.get("audiodb_artist_count", 0),
                 disk_audiodb_album_count=metadata_stats.get("audiodb_album_count", 0),
+                memory_hits=memory_hits,
+                memory_misses=memory_misses,
+                memory_hit_rate_percent=memory_hit_rate_percent,
+                per_prefix=per_prefix,
+                counters_since=counters_since,
             )
 
             self._cached_stats = stats
@@ -208,6 +230,40 @@ class CacheService:
                 message=f"Failed to clear disk cache: {str(e)}",
                 cleared_memory_entries=0,
                 cleared_disk_files=0,
+            )
+
+    async def clear_metadata_cache(self) -> CacheClearResponse:
+        """QW9 Part 4: memory + disk metadata only. Covers (disk files under
+        the covers dir) and the genre disk cache are deliberately untouched,
+        so maintenance tooling gets a non-destructive default."""
+        try:
+            memory_entries = self._cache.size()
+
+            metadata_stats = self._disk_cache.get_stats()
+            metadata_count = metadata_stats["total_count"]
+            await self._disk_cache.clear_all()
+
+            await self._cache.clear()
+            self._cached_stats = None
+
+            return CacheClearResponse(
+                success=True,
+                message=(
+                    f"Successfully cleared {memory_entries} memory entries and "
+                    f"{metadata_count} metadata files (covers preserved)"
+                ),
+                cleared_memory_entries=memory_entries,
+                cleared_disk_files=metadata_count,
+                cover_files_cleared=0,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to clear metadata cache: {e}")
+            return CacheClearResponse(
+                success=False,
+                message=f"Failed to clear metadata cache: {str(e)}",
+                cleared_memory_entries=0,
+                cleared_disk_files=0,
+                cover_files_cleared=0,
             )
 
     async def clear_all_cache(self) -> CacheClearResponse:

@@ -16,6 +16,7 @@ from infrastructure.queue.priority_queue import RequestPriority, get_priority_qu
 from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
 from infrastructure.resilience.retry import CircuitBreaker, CircuitOpenError, with_retry
 from infrastructure.service_health import report_breaker_health
+from infrastructure.observability.provider_counters import record_provider_call
 from models.library_contribution import (
     DiscogsArtistCredit,
     DiscogsFormat,
@@ -275,9 +276,16 @@ class DiscogsRepository:
         semaphore = await get_priority_queue().acquire_slot(priority)
         async with semaphore:
             await _discogs_rate_limiter.acquire()
-            response = await self._client.get(
-                f"{DISCOGS_API_BASE}{path}", params=params
-            )
+            try:
+                response = await self._client.get(
+                    f"{DISCOGS_API_BASE}{path}", params=params
+                )
+            except httpx.HTTPError:
+                # QW9 Part 3: transport-level failure, no response to classify
+                record_provider_call("discogs", priority, None)
+                raise
+        # QW9 Part 3: one increment per wire attempt, classified from status
+        record_provider_call("discogs", priority, response.status_code)
         if response.status_code == 404:
             return None
         if response.status_code == 429:
