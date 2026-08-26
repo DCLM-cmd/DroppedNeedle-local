@@ -841,3 +841,65 @@ async def test_recycled_tracked_file_remains_eligible_for_ordinary_undo(
     assert item.eligibility == "eligible"
     assert item.expected_root_id == MANAGEMENT_RECYCLE_ROOT_ID
     assert item.destination_root_id == "root-1"
+
+
+@pytest.mark.asyncio
+async def test_recycle_blocks_when_a_policy_root_now_overlaps_the_bin(
+    tmp_path: Path,
+) -> None:
+    """F-149: the settings-save gate cannot see policy-side root edits made
+    after a preview seals; the recycle path must re-check overlap against
+    CURRENT roots and fail closed with RECYCLE_UNAVAILABLE."""
+    from api.v1.schemas.library_policies import LibraryRootSettings
+
+    (
+        _root,
+        _source,
+        _occupied,
+        recycle,
+        preferences,
+        store,
+        _planner_value,
+        service,
+        source_job_id,
+        source_revision,
+        settings_revision,
+        policy_revision,
+        _filesystem,
+    ) = await _collision_preview(tmp_path)
+
+    # Simulate a policy-side root edit that moves a scanned root over the bin
+    # without passing through the management-settings save validation.
+    library = preferences.get_typed_library_settings_raw()
+    library.library_roots.append(
+        LibraryRootSettings(
+            id="root-overlap",
+            path=str(recycle),
+            label="Overlapping",
+            policy="automatic",
+            rules=[],
+        )
+    )
+    preferences.save_typed_library_settings(library)
+    # the sealed revisions are stale by design here; re-read what the lane
+    # validates so execution reaches the recycle-overlap check itself
+    policy_revision = LibraryPolicyResolver(
+        preferences.get_typed_library_settings_raw()
+    ).policy_revision
+    settings_revision = (
+        preferences.get_library_management_settings().settings_revision
+    )
+
+    handle = await _create_resolution(
+        service,
+        store,
+        source_job_id=source_job_id,
+        source_revision=source_revision,
+        settings_revision=settings_revision,
+        policy_revision=policy_revision,
+        action="recycle_incoming_keep_existing",
+    )
+    items = await store.list_library_management_plan_items(handle.job_id)
+
+    assert items[0].eligibility == "blocked"
+    assert items[0].reason_code == RECYCLE_UNAVAILABLE

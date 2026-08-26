@@ -36,6 +36,12 @@ class _RootLeaseState:
         with self.condition:
             self.waiting_writers += 1
 
+    def unregister_write_waiter(self) -> None:
+        with self.condition:
+            self.waiting_writers -= 1
+            # a departing pending writer may unblock parked readers
+            self.condition.notify_all()
+
     def acquire_registered_write(self) -> None:
         with self.condition:
             try:
@@ -134,8 +140,12 @@ class LibraryFilesystemCoordinator:
         states = self._ordered_states(root_ids)
         acquired: list[_RootLeaseState] = []
         try:
+            # F-150: register every requested root as writer-pending BEFORE the
+            # acquisition loop, so a reader for a later root cannot overtake a
+            # writer still queued on an earlier one.
             for _root_id, state in states:
                 state.register_write_waiter()
+            for _root_id, state in states:
                 await self._acquire_without_leaking_on_cancel(
                     state.acquire_registered_write, state.release_write
                 )
@@ -144,6 +154,10 @@ class LibraryFilesystemCoordinator:
         finally:
             for state in reversed(acquired):
                 state.release_write()
+            # acquire_registered_write consumes its own registration, so only
+            # the registered-but-not-acquired remainder needs unwinding.
+            for _root_id, lease in states[len(acquired) :]:
+                lease.unregister_write_waiter()
 
     @contextmanager
     def read_sync(self, root_id: str) -> Iterator[None]:

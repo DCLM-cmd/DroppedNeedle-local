@@ -515,11 +515,7 @@ class LibraryManagementPublisher:
 
         record = await self._resume_import_cleanup(record, bundle)
         result = self._import_result(record, repeated=not created)
-        if self._on_commit is not None:
-            try:
-                await self._on_commit(set(result.local_track_ids), set())
-            except Exception:  # noqa: BLE001 - post-commit invalidation is retryable
-                logger.warning("Import publication invalidation failed")
+        await self.run_post_commit(set(result.local_track_ids), set())
         if critical_cancelled:
             raise asyncio.CancelledError
         return result
@@ -988,7 +984,19 @@ class LibraryManagementPublisher:
                     updated_at=self._clock(),
                 )
                 prepared.journal = current
-            await asyncio.to_thread(self._stage_audio, source, temporary, plan)
+            await asyncio.to_thread(
+                self._stage_audio,
+                source,
+                temporary,
+                plan,
+                scratch=self._artifact_path(
+                    destination,
+                    bundle_id,
+                    request.ordinal,
+                    "audio-mp4-scratch",
+                    temporary.suffix,
+                ),
+            )
             staged_fingerprint = await asyncio.to_thread(self._hash_file, temporary)
             current = await self._store.transition_library_management_import_journal(
                 bundle_id,
@@ -1874,6 +1882,23 @@ class LibraryManagementPublisher:
             value.state in {"catalog_committed", "cleanup_pending", "completed"}
             for value in existing
         ):
+            # F-145: a crash between commit and hook permanently lost external
+            # refresh/MB-cache/reconciliation enqueues; replaying the guarded
+            # hook here (deduped downstream) closes that window on any retry.
+            track_ids = {
+                value.local_track_id for value in existing if value.local_track_id
+            }
+            album_ids: set[str] = set()
+            if track_ids:
+                tracks = await self._store.get_target_tracks_by_ids(
+                    sorted(track_ids)
+                )
+                album_ids = {
+                    str(track["local_album_id"])
+                    for track in tracks.values()
+                    if track.get("local_album_id")
+                }
+            await self.run_post_commit(track_ids, album_ids)
             return LibraryManagementBundleCommitResult(
                 catalog_revision=snapshot.catalog_revision,
                 snapshot_revision=snapshot.row_revision,
@@ -1882,7 +1907,6 @@ class LibraryManagementPublisher:
                     value.id: value.row_revision for value in existing
                 },
             )
-
         self._validate_pinned_configuration(snapshot, pinned)
         roots = self._root_paths(snapshot.policy_revision, pinned)
         prepared: list[_PreparedMutation] = []
@@ -1931,17 +1955,28 @@ class LibraryManagementPublisher:
             await self._finish_critical_task(rollback_task)
             raise
 
-        if self._on_commit is not None:
-            try:
-                await self._on_commit(
-                    {value.local_track_id for value in mutations},
-                    {value.local_album_id for value in mutations},
-                )
-            except Exception:  # noqa: BLE001 - post-commit invalidation is retryable
-                logger.warning("Library management post-commit invalidation failed")
+        await self.run_post_commit(
+            {value.local_track_id for value in mutations},
+            {value.local_album_id for value in mutations},
+        )
         if critical_cancelled:
             raise asyncio.CancelledError
         return result
+
+    async def run_post_commit(
+        self, local_track_ids: set[str], local_album_ids: set[str]
+    ) -> None:
+        """Run the post-commit hook guarded; a raise must never fail a commit."""
+
+        if self._on_commit is None:
+            return
+        try:
+            await self._on_commit(local_track_ids, local_album_ids)
+        except Exception:  # noqa: BLE001 - post-commit invalidation is retryable
+            logger.warning(
+                "Library management post-commit invalidation failed",
+                exc_info=True,
+            )
 
     async def _publish_critical_section(
         self,
@@ -1981,7 +2016,11 @@ class LibraryManagementPublisher:
                 now=self._clock(),
             )
             await self._cleanup_committed(
-                prepared, roots, result.committed_journal_revisions
+                prepared,
+                roots,
+                result.committed_journal_revisions,
+                job_id=job_id,
+                bundle_ordinal=bundle_ordinal,
             )
             if (
                 pinned.profile.organization.remove_empty_directories
@@ -2260,7 +2299,17 @@ class LibraryManagementPublisher:
                     )
                 else:
                     await asyncio.to_thread(
-                        self._stage_audio, source, temporary, write_plan
+                        self._stage_audio,
+                        source,
+                        temporary,
+                        write_plan,
+                        scratch=self._artifact_path(
+                            destination,
+                            snapshot.job_id,
+                            item.ordinal,
+                            "audio-mp4-scratch",
+                            temporary.suffix,
+                        ),
                     )
                 staged_fingerprint = await asyncio.to_thread(self._hash_file, temporary)
                 journal = await self._advance_to_validated(journal, staged_fingerprint)
@@ -3516,13 +3565,16 @@ class LibraryManagementPublisher:
                         )
                     except (StaleRevisionError, ValidationError):
                         pass
-
     async def _cleanup_committed(
         self,
         prepared: list[_PreparedMutation],
         roots: dict[str, Path],
         committed_journal_revisions: dict[str, int],
+        *,
+        job_id: str,
+        bundle_ordinal: int,
     ) -> None:
+        fsync_targets: set[Path] = set()
         for value in prepared:
             journal = value.journal
             # F-184: the commit transaction returns each journal's exact
@@ -3533,6 +3585,27 @@ class LibraryManagementPublisher:
                 await asyncio.to_thread(
                     self._cleanup_committed_filesystem, value, roots
                 )
+            except (OSError, ConflictError):
+                await self._mark_cleanup_pending(
+                    journal.id,
+                    expected_row_revision=expected_row_revision,
+                    failure_code="SOURCE_CLEANUP_FAILED",
+                    value=value,
+                )
+                continue
+            # F-147: persist the unlink directory entries like recovery does,
+            # so power loss cannot resurrect removed sources/backups/temps.
+            if value.source_backed_up and value.backup is not None:
+                fsync_targets.add(value.backup.parent)
+            elif (
+                value.remove_source
+                and value.source is not None
+                and value.source != value.destination
+            ):
+                fsync_targets.add(value.source.parent)
+            if value.temporary != value.destination:
+                fsync_targets.add(value.temporary.parent)
+            try:
                 value.journal = await self._store.transition_file_mutation_journal(
                     journal.id,
                     expected_state="catalog_committed",
@@ -3540,20 +3613,73 @@ class LibraryManagementPublisher:
                     expected_row_revision=expected_row_revision,
                     updated_at=self._clock(),
                 )
-            except (
-                OSError,
-                ConflictError,
-                StaleRevisionError,
-                ValidationError,
-            ):
-                value.journal = await self._store.transition_file_mutation_journal(
-                    journal.id,
-                    expected_state="catalog_committed",
-                    new_state="cleanup_pending",
-                    expected_row_revision=expected_row_revision,
-                    updated_at=self._clock(),
-                    failure_code="SOURCE_CLEANUP_FAILED",
+            except (StaleRevisionError, ValidationError):
+                # F-148: the disk work already succeeded; a journal race must
+                # not misreport it as SOURCE_CLEANUP_FAILED.
+                retried = await self._retry_completed_transition(
+                    journal.id, job_id, bundle_ordinal
                 )
+                if retried is not None:
+                    value.journal = retried
+                    continue
+                await self._mark_cleanup_pending(
+                    journal.id,
+                    expected_row_revision=None,
+                    failure_code="CLEANUP_JOURNAL_RACE",
+                    value=value,
+                )
+        await asyncio.to_thread(self._fsync_directory_paths, fsync_targets)
+
+    async def _retry_completed_transition(
+        self, journal_id: str, job_id: str, bundle_ordinal: int
+    ) -> LibraryFileMutationJournal | None:
+        journals = await self._store.list_file_mutation_journals_for_bundle(
+            job_id, bundle_ordinal
+        )
+        current = next(
+            (value for value in journals if value.id == journal_id), None
+        )
+        if current is None or current.state != "catalog_committed":
+            return None
+        try:
+            return await self._store.transition_file_mutation_journal(
+                journal_id,
+                expected_state="catalog_committed",
+                new_state="completed",
+                expected_row_revision=current.row_revision,
+                updated_at=self._clock(),
+            )
+        except (StaleRevisionError, ValidationError):
+            return None
+
+    async def _mark_cleanup_pending(
+        self,
+        journal_id: str,
+        *,
+        expected_row_revision: int | None,
+        failure_code: str,
+        value: _PreparedMutation,
+    ) -> None:
+        try:
+            value.journal = await self._store.transition_file_mutation_journal(
+                journal_id,
+                expected_state="catalog_committed",
+                new_state="cleanup_pending",
+                expected_row_revision=(
+                    value.journal.row_revision
+                    if expected_row_revision is None
+                    else expected_row_revision
+                ),
+                updated_at=self._clock(),
+                failure_code=failure_code,
+            )
+        except (StaleRevisionError, ValidationError):
+            # Leave the row catalog_committed; the recovery committed-bundle
+            # drain completes cleanup later without burning this lease cycle.
+            logger.warning(
+                "Library Management cleanup transition raced for journal %s",
+                journal_id,
+            )
 
     @classmethod
     def _restore_prepared_filesystem(
@@ -3564,7 +3690,8 @@ class LibraryManagementPublisher:
                 value.destination.is_symlink()
                 or not value.destination.is_file()
                 or value.journal.staged_fingerprint is None
-                or cls._hash_file(value.destination) != value.journal.staged_fingerprint
+                or cls._hash_file(value.destination)
+                != value.journal.staged_fingerprint
             ):
                 raise ConflictError(
                     "A published management destination changed during rollback."
@@ -3718,18 +3845,58 @@ class LibraryManagementPublisher:
                 raise ValidationError("A sidecar path contains a symlink.")
         return parent.joinpath(*pure.parts)
 
-    def _stage_audio(self, source: Path, temporary: Path, plan) -> None:
-        if plan.audio_format == "m4a":
-            with tempfile.TemporaryDirectory(
-                prefix="droppedneedle-management-mp4-"
-            ) as directory:
-                local = Path(directory) / temporary.name
-                self._copy_temp(source, local)
-                self._audio.apply(local, plan)
-                self._copy_temp(local, temporary)
+    def _stage_audio(
+        self, source: Path, temporary: Path, plan, scratch: Path | None = None
+    ) -> None:
+        if plan.audio_format != "m4a":
+            self._copy_temp(source, temporary)
+            self._audio.apply(temporary, plan)
             return
-        self._copy_temp(source, temporary)
-        self._audio.apply(temporary, plan)
+        if scratch is not None:
+            # F-151: keep the m4a mutation copy inside the rooted/journaled
+            # namespace instead of the OS temp dir; fall back to system temp
+            # only when the destination root rejects the create.
+            try:
+                self._copy_temp(source, scratch)
+                self._audio.apply(scratch, plan)
+                self._copy_temp(scratch, temporary)
+                return
+            except OSError:
+                logger.warning(
+                    "Library Management staging fell back to the system "
+                    "temp for %s",
+                    temporary,
+                    exc_info=True,
+                )
+            finally:
+                scratch.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="droppedneedle-management-mp4-"
+        ) as directory:
+            local = Path(directory) / temporary.name
+            self._copy_temp(source, local)
+            self._audio.apply(local, plan)
+            self._copy_temp(local, temporary)
+
+    @staticmethod
+    def _fsync_directory_paths(directories: set[Path]) -> None:
+        """F-147: persist unlink directory entries after committed cleanup."""
+
+        for directory in directories:
+            try:
+                descriptor = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            except OSError as error:
+                # F-146: observability without a new failure mode.
+                logger.warning(
+                    "Library Management cleanup directory fsync failed "
+                    "(errno=%s): %s",
+                    error.errno,
+                    directory,
+                )
 
     def _stage_restore(
         self, source: Path, temporary: Path, snapshot: SemanticTagSnapshot
@@ -3797,8 +3964,14 @@ class LibraryManagementPublisher:
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
-            except OSError:
-                continue
+            except OSError as error:
+                # F-146: this is the E29 rename-persistence barrier; a failure
+                # must be observable even though availability is preserved.
+                logger.warning(
+                    "Library Management directory fsync failed (errno=%s): %s",
+                    error.errno,
+                    directory,
+                )
 
     @staticmethod
     def _remove_unpublished_temporaries(

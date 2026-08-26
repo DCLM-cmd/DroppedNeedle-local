@@ -428,6 +428,25 @@ class LibraryManagementRecoveryService:
                     await self._cleanup_committed_locked(
                         snapshot, committed_paths, pinned, roots
                     )
+                # F-145: a crash between catalog commit and the post-commit
+                # hook permanently lost external-refresh/cache enqueues; the
+                # recovery completion replays the guarded hook (deduped).
+                track_ids = {
+                    journal.local_track_id
+                    for journal in committed
+                    if journal.local_track_id
+                }
+                album_ids: set[str] = set()
+                if track_ids:
+                    tracks = await self._store.get_target_tracks_by_ids(
+                        sorted(track_ids)
+                    )
+                    album_ids = {
+                        str(track["local_album_id"])
+                        for track in tracks.values()
+                        if track.get("local_album_id")
+                    }
+                await self._publisher.run_post_commit(track_ids, album_ids)
                 await self._store.release_management_recovery_lease(
                     snapshot.job_id, self._worker_id(), now=self._clock()
                 )
@@ -1561,8 +1580,15 @@ class LibraryManagementRecoveryService:
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
-            except OSError:
-                continue
+            except OSError as error:
+                # F-146: this is the E29 rename-persistence barrier; a failure
+                # must be observable even though availability is preserved.
+                logger.warning(
+                    "Library Management recovery directory fsync failed "
+                    "(errno=%s): %s",
+                    error.errno,
+                    directory,
+                )
 
     @staticmethod
     def _remove_empty_source_directories(

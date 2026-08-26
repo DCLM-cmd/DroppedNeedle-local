@@ -17,7 +17,10 @@ from services.native.library_management_recovery_service import (
     _JournalPaths,
     _RecoveryUncertainError,
 )
-from services.native.library_management_publisher import _IMPORT_BUNDLE_NAMESPACE
+from services.native.library_management_publisher import (
+    LibraryManagementPublisher,
+    _IMPORT_BUNDLE_NAMESPACE,
+)
 from services.native.library_filesystem_coordinator import LibraryFilesystemCoordinator
 from tests.services.native.test_library_management_publisher import (
     _ArtworkRepository,
@@ -1399,3 +1402,42 @@ async def test_recover_import_bundle_skips_while_publication_lock_held(
     assert stuck_record is not None
     assert stuck_record.state == "publishing"
     assert await publisher.recover_import_bundle(stuck_record) == "rolled_back"
+@pytest.mark.asyncio
+async def test_recovery_replays_post_commit_hook_after_completing_bundle(
+    tmp_path: Path,
+) -> None:
+    """F-145: recovery finishing a published bundle must replay the guarded
+    post-commit hook so crash-lost enqueues are recovered at startup."""
+    _root, source, store, audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    prepared = await _prepare_bundle(publisher, store, job_id)
+    value = prepared[0]
+    os.replace(value.temporary, value.destination)
+
+    hook = AsyncMock()
+    from infrastructure.library_management_blob_store import LibraryManagementBlobStore
+    from services.native.audio_write_planning_service import AudioWritePlanningService
+
+    recovered_publisher = LibraryManagementPublisher(
+        store,
+        publisher._preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        LibraryManagementBlobStore(tmp_path / "blobs", store),
+        publisher._filesystem,
+        clock=lambda: 110.0,
+        on_commit=hook,
+    )
+    service = _recovery(recovered_publisher, store)
+
+    result = await service.recover_startup()
+
+    journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
+    assert result.recovered_bundles == 1
+    assert [journal.state for journal in journals] == ["completed"]
+    hook.assert_awaited_once()
+    track_ids, album_ids = hook.await_args.args
+    assert track_ids == {"track-1"}
+    assert album_ids >= {"album-1"}
+    assert source.exists() is False

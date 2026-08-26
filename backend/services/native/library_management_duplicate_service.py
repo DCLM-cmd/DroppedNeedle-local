@@ -794,6 +794,21 @@ class LibraryManagementDuplicateService:
         if not pinned.recycle_bin_path:
             return None
         root = Path(pinned.recycle_bin_path)
+        # F-149: policy-side root edits can move a scanned library root over
+        # the sealed bin path after the preview; re-check the overlap against
+        # CURRENT roots so recycled files never land inside a scanned root.
+        resolved_bin = root.resolve(strict=False)
+        policy = LibraryPolicyResolver(
+            self._preferences.get_typed_library_settings_raw()
+        )
+        for library_root in policy.settings.library_roots:
+            resolved_library = Path(library_root.path).resolve(strict=False)
+            if (
+                resolved_bin == resolved_library
+                or resolved_bin in resolved_library.parents
+                or resolved_library in resolved_bin.parents
+            ):
+                return None
         try:
             metadata = root.lstat()
         except OSError:
