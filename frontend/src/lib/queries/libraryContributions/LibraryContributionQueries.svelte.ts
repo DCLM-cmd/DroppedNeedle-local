@@ -4,7 +4,6 @@ import { api } from '$lib/api/client';
 import { API } from '$lib/constants';
 import { authStore } from '$lib/stores/authStore.svelte';
 import type { LibraryContribution } from '$lib/types';
-import { invalidateLibraryCatalog } from '$lib/queries/library/LibraryCatalogInvalidation';
 import { LibraryContributionQueryKeyFactory } from './LibraryContributionQueryKeyFactory';
 
 export const getLibraryContributionQuery = (getContributionId: Getter<string>) => {
@@ -20,14 +19,10 @@ export const getLibraryContributionQuery = (getContributionId: Getter<string>) =
 						signal
 					}
 				);
-				if (contribution.state === 'linked') {
-					await invalidateLibraryCatalog();
-				}
 				return contribution;
 			},
 			refetchInterval: (query: { state: { data?: LibraryContribution } }) =>
-				['seeded', 'verifying'].includes(query.state.data?.state ?? '') ? 2_000 : false,
-			refetchOnMount: 'always' as const
+				['seeded', 'verifying'].includes(query.state.data?.state ?? '') ? 2_000 : false
 		};
 	});
 	return query;

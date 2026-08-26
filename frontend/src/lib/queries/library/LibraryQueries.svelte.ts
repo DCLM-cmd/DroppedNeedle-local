@@ -153,16 +153,18 @@ export const getLibraryRecentlyAddedQuery = () =>
 			api.global.get<NativeAlbumsResponse>(API.library.recentlyAdded(20), { signal })
 	}));
 
+export const getLibraryAlbumDetailQueryOptions = (albumId: string) =>
+	queryOptions({
+		staleTime: CACHE_TTL.LIBRARY_NATIVE,
+		queryKey: LibraryQueryKeyFactory.albumDetail(albumId),
+		queryFn: ({ signal }) =>
+			api.global.get<LibraryAlbumDetail>(API.library.albumDetail(albumId), { signal })
+	});
+
 export const getLibraryAlbumDetailQuery = (getAlbumId: Getter<string>) =>
 	createQuery(() => {
 		const albumId = getAlbumId();
-		return {
-			enabled: !!albumId,
-			staleTime: CACHE_TTL.LIBRARY_NATIVE,
-			queryKey: LibraryQueryKeyFactory.albumDetail(albumId),
-			queryFn: ({ signal }) =>
-				api.global.get<LibraryAlbumDetail>(API.library.albumDetail(albumId), { signal })
-		};
+		return { ...getLibraryAlbumDetailQueryOptions(albumId), enabled: !!albumId };
 	});
 
 export const cacheCanonicalLibraryAlbumDetail = (album: LibraryAlbumDetail) =>
@@ -198,16 +200,18 @@ export const getLibraryAlbumTracksQuery = (getAlbumId: Getter<string>) =>
 		};
 	});
 
+export const getLibraryArtistDetailQueryOptions = (artistId: string) =>
+	queryOptions({
+		staleTime: CACHE_TTL.LIBRARY_NATIVE,
+		queryKey: LibraryQueryKeyFactory.artistDetail(artistId),
+		queryFn: ({ signal }) =>
+			api.global.get<LibraryArtistSummary>(API.library.artistDetail(artistId), { signal })
+	});
+
 export const getLibraryArtistDetailQuery = (getArtistId: Getter<string>) =>
 	createQuery(() => {
 		const artistId = getArtistId();
-		return {
-			enabled: !!artistId,
-			staleTime: CACHE_TTL.LIBRARY_NATIVE,
-			queryKey: LibraryQueryKeyFactory.artistDetail(artistId),
-			queryFn: ({ signal }) =>
-				api.global.get<LibraryArtistSummary>(API.library.artistDetail(artistId), { signal })
-		};
+		return { ...getLibraryArtistDetailQueryOptions(artistId), enabled: !!artistId };
 	});
 
 export const cacheCanonicalLibraryArtistDetail = (artist: LibraryArtistSummary) =>

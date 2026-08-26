@@ -280,7 +280,12 @@ export function retryHeldManagementUnit() {
 				type: 'success'
 			});
 			void invalidateTasks();
-			void invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all });
+			// One organized import moves sidebar counts + recency lists; the touched
+			// album gets its own key below. Other library lists (paginated grids the
+			// retry cannot name) self-heal within the 1-minute global staleTime +
+			// refetch-on-mount window instead of wiping `library` ALL.
+			void invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.stats() });
+			void invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.recentlyAdded() });
 			invalidateAlbum(input.releaseGroupMbid);
 		},
 		onError: (err: unknown) => {

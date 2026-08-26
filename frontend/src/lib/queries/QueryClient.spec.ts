@@ -1,5 +1,17 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 
+const h = vi.hoisted(() => ({
+	removeQueries: vi.fn().mockResolvedValue(undefined)
+}));
+
+vi.mock('@tanstack/svelte-query-persist-client', () => ({
+	experimental_createQueryPersister: vi.fn(() => ({
+		persisterFn: vi.fn(),
+		persistQueryByKey: vi.fn().mockResolvedValue(undefined),
+		removeQueries: h.removeQueries
+	}))
+}));
+
 const idb = vi.hoisted(() => ({
 	clear: vi.fn().mockResolvedValue(undefined),
 	del: vi.fn().mockResolvedValue(undefined),
@@ -11,6 +23,7 @@ const idb = vi.hoisted(() => ({
 vi.mock('idb-keyval', () => idb);
 
 import {
+	invalidateQueriesWithPersister,
 	queryClient,
 	resetQueryCacheForUserSwitch,
 	setQueryDataWithPersister
@@ -18,6 +31,7 @@ import {
 
 beforeEach(() => {
 	vi.clearAllMocks();
+	h.removeQueries.mockResolvedValue(undefined);
 	queryClient.clear();
 });
 
@@ -32,4 +46,19 @@ it('clears both memory and persisted data before an account switch', async () =>
 
 	expect(queryClient.getQueryData(oldUserKey)).toBeUndefined();
 	expect(idb.clear).toHaveBeenCalledOnce();
+});
+
+it('keeps persisted rows on invalidation by default', async () => {
+	await invalidateQueriesWithPersister({ queryKey: ['library'] });
+
+	expect(h.removeQueries).not.toHaveBeenCalled();
+});
+
+it('destroys persisted rows only when removePersisted is opted into', async () => {
+	await invalidateQueriesWithPersister({ queryKey: ['library'] }, undefined, {
+		removePersisted: true
+	});
+
+	expect(h.removeQueries).toHaveBeenCalledOnce();
+	expect(h.removeQueries).toHaveBeenCalledWith({ queryKey: ['library'] });
 });

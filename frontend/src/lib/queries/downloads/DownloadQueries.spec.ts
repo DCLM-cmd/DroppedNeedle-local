@@ -60,7 +60,8 @@ describe('download queue queries', () => {
 			refetchInterval: (query: { state: { data?: { active_count: number } } }) => number;
 			refetchIntervalInBackground: boolean;
 			refetchOnReconnect: string;
-			refetchOnWindowFocus: string;
+			refetchOnWindowFocus: string | undefined;
+			staleTime: number;
 		};
 
 		await opts.queryFn({ signal: undefined });
@@ -71,17 +72,24 @@ describe('download queue queries', () => {
 		expect(opts.refetchInterval({ state: { data: { active_count: 0 } } })).toBe(120_000);
 		expect(opts.refetchIntervalInBackground).toBe(false);
 		expect(opts.refetchOnReconnect).toBe('always');
-		expect(opts.refetchOnWindowFocus).toBe('always');
+		// B6: focus-'always' dropped - invalidations + the interval own freshness
+		expect(opts.refetchOnWindowFocus).toBeUndefined();
+		expect(opts.staleTime).toBe(0);
 	});
 
 	it('does not give the detailed downloads list a competing interval', () => {
-		const opts = getDownloadsQueryOptions() as {
+		const opts = getDownloadsQueryOptions() as unknown as {
 			refetchInterval?: number;
-			refetchOnWindowFocus: string;
+			refetchOnWindowFocus: string | undefined;
+			refetchOnReconnect: string | undefined;
+			staleTime: number;
 		};
 
 		expect(opts.refetchInterval).toBeUndefined();
-		expect(opts.refetchOnWindowFocus).toBe('always');
+		// B6: neither always-flag remains; 30 s stale window instead
+		expect(opts.refetchOnWindowFocus).toBeUndefined();
+		expect(opts.refetchOnReconnect).toBeUndefined();
+		expect(opts.staleTime).toBe(30_000);
 	});
 
 	it('requestAlbum posts to /requests/new with the mapped body', async () => {

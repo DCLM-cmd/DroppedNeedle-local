@@ -7,8 +7,9 @@ import { createQuery, queryOptions } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 import { DiscoverQueryKeyFactory } from './DiscoverQueryKeyFactory';
 
-// the server bounds rebuild frequency, so visits can revalidate the persisted cache
-const DISCOVER_REVALIDATE_MS = 10_000;
+// B6 policy: floor between intentional revalidates; active rebuilds stream via the
+// refreshing-poll lane below; tab switches never revalidate.
+const DISCOVER_REVALIDATE_MS = 60_000;
 
 // keep the persisted recommendations while the server finishes its SWR rebuild
 async function fetchDiscover(
@@ -42,6 +43,7 @@ async function fetchDiscover(
 export const getDiscoverQueryOptions = (userId: string | null | undefined) =>
 	queryOptions({
 		staleTime: DISCOVER_REVALIDATE_MS,
+		refetchOnWindowFocus: false,
 		queryKey: DiscoverQueryKeyFactory.discover(userId),
 		queryFn: ({ signal }) => fetchDiscover(userId, signal)
 	});
@@ -49,6 +51,7 @@ export const getDiscoverQueryOptions = (userId: string | null | undefined) =>
 export const getDiscoverQuery = () =>
 	createQuery(() => ({
 		staleTime: DISCOVER_REVALIDATE_MS,
+		refetchOnWindowFocus: false,
 		queryKey: DiscoverQueryKeyFactory.discover(authStore.user?.id),
 		queryFn: ({ signal }) => fetchDiscover(authStore.user?.id, signal),
 		refetchInterval: (query: { state: { data?: DiscoverResponse | undefined } }) =>

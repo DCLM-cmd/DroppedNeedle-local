@@ -54,14 +54,17 @@ describe('library contribution queries', () => {
 		expect(query.refetchInterval({ state: { data: { state: 'linked' } } })).toBe(false);
 	});
 
-	it('invalidates catalog views when callback verification links the album', async () => {
+	it('leaves catalog sweeping to the page transition guard, even when linked', async () => {
 		vi.mocked(api.global.get).mockResolvedValue({ state: 'linked' });
 		const query = getLibraryContributionQuery(() => 'draft-1') as unknown as {
 			queryFn: (context: { signal: AbortSignal }) => Promise<unknown>;
+			refetchOnMount?: unknown;
 		};
 
 		await query.queryFn({ signal: new AbortController().signal });
 
-		expect(invalidateLibraryCatalog).toHaveBeenCalledOnce();
+		expect(invalidateLibraryCatalog).not.toHaveBeenCalled();
+		// default refetch semantics - the old 'always' re-triggered the sweep loop
+		expect(query.refetchOnMount).toBeUndefined();
 	});
 });

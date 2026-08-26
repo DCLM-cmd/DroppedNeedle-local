@@ -48,9 +48,17 @@ export const setQueryDataWithPersister = async <
 
 export const invalidateQueriesWithPersister = async <TTaggedQueryKey extends QueryKey = QueryKey>(
 	filters?: InvalidateQueryFilters<TTaggedQueryKey>,
-	options?: InvalidateOptions
+	options?: InvalidateOptions,
+	opts?: { removePersisted?: boolean }
 ) => {
-	await queryPersister.removeQueries(filters);
+	// Default keeps IndexedDB rows: queries are marked stale (active ones
+	// refetch immediately, inactive ones paint the persisted payload instantly
+	// and settle in the background on next mount). Pass `removePersisted: true`
+	// only when a stale paint would be actively wrong - it destroys the 7-day
+	// persisted-cache benefit for the swept prefix.
+	if (opts?.removePersisted) {
+		await queryPersister.removeQueries(filters);
+	}
 	// eslint-disable-next-line no-restricted-syntax
 	await queryClient.invalidateQueries<TTaggedQueryKey>(filters, options);
 };

@@ -10,7 +10,6 @@ import type {
 	MusicBrainzSeed,
 	ReleaseDraft
 } from '$lib/types';
-import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
 import { invalidateLibraryCatalog } from '$lib/queries/library/LibraryCatalogInvalidation';
 import {
 	invalidateQueriesWithPersister,
@@ -18,12 +17,17 @@ import {
 } from '$lib/queries/QueryClient';
 import { LibraryContributionQueryKeyFactory } from './LibraryContributionQueryKeyFactory';
 
+// Draft saves touch exactly one contribution row; its detail key is already
+// fresh via setQueryDataWithPersister above, and no catalog rows change until a
+// link lands (attach mutation / page transition guard sweep the catalog then).
 const saveContribution = async (contribution: LibraryContribution): Promise<void> => {
 	await setQueryDataWithPersister(
 		LibraryContributionQueryKeyFactory.detail(authStore.user?.id, contribution.id),
 		contribution
 	);
-	await invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all });
+	await invalidateQueriesWithPersister({
+		queryKey: LibraryContributionQueryKeyFactory.root(authStore.user?.id)
+	});
 };
 
 const refreshAfterMutationError = async (

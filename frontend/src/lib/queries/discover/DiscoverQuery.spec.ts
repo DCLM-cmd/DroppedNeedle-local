@@ -122,3 +122,29 @@ describe('getRadioQuery', () => {
 		expect(opts.enabled).toBe(false);
 	});
 });
+
+describe('B6 discover revalidation policy', () => {
+	it('prefetch options: 60 s floor, tab switches never revalidate', async () => {
+		const { getDiscoverQueryOptions } = await import('./DiscoverQuery.svelte');
+
+		const opts = getDiscoverQueryOptions('user-1');
+
+		expect(opts.staleTime).toBe(60_000);
+		expect(opts.refetchOnWindowFocus).toBe(false);
+	});
+
+	it('mounted query: same policy plus the poll-while-refreshing lane', async () => {
+		const { getDiscoverQuery } = await import('./DiscoverQuery.svelte');
+
+		getDiscoverQuery();
+		const opts = lastQueryOpts();
+
+		expect(opts.staleTime).toBe(60_000);
+		expect(opts.refetchOnWindowFocus).toBe(false);
+		const interval = opts.refetchInterval as (q: {
+			state: { data?: { refreshing?: boolean } };
+		}) => number | false;
+		expect(interval({ state: { data: { refreshing: true } } })).toBe(10_000);
+		expect(interval({ state: { data: { refreshing: false } } })).toBe(false);
+	});
+});

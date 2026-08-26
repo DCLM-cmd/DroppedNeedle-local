@@ -11,5 +11,6 @@ export const ArtistQueryKeyFactory = {
 	lastFmEnrichment: (id: string, artistName?: string) =>
 		[...ArtistQueryKeyFactory.prefix, id, 'lastfm-enrichment', { artistName }] as const,
 	releases: (id: string) => [...ArtistQueryKeyFactory.prefix, id, 'releases'] as const,
-	similarArtists: (id: string, source: MusicSource) => ['similar-artists', id, { source }] as const
+	similarArtists: (id: string, source: MusicSource) =>
+		[...ArtistQueryKeyFactory.prefix, id, 'similar-artists', { source }] as const
 };

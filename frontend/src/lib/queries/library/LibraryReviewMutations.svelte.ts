@@ -18,7 +18,13 @@ import type {
 	ReviewActionResponse
 } from './LibraryOperationsTypes';
 
-async function invalidateReviewState(reviewId?: string): Promise<void> {
+// Two-layer sweep: the review-local layer (reviews list/detail, activity,
+// operations) always runs; the catalog layer (library ALL + artist + home +
+// discover) runs only for actions that change catalog rows.
+async function invalidateReviewState(
+	reviewId?: string,
+	options?: { catalog?: boolean }
+): Promise<void> {
 	searchStore.clear();
 	await Promise.all([
 		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.reviewsPrefix() }),
@@ -27,10 +33,14 @@ async function invalidateReviewState(reviewId?: string): Promise<void> {
 		...(reviewId
 			? [invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.review(reviewId) })]
 			: []),
-		invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all }),
-		invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.prefix }),
-		invalidateQueriesWithPersister({ queryKey: HomeQueryKeyFactory.prefix }),
-		invalidateQueriesWithPersister({ queryKey: DiscoverQueryKeyFactory.prefix })
+		...(options?.catalog
+			? [
+					invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all }),
+					invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.prefix }),
+					invalidateQueriesWithPersister({ queryKey: HomeQueryKeyFactory.prefix }),
+					invalidateQueriesWithPersister({ queryKey: DiscoverQueryKeyFactory.prefix })
+				]
+			: [])
 	]);
 }
 
@@ -52,7 +62,11 @@ export function actOnLibraryReview(action: ReviewAction) {
 			return api.global.post<ReviewActionResponse>(url, input.body);
 		},
 		onSuccess: async (_result, input) => {
-			await invalidateReviewState(input.reviewId);
+			// dismiss changes no catalog rows (verified non-mutating), so it sweeps
+			// review-local prefixes only. keep_tagged stays broad: backend
+			// row-effect confirmation pending — not narrowed.
+			const catalogMutating = action !== 'dismiss';
+			await invalidateReviewState(input.reviewId, { catalog: catalogMutating });
 			toastStore.show({ message: 'Review decision saved', type: 'success' });
 		},
 		onError: () => toastStore.show({ message: 'Could not save the review decision', type: 'error' })
@@ -67,7 +81,7 @@ export function acceptLibraryReviewCandidate() {
 				input.body
 			),
 		onSuccess: async (_result, input) => {
-			await invalidateReviewState(input.reviewId);
+			await invalidateReviewState(input.reviewId, { catalog: true });
 			toastStore.show({ message: 'Release selected', type: 'success' });
 		},
 		onError: () => toastStore.show({ message: 'Could not select this release', type: 'error' })
@@ -79,7 +93,7 @@ export function retryLibraryReview() {
 		mutationFn: (input: { reviewId: string; body: ReviewActionRequest }) =>
 			api.global.post<OperationResponse>(API.library.reviewRetry(input.reviewId), input.body),
 		onSuccess: async (_result, input) => {
-			await invalidateReviewState(input.reviewId);
+			await invalidateReviewState(input.reviewId, { catalog: true });
 			toastStore.show({ message: 'Identification retry started', type: 'success' });
 		},
 		onError: () => toastStore.show({ message: 'Could not retry identification', type: 'error' })
@@ -107,7 +121,7 @@ export function applyBulkLibraryReview() {
 			confirm_local_metadata?: boolean;
 		}) => api.global.post<OperationResponse>(API.library.bulkReviewApply(), input),
 		onSuccess: async () => {
-			await invalidateReviewState();
+			await invalidateReviewState(undefined, { catalog: true });
 			toastStore.show({ message: 'Bulk review started', type: 'success' });
 		},
 		onError: () => toastStore.show({ message: 'Could not start the bulk review', type: 'error' })

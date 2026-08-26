@@ -28,14 +28,35 @@ export const getDiscoveryBatchesQuery = (getEnabled: () => boolean = () => true)
 		enabled: getEnabled()
 	}));
 
-async function invalidateAfterBatchChange(): Promise<void> {
+// Sweep only what the API result says changed:
+// - create: download tasks shift when at least one item was actually requested
+//   (skips change nothing outside the batch itself);
+// - remove: tasks shift on cancelled requests or recycled albums; library
+//   counts/recency move only when albums were removed.
+async function invalidateAfterBatchChange(
+	result: DiscoveryBatchDetail | DiscoveryBatchRemoveResult
+): Promise<void> {
 	await invalidateQueriesWithPersister({
 		queryKey: discoveryBatchKeys.list(authStore.user?.id)
 	});
-	// download (incl. pending-request) and library state both shift when a batch
-	// lands or is removed
-	await invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.all });
-	await invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.all });
+	const isCreate = 'items' in result;
+	const requested = isCreate && result.items.some((item) => item.outcome === 'requested');
+	const cancelledRequests = isCreate ? 0 : result.cancelled_requests;
+	const removedAlbums = isCreate ? 0 : result.removed_albums;
+	if (requested || cancelledRequests > 0 || removedAlbums > 0) {
+		// pending-request state lives under the tasks prefix
+		await invalidateQueriesWithPersister({
+			queryKey: DownloadQueryKeyFactory.tasks(authStore.user?.id)
+		});
+	}
+	if (removedAlbums > 0) {
+		// The client holds no per-item release-group ids at removal time (batch
+		// list summaries omit items), so album-detail keys cannot be targeted
+		// individually; stats + recently-added carry the visible shift and any
+		// unopened album page self-heals via the global staleTime window.
+		await invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.stats() });
+		await invalidateQueriesWithPersister({ queryKey: LibraryQueryKeyFactory.recentlyAdded() });
+	}
 }
 
 export async function createDiscoveryBatch(
@@ -51,7 +72,7 @@ export async function createDiscoveryBatch(
 				(skipped ? ` · ${skipped} already yours or requested` : ''),
 			type: 'success'
 		});
-		await invalidateAfterBatchChange();
+		await invalidateAfterBatchChange(created);
 		return created;
 	} catch (err) {
 		toastStore.show({
@@ -81,7 +102,7 @@ export async function removeDiscoveryBatch(
 		} else {
 			toastStore.show({ message: 'Batch record removed - albums kept', type: 'success' });
 		}
-		await invalidateAfterBatchChange();
+		await invalidateAfterBatchChange(result);
 		return result;
 	} catch (err) {
 		toastStore.show({
