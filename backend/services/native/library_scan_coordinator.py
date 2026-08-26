@@ -209,6 +209,12 @@ class LibraryScanCoordinator:
             run, _, _ = await self._store.get_scan_run(run_id)
             if run.state not in {"pausing", "stopping"}:
                 self._pending_control_run_ids.discard(run.id)
+                # Every terminal state must release its process-local revision entries,
+                # including scanner-created failed (F-INDEXREC-02). Use public forget_scan
+                # and keep paused/pausing resumable.
+                if run.state in {"completed", "cancelled", "superseded_policy_changed", "failed"}:
+                    if self._filesystem is not None:
+                        self._filesystem.forget_scan(run.id)
                 return run
             new_state = "paused" if run.state == "pausing" else "cancelled"
             try:
@@ -356,7 +362,6 @@ class LibraryScanCoordinator:
             if self._events is not None:
                 await self._events.publish(run, event="scan.transition")
 
-        if run.state == "indexing":
             self._log_progress(run, "phase_indexing_start", force=True)
             if not await self.checkpoint(run.id, frozen_policy_revision):
                 return (await self._store.get_scan_run(run.id))[0]

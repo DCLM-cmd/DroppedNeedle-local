@@ -2030,3 +2030,127 @@ async def test_wedged_walk_timeout_with_filesystem_does_not_block_writer_and_nex
     assert completed is not None and completed.state == "completed"
 
 
+
+@pytest.mark.asyncio
+async def test_failed_run_forgets_scan_revision_for_every_terminal_state(target_store: NativeLibraryStore, tmp_path: Path) -> None:
+    # First scope succeeds and records fence, second fails -> run failed, no retained revision
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist" / "Album").mkdir(parents=True)
+    (root / "Artist" / "Album" / "track-1.flac").write_bytes(b"audio")
+    # Create a second scope that will fail (missing directory)
+    # Use two scopes under same root: one real, one missing
+    resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")]
+        )
+    )
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05)
+    coordinator = LibraryScanCoordinator(target_store, scanner, LibraryIndexer(target_store, _TagReader()), LibraryReconciler(target_store), lambda: resolver, filesystem_coordinator=filesystem)
+    # Create a run with two scopes: one valid, one missing
+    policy_revision = resolver.policy_revision
+    request = ScanRequest(
+        kind="incremental",
+        trigger="manual",
+        policy_revision=policy_revision,
+        scopes=[
+            ScanScope(root_id="root-a", relative_path=".", policy_revision=policy_revision),
+            ScanScope(root_id="root-a", relative_path="missing", policy_revision=policy_revision),
+        ],
+    )
+    await coordinator.request_run(request)
+    failed = await coordinator.run_once({"root-a": root})
+    assert failed is not None and failed.state == "failed"
+    # Verify durable failed state
+    stored, _, _ = await target_store.get_scan_run(failed.id)
+    assert stored.state == "failed"
+    # Advance root revision via write lease
+    async with filesystem.write("root-a"):
+        pass
+    # Public scan_revision should return current, not stale, and no entry for terminal run remains
+    current = filesystem.scan_revision(failed.id, "root-a")
+    # Should be current revision, not the stale recorded one
+    # The coordinator should have forgotten, so scan_revision returns current (or None if no current)
+    # Check that the internal map has no entry for this run
+    assert (failed.id, "root-a") not in filesystem._scan_revisions
+    # After bumping, it should equal current revision
+    async with filesystem.write("root-a"):
+        pass
+    assert filesystem.scan_revision(failed.id, "root-a") == filesystem.revision("root-a")
+
+@pytest.mark.asyncio
+async def test_repeated_failed_runs_do_not_grow_map(target_store: NativeLibraryStore, tmp_path: Path) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = LibraryPolicyResolver(TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")]))
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05)
+    coordinator = LibraryScanCoordinator(target_store, scanner, LibraryIndexer(target_store, _TagReader()), LibraryReconciler(target_store), lambda: resolver, filesystem_coordinator=filesystem)
+    for i in range(5):
+        policy_revision = resolver.policy_revision
+        request = ScanRequest(kind="incremental", trigger="manual", policy_revision=policy_revision, scopes=[ScanScope(root_id="root-a", relative_path=".", policy_revision=policy_revision)])
+        # Make the walk fail by using a denied walker for this run
+        def denied_walk(*_args, **_kwargs):
+            raise PermissionError(errno.EACCES, "Permission denied", str(root / "secret"))
+            yield
+        # Temporarily patch the scanner's walker
+        original_walker = scanner._directory_walker
+        scanner._directory_walker = denied_walk
+        await coordinator.request_run(request)
+        failed = await coordinator.run_once({"root-a": root})
+        assert failed is not None and failed.state == "failed"
+        scanner._directory_walker = original_walker
+        # After each failed run, the map should have no entry for that run
+        assert (failed.id, "root-a") not in filesystem._scan_revisions
+    # After 5 unique failed runs, map should be bounded at zero terminal entries
+    assert len(filesystem._scan_revisions) == 0
+
+@pytest.mark.asyncio
+async def test_pre_record_failure_leaves_no_entry(target_store: NativeLibraryStore, tmp_path: Path) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = LibraryPolicyResolver(TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")]))
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05)
+    coordinator = LibraryScanCoordinator(target_store, scanner, LibraryIndexer(target_store, _TagReader()), LibraryReconciler(target_store), lambda: resolver, filesystem_coordinator=filesystem)
+    # Make discovery fail before any scope records a revision (e.g., root unavailable)
+    # Use a missing root path
+    missing_root = tmp_path / "missing"
+    # Don't create missing_root
+    request = ScanRequest(kind="incremental", trigger="manual", policy_revision=resolver.policy_revision, scopes=[ScanScope(root_id="root-a", relative_path=".", policy_revision=resolver.policy_revision)])
+    await coordinator.request_run(request)
+    failed = await coordinator.run_once({"root-a": missing_root})
+    assert failed is not None and failed.state == "failed"
+    assert (failed.id, "root-a") not in filesystem._scan_revisions
+
+
+@pytest.mark.asyncio
+async def test_paused_run_retains_fence_until_terminal(target_store: NativeLibraryStore, tmp_path: Path) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "Artist" / "Album").mkdir(parents=True)
+    (root / "Artist" / "Album" / "track-1.flac").write_bytes(b"audio")
+    resolver = LibraryPolicyResolver(TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")]))
+    filesystem = LibraryFilesystemCoordinator()
+    scanner = LibraryInventoryScanner(target_store, filesystem_coordinator=filesystem, walk_deadline_seconds=0.05)
+    coordinator = LibraryScanCoordinator(target_store, scanner, LibraryIndexer(target_store, _TagReader()), LibraryReconciler(target_store), lambda: resolver, filesystem_coordinator=filesystem)
+    await coordinator.request_run(ScanRequest(kind="incremental", trigger="manual", policy_revision=resolver.policy_revision, scopes=[ScanScope(root_id="root-a", relative_path=".", policy_revision=resolver.policy_revision)]))
+    run = await target_store.claim_next_scan_run(now=10)
+    assert run is not None
+    # Simulate a successful discovery that recorded a fence
+    filesystem.record_scan_revision(run.id, "root-a")
+    assert filesystem.scan_revision(run.id, "root-a") == filesystem.revision("root-a")
+    # Pause via control -> pausing -> paused (not terminal, should retain)
+    pausing = await coordinator.control(run.id, "pause", run.row_revision)
+    assert pausing.state == "pausing"
+    paused = await coordinator._settle_pending_control(run.id)
+    assert paused.state == "paused"
+    assert filesystem.scan_revision(run.id, "root-a") == filesystem.revision("root-a")
+    # Now stop -> stopping -> cancelled (terminal, should forget)
+    stopping = await coordinator.control(run.id, "stop", paused.row_revision)
+    assert stopping.state in ("stopping", "cancelled")
+    cancelled = await coordinator._settle_pending_control(run.id)
+    assert cancelled.state == "cancelled"
+    assert (run.id, "root-a") not in filesystem._scan_revisions
+    assert filesystem.scan_revision(run.id, "root-a") == filesystem.revision("root-a")
