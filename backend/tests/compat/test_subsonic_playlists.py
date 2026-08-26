@@ -194,3 +194,56 @@ async def test_public_playlist_cover_is_visible_to_another_user(
     )
     assert response.status_code == 200
     assert response.content.endswith(b"public")
+
+
+async def test_spotify_imported_cover_advertised_and_served(
+    compat_env, db_path, write_lock
+):
+    """GH-287: a Spotify-imported playlist cover must reach Feishin - coverArt
+    advertised in the playlist list/detail and the bytes served by getCoverArt."""
+    import threading
+    from unittest.mock import AsyncMock
+
+    from repositories.async_playlist_repository import AsyncPlaylistRepository
+    from repositories.playlist_repository import PlaylistRepository
+    from services.spotify_import_service import (
+        SpotifyImportService,
+        cover_fetcher_for,
+    )
+    from tests.mocks.spotify_cdn_mock import COVER_URL, JPEG_BYTES, SpotifyCdnMock
+
+    cdn = SpotifyCdnMock()
+    spotify_client = AsyncMock()
+    spotify_client.get_playlist.return_value = {
+        "id": "spot-9",
+        "name": "From Spotify",
+        "images": [{"url": COVER_URL, "width": 640, "height": 640}],
+    }
+    spotify_client.get_playlist_tracks.return_value = []
+    factory = AsyncMock()
+    factory.resolve_spotify.return_value = spotify_client
+    importer = SpotifyImportService(
+        client_factory=factory,
+        playlist_repo=None,
+        mb_repo=AsyncMock(),
+        playlist_service=compat_env.playlists,
+        async_playlist_repo=AsyncPlaylistRepository(
+            PlaylistRepository(db_path=db_path, write_lock=write_lock)
+        ),
+        cover_fetcher=cover_fetcher_for(cdn.client()),
+    )
+
+    pid = await importer.ensure_playlist_record("user-alice", "spot-9", "From Spotify")
+    await importer.populate_playlist("user-alice", "spot-9", pid)
+
+    lists = _sub(_get(compat_env, "getPlaylists"))["playlists"]["playlist"]
+    mine = next(p for p in lists if p["id"] == f"pl-{pid}")
+    assert mine["coverArt"] == f"pl-{pid}"
+
+    detail = _sub(_get(compat_env, "getPlaylist", id=f"pl-{pid}"))["playlist"]
+    assert detail["coverArt"] == f"pl-{pid}"
+
+    response = _get(compat_env, "getCoverArt", id=f"pl-{pid}")
+    assert response.status_code == 200
+    assert response.content == JPEG_BYTES
+    assert response.headers["content-type"].startswith("image/jpeg")

@@ -977,6 +977,52 @@ class PlaylistService:
         content_type: str,
     ) -> str:
         await self._load_owned_or_raise(playlist_id, requesting)
+        path = await self._persist_cover_bytes(playlist_id, data, content_type)
+        await self._repo.update_playlist(
+            playlist_id,
+            cover_image_path=path,
+        )
+        return f"/api/v1/playlists/{playlist_id}/cover"
+
+    async def set_imported_cover(
+        self,
+        playlist_id: str,
+        owner_id: str,
+        data: bytes,
+        content_type: str,
+    ) -> bool:
+        """Persist a provider-imported cover (e.g. Spotify playlist artwork).
+
+        Ownership-aware like :meth:`upload_cover` (owner-only mutation; admins
+        included cannot touch another user's playlist, D4/AMU-2) and fill-only:
+        when the playlist already has ANY explicit cover - user upload or a
+        previous import - it is preserved untouched, so a reimport never
+        overwrites the user's cover. Storage rules are identical to uploads.
+        Returns True when bytes were stored, False when an existing cover won.
+        """
+        playlist = await self._repo.get_playlist(playlist_id)
+        if playlist is None:
+            raise PlaylistNotFoundError(f"Playlist {playlist_id} not found")
+        if playlist.user_id != owner_id:
+            raise PermissionDeniedError(
+                "You do not have permission to modify this playlist"
+            )
+        if playlist.cover_image_path:
+            return False
+
+        path = await self._persist_cover_bytes(playlist_id, data, content_type)
+        await self._repo.update_playlist(
+            playlist_id,
+            cover_image_path=path,
+        )
+        return True
+
+    async def _persist_cover_bytes(
+        self, playlist_id: str, data: bytes, content_type: str
+    ) -> str:
+        """Validate and write cover bytes under the shared cover dir - the one
+        place that owns MIME/size rules and atomic file replacement for BOTH
+        user uploads and importer-set covers. Returns the stored path."""
         self._validate_cover_id(playlist_id)
 
         if content_type not in ALLOWED_IMAGE_TYPES:
@@ -999,15 +1045,7 @@ class PlaylistService:
             file_path.write_bytes(data)
 
         await asyncio.to_thread(_write_cover)
-
-        cover_path = str(file_path)
-        await self._repo.update_playlist(
-            playlist_id,
-            cover_image_path=cover_path,
-        )
-
-        cover_url = f"/api/v1/playlists/{playlist_id}/cover"
-        return cover_url
+        return str(file_path)
 
     async def get_cover_path(
         self, playlist_id: str, requesting: UserRecord

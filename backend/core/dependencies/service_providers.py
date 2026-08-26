@@ -2193,19 +2193,28 @@ def get_per_user_client_factory() -> "PerUserClientFactory":
 
 @singleton
 def get_spotify_import_service() -> "SpotifyImportService":
-    from services.spotify_import_service import SpotifyImportService
+    from infrastructure.http.client import get_spotify_cover_http_client
+    from services.spotify_import_service import (
+        SpotifyImportService,
+        cover_fetcher_for,
+    )
 
     return SpotifyImportService(
         client_factory=get_per_user_client_factory(),
         playlist_repo=get_playlist_repository(),
         mb_repo=get_musicbrainz_repository(),
         playlist_service=get_playlist_service(),
+        cover_fetcher=cover_fetcher_for(get_spotify_cover_http_client()),
     )
 
 
 @singleton
 def get_target_spotify_import_service() -> "SpotifyImportService":
-    from services.spotify_import_service import SpotifyImportService
+    from infrastructure.http.client import get_spotify_cover_http_client
+    from services.spotify_import_service import (
+        SpotifyImportService,
+        cover_fetcher_for,
+    )
     from .compat_providers import get_target_consumer_composition
 
     target = get_target_consumer_composition()
@@ -2215,6 +2224,7 @@ def get_target_spotify_import_service() -> "SpotifyImportService":
         mb_repo=get_musicbrainz_repository(),
         playlist_service=target.playlists,
         async_playlist_repo=target.playlist_repository,
+        cover_fetcher=cover_fetcher_for(get_spotify_cover_http_client()),
     )
 
 

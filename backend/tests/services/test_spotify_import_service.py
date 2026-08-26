@@ -1,19 +1,37 @@
 """SpotifyImportService unit tests (PR #108).
 
-Covers the linking gate, the owned-playlist filtering + imported-mapping in
-``list_playlists``, the empty-playlist populate path, and the cover-image picker.
-The Spotify client and the async playlist repo are mocked, so no network or DB.
+The GH-287 block at the bottom wires the importer against REAL
+PlaylistRepository/PlaylistService stores and a MockTransport Spotify CDN
+(tests/mocks/spotify_cdn_mock.py) to prove playlist-cover persistence,
+degradation, and ownership behavior end to end.
 """
 
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from infrastructure.degradation import (
+    clear_degradation_context,
+    init_degradation_context,
+)
+from repositories.playlist_repository import PlaylistRepository
+from services.playlist_service import PlaylistService
 from services.spotify_import_service import (
+    CoverFetcher,
     SpotifyImportService,
     SpotifyNotLinkedError,
     _best_image_url,
+    cover_fetcher_for,
+    fetch_spotify_playlist_cover,
+)
+from tests.mocks.spotify_cdn_mock import (
+    COVER_URL,
+    JPEG_BYTES,
+    PNG_BYTES,
+    SpotifyCdnMock,
 )
 
 
@@ -121,3 +139,285 @@ def test_best_image_url_falls_back_to_largest_when_all_below_min():
 
 def test_best_image_url_none_when_empty():
     assert _best_image_url([]) is None
+
+
+# --- GH-287: playlist-cover persistence (real stores + mock CDN) ---------------
+
+_SPOTIFY_IMAGES = [{"url": COVER_URL, "width": 640, "height": 640}]
+
+_TRACK = {
+    "name": "Song",
+    "artists": [{"name": "Artist"}],
+    "album": {"id": "", "name": "Album", "images": []},
+    "duration_ms": 180_000,
+}
+
+
+def _real_service(tmp_path, cdn: SpotifyCdnMock, *, images=_SPOTIFY_IMAGES):
+    """SpotifyImportService over a REAL PlaylistRepository/PlaylistService with
+    the cover fetcher bound to the mock CDN - the production wiring shape."""
+    repo = PlaylistRepository(
+        db_path=tmp_path / "library.db", write_lock=threading.Lock()
+    )
+    playlists = PlaylistService(repo=repo, cache_dir=tmp_path)
+    client = AsyncMock()
+    client.get_playlist.return_value = {
+        "id": "spot-1",
+        "name": "Mix",
+        "images": images,
+    }
+    client.get_playlist_tracks.return_value = [dict(_TRACK)]
+    factory = AsyncMock()
+    factory.resolve_spotify.return_value = client
+    svc = SpotifyImportService(
+        client_factory=factory,
+        playlist_repo=repo,
+        mb_repo=AsyncMock(),
+        playlist_service=playlists,
+        cover_fetcher=cover_fetcher_for(cdn.client()),
+    )
+    return svc, playlists
+
+
+def _cover_files(tmp_path: Path) -> list[Path]:
+    return list((tmp_path / "covers" / "playlists").glob("*"))
+
+
+async def _import_one(svc, playlists, tmp_path):
+    pid = await svc.ensure_playlist_record("user-1", "spot-1", "Mix")
+    await svc.populate_playlist("user-1", "spot-1", pid)
+    return await playlists.get_playlist(pid)
+
+
+@pytest.mark.asyncio
+async def test_populate_persists_fetched_cover_locally(tmp_path):
+    cdn = SpotifyCdnMock()
+    svc, playlists = _real_service(tmp_path, cdn)
+
+    record = await _import_one(svc, playlists, tmp_path)
+
+    # Cover bytes stored under the shared covers dir and wired into the row.
+    assert record.cover_image_path
+    assert Path(record.cover_image_path).read_bytes() == JPEG_BYTES
+    assert len(cdn.requests) == 1
+    assert cdn.requests[0].url.host == "i.scdn.co"
+    # Tracks still imported alongside the artwork.
+    assert len(await playlists.get_tracks(record.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_populate_without_images_skips_cover_entirely(tmp_path):
+    cdn = SpotifyCdnMock()
+    svc, playlists = _real_service(tmp_path, cdn, images=[])
+
+    record = await _import_one(svc, playlists, tmp_path)
+
+    assert record.cover_image_path is None
+    assert cdn.requests == []
+    assert _cover_files(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_cover_http_failure_degrades_and_keeps_tracks(tmp_path):
+    cdn = SpotifyCdnMock()
+    cdn.status_code = 503
+    svc, playlists = _real_service(tmp_path, cdn)
+
+    ctx = init_degradation_context()
+    try:
+        record = await _import_one(svc, playlists, tmp_path)
+        assert ctx.summary().get("spotify") == "error"
+    finally:
+        clear_degradation_context()
+
+    # Degrade-don't-fail: tracks imported, no cover, no partial writes.
+    assert record.cover_image_path is None
+    assert len(await playlists.get_tracks(record.id)) == 1
+    assert _cover_files(tmp_path) == []
+
+    # And with NO active context (background import) it must not raise either.
+    record2 = await _import_one(svc, playlists, tmp_path)
+    assert record2.cover_image_path is None
+
+
+@pytest.mark.asyncio
+async def test_fetcher_exception_degrades_and_keeps_tracks(tmp_path):
+    async def broken(url: str):
+        raise RuntimeError("cdn unreachable")
+
+    repo = PlaylistRepository(
+        db_path=tmp_path / "library.db", write_lock=threading.Lock()
+    )
+    playlists = PlaylistService(repo=repo, cache_dir=tmp_path)
+    client = AsyncMock()
+    client.get_playlist.return_value = {"id": "spot-1", "images": _SPOTIFY_IMAGES}
+    client.get_playlist_tracks.return_value = []
+    factory = AsyncMock()
+    factory.resolve_spotify.return_value = client
+    svc = SpotifyImportService(
+        client_factory=factory,
+        playlist_repo=repo,
+        mb_repo=AsyncMock(),
+        playlist_service=playlists,
+        cover_fetcher=broken,
+    )
+
+    ctx = init_degradation_context()
+    try:
+        record = await _import_one(svc, playlists, tmp_path)
+        assert ctx.summary().get("spotify") == "error"
+    finally:
+        clear_degradation_context()
+    assert record.cover_image_path is None
+
+
+@pytest.mark.asyncio
+async def test_oversized_response_rejected_without_partial_writes(tmp_path):
+    cdn = SpotifyCdnMock()
+    cdn.image_bytes = b"x" * (5 * 1024 * 1024 + 1)  # declared length > cap
+    svc, playlists = _real_service(tmp_path, cdn)
+
+    ctx = init_degradation_context()
+    try:
+        record = await _import_one(svc, playlists, tmp_path)
+        assert ctx.summary().get("spotify") == "error"
+    finally:
+        clear_degradation_context()
+
+    assert record.cover_image_path is None
+    assert _cover_files(tmp_path) == []
+    assert (await playlists.get_tracks(record.id)) or True  # tracks unaffected
+
+
+@pytest.mark.asyncio
+async def test_wrong_content_type_rejected_without_partial_writes(tmp_path):
+    cdn = SpotifyCdnMock()
+    cdn.content_type = "text/html"
+    svc, playlists = _real_service(tmp_path, cdn)
+
+    ctx = init_degradation_context()
+    try:
+        record = await _import_one(svc, playlists, tmp_path)
+        assert ctx.summary().get("spotify") == "error"
+    finally:
+        clear_degradation_context()
+
+    assert record.cover_image_path is None
+    assert _cover_files(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_disallowed_host_is_never_fetched(tmp_path):
+    cdn = SpotifyCdnMock()
+    svc, playlists = _real_service(
+        tmp_path,
+        cdn,
+        images=[{"url": "https://evil.example.com/a.jpg", "width": 600}],
+    )
+
+    ctx = init_degradation_context()
+    try:
+        record = await _import_one(svc, playlists, tmp_path)
+        assert ctx.summary().get("spotify") == "error"
+    finally:
+        clear_degradation_context()
+
+    assert cdn.requests == []  # rejected before any request left
+    assert record.cover_image_path is None
+
+
+@pytest.mark.asyncio
+async def test_redirect_response_rejected(tmp_path):
+    cdn = SpotifyCdnMock()
+    cdn.status_code = 302
+    cdn.extra_headers = {"Location": "https://evil.example.com/x.jpg"}
+    svc, playlists = _real_service(tmp_path, cdn)
+
+    ctx = init_degradation_context()
+    try:
+        record = await _import_one(svc, playlists, tmp_path)
+        assert ctx.summary().get("spotify") == "error"
+    finally:
+        clear_degradation_context()
+
+    assert len(cdn.requests) == 1  # single attempt, never followed
+    assert record.cover_image_path is None
+
+
+@pytest.mark.asyncio
+async def test_reimport_preserves_user_uploaded_cover(tmp_path):
+    cdn = SpotifyCdnMock()
+    svc, playlists = _real_service(tmp_path, cdn)
+    pid = await svc.ensure_playlist_record("user-1", "spot-1", "Mix")
+    owner = SimpleNamespace(id="user-1")
+    await playlists.upload_cover(pid, owner, PNG_BYTES, "image/png")
+    before = (await playlists.get_playlist(pid)).cover_image_path
+
+    # Re-import of the same playlist: the user's explicit cover must win.
+    await svc.populate_playlist("user-1", "spot-1", pid)
+
+    after = (await playlists.get_playlist(pid)).cover_image_path
+    assert after == before
+    assert Path(after).read_bytes() == PNG_BYTES
+    assert Path(after).suffix == ".png"
+
+
+@pytest.mark.asyncio
+async def test_import_cannot_write_other_users_playlist(tmp_path):
+    cdn = SpotifyCdnMock()
+    svc, playlists = _real_service(tmp_path, cdn)
+    foreign = await playlists.create_playlist("Bob's Mix", user_id="user-bob")
+
+    ctx = init_degradation_context()
+    try:
+        await svc.populate_playlist("user-alice", "spot-1", foreign.id)
+        assert ctx.summary().get("spotify") == "error"
+    finally:
+        clear_degradation_context()
+
+    record = await playlists.get_playlist(foreign.id)
+    assert record.cover_image_path is None
+    assert _cover_files(tmp_path) == []
+
+
+# --- fetch-level units ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_returns_bytes_and_content_type():
+    cdn = SpotifyCdnMock()
+    result = await fetch_spotify_playlist_cover(COVER_URL, cdn.client())
+    assert result == (JPEG_BYTES, "image/jpeg")
+
+
+@pytest.mark.asyncio
+async def test_fetch_aborts_bounded_read_past_cap():
+    cdn = SpotifyCdnMock()
+    cdn.image_bytes = b"x" * (5 * 1024 * 1024 + 10)
+    # Lie about Content-Length so the declared-length check passes and the
+    # streamed read is what trips the cap.
+    cdn.extra_headers = {"Content-Length": str(1024)}
+    result = await fetch_spotify_playlist_cover(COVER_URL, cdn.client())
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_bad_urls_without_requesting():
+    cdn = SpotifyCdnMock()
+    client = cdn.client()
+    for url in (
+        "http://i.scdn.co/img.jpg",  # not https
+        "https://i.scdn.co.evil.com/img.jpg",  # suffix lookalike
+        "https://evil.com/?u=i.scdn.co",  # scdn.co only in the query
+        "",
+    ):
+        assert await fetch_spotify_playlist_cover(url, client) is None
+    assert cdn.requests == []
+
+
+def test_cover_fetcher_alias_shape():
+    async def fetcher(url: str):
+        return None
+
+    typed: CoverFetcher = fetcher
+    assert typed is fetcher

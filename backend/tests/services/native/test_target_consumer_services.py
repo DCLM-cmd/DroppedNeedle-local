@@ -78,7 +78,15 @@ from services.discover.radio_plan_service import RadioPlanService
 from services.playlist_service import PlaylistService
 from services.personal_mix_service import PersonalMixService, _MixTrack
 from services.request_service import RequestService
-from services.spotify_import_service import SpotifyImportService
+from services.spotify_import_service import (
+    SpotifyImportService,
+    cover_fetcher_for,
+)
+from tests.mocks.spotify_cdn_mock import (
+    COVER_URL,
+    JPEG_BYTES,
+    SpotifyCdnMock,
+)
 from tests.helpers import build_test_client, mock_user
 from middleware import _get_current_user
 
@@ -1575,6 +1583,65 @@ async def test_spotify_and_personal_mix_write_only_target_playlists(
             ("personal-mix:user-1",),
             ("spotify:spotify-1",),
         ]
+
+
+@pytest.mark.asyncio
+async def test_spotify_import_persists_cover_in_target_store(
+    target_services, tmp_path: Path
+) -> None:
+    """GH-287: the target composition must persist the fetched Spotify playlist
+    cover into library_playlists.cover_image_path via the shared PlaylistService
+    helper, and a reimport must preserve it (fill-only policy)."""
+    store, _view, _favorites, _history, _root = target_services
+    repository = TargetPlaylistRepository(store)
+    playlists = PlaylistService(
+        None,
+        tmp_path,
+        library_db=TargetLibraryRepository(store),
+        async_repo=repository,
+    )
+
+    cdn = SpotifyCdnMock()
+    spotify_client = AsyncMock()
+    spotify_client.get_playlist.return_value = {
+        "id": "spotify-1",
+        "name": "Spotify",
+        "images": [{"url": COVER_URL, "width": 640, "height": 640}],
+    }
+    spotify_client.get_playlist_tracks.return_value = []
+    factory = AsyncMock()
+    factory.resolve_spotify.return_value = spotify_client
+    spotify = SpotifyImportService(
+        client_factory=factory,
+        playlist_repo=None,
+        mb_repo=AsyncMock(),
+        playlist_service=playlists,
+        async_playlist_repo=repository,
+        cover_fetcher=cover_fetcher_for(cdn.client()),
+    )
+
+    spotify_playlist_id = await spotify.ensure_playlist_record(
+        "user-1", "spotify-1", "Imported Spotify"
+    )
+    await spotify.populate_playlist("user-1", "spotify-1", spotify_playlist_id)
+
+    record = await playlists.get_playlist(spotify_playlist_id)
+    assert record.cover_image_path is not None
+    stored = Path(record.cover_image_path)
+    assert stored.read_bytes() == JPEG_BYTES
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute(
+            "SELECT cover_image_path FROM library_playlists WHERE id = ?",
+            (spotify_playlist_id,),
+        ).fetchone()
+    assert row == (record.cover_image_path,)
+
+    # Re-import: the imported cover already exists -> preserved byte-for-byte.
+    before_bytes = stored.read_bytes()
+    await spotify.populate_playlist("user-1", "spotify-1", spotify_playlist_id)
+    after = (await playlists.get_playlist(spotify_playlist_id)).cover_image_path
+    assert after == record.cover_image_path
+    assert Path(after).read_bytes() == before_bytes
 
 
 @pytest.mark.asyncio

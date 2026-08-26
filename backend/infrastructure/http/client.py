@@ -248,3 +248,21 @@ def get_coverart_http_client(settings: Optional[Settings] = None) -> httpx.Async
         max_keepalive=settings.http_max_keepalive,
         settings=settings,
     )
+
+
+def get_spotify_cover_http_client(settings: Optional[Settings] = None) -> httpx.AsyncClient:
+    """Dedicated client for Spotify CDN playlist-cover fetches (i.scdn.co et al.).
+    Covers are optional enrichment, so this uses the same SHORT budget as the
+    coverart client (6s read / 3s connect): artwork that can't be had quickly is
+    skipped instead of stalling the import. A separate name is required because
+    HttpClientFactory caches by name and the first caller's kwargs win."""
+    if settings is None:
+        settings = get_settings()
+    return HttpClientFactory.get_client(
+        name="spotify-covers",
+        timeout=6.0,
+        connect_timeout=3.0,
+        max_connections=settings.http_max_connections,
+        max_keepalive=settings.http_max_keepalive,
+        settings=settings,
+    )

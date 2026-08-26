@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+import httpx
+
+from infrastructure.degradation import try_get_degradation_context
+from infrastructure.http.client import get_spotify_cover_http_client
+from infrastructure.integration_result import IntegrationResult
 from infrastructure.queue.priority_queue import RequestPriority
+from infrastructure.validators import validate_spotify_cover_url
 from repositories.musicbrainz_album import _pick_best_release_group
 from repositories.musicbrainz_base import mb_api_get
 from repositories.async_playlist_repository import AsyncPlaylistRepository
@@ -40,6 +47,64 @@ def _best_image_url(images: list[dict], min_size: int = 250) -> str | None:
     return sorted_imgs[-1].get("url")
 
 
+_SOURCE = "spotify"
+
+# Network read bound for one playlist cover. Deliberately looser than the
+# 2 MB storage cap PlaylistService enforces: this only stops us reading an
+# unbounded response off the wire; storage validation stays authoritative.
+MAX_COVER_FETCH_BYTES = 5 * 1024 * 1024
+
+CoverFetcher = Callable[[str], Awaitable[tuple[bytes, str] | None]]
+
+
+def _record_degradation(msg: str) -> None:
+    ctx = try_get_degradation_context()
+    if ctx is not None:
+        ctx.record(IntegrationResult.error(source=_SOURCE, msg=msg))
+
+
+async def fetch_spotify_playlist_cover(
+    url: str, http_client: httpx.AsyncClient
+) -> tuple[bytes, str] | None:
+    """Fetch and validate a Spotify CDN playlist image.
+
+    Single attempt, no redirects (a scdn.co URL must answer directly), HTTPS
+    host allowlist, ``image/*`` content type, and a bounded streamed read that
+    aborts past :data:`MAX_COVER_FETCH_BYTES` without buffering the excess.
+    Returns ``(image_bytes, content_type)``, or ``None`` when the response is
+    unusable. Network errors propagate; the caller degrades.
+    """
+    if not validate_spotify_cover_url(url):
+        return None
+    async with http_client.stream("GET", url, follow_redirects=False) as response:
+        if response.is_redirect or response.status_code != 200:
+            return None
+        content_type = (
+            response.headers.get("content-type", "").split(";")[0].strip().lower()
+        )
+        if not content_type.startswith("image/"):
+            return None
+        declared = response.headers.get("content-length")
+        if declared and declared.lstrip().isdigit() and int(declared) > MAX_COVER_FETCH_BYTES:
+            return None
+        buffer = bytearray()
+        async for chunk in response.aiter_bytes():
+            buffer.extend(chunk)
+            if len(buffer) > MAX_COVER_FETCH_BYTES:
+                return None
+    return bytes(buffer), content_type
+
+
+def cover_fetcher_for(http_client: httpx.AsyncClient) -> CoverFetcher:
+    """Bind the bounded cover fetch to a client - the factory-built named
+    client in production, a MockTransport-served client in tests."""
+
+    async def _fetch(url: str) -> tuple[bytes, str] | None:
+        return await fetch_spotify_playlist_cover(url, http_client)
+
+    return _fetch
+
+
 class SpotifyImportService:
     def __init__(
         self,
@@ -48,6 +113,7 @@ class SpotifyImportService:
         mb_repo: MusicBrainzRepository,
         playlist_service: PlaylistService,
         async_playlist_repo: Any | None = None,
+        cover_fetcher: CoverFetcher | None = None,
     ) -> None:
         self._client_factory = client_factory
         if async_playlist_repo is None and playlist_repo is None:
@@ -59,6 +125,7 @@ class SpotifyImportService:
         )
         self._mb_repo = mb_repo
         self._playlist_service = playlist_service
+        self._cover_fetcher: CoverFetcher | None = cover_fetcher
 
     async def _get_client(self, user_id: str):
         client = await self._client_factory.resolve_spotify(user_id)
@@ -162,9 +229,65 @@ class SpotifyImportService:
             )
 
         await self._async_repo.add_tracks(playlist_id, track_dicts)
+        await self._persist_playlist_cover(
+            user_id, spotify_playlist_id, playlist_id, _pl_info
+        )
         logger.info(
             f"Imported Spotify playlist {spotify_playlist_id} - internal {playlist_id} ({len(track_dicts)} tracks)"
         )
+
+    def _cover_fetch(self) -> CoverFetcher:
+        """Lazily bind the default named factory client on first use, so pure
+        unit tests that never touch covers don't build an HTTP client."""
+        if self._cover_fetcher is None:
+            self._cover_fetcher = cover_fetcher_for(get_spotify_cover_http_client())
+        return self._cover_fetcher
+
+    async def _persist_playlist_cover(
+        self,
+        user_id: str,
+        spotify_playlist_id: str,
+        playlist_id: str,
+        pl_info: dict,
+    ) -> None:
+        """Optional enrichment: store the picked provider image as the local
+        playlist cover. Any failure degrades (recorded into the request-scoped
+        DegradationContext when one is active) and leaves the import untouched -
+        artwork must never fail a playlist import; no cover is normal."""
+        cover_url = _best_image_url(pl_info.get("images") or [])
+        if not cover_url:
+            return
+        try:
+            fetched = await self._cover_fetch()(cover_url)
+            if fetched is None:
+                msg = (
+                    f"Spotify playlist cover rejected for {spotify_playlist_id} "
+                    f"({cover_url})"
+                )
+                _record_degradation(msg)
+                logger.warning(
+                    "spotify.playlist_cover action=rejected spotify_playlist=%s",
+                    spotify_playlist_id,
+                )
+                return
+            data, content_type = fetched
+            stored = await self._playlist_service.set_imported_cover(
+                playlist_id, user_id, data, content_type
+            )
+            logger.info(
+                "spotify.playlist_cover action=%s playlist=%s",
+                "stored" if stored else "kept_existing",
+                playlist_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - optional artwork never fails the import
+            _record_degradation(
+                f"Spotify playlist cover fetch failed for {spotify_playlist_id}: {exc}"
+            )
+            logger.warning(
+                "spotify.playlist_cover action=failed spotify_playlist=%s error=%s",
+                spotify_playlist_id,
+                exc,
+            )
 
     async def _resolve_album_mbids(
         self, raw_tracks: list[dict]
