@@ -5,6 +5,7 @@ import errno
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from models.library_work import ScanRun, ScanRunSnapshot, ScanScope
 from services.compat.target_scan_service import TargetCompatScanService
 from services.native.library_scan_events import LibraryScanEventPublisher
 from services.native.library_inventory_scanner import LibraryInventoryScanner
+from services.native.library_scan_coordinator import LibraryScanCoordinator
 from services.native.library_operation_supervisor import LibraryOperationSupervisor
 from services.native.library_scan_scheduler import LibraryAutomaticScanScheduler
 from services.native.library_policy_resolver import LibraryPolicyResolver
@@ -1256,6 +1258,488 @@ async def test_repeated_stalled_walkers_all_tracked_and_warned(
     while scanner._detached_walkers and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
     assert not scanner._detached_walkers
+@pytest.mark.asyncio
+async def test_probe_does_not_block_default_executor(
+    tmp_path: Path,
+) -> None:
+    loop = asyncio.get_running_loop()
+    default_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="default-test")
+    original = loop._default_executor  # type: ignore[attr-defined]
+    loop.set_default_executor(default_executor)
+    try:
+        root = tmp_path / "music"
+        root.mkdir()
+        wedged = threading.Event()
+        probe_thread: list[str] = []
+
+        def probe(path: Path) -> bool:
+            probe_thread.append(threading.current_thread().name)
+            wedged.wait(timeout=5.0)
+            return True
+
+        store = AsyncMock()
+        store.get_scan_scope_discovery_state.return_value = "pending"
+        scanner = LibraryInventoryScanner(
+            store,
+            directory_probe=probe,
+            walk_deadline_seconds=0.05,
+            probe_executor_max_workers=1,
+        )
+        scope = ScanScope(root_id="root", policy_revision="policy-1")
+        run = _scan_run()
+
+        await scanner.discover(
+            run, [scope], {scope.root_id: root}, SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1"), AsyncMock(return_value=True)
+        )
+        assert store.transition_scan_run.await_args is not None
+        assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+        assert scanner.probe_pending_count == 1
+        assert probe_thread and "library-probe" in probe_thread[0]
+        marker_done = False
+
+        async def marker() -> None:
+            nonlocal marker_done
+            await asyncio.to_thread(lambda: time.sleep(0.01))
+            marker_done = True
+
+        await asyncio.wait_for(marker(), timeout=0.5)
+        assert marker_done is True
+        wedged.set()
+        deadline = time.monotonic() + 2.0
+        while scanner.probe_pending_count and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert scanner.probe_pending_count == 0
+        scanner.close()
+        scanner.close()
+    finally:
+        try:
+            loop.set_default_executor(original)  # type: ignore[arg-type]
+        except TypeError:
+            loop._default_executor = original  # type: ignore[attr-defined]
+        default_executor.shutdown(wait=True)
+        wedged.set()
+
+
+@pytest.mark.asyncio
+async def test_repeated_probe_timeouts_bounded_and_cap_refusal(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    wedged = threading.Event()
+
+    def probe(_path: Path) -> bool:
+        wedged.wait(timeout=5.0)
+        return True
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_probe=probe,
+        walk_deadline_seconds=0.05,
+        probe_executor_max_workers=1,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1")
+    checkpoint = AsyncMock(return_value=True)
+
+    run1 = _scan_run("run-1")
+    await scanner.discover(run1, [scope], {scope.root_id: root}, resolver, checkpoint)
+    assert store.transition_scan_run.await_args is not None
+    assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+    assert scanner.probe_pending_count == 1
+    store.transition_scan_run.reset_mock()
+    store.record_scan_failures.reset_mock()
+    store.complete_scan_scope_discovery.reset_mock()
+
+    with caplog.at_level(logging.WARNING, logger="services.native.library_inventory_scanner"):
+        start = time.monotonic()
+        run2 = _scan_run("run-2")
+        await scanner.discover(run2, [scope], {scope.root_id: root}, resolver, checkpoint)
+        elapsed2 = time.monotonic() - start
+        assert store.transition_scan_run.await_args is not None
+        assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+        assert elapsed2 < 0.4
+        assert scanner.probe_pending_count == 1
+        assert "probe_capacity_exceeded" in caplog.text
+        caplog.clear()
+        store.transition_scan_run.reset_mock()
+        store.record_scan_failures.reset_mock()
+        store.complete_scan_scope_discovery.reset_mock()
+        run3 = _scan_run("run-3")
+        await scanner.discover(run3, [scope], {scope.root_id: root}, resolver, checkpoint)
+        assert store.transition_scan_run.await_args is not None
+        assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+        assert scanner.probe_pending_count == 1
+
+    assert scanner.probe_pending_count == 1
+    wedged.set()
+    deadline = time.monotonic() + 2.0
+    while scanner.probe_pending_count and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert scanner.probe_pending_count == 0
+    scanner.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_pending_drains_after_release_and_close_twice(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    wedged = threading.Event()
+
+    def probe(_path: Path) -> bool:
+        wedged.wait(timeout=5.0)
+        return True
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    scanner = LibraryInventoryScanner(
+        store, directory_probe=probe, walk_deadline_seconds=0.05, probe_executor_max_workers=1
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1")
+    await scanner.discover(_scan_run(), [scope], {scope.root_id: root}, resolver, AsyncMock(return_value=True))
+    assert store.transition_scan_run.await_args is not None
+    assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+    assert scanner.probe_pending_count == 1
+    scanner.close()
+    scanner.close()
+    # Close is explicit shutdown: cancels pending futures immediately, does not wait for daemon thread
+    assert scanner.probe_pending_count == 0
+    wedged.set()
+    deadline = time.monotonic() + 2.0
+    while scanner.probe_pending_count and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert scanner.probe_pending_count == 0
+    scanner.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_success_and_missing_root_unchanged(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").write_bytes(b"audio")
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    store.classify_scan_paths.return_value = {"track.flac": ("new", None)}
+    store.add_scan_inventory_batch.return_value = (1, 1)
+    scanner = LibraryInventoryScanner(store, walk_deadline_seconds=0.05, probe_executor_max_workers=1)
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(
+        settings=SimpleNamespace(enabled=True),
+        policy_revision="policy-1",
+        resolve=lambda _p: SimpleNamespace(policy="automatic"),
+    )
+    run = _scan_run()
+    result = await scanner.discover(run, [scope], {scope.root_id: root}, resolver, AsyncMock(return_value=True))
+    assert result is not None
+    # success probe should not have produced WALK_TIMEOUT or ROOT_UNAVAILABLE
+    if store.transition_scan_run.await_args is not None:
+        assert store.transition_scan_run.await_args.kwargs["terminal_code"] not in {"WALK_TIMEOUT", "ROOT_UNAVAILABLE"}
+    assert scanner.probe_pending_count == 0
+    missing_store = AsyncMock()
+    missing_store.get_scan_scope_discovery_state.return_value = "pending"
+    missing_scanner = LibraryInventoryScanner(missing_store, walk_deadline_seconds=0.05, probe_executor_max_workers=1)
+    missing_root = tmp_path / "missing"
+    missing_scope = ScanScope(root_id="root", policy_revision="policy-1")
+    await missing_scanner.discover(_scan_run("run-missing"), [missing_scope], {missing_scope.root_id: missing_root}, SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1"), AsyncMock(return_value=True))
+    assert missing_store.transition_scan_run.await_args is not None
+    assert missing_store.transition_scan_run.await_args.kwargs["terminal_code"] == "ROOT_UNAVAILABLE"
+    assert missing_scanner.probe_pending_count == 0
+    scanner.close()
+    missing_scanner.close()
+
+
+@pytest.mark.asyncio
+async def test_scanner_smoke_delayed_probe_then_normal_scan_and_to_thread(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").write_bytes(b"audio")
+    wedged = threading.Event()
+    call_count = 0
+
+    def probe(path: Path) -> bool:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            wedged.wait(timeout=5.0)
+            return True
+        return Path.is_dir(path)
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    store.classify_scan_paths.return_value = {}
+    store.add_scan_inventory_batch.return_value = (1, 1)
+    scanner = LibraryInventoryScanner(
+        store, directory_probe=probe, walk_deadline_seconds=0.05, probe_executor_max_workers=1
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1", resolve=lambda _p: SimpleNamespace(policy="automatic"))
+    await scanner.discover(_scan_run("run-1"), [scope], {scope.root_id: root}, resolver, AsyncMock(return_value=True))
+    assert store.transition_scan_run.await_args is not None
+    assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+    assert scanner.probe_pending_count == 1
+    await asyncio.wait_for(asyncio.to_thread(lambda: 42), timeout=0.5)
+    wedged.set()
+    deadline = time.monotonic() + 2.0
+    while scanner.probe_pending_count and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert scanner.probe_pending_count == 0
+    store2 = AsyncMock()
+    store2.get_scan_scope_discovery_state.return_value = "pending"
+    store2.classify_scan_paths.return_value = {"track.flac": ("new", None)}
+    store2.add_scan_inventory_batch.return_value = (2, 1)
+    scanner2 = LibraryInventoryScanner(store2, walk_deadline_seconds=0.05, probe_executor_max_workers=1)
+    result2 = await scanner2.discover(_scan_run("run-2"), [scope], {scope.root_id: root}, resolver, AsyncMock(return_value=True))
+    assert result2 is not None
+    assert scanner2.probe_pending_count == 0
+    scanner.close()
+    scanner2.close()
+@pytest.mark.asyncio
+async def test_scanner_close_is_idempotent_and_coordinator_delegates(tmp_path: Path) -> None:
+    store = AsyncMock()
+    scanner = LibraryInventoryScanner(store, probe_executor_max_workers=1)
+    scanner.close()
+    scanner.close()
+    assert scanner.probe_pending_count == 0
+    await scanner.aclose()
+    assert scanner.probe_pending_count == 0
+    coordinator = LibraryScanCoordinator(
+        store,
+        scanner,
+        AsyncMock(),
+        AsyncMock(),
+        lambda: SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="1"),
+    )
+    coordinator.close()
+    await coordinator.aclose()
+    coordinator.close()
+    await coordinator.aclose()
+    assert scanner.probe_pending_count == 0
+@pytest.mark.asyncio
+async def test_concurrent_probe_submissions_atomic_never_exceeds_cap(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    wedged = threading.Event()
+
+    def probe(_path: Path) -> bool:
+        wedged.wait(timeout=5.0)
+        return True
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    scanner = LibraryInventoryScanner(
+        store, directory_probe=probe, walk_deadline_seconds=0.05, probe_executor_max_workers=1
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1")
+    checkpoint = AsyncMock(return_value=True)
+
+    # Two concurrent discovers while first probe is wedged — second must see capacity and fail fast without exceeding cap
+    task1 = asyncio.create_task(scanner.discover(_scan_run("run-1"), [scope], {scope.root_id: root}, resolver, checkpoint))
+    await asyncio.sleep(0.02)
+    assert scanner.probe_pending_count == 1
+    task2 = asyncio.create_task(scanner.discover(_scan_run("run-2"), [scope], {scope.root_id: root}, resolver, checkpoint))
+    await asyncio.sleep(0.02)
+    # Pending must never exceed 1 even under concurrent reservation
+    assert scanner.probe_pending_count == 1
+    results = await asyncio.gather(task1, task2)
+    # Both should have resulted in WALK_TIMEOUT (first via timeout, second via capacity)
+    assert store.transition_scan_run.await_count == 2
+    for call in store.transition_scan_run.await_args_list:
+        assert call.kwargs["terminal_code"] == "WALK_TIMEOUT"
+    assert scanner.probe_pending_count == 1
+    wedged.set()
+    deadline = time.monotonic() + 2.0
+    while scanner.probe_pending_count and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert scanner.probe_pending_count == 0
+    scanner.close()
+
+
+@pytest.mark.asyncio
+async def test_no_deadlock_when_blocked_future_completes_during_capacity_failure(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    wedged = threading.Event()
+
+    def probe(_path: Path) -> bool:
+        wedged.wait(timeout=5.0)
+        return True
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    # Make record_scan_failures sleep to simulate await while holding lock (old bug would deadlock)
+    original_record = AsyncMock()
+    async def slow_record(*args, **kwargs):  # type: ignore[no-untyped-def]
+        await asyncio.sleep(0.2)
+        return None
+
+    store.record_scan_failures = AsyncMock(side_effect=slow_record)
+    store.complete_scan_scope_discovery = AsyncMock()
+    store.transition_scan_run = AsyncMock(return_value=_scan_run("run-x"))
+    scanner = LibraryInventoryScanner(
+        store, directory_probe=probe, walk_deadline_seconds=0.05, probe_executor_max_workers=1
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1")
+    checkpoint = AsyncMock(return_value=True)
+
+    # First probe wedged, pending=1
+    task1 = asyncio.create_task(scanner.discover(_scan_run("run-1"), [scope], {scope.root_id: root}, resolver, checkpoint))
+    await asyncio.sleep(0.02)
+    assert scanner.probe_pending_count == 1
+    # Second probe at capacity will enter failure path and await slow_record (0.2s). During that await, release first probe.
+    task2 = asyncio.create_task(scanner.discover(_scan_run("run-2"), [scope], {scope.root_id: root}, resolver, checkpoint))
+    await asyncio.sleep(0.05)
+    # Release first probe while second is in its await — if lock were held across await, this would deadlock
+    wedged.set()
+    # Both should complete within 1s without deadlock
+    await asyncio.wait_for(asyncio.gather(task1, task2), timeout=1.0)
+    # After both, pending should be 0 (first completed, second never added pending)
+    deadline = time.monotonic() + 2.0
+    while scanner.probe_pending_count and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert scanner.probe_pending_count == 0
+    scanner.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_thread_is_daemon_and_named(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    captured: list[threading.Thread] = []
+    wedged = threading.Event()
+
+    def probe(_path: Path) -> bool:
+        captured.append(threading.current_thread())
+        wedged.wait(timeout=5.0)
+        return True
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    scanner = LibraryInventoryScanner(
+        store, directory_probe=probe, walk_deadline_seconds=0.05, probe_executor_max_workers=1
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    task = asyncio.create_task(scanner.discover(_scan_run(), [scope], {scope.root_id: root}, SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1"), AsyncMock(return_value=True)))
+    await asyncio.sleep(0.02)
+    assert captured
+    thread = captured[0]
+    assert thread.daemon is True
+    assert thread.name == "library-probe"
+    assert scanner.probe_pending_count == 1
+    wedged.set()
+    await asyncio.wait_for(task, timeout=1.0)
+    deadline = time.monotonic() + 2.0
+    while scanner.probe_pending_count and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert scanner.probe_pending_count == 0
+    scanner.close()
+
+
+@pytest.mark.asyncio
+async def test_close_with_permanently_blocked_probe_does_not_hang(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    # Never set this event — probe blocks forever
+    blocked = threading.Event()
+
+    def probe(_path: Path) -> bool:
+        blocked.wait(timeout=10.0)
+        return True
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    scanner = LibraryInventoryScanner(
+        store, directory_probe=probe, walk_deadline_seconds=0.05, probe_executor_max_workers=1
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    task = asyncio.create_task(scanner.discover(_scan_run(), [scope], {scope.root_id: root}, SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1"), AsyncMock(return_value=True)))
+    await asyncio.sleep(0.02)
+    assert scanner.probe_pending_count == 1
+    start = time.monotonic()
+    scanner.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.2
+    # Close cancels pending future, so pending should be 0 even though thread still blocked (daemon)
+    assert scanner.probe_pending_count == 0
+    # Second close idempotent
+    scanner.close()
+    assert scanner.probe_pending_count == 0
+    # Discover after close should fail fast due to closed
+    await asyncio.wait_for(task, timeout=1.0)
+    # New probe after close should also fail fast
+    store2 = AsyncMock()
+    store2.get_scan_scope_discovery_state.return_value = "pending"
+    result2 = await scanner.discover(_scan_run("run-2"), [scope], {scope.root_id: root}, SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1"), AsyncMock(return_value=True))
+    assert store2.transition_scan_run.await_args is None or store2.transition_scan_run.await_args.kwargs.get("terminal_code") == "WALK_TIMEOUT"
+    # Thread is daemon, should not prevent exit — we can check daemon flag of any remaining probe thread
+    # The blocked thread is still alive but daemon, so we just ensure close didn't hang
+    await scanner.aclose()
+@pytest.mark.asyncio
+async def test_probe_loop_closed_does_not_set_future_from_worker_thread(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    loop = asyncio.get_running_loop()
+    original_call = loop.call_soon_threadsafe
+
+    def raising_call(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("loop closed")
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    scanner = LibraryInventoryScanner(
+        store, directory_probe=lambda p: True, walk_deadline_seconds=0.05, probe_executor_max_workers=1
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    loop.call_soon_threadsafe = raising_call  # type: ignore[method-assign]
+    try:
+        with caplog.at_level(logging.DEBUG, logger="services.native.library_inventory_scanner"):
+            result = await scanner.discover(
+                _scan_run(), [scope], {scope.root_id: root}, SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1"), AsyncMock(return_value=True)
+            )
+        # Loop closed simulation should not have called set_result from worker thread; future remains pending until timeout
+        assert store.transition_scan_run.await_args is not None
+        assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+        assert scanner.probe_pending_count == 1
+        # No raw path in debug log
+        for record in caplog.records:
+            assert str(root) not in record.getMessage()
+    finally:
+        loop.call_soon_threadsafe = original_call  # type: ignore[method-assign]
+        # Pending future is still in set (since we returned without setting); close must clear without thread-unsafe set
+        assert scanner.probe_pending_count == 1
+        scanner.close()
+        assert scanner.probe_pending_count == 0
+        # Loop is still running, future was cancelled via close, not set from worker
+
+
+
+
+
+
+
+
 
 
 

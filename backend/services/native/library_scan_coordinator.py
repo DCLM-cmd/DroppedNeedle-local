@@ -443,3 +443,25 @@ class LibraryScanCoordinator:
                 await self._store.complete_scan_management_candidate(
                     run_id, album_id, completed_at=now
                 )
+    def close(self) -> None:
+        close = getattr(self._inventory, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - close must not hang shutdown
+                logger.exception("Failed to close inventory scanner")
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._inventory, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001 - close must not hang shutdown
+                logger.exception("Failed to close inventory scanner")
+            return
+        close = getattr(self._inventory, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - close must not hang shutdown
+                logger.exception("Failed to close inventory scanner")

@@ -61,7 +61,6 @@ class _WalkHeartbeat:
         with self._lock:
             return time.monotonic() - self._touched_at
 
-
 class LibraryInventoryScanner:
     def __init__(
         self,
@@ -72,6 +71,7 @@ class LibraryInventoryScanner:
         walk_deadline_seconds: float = 30.0,
         directory_probe: DirectoryProbe = Path.is_dir,
         max_detached_walkers: int = 4,
+        probe_executor_max_workers: int = 1,
     ) -> None:
         self._store = store
         self._directory_walker = directory_walker
@@ -80,7 +80,10 @@ class LibraryInventoryScanner:
         self._directory_probe = directory_probe
         self._max_detached_walkers = max_detached_walkers
         self._detached_walkers: set[asyncio.Task[None]] = set()
-
+        self._probe_max_workers = probe_executor_max_workers
+        self._probe_lock = threading.Lock()
+        self._pending_probes: set[asyncio.Future[bool]] = set()
+        self._closed = False
     def _finish_detached_walker(self, task: asyncio.Task[None]) -> None:
         self._detached_walkers.discard(task)
         if not task.cancelled():
@@ -97,6 +100,40 @@ class LibraryInventoryScanner:
             )
         self._detached_walkers.add(task)
         task.add_done_callback(self._finish_detached_walker)
+    def _remove_pending_probe(self, fut: asyncio.Future[bool]) -> None:
+        with self._probe_lock:
+            self._pending_probes.discard(fut)
+
+    @property
+    def probe_pending_count(self) -> int:
+        with self._probe_lock:
+            return len(self._pending_probes)
+
+    def close(self) -> None:
+        with self._probe_lock:
+            if self._closed:
+                return
+            self._closed = True
+            pending = list(self._pending_probes)
+            self._pending_probes.clear()
+        for fut in pending:
+            if fut.done():
+                continue
+            try:
+                loop = fut.get_loop()  # type: ignore[attr-defined]
+                if loop.is_running():
+                    loop.call_soon_threadsafe(fut.cancel)
+                else:
+                    fut.cancel()
+            except Exception:  # noqa: BLE001 - close must not fail on pending future cancel
+                try:
+                    fut.cancel()
+                except Exception:  # noqa: BLE001 - close must not fail on pending future cancel
+                    pass
+
+    async def aclose(self) -> None:
+        self.close()
+
 
     async def _record_failure(
         self,
@@ -190,9 +227,123 @@ class LibraryInventoryScanner:
             selected = (
                 root if scope.relative_path == "." else root / scope.relative_path
             )
+            loop = asyncio.get_running_loop()
+            probe_future: asyncio.Future[bool] | None = None
+            should_fail_capacity = False
+            should_fail_closed = False
+            with self._probe_lock:
+                if self._closed:
+                    should_fail_closed = True
+                elif len(self._pending_probes) >= self._probe_max_workers:
+                    should_fail_capacity = True
+                else:
+                    probe_future = loop.create_future()
+                    self._pending_probes.add(probe_future)
+
+                    def _on_done(f: asyncio.Future[bool]) -> None:
+                        with self._probe_lock:
+                            self._pending_probes.discard(f)
+
+                    probe_future.add_done_callback(_on_done)
+            if should_fail_closed:
+                logger.warning(
+                    "library_scan event=probe_executor_closed run_id=%s root_id=%s",
+                    run.id,
+                    scope.root_id,
+                )
+                await self._record_failure(
+                    run.id,
+                    scope,
+                    relative_path=scope.relative_path,
+                    failure_code="WALK_TIMEOUT",
+                    failure_detail=(
+                        "The library root probe exceeded "
+                        f"{self._walk_deadline_seconds:.1f}s."
+                    ),
+                )
+                await self._store.complete_scan_scope_discovery(
+                    run.id,
+                    scope.root_id,
+                    scope.relative_path,
+                    state="unavailable",
+                    error_code="WALK_TIMEOUT",
+                )
+                return await self._store.transition_scan_run(
+                    run.id,
+                    expected_state=current.state,
+                    expected_revision=current.row_revision,
+                    new_state="failed",
+                    now=current.updated_at,
+                    terminal_code="WALK_TIMEOUT",
+                )
+            if should_fail_capacity:
+                logger.warning(
+                    "library_scan event=probe_capacity_exceeded pending=%s max=%s run_id=%s root_id=%s",
+                    len(self._pending_probes) + 1,
+                    self._probe_max_workers,
+                    run.id,
+                    scope.root_id,
+                )
+                await self._record_failure(
+                    run.id,
+                    scope,
+                    relative_path=scope.relative_path,
+                    failure_code="WALK_TIMEOUT",
+                    failure_detail=(
+                        "The library root probe exceeded "
+                        f"{self._walk_deadline_seconds:.1f}s."
+                    ),
+                )
+                await self._store.complete_scan_scope_discovery(
+                    run.id,
+                    scope.root_id,
+                    scope.relative_path,
+                    state="unavailable",
+                    error_code="WALK_TIMEOUT",
+                )
+                return await self._store.transition_scan_run(
+                    run.id,
+                    expected_state=current.state,
+                    expected_revision=current.row_revision,
+                    new_state="failed",
+                    now=current.updated_at,
+                    terminal_code="WALK_TIMEOUT",
+                )
+            assert probe_future is not None
+
+            def _probe_runner() -> None:
+                try:
+                    result = self._directory_probe(selected)
+                    exc: BaseException | None = None
+                except BaseException as e:  # noqa: BLE001 - probe must propagate BaseException via future
+                    result = False
+                    exc = e
+
+                def _complete() -> None:
+                    if probe_future.done():
+                        return
+                    if exc is not None:
+                        if not probe_future.done():
+                            probe_future.set_exception(exc)
+                    else:
+                        if not probe_future.done():
+                            probe_future.set_result(result)  # type: ignore[arg-type]
+
+                try:
+                    loop.call_soon_threadsafe(_complete)
+                except RuntimeError:
+                    logger.debug(
+                        "library_scan event=probe_loop_closed run_id=%s root_id=%s",
+                        run.id,
+                        scope.root_id,
+                    )
+                    return
+
+            thread = threading.Thread(target=_probe_runner, daemon=True, name="library-probe")
+            thread.start()
             try:
                 exists = await asyncio.wait_for(
-                    asyncio.to_thread(self._directory_probe, selected),
+                    asyncio.shield(probe_future),
                     timeout=self._walk_deadline_seconds,
                 )
             except TimeoutError:
@@ -227,6 +378,39 @@ class LibraryInventoryScanner:
                     now=current.updated_at,
                     terminal_code="WALK_TIMEOUT",
                 )
+            except asyncio.CancelledError:
+                if probe_future.cancelled():
+                    logger.warning(
+                        "library_scan event=probe_cancelled run_id=%s root_id=%s",
+                        run.id,
+                        scope.root_id,
+                    )
+                    await self._record_failure(
+                        run.id,
+                        scope,
+                        relative_path=scope.relative_path,
+                        failure_code="WALK_TIMEOUT",
+                        failure_detail=(
+                            "The library root probe exceeded "
+                            f"{self._walk_deadline_seconds:.1f}s."
+                        ),
+                    )
+                    await self._store.complete_scan_scope_discovery(
+                        run.id,
+                        scope.root_id,
+                        scope.relative_path,
+                        state="unavailable",
+                        error_code="WALK_TIMEOUT",
+                    )
+                    return await self._store.transition_scan_run(
+                        run.id,
+                        expected_state=current.state,
+                        expected_revision=current.row_revision,
+                        new_state="failed",
+                        now=current.updated_at,
+                        terminal_code="WALK_TIMEOUT",
+                    )
+                raise
             if not exists:
                 await self._record_failure(
                     run.id,

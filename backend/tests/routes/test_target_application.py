@@ -709,6 +709,76 @@ def test_production_target_lifespan_rejects_malformed_admission_before_validatio
             pass
 
     validate.assert_not_awaited()
+def test_production_target_lifespan_closes_scan_coordinator_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import target_application as target_module
+    from core.dependencies import auth_providers
+    from maintenance import automatic_upgrade
+
+    lifecycle_order: list[str] = []
+    validate = AsyncMock(side_effect=lambda _phase: lifecycle_order.append("validate"))
+    admission = AsyncMock(side_effect=lambda _settings: lifecycle_order.append("admit"))
+    init = AsyncMock()
+    cleanup = AsyncMock()
+    migrate = AsyncMock(side_effect=lambda **_kwargs: lifecycle_order.append("migrate"))
+    operational = AsyncMock(side_effect=lambda **_kwargs: lifecycle_order.append("operational"))
+    timezone_name = MagicMock(return_value="Europe/London")
+    cache = SimpleNamespace(clear=AsyncMock())
+    preferences = SimpleNamespace(
+        get_instance_id=lambda: "instance",
+        get_advanced_settings=lambda: SimpleNamespace(memory_cache_cleanup_interval=60, disk_cache_cleanup_interval=60),
+        get_typed_library_settings=lambda: SimpleNamespace(library_roots=[], enabled=True),
+        get_library_scan_schedule=lambda: SimpleNamespace(scan_frequency="manual", daily_scan_time="03:00"),
+    )
+    auth = SimpleNamespace(cleanup_expired_tokens=AsyncMock())
+    auth_store = object()
+    operation_supervisor = SimpleNamespace(recover=AsyncMock(side_effect=lambda: lifecycle_order.append("operation-recovery")))
+    recovery_service = SimpleNamespace(
+        recover_startup=AsyncMock(return_value=SimpleNamespace(examined_bundles=0, recovered_bundles=0, rolled_back_bundles=0, needs_attention_bundles=0, skipped_bundles=0), side_effect=lambda: (lifecycle_order.append("management-recovery") or SimpleNamespace(examined_bundles=0, recovered_bundles=0, rolled_back_bundles=0, needs_attention_bundles=0, skipped_bundles=0))),
+    )
+    monkeypatch.setattr(target_module.TargetStartupValidator, "validate", validate)
+    monkeypatch.setattr(automatic_upgrade, "await_target_startup_admission", admission)
+    monkeypatch.setattr(target_module, "init_app_state", init)
+    monkeypatch.setattr(target_module, "cleanup_app_state", cleanup)
+    monkeypatch.setattr(target_module, "run_target_one_time_migrations", migrate)
+    monkeypatch.setattr(target_module, "start_target_operational_runtime", operational)
+    monkeypatch.setattr(target_module, "_server_timezone_name", timezone_name)
+    monkeypatch.setattr(target_module, "get_preferences_service", lambda: preferences)
+    monkeypatch.setattr(target_module, "get_native_library_store", lambda: SimpleNamespace(work_wakeups=object()))
+    monkeypatch.setattr(target_module, "get_cache", lambda: cache)
+    monkeypatch.setattr(target_module, "get_disk_cache", lambda: object())
+    monkeypatch.setattr(target_module, "get_target_library_operation_supervisor", lambda: operation_supervisor)
+    monkeypatch.setattr(target_module, "get_library_management_recovery_service", lambda: recovery_service)
+    monkeypatch.setattr(target_module, "get_target_consumer_composition", lambda: SimpleNamespace(covers=SimpleNamespace(disk_cache=object())))
+    monkeypatch.setattr(target_module, "start_cache_cleanup_task", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_memory_maintenance_task", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_disk_cache_cleanup_task", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_scan_supervisor", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_identification_worker", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_operation_worker", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_library_contribution_verification_worker", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_wal_checkpoint_task", lambda _service: None)
+    monkeypatch.setattr(target_module, "start_target_worker_watchdog", lambda starters: None)
+    pending_migration = AsyncMock()
+    pending_migration.schedule.return_value = False
+    monkeypatch.setattr(target_module, "get_legacy_pending_migration_service", lambda: pending_migration)
+    monkeypatch.setattr(auth_providers, "get_auth_service", lambda: auth)
+    monkeypatch.setattr(auth_providers, "get_auth_store", lambda: auth_store)
+    coordinator_close = AsyncMock()
+    mock_coordinator = SimpleNamespace(aclose=coordinator_close, close=MagicMock())
+    monkeypatch.setattr(target_module, "get_target_library_scan_coordinator", lambda: mock_coordinator)
+    registry = target_module.TaskRegistry.get_instance()
+    monkeypatch.setattr(registry, "cancel", AsyncMock())
+    monkeypatch.setattr(registry, "cancel_all", AsyncMock())
+    monkeypatch.setenv("TZ", "Europe/London")
+    monkeypatch.delenv("DROPPEDNEEDLE_TARGET_ADMISSION_TOKEN", raising=False)
+    app = create_production_target_application()
+    with build_test_client(app):
+        pass
+    coordinator_close.assert_awaited_once()
+
+
 
 
 def test_target_provider_call_graph_has_no_direct_legacy_catalog_edge() -> None:

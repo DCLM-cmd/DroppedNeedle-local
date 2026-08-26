@@ -705,6 +705,14 @@ async def production_target_lifespan(app: FastAPI):
         # restart a worker mid-shutdown and orphan the task.
         await registry.cancel(TARGET_WORKER_WATCHDOG_TASK_NAME)
         await registry.cancel_all(grace_period=settings.shutdown_grace_period)
+        try:
+            coordinator = get_target_library_scan_coordinator()
+            if hasattr(coordinator, "aclose"):
+                await coordinator.aclose()
+            elif hasattr(coordinator, "close"):
+                coordinator.close()  # type: ignore[call-arg]
+        except Exception:  # noqa: BLE001 - close must not hang shutdown
+            logger.exception("Failed to close scan coordinator")
         await cleanup_app_state(
             queue_manager_getter=get_target_discover_queue_manager,
             genre_prewarm_getter=get_target_genre_cover_prewarm_service,
