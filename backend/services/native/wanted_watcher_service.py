@@ -30,6 +30,7 @@ from core.exceptions import (
     ValidationError,
 )
 from infrastructure.queue.priority_queue import RequestPriority
+from infrastructure.resilience.retry import CircuitOpenError
 from models.download_identity import soulseek_identity, usenet_identity
 from models.wanted import WantedRetrying, WantedWatch
 from services.native.acquisition.status import is_terminal
@@ -157,6 +158,15 @@ class WantedWatcherService:
                     dispatched += 1
                 elif outcome == "satisfied":
                     fulfilled += 1
+            except CircuitOpenError as exc:
+                errors += 1
+                logger.error(
+                    "wanted.check_failed",
+                    extra={"release_group_mbid": want.release_group_mbid},
+                    exc_info=True,
+                )
+                retry_after = getattr(exc, "retry_after_seconds", None)
+                await self._record_error_cycle(want, settings, retry_after_seconds=retry_after)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - one bad want must never kill the sweep
@@ -693,16 +703,27 @@ class WantedWatcherService:
         self._log_checked(want, outcome, len(candidates), new_count or 0)
         return outcome
 
-    async def _record_error_cycle(self, want: WantedWatch, settings) -> None:  # noqa: ANN001
+    async def _record_error_cycle(
+        self, want: WantedWatch, settings, retry_after_seconds: float | None = None  # noqa: ANN001
+    ) -> None:  # noqa: ANN001
         """A per-want failure reschedules normally with last_outcome='error' -
         one bad want never kills the sweep (§5.2.3)."""
         try:
             now = time.time()
+            interval = self._interval_seconds(want.first_release_date, 0, now)
+            if retry_after_seconds is not None:
+                try:
+                    candidate = float(retry_after_seconds)
+                    import math
+
+                    if math.isfinite(candidate) and candidate > 0:
+                        interval = max(interval, candidate)
+                except (TypeError, ValueError):
+                    pass
             await self._store.record_cycle(
                 want.release_group_mbid,
                 outcome="error",
-                next_check_at=now
-                + self._interval_seconds(want.first_release_date, 0, now),
+                next_check_at=now + interval,
                 quiet=False,
                 go_dormant=(now - want.created_at) > settings.dormant_after_days * _DAY,
                 now=now,

@@ -10,7 +10,8 @@ import uuid
 from collections.abc import Awaitable, Callable
 
 import msgspec
-
+import msgspec.json
+from infrastructure.resilience.retry import CircuitOpenError
 from api.v1.schemas.artist_reconciliation import (
     ArtistCreditEvidence,
     ArtistDuplicateGroupDetail,
@@ -484,7 +485,18 @@ class ArtistIdentityReconciliationService:
                             includes=("artist-credits", "recordings", "release-groups"),
                             priority=RequestPriority.BACKGROUND_SYNC,
                         )
-                    except ExternalServiceError:
+                    except (ExternalServiceError, CircuitOpenError) as exc:
+                        retry_after = getattr(exc, "retry_after_seconds", None)
+                        delay = _PROVIDER_DEFER_RETRY_SECONDS
+                        if retry_after is not None:
+                            try:
+                                candidate = float(retry_after)
+                                import math
+
+                                if math.isfinite(candidate) and candidate > 0:
+                                    delay = max(delay, candidate)
+                            except (TypeError, ValueError):
+                                pass
                         return await self._store.defer_artist_reconciliation_work(
                             job_id=job_id,
                             ordinal=int(work["ordinal"]),
@@ -493,7 +505,7 @@ class ArtistIdentityReconciliationService:
                             input_revision=revision,
                             reason_code="PROVIDER_DEFERRED",
                             now=now,
-                            retry_not_before=now + _PROVIDER_DEFER_RETRY_SECONDS,
+                            retry_not_before=now + delay,
                         )
                 try:
                     projection = self._projection(

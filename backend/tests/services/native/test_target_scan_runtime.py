@@ -2039,3 +2039,90 @@ async def test_automatic_scheduler_scans_allowed_children_of_excluded_roots(
     assert [(scope.scope_id, scope.relative_path) for scope in scopes] == [
         ("allowed", "Allowed")
     ]
+
+@pytest.mark.asyncio
+async def test_target_identification_worker_circuit_open_defers_exact_and_one_wake() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+    from infrastructure.resilience.retry import CircuitOpenError
+
+    queue = AsyncMock()
+    queue.recover = AsyncMock()
+    queue.is_paused = AsyncMock(return_value=False)
+    queue.claim = AsyncMock(return_value={"id": "job1", "attempt_count": 1, "row_revision": 1})
+    queue.defer = AsyncMock(return_value=1)
+    service = MagicMock()
+    service.run_claimed_job = AsyncMock(side_effect=CircuitOpenError("open", breaker_name="test", retry_after_seconds=10))
+    wakeups = MagicMock()
+    wakeups.revision.return_value = 0
+    wakeups.wait = AsyncMock(side_effect=asyncio.CancelledError())
+    await run_target_identification_worker(
+        lambda: queue,
+        lambda: service,
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+    )
+    queue.defer.assert_awaited_once_with({"id": "job1", "attempt_count": 1, "row_revision": 1}, "test-worker", "UNEXPECTED_ERROR", retry_after_seconds=10)
+    assert wakeups.wait.await_count == 1
+    assert wakeups.wait.await_args.kwargs["timeout_seconds"] == 10
+    assert queue.claim.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_target_worker_one_sleep_and_cancel() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    queue = MagicMock()
+    queue.recover = AsyncMock()
+    queue.is_paused = AsyncMock(return_value=True)
+    wakeups = MagicMock()
+    wakeups.revision.return_value = 0
+    wakeups.wait = AsyncMock(side_effect=asyncio.CancelledError())
+    await run_target_identification_worker(
+        lambda: queue,
+        lambda: MagicMock(),
+        worker_id="test-worker",
+        work_wakeups=wakeups,
+    )
+    assert wakeups.wait.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_production_smoke_identification_worker_future_wake_no_reclaim(tmp_path: Path) -> None:
+    import sqlite3
+    import threading
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
+    from services.native.identification_queue_service import IdentificationQueueService
+    from models.library_work import IdentificationJob
+    from models.local_catalog import LocalAlbum, LocalArtist, LocalTrack, CatalogMembership
+    from infrastructure.resilience.retry import CircuitOpenError
+
+    db_path = tmp_path / "smoke.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO auth_users(id) VALUES ('worker')")
+    store = NativeLibraryStore(db_path, threading.Lock(), work_wakeups=DurableWorkWakeups())
+    artist = LocalArtist(id="artist-1", display_name="A", folded_name="a", normalized_name="a", kind="group", created_at=1, updated_at=1)
+    album = LocalAlbum(id="album-1", root_id="root", grouping_key="g1", title="Album", album_artist_id=artist.id, album_artist_name="A", created_at=1, updated_at=1)
+    track = LocalTrack(id="track-1", local_album_id=album.id, root_id="root", file_path="/music/a.flac", relative_path="a.flac", path_hash="h1", file_size_bytes=100, file_mtime_ns=1, stat_revision="s1", tag_revision="t1", title="Track", artist_name="A", album_title="Album", album_artist_name="A", track_number=1, duration_seconds=180, file_format="flac", imported_at=1, applied_policy="automatic", applied_policy_revision="p1")
+    await store.create_catalog_membership(CatalogMembership(album=album, artists=[artist], tracks=[track], album_credits=[], track_credits={track.id: []}))
+    queue = IdentificationQueueService(store)
+    now = time.time()
+    await store.enqueue_identification_job(IdentificationJob(id="job-smoke", local_album_id="album-1", kind="automatic", dedupe_key="automatic:album-1:rev1", input_revision="rev1", priority=20, created_at=now))
+    claimed = await queue.claim("worker-1", now=now + 1)
+    assert claimed is not None
+    delays: list[float] = []
+    orig_notify = store.work_wakeups.notify_after
+
+    def spy(kind: str, delay: float) -> None:
+        if kind == "identification":
+            delays.append(delay)
+        return orig_notify(kind, delay)
+
+    store.work_wakeups.notify_after = spy  # type: ignore
+    await queue.defer(claimed, "worker-1", "UNEXPECTED_ERROR", now=now + 2, retry_after_seconds=10)
+    assert len(delays) == 1
+    assert 29.5 <= delays[0] <= 30.5
+    # No early claim
+    assert await queue.claim("worker-2", now=now + 5) is None
+    assert await queue.claim("worker-2", now=now + 13) is None
+    assert await queue.claim("worker-2", now=now + 33) is not None

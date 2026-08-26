@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import math
 import time
 import uuid
-
 from core.exceptions import (
     ExternalServiceError,
     InvalidExternalPayloadError,
@@ -10,6 +10,7 @@ from core.exceptions import (
 )
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from infrastructure.queue.priority_queue import RequestPriority
+from infrastructure.resilience.retry import CircuitOpenError
 from models.identification import IdentificationAttempt, IdentificationEvidenceRecord
 from models.library_contribution import ContributionRecord
 from repositories.protocols.musicbrainz import MusicBrainzRepositoryProtocol
@@ -108,6 +109,25 @@ class LibraryContributionVerificationWorker:
                 failure_code=UNMAPPABLE_PROVIDER_PAYLOAD,
                 now=timestamp,
             )
+        except CircuitOpenError as exc:
+            retry_after = getattr(exc, "retry_after_seconds", None)
+            try:
+                cand = float(retry_after) if retry_after is not None else None
+                if cand is None or not math.isfinite(cand) or cand <= 0:
+                    retry_after = None
+                else:
+                    retry_after = cand
+            except (TypeError, ValueError):
+                retry_after = None
+            return await self._retry_or_review(
+                job,
+                job_revision=job_revision,
+                worker_id=worker_id,
+                contribution=contribution,
+                failure_code="MUSICBRAINZ_TEMPORARILY_UNAVAILABLE",
+                now=timestamp,
+                retry_after_seconds=retry_after,
+            )
         except ExternalServiceError:
             return await self._retry_or_review(
                 job,
@@ -205,6 +225,7 @@ class LibraryContributionVerificationWorker:
         contribution: ContributionRecord,
         failure_code: str,
         now: float,
+        retry_after_seconds: float | None = None,
     ) -> str:
         received_at = contribution.result_received_at or now
         attempts = int(job["attempt_count"])
@@ -213,6 +234,13 @@ class LibraryContributionVerificationWorker:
             and now - received_at < MAX_AUTOMATIC_WINDOW_SECONDS
         ):
             delay = min(MAX_RETRY_SECONDS, 15 * (2 ** min(attempts - 1, 6)))
+            if retry_after_seconds is not None:
+                try:
+                    cand = float(retry_after_seconds)
+                    if math.isfinite(cand) and cand > 0:
+                        delay = max(delay, cand)
+                except (TypeError, ValueError):
+                    pass
             await self._store.retry_library_contribution_verification(
                 job_id=str(job["id"]),
                 worker_id=worker_id,

@@ -81,9 +81,9 @@ _PROVIDER_DEFERRED_RETRY_SECONDS = 120.0
 
 
 class _ProviderUnavailable(Exception):
-    """Control-flow: the identity provider is unavailable, so the audit defers
-    the whole job instead of writing 'unverifiable' findings during the outage."""
-
+    def __init__(self, message: str, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 class IdentityRepairService:
     def __init__(
@@ -355,12 +355,13 @@ class IdentityRepairService:
                         finding, attempt, evidence = await self._classify(
                             str(job["id"]), work, context
                         )
-                except _ProviderUnavailable:
+                except _ProviderUnavailable as exc:
                     return await self._defer_audit(
                         str(job["id"]),
                         worker_id,
                         timestamp,
                         ordinal=int(work["ordinal"]),
+                        retry_after_seconds=getattr(exc, "retry_after_seconds", None),
                     )
                 await self._store.save_repair_finding_for_work(
                     str(job["id"]),
@@ -386,7 +387,6 @@ class IdentityRepairService:
                     reason_code="BACKGROUND_TIMESLICE_EXPIRED",
                 )
             )
-
     async def _defer_audit(
         self,
         job_id: str,
@@ -394,14 +394,26 @@ class IdentityRepairService:
         timestamp: float,
         *,
         ordinal: int | None = None,
+        retry_after_seconds: float | None = None,
     ) -> OperationResponse:
+        # Use max(existing safe policy, exception deadline) per F-PERF-01
+        delay = _PROVIDER_DEFERRED_RETRY_SECONDS
+        if retry_after_seconds is not None:
+            try:
+                candidate = float(retry_after_seconds)
+                import math
+
+                if math.isfinite(candidate) and candidate > 0:
+                    delay = max(delay, candidate)
+            except (TypeError, ValueError):
+                pass
         deferred = await self._store.defer_repair_audit_work(
             job_id=job_id,
             ordinal=ordinal,
             worker_id=worker_id,
             reason_code="PROVIDER_DEFERRED",
             now=timestamp,
-            retry_not_before=timestamp + _PROVIDER_DEFERRED_RETRY_SECONDS,
+            retry_not_before=timestamp + delay,
         )
         return self._operations._response(deferred)
 
@@ -488,8 +500,10 @@ class IdentityRepairService:
                 priority=RequestPriority.BACKGROUND_SYNC,
             )
         except (ExternalServiceError, CircuitOpenError) as error:
+            retry_after = getattr(error, "retry_after_seconds", None)
             raise _ProviderUnavailable(
-                "MusicBrainz is unavailable; deferring the identity audit."
+                "MusicBrainz is unavailable; deferring the identity audit.",
+                retry_after_seconds=retry_after,
             ) from error
         if release is None:
             return (
@@ -535,8 +549,10 @@ class IdentityRepairService:
                 candidate,
             )
         except (ExternalServiceError, CircuitOpenError) as error:
+            retry_after = getattr(error, "retry_after_seconds", None)
             raise _ProviderUnavailable(
-                "MusicBrainz is unavailable; deferring the identity audit."
+                "MusicBrainz is unavailable; deferring the identity audit.",
+                retry_after_seconds=retry_after,
             ) from error
         evaluated = self._evidence.evaluate_candidate(local_tracks, candidate)
         self._disambiguate_duplicate_recordings(
@@ -760,8 +776,10 @@ class IdentityRepairService:
                             priority=RequestPriority.BACKGROUND_SYNC,
                         )
                     except (ExternalServiceError, CircuitOpenError) as error:
+                        retry_after = getattr(error, "retry_after_seconds", None)
                         raise _ProviderUnavailable(
-                            "MusicBrainz is unavailable; deferring the identity audit."
+                            "MusicBrainz is unavailable; deferring the identity audit.",
+                            retry_after_seconds=retry_after,
                         ) from error
                     if release is None:
                         continue
@@ -1363,8 +1381,10 @@ class IdentityRepairService:
                     RequestPriority.BACKGROUND_SYNC,
                 )
             except (ExternalServiceError, CircuitOpenError) as error:
+                retry_after = getattr(error, "retry_after_seconds", None)
                 raise _ProviderUnavailable(
-                    "MusicBrainz is unavailable; deferring the identity audit."
+                    "MusicBrainz is unavailable; deferring the identity audit.",
+                    retry_after_seconds=retry_after,
                 ) from error
             if candidate is not None:
                 grouping_tracks = [_to_grouping_track(row) for row in tracks]

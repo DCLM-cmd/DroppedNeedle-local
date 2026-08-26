@@ -381,3 +381,46 @@ async def test_recovery_runs_bounded_retention_cleanup_hourly() -> None:
     assert store.recover_library_contribution_verification_leases.await_count == 3
     assert contributions.purge_expired_provider_data.await_count == 2
     assert store.clean_library_contribution_records.await_count == 2
+
+@pytest.mark.asyncio
+async def test_circuit_open_defers_with_retry_after_and_no_early_claim(tmp_path) -> None:
+    from infrastructure.resilience.retry import CircuitOpenError
+
+    service, musicbrainz, path, _ = await _returned_contribution(tmp_path)
+    worker = LibraryContributionVerificationWorker(service._store, service, musicbrainz)
+    delays: list[float] = []
+    orig = service._store.work_wakeups.notify_after
+
+    def spy(kind: str, delay: float) -> None:
+        if kind == "contribution":
+            delays.append(delay)
+        return orig(kind, delay)
+
+    service._store.work_wakeups.notify_after = spy  # type: ignore[assignment]
+    musicbrainz.get_release_for_verification = AsyncMock(side_effect=CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=100))
+    now = time.time() + 10
+    result = await worker.run_once("worker-1", now=now)
+    assert result == "retry_scheduled"
+    assert len(delays) == 1
+    assert 99.9 <= delays[0] <= 101.0
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT not_before, state FROM library_contribution_verification_jobs").fetchone()
+        assert row is not None
+        assert row["state"] == "queued"
+        assert row["not_before"] >= now + 100 - 0.5
+    early = await service._store.claim_library_contribution_verification(worker_id="worker-2", now=now + 50, lease_seconds=90)
+    assert early is None
+    later = await service._store.claim_library_contribution_verification(worker_id="worker-2", now=now + 101, lease_seconds=90)
+    assert later is not None
+    service._store.work_wakeups.notify_after = orig  # type: ignore[assignment]
+    delays.clear()
+    service._store.work_wakeups.notify_after = spy  # type: ignore[assignment]
+    musicbrainz.get_release_for_verification = AsyncMock(side_effect=CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=1))
+    result2 = await worker.run_claimed(later, "worker-2", now=now + 101)
+    assert result2 == "retry_scheduled"
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT not_before FROM library_contribution_verification_jobs WHERE id = ?", (later["id"],)).fetchone()
+        assert row["not_before"] >= now + 101 + 30 - 0.5
+    assert delays[0] >= 29.9

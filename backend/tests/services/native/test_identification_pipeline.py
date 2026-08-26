@@ -2,10 +2,11 @@ import asyncio
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import msgspec
 import pytest
@@ -2530,3 +2531,113 @@ async def test_terminal_miss_compaction_is_bounded_and_protects_references(
     assert rows[0][0:2] == ("evidence-1", 1)
     assert rows[0][2] <= 4096
     assert rows[1][0:2] == ("evidence-2", 0)
+
+@pytest.mark.asyncio
+async def test_identification_queue_defer_with_retry_after_persists_max_and_notifies_once(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    from infrastructure.resilience.retry import CircuitOpenError
+
+    await _seed_album(store, "99")
+    queue = IdentificationQueueService(store)
+    delays: list[float] = []
+    orig = store.work_wakeups.notify_after
+
+    def spy(kind: str, delay: float) -> None:
+        if kind == "identification":
+            delays.append(delay)
+        return orig(kind, delay)
+
+    store.work_wakeups.notify_after = spy  # type: ignore[assignment]
+    now = time.time() + 5
+    job_id = "job-queue-test"
+    await store.enqueue_identification_job(
+        IdentificationJob(
+            id=job_id,
+            local_album_id="album-99",
+            kind="automatic",
+            dedupe_key="automatic:album-99:rev1",
+            input_revision="rev1",
+            priority=20,
+            created_at=now - 10,
+        )
+    )
+    job = await queue.claim("worker-1", now=now)
+    assert job is not None
+    delays.clear()
+    await queue.defer(job, "worker-1", "PROVIDER_TEMPORARILY_UNAVAILABLE", now=now, retry_after_seconds=100)
+    assert len(delays) == 1
+    assert 99.5 <= delays[0] <= 101.0
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT not_before FROM library_identification_jobs WHERE id = ?", (job_id,)).fetchone()
+        assert row["not_before"] >= now + 100 - 0.5
+    # No early claim before deadline
+    assert await queue.claim("worker-2", now=now + 50) is None
+    # Exactly one wake scheduled, claim after deadline succeeds
+    job2 = await queue.claim("worker-2", now=now + 101)
+    assert job2 is not None and job2["id"] == job_id
+    delays.clear()
+    await queue.defer(job2, "worker-2", "PROVIDER_TEMPORARILY_UNAVAILABLE", now=now + 101, retry_after_seconds=1.0)
+    # Short retry should use backoff 60 for attempt 2
+    assert len(delays) == 1
+    assert 59.5 <= delays[0] <= 61.0
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT not_before FROM library_identification_jobs WHERE id = ?", (job_id,)).fetchone()
+        assert row["not_before"] >= now + 101 + 60 - 0.5
+    # Invalid retry_after should be ignored and use backoff 120 for attempt 3
+    job3 = await queue.claim("worker-3", now=now + 200)
+    assert job3 is not None
+    delays.clear()
+    await queue.defer(job3, "worker-3", "PROVIDER_TEMPORARILY_UNAVAILABLE", now=now + 200, retry_after_seconds=float("inf"))
+    assert len(delays) == 1
+    assert 119.5 <= delays[0] <= 121.0
+
+
+@pytest.mark.asyncio
+async def test_album_identification_circuit_open_defers_with_retry_after(store: NativeLibraryStore, db_path: Path) -> None:
+    from infrastructure.resilience.retry import CircuitOpenError
+    from unittest.mock import MagicMock
+
+    await _seed_album(store, "100")
+    queue = IdentificationQueueService(store)
+
+    class CircuitProvider:
+        async def search_album_candidate_ids(self, *a, **k):
+            raise CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=42)
+
+        async def search_recording_candidate_ids(self, *a, **k):
+            raise CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=42)
+
+        async def get_album_candidate(self, *a, **k):
+            raise CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=42)
+
+        async def get_exact_release_candidate(self, *a, **k):
+            raise CircuitOpenError("open", breaker_name="musicbrainz", retry_after_seconds=42)
+
+    provider = CircuitProvider()
+    candidates = AlbumCandidateService(provider)  # type: ignore[arg-type]
+    evidence_engine = AlbumEvidenceEngine()
+    fingerprints = MagicMock()
+    fingerprints.fingerprint_if_needed = AsyncMock(return_value=None)
+    service = AlbumIdentificationService(store, queue, candidates, evidence_engine, fingerprints)
+    now = time.time() + 5
+    await store.enqueue_identification_job(
+        IdentificationJob(
+            id="job-album-100",
+            local_album_id="album-100",
+            kind="automatic",
+            dedupe_key="automatic:album-100:rev1",
+            input_revision="rev1",
+            priority=20,
+            created_at=now - 10,
+        )
+    )
+    job = await queue.claim("worker-1", now=now)
+    assert job is not None
+    result = await service.run_claimed_job(job, "worker-1", now=now)  # type: ignore[arg-type]
+    assert result == "provider_deferred"
+    assert await queue.claim("worker-2", now=now + 10) is None
+    later = await queue.claim("worker-2", now=now + 43)
+    assert later is not None and later["id"] == job["id"]

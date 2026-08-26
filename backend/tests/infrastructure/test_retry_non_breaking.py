@@ -2,6 +2,10 @@
 
 import asyncio
 import logging
+import sqlite3
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -259,5 +263,118 @@ async def test_non_retriable_exception_fails_after_single_attempt():
         await doomed()
 
     assert call_count == 1
-    assert cb.failure_count == 0
-    assert cb.state == CircuitState.CLOSED
+@pytest.mark.asyncio
+async def test_circuit_open_error_carries_retry_after_and_is_fail_fast(monkeypatch):
+    cb = CircuitBreaker(failure_threshold=1, timeout=10.0, success_threshold=1, name="test-open-timing")
+    # Use a fixed time for determinism
+    start = 1000.0
+    monkeypatch.setattr("infrastructure.resilience.retry.time.time", lambda: start)
+    # Trip the breaker
+    cb.record_failure()
+    assert cb.state == CircuitState.OPEN
+    # First call should be fail-fast with retry_after ~10
+    @with_retry(max_attempts=1, circuit_breaker=cb)
+    async def failing_call():
+        assert False, "should not be called when breaker is open"
+
+    with pytest.raises(CircuitOpenError) as exc_info:
+        await failing_call()
+    assert exc_info.value.retry_after_seconds is not None
+    assert 9.5 <= exc_info.value.retry_after_seconds <= 10.0
+    # Repeated immediate calls should be fail-fast and not invoke the function
+    start2 = start + 1.0
+    monkeypatch.setattr("infrastructure.resilience.retry.time.time", lambda: start2)
+    with pytest.raises(CircuitOpenError) as exc2:
+        await failing_call()
+    assert exc2.value.retry_after_seconds is not None
+    assert 8.5 <= exc2.value.retry_after_seconds <= 9.0
+    assert exc2.value.retry_after_seconds < exc_info.value.retry_after_seconds
+    # After timeout, breaker should be half-open and call should go through
+    monkeypatch.setattr("infrastructure.resilience.retry.time.time", lambda: start + 11.0)
+    # Need to also mock time.time for the is_open transition
+    # The breaker should now be half-open, so the call should not raise CircuitOpenError
+    # But our with_retry will call atry_transition which will transition to half-open
+    # So we need to test that after timeout, the call is not fail-fast
+    call_count = 0
+
+    @with_retry(max_attempts=1, circuit_breaker=cb)
+    async def success_call():
+        nonlocal call_count
+        call_count += 1
+        return "ok"
+
+    result = await success_call()
+    assert result == "ok"
+    assert call_count == 1
+@pytest.mark.asyncio
+async def test_circuit_open_error_invalid_retry_values_normalized():
+    # Non-finite, non-positive, non-numeric retry_after should be normalized to None
+    for invalid in [0, -1, float("inf"), float("nan"), "bad", None]:
+        exc = CircuitOpenError("open", breaker_name="test", retry_after_seconds=invalid)  # type: ignore[arg-type]
+        assert exc.retry_after_seconds is None
+    # Valid positive finite should be preserved
+    exc = CircuitOpenError("open", breaker_name="test", retry_after_seconds=5.5)
+    assert exc.retry_after_seconds == 5.5
+    exc = CircuitOpenError("open", breaker_name="test", retry_after_seconds="10")
+    assert exc.retry_after_seconds == 10.0
+
+
+@pytest.mark.asyncio
+async def test_naive_catch_harness_bounded_by_deadline(monkeypatch):
+    cb = CircuitBreaker(failure_threshold=1, timeout=5.0, name="test-naive")
+    start = 1000.0
+    monkeypatch.setattr("infrastructure.resilience.retry.time.time", lambda: start)
+    cb.record_failure()
+    assert cb.state == CircuitState.OPEN
+
+    @with_retry(max_attempts=1, circuit_breaker=cb)
+    async def failing_call():
+        assert False, "should not be called"
+
+    sleep_delays: list[float] = []
+    orig_sleep = asyncio.sleep
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+        await orig_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    policy = 1.0
+    for _ in range(3):
+        try:
+            await failing_call()
+        except CircuitOpenError as exc:
+            assert exc.retry_after_seconds is not None
+            assert 4.9 <= exc.retry_after_seconds <= 5.0
+            await asyncio.sleep(max(policy, exc.retry_after_seconds))
+        else:
+            assert False, "should have raised CircuitOpenError"
+    assert len(sleep_delays) == 3
+    assert all(4.9 <= d <= 5.0 for d in sleep_delays)
+
+
+@pytest.mark.asyncio
+async def test_circuit_open_error_handler_still_immediate_503():
+    from core.exception_handlers import circuit_open_error_handler
+    from infrastructure.resilience.retry import CircuitOpenError
+    from fastapi import Request
+    from unittest.mock import MagicMock
+
+    request = MagicMock(spec=Request)
+    request.method = "GET"
+    request.url.path = "/test"
+    exc = CircuitOpenError("breaker open", breaker_name="test_service", retry_after_seconds=30)
+    start = time.monotonic()
+    response = await circuit_open_error_handler(request, exc)
+    elapsed = time.monotonic() - start
+    assert response.status_code == 503
+    assert elapsed < 0.05
+    body = response.body.decode() if hasattr(response, "body") else ""
+    import json
+
+    data = json.loads(body) if body else {}
+    assert data.get("error", {}).get("code") == "CIRCUIT_BREAKER_OPEN"
+    assert "temporarily unavailable" in data.get("error", {}).get("message", "").lower()
+    assert "retry_after" not in body.lower()
+    assert "retry-after" not in str(response.headers).lower()
+

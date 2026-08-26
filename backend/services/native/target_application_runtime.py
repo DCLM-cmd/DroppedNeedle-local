@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import socket
 import time
@@ -11,7 +12,8 @@ from collections.abc import Awaitable, Callable
 
 from core.task_registry import TaskRegistry
 from infrastructure.queue.durable_work_wakeup import DurableWorkWakeups
-from infrastructure.resilience.retry import CircuitState
+from infrastructure.resilience.retry import CircuitOpenError, CircuitState
+
 from services.native.album_identification_service import AlbumIdentificationService
 from services.native.identification_queue_service import IdentificationQueueService
 from services.native.library_operation_supervisor import LibraryOperationSupervisor
@@ -86,8 +88,29 @@ async def run_target_identification_worker(
                     if job is not None:
                         await service_getter().run_claimed_job(job, owner)
                         processed = True
-        except asyncio.CancelledError:
-            break
+        except CircuitOpenError as exc:
+            logger.exception("Target identification worker iteration failed")
+            retry_after = getattr(exc, "retry_after_seconds", None)
+            try:
+                candidate = float(retry_after) if retry_after is not None else 0.0
+                if math.isfinite(candidate) and candidate > 0:
+                    wait_seconds = max(ERROR_RETRY_INTERVAL_SECONDS, candidate)
+                else:
+                    wait_seconds = ERROR_RETRY_INTERVAL_SECONDS
+            except (TypeError, ValueError):
+                wait_seconds = ERROR_RETRY_INTERVAL_SECONDS
+            if job is not None:
+                try:
+                    retry_after_for_defer = None
+                    try:
+                        ra = float(retry_after) if retry_after is not None else None
+                        if ra is not None and math.isfinite(ra) and ra > 0:
+                            retry_after_for_defer = ra
+                    except (TypeError, ValueError):
+                        retry_after_for_defer = None
+                    await queue.defer(job, owner, "UNEXPECTED_ERROR", retry_after_seconds=retry_after_for_defer)
+                except Exception:  # noqa: BLE001 - a crashed job must not kill the worker
+                    logger.exception("Failed to defer crashed identification job")
         except Exception:  # noqa: BLE001 - a durable worker must survive one failed item
             logger.exception("Target identification worker iteration failed")
             if job is not None:
@@ -112,9 +135,7 @@ async def run_target_identification_worker(
                         # Without traffic the breaker would sit HALF_OPEN forever;
                         # one bounded background probe resolves it either way.
                         await probe_provider()
-                except asyncio.CancelledError:
-                    break
-                except Exception:  # noqa: BLE001 - a failed probe must not kill the worker
+                except Exception:  # noqa: BLE001 - a durable worker must survive one failed item
                     logger.exception("Identification provider health sweep failed")
         try:
             await wakeups.wait(
@@ -147,8 +168,6 @@ async def run_target_operation_worker(
                 if recovery_getter is not None:
                     await recovery_getter().recover_once()
                 processed = await supervisor.run_once(owner) is not None
-        except asyncio.CancelledError:
-            break
         except Exception:  # noqa: BLE001 - a durable worker must survive one failed item
             logger.exception("Target operation worker iteration failed")
             wait_seconds = ERROR_RETRY_INTERVAL_SECONDS

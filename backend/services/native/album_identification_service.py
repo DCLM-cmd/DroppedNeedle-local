@@ -8,12 +8,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-import msgspec
-
 from infrastructure.degradation import (
     clear_degradation_context,
     init_degradation_context,
 )
+from infrastructure.resilience.retry import CircuitOpenError
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.identification import (
     CandidateEvidence,
@@ -615,7 +614,17 @@ class AlbumIdentificationService:
                         "review",
                     }
                 )
-            return decision.outcome
+        except CircuitOpenError as exc:
+            # Defer with breaker deadline, not just queue backoff, per F-PERF-01
+            retry_after = getattr(exc, "retry_after_seconds", None)
+            await self._queue.defer(
+                job,
+                worker_id,
+                "PROVIDER_TEMPORARILY_UNAVAILABLE",
+                now=timestamp,
+                retry_after_seconds=retry_after,
+            )
+            return "provider_deferred"
         finally:
             clear_degradation_context()
 

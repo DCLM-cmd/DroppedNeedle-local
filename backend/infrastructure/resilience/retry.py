@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import random
 import time
 from enum import Enum
@@ -76,6 +77,16 @@ class CircuitBreaker:
                 return False
             return True
         return False
+    def remaining_open_seconds(self) -> float:
+        if self.state != CircuitState.OPEN:
+            return 0.0
+        elapsed = time.time() - self.last_failure_time
+        remaining = self.timeout - elapsed
+        return max(0.0, remaining)
+
+    async def aremaining_open_seconds(self) -> float:
+        async with self._lock:
+            return self.remaining_open_seconds()
 
     def should_log_open_warning(self) -> bool:
         now = time.monotonic()
@@ -160,10 +171,20 @@ class CircuitBreaker:
 
 
 class CircuitOpenError(Exception):
-    def __init__(self, message: str, breaker_name: str = ""):
+    def __init__(
+        self, message: str, breaker_name: str = "", retry_after_seconds: float | None = None
+    ):
         super().__init__(message)
         self.breaker_name = breaker_name
-
+        # Validate positive finite
+        try:
+            value = float(retry_after_seconds) if retry_after_seconds is not None else None
+        except (TypeError, ValueError):
+            value = None
+        if value is None or not math.isfinite(value) or value <= 0:
+            self.retry_after_seconds: float | None = None
+        else:
+            self.retry_after_seconds = value
 
 def _get_retry_after_seconds(exception: Exception) -> Optional[float]:
     retry_after = getattr(exception, "retry_after_seconds", None)
@@ -200,6 +221,7 @@ def with_retry(
             
             if circuit_breaker:
                 await circuit_breaker.atry_transition()
+                retry_after = await circuit_breaker.aremaining_open_seconds()
                 if circuit_breaker.is_open():
                     if circuit_breaker.should_log_open_warning():
                         logger.warning(
@@ -207,9 +229,15 @@ def with_retry(
                             circuit_breaker.name,
                             extra={"service_name": service_name, "function": func_name}
                         )
+                    # Validate positive finite, fallback to timeout if needed
+                    if retry_after is None or not math.isfinite(retry_after) or retry_after <= 0:
+                        retry_after = circuit_breaker.timeout
+                        if not math.isfinite(retry_after) or retry_after <= 0:
+                            retry_after = None
                     raise CircuitOpenError(
                         f"Circuit breaker '{circuit_breaker.name}' is OPEN",
                         breaker_name=circuit_breaker.name,
+                        retry_after_seconds=retry_after,
                     )
             
             last_exception = None
