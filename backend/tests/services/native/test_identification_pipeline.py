@@ -3084,3 +3084,155 @@ def test_target_seed_order_matches_album_identifier_reference() -> None:
     ) + text_ranked
 
     assert combined == matcher_reference
+
+
+class _LocalFailureThenRecoveringFingerprinter(FakeFingerprinter):
+    """fpcalc fails on the first generation, then recovers."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            FingerprintResult(
+                status="pass",
+                recording_id="rec-local",
+                release_group_ids=["rg-local"],
+            ),
+            enabled=True,
+        )
+        self.generate_calls = 0
+
+    async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+        self.generate_calls += 1
+        if self.generate_calls == 1:
+            raise OSError("fpcalc temporarily blocked")
+        return ("fp-hash", 180)
+
+
+@pytest.mark.asyncio
+async def test_local_fingerprint_failure_gets_bounded_retry_deadline(
+    store: NativeLibraryStore,
+) -> None:
+    """F-MATCH-04: FINGERPRINT_LOCAL_FAILURE persists a bounded retry_after;
+    the cached failure is reused before the deadline and regenerated at it,
+    fenced by stat_revision and fingerprinter version."""
+    from services.native.conditional_fingerprint_service import (
+        TRANSIENT_RETRY_SECONDS,
+    )
+
+    await _seed_album(store)
+    fake = _LocalFailureThenRecoveringFingerprinter()
+    service = ConditionalFingerprintService(store, fake)
+
+    failed = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=100.0,
+    )
+    assert failed.state == "failed"
+    assert failed.failure_code == "FINGERPRINT_LOCAL_FAILURE"
+    assert failed.retry_after == pytest.approx(100.0 + TRANSIENT_RETRY_SECONDS)
+    assert failed.attempt_count == 1
+
+    # Before the deadline: cached failure reused, no regeneration.
+    before = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=100.0 + TRANSIENT_RETRY_SECONDS - 1,
+    )
+    assert fake.generate_calls == 1
+    assert before.state == "failed"
+    assert before.retry_after == failed.retry_after
+
+    # At the deadline: generation retried and lookup succeeds normally.
+    recovered = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=100.0 + TRANSIENT_RETRY_SECONDS,
+    )
+    assert fake.generate_calls == 2
+    assert recovered.state == "matched"
+    assert recovered.recording_mbid == "rec-local"
+    assert recovered.stat_revision == "stat-1"
+    assert recovered.fingerprinter_version == "fpcalc-acoustid-v1"
+
+    # A different stat_revision is never blocked by the old revision's failure.
+    changed = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-2",
+        needed=True,
+        now=100.0 + TRANSIENT_RETRY_SECONDS + 1,
+    )
+    assert fake.generate_calls == 3
+    assert changed.stat_revision == "stat-2"
+
+
+@pytest.mark.asyncio
+async def test_automatic_worker_defers_local_fingerprint_failure_honestly(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A local fpcalc failure defers under its own code - never
+    PROVIDER_TEMPORARILY_UNAVAILABLE - so provider-only reset/resurrection
+    gates can never select the row."""
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+
+    # Candidates with NO usable track evidence leave the decision
+    # insufficient_evidence with zero supported recordings, which is exactly
+    # what sends the worker into the conditional fingerprint branch with
+    # needed=True for every track.
+    class LocalFailProvider(FakeProvider):
+        async def search_album_candidate_ids(
+            self, artist: str, title: str, limit: int, priority: RequestPriority
+        ) -> list[str]:
+            return ["rg-a", "rg-b"]
+
+        async def get_album_candidate(
+            self,
+            release_group_mbid: str,
+            target_track_count: int,
+            priority: RequestPriority,
+        ) -> AlbumCandidate | None:
+            # Mirror the existing conditional-fingerprint fixture: one plausible
+            # candidate per group so the ordinary decision lands on `ambiguous`
+            # and the worker enters the fingerprint branch.
+            return AlbumCandidate(
+                release_group_mbid=release_group_mbid,
+                release_mbid=f"release-{release_group_mbid}",
+                album_title="Album",
+                album_artist_name="Artist",
+                tracks=[
+                    CandidateTrack(
+                        title="Track 1",
+                        position=1,
+                        absolute_position=1,
+                        duration_seconds=180.0,
+                        recording_mbid=f"recording-{release_group_mbid}",
+                        release_track_mbid=f"release-track-{release_group_mbid}",
+                    )
+                ],
+                release_type="album",
+            )
+
+    fingerprinter = _LocalFailureThenRecoveringFingerprinter()
+    service = _service(store, LocalFailProvider(), fingerprinter)
+    await queue.enqueue_album("album-1", input_revision="revision", now=1)
+    claimed = await queue.claim("worker", now=2)
+    assert claimed is not None
+    outcome = await service.run_claimed_job(claimed, "worker", now=3)
+
+    assert outcome == "provider_deferred"
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+    assert row[0] == "FINGERPRINT_LOCAL_FAILURE"
+    # Provider-only sweep leaves the local-failure row's backoff untouched.
+    assert await store.reset_provider_identification_deferrals(now=100_000) == 0

@@ -46,12 +46,16 @@ from services.native.library_operation_service import LibraryOperationService
 
 logger = logging.getLogger(__name__)
 
-
 # F-IDENT-03 owner-signed retry policy: transient explicit failures defer for
 # 120 seconds and stop at this finite, durable attempt bound. The bound is a
 # named constant so tests and operators can observe it.
 REIDENTIFICATION_RETRY_SECONDS = 120.0
 MAX_REIDENTIFICATION_ATTEMPTS = 5
+
+
+class _LocalFingerprintFailure(ExternalServiceError):
+    """F-MATCH-04: a failed LOCAL fingerprint outcome (fpcalc/file), distinct
+    from a provider outage so its honest reason survives defer and attention."""
 
 
 class ExplicitReidentificationWorker:
@@ -304,6 +308,13 @@ class ExplicitReidentificationWorker:
                     if not await checkpoint():
                         return await halt()
                     if outcome is not None and outcome.state == "failed":
+                        if outcome.failure_code == "FINGERPRINT_LOCAL_FAILURE":
+                            # F-MATCH-04: fpcalc/file failures are LOCAL
+                            # transients - carry the honest reason instead of
+                            # entering the generic provider-outage path.
+                            raise _LocalFingerprintFailure(
+                                "Fingerprint evidence is temporarily unavailable."
+                            )
                         raise ExternalServiceError(
                             "Fingerprint evidence is temporarily unavailable."
                         )
@@ -385,6 +396,45 @@ class ExplicitReidentificationWorker:
                 matcher_version=MATCHER_VERSION,
                 state="provider_deferred",
                 terminal_reason_code="UNMAPPABLE_PROVIDER_PAYLOAD",
+                started_at=timestamp,
+                completed_at=timestamp,
+            )
+            return await self._store.finish_reidentification_evaluation(
+                str(job["id"]),
+                int(work["ordinal"]),
+                worker_id=worker_id,
+                expected_work_revision=int(work["row_revision"]),
+                expected_album_revision=int(context["album"]["row_revision"]),
+                attempt=attempt,
+                evidence=[],
+                now=timestamp,
+            )
+        except _LocalFingerprintFailure:
+            # F-MATCH-04: the local fingerprint cause survives both the bounded
+            # F-IDENT-03 defer and terminal attention - never rewritten to a
+            # provider outage, never eligible for provider resurrection.
+            attempts_used = int(job.get("reidentification_attempt_count", 0) or 0)
+            if attempts_used < MAX_REIDENTIFICATION_ATTEMPTS:
+                return await self._store.defer_reidentification_work(
+                    str(job["id"]),
+                    int(work["ordinal"]),
+                    worker_id=worker_id,
+                    reason_code="FINGERPRINT_LOCAL_FAILURE",
+                    now=timestamp,
+                    retry_not_before=timestamp + REIDENTIFICATION_RETRY_SECONDS,
+                )
+            attempt = IdentificationAttempt(
+                id=str(uuid.uuid4()),
+                local_album_id=str(work["local_album_id"]),
+                trigger="explicit_reidentification",
+                requested_by_user_id=job["requested_by_user_id"],
+                input_tag_revision=revisions[0],
+                input_file_revision=revisions[1],
+                input_policy_revision=revisions[2],
+                input_identity_revision=identity_revision,
+                matcher_version=MATCHER_VERSION,
+                state="provider_deferred",
+                terminal_reason_code="FINGERPRINT_LOCAL_FAILURE",
                 started_at=timestamp,
                 completed_at=timestamp,
             )

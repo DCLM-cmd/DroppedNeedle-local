@@ -88,6 +88,10 @@ class ConditionalFingerprintService:
                         duration,
                     ) = await self._fingerprinter.generate_fingerprint(path)
             except (OSError, ValueError, TimeoutError, subprocess.SubprocessError):
+                # F-MATCH-04: a LOCAL failure is a transient with a bounded
+                # retry deadline, mirroring the lookup-failure branch. Before
+                # the deadline the cached outcome is reused; at the deadline
+                # generation is attempted again on the same stat_revision key.
                 failed = FingerprintOutcome(
                     id=cached.id if cached is not None else str(uuid.uuid4()),
                     local_track_id=local_track_id,
@@ -95,8 +99,12 @@ class ConditionalFingerprintService:
                     fingerprinter_version=FINGERPRINTER_VERSION,
                     state="failed",
                     failure_code="FINGERPRINT_LOCAL_FAILURE",
+                    attempt_count=(
+                        cached.attempt_count + 1 if cached is not None else 1
+                    ),
                     first_attempt_at=(cached.first_attempt_at if cached else timestamp),
                     last_attempt_at=timestamp,
+                    retry_after=timestamp + TRANSIENT_RETRY_SECONDS,
                 )
                 await self._store.record_fingerprint_outcome(failed)
                 return await self._store.get_fingerprint_outcome(

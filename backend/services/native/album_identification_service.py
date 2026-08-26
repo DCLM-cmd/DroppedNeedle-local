@@ -504,6 +504,18 @@ class AlbumIdentificationService:
                             )
                             return "paused"
                         if outcome is not None and outcome.state == "failed":
+                            # F-MATCH-04: a local fpcalc failure is NOT a
+                            # provider outage. Defer under its own honest code
+                            # so the row never becomes eligible for the
+                            # provider-only reset/resurrection gates.
+                            if outcome.failure_code == "FINGERPRINT_LOCAL_FAILURE":
+                                await self._queue.defer(
+                                    job,
+                                    worker_id,
+                                    "FINGERPRINT_LOCAL_FAILURE",
+                                    now=timestamp,
+                                )
+                                return "provider_deferred"
                             await self._queue.defer(
                                 job,
                                 worker_id,

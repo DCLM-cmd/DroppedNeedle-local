@@ -7321,3 +7321,65 @@ async def test_diagnostic_export_includes_bounded_hashed_failure_rows(
     assert b"secret/dir" not in payload
     with pytest.raises(ValidationError):
         await LibraryDiagnosticsService(store).export("../escape")
+
+
+class _LocalFailureFingerprintBackend(_FingerprintBackend):
+    """fpcalc fails locally: outcome becomes FINGERPRINT_LOCAL_FAILURE."""
+
+    async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+        self.generate_calls += 1
+        raise OSError("fpcalc temporarily blocked")
+
+
+@pytest.mark.asyncio
+async def test_explicit_local_fingerprint_failure_keeps_local_reason_through_defer(
+    store: NativeLibraryStore,
+) -> None:
+    """F-MATCH-04: a local fpcalc failure in explicit re-identification defers
+    under F-IDENT-03's bounded policy with the LOCAL reason - never rewritten
+    to PROVIDER_TEMPORARILY_UNAVAILABLE."""
+    await _seed_album(store, "1")
+    # _FingerprintIdentificationProvider returns ambiguous candidates so the
+    # worker enters the conditional fingerprint branch (like the existing
+    # conditionally_fingerprints test).
+    provider = _FingerprintIdentificationProvider()
+    created = await ReidentificationService(store).create_or_coalesce(
+        "album-1", "admin", idempotency_key="local-fp-explicit", now=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker", now=2, lease_seconds=60, kind="explicit_reidentification"
+    )
+    assert claimed is not None
+    worker = ExplicitReidentificationWorker(
+        store,
+        AlbumCandidateService(provider),
+        AlbumEvidenceEngine(),
+        ConditionalFingerprintService(store, _LocalFailureFingerprintBackend()),
+    )
+    deferred = await worker.run_claimed(claimed, "worker", now=3)
+    assert deferred["state"] == "queued"
+    assert deferred["next_attempt_at"] == 3 + REIDENTIFICATION_RETRY_SECONDS
+
+    job_row = await store.get_operation_job(created["id"])
+    with sqlite3.connect(store.db_path) as connection:
+        work_row = connection.execute(
+            "SELECT failure_code FROM library_operation_work WHERE job_id = ?",
+            (created["id"],),
+        ).fetchone()
+    assert work_row[0] == "FINGERPRINT_LOCAL_FAILURE"
+
+    # The bounded retry re-runs; the fingerprinter still fails locally, and the
+    # reason persists on the next defer as well.
+    retried = await store.claim_operation_job(
+        "worker",
+        now=3 + REIDENTIFICATION_RETRY_SECONDS,
+        lease_seconds=60,
+        kind="explicit_reidentification",
+    )
+    assert retried is not None
+    deferred_again = await worker.run_claimed(
+        retried,
+        "worker",
+        now=3 + REIDENTIFICATION_RETRY_SECONDS,
+    )
+    assert deferred_again["state"] == "queued"
