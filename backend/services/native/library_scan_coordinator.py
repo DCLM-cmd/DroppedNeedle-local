@@ -185,11 +185,23 @@ class LibraryScanCoordinator:
 
     async def recover(self) -> list[ScanRun]:
         if not self._resolver_getter().settings.enabled:
-            return []
+            return await self.recover_stopping()
         runs = await self._store.recover_scan_runs(now=self._clock())
         self._pending_control_run_ids.clear()
         for run in runs:
             self._log_progress(run, "recovery", force=True)
+        return runs
+
+    async def recover_stopping(self) -> list[ScanRun]:
+        runs = await self._store.recover_stopping_scan_runs(now=self._clock())
+        for run in runs:
+            self._pending_control_run_ids.discard(run.id)
+            if self._events is not None:
+                await self._events.publish(run, event="scan.transition")
+            await self._store.flush_scan_invalidation(terminal=True)
+            self._log_progress(run, "recovery", force=True)
+            if self._filesystem is not None:
+                self._filesystem.forget_scan(run.id)
         return runs
 
     async def _settle_pending_control(self, run_id: str) -> ScanRun:
@@ -231,6 +243,9 @@ class LibraryScanCoordinator:
             return True
         run, _, _ = await self._store.get_scan_run(run_id)
         if current_policy_revision != frozen_policy_revision:
+            if run.state == "stopping" or run.requested_control == "stop":
+                await self._settle_pending_control(run.id)
+                return False
             if run.state == "paused":
                 await self._store.transition_scan_run(
                     run.id,

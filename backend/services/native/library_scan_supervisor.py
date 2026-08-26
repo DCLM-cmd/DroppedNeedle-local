@@ -69,10 +69,13 @@ async def supervise_target_scans(
 ) -> None:
     wakeups = work_wakeups or DurableWorkWakeups()
     try:
-        # None resolver getter means the scheduler is not wired up; the library
-        # is treated as enabled so plain supervisor deployments keep working.
-        if resolver_getter is None or resolver_getter().settings.enabled:
-            await coordinator_getter().recover()
+        coordinator = coordinator_getter()
+        resolver = resolver_getter() if resolver_getter is not None else None
+        enabled = resolver is None or resolver.settings.enabled
+        if enabled:
+            await coordinator.recover()
+        else:
+            await coordinator.recover_stopping()
     except asyncio.CancelledError:
         return
     except Exception:  # noqa: BLE001 - startup recovery failure must not kill the supervisor

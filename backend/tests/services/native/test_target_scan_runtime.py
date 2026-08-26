@@ -173,6 +173,7 @@ async def test_supervisor_refreshes_scheduler_and_resolver_each_iteration() -> N
 async def test_supervisor_skips_recover_tick_and_run_when_library_disabled() -> None:
     coordinator = AsyncMock()
     coordinator.run_once.return_value = None
+    coordinator.recover_stopping = AsyncMock()
     scheduler = AsyncMock()
     resolver = SimpleNamespace(
         policy_revision="one", settings=SimpleNamespace(enabled=False)
@@ -191,9 +192,91 @@ async def test_supervisor_skips_recover_tick_and_run_when_library_disabled() -> 
     )
 
     coordinator.recover.assert_not_awaited()
+    coordinator.recover_stopping.assert_awaited_once()
     scheduler.tick.assert_not_awaited()
     coordinator.run_once.assert_not_awaited()
     wakeups.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_disabled_startup_recovers_stopping_without_scheduler(
+    tmp_path: Path,
+) -> None:
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
+
+    db_path = tmp_path / "target.db"
+    import sqlite3
+    import threading
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    store = NativeLibraryStore(db_path=db_path, write_lock=threading.Lock())
+    root = tmp_path / "music"
+    root.mkdir()
+    enabled_resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")], enabled=True)
+    )
+    disabled_resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")], enabled=False)
+    )
+    from services.native.library_scan_coordinator import LibraryScanCoordinator
+    from services.native.library_indexer import LibraryIndexer
+    from services.native.library_reconciler import LibraryReconciler
+    from services.native.library_scan_supervisor import supervise_target_scans
+
+    class _TagReader:
+        def read_tags(self, path: Path):
+            raise NotImplementedError
+
+    coordinator = LibraryScanCoordinator(
+        store,
+        LibraryInventoryScanner(store),
+        LibraryIndexer(store, _TagReader()),
+        LibraryReconciler(store),
+        lambda: enabled_resolver,
+    )
+    # Create a run and make it stopping
+    from models.library_work import ScanRequest, ScanScope
+
+    request = ScanRequest(
+        kind="incremental",
+        trigger="manual",
+        scopes=[ScanScope(root_id="root-a", policy_revision=enabled_resolver.policy_revision)],
+        policy_revision=enabled_resolver.policy_revision,
+    )
+    await coordinator.request_run(request)
+    run = await store.claim_next_scan_run(now=1)
+    assert run is not None
+    await coordinator.control(run.id, "stop", run.row_revision)
+    persisted, _, _ = await store.get_scan_run(run.id)
+    assert persisted.state == "stopping"
+    # Now run supervisor with disabled resolver — should do narrow recovery and not scheduler/run_once
+    scheduler = AsyncMock()
+    wakeups = SimpleNamespace(revision=lambda _k: 0, wait=AsyncMock(side_effect=asyncio.CancelledError()))
+    # Use the same coordinator but with disabled resolver
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        wakeups,
+        lambda: scheduler,
+        lambda: disabled_resolver,
+        lambda: {"frequency": "manual", "daily_time": "03:00", "timezone_name": "UTC"},
+    )
+    # After disabled startup, stopping should be cancelled
+    terminal, _, _ = await store.get_scan_run(run.id)
+    assert terminal.state == "cancelled"
+    assert terminal.requested_control == "none"
+    assert terminal.terminal_at is not None
+    scheduler.tick.assert_not_awaited()
+    # Re-enable and verify queued follow-up can claim without restart
+    await coordinator.request_run(request)
+    follow = await store.claim_next_scan_run(now=2)
+    assert follow is not None
+    assert follow.id != run.id
+    # Cleanup
+    coordinator._pending_control_run_ids.clear()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

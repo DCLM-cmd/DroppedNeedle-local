@@ -9282,6 +9282,39 @@ class NativeLibraryStore(PersistenceBase):
             return [self._scan_state_from_row(row) for row in rows]
 
         return await super()._background_write(operation)
+    async def recover_stopping_scan_runs(self, *, now: float) -> list[ScanRun]:
+        def operation(connection: sqlite3.Connection) -> list[ScanRun]:
+            stopping = connection.execute(
+                "SELECT id FROM library_scan_runs WHERE state = 'stopping' "
+                "OR requested_control = 'stop'"
+            ).fetchall()
+            for row in stopping:
+                connection.execute(
+                    "UPDATE library_scan_runs SET state = 'cancelled', terminal_at = ?, "
+                    "updated_at = ?, requested_control = 'none', row_revision = row_revision + 1, "
+                    "event_revision = event_revision + 1 WHERE id = ?",
+                    (now, now, row["id"]),
+                )
+                connection.execute(
+                    "UPDATE library_scan_runs SET inventory_cleanup_pending = (EXISTS("
+                    "SELECT 1 FROM library_scan_inventory WHERE run_id = ?) OR EXISTS("
+                    "SELECT 1 FROM library_scan_grouping_contexts WHERE run_id = ?)) "
+                    "WHERE id = ?",
+                    (row["id"], row["id"], row["id"]),
+                )
+            if stopping:
+                self._bump_stream(connection, "scan")
+                ids = [row["id"] for row in stopping]
+                placeholders = ",".join("?" for _ in ids)
+                rows = connection.execute(
+                    f"SELECT * FROM library_scan_runs WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                return [self._scan_state_from_row(row) for row in rows]
+            return []
+
+        return await super()._background_write(operation)
+
 
     async def cleanup_terminal_scan_inventory(
         self, *, limit: int = 5_000

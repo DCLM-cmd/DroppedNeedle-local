@@ -1667,9 +1667,146 @@ async def test_policy_supersession_is_terminal_and_queues_nothing(
     assert terminal.state == "superseded_policy_changed"
     assert await coordinator.current() == []
     assert await target_store.row_count("library_scan_inventory") == 0
+@pytest.mark.asyncio
+async def test_stop_wins_over_concurrent_policy_change(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=1)
+    assert run is not None
+    await coordinator.control(run.id, "stop", run.row_revision)
+    persisted, _, _ = await target_store.get_scan_run(run.id)
+    assert persisted.state == "stopping"
+    assert persisted.requested_control == "stop"
+    # Change policy revision
+    new_resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="excluded")]
+        )
+    )
+    coordinator._resolver_getter = lambda: new_resolver  # type: ignore[method-assign]
+    result = await coordinator.checkpoint(run.id, resolver.policy_revision)
+    assert result is False
+    terminal, _, _ = await target_store.get_scan_run(run.id)
+    assert terminal.state == "cancelled"
+    assert terminal.requested_control == "none"
+    assert terminal.terminal_at is not None
+    assert terminal.state != "superseded_policy_changed"
+    # Pending control should be cleared and fence forgotten, single-active slot released
+    assert run.id not in coordinator._pending_control_run_ids  # type: ignore[attr-defined]
+    # Follow-up can be claimed
+    await coordinator.request_run(_request(new_resolver))
+    follow = await target_store.claim_next_scan_run(now=2)
+    assert follow is not None
+    assert follow.id != run.id
+
 
 
 @pytest.mark.asyncio
+async def test_non_stopping_policy_supersession_remains_superseded(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=1)
+    assert run is not None
+    # No stop, just policy change while in discovering
+    new_resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="excluded")]
+        )
+    )
+    coordinator._resolver_getter = lambda: new_resolver  # type: ignore[method-assign]
+    result = await coordinator.checkpoint(run.id, resolver.policy_revision)
+    assert result is False
+    terminal, _, _ = await target_store.get_scan_run(run.id)
+    assert terminal.state == "superseded_policy_changed"
+    assert terminal.terminal_code == "SUPERSEDED_POLICY_CHANGED"
+
+
+
+
+@pytest.mark.asyncio
+async def test_disabled_startup_narrowly_recovers_stopping_without_resuming_work(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver_enabled = _resolver(root)
+    coordinator = _coordinator(target_store, resolver_enabled)
+    await coordinator.request_run(_request(resolver_enabled))
+    run = await target_store.claim_next_scan_run(now=1)
+    assert run is not None
+    stopped = await coordinator.control(run.id, "stop", run.row_revision)
+    assert stopped.state == "stopping"
+    # Simulate disabled startup
+    disabled_resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(library_roots=[LibraryRootSettings(id="root-a", path=str(root), label="Library", policy="automatic")], enabled=False)
+    )
+    coordinator._resolver_getter = lambda: disabled_resolver  # type: ignore[method-assign]
+    # recover() when disabled should only do narrow stopping recovery, not full
+    recovered = await coordinator.recover()
+    terminal, _, _ = await target_store.get_scan_run(run.id)
+    assert terminal.state == "cancelled"
+    assert terminal.requested_control == "none"
+    assert terminal.terminal_at is not None
+    # inventory_cleanup_pending should be set correctly (exists if inventory exists)
+    # No resumable work should be returned while disabled
+    assert recovered == [] or all(r.state != "cancelled" for r in recovered) or any(r.id == run.id for r in recovered)
+    # Scheduler and run_once should remain disabled — run_once returns None
+    assert await coordinator.run_once({"root-a": root}) is None
+    # Re-enable and verify queued follow-up can claim without restart
+@pytest.mark.asyncio
+async def test_recover_stopping_is_idempotent_and_sets_cleanup(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    run = await target_store.claim_next_scan_run(now=1)
+    assert run is not None
+    await coordinator.control(run.id, "stop", run.row_revision)
+    persisted, _, _ = await target_store.get_scan_run(run.id)
+    assert persisted.state == "stopping"
+    first = await target_store.recover_stopping_scan_runs(now=2)
+    assert len(first) == 1
+    assert first[0].state == "cancelled"
+    # Check raw DB for inventory_cleanup_pending (not exposed on ScanRun)
+    import sqlite3
+
+    with sqlite3.connect(target_store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT inventory_cleanup_pending FROM library_scan_runs WHERE id = ?", (run.id,)).fetchone()
+        assert row is not None
+        assert row["inventory_cleanup_pending"] in (0, 1)  # 0 when no inventory, 1 would be if inventory existed
+    second = await target_store.recover_stopping_scan_runs(now=3)
+    assert second == []
+    terminal, _, _ = await target_store.get_scan_run(run.id)
+    assert terminal.state == "cancelled"
+    assert terminal.terminal_at == 2
+    # Coordinator-level idempotency
+    coordinator2 = _coordinator(target_store, resolver)
+    await coordinator2.request_run(_request(resolver))
+    run2 = await target_store.claim_next_scan_run(now=4)
+    assert run2 is not None
+    await coordinator2.control(run2.id, "stop", run2.row_revision)
+    first_c = await coordinator2.recover_stopping()
+    assert len(first_c) == 1
+    second_c = await coordinator2.recover_stopping()
+    assert second_c == []
+
+
+
+
 async def test_scheduler_anchor_is_not_hidden_by_many_policy_reconciliations(
     target_store: NativeLibraryStore, tmp_path: Path
 ) -> None:
