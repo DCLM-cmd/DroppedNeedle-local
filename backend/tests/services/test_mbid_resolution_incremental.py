@@ -11,10 +11,13 @@ from services.discover.mbid_resolution_service import MbidResolutionService
 
 
 def _store():
+    """ST2 cutover: mock the canonical store's release_to_rg interface."""
     store = MagicMock()
-    store.get_mbid_resolution_map = AsyncMock(return_value={})
+    store.get_release_to_rg_batch = AsyncMock(return_value={})
     saved: list[dict] = []
-    store.save_mbid_resolution_map = AsyncMock(side_effect=lambda m: saved.append(dict(m)))
+    async def capture_save(mapping, source_host):
+        saved.append(dict(mapping))
+    store.save_release_to_rg = AsyncMock(side_effect=capture_save)
     return store, saved
 
 
@@ -23,7 +26,7 @@ async def test_each_hit_is_persisted_incrementally_not_batched():
     store, saved = _store()
     mb = MagicMock()
     mb.get_release_group_id_from_release = AsyncMock(side_effect=lambda mbid: f"rg-{mbid}")
-    svc = MbidResolutionService(mb, MagicMock(), MagicMock(), mbid_store=store)
+    svc = MbidResolutionService(mb, MagicMock(), MagicMock(), mb_canonical_store=store)
 
     result = await svc.resolve_lastfm_release_group_mbids(["rel-1", "rel-2"])
 
@@ -46,7 +49,7 @@ async def test_completed_hit_banks_even_when_resolve_is_cancelled():
 
     mb = MagicMock()
     mb.get_release_group_id_from_release = AsyncMock(side_effect=resolve)
-    svc = MbidResolutionService(mb, MagicMock(), MagicMock(), mbid_store=store)
+    svc = MbidResolutionService(mb, MagicMock(), MagicMock(), mb_canonical_store=store)
 
     task = asyncio.create_task(
         svc.resolve_lastfm_release_group_mbids(["rel-fast", "rel-slow"])
@@ -70,7 +73,7 @@ async def test_thorough_mode_resolves_all_not_just_max_lookups():
     store, _saved = _store()
     mb = MagicMock()
     mb.get_release_group_id_from_release = AsyncMock(side_effect=lambda m: f"rg-{m}")
-    svc = MbidResolutionService(mb, MagicMock(), MagicMock(), mbid_store=store)
+    svc = MbidResolutionService(mb, MagicMock(), MagicMock(), mb_canonical_store=store)
     mbids = [f"rel-{i}" for i in range(25)]  # 25 > the default max_lookups of 10
 
     # on-visit (default): capped at max_lookups, the rest pass through unresolved

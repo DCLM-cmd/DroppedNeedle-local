@@ -142,7 +142,7 @@ def get_youtube_store() -> YouTubeStore:
 def get_mbid_store() -> MBIDStore:
     settings = get_settings()
     lock = get_persistence_write_lock()
-
+    return MBIDStore(db_path=settings.library_db_path, write_lock=lock)
 
 @singleton
 def get_mb_canonical_store() -> MbCanonicalStore:

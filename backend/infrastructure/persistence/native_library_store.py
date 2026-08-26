@@ -23610,10 +23610,16 @@ class NativeLibraryStore(PersistenceBase):
             raise ValidationError(
                 "One automatic import bundle must resolve to one catalog album."
             )
+        # P2-backend fix: album_id was referenced but never extracted.
+        (album_id,) = album_ids
+        # P2-backend hotfix: job_id was unconditionally generated as a fresh
+        # UUID even when operation_job_id was provided, causing the
+        # UPDATE branch to match zero rows and raise StaleRevisionError.
+        job_id = operation_job_id if operation_job_id is not None else str(uuid.uuid4())
         first_request = next(iter(requests.values()))
+        release_group_mbid = first_request.release_group_mbid or ""
+        release_mbid = first_request.release_mbid or ""
         pinned = first_request.pinned_profile
-        if pinned is None:
-            raise ValidationError("The automatic import profile is missing.")
         profile_json = msgspec.json.encode(pinned).decode()
         if any(
             request.pinned_profile is None
@@ -23657,7 +23663,7 @@ class NativeLibraryStore(PersistenceBase):
                 _provider_base_url_for("automatic"),
             ),
         )
-        for (_track_id, _write), request in selected.values():
+        for (track_id, _write), request in selected.values():
             if (
                 not request.recording_mbid
                 or not request.release_track_mbid
