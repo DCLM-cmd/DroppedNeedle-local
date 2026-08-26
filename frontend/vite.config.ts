@@ -17,6 +17,10 @@ export default defineConfig({
 				},
 				test: {
 					name: 'client',
+					// Browser tests must see real Tailwind/daisyUI styles for
+					// layout-dependent assertions (GH-281 sidebar scrolling); other
+					// CSS stays stubbed to keep unstyled-DOM specs unchanged
+					css: { include: [/src[/\\]app\.css$/] },
 					environment: 'browser',
 					browser: {
 						enabled: true,

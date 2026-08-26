@@ -1,0 +1,339 @@
+import { page } from '@vitest/browser/context';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { render } from 'vitest-browser-svelte';
+import { createRawSnippet } from 'svelte';
+
+// GH-281: the desktop sidebar had no scroll boundary, so on short viewports the
+// bottom controls (Settings / Log out / Open toggle) sat below the fold and were
+// unreachable. These specs pin the viewport-bounded, scrollable inner nav
+// container in both the collapsed and expanded drawer states. The shell mounts
+// through +layout.svelte so it runs inside the production QueryProvider, and the
+// client project compiles src/app.css so the daisyUI drawer geometry is real.
+
+const { routeState } = vi.hoisted(() => ({ routeState: { pathname: '/' } }));
+
+vi.mock('$env/dynamic/public', () => ({
+	env: {
+		PUBLIC_API_URL: ''
+	}
+}));
+vi.mock('$app/environment', () => ({ browser: true, building: false, dev: false }));
+vi.mock('$app/navigation', () => ({
+	goto: vi.fn(),
+	beforeNavigate: vi.fn(),
+	afterNavigate: vi.fn()
+}));
+vi.mock('$app/paths', () => ({
+	base: '',
+	assets: '',
+	resolve: vi.fn((_route: string, params: Record<string, string>) => `/${params?.id ?? ''}`),
+	resolveRoute: vi.fn((_route: string, params: Record<string, string>) => `/${params?.id ?? ''}`),
+	asset: vi.fn((file: string) => file)
+}));
+vi.mock('$app/state', () => ({
+	page: {
+		get url() {
+			return new URL(routeState.pathname, 'http://localhost');
+		}
+	}
+}));
+vi.mock('$lib/stores/errorModal', () => ({
+	errorModal: {
+		subscribe: vi.fn((cb: (v: unknown) => void) => {
+			cb({ show: false });
+			return () => {};
+		})
+	}
+}));
+vi.mock('$lib/stores/library', () => ({
+	libraryStore: {
+		subscribe: vi.fn((cb: (v: unknown) => void) => {
+			cb({
+				mbidSet: new Set<string>(),
+				requestedSet: new Set<string>(),
+				loading: false,
+				lastUpdated: null,
+				initialized: true
+			});
+			return () => {};
+		}),
+		initialize: vi.fn(),
+		setSession: vi.fn()
+	}
+}));
+vi.mock('$lib/stores/integration', () => ({
+	integrationStore: {
+		subscribe: vi.fn((cb: (v: unknown) => void) => {
+			cb(integrationState);
+			return () => {};
+		}),
+		ensureLoaded: vi.fn().mockResolvedValue(undefined),
+		reset: vi.fn()
+	}
+}));
+vi.mock('$lib/stores/nowPlayingSessions.svelte', () => ({
+	nowPlayingStore: { sessions: [], start: vi.fn(), stop: vi.fn() }
+}));
+vi.mock('$lib/stores/nowPlayingReporter.svelte', () => ({
+	nowPlayingReporter: { start: vi.fn(), stop: vi.fn() }
+}));
+const { followingEventsMock } = vi.hoisted(() => ({
+	followingEventsMock: { start: vi.fn(), stop: vi.fn() }
+}));
+vi.mock('$lib/queries/following/FollowingEvents', () => ({
+	createFollowingEvents: vi.fn(() => followingEventsMock)
+}));
+vi.mock('$lib/stores/cacheTtl', () => ({ initCacheTTLs: vi.fn() }));
+const { syncStatusMock } = vi.hoisted(() => ({
+	syncStatusMock: { connect: vi.fn(), disconnect: vi.fn() }
+}));
+vi.mock('$lib/stores/syncStatus.svelte', () => ({ syncStatus: syncStatusMock }));
+vi.mock('$lib/stores/imageSettings', () => ({
+	imageSettingsStore: { load: vi.fn().mockResolvedValue(undefined) }
+}));
+const playerState = { isPlayerVisible: true };
+vi.mock('$lib/stores/player.svelte', () => ({
+	playerStore: {
+		get isPlayerVisible() {
+			return playerState.isPlayerVisible;
+		},
+		isPlaying: false,
+		nowPlaying: null,
+		progress: 0,
+		duration: 0,
+		volume: 50,
+		currentQueueItem: null,
+		togglePlay: vi.fn(),
+		seekTo: vi.fn(),
+		setVolume: vi.fn(),
+		restoreSession: vi.fn(() => null)
+	}
+}));
+vi.mock('$lib/player/launchYouTubePlayback', () => ({ launchYouTubePlayback: vi.fn() }));
+vi.mock('$lib/stores/playbackToast.svelte', () => ({
+	playbackToast: { visible: false, message: '', type: 'info', show: vi.fn(), dismiss: vi.fn() }
+}));
+vi.mock('$lib/stores/scrobble.svelte', () => ({
+	scrobbleManager: { init: vi.fn().mockResolvedValue(undefined) }
+}));
+vi.mock('$lib/utils/lazyImage', () => ({
+	cancelPendingImages: vi.fn(),
+	lazyImage: vi.fn(() => ({ destroy: vi.fn(), update: vi.fn() })),
+	resetLazyImage: vi.fn()
+}));
+vi.mock('$lib/utils/navigationProgress', () => ({
+	createNavigationProgressController: vi.fn(() => ({
+		start: vi.fn(),
+		finish: vi.fn(),
+		cleanup: vi.fn()
+	}))
+}));
+vi.mock('$lib/components/Player.svelte', () => {
+	const Comp = function () {};
+	Comp.prototype = {};
+	return { default: Comp };
+});
+vi.mock('$lib/components/SearchSuggestions.svelte', () => {
+	const Comp = function () {};
+	Comp.prototype = {};
+	return { default: Comp };
+});
+vi.mock('$lib/components/DownloadsNavBadge.svelte', () => {
+	const Comp = function () {};
+	Comp.prototype = {};
+	return { default: Comp };
+});
+vi.mock('$lib/components/PendingApprovalNavBadge.svelte', () => {
+	const Comp = function () {};
+	Comp.prototype = {};
+	return { default: Comp };
+});
+
+// The shell is loaded lazily by +layout.svelte; the dynamic imports here are the
+// module-loading boundary under test, mirroring routes/layout.svelte.spec.ts.
+vi.mock('$lib/components/lazyComponentLoaders', () => ({
+	loadAuthenticatedAppShell: async () =>
+		(await import('$lib/components/AuthenticatedAppShell.svelte')).default,
+	loadPlaylistModal: async () =>
+		(await import('$lib/components/AddToPlaylistModal.svelte')).default,
+	loadDiscographyModal: async () =>
+		(await import('$lib/components/DiscographyDownloadModal.svelte')).default
+}));
+
+import Layout from '../../routes/+layout.svelte';
+import { authStore, type AuthUser } from '$lib/stores/authStore.svelte';
+import { resetPlaylistModal } from '$lib/stores/playlistModal.svelte';
+import { discographyDownloadStore } from '$lib/stores/discographyDownload.svelte';
+import { batchDownloadStore } from '$lib/stores/batchDownloadStatus.svelte';
+
+type IntegrationState = {
+	download_client: boolean;
+	library: boolean;
+	jellyfin: boolean;
+	listenbrainz: boolean;
+	youtube: boolean;
+	localfiles: boolean;
+	lastfm: boolean;
+	loaded: boolean;
+};
+
+const integrationState: IntegrationState = {
+	download_client: true,
+	library: true,
+	jellyfin: false,
+	listenbrainz: false,
+	youtube: false,
+	localfiles: false,
+	lastfm: false,
+	loaded: true
+};
+
+function testUser(role: AuthUser['role'] = 'admin'): AuthUser {
+	return {
+		id: 'user-1',
+		display_name: 'Test User',
+		role,
+		email: null,
+		avatar_url: null,
+		username: 'testuser',
+		username_display: 'testuser',
+		providers: ['local']
+	};
+}
+
+const childrenSnippet = createRawSnippet(() => ({
+	render: () => '<div data-testid="page-content">Page</div>'
+}));
+
+function renderLayout() {
+	return render(Layout, {
+		props: { children: childrenSnippet } as Record<string, unknown>
+	} as Parameters<typeof render<typeof Layout>>[1]);
+}
+
+/** Inner flex column of .drawer-side (child 0 is the overlay label). */
+function sidebarInner(): HTMLDivElement {
+	const side = document.querySelector('.drawer-side');
+	if (!(side instanceof HTMLElement)) throw new Error('.drawer-side did not render');
+	const inner = side.children[1];
+	if (!(inner instanceof HTMLDivElement)) {
+		throw new Error('inner sidebar container did not render');
+	}
+	return inner;
+}
+
+const VIEWPORT_H = 600;
+// pb-24 on the controls container reserves clearance for the fixed player bar
+const PLAYER_BAR_PX = 96;
+
+/** Sidebar rows mount in waves (integration/service entries); wait until stable. */
+async function waitForStableSidebar() {
+	await vi.waitFor(
+		async () => {
+			const first = sidebarInner().scrollHeight;
+			await new Promise((resolve) => setTimeout(resolve, 120));
+			expect(sidebarInner().scrollHeight).toBe(first);
+		},
+		{ timeout: 8000, interval: 100 }
+	);
+}
+
+/** Scroll the bounded sidebar container to its far end. */
+function scrollToSidebarBottom() {
+	sidebarInner().scrollTop = sidebarInner().scrollHeight;
+}
+
+describe('AuthenticatedAppShell sidebar scroll at short desktop heights (#281)', () => {
+	beforeEach(async () => {
+		vi.clearAllMocks();
+		routeState.pathname = '/';
+		playerState.isPlayerVisible = true;
+		authStore.clear();
+		authStore.setUser(testUser());
+		await page.viewport(1280, 600);
+	});
+
+	afterEach(async () => {
+		authStore.clear();
+		discographyDownloadStore.close();
+		batchDownloadStore.clear();
+		await page.viewport(1280, 720);
+	});
+
+	it('bounds the sidebar height to the viewport with vertical overflow', async () => {
+		renderLayout();
+		await expect.element(page.getByTestId('page-content')).toBeInTheDocument();
+		await waitForStableSidebar();
+
+		const inner = sidebarInner();
+		const style = getComputedStyle(inner);
+		expect(style.overflowY).toBe('auto');
+		// max-h-dvh pins the box to the 600px-tall viewport instead of growing
+		expect(Number.parseFloat(style.maxHeight)).toBe(600);
+		// overflow-x-hidden keeps laid-out-but-invisible collapsed tooltip bubbles
+		// from adding a phantom horizontal scrollbar to the rail
+		expect(style.overflowX).toBe('hidden');
+	});
+
+	it('makes the bottom sidebar controls reachable by scrolling when collapsed', async () => {
+		renderLayout();
+		const logout = page.getByRole('button', { name: 'Log out' });
+		await expect.element(logout).toBeInTheDocument();
+		await waitForStableSidebar();
+
+		// Defect condition: without the height bound the control sits below the fold
+		const before = logout.element().getBoundingClientRect();
+		expect(before.bottom).toBeGreaterThan(600);
+
+		scrollToSidebarBottom();
+
+		// The last control (Open toggle) sits below Log out: fully scrolled it must
+		// sit inside the viewport AND clear of the fixed player bar (pb-24)
+		await vi.waitFor(
+			() => {
+				const last = lastControl();
+				const rect = last.getBoundingClientRect();
+				expect(rect.top).toBeGreaterThanOrEqual(0);
+				expect(rect.bottom).toBeLessThanOrEqual(VIEWPORT_H - PLAYER_BAR_PX);
+			},
+			{ timeout: 3000 }
+		);
+	});
+
+	function lastControl(): HTMLElement {
+		const footer = sidebarInner().lastElementChild;
+		if (!(footer instanceof HTMLElement)) {
+			throw new Error('bottom controls container did not render');
+		}
+		// pb-24 keeps the controls clear of the fixed player bar
+		expect(footer.className).toContain('pb-24');
+		const control = footer.lastElementChild;
+		if (!(control instanceof HTMLElement)) throw new Error('Open toggle did not render');
+		return control;
+	}
+
+	it('keeps the bottom controls reachable in the expanded drawer state', async () => {
+		renderLayout();
+		await expect.element(page.getByTestId('page-content')).toBeInTheDocument();
+		await waitForStableSidebar();
+
+		const toggle = document.getElementById('main-drawer');
+		if (!(toggle instanceof HTMLInputElement)) throw new Error('drawer toggle did not render');
+		toggle.click();
+		await waitForStableSidebar();
+
+		const width = sidebarInner().getBoundingClientRect().width;
+		// is-drawer-open:w-64 applies once the toggle is checked
+		expect(width, `expanded sidebar width, checked=${toggle.checked}`).toBe(256);
+
+		scrollToSidebarBottom();
+		await vi.waitFor(
+			() => {
+				const rect = lastControl().getBoundingClientRect();
+				expect(rect.top).toBeGreaterThanOrEqual(0);
+				expect(rect.bottom).toBeLessThanOrEqual(VIEWPORT_H - PLAYER_BAR_PX);
+			},
+			{ timeout: 3000 }
+		);
+	});
+});

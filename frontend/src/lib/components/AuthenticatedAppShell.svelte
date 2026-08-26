@@ -426,7 +426,7 @@
 	<div class="drawer-side hidden md:block is-drawer-close:overflow-visible">
 		<label for="main-drawer" aria-label="close sidebar" class="drawer-overlay"></label>
 		<div
-			class="is-drawer-close:w-16 is-drawer-open:w-64 bg-base-200 flex flex-col items-start min-h-full"
+			class="is-drawer-close:w-16 is-drawer-open:w-64 bg-base-200 flex flex-col items-start min-h-full max-h-dvh overflow-y-auto overflow-x-hidden"
 		>
 			<ul class="menu w-full grow p-2 [&_li>*]:py-3">
 				<li>
