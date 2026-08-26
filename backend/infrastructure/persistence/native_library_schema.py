@@ -636,6 +636,8 @@ CREATE TABLE IF NOT EXISTS library_operation_jobs (
     lease_expires_at REAL,
     heartbeat_at REAL,
     next_attempt_at REAL,
+    reidentification_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK(reidentification_attempt_count >= 0),
     created_at REAL NOT NULL,
     started_at REAL,
     phase_started_at REAL,

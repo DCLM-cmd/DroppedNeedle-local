@@ -1293,6 +1293,8 @@ class NativeLibraryStore(PersistenceBase):
                 "ALTER TABLE library_management_import_journal ADD COLUMN baseline_file_mtime_ns INTEGER",
                 "ALTER TABLE library_management_import_journal ADD COLUMN baseline_file_mode INTEGER",
                 "ALTER TABLE library_operation_jobs ADD COLUMN next_attempt_at REAL",
+                "ALTER TABLE library_operation_jobs "
+                "ADD COLUMN reidentification_attempt_count INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE library_identification_jobs ADD COLUMN attention_cause TEXT",
             ):
                 try:
@@ -25898,6 +25900,57 @@ class NativeLibraryStore(PersistenceBase):
             return dict(updated)
 
         return await self._write(operation)
+
+    async def defer_reidentification_work(
+        self,
+        job_id: str,
+        ordinal: int,
+        *,
+        worker_id: str,
+        reason_code: str,
+        now: float,
+        retry_not_before: float,
+    ) -> dict[str, Any]:
+        """F-IDENT-03: durably defer one transient explicit re-identification.
+
+        The running work item returns to 'pending' with the failure code, the
+        job returns to 'queued' with ``next_attempt_at`` set, and the durable
+        attempt counter advances. Nothing is marked succeeded or failed and no
+        candidate is selected; the sealed snapshot stays untouched so the next
+        claim re-evaluates against the original revisions.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            work_update = connection.execute(
+                "UPDATE library_operation_work SET state = 'pending', failure_code = ?, "
+                "updated_at = ?, row_revision = row_revision + 1 "
+                "WHERE job_id = ? AND ordinal = ? AND state = 'running'",
+                (reason_code, now, job_id, ordinal),
+            )
+            if work_update.rowcount != 1:
+                raise StaleRevisionError(
+                    "The re-identification work lease changed while it was deferred."
+                )
+            updated = connection.execute(
+                "UPDATE library_operation_jobs SET state = 'queued', lease_owner = NULL, "
+                "lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?, "
+                "next_attempt_at = ?, "
+                "reidentification_attempt_count = reidentification_attempt_count + 1, "
+                "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+                "WHERE id = ? AND kind = 'explicit_reidentification' "
+                "AND state = 'running' AND lease_owner = ? RETURNING *",
+                (now, retry_not_before, job_id, worker_id),
+            ).fetchone()
+            if updated is None:
+                raise StaleRevisionError(
+                    "The re-identification lease changed while it was deferred."
+                )
+            self._bump_stream(connection, "operation")
+            return dict(updated)
+
+        result = await self._write(operation)
+        self.work_wakeups.notify_after("operation", retry_not_before - now)
+        return result
 
     async def accept_reidentification_candidate(
         self,

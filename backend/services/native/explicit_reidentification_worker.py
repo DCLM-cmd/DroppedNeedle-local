@@ -8,7 +8,10 @@ import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import (
+    ExternalServiceError,
+    InvalidExternalPayloadError,
+)
 from infrastructure.degradation import (
     clear_degradation_context,
     init_degradation_context,
@@ -42,6 +45,13 @@ from services.native.identification_revisions import (
 from services.native.library_operation_service import LibraryOperationService
 
 logger = logging.getLogger(__name__)
+
+
+# F-IDENT-03 owner-signed retry policy: transient explicit failures defer for
+# 120 seconds and stop at this finite, durable attempt bound. The bound is a
+# named constant so tests and operators can observe it.
+REIDENTIFICATION_RETRY_SECONDS = 120.0
+MAX_REIDENTIFICATION_ATTEMPTS = 5
 
 
 class ExplicitReidentificationWorker:
@@ -359,7 +369,49 @@ class ExplicitReidentificationWorker:
                 evidence=records,
                 now=timestamp,
             )
+        except InvalidExternalPayloadError:
+            # F-MATCH-03 policy: a deterministic payload-shape failure is not a
+            # provider outage and must not consume transient retry slots. It
+            # stays terminal under its own honest code.
+            attempt = IdentificationAttempt(
+                id=str(uuid.uuid4()),
+                local_album_id=str(work["local_album_id"]),
+                trigger="explicit_reidentification",
+                requested_by_user_id=job["requested_by_user_id"],
+                input_tag_revision=revisions[0],
+                input_file_revision=revisions[1],
+                input_policy_revision=revisions[2],
+                input_identity_revision=identity_revision,
+                matcher_version=MATCHER_VERSION,
+                state="provider_deferred",
+                terminal_reason_code="UNMAPPABLE_PROVIDER_PAYLOAD",
+                started_at=timestamp,
+                completed_at=timestamp,
+            )
+            return await self._store.finish_reidentification_evaluation(
+                str(job["id"]),
+                int(work["ordinal"]),
+                worker_id=worker_id,
+                expected_work_revision=int(work["row_revision"]),
+                expected_album_revision=int(context["album"]["row_revision"]),
+                attempt=attempt,
+                evidence=[],
+                now=timestamp,
+            )
         except ExternalServiceError:
+            # F-IDENT-03: transient provider or fingerprint interruptions defer
+            # durably (queued job, pending work, next_attempt_at = now + 120)
+            # instead of terminalizing the operation, until the finite bound.
+            attempts_used = int(job.get("reidentification_attempt_count", 0) or 0)
+            if attempts_used < MAX_REIDENTIFICATION_ATTEMPTS:
+                return await self._store.defer_reidentification_work(
+                    str(job["id"]),
+                    int(work["ordinal"]),
+                    worker_id=worker_id,
+                    reason_code="PROVIDER_TEMPORARILY_UNAVAILABLE",
+                    now=timestamp,
+                    retry_not_before=timestamp + REIDENTIFICATION_RETRY_SECONDS,
+                )
             attempt = IdentificationAttempt(
                 id=str(uuid.uuid4()),
                 local_album_id=str(work["local_album_id"]),

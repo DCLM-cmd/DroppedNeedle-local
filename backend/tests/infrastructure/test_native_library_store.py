@@ -2780,3 +2780,53 @@ async def test_policy_transition_journal_is_durable_and_idempotent(
     assert transition is not None and transition["state"] == "completed"
     assert pending is not None
     assert pending["desired_policy_revision"] == "policy-2"
+
+
+def test_operation_job_schema_construction_is_idempotent_with_retry_column(
+    tmp_path: Path,
+) -> None:
+    """F-IDENT-03: the additive reidentification_attempt_count column exists on
+    both fresh and repeated construction of the same database path."""
+    db_file = tmp_path / "library.db"
+    with sqlite3.connect(db_file) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO auth_users VALUES ('admin')")
+
+    first = NativeLibraryStore(db_file, threading.Lock())
+    first._ensure_tables()
+    second = NativeLibraryStore(db_file, threading.Lock())
+    second._ensure_tables()
+
+    with sqlite3.connect(db_file) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(library_operation_jobs)"
+            ).fetchall()
+        }
+    assert "reidentification_attempt_count" in columns
+    assert "next_attempt_at" in columns
+
+
+@pytest.mark.asyncio
+async def test_defer_reidentification_work_requires_the_running_lease(
+    tmp_path: Path,
+) -> None:
+    """A defer under a stale worker lease fails closed without queueing work."""
+    from core.exceptions import StaleRevisionError
+
+    db_file = tmp_path / "library.db"
+    with sqlite3.connect(db_file) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO auth_users VALUES ('admin')")
+    store = NativeLibraryStore(db_file, threading.Lock())
+
+    with pytest.raises(StaleRevisionError):
+        await store.defer_reidentification_work(
+            "missing-job",
+            0,
+            worker_id="worker",
+            reason_code="PROVIDER_TEMPORARILY_UNAVAILABLE",
+            now=5.0,
+            retry_not_before=125.0,
+        )

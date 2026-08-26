@@ -80,6 +80,8 @@ from services.native.conditional_fingerprint_service import (
     ConditionalFingerprintService,
 )
 from services.native.explicit_reidentification_worker import (
+    MAX_REIDENTIFICATION_ATTEMPTS,
+    REIDENTIFICATION_RETRY_SECONDS,
     ExplicitReidentificationWorker,
 )
 from services.native.identification_queue_service import IdentificationQueueService
@@ -2791,9 +2793,12 @@ async def test_automatic_identification_commit_rejects_an_identity_change(
 
 
 @pytest.mark.asyncio
-async def test_explicit_reidentification_provider_failure_is_terminal_and_retryable(
+async def test_explicit_transient_failure_defers_then_succeeds_after_due_claim(
     store: NativeLibraryStore,
 ) -> None:
+    """F-IDENT-03: the first transient failure defers durably - queued job,
+    pending work, next_attempt_at = now + 120, no failed count - and a due
+    claim retries the same sealed operation to the existing ready flow."""
     await _seed_album(store, "1")
     created = await ReidentificationService(store).create_or_coalesce(
         "album-1", "admin", idempotency_key="flaky-explicit", now=1
@@ -2806,23 +2811,83 @@ async def test_explicit_reidentification_provider_failure_is_terminal_and_retrya
     worker = ExplicitReidentificationWorker(
         store, AlbumCandidateService(provider), AlbumEvidenceEngine()
     )
-    failed = await worker.run_claimed(claimed, "worker", now=3)
-    assert failed["state"] == "failed"
-    assert failed["terminal_code"] == "PROVIDER_TEMPORARILY_UNAVAILABLE"
-    assert failed["failed_count"] == 1
+    deferred = await worker.run_claimed(claimed, "worker", now=3)
+    assert deferred["state"] == "queued"
+    assert deferred["next_attempt_at"] == 3 + REIDENTIFICATION_RETRY_SECONDS
+    assert deferred["failed_count"] == 0
+    assert deferred["succeeded_count"] == 0
+    assert deferred["reidentification_attempt_count"] == 1
+
+    # Early claim is blocked; due claim clears next_attempt_at and retries.
+    queue = IdentificationQueueService(store)  # noqa: F841 (queue unused directly)
+    early = await store.claim_operation_job(
+        "worker", now=4, lease_seconds=60, kind="explicit_reidentification"
+    )
+    assert early is None
+    retried = await store.claim_operation_job(
+        "worker",
+        now=3 + REIDENTIFICATION_RETRY_SECONDS,
+        lease_seconds=60,
+        kind="explicit_reidentification",
+    )
+    assert retried is not None
+    assert retried["next_attempt_at"] is None
+    ready = await worker.run_claimed(
+        retried,
+        "worker",
+        now=3 + REIDENTIFICATION_RETRY_SECONDS,
+    )
+    assert ready["state"] == "ready"
+    assert ready["failed_count"] == 0
+
+
+
+@pytest.mark.asyncio
+async def test_explicit_transient_failures_stop_at_the_finite_bound(
+    store: NativeLibraryStore,
+) -> None:
+    """Repeated transient failures defer until MAX_REIDENTIFICATION_ATTEMPTS,
+    then terminalize with the existing provider code; manual resume still works."""
+    await _seed_album(store, "1")
+    created = await ReidentificationService(store).create_or_coalesce(
+        "album-1", "admin", idempotency_key="flaky-explicit-bound", now=1
+    )
+    class _AlwaysFailingProvider(_FlakyIdentificationProvider):
+        async def search_album_candidate_ids(self, artist, title, limit, priority):
+            self.calls += 1
+            raise ExternalServiceError("temporary private provider failure")
+
+    provider = _AlwaysFailingProvider()
+    worker = ExplicitReidentificationWorker(
+        store, AlbumCandidateService(provider), AlbumEvidenceEngine()
+    )
+    now = 2.0
+    final: dict | None = None
+    for _attempt in range(MAX_REIDENTIFICATION_ATTEMPTS + 4):
+        claimed = await store.claim_operation_job(
+            "worker", now=now, lease_seconds=60, kind="explicit_reidentification"
+        )
+        if claimed is None:
+            now += 1000.0
+            continue
+        result = await worker.run_claimed(claimed, "worker", now=now)
+        if result["state"] == "failed":
+            final = result
+            break
+        now += REIDENTIFICATION_RETRY_SECONDS + 1.0
+    assert final is not None
+    assert final["terminal_code"] == "PROVIDER_TEMPORARILY_UNAVAILABLE"
+    job_row = await store.get_operation_job(created["id"])
+    attempts_used = int(job_row["reidentification_attempt_count"])
+    failed_count = int(job_row["failed_count"])
+    assert attempts_used == MAX_REIDENTIFICATION_ATTEMPTS
+    assert failed_count == 1
 
     operations = LibraryOperationService(store)
     resumed = await operations.control(
-        created["id"], "resume", int(failed["row_revision"]), now=4
+        created["id"], "resume", int(final["row_revision"]), now=now + 10
     )
     assert resumed.state == "queued"
-    retried = await store.claim_operation_job(
-        "worker", now=5, lease_seconds=60, kind="explicit_reidentification"
-    )
-    assert retried is not None
-    ready = await worker.run_claimed(retried, "worker", now=6)
-    assert ready["state"] == "ready"
-    assert ready["failed_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -3287,10 +3352,15 @@ async def test_exact_release_override_never_searches_or_fingerprints_a_missing_r
     assert provider.exact_calls == [EXACT_RELEASE]
     assert provider.search_calls == 0
     assert fingerprint_backend.generate_calls == 0
-    assert result["state"] == ("failed" if unavailable else "succeeded")
-    assert result["terminal_code"] == (
-        "PROVIDER_TEMPORARILY_UNAVAILABLE" if unavailable else "NO_EXTERNAL_RESULT"
-    )
+    if unavailable:
+        # F-IDENT-03: the transient unavailability defers instead of failing.
+        assert result["state"] == "queued"
+        assert result["next_attempt_at"] == 3 + REIDENTIFICATION_RETRY_SECONDS
+        assert result["failed_count"] == 0
+        assert result["reidentification_attempt_count"] == 1
+    else:
+        assert result["state"] == "succeeded"
+        assert result["terminal_code"] == "NO_EXTERNAL_RESULT"
     assert (
         await LibraryOperationService(store).get(created["id"])
     ).reidentification_candidates == []
