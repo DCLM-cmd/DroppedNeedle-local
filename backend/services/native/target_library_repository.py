@@ -129,25 +129,30 @@ class TargetLibraryRepository:
         return max(tiers, key=tier_rank) if tiers else None
 
     async def list_cutoff_unmet(self, cutoff: str) -> list[dict[str, Any]]:
-        from services.native.quality_tiers import tier_rank
+        from services.native.quality_tiers import TIER_KEYS, tier_rank
 
-        rows, _ = await self._store.list_target_albums(
-            limit=100_000, offset=0, sort="name"
+        cutoff_rank = tier_rank(cutoff)
+        rows = await self._store.list_target_cutoff_unmet(
+            cutoff_rank, limit=100_000
         )
+
+        # F-TARGETCATALOG-03: one aggregate read replaces the per-album N+1.
+        # The store computes MIN(track-rank) in SQL; we only translate the
+        # numeric rank back to its tier key (low=0 .. lossless=4).
+        rank_to_tier = list(TIER_KEYS)[::-1]
         result: list[dict[str, Any]] = []
         for row in rows:
-            tier = await self.album_quality_tier(str(row["release_group_mbid"]))
-            if tier is not None and tier_rank(tier) < tier_rank(cutoff):
-                # NEW-TARGET-01: translate the target row to the shared cutoff
-                # worklist contract. artist_mbid is ONLY the provider identity -
-                # never the local album-artist ID alias.
-                normalized = {
-                    **row,
-                    "current_tier": tier,
-                    "artist_name": row.get("album_artist_name"),
-                    "artist_mbid": row.get("provider_artist_mbid"),
-                }
-                result.append(normalized)
+            tier = rank_to_tier[int(row["worst_rank"])]
+            # NEW-TARGET-01: translate the target row to the shared cutoff
+            # worklist contract. artist_mbid is ONLY the provider identity -
+            # never the local album-artist ID alias.
+            normalized = {
+                **row,
+                "current_tier": tier,
+                "artist_name": row.get("album_artist_name"),
+                "artist_mbid": row.get("provider_artist_mbid"),
+            }
+            result.append(normalized)
         return result
 
     async def get_file_rows_for_album(self, album_id: str) -> list[dict[str, Any]]:

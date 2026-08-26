@@ -2668,6 +2668,70 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def list_target_cutoff_unmet(
+        self, cutoff_rank: int, *, limit: int = 100_000
+    ) -> list[dict[str, Any]]:
+        """F-TARGETCATALOG-03: one aggregate replacing the per-album N+1 reads.
+
+        Computes each active indexed album's WORST track quality rank in SQL
+        (mirroring ``quality_tiers.tier_for`` exactly - lossless extensions,
+        MP4-family lossless only with bit-depth evidence, then the bitrate
+        bands) and returns only albums whose worst rank is below
+        ``cutoff_rank``. Same row shape as ``list_target_albums`` plus
+        ``worst_rank``; ordering matches that worklist's album/artist keys.
+        """
+
+        def operation(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+            rank = (
+                "CASE "
+                "WHEN LOWER(COALESCE(t.file_format, '')) IN "
+                "('flac','alac','wav','ape','wv') THEN 4 "
+                "WHEN LOWER(COALESCE(t.file_format, '')) IN ('m4a','mp4','mov') "
+                "AND t.bit_depth IS NOT NULL THEN 4 "
+                "WHEN COALESCE(t.bit_rate, 0) >= 320 THEN 3 "
+                "WHEN COALESCE(t.bit_rate, 0) >= 256 THEN 2 "
+                "WHEN COALESCE(t.bit_rate, 0) >= 192 THEN 1 "
+                "ELSE 0 END"
+            )
+            rows = connection.execute(
+                "SELECT a.id AS release_group_mbid, a.title AS album_title, "
+                "a.album_artist_name, a.album_artist_id AS album_artist_mbid, "
+                "a.year, a.is_compilation, a.original_release_date, "
+                "a.album_artist_sort_name, COUNT(t.id) AS track_count, "
+                "SUM(t.file_size_bytes) AS total_size_bytes, "
+                "SUM(COALESCE(t.duration_seconds, 0)) AS total_duration_seconds, "
+                "MAX(t.imported_at) AS last_imported_at, "
+                "MAX(t.file_format) AS file_format, MAX(t.album_sort) AS album_sort_name, "
+                "GROUP_CONCAT(DISTINCT NULLIF(t.genre, '')) AS genres, "
+                "ae.release_group_mbid AS provider_release_group_mbid, "
+                "ae.release_mbid AS provider_release_mbid, "
+                "custom.manifest_id AS custom_manifest_id, "
+                "aie.provider_artist_id AS provider_artist_mbid, artwork.cover_url, "
+                "artwork.source AS artwork_source, contribution.id AS contribution_id, "
+                "contribution.state AS contribution_state, "
+                f"MIN({rank}) AS worst_rank "
+                "FROM local_albums a JOIN local_tracks t ON t.local_album_id = a.id "
+                "LEFT JOIN local_album_external_identities ae "
+                "ON ae.local_album_id = a.id AND ae.provider = 'musicbrainz' "
+                "LEFT JOIN local_artist_external_identities aie "
+                "ON aie.local_artist_id = a.album_artist_id "
+                "AND aie.provider = 'musicbrainz' "
+                "LEFT JOIN library_custom_edition_active custom "
+                "ON custom.local_album_id = a.id "
+                "LEFT JOIN local_album_artwork artwork ON artwork.local_album_id = a.id "
+                "LEFT JOIN library_contribution_drafts contribution "
+                "ON contribution.local_album_id = a.id "
+                "AND contribution.state NOT IN ('linked','cancelled','stale') "
+                "WHERE a.retired_into_album_id IS NULL AND t.availability = 'indexed' "
+                "GROUP BY a.id "
+                f"HAVING MIN({rank}) < ? "
+                "ORDER BY a.title_folded, a.id LIMIT ?",
+                (cutoff_rank, max(1, limit)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return await self._read(operation)
+
     async def list_target_artists(
         self,
         *,
