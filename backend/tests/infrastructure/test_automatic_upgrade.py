@@ -1732,6 +1732,149 @@ def test_replace_database_raises_when_content_never_verifies(
     assert _source_value(destination) == "original"
 
 
+
+def _write_multi_page_database(path: Path, value: str = "original") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE source_value (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO source_value VALUES (?)", (value,))
+        connection.execute("CREATE TABLE bulk (payload TEXT NOT NULL)")
+        connection.executemany(
+            "INSERT INTO bulk VALUES (?)",
+            [(f"row-{index}-" + "x" * 120,) for index in range(2000)],
+        )
+
+
+def test_promote_rejects_working_copy_that_fails_quick_check(tmp_path: Path) -> None:
+    """F2/H2: page-level rot in the working copy fails promotion closed
+    before any live byte is swapped; the marker gate alone cannot see it."""
+    settings = _settings(tmp_path)
+    _write_multi_page_database(settings.library_db_path)
+    backup = automatic_upgrade.capture_upgrade_backup(settings)
+    working = automatic_upgrade.prepare_working_copy(settings, backup)
+    working_database = working / "cache" / "library.db"
+    with sqlite3.connect(working_database) as connection:
+        connection.execute("UPDATE source_value SET value = 'migrated'")
+    _mark_migrated(working_database)
+    # Empirically validated technique: flipping a leaf-page header trips
+    # PRAGMA quick_check while the completion-marker gate still passes.
+    with open(working_database, "r+b") as handle:
+        handle.seek(4096 * 3 + 8)
+        handle.write(b"\xde\xad\xbe\xef" * 4)
+    assert automatic_upgrade._database_has_marker(working_database)
+
+    live_before = automatic_upgrade._sha256(settings.library_db_path)
+    with pytest.raises(AutomaticUpgradeError, match="quick_check"):
+        automatic_upgrade.promote_working_copy(settings, working)
+
+    assert automatic_upgrade._sha256(settings.library_db_path) == live_before
+
+
+def test_promote_healthy_working_copy_installs_itself(tmp_path: Path) -> None:
+    """Positive companion for the quick_check gate: an intact working copy
+    promotes unchanged through the same code path."""
+    settings = _settings(tmp_path)
+    _write_unmigrated_database(settings.library_db_path)
+    backup = automatic_upgrade.capture_upgrade_backup(settings)
+    working = automatic_upgrade.prepare_working_copy(settings, backup)
+    working_database = working / "cache" / "library.db"
+    with sqlite3.connect(working_database) as connection:
+        connection.execute("UPDATE source_value SET value = 'migrated'")
+    _mark_migrated(working_database)
+
+    automatic_upgrade.promote_working_copy(settings, working)
+
+    assert automatic_upgrade._database_has_marker(settings.library_db_path)
+    assert _source_value(settings.library_db_path) == "migrated"
+
+
+def test_wal_quarantine_survives_crash_between_unlink_and_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F7/H7: a crash after the destination WAL is quarantined but before the
+    swap leaves the old WAL recoverable beside the database; the restart
+    restore path installs the manifest-verified backup bytes and sweeps the
+    quarantine siblings."""
+    settings = _settings(tmp_path)
+    settings.library_db_path.parent.mkdir(parents=True)
+    crash = {"armed": True}
+    real_replace = os.replace
+
+    class SimulatedPromotionCrash(BaseException):
+        pass
+
+    def crashing_replace(source: object, destination: object, **kwargs: object):
+        if crash["armed"] and Path(str(destination)) == settings.library_db_path:
+            raise SimulatedPromotionCrash
+        return real_replace(source, destination, **kwargs)
+
+    live_connection = sqlite3.connect(settings.library_db_path)
+    try:
+        assert (
+            live_connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        )
+        live_connection.execute("CREATE TABLE source_value (value TEXT NOT NULL)")
+        live_connection.execute("INSERT INTO source_value VALUES ('original')")
+        live_connection.execute("CREATE TABLE wal_value (value TEXT NOT NULL)")
+        live_connection.execute("INSERT INTO wal_value VALUES ('committed')")
+        live_connection.commit()
+        backup = automatic_upgrade.capture_upgrade_backup(settings)
+        manifest = json.loads(
+            (backup.directory / "manifest.json").read_text(encoding="utf-8")
+        )
+
+        working = automatic_upgrade.prepare_working_copy(settings, backup)
+        working_database = working / "cache" / "library.db"
+        with sqlite3.connect(working_database) as connection:
+            connection.execute("UPDATE source_value SET value = 'migrated'")
+        _mark_migrated(working_database)
+
+        # Committed frames that exist ONLY in the -wal file at promote time.
+        live_connection.execute("INSERT INTO wal_value VALUES ('late-wal-row')")
+        live_connection.commit()
+        assert Path(f"{settings.library_db_path}-wal").is_file()
+
+        monkeypatch.setattr(
+            automatic_upgrade.os, "replace", crashing_replace
+        )
+        with pytest.raises(SimulatedPromotionCrash):
+            automatic_upgrade.promote_working_copy(settings, working)
+    finally:
+        live_connection.close()
+
+    quarantined_wal = list(
+        settings.library_db_path.parent.glob(
+            f".{settings.library_db_path.name}-wal.upgrade-*.quarantine"
+        )
+    )
+    assert len(quarantined_wal) == 1
+    assert b"late-wal-row" in quarantined_wal[0].read_bytes()
+    assert not Path(f"{settings.library_db_path}-wal").exists()
+
+    crash["armed"] = False
+    restored = automatic_upgrade._load_upgrade_backup(
+        settings, str(backup.directory)
+    )
+    automatic_upgrade.restore_upgrade_backup(settings, restored)
+
+    assert automatic_upgrade._sha256(settings.library_db_path) == manifest[
+        "database_sha256"
+    ]
+    assert not list(settings.library_db_path.parent.glob("*.quarantine"))
+    recovered = sqlite3.connect(settings.library_db_path)
+    try:
+        assert (
+            recovered.execute("SELECT value FROM source_value").fetchone()[0]
+            == "original"
+        )
+        assert (
+            recovered.execute("SELECT value FROM wal_value").fetchone()[0]
+            == "committed"
+        )
+    finally:
+        recovered.close()
+
+
 def test_upgrade_completes_when_atomic_rename_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

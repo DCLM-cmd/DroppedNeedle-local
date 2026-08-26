@@ -142,6 +142,20 @@ def _database_has_marker(database: Path) -> bool:
         return False
 
 
+def _quick_check_failure(database: Path) -> str | None:
+    """F2/H2: physical integrity gate for the working copy, read-only so the
+    probe itself can never dirty a database it is about to vouch for."""
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            rows = connection.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.Error as error:
+        return f"the integrity probe failed: {error}"
+    problems = [str(row[0]) for row in rows if str(row[0]) != "ok"]
+    if not problems:
+        return None
+    return problems[0]
+
+
 def _sqlite_backup(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with (
@@ -394,8 +408,11 @@ def _replace_database(source: Path, destination: Path) -> None:
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
         expected = _sha256(temporary)
-        for suffix in ("-wal", "-shm"):
-            Path(f"{destination}{suffix}").unlink(missing_ok=True)
+        # From stage `promoting` onward the manifest-verified backup is
+        # authoritative: these sidecars are quarantined rather than destroyed
+        # so a crash in this window leaves the previous WAL recoverable by
+        # hand, while every restart path restores from the backup wholesale.
+        quarantined = _quarantine_database_sidecars(destination)
         try:
             os.replace(temporary, destination)
         except OSError:
@@ -422,8 +439,44 @@ def _replace_database(source: Path, destination: Path) -> None:
                     "The upgraded library database could not be verified "
                     "after installation."
                 )
+        for sibling in quarantined:
+            sibling.unlink(missing_ok=True)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _quarantine_database_sidecars(destination: Path) -> list[Path]:
+    """Rename live -wal/-shm sidecars to sibling quarantine names instead of
+    destroying them, so a crash before the swap preserves the previous WAL.
+    Filesystems without atomic rename keep the legacy unlink behavior."""
+    quarantined: list[Path] = []
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{destination}{suffix}")
+        if not sidecar.exists():
+            continue
+        sibling = destination.with_name(
+            f".{destination.name}{suffix}.upgrade-{uuid.uuid4().hex}.quarantine"
+        )
+        try:
+            os.replace(sidecar, sibling)
+        except OSError:
+            logger.warning(
+                "automatic_upgrade.database_sidecar_quarantine_unavailable"
+            )
+            sidecar.unlink(missing_ok=True)
+        else:
+            quarantined.append(sibling)
+    return quarantined
+
+
+def _discard_quarantined_sidecars(destination: Path) -> None:
+    """Sweep superseded quarantine siblings once a replacement or restored
+    database is verified in place; leftovers from crashed windows die here."""
+    for suffix in ("-wal", "-shm"):
+        for sibling in destination.parent.glob(
+            f".{destination.name}{suffix}.upgrade-*.quarantine"
+        ):
+            sibling.unlink(missing_ok=True)
 
 
 def restore_upgrade_backup(settings: Settings, backup: UpgradeBackup) -> None:
@@ -443,6 +496,7 @@ def restore_upgrade_backup(settings: Settings, backup: UpgradeBackup) -> None:
         _replace_file(backup.config, config)
     else:
         config.unlink(missing_ok=True)
+    _discard_quarantined_sidecars(database)
 
 
 def prepare_working_copy(settings: Settings, backup: UpgradeBackup) -> Path:
@@ -477,10 +531,15 @@ def promote_working_copy(settings: Settings, working: Path) -> None:
         raise AutomaticUpgradeError(
             "The checked library upgrade is missing its completion marker."
         )
+    quick_check = _quick_check_failure(working_database)
+    if quick_check is not None:
+        raise AutomaticUpgradeError(
+            "The upgraded library database failed its PRAGMA quick_check "
+            f"integrity gate: {quick_check}"
+        )
     if working_config.is_file():
         _replace_file(working_config, settings.config_file_path)
     _replace_database(working_database, settings.library_db_path)
-
 
 def _restore_interrupted_upgrade(settings: Settings, state_path: Path) -> None:
     state = _read_state(state_path)
