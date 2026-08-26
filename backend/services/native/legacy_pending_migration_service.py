@@ -18,6 +18,18 @@ logger = logging.getLogger(__name__)
 PENDING_RUN_PREFIX = "legacy-pending"
 
 
+def pending_run_id(policy_revision: str, source_revision: str) -> str:
+    """Durable pending-run identity: policy revision plus pending INPUT revision.
+
+    NEW-MIG-01: gating on the policy revision alone let a completed run suppress
+    every later schedule whenever new legacy rows arrived under an unchanged
+    policy. Keying the ID on the bounded legacy source revision makes an
+    unchanged input idempotently skipped while any new pending input yields a
+    fresh run."""
+    return f"{PENDING_RUN_PREFIX}-{policy_revision}-{source_revision}"
+
+
+
 class LegacyPendingMigrationService:
     """Migrate legacy rows that became resolvable after the upgrade cutover."""
 
@@ -54,7 +66,13 @@ class LegacyPendingMigrationService:
         counts = await self._store.get_pending_legacy_counts()
         if not any(value > 0 for value in counts.values()):
             return None
-        run_id = f"{PENDING_RUN_PREFIX}-{self._resolver_getter().policy_revision}"
+        # NEW-MIG-01: include the bounded pending-input revision in the identity.
+        # The migrator's own source/root revision checks remain the final
+        # authority; this gate only decides whether a task may start.
+        source_revision = await self._store.get_bounded_legacy_source_revision()
+        run_id = pending_run_id(
+            self._resolver_getter().policy_revision, source_revision
+        )
         if await self._store.get_migration_run_state(run_id) == "completed":
             return None
         return run_id
