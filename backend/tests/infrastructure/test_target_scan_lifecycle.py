@@ -89,16 +89,18 @@ def _request(
     kind: str = "incremental",
     relative_path: str = ".",
     trigger: str = "manual",
+    policy_revision: str | None = None,
 ) -> ScanRequest:
+    revision = policy_revision or resolver.policy_revision
     return ScanRequest(
         kind=kind,
         trigger=trigger,
-        policy_revision=resolver.policy_revision,
+        policy_revision=revision,
         scopes=[
             ScanScope(
                 root_id="root-a",
                 relative_path=relative_path,
-                policy_revision=resolver.policy_revision,
+                policy_revision=revision,
             )
         ],
     )
@@ -188,6 +190,112 @@ async def test_atomic_single_flight_coalescing_union_and_kind_conflict(
     _, scopes, _ = await target_store.get_scan_run(queued.run_id)
     assert {scope.relative_path for scope in scopes} == {"Disc 1", "Disc 2"}
 
+
+@pytest.mark.asyncio
+async def test_queued_only_disjoint_request_expands_existing_run(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    first = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1", trigger="manual")
+    )
+    expanded = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 2", trigger="automatic")
+    )
+
+    assert first.disposition == "started"
+    assert expanded.disposition == "expanded"
+    assert expanded.run_id == first.run_id
+    assert await target_store.row_count("library_scan_runs") == 1
+    run, scopes, _ = await target_store.get_scan_run(first.run_id)
+    assert run.kind == "incremental"
+    assert run.trigger == "manual"
+    assert {scope.relative_path for scope in scopes} == {"Disc 1", "Disc 2"}
+    assert {scope.policy_revision for scope in scopes} == {resolver.policy_revision}
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        triggers = connection.execute(
+            "SELECT trigger, reason FROM library_scan_run_triggers "
+            "WHERE run_id = ? ORDER BY trigger_sequence",
+            (first.run_id,),
+        ).fetchall()
+        indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list('library_scan_runs')"
+            ).fetchall()
+        }
+    assert triggers == [("manual", "accepted"), ("automatic", "scope_expanded")]
+    assert "idx_scan_runs_single_queued" in indexes
+
+
+@pytest.mark.asyncio
+async def test_concurrent_queued_only_requests_expand_one_run(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    results = await asyncio.gather(
+        coordinator.request_run(
+            _request(resolver, relative_path="Disc 1", trigger="manual")
+        ),
+        coordinator.request_run(
+            _request(resolver, relative_path="Disc 2", trigger="automatic")
+        ),
+    )
+
+    assert {result.disposition for result in results} == {"started", "expanded"}
+    started = next(result for result in results if result.disposition == "started")
+    expanded = next(result for result in results if result.disposition == "expanded")
+    assert expanded.run_id == started.run_id
+    assert await target_store.row_count("library_scan_runs") == 1
+    _, scopes, _ = await target_store.get_scan_run(started.run_id)
+    assert {scope.relative_path for scope in scopes} == {"Disc 1", "Disc 2"}
+    assert await target_store.row_count("library_scan_run_triggers") == 2
+
+
+@pytest.mark.asyncio
+async def test_queued_only_incompatible_requests_conflict_without_mutation(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    first = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1")
+    )
+    kind_conflict = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 2", kind="rescan_files")
+    )
+    policy_conflict = await coordinator.request_run(
+        _request(
+            resolver,
+            relative_path="Disc 3",
+            policy_revision="different-policy",
+        )
+    )
+
+    assert kind_conflict.disposition == "conflict"
+    assert kind_conflict.run_id == first.run_id
+    assert kind_conflict.conflicting_kind == "incremental"
+    assert policy_conflict.disposition == "conflict"
+    assert policy_conflict.run_id == first.run_id
+    assert policy_conflict.conflicting_kind == "incremental"
+    assert await target_store.row_count("library_scan_runs") == 1
+    assert await target_store.row_count("library_scan_run_triggers") == 1
+    assert await target_store.get_stream_revision("scan") == 1
+    run, scopes, _ = await target_store.get_scan_run(first.run_id)
+    assert run.row_revision == first.row_revision
+    assert {scope.relative_path for scope in scopes} == {"Disc 1"}
 
 @pytest.mark.asyncio
 async def test_every_target_trigger_uses_the_single_request_transaction(

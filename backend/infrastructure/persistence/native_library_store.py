@@ -8272,7 +8272,7 @@ class NativeLibraryStore(PersistenceBase):
                     row_revision=int(updated["row_revision"]),
                 )
 
-            if active is not None and queued is not None:
+            if queued is not None:
                 if (
                     queued["kind"] != request.kind
                     or connection.execute(
