@@ -75,22 +75,27 @@ from infrastructure.persistence.gh293_calibration import (
 from services.native.wal_checkpoint_service import WalCheckpointService
 
 
-def _edition_date_key(value: str | None) -> tuple[int, int, int, int]:
-    """F-EDITION-02 mixed-precision date ordering key.
+def _edition_date_key(value: str | None) -> tuple:
+    """F-EDITION-02 explicit mixed-precision date ordering key.
 
-    Parsed dates sort as (1, year, month, day) with 0 for missing month/day,
-    so full dates precede partial dates within the same year without
-    inventing calendar precision. Absent or unparseable dates sort last as
-    (0, 0, 0, 0).
+    Supported MusicBrainz shapes are ``YYYY``, ``YYYY-MM``, ``YYYY-MM-DD``.
+    Known components compare chronologically; when two values share the same
+    known prefix, the MORE precise value sorts FIRST, so a fully dated release
+    never loses to an ambiguous year-only value of the same year. Missing
+    components never become invented calendar values. Empty or invalid input
+    sorts after every valid date. The original string is never rewritten.
     """
-    match = re.match(r"^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?", value or "")
+    match = re.match(r"^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?$", (value or "").strip())
     if not match:
-        return (0, 0, 0, 0)
+        return (1, 0, 0, 0)  # invalid/empty: after all valid dates
+    year = int(match.group(1))
+    month_known = match.group(2) is not None
+    day_known = match.group(3) is not None
     return (
-        1,
-        int(match.group(1)),
-        int(match.group(2) or 0),
-        int(match.group(3) or 0),
+        0,
+        year,
+        (0, int(match.group(2))) if month_known else (1, 0),
+        (0, int(match.group(3))) if day_known else (1, 0),
     )
 
 

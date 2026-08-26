@@ -7650,3 +7650,173 @@ async def test_same_rg_rg_only_identity_accepts_fill_through_sealed_path(
     assert identity["release_mbid"] == "release-one"  # exact release filled
     track = after["tracks"][0]
     assert track["identity_release_mbid"] == "release-one"
+
+
+@pytest.mark.asyncio
+async def test_mixed_precision_dates_rank_more_precise_first(
+    store: NativeLibraryStore, db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F-EDITION-02: year-only and month-only dates must not outrank a more
+    precise date sharing the same known prefix. Chronological ordering holds
+    for known months; invalid/empty sorts last without raising."""
+    from services.native.identity_repair_service import _edition_date_key
+
+    # Unit-level ordering contract (shared with F-EDITION-01 rank tuple).
+    assert _edition_date_key("2024-01-31") < _edition_date_key("2024")
+    assert _edition_date_key("2024-01-31") < _edition_date_key("2024-01")
+    assert _edition_date_key("2024-01") < _edition_date_key("2024-02")
+    assert _edition_date_key("2023-12-31") < _edition_date_key("2024-01")
+    assert _edition_date_key("") > _edition_date_key("2024-02")
+    assert _edition_date_key(None) > _edition_date_key("2024-02")
+    assert _edition_date_key("not-a-date") > _edition_date_key("1999")
+
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+
+    def evidence_for(release_mbid: str, date: str | None, score: float):
+        item = _suggestion_evidence(
+            release_mbid=release_mbid, release_date=date
+        )
+        item.score = score
+        return item
+
+    # Same score, same Official status, same country: the fully dated release
+    # wins over a year-only sibling (pre-fix raw-string order chose 2024).
+    year_only = _suggestion_evidence(release_mbid="release-year-only")
+    year_only.score = 0.80
+    full = _suggestion_evidence(release_mbid="release-full")
+    full.score = 0.80
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-precision",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            ("evidence-year-only", year_only),
+            ("evidence-full", full),
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-year-only": _tie_release(
+                "release-year-only", status="Official", date="2024", country="US"
+            ),
+            "release-full": _tie_release(
+                "release-full", status="Official", date="2024-01-31", country="US"
+            ),
+        }
+    )
+    preparation, created, _ = await _run_preparation(
+        store, provider, idempotency_key="precision-full-vs-year"
+    )
+    finding = (
+        await preparation.findings(created.id, finding_category="exact_release_required")
+    ).items[0]
+    assert finding.reason_code == "EXACT_EDITION_SUGGESTED"
+    assert finding.suggested_edition is not None
+    assert finding.suggested_edition.release_mbid == "release-full"
+    # Displayed/persisted precision is preserved verbatim.
+    assert finding.suggested_edition.date == "2024-01-31"
+
+    # Month/day precision boundary: month-only loses to full day of same month;
+    # different known months stay chronological.
+    month_only = _suggestion_evidence(release_mbid="release-month-only")
+    month_only.score = 0.80
+    other_month = _suggestion_evidence(release_mbid="release-feb")
+    other_month.score = 0.80
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-precision-2",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            ("evidence-month-only", month_only),
+            ("evidence-feb", other_month),
+        ],
+    )
+    provider2 = _SuggestedEditionProvider(
+        {
+            "release-month-only": _tie_release(
+                "release-month-only", status="Official", date="2024-01", country="US"
+            ),
+            "release-feb": _tie_release(
+                "release-feb", status="Official", date="2024-02-14", country="US"
+            ),
+        }
+    )
+    preparation2, created2, _ = await _run_preparation(
+        store, provider2, idempotency_key="precision-month-boundary"
+    )
+    finding2 = (
+        await preparation2.findings(
+            created2.id, finding_category="exact_release_required"
+        )
+    ).items[0]
+    assert finding2.suggested_edition is not None
+    # Known January precedes known February chronologically.
+    assert finding2.suggested_edition.release_mbid == "release-month-only"
+
+
+@pytest.mark.asyncio
+async def test_invalid_or_empty_dates_sort_last_and_provider_absent_uses_evidence_date(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Provider-absent fallback uses CandidateEvidence.release_date under the
+    same policy; an invalid date on a single suggestible candidate still seals
+    without raising (nothing to compare against), precision preserved."""
+    from services.native.identity_repair_service import _edition_date_key as _key
+
+    # Unit contract: emptiness/None share the last-sort key; valid beats both.
+    assert _key("") == _key(None)
+    assert _key("1999") < _key("")
+    assert _key("2024-02") < _key("")
+
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+
+    single_valid = _suggestion_evidence(
+        release_mbid="release-valid", release_date="2021-06-01"
+    )
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-provider-absent",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[("evidence-valid", single_valid)],
+    )
+    provider = _SuggestedEditionProvider()  # canonical absent
+    preparation, created, _ = await _run_preparation(
+        store, provider, idempotency_key="provider-absent-date"
+    )
+    finding = (
+        await preparation.findings(created.id, finding_category="exact_release_required")
+    ).items[0]
+    assert finding.reason_code == "EXACT_EDITION_SUGGESTED"
+    assert finding.suggested_edition is not None
+    assert finding.suggested_edition.release_mbid == "release-valid"
+    assert finding.suggested_edition.date == "2021-06-01"  # precision preserved
+
+    # Single candidate with an INVALID date still seals (single-candidate path
+    # never ranks) and does not raise during preparation.
+    db_path2 = db_path  # same store fixture
+    single_bad = _suggestion_evidence(
+        release_mbid="release-bad", release_date="not-a-date"
+    )
+    _seed_stored_attempt(
+        store.db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-invalid-single",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[("evidence-bad", single_bad)],
+    )
+    preparation2, created2, _ = await _run_preparation(
+        store, provider, idempotency_key="invalid-single-seals"
+    )
+    finding2 = (
+        await preparation2.findings(
+            created2.id, finding_category="exact_release_required"
+        )
+    ).items[0]
+    assert finding2.reason_code == "EXACT_EDITION_SUGGESTED"
