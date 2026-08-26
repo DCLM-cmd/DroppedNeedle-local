@@ -129,6 +129,18 @@ from models.local_catalog import (
 )
 
 MAX_REVISION = 9_223_372_036_854_775_807
+
+
+def _has_surrogates(text: str) -> bool:
+    """True when the string carries surrogateescape code points (raw
+    filesystem bytes that are not valid UTF-8 - F-021)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
 _CATALOG_VALIDATION_MMAP_BYTES = 64 * 1024 * 1024
 _FOREIGN_KEY_VALIDATION_REVISION = 1
 _POST_PROCESSING_IDENTIFICATION_PRIORITY = 50
@@ -10110,40 +10122,61 @@ class NativeLibraryStore(PersistenceBase):
         discovery_generation: int = 1,
     ) -> tuple[int, int]:
         def operation(connection: sqlite3.Connection) -> tuple[int, int]:
-            connection.executemany(
-                "INSERT INTO library_scan_inventory "
-                "(run_id, root_id, relative_path, scope_relative_path, discovery_generation, absolute_path, file_size_bytes, "
-                "file_mtime_ns, stat_revision, policy_revision, effective_policy, "
-                "comparison_result, local_track_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(run_id, root_id, relative_path) DO UPDATE SET "
-                "scope_relative_path = excluded.scope_relative_path, "
-                "discovery_generation = excluded.discovery_generation, "
-                "absolute_path = excluded.absolute_path, file_size_bytes = excluded.file_size_bytes, "
-                "file_mtime_ns = excluded.file_mtime_ns, stat_revision = excluded.stat_revision, "
-                "policy_revision = excluded.policy_revision, "
-                "effective_policy = excluded.effective_policy, "
-                "comparison_result = excluded.comparison_result, "
-                "local_track_id = excluded.local_track_id, row_revision = "
-                "library_scan_inventory.row_revision + 1",
-                [
+            rows = [
+                (
+                    run_id,
+                    item.root_id,
+                    item.relative_path,
+                    item.scope_relative_path,
+                    discovery_generation,
+                    item.absolute_path,
+                    item.file_size_bytes,
+                    item.file_mtime_ns,
+                    item.stat_revision,
+                    item.policy_revision,
+                    item.effective_policy,
+                    item.comparison_result,
+                    item.local_track_id,
+                )
+                for item in items
+            ]
+            try:
+                connection.executemany(
+                    "INSERT INTO library_scan_inventory "
+                    "(run_id, root_id, relative_path, scope_relative_path, discovery_generation, absolute_path, file_size_bytes, "
+                    "file_mtime_ns, stat_revision, policy_revision, effective_policy, "
+                    "comparison_result, local_track_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(run_id, root_id, relative_path) DO UPDATE SET "
+                    "scope_relative_path = excluded.scope_relative_path, "
+                    "discovery_generation = excluded.discovery_generation, "
+                    "absolute_path = excluded.absolute_path, file_size_bytes = excluded.file_size_bytes, "
+                    "file_mtime_ns = excluded.file_mtime_ns, stat_revision = excluded.stat_revision, "
+                    "policy_revision = excluded.policy_revision, "
+                    "effective_policy = excluded.effective_policy, "
+                    "comparison_result = excluded.comparison_result, "
+                    "local_track_id = excluded.local_track_id, row_revision = "
+                    "library_scan_inventory.row_revision + 1",
+                    rows,
+                )
+            except UnicodeEncodeError as exc:
+                # F-021 defense-in-depth: the scanner skips non-UTF-8 names
+                # upstream; if one ever reaches here anyway, fail with the
+                # offending index instead of a bare UnicodeEncodeError.
+                bad = next(
                     (
-                        run_id,
-                        item.root_id,
-                        item.relative_path,
-                        item.scope_relative_path,
-                        discovery_generation,
-                        item.absolute_path,
-                        item.file_size_bytes,
-                        item.file_mtime_ns,
-                        item.stat_revision,
-                        item.policy_revision,
-                        item.effective_policy,
-                        item.comparison_result,
-                        item.local_track_id,
-                    )
-                    for item in items
-                ],
-            )
+                        index
+                        for index, row in enumerate(rows)
+                        if any(
+                            isinstance(value, str)
+                            and _has_surrogates(value)
+                            for value in row
+                        )
+                    ),
+                    None,
+                )
+                raise ValueError(
+                    f"Scan inventory row {bad} for run {run_id} is not valid UTF-8 TEXT."
+                ) from exc
             if items:
                 connection.execute(
                     "UPDATE library_scan_run_scopes SET discovered_count = discovered_count + ?, "

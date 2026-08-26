@@ -120,7 +120,18 @@ async def test_walk_excludes_escaping_symlinks_and_non_audio_entries(
         "escaping symlinks, symlinked directories, and non-audio files must "
         "never enter inventory"
     )
-    assert store.failures == []
+    # F-020: escape-out links leave an audit row keyed by their own
+    # walk-relative name instead of being dropped silently.
+    assert len(store.failures) == 1
+    records = store.failures[0]
+    assert [
+        (record.failure_code, record.relative_path, record.phase)
+        for record in records
+    ] == [("SYMLINK_ESCAPE_OUT", "escape-link.flac", "discovering")]
+    assert all(
+        record.failure_detail.startswith("A symbolic link resolves outside")
+        for record in records
+    )
 
 
 class SimpleNamespace_resolve:

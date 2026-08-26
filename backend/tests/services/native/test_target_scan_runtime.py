@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1114,19 +1115,26 @@ async def test_walk_oserror_logs_path_and_records_failure_row(
             AsyncMock(return_value=True),
         )
 
-    assert completed is False
-    assert failure_code == "ROOT_PERMISSION_DENIED"
+    # F-022: an unreadable root no longer aborts discovery wholesale - the
+    # walk degrades, records the failure row, and reports completion so the
+    # inventory that DID land proceeds to indexing.
+    assert failure_code == "WALK_EACCES"
     records = store.record_scan_failures.await_args.args[1]
     assert [
         (record.failure_code, record.relative_path, record.phase)
         for record in records
     ] == [("WALK_EACCES", "secret", "discovering")]
+    # F-032: discovery rows meet the indexing-phase NEW-SCAN-04 detail
+    # standard - exception CLASS plus errno, never str(error) or host paths.
+    assert records[0].failure_detail == (
+        "PermissionError (errno=EACCES) while walking."
+    )
     store.complete_scan_scope_discovery.assert_awaited_once_with(
         "run-1",
         "root",
         ".",
         state="partially_read",
-        error_code="ROOT_PERMISSION_DENIED",
+        error_code="WALK_EACCES",
     )
     assert "event=walk_error" in caplog.text
     assert "secret" in caplog.text
@@ -1403,7 +1411,10 @@ async def test_repeated_stalled_walkers_all_tracked_and_warned(
     resolver = SimpleNamespace(resolve=lambda _path: None)
     checkpoint = AsyncMock(return_value=True)
 
-    for ordinal in range(5):
+    # F-024: the first 4 wedged walkers are detached and tracked; the 5th
+    # exceeds the cap - it is refused, counted as leaked, and fails the run
+    # with a dedicated code instead of being tracked silently.
+    for ordinal in range(4):
         store.record_scan_failures.reset_mock()
         store.complete_scan_scope_discovery.reset_mock()
         with caplog.at_level(logging.WARNING, logger="services.native.library_inventory_scanner"):
@@ -1412,16 +1423,38 @@ async def test_repeated_stalled_walkers_all_tracked_and_warned(
             )
         assert completed is False
         assert failure_code == "WALK_TIMEOUT"
-    # All 5 must be tracked, not silently dropped; 5th exceeds cap and warns
-    assert len(scanner._detached_walkers) == 5
+    assert len(scanner._detached_walkers) == 4
+
+    store.record_scan_failures.reset_mock()
+    store.complete_scan_scope_discovery.reset_mock()
+    with caplog.at_level(logging.WARNING, logger="services.native.library_inventory_scanner"):
+        _updated, completed, failure_code = await scanner._walk_scope(
+            _scan_run("run-overflow"), scope, root, root, resolver, checkpoint
+        )
+    assert completed is False
+    assert failure_code == "WALKER_UNAVAILABLE"
+    assert len(scanner._detached_walkers) == 4
+    assert scanner.leaked_walker_count == 1
+    records = store.record_scan_failures.await_args.args[1]
+    assert [record.failure_code for record in records] == ["WALKER_UNAVAILABLE"]
+    store.complete_scan_scope_discovery.assert_awaited_with(
+        "run-overflow",
+        "root",
+        ".",
+        state="partially_read",
+        error_code="WALKER_UNAVAILABLE",
+    )
     assert "detached_walker_cap_exceeded" in caplog.text
 
+    # Releasing the events lets the four detached producers drain.
     for ev in events:
         ev.set()
     deadline = time.monotonic() + 2.0
     while scanner._detached_walkers and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
     assert not scanner._detached_walkers
+
+
 @pytest.mark.asyncio
 async def test_probe_does_not_block_default_executor(
     tmp_path: Path,
@@ -1457,7 +1490,10 @@ async def test_probe_does_not_block_default_executor(
         )
         assert store.transition_scan_run.await_args is not None
         assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
-        assert scanner.probe_pending_count == 1
+        # F-023: the abandoned probe future is tombstoned on timeout, so the
+        # slot recovers immediately instead of staying occupied forever.
+        assert scanner.probe_pending_count == 0
+        assert scanner.wedged_probe_count == 1
         assert probe_thread and "library-probe" in probe_thread[0]
         marker_done = False
 
@@ -1483,18 +1519,22 @@ async def test_probe_does_not_block_default_executor(
         default_executor.shutdown(wait=True)
         wedged.set()
 
-
 @pytest.mark.asyncio
-async def test_repeated_probe_timeouts_bounded_and_cap_refusal(
+async def test_repeated_probe_timeouts_recover_the_slot_each_run(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """F-023: a wedged probe no longer occupies the slot forever. Every run
+    attempts a fresh probe (bounded by its own deadline) instead of
+    fast-failing on capacity until restart; each timeout tombstones its
+    future so pending drains to zero immediately."""
     root = tmp_path / "music"
     root.mkdir()
-    wedged = threading.Event()
+    release: list[threading.Event] = []
 
     def probe(_path: Path) -> bool:
-        wedged.wait(timeout=5.0)
+        ev = threading.Event()
+        release.append(ev)
+        ev.wait(timeout=5.0)
         return True
 
     store = AsyncMock()
@@ -1513,38 +1553,134 @@ async def test_repeated_probe_timeouts_bounded_and_cap_refusal(
     await scanner.discover(run1, [scope], {scope.root_id: root}, resolver, checkpoint)
     assert store.transition_scan_run.await_args is not None
     assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
-    assert scanner.probe_pending_count == 1
+    assert scanner.probe_pending_count == 0
+    assert scanner.wedged_probe_count == 1
     store.transition_scan_run.reset_mock()
-    store.record_scan_failures.reset_mock()
-    store.complete_scan_scope_discovery.reset_mock()
 
-    with caplog.at_level(logging.WARNING, logger="services.native.library_inventory_scanner"):
-        start = time.monotonic()
-        run2 = _scan_run("run-2")
-        await scanner.discover(run2, [scope], {scope.root_id: root}, resolver, checkpoint)
-        elapsed2 = time.monotonic() - start
-        assert store.transition_scan_run.await_args is not None
-        assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
-        assert elapsed2 < 0.4
-        assert scanner.probe_pending_count == 1
-        assert "probe_capacity_exceeded" in caplog.text
-        caplog.clear()
-        store.transition_scan_run.reset_mock()
-        store.record_scan_failures.reset_mock()
-        store.complete_scan_scope_discovery.reset_mock()
-        run3 = _scan_run("run-3")
-        await scanner.discover(run3, [scope], {scope.root_id: root}, resolver, checkpoint)
-        assert store.transition_scan_run.await_args is not None
-        assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
-        assert scanner.probe_pending_count == 1
+    run2 = _scan_run("run-2")
+    start = time.monotonic()
+    await scanner.discover(run2, [scope], {scope.root_id: root}, resolver, checkpoint)
+    elapsed2 = time.monotonic() - start
+    # The slot was recovered, so run2 attempted a real probe and paid one
+    # bounded deadline instead of failing instantly with the stale refusal.
+    assert store.transition_scan_run.await_args is not None
+    assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+    assert elapsed2 < 2.0
+    assert scanner.probe_pending_count == 0
+    assert scanner.wedged_probe_count == 2
 
-    assert scanner.probe_pending_count == 1
-    wedged.set()
+    for ev in release:
+        ev.set()
     deadline = time.monotonic() + 2.0
     while scanner.probe_pending_count and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
-    assert scanner.probe_pending_count == 0
     scanner.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_capacity_refusal_reports_unavailable_and_retry_recovers(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F-023: capacity refusal gets its own PROBE_UNAVAILABLE code and detail,
+    plus ONE bounded retry - when the wedged probe finishes during the wait,
+    the same scope proceeds instead of failing the run."""
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "healthy.flac").write_bytes(b"x")
+    wedged = threading.Event()
+
+    def probe(_path: Path) -> bool:
+        wedged.wait(timeout=5.0)
+        return True
+
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    store.classify_scan_paths.return_value = {"healthy.flac": ("new", None)}
+    store.add_scan_inventory_batch.return_value = (1, 1)
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=os.walk,
+        directory_probe=probe,
+        walk_deadline_seconds=0.05,
+        probe_executor_max_workers=1,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1", resolve=lambda _p: SimpleNamespace(policy="automatic"))
+    checkpoint = AsyncMock(return_value=True)
+
+    blocker = asyncio.get_running_loop().create_future()
+    scanner._pending_probes.add(blocker)
+
+    async def release_during_retry() -> None:
+        await asyncio.sleep(0.02)
+        wedged.set()
+        # Mirror the scanner-created futures' on-done discard: without a
+        # callback, completing the blocker leaves the slot occupied.
+        blocker.set_result(True)
+        scanner._pending_probes.discard(blocker)
+
+    asyncio.create_task(release_during_retry())
+
+    with caplog.at_level(logging.WARNING, logger="services.native.library_inventory_scanner"):
+        result = await scanner.discover(
+            _scan_run("run-retry"),
+            [scope],
+            {scope.root_id: root},
+            resolver,
+            checkpoint,
+        )
+
+    # The retry recovered the slot: no wholesale failure was recorded.
+    assert "probe_capacity_exceeded" in caplog.text
+    assert store.transition_scan_run.await_args is None or (
+        store.transition_scan_run.await_args.kwargs.get("terminal_code")
+        != "PROBE_UNAVAILABLE"
+    )
+    scanner.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_probe_wedge_fails_with_probe_unavailable(
+    tmp_path: Path,
+) -> None:
+    """F-023: when the retry also hits a still-occupied slot, the run fails
+    with the dedicated PROBE_UNAVAILABLE code and honest detail text."""
+    root = tmp_path / "music"
+    root.mkdir()
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=os.walk,
+        walk_deadline_seconds=0.05,
+        probe_executor_max_workers=1,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(settings=SimpleNamespace(enabled=True), policy_revision="policy-1")
+
+    blocker = asyncio.get_running_loop().create_future()
+    scanner._pending_probes.add(blocker)
+
+    await scanner.discover(
+        _scan_run("run-refused"),
+        [scope],
+        {scope.root_id: root},
+        resolver,
+        AsyncMock(return_value=True),
+    )
+
+    assert store.transition_scan_run.await_args is not None
+    assert (
+        store.transition_scan_run.await_args.kwargs["terminal_code"]
+        == "PROBE_UNAVAILABLE"
+    )
+    records = store.record_scan_failures.await_args.args[1]
+    assert records[0].failure_code == "PROBE_UNAVAILABLE"
+    assert "A previous root probe never completed" in records[0].failure_detail
+    scanner.close()
+
+
 
 
 @pytest.mark.asyncio
@@ -1569,10 +1705,11 @@ async def test_probe_pending_drains_after_release_and_close_twice(
     await scanner.discover(_scan_run(), [scope], {scope.root_id: root}, resolver, AsyncMock(return_value=True))
     assert store.transition_scan_run.await_args is not None
     assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
-    assert scanner.probe_pending_count == 1
+    # F-023: the timeout tombstoned the future, so the slot already recovered.
+    assert scanner.probe_pending_count == 0
     scanner.close()
     scanner.close()
-    # Close is explicit shutdown: cancels pending futures immediately, does not wait for daemon thread
+    # Close is explicit shutdown and stays idempotent after the recovery.
     assert scanner.probe_pending_count == 0
     wedged.set()
     deadline = time.monotonic() + 2.0
@@ -1650,7 +1787,8 @@ async def test_scanner_smoke_delayed_probe_then_normal_scan_and_to_thread(
     await scanner.discover(_scan_run("run-1"), [scope], {scope.root_id: root}, resolver, AsyncMock(return_value=True))
     assert store.transition_scan_run.await_args is not None
     assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
-    assert scanner.probe_pending_count == 1
+    # F-023: slot recovered immediately after the timeout tombstone.
+    assert scanner.probe_pending_count == 0
     await asyncio.wait_for(asyncio.to_thread(lambda: 42), timeout=0.5)
     wedged.set()
     deadline = time.monotonic() + 2.0
@@ -1722,8 +1860,8 @@ async def test_concurrent_probe_submissions_atomic_never_exceeds_cap(
     assert store.transition_scan_run.await_count == 2
     for call in store.transition_scan_run.await_args_list:
         assert call.kwargs["terminal_code"] == "WALK_TIMEOUT"
-    assert scanner.probe_pending_count == 1
-    wedged.set()
+    # F-023: both timeout tombstones recovered the slot - nothing stays pending.
+    assert scanner.probe_pending_count == 0
     deadline = time.monotonic() + 2.0
     while scanner.probe_pending_count and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
@@ -1885,19 +2023,18 @@ async def test_probe_loop_closed_does_not_set_future_from_worker_thread(
         # Loop closed simulation should not have called set_result from worker thread; future remains pending until timeout
         assert store.transition_scan_run.await_args is not None
         assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
-        assert scanner.probe_pending_count == 1
+        # F-023: the timeout tombstones the future even when call_soon_threadsafe
+        # is broken - the in-loop fallback cancel recovers the slot immediately.
+        assert scanner.probe_pending_count == 0
         # No raw path in debug log
         for record in caplog.records:
             assert str(root) not in record.getMessage()
     finally:
         loop.call_soon_threadsafe = original_call  # type: ignore[method-assign]
-        # Pending future is still in set (since we returned without setting); close must clear without thread-unsafe set
-        assert scanner.probe_pending_count == 1
+        # Slot already recovered by the tombstone; close stays a no-op here.
+        assert scanner.probe_pending_count == 0
         scanner.close()
         assert scanner.probe_pending_count == 0
-        # Loop is still running, future was cancelled via close, not set from worker
-
-
 
 
 

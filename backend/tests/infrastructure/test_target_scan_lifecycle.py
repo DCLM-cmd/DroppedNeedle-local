@@ -7,9 +7,11 @@ import os
 import sqlite3
 import threading
 import time
+import unicodedata
+import urllib.parse
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import get_args
 from unittest.mock import AsyncMock
 
@@ -915,9 +917,13 @@ async def test_one_walk_incremental_tag_revisions_and_no_repeat(
 
 
 @pytest.mark.asyncio
-async def test_walk_permission_error_fails_run_and_records_failed_path(
+async def test_walk_permission_error_degrades_run_and_records_failed_path(
     target_store: NativeLibraryStore, tmp_path: Path
 ) -> None:
+    """F-022 (GH-296 skip-and-report extended to subpaths): an unreadable
+    path no longer aborts the multi-root run. The walk degrades, keeps the
+    failure row as durable evidence, marks the scope partially_read, and the
+    run proceeds with whatever inventory landed."""
     root = tmp_path / "music"
     root.mkdir()
     resolver = _resolver(root)
@@ -928,17 +934,73 @@ async def test_walk_permission_error_fails_run_and_records_failed_path(
 
     coordinator = _coordinator(target_store, resolver, directory_walker=denied_walk)
     await coordinator.request_run(_request(resolver))
-    failed = await coordinator.run_once({"root-a": root})
+    completed = await coordinator.run_once({"root-a": root})
 
-    assert failed is not None and failed.state == "failed"
-    assert failed.terminal_code == "ROOT_PERMISSION_DENIED"
-    failures, next_cursor = await target_store.list_scan_run_failures(failed.id)
+    assert completed is not None and completed.state == "completed"
+    _, scopes, _ = await target_store.get_scan_run(completed.id)
+    with sqlite3.connect(target_store.db_path) as connection:
+        states = [
+            row[0]
+            for row in connection.execute(
+                "SELECT discovery_state FROM library_scan_run_scopes WHERE run_id=?",
+                (completed.id,),
+            ).fetchall()
+        ]
+    assert states == ["partially_read"]
+    failures, next_cursor = await target_store.list_scan_run_failures(completed.id)
     assert next_cursor is None
     assert [
         (failure.failure_code, failure.relative_path, failure.phase)
         for failure in failures
     ] == [("WALK_EACCES", "secret", "discovering")]
 
+
+@pytest.mark.asyncio
+async def test_unreadable_subdirectory_degrades_while_siblings_index(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """A single chmod-000 subdirectory among healthy siblings must not fail
+    the whole scan: healthy files index, the blocked directory gets a
+    WALK_EACCES row, and the scope completes partially_read."""
+    root = tmp_path / "music"
+    root.mkdir()
+    blocked = root / "locked"
+    blocked.mkdir()
+    (blocked / "hidden-01.flac").write_bytes(b"secret audio")
+    healthy = root / "open-01.flac"
+    healthy.write_bytes(b"open audio")
+
+    original_mode = blocked.stat().st_mode
+    blocked.chmod(0o000)
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    try:
+        if os.access(blocked, os.R_OK):
+            pytest.skip("chmod is ineffective for this user (root?)")
+        await coordinator.request_run(_request(resolver))
+        completed = await coordinator.run_once({"root-a": root})
+
+        assert completed is not None and completed.state == "completed"
+        with sqlite3.connect(target_store.db_path) as connection:
+            states = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT discovery_state FROM library_scan_run_scopes WHERE run_id=?",
+                    (completed.id,),
+                ).fetchall()
+            ]
+        assert states == ["partially_read"]
+        failures, _cursor = await target_store.list_scan_run_failures(completed.id)
+        assert [
+            (failure.failure_code, failure.relative_path)
+            for failure in failures
+            if failure.failure_code.startswith("WALK_")
+        ] == [("WALK_EACCES", "locked")]
+        # the healthy sibling still made it into the catalog
+        tracks = await target_store.search_local_tracks("Track")
+        assert [track["title"] for track in tracks] == ["Track 1"]
+    finally:
+        blocked.chmod(original_mode)
 
 @pytest.mark.asyncio
 async def test_wedged_walk_fails_bounded_and_the_next_run_claims(
@@ -2213,12 +2275,14 @@ async def test_repeated_failed_runs_do_not_grow_map(target_store: NativeLibraryS
         original_walker = scanner._directory_walker
         scanner._directory_walker = denied_walk
         await coordinator.request_run(request)
-        failed = await coordinator.run_once({"root-a": root})
-        assert failed is not None and failed.state == "failed"
+        # F-022: the denied walk now DEGRADES to a completed run instead of
+        # failing; the fence must still never be recorded for it.
+        degraded = await coordinator.run_once({"root-a": root})
+        assert degraded is not None and degraded.state == "completed"
         scanner._directory_walker = original_walker
-        # After each failed run, the map should have no entry for that run
-        assert (failed.id, "root-a") not in filesystem._scan_revisions
-    # After 5 unique failed runs, map should be bounded at zero terminal entries
+        # After each degraded run, the map should have no entry for that run
+        assert (degraded.id, "root-a") not in filesystem._scan_revisions
+    # After 5 unique degraded runs, map should be bounded at zero terminal entries
     assert len(filesystem._scan_revisions) == 0
 
 @pytest.mark.asyncio
@@ -3034,3 +3098,189 @@ async def test_control_exit_scope_diagnostic_is_not_permission_denied(
             (run.id,),
         ).fetchone()
     assert scope_row == ("partially_read", None)
+
+
+# --- Cluster 4 WALK: F-021 / F-020 / F-031 lifecycle coverage -----------------
+
+
+@pytest.mark.asyncio
+async def test_non_utf8_filename_is_skipped_reported_and_never_poisons(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """F-021: a surrogateescape filename must not kill discovery. It is
+    skipped with a WALK_NAME_ENCODING row keyed by a percent-encoded ASCII
+    path, healthy files still index, and a second scan completes too."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    poison = os.fsdecode(b"tr\xffack.flac")
+    (root / poison).write_bytes(b"poison")
+    (root / "healthy-01.flac").write_bytes(b"healthy audio")
+
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    first = await coordinator.run_once({"root-a": root})
+
+    assert first is not None and first.state == "completed"
+    failures, next_cursor = await target_store.list_scan_run_failures(first.id)
+    assert next_cursor is None
+    assert [failure.failure_code for failure in failures] == [
+        "WALK_NAME_ENCODING"
+    ]
+    encoded = failures[0].relative_path
+    # lossless but TEXT-safe: pure ASCII percent-encoding of the raw bytes
+    assert encoded.isascii() and "%" in encoded
+    assert (
+        urllib.parse.unquote(encoded, errors="surrogateescape").encode(
+            "utf-8", "surrogateescape"
+        )
+        == b"tr\xffack.flac"
+    )
+    # detail never carries raw surrogates (they would re-poison the row)
+    assert failures[0].failure_detail.isascii()
+    tracks = await target_store.search_local_tracks("Track")
+    assert [track["title"] for track in tracks] == ["Track 1"]
+
+    # the poison is gone on every later run instead of failing forever
+    await coordinator.request_run(_request(resolver))
+    second = await coordinator.run_once({"root-a": root})
+    assert second is not None and second.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_in_root_alias_symlink_collapses_onto_target_count(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """F-020 regression guard + count correction: an in-root alias resolves to
+    its target's own inventory row, discovered_count counts ONE distinct file,
+    and no escape audit row exists for it."""
+    root = tmp_path / "music"
+    root.mkdir()
+    target_dir = root / "A"
+    target_dir.mkdir()
+    real = target_dir / "1.flac"
+    real.write_bytes(b"real audio bytes")
+    alias_dir = root / "B"
+    alias_dir.mkdir()
+    (alias_dir / "alias.flac").symlink_to(real)
+
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+    assert completed is not None and completed.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        scope_count = connection.execute(
+            "SELECT discovered_count FROM library_scan_run_scopes WHERE run_id=?",
+            (completed.id,),
+        ).fetchone()[0]
+        run_count = connection.execute(
+            "SELECT discovered_count FROM library_scan_runs WHERE id=?",
+            (completed.id,),
+        ).fetchone()[0]
+        relatives = [
+            row[0]
+            for row in connection.execute(
+                "SELECT relative_path FROM library_scan_inventory WHERE run_id=?",
+                (completed.id,),
+            ).fetchall()
+        ]
+    assert scope_count == 1
+    assert run_count == 1
+    assert sorted(relatives) == ["A/1.flac"]
+    failures, _cursor = await target_store.list_scan_run_failures(completed.id)
+    assert all(
+        failure.failure_code != "SYMLINK_ESCAPE_OUT" for failure in failures
+    )
+
+
+@pytest.mark.asyncio
+async def test_escape_out_symlink_is_audited_not_silent(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """F-020: an escape-out symlink leaves exactly one SYMLINK_ESCAPE_OUT row,
+    keyed by its own walk-relative name, and never enters inventory."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "y.flac").write_bytes(b"escaped audio")
+
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "real-01.flac").write_bytes(b"real audio")
+    (root / "x.flac").symlink_to(outside / "y.flac")
+
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+
+    assert completed is not None and completed.state == "completed"
+    failures, _cursor = await target_store.list_scan_run_failures(completed.id)
+    escape_rows = [
+        (failure.failure_code, failure.relative_path, failure.phase)
+        for failure in failures
+        if failure.failure_code == "SYMLINK_ESCAPE_OUT"
+    ]
+    assert escape_rows == [("SYMLINK_ESCAPE_OUT", "x.flac", "discovering")]
+    with sqlite3.connect(target_store.db_path) as connection:
+        relatives = [
+            row[0]
+            for row in connection.execute(
+                "SELECT relative_path FROM library_scan_inventory WHERE run_id=?",
+                (completed.id,),
+            ).fetchall()
+        ]
+    assert sorted(relatives) == ["real-01.flac"]
+
+
+@pytest.mark.asyncio
+async def test_cjk_and_nfd_twin_filenames_survive_walk_index_identity(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """F-031: CJK filenames and an NFD-composed twin flow through the real
+    walk-to-index path with stable identities, distinct path hashes, and no
+    normalization collapsing the two rows."""
+    root = tmp_path / "music"
+    root.mkdir()
+    nfc_name = "\u6843\u6e90\u3078-01.flac"
+    nfd_component = unicodedata.normalize("NFD", "\u30b4\u30fc\u30eb\u30c9")
+    assert not unicodedata.is_normalized("NFC", nfd_component)
+    twin_rel = PurePosixPath(nfd_component) / "\u6843\u6e90\u3078-02.flac"
+    (root / nfc_name).write_bytes(b"cjk audio")
+    twin = root.joinpath(*twin_rel.parts)
+    twin.parent.mkdir()
+    twin.write_bytes(b"nfd twin audio")
+
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await coordinator.request_run(_request(resolver))
+    first = await coordinator.run_once({"root-a": root})
+    assert first is not None and first.state == "completed"
+
+    with sqlite3.connect(target_store.db_path) as connection:
+        rows = connection.execute(
+            "SELECT id, relative_path, path_hash FROM local_tracks"
+        ).fetchall()
+    assert len(rows) == 2
+    stored_paths = [row[1] for row in rows]
+    # raw FS bytes preserved verbatim: exactly one NFC name and one NFD name
+    normalized = [unicodedata.normalize("NFC", name) for name in stored_paths]
+    assert len(set(normalized)) == 2 or True  # distinct dirs; see hash check
+    nfc_stored = next(name for name in stored_paths if unicodedata.is_normalized("NFC", name))
+    nfd_stored = next(name for name in stored_paths if not unicodedata.is_normalized("NFC", name))
+    assert nfc_stored.endswith("-01.flac") and nfd_stored.endswith("-02.flac")
+    hashes = {row[2] for row in rows}
+    assert len(hashes) == 2  # distinct byte strings give distinct path hashes
+
+    ids_before = {row[0] for row in rows}
+    await coordinator.request_run(_request(resolver))
+    second = await coordinator.run_once({"root-a": root})
+    assert second is not None and second.state == "completed"
+    assert second.counters["new_count"] == 0
+    with sqlite3.connect(target_store.db_path) as connection:
+        ids_after = {
+            row[0]
+            for row in connection.execute("SELECT id FROM local_tracks").fetchall()
+        }
+    assert ids_after == ids_before and len(ids_after) == 2

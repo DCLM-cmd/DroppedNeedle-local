@@ -9,8 +9,8 @@ import threading
 import time
 import logging
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
+from urllib.parse import quote_from_bytes
 
 import msgspec
 
@@ -38,13 +38,18 @@ DirectoryProbe = Callable[[Path], bool]
 logger = logging.getLogger(__name__)
 
 
-@contextmanager
-def _uncoordinated_read() -> Iterator[None]:
-    yield
-
-
 class _WalkHeartbeat:
-    """Thread-safe liveness signal written by the walk producer thread."""
+    """Thread-safe liveness signal written by the walk producer thread.
+
+    Deadline semantics (F-025): the consumer fires WALK_TIMEOUT only when NO
+    progress signal has arrived for ``walk_deadline_seconds`` - where progress
+    means either a directory yield or an inventory item delivered to the
+    queue. A single huge directory whose cold listing takes longer than the
+    deadline produces no observable progress and can still false-positive;
+    that tradeoff is accepted for hashless scans (see F-029's boundary note)
+    and is contained by F-024's loud walker-cap refusal instead of silent
+    thread leaks.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -85,23 +90,52 @@ class LibraryInventoryScanner:
         self._probe_lock = threading.Lock()
         self._pending_probes: set[asyncio.Future[bool]] = set()
         self._closed = False
+        # F-024: monotonic count of walkers that wedged beyond the detach cap;
+        # unlike the in-flight set this never shrinks, so repeated leaks stay
+        # observable for the life of the process.
+        self._leaked_walkers = 0
+        # F-023: probes abandoned past their deadline; each one means a stat
+        # is still blocked somewhere on the filesystem.
+        self._wedged_probes = 0
         self._clock = clock
+
+    @property
+    def wedged_probe_count(self) -> int:
+        return self._wedged_probes
+
+    @property
+    def leaked_walker_count(self) -> int:
+        return self._leaked_walkers
+
     def _finish_detached_walker(self, task: asyncio.Task[None]) -> None:
         self._detached_walkers.discard(task)
         if not task.cancelled():
             task.exception()
 
-    def _detach_walker(self, task: asyncio.Task[None]) -> None:
+    def _detach_walker(self, task: asyncio.Task[None]) -> bool:
+        """Detach a wedged producer so it cannot wedge the scan worker.
+
+        F-024: the cap is ENFORCED - beyond ``max_detached_walkers`` in-flight
+        wedged walkers the task is refused (and counted as leaked) instead of
+        being tracked silently; the caller fails the run with
+        WALKER_UNAVAILABLE, mirroring the tag-read capacity contract.
+        """
         if task.done():
-            return
+            return True
         if len(self._detached_walkers) >= self._max_detached_walkers:
+            self._leaked_walkers += 1
             logger.warning(
-                "library_scan event=detached_walker_cap_exceeded count=%s max=%s",
+                "library_scan event=detached_walker_cap_exceeded count=%s max=%s "
+                "leaked_total=%s",
                 len(self._detached_walkers) + 1,
                 self._max_detached_walkers,
+                self._leaked_walkers,
             )
+            return False
         self._detached_walkers.add(task)
         task.add_done_callback(self._finish_detached_walker)
+        return True
+
     def _remove_pending_probe(self, fut: asyncio.Future[bool]) -> None:
         with self._probe_lock:
             self._pending_probes.discard(fut)
@@ -161,11 +195,38 @@ class LibraryInventoryScanner:
         )
 
     @staticmethod
+    def _text_safe_posix(path: Path) -> str:
+        """POSIX text for a path that is always bindable as SQLite TEXT
+        (F-021 / NEW-SCAN-04): names that are not valid UTF-8 arrive here as
+        surrogateescape strings and would re-poison any failure-row insert,
+        so their raw bytes are losslessly percent-encoded instead."""
+        text = PurePosixPath(*path.parts).as_posix()
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            return quote_from_bytes(os.fsencode(path), safe="/")
+        return text
+
+    @staticmethod
     def _relativize(path: Path, root: Path) -> str:
         try:
-            return PurePosixPath(*path.relative_to(root).parts).as_posix()
+            relative = path.relative_to(root)
         except ValueError:
-            return path.as_posix()
+            relative = path
+        return LibraryInventoryScanner._text_safe_posix(relative)
+
+    @staticmethod
+    def _walk_failure_detail(exc: BaseException) -> str:
+        """Class-name-plus-errno detail; never str(error) or filesystem paths
+        (F-032, consistent with the indexing-phase NEW-SCAN-04 standard)."""
+        if isinstance(exc, OSError):
+            code = (
+                errno.errorcode.get(exc.errno, "EUNKNOWN")
+                if exc.errno is not None
+                else "EUNKNOWN"
+            )
+            return f"{type(exc).__name__} (errno={code}) while walking."
+        return f"{type(exc).__name__} while walking."
 
     @staticmethod
     def _failure_relative_path(
@@ -287,32 +348,63 @@ class LibraryInventoryScanner:
                     run.id,
                     scope.root_id,
                 )
-                await self._record_failure(
-                    run.id,
-                    scope,
-                    relative_path=scope.relative_path,
-                    failure_code="WALK_TIMEOUT",
-                    failure_detail=(
-                        "The library root probe exceeded "
-                        f"{self._walk_deadline_seconds:.1f}s."
-                    ),
-                )
-                await self._store.complete_scan_scope_discovery(
-                    run.id,
-                    scope.root_id,
-                    scope.relative_path,
-                    state="unavailable",
-                    error_code="WALK_TIMEOUT",
-                )
-                return await self._store.transition_scan_run(
-                    run.id,
-                    expected_state=current.state,
-                    expected_revision=current.row_revision,
-                    new_state="failed",
-                    now=self._clock(),
-                    terminal_code="WALK_TIMEOUT",
-                )
-            assert probe_future is not None
+                # F-023: distinguish a wedged previous probe (slot occupied)
+                # from this root's own timeout, and give the wedged stat ONE
+                # bounded deadline to finish before failing the run.
+                await asyncio.sleep(self._walk_deadline_seconds)
+                with self._probe_lock:
+                    recovered = (
+                        not self._closed
+                        and len(self._pending_probes) < self._probe_max_workers
+                    )
+                if recovered:
+                    logger.info(
+                        "library_scan event=probe_slot_recovered run_id=%s root_id=%s",
+                        run.id,
+                        scope.root_id,
+                    )
+                    should_fail_capacity = False
+                    probe_future = None
+                else:
+                    await self._record_failure(
+                        run.id,
+                        scope,
+                        relative_path=scope.relative_path,
+                        failure_code="PROBE_UNAVAILABLE",
+                        failure_detail=(
+                            "A previous root probe never completed; scanning is "
+                            "paused until the filesystem responds or the service "
+                            "restarts."
+                        ),
+                    )
+                    await self._store.complete_scan_scope_discovery(
+                        run.id,
+                        scope.root_id,
+                        scope.relative_path,
+                        state="unavailable",
+                        error_code="PROBE_UNAVAILABLE",
+                    )
+                    return await self._store.transition_scan_run(
+                        run.id,
+                        expected_state=current.state,
+                        expected_revision=current.row_revision,
+                        new_state="failed",
+                        now=self._clock(),
+                        terminal_code="PROBE_UNAVAILABLE",
+                    )
+
+            assert probe_future is None or not should_fail_capacity
+
+            if probe_future is None:
+                # F-023 retry path: the wedged slot freed up, so start a fresh
+                # probe for this scope instead of failing the run.
+                probe_future = loop.create_future()
+
+                def _on_retry_done(f: asyncio.Future[bool]) -> None:
+                    with self._probe_lock:
+                        self._pending_probes.discard(f)
+
+                probe_future.add_done_callback(_on_retry_done)
 
             def _probe_runner() -> None:
                 try:
@@ -350,6 +442,16 @@ class LibraryInventoryScanner:
                     timeout=self._walk_deadline_seconds,
                 )
             except TimeoutError:
+                # F-023: the shielded inner future is abandoned uncancelled by
+                # wait_for; tombstone it (cancel on the loop thread - the late
+                # _complete re-checks done()) so the slot is recovered instead
+                # of staying occupied for the process lifetime.
+                self._wedged_probes += 1
+                try:
+                    loop.call_soon_threadsafe(probe_future.cancel)
+                except RuntimeError:
+                    probe_future.cancel()
+                self._remove_pending_probe(probe_future)
                 logger.warning(
                     "library_scan event=walk_timeout run_id=%s root_id=%s path=%s",
                     run.id,
@@ -420,7 +522,10 @@ class LibraryInventoryScanner:
                     scope,
                     relative_path=scope.relative_path,
                     failure_code="ROOT_UNAVAILABLE",
-                    failure_detail=f"The library root path is missing: {selected}",
+                    failure_detail=(
+                        "The library root path is missing: "
+                        f"{scope.relative_path}"
+                    ),
                 )
                 await self._store.complete_scan_scope_discovery(
                     run.id,
@@ -433,6 +538,8 @@ class LibraryInventoryScanner:
                 # remaining scopes instead of failing the whole run.
                 unavailable_scopes += 1
                 continue
+            restarts = 0
+            superseded_scope = False
             while True:
                 discovery_generation = (
                     await self._store.get_scan_scope_discovery_generation(
@@ -457,7 +564,29 @@ class LibraryInventoryScanner:
                     break
                 async with self._filesystem.read(scope.root_id):
                     if self._filesystem.revision(scope.root_id) == filesystem_revision:
-                        self._filesystem.record_scan_revision(run.id, scope.root_id)
+                        # F-022/F-030: only a CLEAN, un-degraded walk records
+                        # the fence - a partially-read scope keeps the
+                        # reconciler conservative (allow_missing stays false).
+                        if walk_failure_code is None and not superseded_scope:
+                            self._filesystem.record_scan_revision(
+                                run.id, scope.root_id
+                            )
+                        break
+                    restarts += 1
+                    if restarts >= 3:
+                        # F-030: sustained concurrent publication would
+                        # otherwise re-walk this scope forever; stop after the
+                        # bound and complete honestly - the follow-up request
+                        # machinery requeues what the last generation missed.
+                        logger.warning(
+                            "library_scan event=walk_superseded run_id=%s "
+                            "root_id=%s path=%s restarts=%d",
+                            run.id,
+                            scope.root_id,
+                            scope.relative_path,
+                            restarts,
+                        )
+                        superseded_scope = True
                         break
                     await self._store.restart_scan_scope_discovery(
                         run.id, scope.root_id, scope.relative_path
@@ -476,13 +605,35 @@ class LibraryInventoryScanner:
                         terminal_code=walk_failure_code or "ROOT_PERMISSION_DENIED",
                     )
                 return current
-            await self._store.complete_scan_scope_discovery(
-                run.id,
-                scope.root_id,
-                scope.relative_path,
-                state="completed",
-                error_code=None,
-            )
+            if superseded_scope:
+                # F-030: honest partially-read completion for the capped scope;
+                # inventory from the last completed generation stays durable.
+                await self._store.complete_scan_scope_discovery(
+                    run.id,
+                    scope.root_id,
+                    scope.relative_path,
+                    state="partially_read",
+                    error_code="WALK_SUPERSEDED",
+                )
+            elif walk_failure_code:
+                # F-022: the walk degraded on unreadable paths - keep the
+                # honest partially_read completion instead of overriding it
+                # with a clean completed.
+                await self._store.complete_scan_scope_discovery(
+                    run.id,
+                    scope.root_id,
+                    scope.relative_path,
+                    state="partially_read",
+                    error_code=walk_failure_code,
+                )
+            else:
+                await self._store.complete_scan_scope_discovery(
+                    run.id,
+                    scope.root_id,
+                    scope.relative_path,
+                    state="completed",
+                    error_code=None,
+                )
         if unavailable_scopes and unavailable_scopes == len(scopes):
             # GH-296: every scope proved unreachable, so the run terminates
             # honestly as failed instead of completing silently green.
@@ -512,18 +663,23 @@ class LibraryInventoryScanner:
         discovery_generation: int = 1,
     ) -> tuple[ScanRun, bool, str | None]:
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[tuple[Path, os.stat_result] | BaseException | None] = (
+        queue: asyncio.Queue[
+            tuple[Path, os.stat_result] | BaseException | list[tuple[str, str]] | None
+        ] = (
             asyncio.Queue(maxsize=INVENTORY_QUEUE_SIZE)
         )
         stopped = threading.Event()
         heartbeat = _WalkHeartbeat()
 
         def producer() -> None:
+            # F-022: unreadable directories are collected and reported instead
+            # of aborting the walk (GH-296 skip-and-report for subpaths).
+            walk_errors: list[OSError] = []
+
+            def onerror(error: OSError) -> None:
+                walk_errors.append(error)
+
             try:
-
-                def onerror(error: OSError) -> None:
-                    raise error
-
                 walker = iter(
                     self._directory_walker(selected, followlinks=False, onerror=onerror)
                 )
@@ -543,16 +699,42 @@ class LibraryInventoryScanner:
                     inspected: list[
                         tuple[Path, os.stat_result] | BaseException
                     ] = []
+                    skips: list[tuple[str, str]] = []
                     for filename in filenames:
-                        heartbeat.touch(directory)
                         path = Path(directory) / filename
                         if (
                             path.suffix.casefold() not in AUDIO_EXTENSIONS
                             or is_management_artifact(path)
                         ):
                             continue
+                        try:
+                            path.as_posix().encode("utf-8")
+                        except UnicodeEncodeError:
+                            # F-021: surrogateescape names would poison every
+                            # downstream TEXT bind; skip and report with a
+                            # percent-encoded key instead.
+                            skips.append(
+                                (
+                                    LibraryInventoryScanner._text_safe_posix(
+                                        path.relative_to(root)
+                                    ),
+                                    "WALK_NAME_ENCODING",
+                                )
+                            )
+                            continue
+                        # In-root file symlinks resolve onto their target's own
+                        # path by design; escape-out links are audited below
+                        # (E11: symlinks are never followed into the library).
                         resolved = path.resolve(strict=False)
                         if not resolved.is_relative_to(root):
+                            skips.append(
+                                (
+                                    LibraryInventoryScanner._text_safe_posix(
+                                        path.relative_to(root)
+                                    ),
+                                    "SYMLINK_ESCAPE_OUT",
+                                )
+                            )
                             continue
                         try:
                             inspected.append((resolved, resolved.stat()))
@@ -560,8 +742,18 @@ class LibraryInventoryScanner:
                             continue
                         except OSError as exc:
                             inspected.append(exc)
+                    if skips:
+                        asyncio.run_coroutine_threadsafe(
+                            queue.put(skips), loop
+                        ).result()
                     for item in inspected:
                         asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
+                        # F-025: delivery is a progress signal, not just reads.
+                        heartbeat.touch(directory)
+                for error in walk_errors:
+                    asyncio.run_coroutine_threadsafe(
+                        queue.put(error), loop
+                    ).result()
             except (OSError, RuntimeError) as exc:
                 asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result()
             finally:
@@ -578,16 +770,28 @@ class LibraryInventoryScanner:
         # permission code.
         control_exit = False
         walk_failure_code: str | None = None
+        # F-022: a walk that finished despite per-path errors degrades instead
+        # of failing the run; first degraded code becomes the scope diagnostic.
+        degraded_code: str | None = None
         discovered = 0
         stale_cleanup_pending = True
         last_checkpoint = time.monotonic()
         last_log = last_checkpoint
+        # F-025: delivery progress is tracked separately from producer touches.
+        last_item_at = time.monotonic()
+        # F-020: distinct persisted relative paths within one discovery
+        # generation; memory cost is one path string per distinct file.
+        seen_relative_paths: set[str] = set()
         try:
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=0.25)
                 except TimeoutError:
-                    if heartbeat.age() > self._walk_deadline_seconds:
+                    if (
+                        heartbeat.age() > self._walk_deadline_seconds
+                        and time.monotonic() - last_item_at
+                        > self._walk_deadline_seconds
+                    ):
                         completed = False
                         stopped.set()
                         walk_failure_code = "WALK_TIMEOUT"
@@ -608,14 +812,29 @@ class LibraryInventoryScanner:
                             ),
                             failure_code="WALK_TIMEOUT",
                             failure_detail=(
-                                "The directory walk made no progress for "
-                                f"{self._walk_deadline_seconds:.1f}s."
+                                "The directory walk made no delivered progress "
+                                f"for {self._walk_deadline_seconds:.1f}s."
                             ),
                         )
                         # The producer thread is wedged in a syscall; awaiting it
                         # would wedge the scan worker, so it is detached instead.
-                        self._detach_walker(producer_task)
+                        # F-024: beyond the in-flight cap the leak is counted and
+                        # the run fails with a dedicated code (no silent leaks);
+                        # either way the wedged producer is never awaited.
+                        accepted = self._detach_walker(producer_task)
                         detached = True
+                        if not accepted:
+                            walk_failure_code = "WALKER_UNAVAILABLE"
+                            await self._record_failure(
+                                run.id,
+                                scope,
+                                relative_path=scope.relative_path,
+                                failure_code="WALKER_UNAVAILABLE",
+                                failure_detail=(
+                                    "Too many wedged directory walks are still "
+                                    "in flight; the walk was not started."
+                                ),
+                            )
                         break
                     if not await checkpoint(run.id, scope.policy_revision):
                         completed = False
@@ -624,21 +843,41 @@ class LibraryInventoryScanner:
                         control_exit = True
                     last_checkpoint = time.monotonic()
                     continue
+                last_item_at = time.monotonic()
                 if item is None:
                     break
                 if discard_remaining:
                     continue
+                if isinstance(item, list):
+                    # F-020/F-021 skip records: escape-out symlinks and
+                    # non-UTF-8 names become auditable failure rows.
+                    for relative_path, failure_code in item:
+                        await self._record_failure(
+                            run.id,
+                            scope,
+                            relative_path=relative_path,
+                            failure_code=failure_code,
+                            failure_detail=(
+                                "A symbolic link resolves outside its library "
+                                "root; it was not followed."
+                                if failure_code == "SYMLINK_ESCAPE_OUT"
+                                else "A filename is not valid UTF-8; the file "
+                                "was skipped."
+                            ),
+                        )
+                    continue
                 if isinstance(item, BaseException):
-                    completed = False
-                    stopped.set()
-                    discard_remaining = True
-                    walk_failure_code = "ROOT_PERMISSION_DENIED"
+                    # F-022: record the per-path row but keep consuming - one
+                    # unreadable file or directory no longer aborts the run
+                    # (GH-296 skip-and-report for subpaths).
                     relative_path = self._failure_relative_path(item, root, heartbeat)
                     failure_code = (
                         "WALK_" + errno.errorcode.get(item.errno, "EUNKNOWN")
                         if isinstance(item, OSError) and item.errno is not None
                         else "WALK_ERROR"
                     )
+                    if degraded_code is None:
+                        degraded_code = failure_code
                     logger.warning(
                         "library_scan event=walk_error run_id=%s root_id=%s path=%s "
                         "error=%s",
@@ -652,9 +891,20 @@ class LibraryInventoryScanner:
                         scope,
                         relative_path=relative_path,
                         failure_code=failure_code,
-                        failure_detail=str(item),
+                        failure_detail=self._walk_failure_detail(item),
                     )
                     continue
+                # F-020: an in-root alias resolves onto its target's own path;
+                # dedupe against everything already persisted in this
+                # discovery generation so discovered_count counts distinct
+                # files even when an alias batch lands after its target's.
+                resolved_path, stat_result = item
+                relative_key = PurePosixPath(
+                    *resolved_path.relative_to(root).parts
+                ).as_posix()
+                if relative_key in seen_relative_paths:
+                    continue
+                seen_relative_paths.add(relative_key)
                 batch.append(item)
                 if len(batch) >= INVENTORY_BATCH_SIZE:
                     current = await self._persist_batch(
@@ -709,6 +959,8 @@ class LibraryInventoryScanner:
                     await asyncio.wait_for(queue.get(), timeout=0.1)
                 except TimeoutError:
                     if heartbeat.age() > self._walk_deadline_seconds:
+                        # Detach even when the cap refuses: awaiting a wedged
+                        # producer would wedge cancellation itself.
                         self._detach_walker(producer_task)
                         detached = True
                         break
@@ -735,6 +987,22 @@ class LibraryInventoryScanner:
                 state="partially_read",
                 error_code=scope_error,
             )
+        elif degraded_code is not None:
+            # F-022: the walk finished, but some paths were unreadable - the
+            # scope completes honestly as partially read (the recorded failure
+            # rows are the durable evidence) while the run proceeds to index
+            # the inventory that DID land.
+            await self._store.complete_scan_scope_discovery(
+                run.id,
+                scope.root_id,
+                scope.relative_path,
+                state="partially_read",
+                error_code=degraded_code,
+            )
+        if degraded_code is not None:
+            # F-022: surface the degrade through the return contract so
+            # discover() completes this scope honestly instead of overriding.
+            return current, completed, degraded_code
         return current, completed, walk_failure_code
 
     async def _persist_batch(

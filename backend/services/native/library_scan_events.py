@@ -26,6 +26,10 @@ class LibraryScanEventPublisher:
         self._clock = clock
         self._last_counter_event: dict[str, float] = {}
 
+    _TERMINAL_STATES = frozenset(
+        {"completed", "failed", "cancelled", "superseded_policy_changed"}
+    )
+
     async def publish(self, run: ScanRun, *, event: str, counter: bool = False) -> bool:
         now = self._clock()
         last = self._last_counter_event.get(run.id)
@@ -33,6 +37,13 @@ class LibraryScanEventPublisher:
             return False
         if counter:
             self._last_counter_event[run.id] = now
+        elif (
+            run.state in self._TERMINAL_STATES
+            and run.id in self._last_counter_event
+        ):
+            # F-027: runs end via store transitions, never publisher callbacks,
+            # so terminal-run entries would otherwise live forever.
+            del self._last_counter_event[run.id]
         stream_revision = await self._store.get_stream_revision("scan")
         await self._publisher.publish(
             SCAN_EVENT_CHANNEL,

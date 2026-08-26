@@ -166,7 +166,6 @@ class LibraryIndexer:
                 "unchanged": [],
                 "excluded": [],
             }
-            failures: list[tuple[str, str, str]] = []
             last_checkpoint = time.monotonic()
             for item in batch:
                 if len(writes) >= TAG_BATCH_SIZE:
