@@ -28,6 +28,7 @@ from api.v1.schemas.library_scan_target import (
 from api.v1.schemas.library import LibraryScanStatusResponse
 from core.dependencies import (
     LibraryAdministrativeWorkServiceDep,
+    LibraryPolicyReconciliationServiceDep,
     LibraryPolicyResolverDep,
     MbProviderAvailabilityDep,
     NativeLibraryStoreDep,
@@ -466,17 +467,30 @@ async def request_scan_run(
     current_admin: CurrentAdminDep,
     coordinator: TargetLibraryScanCoordinatorDep,
     resolver: LibraryPolicyResolverDep,
+    reconciliation: LibraryPolicyReconciliationServiceDep,
     body: ScanRunRequestBody = MsgSpecBody(ScanRunRequestBody),
 ) -> ScanRunRequestedResponse:
-    result = await coordinator.request_run(
-        ScanRequest(
-            kind=body.kind,
-            trigger="manual",
-            scopes=_selected_scopes(body, resolver),
+    if body.kind == "policy_reconcile":
+        # F-TARGETCATALOG-02: a policy Apply must run the frozen pending
+        # transition scopes (removed roots, deleted rules, same-ID re-paths)
+        # through the reconciliation service instead of rebuilding scopes from
+        # current settings. The service owns the expected-revision gate and
+        # keeps trigger="policy_apply".
+        result = await reconciliation.apply(
+            body.scope_ids,
+            expected_policy_revision=body.expected_policy_revision,
             requested_by_user_id=current_admin.id,
-            policy_revision=resolver.policy_revision,
         )
-    )
+    else:
+        result = await coordinator.request_run(
+            ScanRequest(
+                kind=body.kind,
+                trigger="manual",
+                scopes=_selected_scopes(body, resolver),
+                requested_by_user_id=current_admin.id,
+                policy_revision=resolver.policy_revision,
+            )
+        )
     return ScanRunRequestedResponse(
         run_id=result.run_id,
         disposition=result.disposition,

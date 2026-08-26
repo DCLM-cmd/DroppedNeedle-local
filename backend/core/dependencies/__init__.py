@@ -274,6 +274,7 @@ from .type_aliases import (  # noqa: F401
     ArtworkProjectionServiceDep,
     AudioWritePlanningServiceDep,
     TargetLibraryPolicyServiceDep,
+    LibraryPolicyReconciliationServiceDep,
     LibraryPolicyResolverDep,
     TargetLibraryScanCoordinatorDep,
     TargetLibraryOwnershipServiceDep,

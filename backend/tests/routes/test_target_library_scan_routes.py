@@ -18,6 +18,7 @@ from core.dependencies import (
     get_mb_provider_availability,
     get_native_library_store,
     get_target_identification_queue,
+    get_target_library_policy_reconciliation_service,
     get_target_library_scan_coordinator,
 )
 from core.exceptions import ResourceNotFoundError, StaleRevisionError, ValidationError
@@ -27,6 +28,7 @@ from models.library_work import (
     ScanControlResult,
     ScanFailureRecord,
     ScanRequestResult,
+    ScanScope,
 )
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.library_activity_events import activity_events
@@ -125,6 +127,18 @@ def native_store() -> AsyncMock:
 
 
 @pytest.fixture
+def reconciliation() -> AsyncMock:
+    service = AsyncMock()
+    service.apply.return_value = ScanRequestResult(
+        run_id="policy-run-1",
+        disposition="started",
+        state="queued",
+        row_revision=1,
+    )
+    return service
+
+
+@pytest.fixture
 def mb_availability() -> MagicMock:
     return MagicMock(return_value=True)
 
@@ -137,6 +151,7 @@ def app(
     native_store: AsyncMock,
     mb_availability: MagicMock,
     resolver: LibraryPolicyResolver,
+    reconciliation: AsyncMock,
 ) -> FastAPI:
     application = FastAPI()
     application.include_router(router)
@@ -151,6 +166,9 @@ def app(
         lambda: administrative_work
     )
     application.dependency_overrides[get_native_library_store] = lambda: native_store
+    application.dependency_overrides[
+        get_target_library_policy_reconciliation_service
+    ] = lambda: reconciliation
     application.dependency_overrides[get_mb_provider_availability] = (
         lambda: mb_availability
     )
@@ -767,3 +785,154 @@ async def test_activity_stream_coalesces_revisions_and_sends_bounded_heartbeats(
     assert '"identification":4' in changed
     assert first.splitlines()[0] != changed.splitlines()[0]
     assert delays == [2.0] * 16
+
+
+def test_policy_reconcile_apply_uses_frozen_pending_scopes(
+    admin_client,
+    coordinator: AsyncMock,
+    reconciliation: AsyncMock,
+    resolver: LibraryPolicyResolver,
+) -> None:
+    """F-TARGETCATALOG-02: a policy Apply must route through the
+    reconciliation service (frozen pending scopes, trigger=policy_apply)
+    instead of rebuilding current-settings scopes with trigger=manual."""
+    frozen_scope = ScanScope(
+        root_id="root-a",
+        scope_id="removed-root",
+        relative_path="Old Root",
+        effective_policy="excluded",
+        policy_revision="pending-rev",
+    )
+    reconciliation.preview_apply.return_value = {
+        "policy_revision": "pending-rev",
+        "scope_ids": ["removed-root"],
+        "estimated_file_count": 3,
+        "scopes": [frozen_scope],
+    }
+
+    response = admin_client.post(
+        "/library/scan-runs",
+        json={
+            "kind": "policy_reconcile",
+            "scope_ids": ["removed-root"],
+            "expected_policy_revision": "pending-rev",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["run_id"] == "policy-run-1"
+    assert body["disposition"] == "started"
+    # The general scan path must not be used for a policy Apply.
+    coordinator.request_run.assert_not_awaited()
+    reconciliation.apply.assert_awaited_once_with(
+        ["removed-root"],
+        expected_policy_revision="pending-rev",
+        requested_by_user_id="test-admin-id",
+    )
+
+
+def test_manual_scans_still_use_current_scopes_and_manual_trigger(
+    admin_client,
+    coordinator: AsyncMock,
+    reconciliation: AsyncMock,
+    resolver: LibraryPolicyResolver,
+) -> None:
+    """F-TARGETCATALOG-02 non-goal guard: ordinary manual scans keep the
+    current-scope selection and trigger=manual."""
+    response = admin_client.post(
+        "/library/scan-runs",
+        json={
+            "kind": "incremental",
+            "scope_ids": ["parent"],
+            "expected_policy_revision": resolver.policy_revision,
+        },
+    )
+
+    assert response.status_code == 202
+    reconciliation.apply.assert_not_awaited()
+    request = coordinator.request_run.await_args.args[0]
+    assert request.trigger == "manual"
+    assert request.kind == "incremental"
+
+
+def test_stale_policy_apply_returns_error_without_requesting_a_run(
+    admin_client,
+    coordinator: AsyncMock,
+    reconciliation: AsyncMock,
+) -> None:
+    """F-TARGETCATALOG-02: a stale expected revision fails through the
+    service's existing gate and never enqueues a run."""
+    from core.exceptions import StaleRevisionError
+
+    reconciliation.apply.side_effect = StaleRevisionError(
+        "The library policy changed. Refresh this page and try again."
+    )
+
+    response = admin_client.post(
+        "/library/scan-runs",
+        json={
+            "kind": "policy_reconcile",
+            "scope_ids": ["removed-root"],
+            "expected_policy_revision": "stale-rev",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "STALE_REVISION"
+    coordinator.request_run.assert_not_awaited()
+
+
+def test_same_id_repath_apply_carries_both_frozen_paths(
+    admin_client,
+    coordinator: AsyncMock,
+    reconciliation: AsyncMock,
+) -> None:
+    """F-TARGETCATALOG-02: a same-ID re-path's frozen pending scopes include
+    both the old and new relative paths; Apply must pass them through so one
+    policy run reconciles both. The service (not the route) owns selection."""
+    old_scope = ScanScope(
+        root_id="root-a",
+        scope_id="rule-1",
+        relative_path="Artist/Old",
+        effective_policy="excluded",
+        policy_revision="pending-rev",
+    )
+    new_scope = ScanScope(
+        root_id="root-a",
+        scope_id="rule-1",
+        relative_path="Artist/New",
+        effective_policy="automatic",
+        policy_revision="pending-rev",
+    )
+    reconciliation.preview_apply.return_value = {
+        "policy_revision": "pending-rev",
+        "scope_ids": ["rule-1"],
+        "estimated_file_count": 2,
+        "scopes": [old_scope, new_scope],
+    }
+    reconciliation.apply.return_value = ScanRequestResult(
+        run_id="repath-run-1",
+        disposition="started",
+        state="queued",
+        row_revision=1,
+    )
+
+    response = admin_client.post(
+        "/library/scan-runs",
+        json={
+            "kind": "policy_reconcile",
+            "scope_ids": ["rule-1"],
+            "expected_policy_revision": "pending-rev",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["run_id"] == "repath-run-1"
+    # The service received the shared ID once and is responsible for carrying
+    # every matching frozen scope into the run.
+    reconciliation.apply.assert_awaited_once_with(
+        ["rule-1"],
+        expected_policy_revision="pending-rev",
+        requested_by_user_id="test-admin-id",
+    )

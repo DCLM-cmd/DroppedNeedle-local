@@ -61,6 +61,9 @@ from services.native.library_management_override_service import (
 from services.native.genre_projection_service import GenreProjectionService
 from services.native.artwork_projection_service import ArtworkProjectionService
 from services.native.audio_write_planning_service import AudioWritePlanningService
+from services.native.library_policy_reconciliation_service import (
+    LibraryPolicyReconciliationService,
+)
 from services.native.target_library_policy_service import TargetLibraryPolicyService
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.library_scan_coordinator import LibraryScanCoordinator
@@ -148,6 +151,7 @@ from .repo_providers import (
 )
 from .service_providers import (
     get_library_policy_service,
+    get_target_library_policy_reconciliation_service,
     get_legacy_pending_migration_service,
     get_library_management_profile_service,
     get_library_management_preview_service,
@@ -290,6 +294,10 @@ LibraryPolicyResolverDep = Annotated[
 ]
 TargetLibraryScanCoordinatorDep = Annotated[
     LibraryScanCoordinator, Depends(get_target_library_scan_coordinator)
+]
+LibraryPolicyReconciliationServiceDep = Annotated[
+    LibraryPolicyReconciliationService,
+    Depends(get_target_library_policy_reconciliation_service),
 ]
 TargetLibraryOwnershipServiceDep = Annotated[
     LibraryOwnershipService, Depends(get_target_library_ownership_service)
