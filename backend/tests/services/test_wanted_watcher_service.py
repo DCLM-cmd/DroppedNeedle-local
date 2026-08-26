@@ -1233,3 +1233,93 @@ async def test_enrol_reuses_batched_task_data_without_single_reads(env):
     env.download_store.get_task.assert_not_awaited()  # batched, not per row
     assert env.download_store.get_tasks.await_count >= 1
     assert summary.enrolled == 1
+
+
+# --- F-PERF-09: one immutable membership snapshot per sweep --------------------
+
+
+def _install_membership_counter(env, members: set[str]):
+    calls = {"n": 0}
+    returned_objects: list[object] = []
+
+    async def counting_mbids(include_release_ids=False):
+        calls["n"] += 1
+        snapshot = frozenset(value.lower() for value in members)
+        returned_objects.append(snapshot)
+        # the repository hands back a fresh mutable copy each call
+        return set(snapshot)
+
+    env.library.get_library_mbids = counting_mbids
+    return calls, returned_objects
+
+
+@pytest.mark.asyncio
+async def test_sweep_reuses_one_immutable_membership_snapshot(env):
+    """Several no-tracklist missing wants in ONE sweep load + normalize the
+    library membership exactly once and compare against the same frozenset."""
+    for index in range(3):  # default due cap visits all three
+        await _add_watch(env, mbid=f"rg-lib-{index}")
+    _serve_history(env)
+
+    calls, _objects = _install_membership_counter(
+        env, {f"mbid-{i}" for i in range(4000)} | {"RG-LIB-0"}
+    )
+    env.album_service.get_album_tracks_info.side_effect = RuntimeError("no tracklist")
+
+    summary = await env.watcher.run_sweep()
+
+    assert summary.checked == 3
+    assert calls["n"] == 1, "one membership load serves the whole sweep"
+    assert summary.fulfilled == 1  # rg-lib-0 matches RG-LIB-0 case-insensitively
+
+
+@pytest.mark.asyncio
+async def test_snapshot_is_not_carried_across_sweeps_or_revisions(env):
+    await _add_watch(env, mbid="rg-target-a")
+    await _add_watch(env, mbid="rg-target-b")
+    _serve_history(env)
+
+    members = {"rg-target-a"}
+    calls, snapshots = _install_membership_counter(env, members)
+    env.album_service.get_album_tracks_info.side_effect = RuntimeError("no tracklist")
+
+    first = await env.watcher.run_sweep()
+    assert first.fulfilled == 1
+    first_object = snapshots[0]
+
+    # catalog change between sweeps: membership now contains only B, and B's
+    # watch becomes due again (fulfilled A must not be carried forward).
+    members.clear()
+    members.add("rg-target-b")
+    await env.store.reschedule("rg-target-b", time.time() - 5)
+
+    second = await env.watcher.run_sweep()
+    assert second.fulfilled == 1
+    assert len(snapshots) == 2 and snapshots[1] is not first_object
+    assert calls["n"] == 2  # one load per sweep, not per want, not shared
+
+
+@pytest.mark.asyncio
+async def test_failed_membership_read_stays_fail_open_per_want(env):
+    for index in range(3):
+        await _add_watch(env, mbid=f"rg-fail-{index}")
+    _serve_history(env)
+
+    attempts = {"n": 0}
+
+    async def failing_mbids(include_release_ids=False):
+        attempts["n"] += 1
+        raise RuntimeError("library read failed")
+
+    env.library.get_library_mbids = failing_mbids
+    env.album_service.get_album_tracks_info.side_effect = RuntimeError("no tracklist")
+
+    summary = await env.watcher.run_sweep()
+
+    # fail-open: every want still got its best-effort presence check (the
+    # pre-ticket per-want retry behavior on failures is preserved), nothing
+    # was fulfilled, and the sweep completed without aborting.
+    assert summary.checked == 3
+    assert summary.fulfilled == 0
+    assert summary.errors == 0
+    assert attempts["n"] == 3

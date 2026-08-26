@@ -113,6 +113,16 @@ def _interval_days(
     return 28.0 if quiet_streak >= _QUIET_DOUBLING_STREAK else 14.0
 
 
+class _SweepMembershipState:
+    """Mutable per-sweep slot holding ONE immutable normalized membership."""
+
+    __slots__ = ("loaded", "mbids")
+
+    def __init__(self) -> None:
+        self.loaded = False
+        self.mbids: frozenset[str] = frozenset()
+
+
 class WantedWatcherService:
     def __init__(
         self,
@@ -151,10 +161,11 @@ class WantedWatcherService:
         enrolled = await self._enrol(settings)
 
         due = await self._store.list_due(time.time(), settings.max_checks_per_sweep)
+        membership_state = _SweepMembershipState()
         checked = dispatched = fulfilled = errors = 0
         for index, want in enumerate(due):
             try:
-                outcome = await self._check_want(want, settings)
+                outcome = await self._check_want(want, settings, membership_state)
                 checked += 1
                 if outcome == "auto_dispatched":
                     dispatched += 1
@@ -447,6 +458,20 @@ class WantedWatcherService:
             raise ResourceNotFoundError("Watch not found")
         return watch
 
+    # -- sweep-local library membership snapshot (F-PERF-09) --
+
+    async def _library_membership_snapshot(self, state) -> frozenset[str]:
+        """Lazily load + case-normalize the album-only membership ONCE per
+        sweep; every later no-tracklist presence check compares against this
+        immutable object. A failed read stays fail-open: ``loaded`` remains
+        False so a later want in the SAME sweep retries exactly like the
+        pre-ticket per-want behavior, while successful loads are shared."""
+        if not state.loaded:
+            raw = await self._library.get_library_mbids(include_release_ids=False)
+            state.mbids = frozenset(str(m).lower() for m in (raw or ()))
+            state.loaded = True
+        return state.mbids
+
     # -- enrolment (§5.2.1) --
 
     async def _enrol(self, settings) -> int:  # noqa: ANN001 - WantedWatcherSettings
@@ -629,7 +654,7 @@ class WantedWatcherService:
 
     # -- per-want check cycle (§5.2.3) --
 
-    async def _check_want(self, want: WantedWatch, settings) -> str:  # noqa: ANN001
+    async def _check_want(self, want: WantedWatch, settings, membership_state) -> str:  # noqa: ANN001
         now = time.time()
         mbid = want.release_group_mbid
 
@@ -658,7 +683,7 @@ class WantedWatcherService:
         elif want.kind == "missing":
             # tracklist unavailable: the library-presence semantic the requests
             # page uses (§5.2.3.a) - never raw file-row counts
-            if await self._in_library(mbid):
+            if await self._in_library(mbid, membership_state):
                 await self._fulfil(want)
                 return "satisfied"
         else:
@@ -912,12 +937,18 @@ class WantedWatcherService:
         except Exception:  # noqa: BLE001 - a rows failure reads as nothing held
             return []
 
-    async def _in_library(self, mbid: str) -> bool:
+    async def _in_library(self, mbid: str, membership_state=None) -> bool:
+        """Case-insensitive presence against the sweep-local immutable
+        snapshot (F-PERF-09); direct callers without sweep state keep the
+        per-call behavior."""
         try:
-            mbids = await self._library.get_library_mbids(include_release_ids=False)
+            if membership_state is None:
+                raw = await self._library.get_library_mbids(include_release_ids=False)
+                return mbid.lower() in {str(m).lower() for m in (raw or ())}
+            mbids = await self._library_membership_snapshot(membership_state)
         except Exception:  # noqa: BLE001 - presence check is best-effort
             return False
-        return mbid.lower() in {str(m).lower() for m in mbids}
+        return mbid.lower() in mbids
 
     async def _has_active_work(self, want: WantedWatch) -> bool:
         mbid = want.release_group_mbid
