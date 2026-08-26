@@ -12,7 +12,9 @@ async def test_waits_for_interactive_quiet_period() -> None:
         interactive_quiet_period=0.04,
         interactive_max_deferral=1.0,
     )
-    gate.note_interactive_activity()
+    # A completed request: begin/end arms the quiet window without holding admission.
+    gate.begin_interactive_request()
+    gate.end_interactive_request()
 
     started = monotonic()
     await gate.wait_until_available()
@@ -60,12 +62,13 @@ async def test_continuous_activity_gets_one_bounded_fairness_pass() -> None:
         interactive_quiet_period=0.05,
         interactive_max_deferral=0.12,
     )
-    gate.note_interactive_activity()
+    gate.begin_interactive_request()
     waiter = asyncio.create_task(gate.wait_until_available())
 
     while not waiter.done():
         await asyncio.sleep(0.015)
-        gate.note_interactive_activity()
+        gate.begin_interactive_request()
+        gate.end_interactive_request()
 
     await waiter
 

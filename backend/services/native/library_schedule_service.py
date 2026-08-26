@@ -38,7 +38,11 @@ class LibraryScheduleService:
                 return None
             if terminal_at is None:
                 return local_now
-            return datetime.fromtimestamp(terminal_at, zone) + interval
+            # Absolute-seconds arithmetic keeps the rolling gap honest across
+            # DST transitions (aware + timedelta is wall-clock arithmetic).
+            return datetime.fromtimestamp(
+                terminal_at + interval.total_seconds(), zone
+            )
         try:
             hour, minute = (int(part) for part in daily_time.split(":", 1))
             if not 0 <= hour <= 23 or not 0 <= minute <= 59:

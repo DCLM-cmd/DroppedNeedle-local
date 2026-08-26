@@ -17,7 +17,7 @@ import pytest
 from core.task_registry import TaskRegistry
 from infrastructure.sse_publisher import KEEPALIVE, SSEPublisher
 from infrastructure.queue.durable_work_wakeup import DurableWorkWakeups
-from models.library_work import ScanRun, ScanRunSnapshot, ScanScope
+from models.library_work import ScanFailureRecord, ScanRun, ScanRunSnapshot, ScanScope
 from services.compat.target_scan_service import TargetCompatScanService
 from services.native.library_scan_events import LibraryScanEventPublisher
 from infrastructure.persistence.native_library_store import NativeLibraryStore
@@ -36,6 +36,7 @@ from api.v1.schemas.library_policies import (
     TypedLibrarySettings,
 )
 from services.native.library_scan_supervisor import (
+    ERROR_RETRY_INTERVAL_SECONDS,
     SUPERVISOR_TASK_NAME,
     start_target_scan_supervisor,
     supervise_target_scans,
@@ -46,7 +47,7 @@ from services.native.target_application_runtime import (
     run_target_operation_worker,
     run_target_worker_watchdog,
 )
-from core.exceptions import AudioFormatError
+from core.exceptions import AudioFormatError, ResourceNotFoundError
 from infrastructure.resilience.retry import CircuitState
 from services.native.background_workload_gate import BackgroundWorkloadGate
 from services.native.library_filesystem_coordinator import LibraryFilesystemCoordinator
@@ -110,6 +111,80 @@ async def test_supervisor_fetches_the_current_coordinator_each_iteration() -> No
     coordinators[0].recover.assert_awaited_once()
     coordinators[1].run_once.assert_awaited_once()
     coordinators[2].run_once.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_wait_failure_logs_and_sleeps_instead_of_dying(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F-002: a non-cancel exception from the sleep path must log with exc_info,
+    take exactly one error-retry sleep, and continue the supervision loop."""
+    coordinator = AsyncMock()
+    coordinator.run_once.return_value = None
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(
+            side_effect=[RuntimeError("wakeup store fault"), asyncio.CancelledError()]
+        ),
+    )
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    with caplog.at_level(
+        logging.ERROR, logger="services.native.library_scan_supervisor"
+    ):
+        await supervise_target_scans(
+            lambda: coordinator, lambda: {"root-a": Path("/scratch")}, wakeups
+        )
+
+    assert coordinator.run_once.await_count == 2
+    assert sleeps == [ERROR_RETRY_INTERVAL_SECONDS]
+    assert any(
+        record.exc_info is not None
+        and record.getMessage() == "Target scan supervisor wait failed"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_scan_run_failures_gates_listing_on_existence() -> None:
+    """F-005: the failures passthrough keeps snapshot's typed NOT_FOUND boundary
+    (unknown runs raise before the page read) and delegates the rowid page."""
+    store = AsyncMock()
+    record = ScanFailureRecord(
+        root_id="root-a",
+        relative_path="Artist/Album",
+        failure_code="WALK_EACCES",
+        recorded_at=1.0,
+        failure_detail="[Errno 13] Permission denied",
+        phase="discovering",
+    )
+    store.list_scan_run_failures.return_value = ([record], 41)
+    coordinator = LibraryScanCoordinator(
+        store, AsyncMock(), AsyncMock(), AsyncMock(), lambda: None
+    )
+
+    items, next_cursor = await coordinator.scan_run_failures(
+        "run-1", limit=50, cursor_rowid=40
+    )
+
+    store.get_scan_run.assert_awaited_once_with("run-1")
+    store.list_scan_run_failures.assert_awaited_once_with(
+        "run-1", limit=50, cursor_rowid=40
+    )
+    assert items == [record]
+    assert next_cursor == 41
+
+    store.get_scan_run.side_effect = ResourceNotFoundError("Scan run not found: nope")
+    with pytest.raises(ResourceNotFoundError):
+        await coordinator.scan_run_failures("nope")
+    store.list_scan_run_failures.assert_awaited_once()
 
 
 @pytest.mark.asyncio

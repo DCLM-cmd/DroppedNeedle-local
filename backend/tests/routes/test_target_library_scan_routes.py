@@ -16,7 +16,6 @@ from core.dependencies import (
     get_library_administrative_work_service,
     get_library_policy_resolver,
     get_mb_provider_availability,
-    get_native_library_store,
     get_target_identification_queue,
     get_target_library_policy_reconciliation_service,
     get_target_library_scan_coordinator,
@@ -68,6 +67,7 @@ def coordinator() -> AsyncMock:
     service.current.return_value = []
     service.history.return_value = []
     service.history_page.return_value = ([], None)
+    service.scan_run_failures.return_value = ([], None)
     service.estimate.return_value = (12, 10.0)
     service.request_run.return_value = ScanRequestResult(
         run_id="run-1",
@@ -120,13 +120,6 @@ def administrative_work() -> AsyncMock:
 
 
 @pytest.fixture
-def native_store() -> AsyncMock:
-    store = AsyncMock()
-    store.list_scan_run_failures.return_value = ([], None)
-    return store
-
-
-@pytest.fixture
 def reconciliation() -> AsyncMock:
     service = AsyncMock()
     service.apply.return_value = ScanRequestResult(
@@ -148,7 +141,6 @@ def app(
     coordinator: AsyncMock,
     identification_queue: AsyncMock,
     administrative_work: AsyncMock,
-    native_store: AsyncMock,
     mb_availability: MagicMock,
     resolver: LibraryPolicyResolver,
     reconciliation: AsyncMock,
@@ -165,7 +157,6 @@ def app(
     application.dependency_overrides[get_library_administrative_work_service] = (
         lambda: administrative_work
     )
-    application.dependency_overrides[get_native_library_store] = lambda: native_store
     application.dependency_overrides[
         get_target_library_policy_reconciliation_service
     ] = lambda: reconciliation
@@ -634,11 +625,11 @@ def test_scan_runs_start_rejects_a_disabled_library_with_the_switch_message(
 
 
 def test_scan_run_failures_returns_persisted_detail_for_indexing_rows(
-    admin_client, native_store: AsyncMock
+    admin_client, coordinator: AsyncMock
 ) -> None:
     """NEW-SCAN-04: the failures endpoint serializes the safe detail recorded by
     the indexer (timeout deadline, capacity, exception class) for admin eyes."""
-    native_store.list_scan_run_failures.return_value = (
+    coordinator.scan_run_failures.return_value = (
         [
             ScanFailureRecord(
                 root_id="root-a",
@@ -704,9 +695,9 @@ def test_activity_reports_healthy_breaker_with_unmappable_reason(
 
 
 def test_scan_run_failures_returns_snake_case_items(
-    admin_client, native_store: AsyncMock
+    admin_client, coordinator: AsyncMock
 ) -> None:
-    native_store.list_scan_run_failures.return_value = (
+    coordinator.scan_run_failures.return_value = (
         [
             ScanFailureRecord(
                 root_id="root-a",
@@ -736,7 +727,7 @@ def test_scan_run_failures_returns_snake_case_items(
         ],
         "next_cursor": 41,
     }
-    native_store.list_scan_run_failures.assert_awaited_once_with(
+    coordinator.scan_run_failures.assert_awaited_once_with(
         "run-1", limit=50, cursor_rowid=40
     )
 
@@ -749,7 +740,9 @@ def test_scan_run_failures_limit_bounds_are_validated(admin_client) -> None:
     )
 
 
-def test_scan_run_failures_auth_matrix(app: FastAPI, native_store: AsyncMock) -> None:
+def test_scan_run_failures_auth_matrix(
+    app: FastAPI, coordinator: AsyncMock
+) -> None:
     assert (
         build_test_client(app).get("/library/scan-runs/run-1/failures").status_code
         == 401
@@ -766,7 +759,7 @@ def test_scan_run_failures_auth_matrix(app: FastAPI, native_store: AsyncMock) ->
 
     override_admin_auth(app)
     override_user_auth(app, role="admin")
-    native_store.get_scan_run.side_effect = ResourceNotFoundError(
+    coordinator.scan_run_failures.side_effect = ResourceNotFoundError(
         "Scan run not found: missing"
     )
     missing = build_test_client(app).get("/library/scan-runs/missing/failures")

@@ -11,12 +11,14 @@ auth-passed. This test owns the auth posture; route unit tests own body behaviou
 
 Service providers are overridden with non-raising mocks so dependency resolution
 never 500s before the auth dependency is evaluated (which would mask a 401).
-SSE stream endpoints are covered separately in ``test_sse_auth.py`` (their infinite
-generators can't be driven through ``TestClient`` for the admitted case).
+The two library scan SSE stream endpoints ARE inventoried: an autouse fixture
+swaps their generator for a one-event fake, so admitted requests end after the
+status/headers instead of hanging TestClient on the infinite poll loop.
 """
 
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
 
 from api.v1.routes import connect_apps_routes
@@ -742,6 +744,10 @@ _ADMIN_ENDPOINTS = [
         "/api/v1/library/scan-runs/run-1/stop",
         {"expected_revision": 1},
     ),
+    # Library scan SSE streams: CurrentAdminDep (admin-only) and CurrentUserDep
+    # respectively; the autouse SSE fixture ends admitted responses after the
+    # headers, so status-only assertions hold here like everywhere else.
+    ("GET", "/api/v1/library/operations/stream", None),
     ("POST", "/api/v1/downloads/held/management/task-1/retry", None),
     ("POST", "/api/v1/downloads/held/management/task-1/discard", None),
 ]
@@ -791,7 +797,7 @@ _USER_ENDPOINTS = [
     ("GET", "/api/v1/library/albums/album-1/artwork/cached?v=1", None),
     ("POST", "/api/v1/library/resolve-tracks", {"items": []}),
     ("GET", "/api/v1/library/activity", None),
-    ("GET", "/api/v1/me/section-prefs", None),
+    ("GET", "/api/v1/library/activity/stream", None),
     ("POST", "/api/v1/me/personal-mix/refresh", None),
     ("PUT", "/api/v1/me/section-prefs", {"page": "home", "sections": []}),
     ("GET", "/api/v1/discover/batches", None),
@@ -873,6 +879,22 @@ _USER_ENDPOINTS = [
 ]
 
 _ALL_ENDPOINTS = _ADMIN_ENDPOINTS + _USER_ENDPOINTS
+
+
+@pytest.fixture(autouse=True)
+def finite_sse_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Swap the library scan SSE generators for a one-event fake.
+
+    The real generator polls forever; TestClient buffers a response to
+    completion, so admitted requests must end after the status/headers for the
+    inventory loops above to assert on them.
+    """
+
+    async def one_event(source):
+        await source.stream_revisions()
+        yield "id: activity:test\nevent: activity.changed\ndata: {}\n\n"
+
+    monkeypatch.setattr(target_library_scan_routes, "activity_events", one_event)
 
 
 def _deny_admin():

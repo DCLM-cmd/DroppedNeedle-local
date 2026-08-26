@@ -118,3 +118,6 @@ async def supervise_target_scans(
             )
         except asyncio.CancelledError:
             break
+        except Exception:  # noqa: BLE001 - a failed wait must not kill the supervisor
+            logger.exception("Target scan supervisor wait failed")
+            await asyncio.sleep(ERROR_RETRY_INTERVAL_SECONDS)

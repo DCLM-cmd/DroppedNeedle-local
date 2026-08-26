@@ -29,7 +29,6 @@ from core.dependencies import (
     LibraryPolicyReconciliationServiceDep,
     LibraryPolicyResolverDep,
     MbProviderAvailabilityDep,
-    NativeLibraryStoreDep,
     TargetIdentificationQueueDep,
     TargetLibraryScanCoordinatorDep,
 )
@@ -557,12 +556,11 @@ async def scan_run_detail(
 async def scan_run_failures(
     run_id: str,
     _: CurrentAdminDep,
-    store: NativeLibraryStoreDep,
+    coordinator: TargetLibraryScanCoordinatorDep,
     limit: int = Query(default=50, ge=1, le=200),
     cursor: int | None = Query(default=None, ge=1),
 ) -> ScanRunFailuresResponse:
-    await store.get_scan_run(run_id)
-    items, next_cursor = await store.list_scan_run_failures(
+    items, next_cursor = await coordinator.scan_run_failures(
         run_id, limit=limit, cursor_rowid=cursor
     )
     return ScanRunFailuresResponse(

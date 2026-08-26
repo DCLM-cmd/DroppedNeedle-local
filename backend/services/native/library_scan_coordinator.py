@@ -12,6 +12,7 @@ from core.exceptions import StaleRevisionError, ValidationError
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.library_work import (
     ScanControlResult,
+    ScanFailureRecord,
     ScanRequest,
     ScanRequestResult,
     ScanRun,
@@ -170,6 +171,14 @@ class LibraryScanCoordinator:
             last = items[-1]
             next_cursor = f"{last.terminal_at}:{last.id}"
         return items, next_cursor
+
+    async def scan_run_failures(
+        self, run_id: str, *, limit: int = 50, cursor_rowid: int | None = None
+    ) -> tuple[list[ScanFailureRecord], int | None]:
+        await self._store.get_scan_run(run_id)
+        return await self._store.list_scan_run_failures(
+            run_id, limit=limit, cursor_rowid=cursor_rowid
+        )
 
     async def control(
         self, run_id: str, control: str, expected_revision: int
