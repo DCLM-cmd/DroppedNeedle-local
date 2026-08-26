@@ -43,4 +43,22 @@ describe('TrackRequestButton.svelte', () => {
 		await page.getByRole('button', { name: 'Request this track' }).click();
 		expect(h.mutate).toHaveBeenCalled();
 	});
+
+	it('sends the displayed selected edition as release_id in the exact-track mutation', async () => {
+		renderButton({ releaseMbid: 'release-20' });
+		await page.getByRole('button', { name: 'Request this track' }).click();
+		expect(h.mutate).toHaveBeenCalledTimes(1);
+		expect(h.mutate.mock.calls[0][0]).toMatchObject({
+			recording_mbid: 'rec',
+			release_group_mbid: 'rg',
+			release_id: 'release-20'
+		});
+	});
+
+	it('keeps release_id null when no edition is selected', async () => {
+		renderButton();
+		await page.getByRole('button', { name: 'Request this track' }).click();
+		expect(h.mutate).toHaveBeenCalledTimes(1);
+		expect(h.mutate.mock.calls[0][0].release_id).toBeNull();
+	});
 });

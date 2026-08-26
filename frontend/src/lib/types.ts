@@ -650,6 +650,8 @@ export type StatusMessage = {
 	messages: string[];
 };
 
+export type RequestKind = 'album' | 'track';
+
 export type ActiveRequestItem = {
 	musicbrainz_id: string;
 	artist_name: string;
@@ -673,6 +675,10 @@ export type ActiveRequestItem = {
 	download_client?: string | null;
 	user_id?: string | null;
 	requested_by_name?: string | null;
+	request_kind: RequestKind;
+	track_title?: string | null;
+	duration_seconds?: number | null;
+	track_release_group_mbid?: string | null;
 };
 
 export type RequestHistoryItem = {
@@ -692,6 +698,10 @@ export type RequestHistoryItem = {
 	reviewed_at?: string | null;
 	download_task_id?: string | null;
 	can_reimport?: boolean;
+	request_kind: RequestKind;
+	track_title?: string | null;
+	duration_seconds?: number | null;
+	track_release_group_mbid?: string | null;
 };
 
 export type ActiveRequestsResponse = {
@@ -2447,16 +2457,26 @@ export interface DownloadProgress extends DownloadSourceUpdate {
 }
 
 // mirrors backend RequestAcceptedResponse (api/v1/schemas/request.py)
-// status is one of: "pending" | "awaiting_approval" | "downloading"
+export type RequestAcceptedStatus =
+	| 'pending'
+	| 'awaiting_approval'
+	| 'queued'
+	| 'downloading'
+	| 'cancelling'
+	| 'failed'
+	| 'imported';
+
 export interface RequestAccepted {
 	success: boolean;
 	message: string;
 	musicbrainz_id: string;
-	status: string;
+	status: RequestAcceptedStatus;
 }
 
+export type TrackRequestStatus = 'awaiting_approval' | 'queued' | 'already_in_library';
+
 export interface TrackRequestResponse {
-	status: string;
+	status: TrackRequestStatus;
 	task_id?: string | null;
 }
 
@@ -2503,6 +2523,7 @@ export interface QuarantineListResponse {
 export interface ConnectAppsSettings {
 	subsonic_enabled: boolean;
 	jellyfin_enabled: boolean;
+	exact_track_approval_supported?: boolean;
 	transcoding_enabled: boolean;
 	transcode_default_format: 'mp3' | 'opus';
 	transcode_max_bitrate_kbps: number;

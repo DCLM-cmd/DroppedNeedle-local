@@ -70,6 +70,7 @@
 		heldByPosition?: Map<string, HeldImport>;
 		trackDownloadTasks?: Map<string, DownloadTask>;
 		releaseGroupMbid?: string;
+		releaseMbid?: string | null;
 		onPlaySourceTrack: (
 			source: 'jellyfin' | 'local' | 'navidrome' | 'plex',
 			trackPosition: number,
@@ -116,6 +117,7 @@
 		heldByPosition = new Map(),
 		trackDownloadTasks = new Map(),
 		releaseGroupMbid = '',
+		releaseMbid = null,
 		onPlaySourceTrack,
 		onTrackGenerated,
 		onQuotaUpdate,
@@ -323,6 +325,7 @@
 										albumTitle={album.title}
 										durationSeconds={track.length ? Math.round(track.length / 1000) : null}
 										artistMbid={album.artist_id}
+										{releaseMbid}
 									/>
 								{/if}
 								{#if showUpgrade && upgradeRecordingId}

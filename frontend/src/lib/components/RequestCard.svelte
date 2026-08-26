@@ -2,7 +2,7 @@
 	import { albumHref, artistHref } from '$lib/utils/entityRoutes';
 	import AlbumImage from './AlbumImage.svelte';
 	import DeleteAlbumModal from './DeleteAlbumModal.svelte';
-	import type { ActiveRequestItem, RequestHistoryItem } from '$lib/types';
+	import type { ActiveRequestItem, RequestHistoryItem, RequestKind } from '$lib/types';
 	import { reimportDownload } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import {
@@ -30,9 +30,9 @@
 		// still being worked on despite the terminal status: 'retrying' = auto-retry
 		// ladder, 'watching' = wanted watcher. Renders a chip linking to the Wanted tab.
 		watchState?: 'retrying' | 'watching';
-		oncancel?: (mbid: string) => void;
-		onretry?: (mbid: string) => void;
-		onclear?: (mbid: string) => void;
+		oncancel?: (mbid: string, requestKind: RequestKind) => void;
+		onretry?: (mbid: string, requestKind: RequestKind) => void;
+		onclear?: (mbid: string, requestKind: RequestKind) => void;
 		onremoved?: () => void;
 		onreimported?: () => void;
 	}
@@ -148,11 +148,22 @@
 			item.status === 'downloadClientUnavailable'
 	);
 	const artistMbid = $derived('artist_mbid' in item ? item.artist_mbid : null);
+	const requestKind = $derived(item.request_kind ?? 'album');
+	const isTrackRequest = $derived(requestKind === 'track');
+	const trackTitle = $derived(
+		isTrackRequest ? (item.track_title ?? 'Unknown track') : item.album_title
+	);
+	const artworkMbid = $derived(
+		isTrackRequest ? (item.track_release_group_mbid ?? '') : item.musicbrainz_id
+	);
+	const albumContextMbid = $derived(
+		isTrackRequest ? item.track_release_group_mbid : item.musicbrainz_id
+	);
 
 	function handleCancelClick(e: Event) {
 		e.stopPropagation();
 		if (confirmingCancel) {
-			oncancel?.(item.musicbrainz_id);
+			oncancel?.(item.musicbrainz_id, requestKind);
 			confirmingCancel = false;
 		} else {
 			confirmingCancel = true;
@@ -169,12 +180,12 @@
 
 	function handleRetry(e: Event) {
 		e.stopPropagation();
-		onretry?.(item.musicbrainz_id);
+		onretry?.(item.musicbrainz_id, requestKind);
 	}
 
 	function handleClear(e: Event) {
 		e.stopPropagation();
-		onclear?.(item.musicbrainz_id);
+		onclear?.(item.musicbrainz_id, requestKind);
 	}
 
 	function handleRemoveFromLibrary(e: Event) {
@@ -207,16 +218,20 @@
 	class:border={isFailedState}
 	class:is-downloading={isActive && activeItem.status === 'downloading'}
 >
-	<a
-		href={albumHref(item.musicbrainz_id)}
-		class="absolute inset-0 z-0 rounded-box"
-		aria-label="Open {item.album_title}"
-	></a>
+	{#if albumContextMbid}
+		<a
+			href={albumHref(albumContextMbid)}
+			class="absolute inset-0 z-0 rounded-box"
+			aria-label={isTrackRequest
+				? `Open album context for ${item.album_title}`
+				: `Open ${item.album_title}`}
+		></a>
+	{/if}
 
 	<div class="relative z-10 flex items-center gap-3 sm:gap-4 p-3 sm:p-4 pointer-events-none">
 		<div class="w-14 h-14 sm:w-18 sm:h-18 shrink-0 rounded-lg overflow-hidden relative">
 			<AlbumImage
-				mbid={item.musicbrainz_id}
+				mbid={artworkMbid}
 				customUrl={item.cover_url ?? null}
 				alt={item.album_title}
 				size="sm"
@@ -229,11 +244,16 @@
 				</div>
 			{/if}
 		</div>
-
-		<div class="flex-1 min-w-0">
+		<div class="min-w-0 flex-1">
 			<p class="font-semibold text-base-content text-sm sm:text-base line-clamp-1">
-				{item.album_title}
+				{trackTitle}
 			</p>
+			{#if isTrackRequest}
+				<p class="text-xs sm:text-sm text-base-content/70 line-clamp-1 text-left">
+					<span class="badge badge-ghost badge-xs align-middle">Track</span>
+					<span class="ml-1">Album: {item.album_title}</span>
+				</p>
+			{/if}
 			{#if artistMbid}
 				<a
 					href={artistHref(artistMbid)}
@@ -387,7 +407,8 @@
 								reimport.mutate(
 									{
 										id: historyItem.download_task_id!,
-										release_group_mbid: historyItem.musicbrainz_id
+										release_group_mbid:
+											historyItem.track_release_group_mbid ?? historyItem.musicbrainz_id
 									},
 									{ onSuccess: () => onreimported?.() }
 								);
@@ -399,7 +420,7 @@
 							<FileDown class="h-3.5 w-3.5" />
 						</button>
 					{/if}
-					{#if authStore.isAdmin && historyItem.status === 'imported' && historyItem.in_library}
+					{#if authStore.isAdmin && !isTrackRequest && historyItem.status === 'imported' && historyItem.in_library}
 						<button
 							class="btn btn-xs btn-ghost text-base-content/40 hover:text-error"
 							onclick={handleRemoveFromLibrary}

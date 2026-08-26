@@ -33,6 +33,7 @@ interface TrackRequestInput {
 	duration_seconds?: number | null;
 	release_group_mbid?: string | null;
 	artist_mbid?: string | null;
+	release_id?: string | null;
 }
 
 const invalidateTasks = () =>
@@ -56,13 +57,52 @@ export function requestAlbum() {
 				artist_mbid: input.artist_mbid ?? null
 			}),
 		onSuccess: (data: RequestAccepted) => {
-			toastStore.show({
-				message:
-					data.status === 'awaiting_approval'
-						? 'Request submitted for admin approval'
-						: 'Request submitted - searching for downloads',
-				type: 'success'
-			});
+			if (!data.success) {
+				toastStore.show({
+					message: data.message || 'Request failed',
+					type: 'error'
+				});
+			} else {
+				switch (data.status) {
+					case 'pending':
+						toastStore.show({
+							message: 'Request submitted - searching for downloads',
+							type: 'success'
+						});
+						break;
+					case 'awaiting_approval':
+						toastStore.show({
+							message: 'Request submitted for admin approval',
+							type: 'success'
+						});
+						break;
+					case 'queued':
+					case 'downloading':
+						toastStore.show({
+							message: data.message || 'Request already in progress',
+							type: 'info'
+						});
+						break;
+					case 'cancelling':
+						toastStore.show({
+							message: data.message || 'Request is being cancelled',
+							type: 'info'
+						});
+						break;
+					case 'failed':
+						toastStore.show({
+							message: data.message || 'Request failed',
+							type: 'error'
+						});
+						break;
+					case 'imported':
+						toastStore.show({
+							message: data.message || 'Album is already in the library',
+							type: 'info'
+						});
+						break;
+				}
+			}
 			void invalidateTasks();
 		},
 		onError: (err: unknown) =>
@@ -79,14 +119,17 @@ export function requestTrack() {
 				album_title: input.album_title ?? null,
 				duration_seconds: input.duration_seconds ?? null,
 				release_group_mbid: input.release_group_mbid ?? null,
-				artist_mbid: input.artist_mbid ?? null
+				artist_mbid: input.artist_mbid ?? null,
+				release_id: input.release_id ?? null
 			}),
 		onSuccess: (data: TrackRequestResponse) => {
 			toastStore.show({
 				message:
 					data.status === 'already_in_library'
 						? 'That track is already in your library'
-						: 'Track requested - searching for downloads',
+						: data.status === 'awaiting_approval'
+							? 'Track request submitted for admin approval'
+							: 'Track requested - searching for downloads',
 				type: 'success'
 			});
 			void invalidateTasks();

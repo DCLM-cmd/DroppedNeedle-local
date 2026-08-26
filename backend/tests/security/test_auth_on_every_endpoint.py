@@ -21,8 +21,9 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
 
-from api.v1.routes import connect_apps_routes
+from api.v1.routes import requests as requests_routes
 from api.v1.routes import auth as auth_routes
+from api.v1.routes import connect_apps_routes
 from api.v1.routes import download_client as download_client_routes
 from api.v1.routes import download_clients as download_clients_routes
 from api.v1.routes import downloads as downloads_routes
@@ -450,6 +451,28 @@ _ADMIN_ENDPOINTS = [
     ("GET", "/api/v1/requests/auto-download-approval-batches", None),
     ("POST", "/api/v1/requests/auto-download-approval-batches/batch-1/approve", None),
     ("POST", "/api/v1/requests/auto-download-approval-batches/batch-1/reject", None),
+    ("GET", "/api/v1/requests/pending-approvals", None),
+    ("GET", "/api/v1/requests/pending-approvals/count", None),
+    (
+        "POST",
+        "/api/v1/requests/approve/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa?request_kind=album",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/approve/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/reject/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa?request_kind=album",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/reject/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
     # Feedback Fixes target-only surfaces. The router remains unmounted in production
     # until the separately authorized offline replacement, but its auth contract is
     # complete and testable in isolation.
@@ -756,8 +779,69 @@ _ADMIN_ENDPOINTS = [
     ("POST", "/api/v1/downloads/held/management/task-1/retry", None),
     ("POST", "/api/v1/downloads/held/management/task-1/discard", None),
 ]
-
 _USER_ENDPOINTS = [
+    # Request submission surfaces: both album and exact-track asks are user
+    # scoped and must remain behind the CurrentUser dependency.
+    (
+        "POST",
+        "/api/v1/requests/new",
+        {
+            "musicbrainz_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "artist": "A",
+            "album": "B",
+        },
+    ),
+    (
+        "POST",
+        "/api/v1/requests/batch",
+        {
+            "items": [
+                {
+                    "musicbrainz_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "artist_name": "A",
+                    "album_title": "B",
+                }
+            ]
+        },
+    ),
+    (
+        "POST",
+        "/api/v1/requests/batch/cancel",
+        {"musicbrainz_ids": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]},
+    ),
+    ("GET", "/api/v1/requests/active", None),
+    ("GET", "/api/v1/requests/active/count", None),
+    ("GET", "/api/v1/requests/history", None),
+    (
+        "DELETE",
+        "/api/v1/requests/active/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        None,
+    ),
+    (
+        "DELETE",
+        "/api/v1/requests/active/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/retry/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/retry/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
+    (
+        "DELETE",
+        "/api/v1/requests/history/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        None,
+    ),
+    (
+        "DELETE",
+        "/api/v1/requests/history/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
     ("GET", "/api/v1/library/contributions/contribution-1", None),
     ("GET", "/api/v1/me/navidrome/music-folder-preferences", None),
     (
@@ -786,8 +870,11 @@ _USER_ENDPOINTS = [
     ("POST", "/api/v1/downloads/search/job-1/pick", {"candidate_index": 0}),
     ("POST", "/api/v1/downloads/search/job-1/dismiss", None),
     ("POST", "/api/v1/downloads/search/job-1/cancel", None),
-    ("POST", "/api/v1/tracks/rec-1/request", {"artist_name": "A", "track_title": "T"}),
-    ("GET", "/api/v1/library/artists", None),
+    (
+        "POST",
+        "/api/v1/tracks/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/request",
+        {"artist_name": "A", "track_title": "T"},
+    ),
     ("GET", "/api/v1/library/albums", None),
     ("GET", "/api/v1/library/tracks", None),
     ("GET", "/api/v1/library/stats", None),
@@ -796,6 +883,7 @@ _USER_ENDPOINTS = [
     ("GET", "/api/v1/library/mbids", None),
     ("GET", "/api/v1/library/recently-added", None),
     ("GET", "/api/v1/library/artists/artist-1", None),
+    ("GET", "/api/v1/library/artists", None),
     ("GET", "/api/v1/library/artists/artist-1/albums", None),
     ("GET", "/api/v1/library/artists/artist-1/appearances", None),
     ("GET", "/api/v1/library/albums/album-1", None),
@@ -934,6 +1022,7 @@ def _client(scenario: str):
         discovery_batches_routes.router,
         system_routes.router,
         playlists_routes.router,
+        requests_routes.router,
         requests_page_routes.router,
         lidarr_import_routes.router,
         import_drop_routes.router,

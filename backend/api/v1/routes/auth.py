@@ -10,6 +10,8 @@ from api.v1.schemas.auth import (
     AuthProvidersResponse,
     AuthResponse,
     CreateUserRequest,
+    DeviceSessionRequest,
+    DeviceSessionResponse,
     ImportCandidateListResponse,
     ImportUsersRequest,
     ImportUsersResponse,
@@ -231,6 +233,37 @@ async def list_sessions(
 ) -> SessionListResponse:
     tokens = await auth.list_sessions(current_user.id)
     return SessionListResponse(sessions = [session_to_response(token) for token in tokens])
+
+
+
+@router.post("/device-sessions", response_model = DeviceSessionResponse)
+async def create_device_session(
+    current_user: CurrentUserDep,
+    current_token: CurrentTokenDep,
+    response: Response,
+    body: DeviceSessionRequest = MsgSpecBody(DeviceSessionRequest),
+    auth: AuthService = Depends(get_auth_service),
+) -> DeviceSessionResponse:
+    """Mint a separately revocable bearer for one trusted companion."""
+    response.headers["Cache-Control"] = "no-store"
+    if current_token.session_kind != "standard":
+        raise HTTPException(
+            status_code = status.HTTP_403_FORBIDDEN,
+            detail = "Companion sessions cannot mint device sessions",
+        )
+    try:
+        auth.validate_device_session_name(body.device_name)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code = status.HTTP_400_BAD_REQUEST, detail = str(exc))
+    providers = await auth.get_provider_names_for_users([current_user.id])
+    try:
+        token = await auth.issue_device_session(current_user.id, body.device_name)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code = status.HTTP_400_BAD_REQUEST, detail = str(exc))
+    return DeviceSessionResponse(
+        token = token,
+        user = user_to_response(current_user, providers.get(current_user.id)),
+    )
 
 
 @router.delete("/sessions/{session_id}", status_code = status.HTTP_204_NO_CONTENT)

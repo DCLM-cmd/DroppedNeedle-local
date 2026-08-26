@@ -12,6 +12,7 @@
 		albumTitle?: string | null;
 		durationSeconds?: number | null;
 		artistMbid?: string | null;
+		releaseMbid?: string | null;
 	}
 	let {
 		recordingMbid,
@@ -20,7 +21,8 @@
 		albumMbid,
 		albumTitle = null,
 		durationSeconds = null,
-		artistMbid = null
+		artistMbid = null,
+		releaseMbid = null
 	}: Props = $props();
 
 	const request = requestTrack();
@@ -35,7 +37,8 @@
 				album_title: albumTitle,
 				duration_seconds: durationSeconds,
 				release_group_mbid: albumMbid,
-				artist_mbid: artistMbid
+				artist_mbid: artistMbid,
+				release_id: releaseMbid
 			},
 			{ onSuccess: () => (requested = true) }
 		);

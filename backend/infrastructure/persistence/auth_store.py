@@ -47,6 +47,7 @@ class TokenRecord(msgspec.Struct, frozen = True):
     last_seen_at: str
     revoked: bool
     user_agent: str | None = None
+    session_kind: str = "standard"
 
 
 class AuthStore(PersistenceBase):
@@ -101,7 +102,8 @@ class AuthStore(PersistenceBase):
                     expires_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL,
                     revoked INTEGER NOT NULL DEFAULT 0,
-                    user_agent TEXT
+                    user_agent TEXT,
+                    session_kind TEXT NOT NULL DEFAULT 'standard'
                 );
                 CREATE INDEX IF NOT EXISTS idx_auth_tokens_user
                     ON auth_tokens(user_id);
@@ -135,6 +137,15 @@ class AuthStore(PersistenceBase):
             # PKCE column ratchet: pre-PKCE databases lack it; additive, idempotent.
             try:
                 conn.execute("ALTER TABLE auth_oidc_states ADD COLUMN code_verifier TEXT")
+            except sqlite3.OperationalError:
+                pass  # duplicate column - already present
+            # Companion sessions must not be inferred from an untrusted HTTP User-Agent.
+            # Existing rows remain standard because their provenance is ambiguous.
+            try:
+                conn.execute(
+                    "ALTER TABLE auth_tokens ADD COLUMN session_kind "
+                    "TEXT NOT NULL DEFAULT 'standard'"
+                )
             except sqlite3.OperationalError:
                 pass  # duplicate column - already present
             # Username login (D3): additive, idempotent. `username` is the lowercased
@@ -195,6 +206,7 @@ class AuthStore(PersistenceBase):
             last_seen_at = row["last_seen_at"],
             revoked = bool(row["revoked"]),
             user_agent = row["user_agent"],
+            session_kind = row["session_kind"],
         )
 
     async def has_any_users(self) -> bool:
@@ -599,8 +611,9 @@ class AuthStore(PersistenceBase):
         def operation(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """INSERT INTO auth_tokens
-                   (id, user_id, token_hash, issued_at, expires_at, last_seen_at, revoked, user_agent)
-                   VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
+                   (id, user_id, token_hash, issued_at, expires_at, last_seen_at,
+                    revoked, user_agent, session_kind)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'standard')""",
                 (id, user_id, token_hash, now, expiry, now, user_agent),
             )
 
@@ -614,6 +627,48 @@ class AuthStore(PersistenceBase):
             last_seen_at = now,
             revoked = False,
             user_agent = user_agent,
+            session_kind = "standard",
+        )
+
+    async def replace_companion_token(
+        self,
+        *,
+        id: str,
+        user_id: str,
+        token_hash: str,
+        user_agent: str,
+    ) -> TokenRecord:
+        """Issue a companion and revoke an active same-label companion atomically."""
+        now = _now_iso()
+        expiry = _expiry_iso()
+
+        def operation(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """INSERT INTO auth_tokens
+                   (id, user_id, token_hash, issued_at, expires_at, last_seen_at,
+                    revoked, user_agent, session_kind)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'companion')""",
+                (id, user_id, token_hash, now, expiry, now, user_agent),
+            )
+            conn.execute(
+                """UPDATE auth_tokens SET revoked = 1
+                   WHERE user_id = ? AND user_agent = ? AND id != ?
+                     AND session_kind = 'companion'
+                     AND revoked = 0 AND expires_at > ?""",
+                (user_id, user_agent, id, now),
+            )
+
+        await self._write(operation)
+        return TokenRecord(
+            id = id,
+            user_id = user_id,
+            token_hash = token_hash,
+            issued_at = now,
+            expires_at = expiry,
+            last_seen_at = now,
+            revoked = False,
+            user_agent = user_agent,
+            session_kind = "companion",
         )
 
     async def verify_token(self, raw_token: str) -> TokenRecord | None:
@@ -647,6 +702,7 @@ class AuthStore(PersistenceBase):
                 "SELECT token.id AS token_id, token.user_id AS token_user_id, "
                 "token.token_hash, token.issued_at, token.expires_at, "
                 "token.last_seen_at, token.revoked, token.user_agent, "
+                "token.session_kind, "
                 "user.id AS user_id, user.display_name, user.email, "
                 "user.avatar_url, user.role, user.created_at, user.last_login_at, "
                 "user.username, user.username_display "
@@ -671,14 +727,15 @@ class AuthStore(PersistenceBase):
                 username_display=row["username_display"],
             )
             token = TokenRecord(
-                id=str(row["token_id"]),
-                user_id=str(row["token_user_id"]),
-                token_hash=str(row["token_hash"]),
-                issued_at=str(row["issued_at"]),
-                expires_at=str(row["expires_at"]),
-                last_seen_at=str(row["last_seen_at"]),
-                revoked=bool(row["revoked"]),
-                user_agent=row["user_agent"],
+                id = str(row["token_id"]),
+                user_id = str(row["token_user_id"]),
+                token_hash = str(row["token_hash"]),
+                issued_at = str(row["issued_at"]),
+                expires_at = str(row["expires_at"]),
+                last_seen_at = str(row["last_seen_at"]),
+                revoked = bool(row["revoked"]),
+                user_agent = row["user_agent"],
+                session_kind = str(row["session_kind"]),
             )
             return user, token
 

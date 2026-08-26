@@ -36,6 +36,11 @@ class LoginRequest(AppStruct):
     password: str
 
 
+class DeviceSessionRequest(AppStruct):
+    """A caller-authorized, separately revocable companion session."""
+
+    device_name: str
+
 class PasswordRecoveryResetRequest(AppStruct):
     username: str
     recovery_code: str
@@ -58,6 +63,10 @@ class UserResponse(AppStruct):
     providers: list[str] = []
 
 
+class DeviceSessionResponse(AppStruct):
+    token: str
+    user: UserResponse
+
 class AuthResponse(AppStruct):
     token: str
     user: UserResponse
@@ -69,7 +78,7 @@ class SessionResponse(AppStruct):
     expires_at: str
     last_seen_at: str
     user_agent: str | None = None
-
+    session_kind: str = "standard"
 
 class SessionListResponse(AppStruct):
     sessions: list[SessionResponse]
@@ -184,4 +193,5 @@ def session_to_response(token) -> SessionResponse:
         expires_at = token.expires_at,
         last_seen_at = token.last_seen_at,
         user_agent = token.user_agent,
+        session_kind = token.session_kind,
     )

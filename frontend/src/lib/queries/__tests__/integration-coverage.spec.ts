@@ -13,6 +13,7 @@ import { API } from '$lib/constants';
 
 // [description, actual path produced by the API builder, expected backend route]
 const COVERAGE: Array<[string, string, string]> = [
+	['device session', API.auth.deviceSessions(), '/api/v1/auth/device-sessions'],
 	// local password recovery
 	[
 		'password recovery reset',
@@ -673,6 +674,64 @@ const COVERAGE: Array<[string, string, string]> = [
 		'Plex user playlist image',
 		API.plexLibrary.playlistImage('P1', 'I1', 300),
 		'/api/v1/plex/playlist-image/P1/I1?size=300'
+	],
+	// Request page reads and actions (album default plus exact-track variants)
+	['active requests', API.requests.active(), '/api/v1/requests/active'],
+	['request history', API.requests.history(), '/api/v1/requests/history?page=1&page_size=20'],
+	[
+		'pending request approvals',
+		API.requests.pendingApprovals(),
+		'/api/v1/requests/pending-approvals'
+	],
+	[
+		'cancel request (album)',
+		API.requests.cancel('M1'),
+		'/api/v1/requests/active/M1?request_kind=album'
+	],
+	[
+		'cancel request (track)',
+		API.requests.cancel('M/1', 'track'),
+		'/api/v1/requests/active/M%2F1?request_kind=track'
+	],
+	[
+		'retry request (album)',
+		API.requests.retry('M1'),
+		'/api/v1/requests/retry/M1?request_kind=album'
+	],
+	[
+		'retry request (track)',
+		API.requests.retry('M/1', 'track'),
+		'/api/v1/requests/retry/M%2F1?request_kind=track'
+	],
+	[
+		'clear request history (album)',
+		API.requests.clearHistoryItem('M1'),
+		'/api/v1/requests/history/M1?request_kind=album'
+	],
+	[
+		'clear request history (track)',
+		API.requests.clearHistoryItem('M/1', 'track'),
+		'/api/v1/requests/history/M%2F1?request_kind=track'
+	],
+	[
+		'approve request (album)',
+		API.requests.approve('M1'),
+		'/api/v1/requests/approve/M1?request_kind=album'
+	],
+	[
+		'approve request (track)',
+		API.requests.approve('M/1', 'track'),
+		'/api/v1/requests/approve/M%2F1?request_kind=track'
+	],
+	[
+		'reject request (album)',
+		API.requests.reject('M1'),
+		'/api/v1/requests/reject/M1?request_kind=album'
+	],
+	[
+		'reject request (track)',
+		API.requests.reject('M/1', 'track'),
+		'/api/v1/requests/reject/M%2F1?request_kind=track'
 	],
 	// Weekly Mix (user-scoped refresh + admin standing-grant queue)
 	['personal mix refresh', API.me.personalMixRefresh(), '/api/v1/me/personal-mix/refresh'],

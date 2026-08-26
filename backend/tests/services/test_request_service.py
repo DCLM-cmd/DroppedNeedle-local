@@ -1,9 +1,15 @@
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import ExternalServiceError, ValidationError
+from infrastructure.persistence.request_history import (
+    RequestBeginResult,
+    RequesterCancelDecision,
+    RequestHistoryStore,
+)
 from services.request_service import RequestService
 from tests.helpers import make_builtin_dispatcher
 
@@ -12,14 +18,48 @@ def _make_service() -> tuple[RequestService, MagicMock, MagicMock]:
     request_history = MagicMock()
     download_service = MagicMock()
 
-    request_history.async_record_request = AsyncMock()
     request_history.async_get_record = AsyncMock(return_value=None)
-    request_history.async_update_status = AsyncMock()
-    request_history.async_update_download_task_id = AsyncMock()
-    request_history.async_bulk_record_requests = AsyncMock()
+    request_history.async_record_request = AsyncMock(
+        side_effect=lambda **kwargs: RequestBeginResult(
+            musicbrainz_id=str(kwargs["musicbrainz_id"]),
+            request_kind=str(kwargs.get("request_kind", "album")),
+            generation=1,
+        )
+    )
+    request_history.async_bulk_record_requests = AsyncMock(
+        side_effect=lambda items, **_kwargs: [
+            RequestBeginResult(
+                musicbrainz_id=str(item["musicbrainz_id"]),
+                request_kind=str(item.get("request_kind", "album")),
+                generation=1,
+            )
+            for item in items
+        ]
+    )
+    request_history.async_add_requester = AsyncMock(return_value=True)
+    request_history.async_add_requesters = AsyncMock(return_value=1)
+    request_history.async_is_requester = AsyncMock(return_value=True)
+    request_history.async_requester_count = AsyncMock(return_value=1)
+    request_history.async_remove_requester = AsyncMock(return_value=True)
+    request_history.async_prepare_requester_cancel = AsyncMock(
+        return_value=RequesterCancelDecision("cancelled", "awaiting_approval", 1)
+    )
     request_history.async_get_active_mbids = AsyncMock(return_value=set())
     request_history.async_get_requested_mbids = AsyncMock(return_value=set())
+    request_history.async_canonicalize_known_release_aliases = AsyncMock(return_value=1)
+    request_history.async_update_monitoring_flags = AsyncMock(return_value=True)
+    request_history.async_update_dispatch_authorized = AsyncMock(return_value=True)
+    request_history.async_update_status = AsyncMock(return_value=True)
+    request_history.async_update_download_task_id = AsyncMock(return_value=True)
+    request_history.async_restore_request_status = AsyncMock(return_value=True)
+    request_history.async_claim_approval = AsyncMock(
+        return_value=RequestBeginResult("request", "album", 1)
+    )
+    request_history.async_claim_retry = AsyncMock(
+        return_value=RequestBeginResult("request", "album", 1)
+    )
     download_service.request_album = AsyncMock(return_value="task-1")
+    download_service.request_track = AsyncMock(return_value="track-task-1")
     download_service.cancel_task = AsyncMock()
 
     get_ds = lambda: download_service  # noqa: E731
@@ -50,7 +90,7 @@ async def test_request_album_dispatches_download_and_links_task():
 
     download_service.request_album.assert_awaited_once()
     request_history.async_update_download_task_id.assert_awaited_once_with(
-        "rg-123", "task-1"
+        "rg-123", "task-1", request_kind="album", expected_generation=1
     )
     request_history.async_record_request.assert_awaited_once()
     kwargs = request_history.async_record_request.await_args.kwargs
@@ -149,15 +189,22 @@ async def test_request_album_already_in_library_not_linked_as_task_id():
     assert response.success is True
     assert response.message == "Album is already in the library"
     request_history.async_update_download_task_id.assert_not_awaited()
+    status_call = request_history.async_update_status.await_args
+    assert status_call.args[:2] == ("rg-123", "imported")
+    assert status_call.kwargs["expected_generation"] == 1
 
 
 @pytest.mark.asyncio
 async def test_request_album_wraps_errors():
-    service, _request_history, download_service = _make_service()
+    service, request_history, download_service = _make_service()
     download_service.request_album = AsyncMock(side_effect=RuntimeError("boom"))
 
     with pytest.raises(ExternalServiceError):
         await service.request_album("rg-123", user_role="admin")
+
+    status_call = request_history.async_update_status.await_args
+    assert status_call.args[:2] == ("rg-123", "failed")
+    assert status_call.kwargs["expected_generation"] == 1
 
 
 @pytest.mark.asyncio
@@ -190,6 +237,10 @@ async def test_request_batch_dispatches_each_and_links():
         for c in request_history.async_update_download_task_id.await_args_list
     }
     assert linked == {"rg-1": "task-1", "rg-2": "task-2"}
+    assert all(
+        call.kwargs["expected_generation"] == 1
+        for call in request_history.async_update_download_task_id.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -227,6 +278,10 @@ async def test_request_batch_canonicalizes_aliases_and_keeps_the_source_release(
     assert (
         download_service.request_album.await_args_list[0].kwargs["release_mbid"]
         == "release-1"
+    )
+    assert all(
+        call.kwargs["expected_generation"] == 1
+        for call in request_history.async_update_download_task_id.await_args_list
     )
 
 
@@ -296,6 +351,7 @@ async def test_request_batch_does_not_overwrite_an_approval_pending_request():
 
     assert response.requested == 0
     assert response.skipped == 1
+    assert response.status == "already_requested"
     request_history.async_bulk_record_requests.assert_not_awaited()
     download_service.request_album.assert_not_awaited()
 
@@ -310,15 +366,22 @@ async def test_request_batch_user_role_awaits_approval_without_dispatch():
     resp = await service.request_batch(items, user_role="user", user_id="u1")
 
     assert "approval" in resp.message.lower()
+    assert resp.status == "awaiting_approval"
     download_service.request_album.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_cancel_batch_admin_cancels_all():
     service, request_history, download_service = _make_service()
-    request_history.async_update_status = AsyncMock()
+    request_history.async_update_status = AsyncMock(return_value=True)
     request_history.async_get_record = AsyncMock(
-        return_value=SimpleNamespace(user_id="bob", download_task_id=None)
+        return_value=SimpleNamespace(
+            status="pending",
+            user_id="bob",
+            download_task_id=None,
+            generation=1,
+            dispatch_authorized=True,
+        )
     )
 
     response = await service.cancel_batch(
@@ -329,33 +392,93 @@ async def test_cancel_batch_admin_cancels_all():
     assert response.failed == 0
     assert response.success is True
     download_service.cancel_task.assert_not_awaited()
+    request_history.async_update_status.assert_any_await(
+        "rg-1",
+        "cancelled",
+        completed_at=ANY,
+        request_kind="album",
+        expected_generation=1,
+    )
+    request_history.async_update_status.assert_any_await(
+        "rg-2",
+        "cancelled",
+        completed_at=ANY,
+        request_kind="album",
+        expected_generation=1,
+    )
+    assert request_history.async_update_status.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cancel_batch_without_user_identity_cannot_use_admin_override():
+    service, request_history, download_service = _make_service()
+    request_history.async_get_record = AsyncMock(
+        return_value=SimpleNamespace(
+            status="pending",
+            user_id="owner",
+            download_task_id="task-owned",
+            generation=1,
+        )
+    )
+    request_history.async_prepare_requester_cancel.return_value = RequesterCancelDecision(
+        "denied", "pending", 1
+    )
+
+    response = await service.cancel_batch(
+        ["rg-owned"], user_id=None, user_role="user"
+    )
+
+    assert response.success is False
+    assert response.cancelled == 0
+    assert response.failed == 1
+    request_history.async_update_status.assert_not_awaited()
+    download_service.cancel_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_cancel_batch_cancels_linked_native_task():
     service, request_history, download_service = _make_service()
-    request_history.async_update_status = AsyncMock()
+    request_history.async_update_status = AsyncMock(return_value=True)
     request_history.async_get_record = AsyncMock(
-        return_value=SimpleNamespace(user_id="alice", download_task_id="task-9")
+        return_value=SimpleNamespace(
+            status="downloading",
+            user_id="alice",
+            download_task_id="task-9",
+            generation=1,
+        )
+    )
+    request_history.async_prepare_requester_cancel.return_value = RequesterCancelDecision(
+        "cancel_task", "downloading", 1
     )
 
     response = await service.cancel_batch(["rg-mine"], user_id="alice")
 
     assert response.cancelled == 1
     download_service.cancel_task.assert_awaited_once_with("task-9", "alice", "user")
+    status_call = request_history.async_update_status.await_args
+    assert status_call.args[:2] == ("rg-mine", "cancelled")
+    assert status_call.kwargs["expected_generation"] == 1
 
 
 @pytest.mark.asyncio
 async def test_cancel_batch_user_only_cancels_owned_requests():
     service, request_history, download_service = _make_service()
-    request_history.async_update_status = AsyncMock()
+    request_history.async_update_status = AsyncMock(return_value=True)
     records = {
-        "rg-mine": SimpleNamespace(user_id="alice", download_task_id=None),
-        "rg-theirs": SimpleNamespace(user_id="bob", download_task_id=None),
+        "rg-mine": SimpleNamespace(
+            status="pending", user_id="alice", download_task_id=None, generation=1
+        ),
+        "rg-theirs": SimpleNamespace(
+            status="pending", user_id="bob", download_task_id=None, generation=1
+        ),
     }
     request_history.async_get_record = AsyncMock(
-        side_effect=lambda mbid: records.get(mbid)
+        side_effect=lambda mbid, **_kwargs: records.get(mbid)
     )
+    request_history.async_prepare_requester_cancel.side_effect = [
+        RequesterCancelDecision("cancelled", "pending", 1),
+        RequesterCancelDecision("denied", "pending", 1),
+    ]
 
     response = await service.cancel_batch(["rg-mine", "rg-theirs"], user_id="alice")
 
@@ -367,7 +490,7 @@ async def test_cancel_batch_user_only_cancels_owned_requests():
 @pytest.mark.asyncio
 async def test_cancel_batch_user_missing_record_counts_as_failed():
     service, request_history, _download = _make_service()
-    request_history.async_update_status = AsyncMock()
+    request_history.async_update_status = AsyncMock(return_value=True)
     request_history.async_get_record = AsyncMock(return_value=None)
 
     response = await service.cancel_batch(["rg-unknown"], user_id="alice")
@@ -385,8 +508,8 @@ def _make_service_with_quota() -> (
 ):
     service, request_history, download_service = _make_service()
     quota = MagicMock()
-    quota.check_request_quota = AsyncMock()
-    quota.check_storage_admission = AsyncMock()
+    quota.check_request_quota = AsyncMock(return_value=True)
+    quota.check_storage_admission = AsyncMock(return_value=True)
     service._quota = quota
     return service, request_history, download_service, quota
 
@@ -464,10 +587,15 @@ async def test_request_album_resolves_download_service_per_dispatch():
     capture an instance - else a saved quality change is ignored until restart. Uses
     DISTINCT mbids so the second call isn't short-circuited by request dedup."""
     request_history = MagicMock()
-    request_history.async_record_request = AsyncMock()
+    request_history.async_record_request = AsyncMock(
+        side_effect=[
+            RequestBeginResult("rg-A", "album", 1),
+            RequestBeginResult("rg-B", "album", 1),
+        ]
+    )
     request_history.async_get_record = AsyncMock(return_value=None)
-    request_history.async_update_status = AsyncMock()
-    request_history.async_update_download_task_id = AsyncMock()
+    request_history.async_update_status = AsyncMock(return_value=True)
+    request_history.async_update_download_task_id = AsyncMock(return_value=True)
 
     ds_a, ds_b = MagicMock(), MagicMock()
     ds_a.request_album = AsyncMock(return_value="task-a")
@@ -486,3 +614,457 @@ async def test_request_album_resolves_download_service_per_dispatch():
 
     ds_a.request_album.assert_awaited_once()  # first dispatch used the original engine
     ds_b.request_album.assert_awaited_once()  # second used the NEW one (fails if captured)
+    assert [
+        call.kwargs["expected_generation"]
+        for call in request_history.async_update_download_task_id.await_args_list
+    ] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_request_track_user_role_records_exact_metadata_and_awaits_approval():
+    service, request_history, download_service = _make_service()
+
+    response = await service.request_track(
+        "recording-1",
+        user_id="listener-1",
+        user_role="user",
+        requested_by_name="Listener",
+        artist_name="Radiohead",
+        track_title="Airbag",
+        album_title="OK Computer",
+        duration_seconds=287,
+        release_group_mbid="release-group-1",
+        artist_mbid="artist-1",
+        release_mbid="release-1",
+    )
+
+    assert response.status == "awaiting_approval"
+    assert response.task_id is None
+    download_service.request_track.assert_not_awaited()
+    kwargs = request_history.async_record_request.await_args.kwargs
+    assert kwargs["musicbrainz_id"] == "recording-1"
+    assert kwargs["request_kind"] == "track"
+    assert kwargs["track_title"] == "Airbag"
+    assert kwargs["duration_seconds"] == 287
+    assert kwargs["track_release_group_mbid"] == "release-group-1"
+    assert kwargs["release_mbid"] == "release-1"
+    assert kwargs["initial_status"] == "awaiting_approval"
+    assert kwargs["dispatch_authorized"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_role", "expected_status", "authorized"),
+    [
+        ("trusted", "queued", True),
+        ("admin", "queued", True),
+        ("unknown-role", "awaiting_approval", False),
+    ],
+)
+async def test_request_track_role_gate_is_fail_closed(
+    user_role: str, expected_status: str, authorized: bool
+):
+    service, request_history, download_service = _make_service()
+
+    response = await service.request_track(
+        "recording-role",
+        user_id="listener-role",
+        user_role=user_role,
+        artist_name="Radiohead",
+        track_title="Airbag",
+        album_title="OK Computer",
+        release_group_mbid="release-group-1",
+    )
+
+    assert response.status == expected_status
+    assert (
+        response.task_id == "track-task-1"
+        if expected_status == "queued"
+        else response.task_id is None
+    )
+    kwargs = request_history.async_record_request.await_args.kwargs
+    assert kwargs["request_kind"] == "track"
+    assert kwargs["dispatch_authorized"] is authorized
+    if authorized:
+        download_service.request_track.assert_awaited_once()
+        assert (
+            request_history.async_update_download_task_id.await_args.kwargs[
+                "expected_generation"
+            ]
+            == 1
+        )
+    else:
+        download_service.request_track.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_existing_exact_track_attaches_listener_without_redispatch():
+    service, request_history, download_service = _make_service()
+    request_history.async_get_record.return_value = SimpleNamespace(
+        status="pending", download_task_id="existing-track-task", generation=1
+    )
+
+    response = await service.request_track(
+        "recording-shared",
+        user_id="listener-2",
+        user_role="user",
+        requested_by_name="Second listener",
+        artist_name="Radiohead",
+        track_title="Airbag",
+    )
+
+    assert response.status == "queued"
+    assert response.task_id == "existing-track-task"
+    request_history.async_add_requester.assert_awaited_once_with(
+        "recording-shared",
+        "listener-2",
+        "Second listener",
+        request_kind="track",
+    )
+    download_service.request_track.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_existing_album_attaches_listener_without_redispatch():
+    service, request_history, download_service = _make_service()
+    request_history.async_get_record.return_value = SimpleNamespace(
+        status="pending", monitor_artist=False, generation=1
+    )
+
+    response = await service.request_album(
+        "release-group-shared",
+        user_id="listener-2",
+        user_role="user",
+        requested_by_name="Second listener",
+    )
+
+    assert response.status == "pending"
+    request_history.async_add_requester.assert_awaited_once_with(
+        "release-group-shared", "listener-2", "Second listener", request_kind="album"
+    )
+    download_service.request_album.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batch_duplicate_attaches_listener_and_reports_authoritative_status():
+    service, request_history, download_service = _make_service()
+    request_history.async_get_requested_mbids.return_value = {"rg-existing"}
+
+    response = await service.request_batch(
+        [
+            {"musicbrainz_id": "rg-existing"},
+            {"musicbrainz_id": "rg-new", "artist_name": "Artist"},
+        ],
+        user_id="listener-2",
+        user_role="user",
+    )
+
+    assert response.status == "awaiting_approval"
+    assert response.requested == 1
+    request_history.async_add_requesters.assert_awaited_once_with(
+        ["rg-existing"], "listener-2", None, request_kind="album"
+    )
+    download_service.request_album.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_role", "expected_status", "authorized"),
+    [
+        ("user", "awaiting_approval", False),
+        ("trusted", "pending", True),
+        ("admin", "pending", True),
+    ],
+)
+async def test_new_album_generation_persists_dispatch_authorization(
+    user_role: str, expected_status: str, authorized: bool
+):
+    service, request_history, download_service = _make_service()
+
+    response = await service.request_album(
+        f"release-group-{user_role}",
+        user_id=f"user-{user_role}",
+        user_role=user_role,
+    )
+
+    assert response.status == expected_status
+    kwargs = request_history.async_record_request.await_args.kwargs
+    assert kwargs["dispatch_authorized"] is authorized
+    if authorized:
+        download_service.request_album.assert_awaited_once()
+        assert (
+            request_history.async_update_download_task_id.await_args.kwargs[
+                "expected_generation"
+            ]
+            == 1
+        )
+    else:
+        download_service.request_album.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_album_and_track_with_same_uuid_use_isolated_history_kinds(tmp_path):
+    store = RequestHistoryStore(tmp_path / "library.db")
+    download_service = MagicMock()
+    download_service.request_album = AsyncMock(return_value="album-task")
+    download_service.request_track = AsyncMock(return_value="track-task")
+
+    get_ds = lambda: download_service  # noqa: E731
+    service = RequestService(
+        store,
+        get_download_service=get_ds,
+        acquisition=make_builtin_dispatcher(get_ds),
+    )
+
+    await service.request_album(
+        "same-uuid",
+        artist="Artist",
+        album="Album",
+        user_id="album-user",
+        user_role="trusted",
+    )
+    await service.request_track(
+        "same-uuid",
+        user_id="track-user",
+        user_role="trusted",
+        artist_name="Artist",
+        track_title="Track",
+        album_title="Album",
+        duration_seconds=200,
+        release_group_mbid="release-group",
+        release_mbid="release-edition",
+    )
+
+    album = await store.async_get_record("same-uuid")
+    track = await store.async_get_record("same-uuid", request_kind="track")
+    assert album is not None
+    assert track is not None
+    assert album.request_kind == "album"
+    assert album.download_task_id == "album-task"
+    assert track.request_kind == "track"
+    assert track.musicbrainz_id == "same-uuid"
+    assert track.download_task_id == "track-task"
+    assert track.track_title == "Track"
+    assert track.release_mbid == "release-edition"
+    assert await store.async_requester_count("same-uuid") == 1
+    assert await store.async_requester_count("same-uuid", request_kind="track") == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_batch_uses_atomic_last_listener_decision_and_primary_owner():
+    service, history, download_service = _make_service()
+    history.async_get_record.return_value = SimpleNamespace(
+        status="downloading",
+        user_id="primary-owner",
+        download_task_id="task-shared",
+        generation=1,
+    )
+    history.async_prepare_requester_cancel.return_value = RequesterCancelDecision(
+        "cancel_task", "downloading", 1
+    )
+
+    response = await service.cancel_batch(
+        ["rg-shared"], user_id="second-listener", user_role="user"
+    )
+
+    assert response.success is True
+    assert response.cancelled == 1
+    download_service.cancel_task.assert_awaited_once_with(
+        "task-shared", "primary-owner", "user"
+    )
+    status_calls = history.async_update_status.await_args_list
+    assert status_calls
+    assert status_calls[-1].args[:2] == ("rg-shared", "cancelled")
+    assert status_calls[-1].kwargs["expected_generation"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_batch_restores_status_and_reports_failure_when_task_cancel_fails():
+    service, history, download_service = _make_service()
+    history.async_get_record.return_value = SimpleNamespace(
+        status="downloading",
+        user_id="primary-owner",
+        download_task_id="task-shared",
+        generation=1,
+    )
+    history.async_prepare_requester_cancel.return_value = RequesterCancelDecision(
+        "cancel_task", "downloading", 1
+    )
+    download_service.cancel_task.side_effect = RuntimeError("provider secret")
+
+    response = await service.cancel_batch(
+        ["rg-shared"], user_id="second-listener", user_role="user"
+    )
+
+    assert response.success is False
+    assert response.cancelled == 0
+    assert response.failed == 1
+    history.async_update_status.assert_not_awaited()
+    history.async_restore_request_status.assert_awaited_once_with(
+        "rg-shared",
+        "downloading",
+        expected_status="cancelling",
+        expected_generation=1,
+        request_kind="album",
+    )
+    assert "provider secret" not in response.message
+
+
+@pytest.mark.asyncio
+async def test_terminal_reactivation_starts_private_generation_without_old_listeners(
+    tmp_path,
+):
+    store = RequestHistoryStore(tmp_path / "library.db")
+    download_service = MagicMock()
+    download_service.request_album = AsyncMock(return_value="new-task")
+    get_ds = lambda: download_service  # noqa: E731
+    service = RequestService(
+        store,
+        get_download_service=get_ds,
+        acquisition=make_builtin_dispatcher(get_ds),
+    )
+
+    await store.async_record_request(
+        "release-group-private",
+        "Artist",
+        "Album",
+        user_id="old-owner",
+        initial_status="pending",
+    )
+    await store.async_add_requester("release-group-private", "old-listener")
+    await store.async_update_status("release-group-private", "failed")
+
+    response = await service.request_album(
+        "release-group-private",
+        user_id="new-owner",
+        user_role="user",
+        requested_by_name="New owner",
+    )
+
+    assert response.status == "awaiting_approval"
+    assert await store.async_is_requester("old-owner", "release-group-private") is False
+    assert await store.async_is_requester("old-listener", "release-group-private") is False
+    assert await store.async_is_requester("new-owner", "release-group-private") is True
+    record = await store.async_get_record("release-group-private")
+    assert record is not None
+    assert record.status == "awaiting_approval"
+    assert record.user_id == "new-owner"
+    assert record.dispatch_authorized is False
+    download_service.request_album.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_dispatch_generation_cancels_orphan_after_reactivation():
+    service, history, download_service = _make_service()
+    dispatch_started = asyncio.Event()
+    release_old_dispatch = asyncio.Event()
+
+    history.async_get_record = AsyncMock(
+        side_effect=[
+            None,
+            SimpleNamespace(
+                status="pending",
+                user_id="old-owner",
+                download_task_id=None,
+                generation=1,
+            ),
+            SimpleNamespace(status="failed", generation=1),
+        ]
+    )
+    history.async_record_request = AsyncMock(
+        side_effect=[
+            RequestBeginResult("rg-race", "album", 1),
+            RequestBeginResult("rg-race", "album", 2),
+        ]
+    )
+    history.async_prepare_requester_cancel.return_value = RequesterCancelDecision(
+        "cancelled", "pending", 1
+    )
+
+    async def dispatch(**kwargs):
+        if kwargs["user_id"] == "old-owner":
+            dispatch_started.set()
+            await release_old_dispatch.wait()
+            return "orphan-task"
+        return "successor-task"
+
+    download_service.request_album = AsyncMock(side_effect=dispatch)
+    link_generations: list[int | None] = []
+
+    async def link(_mbid, _task_id, **kwargs):
+        generation = kwargs.get("expected_generation")
+        link_generations.append(generation)
+        return generation != 1
+
+    history.async_update_download_task_id = AsyncMock(side_effect=link)
+
+    old_request = asyncio.create_task(
+        service.request_album(
+            "rg-race",
+            user_id="old-owner",
+            user_role="trusted",
+        )
+    )
+    await dispatch_started.wait()
+
+    cancelled = await service.cancel_batch(
+        ["rg-race"], user_id="old-owner", user_role="user"
+    )
+    assert cancelled.success is True
+
+    successor = await service.request_album(
+        "rg-race",
+        user_id="new-owner",
+        user_role="trusted",
+    )
+    assert successor.success is True
+
+    release_old_dispatch.set()
+    with pytest.raises(ExternalServiceError):
+        await old_request
+
+    assert link_generations == [2, 1]
+    download_service.cancel_task.assert_awaited_once_with(
+        "orphan-task", "old-owner", "user"
+    )
+
+
+@pytest.mark.asyncio
+async def test_overlapping_batches_dispatch_only_their_exact_winners():
+    service, history, download_service = _make_service()
+    items = [
+        {"musicbrainz_id": "rg-a", "artist_name": "A"},
+        {"musicbrainz_id": "rg-b", "artist_name": "B"},
+    ]
+    history.async_get_requested_mbids = AsyncMock(
+        side_effect=[set(), set()]
+    )
+    history.async_bulk_record_requests = AsyncMock(
+        side_effect=[
+            [
+                RequestBeginResult("rg-a", "album", 1)
+            ],
+            [
+                RequestBeginResult("rg-b", "album", 1)
+            ],
+        ]
+    )
+    download_service.request_album = AsyncMock(
+        side_effect=lambda **kwargs: f"task-{kwargs['release_group_mbid']}"
+    )
+
+    responses = await asyncio.gather(
+        service.request_batch(items, user_id="u1", user_role="trusted"),
+        service.request_batch(items, user_id="u1", user_role="trusted"),
+    )
+
+    dispatched = [
+        call.kwargs["release_group_mbid"]
+        for call in download_service.request_album.await_args_list
+    ]
+    assert dispatched == ["rg-a", "rg-b"]
+    assert [response.requested for response in responses] == [1, 1]
+    assert [
+        call.kwargs["expected_generation"]
+        for call in history.async_update_download_task_id.await_args_list
+    ] == [1, 1]

@@ -306,6 +306,7 @@ class WantedWatcherService:
             page_size=_ENROL_PAGE_SIZE,
             cursor=cursor,
             owner_id=owner_id,
+            request_kind="album",
         )
         task_ids = [
             record.download_task_id

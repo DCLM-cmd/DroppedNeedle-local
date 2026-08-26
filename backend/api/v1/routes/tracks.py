@@ -7,13 +7,13 @@ downloads the single track (Q8-D). Authenticated + user-scoped.
 
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from api.v1.schemas.download import TrackRequestBody, TrackRequestResponse
-from core.dependencies import get_acquisition_dispatcher, get_quota_service
+from core.dependencies import get_request_service
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
+from infrastructure.validators import validate_mbid
 from middleware import CurrentUserDep
-from services.native.download_service import ALREADY_IN_LIBRARY
 
 logger = logging.getLogger(__name__)
 
@@ -25,16 +25,18 @@ async def request_track(
     recording_mbid: str,
     current_user: CurrentUserDep,
     body: TrackRequestBody = MsgSpecBody(TrackRequestBody),
-    service=Depends(get_acquisition_dispatcher),
-    quota=Depends(get_quota_service),
+    service=Depends(get_request_service),
 ):
-    # Track asks bypass the approval queue (existing behaviour) but still count
-    # toward the rolling request quota (Feature C layer 1, D20) - their download
-    # task IS the ask, so the gate runs at this submit point.
-    await quota.check_request_quota(current_user.id, current_user.role)
-    task_id = await service.request_track(
+    try:
+        recording_mbid = validate_mbid(recording_mbid, "recording")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid MBID format")
+
+    return await service.request_track(
+        recording_mbid,
         user_id=current_user.id,
-        recording_mbid=recording_mbid,
+        user_role=current_user.role,
+        requested_by_name=current_user.display_name,
         artist_name=body.artist_name,
         track_title=body.track_title,
         album_title=body.album_title,
@@ -43,6 +45,3 @@ async def request_track(
         artist_mbid=body.artist_mbid,
         release_mbid=body.release_id,
     )
-    if task_id == ALREADY_IN_LIBRARY:
-        return TrackRequestResponse(status="already_in_library")
-    return TrackRequestResponse(status="queued", task_id=task_id)

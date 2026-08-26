@@ -17,6 +17,7 @@ from core.exceptions import PermissionDeniedError, ValidationError
 from infrastructure.cover_urls import prefer_release_group_cover_url
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.persistence.request_history import (
+    RequesterCancelDecision,
     RequestHistoryRecord,
     RequestHistoryStore,
 )
@@ -27,11 +28,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_CANCELLABLE_STATUSES = {"pending", "downloading"}
+_CANCELLABLE_STATUSES = {"pending", "downloading", "queued"}
 _RETRYABLE_STATUSES = {"failed", "cancelled", "incomplete"}
 _CLEARABLE_STATUSES = {"imported", "incomplete", "failed", "cancelled"}
+_RETRYABLE_STATUS_ORDER = ("failed", "cancelled", "incomplete")
 
 _LIBRARY_MBIDS_CACHE_TTL = 30
+
+
+def _generation_of(value: object | None) -> int | None:
+    generation = getattr(value, "generation", None)
+    return generation if isinstance(generation, int) and not isinstance(generation, bool) else None
+
+
+def _mutation_won(value: object) -> bool:
+    return value is not False
 
 
 class RequestsPageService:
@@ -61,14 +72,20 @@ class RequestsPageService:
         self._library_mbids_cache_time: float = 0
 
     async def get_active_requests(
-        self, user_id: str | None = None
+        self,
+        user_id: str | None = None,
+        request_kind: str | None = None,
     ) -> ActiveRequestsResponse:
         if user_id is not None:
             active_records = (
-                await self._request_history.async_get_active_requests_for_user(user_id)
+                await self._request_history.async_get_active_requests_for_user(
+                    user_id, request_kind=request_kind
+                )
             )
         else:
-            active_records = await self._request_history.async_get_active_requests()
+            active_records = await self._request_history.async_get_active_requests(
+                request_kind=request_kind
+            )
         if not active_records:
             return ActiveRequestsResponse(items=[], count=0)
 
@@ -95,6 +112,7 @@ class RequestsPageService:
         status_filter: Optional[str] = None,
         sort: Optional[str] = None,
         user_id: Optional[str] = None,
+        request_kind: str | None = None,
     ) -> RequestHistoryResponse:
         if user_id is not None:
             records, total = await self._request_history.async_get_history_for_user(
@@ -103,10 +121,15 @@ class RequestsPageService:
                 page_size=page_size,
                 status_filter=status_filter,
                 sort=sort,
+                request_kind=request_kind,
             )
         else:
             records, total = await self._request_history.async_get_history(
-                page=page, page_size=page_size, status_filter=status_filter, sort=sort
+                page=page,
+                page_size=page_size,
+                status_filter=status_filter,
+                sort=sort,
+                request_kind=request_kind,
             )
 
         library_mbids = await self._fetch_library_mbids()
@@ -141,6 +164,10 @@ class RequestsPageService:
                 download_task_id=r.download_task_id,
                 can_reimport=r.status == "failed"
                 and r.download_task_id in reimportable,
+                request_kind=getattr(r, "request_kind", "album"),
+                track_title=r.track_title,
+                duration_seconds=r.duration_seconds,
+                track_release_group_mbid=r.track_release_group_mbid,
             )
             for r in records
         ]
@@ -155,18 +182,30 @@ class RequestsPageService:
             total_pages=total_pages,
         )
 
-    async def get_pending_approvals(self) -> ActiveRequestsResponse:
-        records = await self._request_history.async_get_pending_approvals()
+    async def get_pending_approvals(
+        self, request_kind: str | None = None
+    ) -> ActiveRequestsResponse:
+        records = await self._request_history.async_get_pending_approvals(
+            request_kind=request_kind
+        )
         items = [self._build_pending_item(r) for r in records]
         return ActiveRequestsResponse(items=items, count=len(items))
 
-    async def get_pending_approval_count(self) -> int:
-        return await self._request_history.async_get_pending_approval_count()
+    async def get_pending_approval_count(self, request_kind: str | None = None) -> int:
+        return await self._request_history.async_get_pending_approval_count(
+            request_kind=request_kind
+        )
 
     async def approve_request(
-        self, musicbrainz_id: str, reviewer_id: str, reviewer_name: str | None = None
+        self,
+        musicbrainz_id: str,
+        reviewer_id: str,
+        reviewer_name: str | None = None,
+        request_kind: str = "album",
     ) -> CancelRequestResponse:
-        record = await self._request_history.async_get_record(musicbrainz_id)
+        record = await self._request_history.async_get_record(
+            musicbrainz_id, request_kind=request_kind
+        )
         if not record:
             return CancelRequestResponse(success=False, message="Request not found")
         if record.status != "awaiting_approval":
@@ -174,59 +213,111 @@ class RequestsPageService:
                 success=False,
                 message=f"Request is not awaiting approval (status: {record.status})",
             )
-        await self._request_history.async_record_review(
-            musicbrainz_id, "pending", reviewer_id, reviewer_name
+
+        expected_generation = _generation_of(record)
+        claim_kwargs: dict[str, object] = {
+            "reviewer_id": reviewer_id,
+            "reviewer_name": reviewer_name,
+            "request_kind": request_kind,
+        }
+        if expected_generation is not None:
+            claim_kwargs["expected_generation"] = expected_generation
+        claim = await self._request_history.async_claim_approval(
+            musicbrainz_id, **claim_kwargs
         )
-        # approving dispatches the native pipeline directly; link the new task id
-        # (the 'already_in_library' sentinel is guarded)
-        if self._acquisition is not None:
-            try:
-                task_id = await self._acquisition.request_album(
-                    user_id=record.user_id or "",
-                    release_group_mbid=musicbrainz_id,
-                    artist_name=record.artist_name or "Unknown",
-                    album_title=record.album_title or "Unknown",
-                    year=record.year,
-                    artist_mbid=record.artist_mbid,
+        if claim is None:
+            current = await self._request_history.async_get_record(
+                musicbrainz_id, request_kind=request_kind
+            )
+            status = getattr(current, "status", "changed")
+            return CancelRequestResponse(
+                success=False,
+                message=f"Request is not awaiting approval (status: {status})",
+            )
+        generation = _generation_of(claim) or expected_generation
+        task_id: str | None = None
+        try:
+            if self._acquisition is not None:
+                task_id = await self._dispatch_record(
+                    record,
                     origin="user",
-                    release_mbid=record.release_mbid,
-                    track_count_priority=RequestPriority.USER_INITIATED,
+                    fallback_user_id=reviewer_id,
                 )
-            except ValidationError as e:
-                # A cap/quota rejection (Feature C) is not a failure of the request:
-                # put it BACK in the approval queue (it would otherwise silently
-                # vanish into 'failed') and tell the admin exactly why it can't start.
-                await self._request_history.async_update_status(
-                    musicbrainz_id, "awaiting_approval"
+        except ValidationError as error:
+            await self._restore_request_status(
+                musicbrainz_id,
+                "awaiting_approval",
+                request_kind=request_kind,
+                expected_generation=generation,
+            )
+            return CancelRequestResponse(success=False, message=str(error))
+        except Exception:  # noqa: BLE001 - keep provider details out of the response
+            logger.exception("Failed to dispatch approved request %s", musicbrainz_id)
+            await self._restore_request_status(
+                musicbrainz_id,
+                "failed",
+                request_kind=request_kind,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                expected_generation=generation,
+            )
+            return CancelRequestResponse(
+                success=False,
+                message=f"Approved but failed to start: {self._record_title(record)}",
+            )
+
+        from services.native.download_service import ALREADY_IN_LIBRARY
+
+        if task_id == ALREADY_IN_LIBRARY:
+            kwargs: dict[str, object] = {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "request_kind": request_kind,
+            }
+            if generation is not None:
+                kwargs["expected_generation"] = generation
+            await self._request_history.async_update_status(
+                musicbrainz_id, "imported", **kwargs
+            )
+        elif task_id is not None:
+            kwargs = {"request_kind": request_kind}
+            if generation is not None:
+                kwargs["expected_generation"] = generation
+            try:
+                linked = await self._request_history.async_update_download_task_id(
+                    musicbrainz_id, task_id, **kwargs
                 )
-                return CancelRequestResponse(success=False, message=str(e))
-            except Exception as e:  # noqa: BLE001
-                logger.error(
-                    f"Failed to dispatch approved request {musicbrainz_id}: {e}"
-                )
-                await self._request_history.async_update_status(
+                if not _mutation_won(linked):
+                    await self._cancel_orphan_task(task_id, record.user_id or reviewer_id)
+                    return CancelRequestResponse(
+                        success=False, message="Approved request became stale"
+                    )
+            except Exception:  # noqa: BLE001 - provider details stay out of responses
+                logger.exception("Failed to link approved request %s", musicbrainz_id)
+                await self._cancel_orphan_task(task_id, record.user_id or reviewer_id)
+                await self._restore_request_status(
                     musicbrainz_id,
                     "failed",
+                    request_kind=request_kind,
                     completed_at=datetime.now(timezone.utc).isoformat(),
+                    expected_generation=generation,
                 )
                 return CancelRequestResponse(
                     success=False,
-                    message=f"Approved but failed to start: {record.album_title}",
-                )
-            from services.native.download_service import ALREADY_IN_LIBRARY
-
-            if task_id != ALREADY_IN_LIBRARY:
-                await self._request_history.async_update_download_task_id(
-                    musicbrainz_id, task_id
+                    message=f"Approved but failed to start: {self._record_title(record)}",
                 )
         return CancelRequestResponse(
-            success=True, message=f"Approved: {record.album_title}"
+            success=True, message=f"Approved: {self._record_title(record)}"
         )
 
     async def reject_request(
-        self, musicbrainz_id: str, reviewer_id: str, reviewer_name: str | None = None
+        self,
+        musicbrainz_id: str,
+        reviewer_id: str,
+        reviewer_name: str | None = None,
+        request_kind: str = "album",
     ) -> CancelRequestResponse:
-        record = await self._request_history.async_get_record(musicbrainz_id)
+        record = await self._request_history.async_get_record(
+            musicbrainz_id, request_kind=request_kind
+        )
         if not record:
             return CancelRequestResponse(success=False, message="Request not found")
         if record.status != "awaiting_approval":
@@ -234,143 +325,348 @@ class RequestsPageService:
                 success=False,
                 message=f"Request is not awaiting approval (status: {record.status})",
             )
-        now_iso = datetime.now(timezone.utc).isoformat()
-        await self._request_history.async_record_review(
-            musicbrainz_id, "rejected", reviewer_id, reviewer_name, completed_at=now_iso
+        expected_generation = _generation_of(record)
+        claim_kwargs: dict[str, object] = {
+            "reviewer_id": reviewer_id,
+            "reviewer_name": reviewer_name,
+            "request_kind": request_kind,
+            "target_status": "rejected",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if expected_generation is not None:
+            claim_kwargs["expected_generation"] = expected_generation
+        claim = await self._request_history.async_claim_approval(
+            musicbrainz_id, **claim_kwargs
         )
+        if claim is None:
+            current = await self._request_history.async_get_record(
+                musicbrainz_id, request_kind=request_kind
+            )
+            status = getattr(current, "status", "changed")
+            return CancelRequestResponse(
+                success=False,
+                message=f"Request is not awaiting approval (status: {status})",
+            )
         return CancelRequestResponse(
-            success=True, message=f"Rejected: {record.album_title}"
+            success=True, message=f"Rejected: {self._record_title(record)}"
         )
 
     async def cancel_request(
-        self, musicbrainz_id: str, *, user_id: str, user_role: str
+        self,
+        musicbrainz_id: str,
+        *,
+        user_id: str,
+        user_role: str,
+        request_kind: str = "album",
     ) -> CancelRequestResponse:
-        record = await self._request_history.async_get_record(musicbrainz_id)
+        record = await self._request_history.async_get_record(
+            musicbrainz_id, request_kind=request_kind
+        )
         if not record:
             return CancelRequestResponse(success=False, message="Request not found")
-        if user_role != "admin" and record.user_id != user_id:
-            raise PermissionDeniedError("Cannot cancel another user's request")
 
-        # awaiting_approval requests never dispatched, cancel directly
-        if record.status == "awaiting_approval":
-            now_iso = datetime.now(timezone.utc).isoformat()
-            await self._request_history.async_update_status(
-                musicbrainz_id, "cancelled", completed_at=now_iso
+        is_admin = user_role == "admin"
+        prior_status = record.status
+        generation = _generation_of(record)
+        task_owner = record.user_id or user_id
+        decision: RequesterCancelDecision | None = None
+        if not is_admin:
+            decision = await self._request_history.async_prepare_requester_cancel(
+                user_id, musicbrainz_id, request_kind=request_kind
+            )
+            prior_status = decision.prior_status or prior_status
+            generation = _generation_of(decision) or generation
+            if decision.action == "denied":
+                if prior_status not in (*_CANCELLABLE_STATUSES, "awaiting_approval"):
+                    return CancelRequestResponse(
+                        success=False,
+                        message=f"Cannot cancel request with status '{prior_status}'",
+                    )
+                raise PermissionDeniedError("Cannot cancel another user's request")
+            if decision.action == "detached":
+                return CancelRequestResponse(
+                    success=True,
+                    message=(
+                        "Removed from your requests. The shared server request "
+                        "continues for another listener."
+                    ),
+                )
+            if decision.action == "cancelled":
+                return CancelRequestResponse(
+                    success=True,
+                    message=f"Cancelled request for {self._record_title(record)}",
+                )
+            if decision.action != "cancel_task":
+                return CancelRequestResponse(
+                    success=False,
+                    message=f"Cannot cancel request with status '{prior_status}'",
+                )
+            current = await self._request_history.async_get_record(
+                musicbrainz_id, request_kind=request_kind
+            )
+            if current is not None:
+                record = current
+                task_owner = record.user_id or user_id
+        elif prior_status == "awaiting_approval":
+            kwargs: dict[str, object] = {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "request_kind": request_kind,
+            }
+            if generation is not None:
+                kwargs["expected_generation"] = generation
+            changed = await self._request_history.async_update_status(
+                musicbrainz_id, "cancelled", **kwargs
+            )
+            if not _mutation_won(changed):
+                return CancelRequestResponse(
+                    success=False, message="Request changed while cancelling"
+                )
+            await self._request_history.async_update_dispatch_authorized(
+                musicbrainz_id,
+                False,
+                request_kind=request_kind,
+                **(
+                    {"expected_generation": generation}
+                    if generation is not None
+                    else {}
+                ),
             )
             return CancelRequestResponse(
                 success=True,
-                message=f"Cancelled request for {record.album_title}",
+                message=f"Cancelled request for {self._record_title(record)}",
             )
 
-        if record.status not in _CANCELLABLE_STATUSES:
+        if prior_status not in _CANCELLABLE_STATUSES:
             return CancelRequestResponse(
                 success=False,
-                message=f"Cannot cancel request with status '{record.status}'",
+                message=f"Cannot cancel request with status '{prior_status}'",
             )
 
-        # best-effort: a missing/already-terminal task must not block marking cancelled
-        download_service = (
-            self._get_download_service()
-            if self._get_download_service is not None
-            else None
-        )
-        if record.download_task_id and download_service is not None:
-            try:
+        download_service = None
+        try:
+            if self._get_download_service is not None:
+                download_service = self._get_download_service()
+            if record.download_task_id and download_service is not None:
                 await download_service.cancel_task(
-                    record.download_task_id, user_id, user_role
+                    record.download_task_id,
+                    user_id if is_admin else task_owner,
+                    "admin" if is_admin else "user",
                 )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "cancel_request: native task cancel failed for %s: %s",
-                    musicbrainz_id,
-                    e,
+            kwargs = {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "request_kind": request_kind,
+            }
+            if generation is not None:
+                kwargs["expected_generation"] = generation
+            changed = await self._request_history.async_update_status(
+                musicbrainz_id, "cancelled", **kwargs
+            )
+            if not _mutation_won(changed):
+                return CancelRequestResponse(
+                    success=False, message="Request changed while cancelling"
                 )
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        await self._request_history.async_update_status(
-            musicbrainz_id, "cancelled", completed_at=now_iso
-        )
+        except Exception:  # noqa: BLE001 - provider details are never user-facing
+            logger.exception("Failed to cancel request %s", musicbrainz_id)
+            if decision is not None and decision.prior_status is not None:
+                try:
+                    await self._request_history.async_restore_request_status(
+                        musicbrainz_id,
+                        decision.prior_status,
+                        request_kind=request_kind,
+                        expected_status="cancelling",
+                        expected_generation=generation,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to restore request %s", musicbrainz_id)
+            return CancelRequestResponse(
+                success=False, message="Unable to cancel request"
+            )
 
         return CancelRequestResponse(
             success=True,
-            message=f"Cancelled download of {record.album_title}",
+            message=f"Cancelled download of {self._record_title(record)}",
         )
 
     async def retry_request(
-        self, musicbrainz_id: str, *, user_id: str, user_role: str
+        self,
+        musicbrainz_id: str,
+        *,
+        user_id: str,
+        user_role: str,
+        request_kind: str = "album",
     ) -> RetryRequestResponse:
-        record = await self._request_history.async_get_record(musicbrainz_id)
+        record = await self._request_history.async_get_record(
+            musicbrainz_id, request_kind=request_kind
+        )
         if not record:
             return RetryRequestResponse(success=False, message="Request not found")
-        if user_role != "admin" and record.user_id != user_id:
-            raise PermissionDeniedError("Cannot retry another user's request")
-
         if record.status not in _RETRYABLE_STATUSES:
             return RetryRequestResponse(
                 success=False,
                 message=f"Cannot retry request with status '{record.status}'",
             )
 
-        # re-dispatch through the native pipeline (mirrors approve_request); link the
-        # new task id (sentinel-guarded)
         if self._acquisition is None:
             return RetryRequestResponse(success=False, message="Downloads unavailable")
+
+        # The transaction verifies requester membership and claims exactly one
+        # retryable generation. An ordinary user may dispatch only a generation
+        # that already carries approval provenance.
+        can_dispatch = bool(record.dispatch_authorized) or user_role in (
+            "admin",
+            "trusted",
+        )
+        target_status = "pending" if can_dispatch else "awaiting_approval"
+        claim_kwargs: dict[str, object] = {
+            "user_id": user_id,
+            "request_kind": request_kind,
+            "target_status": target_status,
+            "dispatch_authorized": can_dispatch,
+            "require_membership": user_role != "admin",
+        }
+        expected_generation = _generation_of(record)
+        if expected_generation is not None:
+            claim_kwargs["expected_generation"] = expected_generation
+        claim = await self._request_history.async_claim_retry(
+            musicbrainz_id, **claim_kwargs
+        )
+        if claim is None:
+            current = await self._request_history.async_get_record(
+                musicbrainz_id, request_kind=request_kind
+            )
+            current_status = getattr(current, "status", None)
+            if (
+                user_role != "admin"
+                and current_status in _RETRYABLE_STATUSES
+                and not await self._request_history.async_is_requester(
+                    user_id, musicbrainz_id, request_kind=request_kind
+                )
+            ):
+                raise PermissionDeniedError("Cannot retry another user's request")
+            return RetryRequestResponse(
+                success=False,
+                message=(
+                    "Request not found"
+                    if current is None
+                    else f"Cannot retry request with status '{current_status}'"
+                ),
+            )
+
+        generation = _generation_of(claim) or expected_generation
+        if target_status == "awaiting_approval":
+            return RetryRequestResponse(
+                success=True,
+                message="Retry submitted, awaiting admin approval",
+            )
+
+        task_id: str | None = None
         try:
-            await self._request_history.async_update_status(musicbrainz_id, "pending")
-            # A retry re-dispatches an already-recorded ask, so it is not a new
-            # user request for quota purposes (CollectionManagement D20).
-            task_id = await self._acquisition.request_album(
-                user_id=record.user_id or user_id or "",
-                release_group_mbid=musicbrainz_id,
-                artist_name=record.artist_name or "Unknown",
-                album_title=record.album_title or "Unknown",
-                year=record.year,
-                artist_mbid=record.artist_mbid,
+            task_id = await self._dispatch_record(
+                record,
                 origin="retry",
-                release_mbid=record.release_mbid,
-                track_count_priority=RequestPriority.USER_INITIATED,
+                fallback_user_id=user_id,
             )
-        except ValidationError as e:
-            # cap/quota rejection: restore the pre-retry status (don't strand it as
-            # a phantom 'pending') and surface the reason verbatim
-            await self._request_history.async_update_status(
-                musicbrainz_id, record.status
+        except ValidationError as error:
+            await self._restore_request_status(
+                musicbrainz_id,
+                record.status,
+                request_kind=request_kind,
+                expected_generation=generation,
             )
-            return RetryRequestResponse(success=False, message=str(e))
-        except Exception as e:  # noqa: BLE001
-            logger.error("Retry failed for %s: %s", musicbrainz_id, e)
-            return RetryRequestResponse(success=False, message=f"Retry failed: {e}")
+            return RetryRequestResponse(success=False, message=str(error))
+        except Exception:  # noqa: BLE001 - keep provider details out of the response
+            logger.exception("Retry dispatch failed for request %s", musicbrainz_id)
+            await self._restore_request_status(
+                musicbrainz_id,
+                record.status,
+                request_kind=request_kind,
+                expected_generation=generation,
+            )
+            return RetryRequestResponse(
+                success=False, message="Retry failed to start download"
+            )
 
         from services.native.download_service import ALREADY_IN_LIBRARY
 
-        if task_id != ALREADY_IN_LIBRARY:
-            await self._request_history.async_update_download_task_id(
-                musicbrainz_id, task_id
+        if task_id == ALREADY_IN_LIBRARY:
+            kwargs: dict[str, object] = {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "request_kind": request_kind,
+            }
+            if generation is not None:
+                kwargs["expected_generation"] = generation
+            await self._request_history.async_update_status(
+                musicbrainz_id, "imported", **kwargs
             )
+        else:
+            kwargs = {"request_kind": request_kind}
+            if generation is not None:
+                kwargs["expected_generation"] = generation
+            try:
+                linked = await self._request_history.async_update_download_task_id(
+                    musicbrainz_id, task_id, **kwargs
+                )
+                if not _mutation_won(linked):
+                    await self._cancel_orphan_task(task_id, record.user_id or user_id)
+                    return RetryRequestResponse(
+                        success=False, message="Retry request became stale"
+                    )
+            except Exception:  # noqa: BLE001 - provider details stay out of responses
+                logger.exception("Failed to link retried request %s", musicbrainz_id)
+                await self._cancel_orphan_task(task_id, record.user_id or user_id)
+                await self._restore_request_status(
+                    musicbrainz_id,
+                    "failed",
+                    request_kind=request_kind,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    expected_generation=generation,
+                )
+                return RetryRequestResponse(
+                    success=False, message="Retry failed to start download"
+                )
         return RetryRequestResponse(
-            success=True, message=f"Re-requested {record.album_title}"
+            success=True, message=f"Re-requested {self._record_title(record)}"
         )
 
     async def clear_history_item(
-        self, musicbrainz_id: str, *, user_id: str, user_role: str
+        self,
+        musicbrainz_id: str,
+        *,
+        user_id: str,
+        user_role: str,
+        request_kind: str = "album",
     ) -> bool:
-        record = await self._request_history.async_get_record(musicbrainz_id)
+        record = await self._request_history.async_get_record(
+            musicbrainz_id, request_kind=request_kind
+        )
         if not record:
             return False
-        # ownership checked before clearability so a non-owner gets 403, not a
-        # misleading 200/False, on another user's row
-        if user_role != "admin" and record.user_id != user_id:
+        # Check ownership before clearability so a non-owner gets 403 rather than a
+        # misleading success/false for another listener's row.
+        if user_role != "admin" and not await self._request_history.async_is_requester(
+            user_id, musicbrainz_id, request_kind=request_kind
+        ):
             raise PermissionDeniedError("Cannot clear another user's request")
         if record.status not in _CLEARABLE_STATUSES:
             return False
         if user_role == "admin":
-            return await self._request_history.async_delete_record(musicbrainz_id)
-        return await self._request_history.async_dismiss_record(user_id, musicbrainz_id)
+            return await self._request_history.async_delete_record(
+                musicbrainz_id, request_kind=request_kind
+            )
+        return await self._request_history.async_dismiss_record(
+            user_id, musicbrainz_id, request_kind=request_kind
+        )
 
-    async def get_active_count(self, user_id: str | None = None) -> int:
+    async def get_active_count(
+        self, user_id: str | None = None, request_kind: str | None = None
+    ) -> int:
         if user_id is not None:
-            return await self._request_history.async_get_active_count_for_user(user_id)
-        return await self._request_history.async_get_active_count()
+            return await self._request_history.async_get_active_count_for_user(
+                user_id, request_kind=request_kind
+            )
+        return await self._request_history.async_get_active_count(
+            request_kind=request_kind
+        )
 
     # download_task.status -> request_history.status
     _TASK_TO_REQUEST_STATUS = {
@@ -383,13 +679,7 @@ class RequestsPageService:
     }
 
     async def sync_request_statuses(self) -> None:
-        """Periodic safety net: reconcile each active request against its native
-        download task. The orchestrator already updates a request at each terminal
-        transition; this catches tasks that died without a clean transition (a crash
-        or a restart mid-download) so a request never sticks on 'Pending' forever.
-
-        Replaces the old Lidarr-queue sync (which referenced an undefined method and
-        was a silent no-op)."""
+        """Reconcile active request rows with their native download tasks."""
         active_records = await self._request_history.async_get_active_requests()
         if not active_records:
             return
@@ -397,12 +687,13 @@ class RequestsPageService:
         for record in active_records:
             try:
                 await self._reconcile_request(record, library_mbids)
-            except Exception:  # noqa: BLE001 - one bad record must not stop the sweep
+            except Exception:  # noqa: BLE001 - one bad row must not stop the sweep
                 logger.warning("Failed to reconcile request %s", record.musicbrainz_id)
 
     async def _reconcile_request(
         self, record: RequestHistoryRecord, library_mbids: set[str]
     ) -> None:
+        request_kind = getattr(record, "request_kind", "album")
         task = await self._find_download_task(record)
         if task is not None:
             mapped = self._TASK_TO_REQUEST_STATUS.get(task.status)
@@ -412,26 +703,38 @@ class RequestsPageService:
                     if mapped in ("imported", "failed", "cancelled")
                     else None
                 )
-                await self._request_history.async_update_status(
-                    record.musicbrainz_id, mapped, completed_at=completed_at
+                kwargs: dict[str, object] = {
+                    "completed_at": completed_at,
+                    "request_kind": request_kind,
+                }
+                generation = _generation_of(record)
+                if generation is not None:
+                    kwargs["expected_generation"] = generation
+                changed = await self._request_history.async_update_status(
+                    record.musicbrainz_id,
+                    mapped,
+                    **kwargs,
                 )
-                if mapped == "imported":
+                if _mutation_won(changed) and mapped == "imported":
                     await self._notify_import(record)
             return
-        # No native task (older row, or an orphan flow): fall back to library presence.
+        # Only album rows can be reconciled from album-level library presence.
+        # Exact tracks require their linked task ID; a recording MBID is not an
+        # album/library key.
         await self._check_if_completed(record, library_mbids)
 
     async def _find_download_task(self, record: RequestHistoryRecord):
+        request_kind = getattr(record, "request_kind", "album")
         if self._download_store is None:
             return None
-        # The link is the reliable path (set right after dispatch). The album fallback
-        # only matches ACTIVE tasks, so a request whose link is missing AND whose task
-        # already went terminal can't be recovered here - it then falls through to the
-        # library-presence check in _reconcile_request, which is the correct backstop.
+        # Task IDs are globally unique across album and track requests. Do not
+        # constrain this lookup by request kind.
         if record.download_task_id:
             task = await self._download_store.get_task(record.download_task_id)
             if task is not None:
                 return task
+        if request_kind == "track":
+            return None
         return await self._download_store.get_active_task_for_album_any_user(
             record.musicbrainz_id
         )
@@ -453,8 +756,93 @@ class RequestsPageService:
                 return self._library_mbids_cache
             return set()
 
+    async def _cancel_orphan_task(self, task_id: str | None, user_id: str) -> None:
+        if not task_id:
+            return
+        try:
+            if self._get_download_service is not None:
+                await self._get_download_service().cancel_task(task_id, user_id, "user")
+        except Exception:  # noqa: BLE001 - stale request rows remain untouched
+            logger.warning("Failed to cancel orphan download task %s", task_id)
+
+    async def _restore_request_status(
+        self,
+        musicbrainz_id: str,
+        status: str,
+        *,
+        request_kind: str,
+        completed_at: str | None = None,
+        expected_generation: int | None = None,
+    ) -> bool:
+        try:
+            kwargs: dict[str, object] = {
+                "completed_at": completed_at,
+                "request_kind": request_kind,
+            }
+            if expected_generation is not None:
+                kwargs["expected_generation"] = expected_generation
+            result = await self._request_history.async_update_status(
+                musicbrainz_id, status, **kwargs
+            )
+            return _mutation_won(result)
+        except Exception:  # noqa: BLE001 - restoration is best effort
+            logger.exception("Failed to restore request %s status", musicbrainz_id)
+            return False
+
+    async def _dispatch_record(
+        self,
+        record: RequestHistoryRecord,
+        *,
+        origin: str,
+        fallback_user_id: str = "",
+    ) -> str:
+        """Dispatch one stored request without widening exact-track identity."""
+        request_kind = getattr(record, "request_kind", "album")
+        # Shared retries retain the immutable primary owner. Only ownerless
+        # legacy rows use the acting user as a fallback.
+        user_id = record.user_id or fallback_user_id
+        if request_kind == "track":
+            if not record.track_title:
+                raise ValidationError("Exact-track request is missing its track title")
+            return await self._acquisition.request_track(
+                user_id=user_id,
+                recording_mbid=record.musicbrainz_id,
+                artist_name=record.artist_name or "Unknown",
+                track_title=record.track_title,
+                album_title=record.album_title,
+                duration_seconds=record.duration_seconds,
+                release_group_mbid=record.track_release_group_mbid,
+                artist_mbid=record.artist_mbid,
+                origin=origin,
+                release_mbid=record.release_mbid,
+            )
+        return await self._acquisition.request_album(
+            user_id=user_id,
+            release_group_mbid=record.musicbrainz_id,
+            artist_name=record.artist_name or "Unknown",
+            album_title=record.album_title or "Unknown",
+            year=record.year,
+            artist_mbid=record.artist_mbid,
+            origin=origin,
+            release_mbid=record.release_mbid,
+            track_count_priority=RequestPriority.USER_INITIATED,
+        )
+
+    @staticmethod
+    def _record_title(record: RequestHistoryRecord) -> str:
+        request_kind = getattr(record, "request_kind", "album")
+        if request_kind == "track" and record.track_title:
+            return record.track_title
+        return record.album_title
+
     @staticmethod
     def _build_pending_item(record: RequestHistoryRecord) -> ActiveRequestItem:
+        request_kind = getattr(record, "request_kind", "album")
+        cover_mbid = (
+            record.track_release_group_mbid
+            if request_kind == "track" and record.track_release_group_mbid
+            else record.musicbrainz_id
+        )
         return ActiveRequestItem(
             musicbrainz_id=record.musicbrainz_id,
             artist_name=record.artist_name,
@@ -462,7 +850,7 @@ class RequestsPageService:
             artist_mbid=record.artist_mbid,
             year=record.year,
             cover_url=prefer_release_group_cover_url(
-                record.musicbrainz_id,
+                cover_mbid,
                 record.cover_url,
                 size=500,
             ),
@@ -478,6 +866,10 @@ class RequestsPageService:
             library_queue_id=None,
             user_id=record.user_id,
             requested_by_name=record.requested_by_name,
+            request_kind=request_kind,
+            track_title=record.track_title,
+            duration_seconds=record.duration_seconds,
+            track_release_group_mbid=record.track_release_group_mbid,
         )
 
     async def _check_if_completed(
@@ -485,15 +877,51 @@ class RequestsPageService:
         record: RequestHistoryRecord,
         library_mbids: set[str],
     ) -> bool:
+        request_kind = getattr(record, "request_kind", "album")
+        if request_kind == "track":
+            task = await self._find_download_task(record)
+            if task is None:
+                return False
+            mapped = self._TASK_TO_REQUEST_STATUS.get(task.status)
+            if mapped and mapped != record.status:
+                completed_at = (
+                    datetime.now(timezone.utc).isoformat()
+                    if mapped in ("imported", "failed", "cancelled")
+                    else None
+                )
+                kwargs: dict[str, object] = {
+                    "completed_at": completed_at,
+                    "request_kind": request_kind,
+                }
+                generation = _generation_of(record)
+                if generation is not None:
+                    kwargs["expected_generation"] = generation
+                changed = await self._request_history.async_update_status(
+                    record.musicbrainz_id,
+                    mapped,
+                    **kwargs,
+                )
+                if _mutation_won(changed) and mapped == "imported":
+                    await self._notify_import(record)
+            return mapped in ("imported", "incomplete", "failed", "cancelled")
+
         now_iso = datetime.now(timezone.utc).isoformat()
-
         if record.musicbrainz_id.lower() in library_mbids:
-            await self._request_history.async_update_status(
-                record.musicbrainz_id, "imported", completed_at=now_iso
+            kwargs = {
+                "completed_at": now_iso,
+                "request_kind": request_kind,
+            }
+            generation = _generation_of(record)
+            if generation is not None:
+                kwargs["expected_generation"] = generation
+            changed = await self._request_history.async_update_status(
+                record.musicbrainz_id,
+                "imported",
+                **kwargs,
             )
-            await self._notify_import(record)
+            if _mutation_won(changed):
+                await self._notify_import(record)
             return True
-
         return False
 
     async def _notify_import(self, record: RequestHistoryRecord) -> None:

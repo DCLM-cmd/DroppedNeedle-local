@@ -4,9 +4,9 @@ Two distinct layers - deliberately NOT one choke point:
 
 - **Layer 1, request-count quota, at submit.** A plain user's ask is recorded in
   ``request_history`` long before any download task exists, so the count gate runs
-  where the ask is made: ``RequestService.request_album``/``request_batch`` and the
-  per-track request route (tracks bypass approval, so their ``download_tasks`` row
-  is the ask). Rolling window (D9); pending asks count.
+  where the ask is made: ``RequestService.request_album``/``request_batch``/
+  ``request_track``. Exact tracks share the same approval gate as albums. Rolling
+  window (D9); pending asks count.
 
 - **Layer 2, byte caps, at every download-task-creation site.** The global library
   cap (all roles) and the per-user storage quota apply when bytes will actually be
@@ -102,15 +102,33 @@ class QuotaService:
         )
 
     async def count_requests_in_window(self, user_id: str, window_days: int) -> int:
-        """Asks in the rolling window: album asks from request_history (ISO
-        timestamps) + track asks from download_tasks (epoch floats) - the two
-        halves keep their native timestamp formats."""
+        """Count each history ask once and add only unrepresented direct tasks.
+
+        New exact-track asks are persisted before dispatch, while older direct
+        track requests are represented only by an ``origin='user'`` task. Only
+        the task-carrying generations are subtracted from the task count, so a
+        represented track is never charged twice - and a pending approval
+        (history row without a task link yet) no longer masks unrepresented
+        legacy tasks. ``max`` also absorbs pruning asymmetries, e.g. a linked
+        history row whose task was pruned.
+        """
         now = datetime.now(timezone.utc)
         since_iso = (now - timedelta(days=window_days)).isoformat()
         since_epoch = time.time() - window_days * 86400
-        albums = await self._request_history.async_count_user_requests_since(user_id, since_iso)
-        tracks = await self._download_store.count_user_track_requests_since(user_id, since_epoch)
-        return albums + tracks
+        history_count = await self._request_history.async_count_user_requests_since(
+            user_id, since_iso
+        )
+        linked_track_count = (
+            await self._request_history.async_count_linked_track_requests_since(
+                user_id, since_iso
+            )
+        )
+        direct_track_count = (
+            await self._download_store.count_user_track_requests_since(
+                user_id, since_epoch
+            )
+        )
+        return history_count + max(0, direct_track_count - linked_track_count)
 
     async def check_request_quota(
         self, user_id: str | None, user_role: str | None, new_requests: int = 1

@@ -4,6 +4,8 @@ exercised through the real auth router with a temp AuthStore."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import sqlite3
 
 import pytest
 from fastapi import FastAPI
@@ -11,8 +13,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.v1.routes.auth import router
 from core.dependencies.auth_providers import get_auth_service
-from infrastructure.persistence.auth_store import AuthStore, UserRecord
-from middleware import AuthMiddleware, _get_current_admin, _get_current_user
+from infrastructure.persistence.auth_store import AuthStore, TokenRecord, UserRecord
+from middleware import AuthMiddleware, _get_current_admin, _get_current_token, _get_current_user
 from services.auth_service import AuthService
 from tests.helpers import build_test_client, mock_admin_user, mock_user
 
@@ -48,6 +50,238 @@ def _app(tmp_path) -> tuple[FastAPI, AuthService]:
     app.include_router(router)
     app.dependency_overrides[get_auth_service] = lambda: service
     return app, service
+
+
+def _override_authenticated_session(
+    app: FastAPI, service: AuthService, user: UserRecord, raw_token: str
+) -> TokenRecord:
+    verified = asyncio.run(service.verify_token(raw_token))
+    assert verified is not None
+    verified_user, token = verified
+    assert verified_user.id == user.id
+    app.dependency_overrides[_get_current_user] = lambda: user
+    app.dependency_overrides[_get_current_token] = lambda: token
+    return token
+
+
+def test_standard_session_can_mint_companion_session(tmp_path):
+    app, service = _app(tmp_path)
+    user, account_token = asyncio.run(
+        service.create_first_admin(
+            display_name="Jane",
+            username="jane",
+            password=PASSWORD,
+        )
+    )
+    source_token = _override_authenticated_session(
+        app, service, user, account_token
+    )
+    client = build_test_client(app)
+
+    response = client.post(
+        "/auth/device-sessions",
+        json={"device_name": "  Kyle   Apple Watch Ultra  "},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["token"]
+    sessions = asyncio.run(service.list_sessions(user.id))
+    companion = next(
+        session
+        for session in sessions
+        if session.id != source_token.id
+    )
+    assert companion.session_kind == "companion"
+    assert companion.user_agent == "DroppedNeedle companion · Kyle Apple Watch Ultra"
+    projected = client.get("/auth/sessions")
+    assert projected.status_code == 200
+    assert {
+        session["session_kind"] for session in projected.json()["sessions"]
+    } == {"standard", "companion"}
+
+
+def test_device_session_is_no_store_and_persists_only_raw_token_hash(tmp_path):
+    app, service = _app(tmp_path)
+    user, account_token = asyncio.run(
+        service.create_first_admin(
+            display_name="Jane",
+            username="jane",
+            password=PASSWORD,
+        )
+    )
+    _override_authenticated_session(app, service, user, account_token)
+    client = build_test_client(app)
+
+    response = client.post(
+        "/auth/device-sessions",
+        json={"device_name": "Kyle Apple Watch Ultra"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    raw_token = response.json()["token"]
+    assert raw_token
+    listed = client.get("/auth/sessions")
+    assert listed.status_code == 200
+    assert raw_token not in listed.text
+    with sqlite3.connect(tmp_path / "library.db") as connection:
+        hashes = {
+            row[0]
+            for row in connection.execute("SELECT token_hash FROM auth_tokens")
+        }
+    assert hashlib.sha256(raw_token.encode()).hexdigest() in hashes
+    assert raw_token not in hashes
+
+
+def test_companion_session_cannot_mint_another_companion(tmp_path):
+    app, service = _app(tmp_path)
+    user, account_token = asyncio.run(
+        service.create_first_admin(
+            display_name="Jane",
+            username="jane",
+            password=PASSWORD,
+        )
+    )
+    _override_authenticated_session(app, service, user, account_token)
+    client = build_test_client(app)
+    created = client.post(
+        "/auth/device-sessions",
+        json={"device_name": "Kyle Apple Watch Ultra"},
+    )
+    companion_raw = created.json()["token"]
+    verified = asyncio.run(service.verify_token(companion_raw))
+    assert verified is not None
+    app.dependency_overrides[_get_current_token] = lambda: verified[1]
+
+    denied = client.post(
+        "/auth/device-sessions",
+        json={"device_name": "Another Watch"},
+    )
+
+    assert denied.status_code == 403
+    assert asyncio.run(service.verify_token(companion_raw)) is not None
+    assert len(asyncio.run(service.list_sessions(user.id))) == 2
+
+
+def test_cross_user_cannot_revoke_companion_session(tmp_path):
+    app, service = _app(tmp_path)
+    owner, account_token = asyncio.run(
+        service.create_first_admin(
+            display_name="Jane",
+            username="jane",
+            password=PASSWORD,
+        )
+    )
+    _override_authenticated_session(app, service, owner, account_token)
+    client = build_test_client(app)
+    created = client.post(
+        "/auth/device-sessions",
+        json={"device_name": "Kyle Apple Watch Ultra"},
+    )
+    companion_raw = created.json()["token"]
+    companion = next(
+        session
+        for session in asyncio.run(service.list_sessions(owner.id))
+        if session.session_kind == "companion"
+    )
+    other_user = asyncio.run(
+        service.admin_create_user(
+            display_name="Alex",
+            username="alex",
+            password=PASSWORD,
+        )
+    )
+    app.dependency_overrides[_get_current_user] = lambda: other_user
+
+    denied = client.delete(f"/auth/sessions/{companion.id}")
+
+    assert denied.status_code == 403
+    assert asyncio.run(service.verify_token(companion_raw)) is not None
+
+
+def test_ordinary_session_with_companion_label_is_not_revoked(tmp_path):
+    app, service = _app(tmp_path)
+    label = "DroppedNeedle companion · Kyle Apple Watch Ultra"
+    user, account_token = asyncio.run(
+        service.create_first_admin(
+            display_name="Jane",
+            username="jane",
+            password=PASSWORD,
+            user_agent=label,
+        )
+    )
+    source_token = _override_authenticated_session(
+        app, service, user, account_token
+    )
+    client = build_test_client(app)
+
+    created = client.post(
+        "/auth/device-sessions",
+        json={"device_name": "Kyle Apple Watch Ultra"},
+    )
+
+    assert created.status_code == 200
+    loaded_source = asyncio.run(service.verify_token(account_token))
+    assert loaded_source is not None
+    assert loaded_source[1].id == source_token.id
+    assert loaded_source[1].session_kind == "standard"
+    assert asyncio.run(service.verify_token(created.json()["token"])) is not None
+    sessions = asyncio.run(service.list_sessions(user.id))
+    assert len(sessions) == 2
+    assert {session.session_kind for session in sessions} == {"standard", "companion"}
+
+
+def test_device_session_rejects_empty_or_unbounded_label(tmp_path):
+    app, service = _app(tmp_path)
+    user, account_token = asyncio.run(
+        service.create_first_admin(
+            display_name="Jane",
+            username="jane",
+            password=PASSWORD,
+        )
+    )
+    _override_authenticated_session(app, service, user, account_token)
+    client = build_test_client(app)
+
+    empty = client.post("/auth/device-sessions", json={"device_name": " \t "})
+    unbounded = client.post(
+        "/auth/device-sessions",
+        json={"device_name": "x" * 81},
+    )
+
+    assert empty.status_code == 400
+    assert unbounded.status_code == 400
+    assert len(asyncio.run(service.list_sessions(user.id))) == 1
+
+
+def test_same_label_replacement_invalidates_old_companion_bearer(tmp_path):
+    app, service = _app(tmp_path)
+    user, account_token = asyncio.run(
+        service.create_first_admin(
+            display_name="Jane",
+            username="jane",
+            password=PASSWORD,
+        )
+    )
+    _override_authenticated_session(app, service, user, account_token)
+    client = build_test_client(app)
+    original = client.post(
+        "/auth/device-sessions",
+        json={"device_name": "Kyle Apple Watch Ultra"},
+    )
+    replacement = client.post(
+        "/auth/device-sessions",
+        json={"device_name": "Kyle Apple Watch Ultra"},
+    )
+
+    assert original.status_code == 200
+    assert replacement.status_code == 200
+    old_raw = original.json()["token"]
+    new_raw = replacement.json()["token"]
+    assert new_raw != old_raw
+    assert asyncio.run(service.verify_token(old_raw)) is None
+    assert asyncio.run(service.verify_token(new_raw)) is not None
+    assert len(asyncio.run(service.list_sessions(user.id))) == 2
 
 
 def test_setup_accepts_username_with_optional_email_omitted(tmp_path):

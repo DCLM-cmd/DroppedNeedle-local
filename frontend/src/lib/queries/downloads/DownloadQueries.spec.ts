@@ -105,10 +105,29 @@ describe('download queue queries', () => {
 		expect(call?.[1]).toMatchObject({ musicbrainz_id: 'rg', artist: 'A', album: 'B', year: 2000 });
 	});
 
-	it('requestTrack posts to /tracks/{recording_mbid}/request', async () => {
+	it('requestTrack posts the complete exact-track payload', async () => {
 		const m = requestTrack() as unknown as { mutationFn: (i: unknown) => unknown };
-		await m.mutationFn({ recording_mbid: 'rec', artist_name: 'A', track_title: 'T' });
-		expect(String(mockPost.mock.calls.at(-1)?.[0])).toContain('/tracks/rec/request');
+		await m.mutationFn({
+			recording_mbid: 'rec',
+			artist_name: 'A',
+			track_title: 'T',
+			album_title: 'B',
+			duration_seconds: 287,
+			release_group_mbid: 'rg',
+			artist_mbid: 'artist',
+			release_id: 'release'
+		});
+		const call = mockPost.mock.calls.at(-1);
+		expect(call?.[0]).toBe('/api/v1/tracks/rec/request');
+		expect(call?.[1]).toEqual({
+			artist_name: 'A',
+			track_title: 'T',
+			album_title: 'B',
+			duration_seconds: 287,
+			release_group_mbid: 'rg',
+			artist_mbid: 'artist',
+			release_id: 'release'
+		});
 	});
 
 	it('cancelDownload posts to /downloads/{id}/cancel', async () => {
@@ -164,22 +183,94 @@ describe('download queue queries', () => {
 		});
 	});
 
-	it('requestAlbum shows the "searching" toast for a pending status', () => {
+	it.each([
+		{
+			status: 'pending',
+			success: true,
+			message: '',
+			expectedMessage: 'Request submitted - searching for downloads',
+			type: 'success'
+		},
+		{
+			status: 'awaiting_approval',
+			success: true,
+			message: '',
+			expectedMessage: 'Request submitted for admin approval',
+			type: 'success'
+		},
+		{
+			status: 'queued',
+			success: true,
+			message: 'Request already in progress',
+			expectedMessage: 'Request already in progress',
+			type: 'info'
+		},
+		{
+			status: 'downloading',
+			success: true,
+			message: 'Request already in progress',
+			expectedMessage: 'Request already in progress',
+			type: 'info'
+		},
+		{
+			status: 'cancelling',
+			success: true,
+			message: 'Request is being cancelled',
+			expectedMessage: 'Request is being cancelled',
+			type: 'info'
+		},
+		{
+			status: 'failed',
+			success: true,
+			message: 'Request could not be recorded',
+			expectedMessage: 'Request could not be recorded',
+			type: 'error'
+		},
+		{
+			status: 'imported',
+			success: true,
+			message: 'Album is already in the library',
+			expectedMessage: 'Album is already in the library',
+			type: 'info'
+		}
+	] as const)('requestAlbum shows the correct toast for $status', (response) => {
 		mockToast.mockClear();
 		const m = requestAlbum() as unknown as { onSuccess: (d: unknown) => unknown };
-		m.onSuccess({ success: true, message: '', musicbrainz_id: 'rg', status: 'pending' });
-		expect(mockToast).toHaveBeenCalledWith(
-			expect.objectContaining({ message: expect.stringContaining('searching') })
-		);
+		m.onSuccess({
+			success: response.success,
+			message: response.message,
+			musicbrainz_id: 'rg',
+			status: response.status
+		});
+		expect(mockToast).toHaveBeenCalledWith({
+			message: response.expectedMessage,
+			type: response.type
+		});
 	});
 
-	it('requestAlbum shows the approval toast for awaiting_approval', () => {
+	it('requestAlbum reports an unsuccessful response before handling its status', () => {
 		mockToast.mockClear();
 		const m = requestAlbum() as unknown as { onSuccess: (d: unknown) => unknown };
-		m.onSuccess({ success: true, message: '', musicbrainz_id: 'rg', status: 'awaiting_approval' });
-		expect(mockToast).toHaveBeenCalledWith(
-			expect.objectContaining({ message: expect.stringContaining('approval') })
-		);
+		m.onSuccess({
+			success: false,
+			message: 'Request could not be recorded',
+			musicbrainz_id: 'rg',
+			status: 'pending'
+		});
+		expect(mockToast).toHaveBeenCalledWith({
+			message: 'Request could not be recorded',
+			type: 'error'
+		});
+	});
+	it.each([
+		['already_in_library', 'That track is already in your library'],
+		['awaiting_approval', 'Track request submitted for admin approval'],
+		['queued', 'Track requested - searching for downloads']
+	] as const)('requestTrack shows the correct toast for %s', (status, message) => {
+		mockToast.mockClear();
+		const m = requestTrack() as unknown as { onSuccess: (d: unknown) => unknown };
+		m.onSuccess({ status });
+		expect(mockToast).toHaveBeenCalledWith({ message, type: 'success' });
 	});
 
 	it('the key factory builds stable keys', () => {

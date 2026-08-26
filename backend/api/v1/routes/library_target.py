@@ -195,7 +195,8 @@ async def get_target_provider_ids(
     request_history: RequestHistoryStoreDep,
 ) -> LibraryMbidsResponse:
     provider_ids, requested_ids = await asyncio.gather(
-        service.provider_ids(), request_history.async_get_requested_mbids()
+        service.provider_ids(),
+        request_history.async_get_requested_mbids(request_kind="album"),
     )
     return LibraryMbidsResponse(
         mbids=provider_ids.musicbrainz_release_group_ids,

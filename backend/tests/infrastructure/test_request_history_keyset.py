@@ -20,15 +20,21 @@ def _seed_row(
     user_id: str | None = "user-a",
     requested_at: str | None = None,
     task_id: str | None = "task-1",
+    request_kind: str = "album",
 ) -> None:
+    typed_key = (
+        mbid.lower()
+        if request_kind == "album"
+        else f"track:{mbid.lower()}"
+    )
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO request_history "
             "(musicbrainz_id_lower, musicbrainz_id, artist_name, album_title, "
-            "requested_at, status, user_id, download_task_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "requested_at, status, user_id, download_task_id, request_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                mbid.lower(),
+                typed_key,
                 mbid,
                 f"Artist {mbid}",
                 f"Album {mbid}",
@@ -36,8 +42,21 @@ def _seed_row(
                 status,
                 user_id,
                 task_id,
+                request_kind,
             ),
         )
+        if user_id is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO request_history_requesters "
+                "(user_id, musicbrainz_id_lower, requested_at, requested_by_name) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    user_id,
+                    typed_key,
+                    requested_at or "2026-01-01T00:00:00+00:00",
+                    f"User {user_id}",
+                ),
+            )
 
 
 class TracedHistory(RequestHistoryStore):
@@ -125,6 +144,124 @@ async def test_owner_scope_is_applied_inside_the_query(store: TracedHistory) -> 
 
 
 @pytest.mark.asyncio
+async def test_keyset_owner_scope_joins_requesters_and_keeps_typed_rows_distinct(
+    store: TracedHistory,
+) -> None:
+    _seed_row(store.db_path, "shared-id", user_id="user-a")
+    _seed_row(store.db_path, "mine-a", user_id="user-a")
+    _seed_row(store.db_path, "mine-b", user_id="user-b")
+    _seed_row(
+        store.db_path,
+        "shared-id",
+        user_id="user-b",
+        request_kind="track",
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO request_history_requesters "
+            "(user_id, musicbrainz_id_lower, requested_at, requested_by_name) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                "user-b",
+                "shared-id",
+                "2026-01-01T00:00:00+00:00",
+                "User user-b",
+            ),
+        )
+
+    user_a, _ = await store.async_get_retrying_page(
+        "failed",
+        page_size=50,
+        owner_id="user-a",
+        request_kind="album",
+    )
+    user_b_albums, _ = await store.async_get_retrying_page(
+        "failed",
+        page_size=50,
+        owner_id="user-b",
+        request_kind="album",
+    )
+    user_b_tracks, _ = await store.async_get_retrying_page(
+        "failed",
+        page_size=50,
+        owner_id="user-b",
+        request_kind="track",
+    )
+    admin, _ = await store.async_get_retrying_page(
+        "failed", page_size=50, owner_id=None, request_kind=None
+    )
+
+    assert {record.musicbrainz_id for record in user_a} == {"shared-id", "mine-a"}
+    assert {record.musicbrainz_id for record in user_b_albums} == {
+        "shared-id",
+        "mine-b",
+    }
+    assert [record.musicbrainz_id for record in user_b_tracks] == ["shared-id"]
+    assert all(record.request_kind == "track" for record in user_b_tracks)
+    # All-users queries are over request rows, not requester rows.
+    assert len(admin) == 4
+    assert {
+        (record.request_kind, record.musicbrainz_id)
+        for record in admin
+    } == {
+        ("album", "shared-id"),
+        ("album", "mine-a"),
+        ("album", "mine-b"),
+        ("track", "shared-id"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_keyset_cursor_carries_typed_internal_key_for_equal_timestamps(
+    store: TracedHistory,
+) -> None:
+    _seed_row(
+        store.db_path,
+        "same-id",
+        user_id="user-a",
+        requested_at="2026-06-01T00:00:00+00:00",
+        request_kind="track",
+    )
+
+    page, cursor = await store.async_get_retrying_page(
+        "failed",
+        page_size=1,
+        owner_id="user-a",
+        request_kind="track",
+    )
+    assert [record.musicbrainz_id for record in page] == ["same-id"]
+    assert cursor == ("2026-06-01T00:00:00+00:00", "track:same-id")
+
+
+@pytest.mark.asyncio
+async def test_user_history_and_active_queries_are_listener_scoped(
+    store: TracedHistory,
+) -> None:
+    _seed_row(store.db_path, "shared-id", status="pending", user_id="user-a")
+    _seed_row(store.db_path, "only-a", status="awaiting_approval", user_id="user-a")
+    _seed_row(store.db_path, "only-b", status="pending", user_id="user-b")
+    await store.async_add_requester("shared-id", "user-b", "Second listener")
+
+    active_a = await store.async_get_active_requests_for_user("user-a")
+    active_b = await store.async_get_active_requests_for_user("user-b")
+    history_a, total_a = await store.async_get_history_for_user("user-a")
+    history_b, total_b = await store.async_get_history_for_user("user-b")
+    global_active = await store.async_get_active_requests()
+
+    assert {record.musicbrainz_id for record in active_a} == {"shared-id", "only-a"}
+    assert {record.musicbrainz_id for record in active_b} == {"shared-id", "only-b"}
+    assert {record.user_id for record in active_a} == {"user-a"}
+    assert {record.user_id for record in active_b} == {"user-b"}
+    assert {record.musicbrainz_id for record in history_a} == {"shared-id", "only-a"}
+    assert {record.musicbrainz_id for record in history_b} == {"shared-id", "only-b"}
+    assert total_a == 2 and total_b == 2
+    assert {record.musicbrainz_id for record in global_active} == {
+        "shared-id",
+        "only-b",
+    }
+
+
+@pytest.mark.asyncio
 async def test_no_count_query_and_plan_uses_the_keyset_index(
     store: TracedHistory,
 ) -> None:
@@ -193,3 +330,33 @@ async def test_get_tasks_batches_in_one_query_and_skips_empty(tmp_path: Path) ->
     assert len(selects) == 1  # one IN query; the empty input opened none
     # trace expands parameters: three bound ids in one statement
     assert "IN (" in selects[0] and selects[0].count(",") >= 2
+
+
+@pytest.mark.asyncio
+async def test_bulk_begin_returns_exact_winners_for_partial_overlap(
+    store: TracedHistory,
+) -> None:
+    first = await store.async_bulk_record_requests(
+        [{"musicbrainz_id": "rg-a", "artist_name": "Artist A", "album_title": "Album A"}],
+        user_id="user-a",
+        initial_status="pending",
+    )
+    assert [(item.musicbrainz_id, item.request_kind, item.generation) for item in first] == [
+        ("rg-a", "album", 1)
+    ]
+
+    second = await store.async_bulk_record_requests(
+        [
+            {"musicbrainz_id": "rg-a", "artist_name": "Replacement", "album_title": "A"},
+            {"musicbrainz_id": "rg-b", "artist_name": "Artist B", "album_title": "Album B"},
+        ],
+        user_id="user-a",
+        initial_status="pending",
+    )
+    assert [(item.musicbrainz_id, item.request_kind, item.generation) for item in second] == [
+        ("rg-b", "album", 1)
+    ]
+    retained = await store.async_get_record("rg-a")
+    created = await store.async_get_record("rg-b")
+    assert retained is not None and retained.artist_name == "Artist A"
+    assert created is not None and created.artist_name == "Artist B"

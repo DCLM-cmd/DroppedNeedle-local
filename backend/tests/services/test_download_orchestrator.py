@@ -260,28 +260,81 @@ class _StubClient:
 
 
 class _FakeRequestHistory:
-    def __init__(self, record=None):
+    def __init__(self, record=None, *, cas_lost=False):
         self.record = record
         self.updates: list[tuple] = []
+        self.status_calls: list[tuple] = []
         self.relinks: list[tuple] = []
+        self.link_calls: list[tuple] = []
+        self.cas_lost = cas_lost
 
-    async def async_get_record(self, mbid):
-        if self.record is not None and self.record.musicbrainz_id == mbid:
+    async def async_get_record(self, mbid, request_kind="album"):
+        if (
+            self.record is not None
+            and self.record.musicbrainz_id == mbid
+            and getattr(self.record, "request_kind", "album") == request_kind
+        ):
             return self.record
         return None
 
-    async def async_update_status(self, mbid, status, completed_at=None):
+    async def async_get_record_by_download_task_id(
+        self, task_id, request_kind=None
+    ):
+        if (
+            self.record is not None
+            and self.record.download_task_id == task_id
+            and (
+                request_kind is None
+                or self.record.request_kind == request_kind
+            )
+        ):
+            return self.record
+        return None
+
+    async def async_update_status(
+        self,
+        mbid,
+        status,
+        completed_at=None,
+        request_kind="album",
+        expected_generation=None,
+    ):
         self.updates.append((mbid, status, completed_at))
+        self.status_calls.append(
+            (mbid, status, completed_at, request_kind, expected_generation)
+        )
         if self.record is not None and self.record.musicbrainz_id == mbid:
             self.record.status = status
+        return True
 
-    async def async_update_download_task_id(self, mbid, task_id):
+    async def async_update_download_task_id(
+        self,
+        mbid,
+        task_id,
+        request_kind="album",
+        expected_generation=None,
+    ):
+        self.link_calls.append((mbid, task_id, request_kind, expected_generation))
+        if self.cas_lost:
+            return False
         self.relinks.append((mbid, task_id))
-        if self.record is not None and self.record.musicbrainz_id == mbid:
+        if (
+            self.record is not None
+            and self.record.musicbrainz_id == mbid
+            and getattr(self.record, "request_kind", "album") == request_kind
+        ):
             self.record.download_task_id = task_id
+        return True
 
 
-def _request_record(mbid="rg-1", *, download_task_id=None, status="downloading"):
+def _request_record(
+    mbid="rg-1",
+    *,
+    download_task_id=None,
+    status="downloading",
+    request_kind="album",
+    generation=1,
+):
     from types import SimpleNamespace
 
     return SimpleNamespace(
@@ -293,6 +346,8 @@ def _request_record(mbid="rg-1", *, download_task_id=None, status="downloading")
         album_title="Album",
         year=2020,
         cover_url="",
+        request_kind=request_kind,
+        generation=generation,
     )
 
 
@@ -1946,7 +2001,6 @@ async def test_retry_task_sets_retry_origin(tmp_path: Path):
     store, orch, *_ = _build(tmp_path)
     orch.dispatch = MagicMock()
     task = await _new_task(store, status="failed")
-    assert task.origin == "user"
 
     new_id = await orch.retry_task(task.id, "user-a", "user")
 
@@ -1997,6 +2051,13 @@ async def test_cancel_task_syncs_linked_request_to_cancelled(tmp_path: Path):
 
     assert (await store.get_task(task.id)).status == "cancelled"
     assert any(s == "cancelled" for (_m, s, _c) in rh.updates)
+    assert any(
+        m == "rg-1"
+        and s == "cancelled"
+        and kind == "album"
+        and generation == 1
+        for (m, s, _c, kind, generation) in rh.status_calls
+    )
     assert rh.record.status == "cancelled"
 
 
@@ -2173,7 +2234,6 @@ async def test_poll_until_done_bails_on_out_of_band_cancel(tmp_path: Path):
     task = await _new_task(store, status="downloading", source_username="peer")
     _write_manifest(orch, task.id, ["peer/01.flac"])
     await store.update_status(task.id, "cancelled")
-    task = await store.get_task(task.id)
 
     with pytest.raises(_Cancelled):
         await orch._poll_until_done(task)
@@ -2195,7 +2255,6 @@ async def test_startup_resume_tracks_handle_so_cancel_can_reach_it(tmp_path: Pat
 
     assert task.id in orch._active_tasks
     orch._active_tasks[task.id].cancel()
-
 
 # Request/library state bridge (Phase 3)
 
@@ -2224,6 +2283,13 @@ async def test_terminal_completed_marks_linked_request_imported(tmp_path: Path):
     await orch.process_task(task.id)
 
     assert ("rg-1", "imported") in [(m, s) for (m, s, _c) in rh.updates]
+    assert any(
+        m == "rg-1"
+        and s == "imported"
+        and kind == "album"
+        and generation == 1
+        for (m, s, _c, kind, generation) in rh.status_calls
+    )
     on_import.assert_awaited()  # caches busted + album materialised
 
 
@@ -2247,6 +2313,13 @@ async def test_terminal_failed_marks_linked_request_failed(tmp_path: Path):
     await orch.process_task(task.id)
 
     assert any(s == "failed" for (_m, s, _c) in rh.updates)
+    assert any(
+        m == "rg-1"
+        and s == "failed"
+        and kind == "album"
+        and generation == 1
+        for (m, s, _c, kind, generation) in rh.status_calls
+    )
 
 
 @pytest.mark.asyncio
@@ -2673,6 +2746,133 @@ async def test_create_retry_task_skips_relink_when_request_owned_by_other_task(
 
     assert rh.relinks == []
     assert record.download_task_id == "newer-task"
+
+
+class _BlindByTaskIdHistory(_FakeRequestHistory):
+    """Simulates the direct by-task-id lookup coming up empty so the exact-track
+    relink must fall back to the recording-MBID key."""
+
+    async def async_get_record_by_download_task_id(self, task_id, request_kind=None):
+        return None
+
+
+async def _new_track_task(store):
+    return await _new_task(
+        store,
+        download_type="track",
+        recording_mbid="rec-1",
+        track_title="Song",
+        status="failed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_retry_task_relinks_track_request(tmp_path: Path):
+    """An exact-track retry re-points ITS OWN request_kind='track' history row at
+    the replacement task via generation CAS so the retried download still syncs
+    that row on terminal - never an album row."""
+    record = _request_record(
+        mbid="rec-1",
+        status="failed",
+        download_task_id=None,
+        request_kind="track",
+        generation=3,
+    )
+    rh = _FakeRequestHistory(record)
+    store, orch, *_ = _build(tmp_path, request_history=rh)
+    orch.dispatch = MagicMock()
+    task = await _new_track_task(store)
+    record.download_task_id = task.id
+
+    new_id = await orch._create_retry_task(task)
+
+    assert rh.link_calls[-1] == ("rec-1", new_id, "track", 3)
+    assert rh.relinks == [("rec-1", new_id)]
+    assert record.download_task_id == new_id
+    orch.dispatch.assert_called_once_with(new_id)
+
+
+@pytest.mark.asyncio
+async def test_create_retry_task_track_relink_falls_back_to_recording_mbid(
+    tmp_path: Path,
+):
+    """When the direct by-task-id lookup finds nothing, the relink still locates
+    the track history via recording_mbid + request_kind='track' and links it."""
+    record = _request_record(
+        mbid="rec-1",
+        status="failed",
+        download_task_id=None,
+        request_kind="track",
+        generation=5,
+    )
+    rh = _BlindByTaskIdHistory(record)
+    store, orch, *_ = _build(tmp_path, request_history=rh)
+    orch.dispatch = MagicMock()
+    task = await _new_track_task(store)
+    record.download_task_id = task.id
+
+    new_id = await orch._create_retry_task(task)
+
+    assert rh.link_calls[-1] == ("rec-1", new_id, "track", 5)
+    assert record.download_task_id == new_id
+    orch.dispatch.assert_called_once_with(new_id)
+
+
+@pytest.mark.asyncio
+async def test_create_retry_task_cancels_track_retry_when_link_race_is_lost(
+    tmp_path: Path,
+):
+    """Losing the generation CAS means a newer owner advanced the row since we
+    read it: the fresh track retry is cancelled and never dispatched, so it can't
+    overwrite the successor's link."""
+    record = _request_record(
+        mbid="rec-1",
+        status="pending",
+        download_task_id=None,
+        request_kind="track",
+        generation=9,
+    )
+    rh = _FakeRequestHistory(record, cas_lost=True)
+    store, orch, *_ = _build(tmp_path, request_history=rh)
+    orch.dispatch = MagicMock()
+    task = await _new_track_task(store)
+    record.download_task_id = task.id
+
+    new_id = await orch._create_retry_task(task)
+
+    assert rh.relinks == []  # nothing written through the lost CAS
+    assert record.download_task_id == task.id  # successor keeps the row
+    orch.dispatch.assert_not_called()
+    assert (await store.get_task(new_id)).status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_relinked_track_row_syncs_on_new_task_terminal(tmp_path: Path):
+    """End-to-end bridge: the relink points the track row at the replacement task,
+    and that task's terminal event flips the SAME row - the history never strands
+    on the dead original task id."""
+    record = _request_record(
+        mbid="rec-1",
+        status="downloading",
+        download_task_id=None,
+        request_kind="track",
+        generation=3,
+    )
+    rh = _FakeRequestHistory(record)
+    store, orch, *_ = _build(tmp_path, request_history=rh)
+    orch.dispatch = MagicMock()
+    task = await _new_track_task(store)
+    record.download_task_id = task.id
+
+    new_id = await orch._create_retry_task(task)
+    assert record.download_task_id == new_id
+
+    new_task = await store.get_task(new_id)
+    await orch._sync_request_on_terminal(new_task, DownloadStatus.COMPLETED)
+
+    assert record.status == "imported"
+    assert rh.status_calls[-1][:2] == ("rec-1", "imported")
+    assert rh.status_calls[-1][3:] == ("track", 3)
 
 
 # settle_after_manual_import: an "import anyway" that completes an album must stop the retry

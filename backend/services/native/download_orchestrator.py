@@ -112,6 +112,11 @@ def _is_local_fault(message: str | None) -> bool:
     return any(m in low for m in _LOCAL_FAULT_MARKERS)
 
 
+def _generation_of(value: object | None) -> int | None:
+    generation = getattr(value, "generation", None)
+    return generation if isinstance(generation, int) and not isinstance(generation, bool) else None
+
+
 # _poll_until_done outcomes.
 _OUT_COMPLETED = "completed"  # every transfer terminal and succeeded
 _OUT_TERMINAL = "terminal"  # every transfer terminal, at least one failed
@@ -1873,14 +1878,7 @@ class DownloadOrchestrator:
         await self._sync_request_on_terminal(task, status)
 
     async def _sync_request_on_terminal(self, task, status: str) -> None:  # noqa: ANN001
-        """Bridge a terminal download status into the linked request + caches, so a
-        request no longer sticks on 'Pending' forever and a completed album flips to
-        In-Library without a manual reload.
-
-        Keyed on ``download_task_id == task.id``: a request is only touched by the
-        task that actually dispatched it, so a stray per-track download of an album
-        can't flip that album's request. Monitor/orphan downloads (no request row)
-        are a safe no-op."""
+        """Bridge a terminal download status into its exact request generation."""
         mapping = {
             DownloadStatus.COMPLETED: "imported",
             DownloadStatus.PARTIAL: "incomplete",
@@ -1907,27 +1905,41 @@ class DownloadOrchestrator:
         if self._request_history is None:
             return
         try:
-            record = await self._request_history.async_get_record(
-                task.release_group_mbid
+            # The task ID is the only identifier shared by album and exact-track
+            # requests. Looking up by MBID would silently default tracks to album.
+            record = await self._request_history.async_get_record_by_download_task_id(
+                task.id
             )
         except Exception:  # noqa: BLE001 - request sync must never fail the download
-            logger.warning("Could not load request for %s", task.release_group_mbid)
+            logger.warning("Could not load request for task %s", task.id)
             return
         if record is None or getattr(record, "download_task_id", None) != task.id:
             return
         from datetime import datetime, timezone
 
+        request_kind = getattr(record, "request_kind", "album")
         completed_at = (
             datetime.now(timezone.utc).isoformat()
             if new_status in ("imported", "failed", "cancelled")
             else None
         )
+        kwargs: dict[str, object] = {
+            "completed_at": completed_at,
+            "request_kind": request_kind,
+        }
+        generation = _generation_of(record)
+        if generation is not None:
+            kwargs["expected_generation"] = generation
         try:
-            await self._request_history.async_update_status(
-                record.musicbrainz_id, new_status, completed_at=completed_at
+            changed = await self._request_history.async_update_status(
+                record.musicbrainz_id,
+                new_status,
+                **kwargs,
             )
-            # An import (full or partial) added library files - bust the album/library
-            # caches and materialise the album row so the UI reflects it.
+            if changed is False:
+                return
+            # An import (full or partial) added library files - bust the
+            # album/library caches and materialise the row for the UI.
             if new_status in ("imported", "incomplete") and self._on_import is not None:
                 await self._on_import(record)
         except Exception:  # noqa: BLE001
@@ -2510,37 +2522,63 @@ class DownloadOrchestrator:
         await asyncio.to_thread(
             lambda: (self._staging / new_task.id).mkdir(parents=True, exist_ok=True)
         )
-        await self._relink_request(task, new_task.id)
-        self.dispatch(new_task.id)
+        linked = await self._relink_request(task, new_task.id)
+        if linked:
+            self.dispatch(new_task.id)
         return new_task.id
 
-    async def _relink_request(self, task, new_task_id: str) -> None:  # noqa: ANN001 - DownloadTask
-        """Point the linked request at the replacement task. Without this a retried
-        download imports the album but ``_sync_request_on_terminal`` (keyed on
-        ``download_task_id == task.id``) ignores the new task, so the request stays
-        ``failed`` and the import cache-bust never fires. Album downloads only, and
-        only when THIS task still owns the link - a per-track retry must not hijack
-        the album's request, and a request already re-linked to a newer task is left
-        alone."""
-        if (
-            self._request_history is None
-            or task.download_type != "album"
-            or not task.release_group_mbid
-        ):
-            return
+
+    async def _locate_track_request(self, task) -> object | None:  # noqa: ANN001 - DownloadTask
+        """The exact-track history row tied to ``task`` - looked up by the old
+        download task ID first, then by its recording-MBID key."""
+        record = await self._request_history.async_get_record_by_download_task_id(
+            task.id, request_kind="track"
+        )
+        if record is not None or not task.recording_mbid:
+            return record
+        return await self._request_history.async_get_record(
+            task.recording_mbid, request_kind="track"
+        )
+
+    async def _relink_request(self, task, new_task_id: str) -> bool:  # noqa: ANN001 - DownloadTask
+        """Point the linked request - album or exact-track - at the replacement
+        task via its generation CAS. Exact-track retries relink only their own
+        ``request_kind='track'`` row, never an album row. Losing the CAS means a
+        newer retry/re-request owns this generation: the fresh task is cancelled
+        instead of racing that successor unlinked."""
+        if self._request_history is None:
+            return True
         try:
-            record = await self._request_history.async_get_record(
-                task.release_group_mbid
-            )
-            if (
-                record is not None
-                and getattr(record, "download_task_id", None) == task.id
-            ):
-                await self._request_history.async_update_download_task_id(
-                    record.musicbrainz_id, new_task_id
+            kwargs: dict[str, object] = {}
+            if task.download_type == "track":
+                record = await self._locate_track_request(task)
+                kwargs["request_kind"] = "track"
+            elif task.release_group_mbid:
+                record = await self._request_history.async_get_record(
+                    task.release_group_mbid
                 )
+            else:
+                return True
+            if (
+                record is None
+                or getattr(record, "download_task_id", None) != task.id
+            ):
+                return True
+            generation = _generation_of(record)
+            if generation is not None:
+                kwargs["expected_generation"] = generation
+            linked = await self._request_history.async_update_download_task_id(
+                record.musicbrainz_id,
+                new_task_id,
+                **kwargs,
+            )
+            if linked is False:
+                await self.cancel_task(new_task_id, task.user_id, "user")
+                return False
+            return True
         except Exception:  # noqa: BLE001 - re-link must never fail the retry
             logger.warning("Could not re-link request for retry of %s", task.id)
+            return True
 
     @property
     def auto_retry_max(self) -> int:

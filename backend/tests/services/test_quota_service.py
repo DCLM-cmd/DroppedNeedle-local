@@ -72,8 +72,8 @@ class _Env:
 
     async def add_track_task(
         self, user_id: str, rec: str, origin: str = "user"
-    ) -> None:
-        await self.download_store.create_task(
+    ):
+        return await self.download_store.create_task(
             user_id=user_id,
             download_type="track",
             release_group_mbid="rg-t",
@@ -81,6 +81,18 @@ class _Env:
             artist_name="A",
             album_title="B",
             origin=origin,
+        )
+
+    async def record_track_ask(self, user_id: str, rec: str) -> None:
+        await self.request_history.async_record_request(
+            musicbrainz_id=rec,
+            artist_name="A",
+            album_title="B",
+            user_id=user_id,
+            initial_status="awaiting_approval",
+            request_kind="track",
+            track_title="T",
+            track_release_group_mbid="rg-t",
         )
 
     async def add_library_file(
@@ -149,6 +161,113 @@ async def test_request_quota_counts_track_asks_but_not_retries_or_upgrades(env: 
     await env.add_track_task("u1", "rec-4", origin="user")
     with pytest.raises(ValidationError):
         await env.quota.check_request_quota("u1", "user")
+
+
+@pytest.mark.asyncio
+async def test_request_quota_counts_history_tracks_once_and_legacy_track_tasks(
+    env: _Env,
+):
+    await env.add_user("u1")
+    env.set_policy(default_request_quota_count=10, default_request_quota_days=7)
+
+    await env.record_album_ask("u1", "rg-album")
+    await env.record_track_ask("u1", "rec-represented")
+    represented = await env.add_track_task("u1", "rec-represented", origin="user")
+    assert await env.request_history.async_update_download_task_id(
+        "rec-represented",
+        represented.id,
+        request_kind="track",
+        expected_generation=1,
+    )
+
+    await env.add_track_task("u1", "rec-legacy", origin="user")
+    await env.add_track_task("u1", "rec-retry", origin="retry")
+    await env.add_track_task("u1", "rec-upgrade", origin="upgrade")
+
+    # album history + exact-track history + one unrepresented legacy/direct
+    # track task; retries and upgrades are not new asks.
+    assert await env.quota.count_requests_in_window("u1", 7) == 3
+
+
+@pytest.mark.asyncio
+async def test_request_quota_pending_and_legacy_tracks_avoid_mixed_undercount(
+    env: _Env,
+):
+    await env.add_user("u1")
+    env.set_policy(default_request_quota_count=10, default_request_quota_days=7)
+
+    await env.record_album_ask("u1", "rg-album")
+    await env.record_track_ask("u1", "rec-pending")
+    await env.add_track_task("u1", "rec-legacy-a", origin="user")
+
+    # album + unlinked pending track ask + the legacy task it must not mask.
+    assert await env.quota.count_requests_in_window("u1", 7) == 3
+    assert (
+        await env.request_history.async_count_linked_track_requests_since(
+            "u1", "2000-01-01T00:00:00+00:00"
+        )
+        == 0
+    )
+
+    await env.record_track_ask("u1", "rec-linked")
+    linked = await env.add_track_task("u1", "rec-linked", origin="user")
+    assert await env.request_history.async_update_download_task_id(
+        "rec-linked",
+        linked.id,
+        request_kind="track",
+        expected_generation=1,
+    )
+
+    assert (
+        await env.request_history.async_count_linked_track_requests_since(
+            "u1", "2000-01-01T00:00:00+00:00"
+        )
+        == 1
+    )
+    # album + pending track + linked track (charged once) + legacy task.
+    assert await env.quota.count_requests_in_window("u1", 7) == 4
+
+
+@pytest.mark.asyncio
+async def test_request_quota_co_requester_not_masked_by_shared_link(env: _Env):
+    await env.add_user("u1")
+    await env.add_user("u2")
+    env.set_policy(default_request_quota_count=10, default_request_quota_days=7)
+
+    # u1 asks for a track; dispatch creates and links her own direct task.
+    await env.record_track_ask("u1", "rec-shared")
+    shared = await env.add_track_task("u1", "rec-shared", origin="user")
+    assert await env.request_history.async_update_download_task_id(
+        "rec-shared",
+        shared.id,
+        request_kind="track",
+        expected_generation=1,
+    )
+
+    # u2 co-requests the same linked ask and owns an unrelated legacy task.
+    assert await env.request_history.async_add_requester(
+        "rec-shared", "u2", request_kind="track"
+    )
+    await env.add_track_task("u2", "rec-u2-legacy", origin="user")
+
+    # The shared representation belongs to its owner only: u2 still charges
+    # her membership ask plus her legacy task instead of cancelling each other.
+    assert (
+        await env.request_history.async_count_linked_track_requests_since(
+            "u2", "2000-01-01T00:00:00+00:00"
+        )
+        == 0
+    )
+    assert await env.quota.count_requests_in_window("u2", 7) == 2
+
+    # u1 keeps counting her represented linked ask exactly once.
+    assert (
+        await env.request_history.async_count_linked_track_requests_since(
+            "u1", "2000-01-01T00:00:00+00:00"
+        )
+        == 1
+    )
+    assert await env.quota.count_requests_in_window("u1", 7) == 1
 
 
 @pytest.mark.asyncio

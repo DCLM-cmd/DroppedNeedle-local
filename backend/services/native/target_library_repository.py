@@ -421,7 +421,9 @@ class TargetLibraryRepository:
             return set()
         if ids is not None:
             return await self._request_history.async_existing_requested_mbids(ids)
-        return await self._request_history.async_get_requested_mbids()
+        return await self._request_history.async_get_requested_mbids(
+            request_kind="album"
+        )
 
     async def has_recording(self, track_id: str) -> bool:
         return bool(await self._store.get_target_recording_tracks(track_id))

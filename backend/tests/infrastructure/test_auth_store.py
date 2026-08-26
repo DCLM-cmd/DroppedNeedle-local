@@ -6,6 +6,7 @@ idempotency test (construct twice on the same path).
 """
 
 import hashlib
+import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,156 @@ def test_migration_is_idempotent(tmp_path: Path):
     # guarded ALTERs); it must not raise.
     AuthStore(db_path, write_lock=lock)
     assert db_path.exists()
+
+
+def test_session_kind_migration_preserves_legacy_tokens_as_standard(tmp_path: Path):
+    db_path = tmp_path / "library.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TABLE auth_tokens (
+                   id TEXT PRIMARY KEY,
+                   user_id TEXT NOT NULL,
+                   token_hash TEXT NOT NULL UNIQUE,
+                   issued_at TEXT NOT NULL,
+                   expires_at TEXT NOT NULL,
+                   last_seen_at TEXT NOT NULL,
+                   revoked INTEGER NOT NULL DEFAULT 0,
+                   user_agent TEXT
+               )"""
+        )
+        connection.execute(
+            """INSERT INTO auth_tokens
+                   (id, user_id, token_hash, issued_at, expires_at, last_seen_at,
+                    revoked, user_agent)
+               VALUES ('legacy-token', 'user-1', 'hash', 'now', 'later', 'now', 0,
+                       'DroppedNeedle companion · Watch')"""
+        )
+
+    AuthStore(db_path)
+    AuthStore(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        session_kind = connection.execute(
+            "SELECT session_kind FROM auth_tokens WHERE id = 'legacy-token'"
+        ).fetchone()[0]
+    assert session_kind == "standard"
+
+
+@pytest.mark.asyncio
+async def test_token_projection_distinguishes_standard_and_companion_sessions(
+    tmp_path: Path,
+):
+    store = AuthStore(tmp_path / "auth.db")
+    user = await store.create_user(
+        id="user-1", display_name="Alice", role="admin", username="alice"
+    )
+
+    standard_raw, standard_hash = store.issue_token()
+    standard = await store.store_token(
+        id="standard-token",
+        user_id=user.id,
+        token_hash=standard_hash,
+        user_agent="DroppedNeedle companion · Watch",
+    )
+    assert standard.session_kind == "standard"
+    loaded_standard = await store.verify_token(standard_raw)
+    assert loaded_standard is not None
+    assert loaded_standard.session_kind == "standard"
+
+    companion_raw, companion_hash = store.issue_token()
+    companion = await store.replace_companion_token(
+        id="companion-token",
+        user_id=user.id,
+        token_hash=companion_hash,
+        user_agent="DroppedNeedle companion · Watch",
+    )
+    assert companion.session_kind == "companion"
+    loaded_companion = await store.verify_token(companion_raw)
+    assert loaded_companion is not None
+    assert loaded_companion.session_kind == "companion"
+
+
+@pytest.mark.asyncio
+async def test_replace_companion_token_replaces_same_label_atomically(
+    tmp_path: Path,
+):
+    store = AuthStore(tmp_path / "auth.db")
+    user = await store.create_user(
+        id="user-1", display_name="Alice", role="admin", username="alice"
+    )
+    label = "DroppedNeedle companion · Watch"
+
+    old_raw, old_hash = store.issue_token()
+    await store.replace_companion_token(
+        id="old-companion",
+        user_id=user.id,
+        token_hash=old_hash,
+        user_agent=label,
+    )
+    new_raw, new_hash = store.issue_token()
+    await store.replace_companion_token(
+        id="new-companion",
+        user_id=user.id,
+        token_hash=new_hash,
+        user_agent=label,
+    )
+
+    assert await store.verify_token(old_raw) is None
+    current = await store.verify_token(new_raw)
+    assert current is not None
+    assert current.id == "new-companion"
+    assert current.session_kind == "companion"
+    active = await store.list_tokens_for_user(user.id)
+    assert [token.id for token in active] == ["new-companion"]
+
+
+@pytest.mark.asyncio
+async def test_replace_companion_token_rolls_back_insert_when_replacement_fails(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "auth.db"
+    store = AuthStore(db_path)
+    user = await store.create_user(
+        id="user-1", display_name="Alice", role="admin", username="alice"
+    )
+    label = "DroppedNeedle companion · Watch"
+    old_raw, old_hash = store.issue_token()
+    await store.replace_companion_token(
+        id="old-companion",
+        user_id=user.id,
+        token_hash=old_hash,
+        user_agent=label,
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_companion_replacement
+               BEFORE UPDATE OF revoked ON auth_tokens
+               WHEN OLD.user_agent = 'DroppedNeedle companion · Watch'
+                 AND NEW.revoked = 1
+               BEGIN
+                 SELECT RAISE(ABORT, 'forced replacement failure');
+               END"""
+        )
+
+    new_raw, new_hash = store.issue_token()
+    with pytest.raises(sqlite3.IntegrityError):
+        await store.replace_companion_token(
+            id="new-companion",
+            user_id=user.id,
+            token_hash=new_hash,
+            user_agent=label,
+        )
+
+    assert await store.verify_token(old_raw) is not None
+    assert await store.verify_token(new_raw) is None
+    active = await store.list_tokens_for_user(user.id)
+    assert [token.id for token in active] == ["old-companion"]
+    with sqlite3.connect(db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM auth_tokens WHERE user_id = 'user-1'"
+        ).fetchone()[0]
+    assert count == 1
 
 
 @pytest.mark.asyncio

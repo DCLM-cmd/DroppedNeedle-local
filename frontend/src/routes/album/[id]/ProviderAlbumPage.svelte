@@ -208,6 +208,7 @@
 						heldByPosition={state.heldByPosition}
 						trackDownloadTasks={state.trackDownloadTasks}
 						releaseGroupMbid={album.musicbrainz_id}
+						releaseMbid={state.tracksInfo?.selected_release_mbid}
 						onPlaySourceTrack={state.playSourceTrack}
 						onTrackGenerated={state.handleTrackGenerated}
 						onQuotaUpdate={state.handleQuotaUpdate}

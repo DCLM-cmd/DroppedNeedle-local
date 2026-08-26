@@ -3,8 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 
 // keep the Request button real; stub only its mutation hook so it renders without a QueryClient
+const downloadMutations = vi.hoisted(() => ({ requestMutate: vi.fn() }));
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
-	requestTrack: () => ({ mutate: vi.fn(), isPending: false }),
+	requestTrack: () => ({ mutate: downloadMutations.requestMutate, isPending: false }),
 	importHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),
 	discardHeldTrack: () => ({ mutate: vi.fn(), isPending: false })
 }));
@@ -152,6 +153,7 @@ function renderList(
 		heldByRecording?: Map<string, HeldImport>;
 		heldByPosition?: Map<string, HeldImport>;
 		byRecording?: Map<string, LibraryFileMeta>;
+		releaseMbid?: string | null;
 	} = {}
 ) {
 	const album: AlbumBasicInfo = {
@@ -191,6 +193,7 @@ function renderList(
 		heldByRecording: over.heldByRecording ?? new Map(),
 		heldByPosition: over.heldByPosition ?? new Map(),
 		releaseGroupMbid: 'rg-1',
+		releaseMbid: over.releaseMbid ?? null,
 		onPlaySourceTrack: vi.fn(),
 		onTrackGenerated: vi.fn(),
 		onQuotaUpdate: vi.fn(),
@@ -260,5 +263,29 @@ describe('AlbumTrackList upgrade affordance (admin/trusted, below cutoff)', () =
 		renderList(); // default fixtures: below_cutoff false everywhere
 
 		expect(page.getByRole('button', { name: /upgrade/i }).elements()).toHaveLength(0);
+	});
+});
+
+describe('AlbumTrackList exact-track request release propagation', () => {
+	it('sends the displayed selected edition to the track request mutation', async () => {
+		downloadMutations.requestMutate.mockClear();
+		renderList({ releaseMbid: 'release-20' });
+
+		await page.getByRole('button', { name: 'Request this track' }).click();
+		expect(downloadMutations.requestMutate).toHaveBeenCalledTimes(1);
+		expect(downloadMutations.requestMutate.mock.calls[0][0]).toMatchObject({
+			recording_mbid: 'rec-3',
+			release_group_mbid: 'rg-1',
+			release_id: 'release-20'
+		});
+	});
+
+	it('keeps the track request usable with a null edition', async () => {
+		downloadMutations.requestMutate.mockClear();
+		renderList();
+
+		await page.getByRole('button', { name: 'Request this track' }).click();
+		expect(downloadMutations.requestMutate).toHaveBeenCalledTimes(1);
+		expect(downloadMutations.requestMutate.mock.calls[0][0].release_id).toBeNull();
 	});
 });

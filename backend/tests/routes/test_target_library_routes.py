@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -24,6 +25,7 @@ from core.dependencies import (
     get_target_album_edition_finder_service,
     get_wanted_watcher_service,
 )
+from infrastructure.persistence.request_history import RequestHistoryStore
 from middleware import _get_current_admin, _get_current_curator
 from tests.helpers import build_test_client, override_admin_auth, override_user_auth
 
@@ -447,6 +449,45 @@ def test_target_provider_ids_preserve_existing_library_store_contract(
         "mbids": ["owned-rg"],
         "requested_mbids": ["requested-rg"],
     }
+    history.async_get_requested_mbids.assert_awaited_once_with(
+        request_kind="album"
+    )
+
+
+def test_target_provider_ids_requested_mbids_exclude_track_keys(
+    app: FastAPI, tmp_path
+) -> None:
+    override_user_auth(app, role="user")
+    service = app.dependency_overrides[get_target_native_library_service]()
+    service.provider_ids.return_value = SimpleNamespace(
+        musicbrainz_release_group_ids=["owned-rg"]
+    )
+    history = RequestHistoryStore(tmp_path / "requests.db")
+
+    async def _seed() -> None:
+        await history.async_record_request(
+            "requested-rg", "Requested Artist", "Requested Album"
+        )
+        await history.async_record_request(
+            "recording-1",
+            "Requested Artist",
+            "Requested Album",
+            track_title="Requested Track",
+            request_kind="track",
+        )
+
+    asyncio.run(_seed())
+    app.dependency_overrides[get_request_history_store] = lambda: history
+
+    response = build_test_client(app).get("/library/mbids")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mbids"] == ["owned-rg"]
+    # The exact-track row persists under its track-prefixed key and must
+    # never leak into the album requested-ID set.
+    assert "track:recording-1" not in payload["requested_mbids"]
+    assert payload["requested_mbids"] == ["requested-rg"]
 
 
 def test_target_membership_is_bounded_and_candidate_scoped(app: FastAPI) -> None:

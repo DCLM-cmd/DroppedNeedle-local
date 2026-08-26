@@ -1,7 +1,7 @@
 import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional
+from typing import Literal, Optional
 
 from api.v1.schemas.requests_page import (
     ActiveCountResponse,
@@ -80,14 +80,18 @@ async def get_request_history(
 async def cancel_request(
     current_user: CurrentUserDep,
     musicbrainz_id: str,
+    request_kind: Literal["album", "track"] = Query("album"),
     service: RequestsPageService = Depends(get_requests_page_service),
 ):
     try:
-        musicbrainz_id = validate_mbid(musicbrainz_id, "album")
+        musicbrainz_id = validate_mbid(musicbrainz_id, request_kind)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid MBID format")
     return await service.cancel_request(
-        musicbrainz_id, user_id=current_user.id, user_role=current_user.role
+        musicbrainz_id,
+        user_id=current_user.id,
+        user_role=current_user.role,
+        request_kind=request_kind,
     )
 
 
@@ -95,14 +99,18 @@ async def cancel_request(
 async def retry_request(
     current_user: CurrentUserDep,
     musicbrainz_id: str,
+    request_kind: Literal["album", "track"] = Query("album"),
     service: RequestsPageService = Depends(get_requests_page_service),
 ):
     try:
-        musicbrainz_id = validate_mbid(musicbrainz_id, "album")
+        musicbrainz_id = validate_mbid(musicbrainz_id, request_kind)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid MBID format")
     return await service.retry_request(
-        musicbrainz_id, user_id=current_user.id, user_role=current_user.role
+        musicbrainz_id,
+        user_id=current_user.id,
+        user_role=current_user.role,
+        request_kind=request_kind,
     )
 
 
@@ -110,14 +118,18 @@ async def retry_request(
 async def clear_history_item(
     current_user: CurrentUserDep,
     musicbrainz_id: str,
+    request_kind: Literal["album", "track"] = Query("album"),
     service: RequestsPageService = Depends(get_requests_page_service),
 ):
     try:
-        musicbrainz_id = validate_mbid(musicbrainz_id, "album")
+        musicbrainz_id = validate_mbid(musicbrainz_id, request_kind)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid MBID format")
     deleted = await service.clear_history_item(
-        musicbrainz_id, user_id=current_user.id, user_role=current_user.role
+        musicbrainz_id,
+        user_id=current_user.id,
+        user_role=current_user.role,
+        request_kind=request_kind,
     )
     return ClearHistoryResponse(success=deleted)
 
@@ -254,13 +266,19 @@ async def get_pending_approval_count(
 async def approve_request(
     admin: CurrentAdminDep,
     musicbrainz_id: str,
+    request_kind: Literal["album", "track"] = Query("album"),
     service: RequestsPageService = Depends(get_requests_page_service),
 ):
     try:
-        musicbrainz_id = validate_mbid(musicbrainz_id, "album")
+        musicbrainz_id = validate_mbid(musicbrainz_id, request_kind)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid MBID format")
-    result = await service.approve_request(musicbrainz_id, admin.id, admin.display_name)
+    result = await service.approve_request(
+        musicbrainz_id,
+        admin.id,
+        admin.display_name,
+        request_kind=request_kind,
+    )
     return ApprovalActionResponse(success=result.success, message=result.message)
 
 
@@ -268,13 +286,19 @@ async def approve_request(
 async def reject_request(
     admin: CurrentAdminDep,
     musicbrainz_id: str,
+    request_kind: Literal["album", "track"] = Query("album"),
     service: RequestsPageService = Depends(get_requests_page_service),
 ):
     try:
-        musicbrainz_id = validate_mbid(musicbrainz_id, "album")
+        musicbrainz_id = validate_mbid(musicbrainz_id, request_kind)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid MBID format")
-    result = await service.reject_request(musicbrainz_id, admin.id, admin.display_name)
+    result = await service.reject_request(
+        musicbrainz_id,
+        admin.id,
+        admin.display_name,
+        request_kind=request_kind,
+    )
     return ApprovalActionResponse(success=result.success, message=result.message)
 
 

@@ -7,7 +7,7 @@
 	import Pagination from '$lib/components/Pagination.svelte';
 	import Toast from '$lib/components/Toast.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
-	import type { ActiveRequestItem, RequestHistoryItem } from '$lib/types';
+	import type { ActiveRequestItem, RequestHistoryItem, RequestKind } from '$lib/types';
 	import {
 		TriangleAlert,
 		CheckCircle,
@@ -215,6 +215,13 @@
 	let approvalError = $state<string | null>(null);
 	let approvalAbortController: AbortController | null = null;
 
+	function requestKey(mbid: string, requestKind: RequestKind): string {
+		return `${requestKind}:${mbid}`;
+	}
+
+	function itemRequestKey(item: { musicbrainz_id: string; request_kind?: RequestKind }): string {
+		return requestKey(item.musicbrainz_id, item.request_kind ?? 'album');
+	}
 	const downloadingCount = $derived(activeItems.filter((i) => i.status === 'downloading').length);
 	const pendingCount = $derived(
 		activeItems.filter((i) => i.status === 'pending' || i.status === 'queued').length
@@ -358,12 +365,13 @@
 		}
 	}
 
-	async function handleApprove(mbid: string) {
+	async function handleApprove(mbid: string, requestKind: RequestKind) {
 		try {
-			const result = await approveRequest(mbid);
+			const result = await approveRequest(mbid, requestKind);
 			if (result.success) {
 				showToast(result.message);
-				approvalItems = approvalItems.filter((i) => i.musicbrainz_id !== mbid);
+				const key = requestKey(mbid, requestKind);
+				approvalItems = approvalItems.filter((i) => itemRequestKey(i) !== key);
 				approvalCount = approvalItems.length;
 				notifyPendingApprovalCountChanged();
 			} else {
@@ -374,12 +382,13 @@
 		}
 	}
 
-	async function handleReject(mbid: string) {
+	async function handleReject(mbid: string, requestKind: RequestKind) {
 		try {
-			const result = await rejectRequest(mbid);
+			const result = await rejectRequest(mbid, requestKind);
 			if (result.success) {
 				showToast(result.message, 'info');
-				approvalItems = approvalItems.filter((i) => i.musicbrainz_id !== mbid);
+				const key = requestKey(mbid, requestKind);
+				approvalItems = approvalItems.filter((i) => itemRequestKey(i) !== key);
 				approvalCount = approvalItems.length;
 				notifyPendingApprovalCountChanged();
 			} else {
@@ -412,12 +421,13 @@
 		}
 	}
 
-	async function handleCancel(mbid: string) {
+	async function handleCancel(mbid: string, requestKind: RequestKind) {
 		try {
-			const result = await cancelRequest(mbid);
+			const result = await cancelRequest(mbid, requestKind);
 			if (result.success) {
 				showToast(result.message);
-				activeItems = activeItems.filter((i) => i.musicbrainz_id !== mbid);
+				const key = requestKey(mbid, requestKind);
+				activeItems = activeItems.filter((i) => itemRequestKey(i) !== key);
 				activeCount = activeItems.length;
 			} else {
 				showToast(result.message, 'error');
@@ -427,9 +437,9 @@
 		}
 	}
 
-	async function handleRetry(mbid: string) {
+	async function handleRetry(mbid: string, requestKind: RequestKind) {
 		try {
-			const result = await retryRequest(mbid);
+			const result = await retryRequest(mbid, requestKind);
 			if (result.success) {
 				showToast(result.message);
 				await Promise.all([loadHistory(), loadActive()]);
@@ -441,12 +451,13 @@
 		}
 	}
 
-	async function handleClear(mbid: string) {
+	async function handleClear(mbid: string, requestKind: RequestKind) {
 		try {
-			const result = await clearHistoryItem(mbid);
+			const result = await clearHistoryItem(mbid, requestKind);
 			if (result.success) {
 				showToast('Removed from history');
-				historyItems = historyItems.filter((i) => i.musicbrainz_id !== mbid);
+				const key = requestKey(mbid, requestKind);
+				historyItems = historyItems.filter((i) => itemRequestKey(i) !== key);
 				historyTotal = Math.max(0, historyTotal - 1);
 			} else {
 				showToast("Couldn't remove that item", 'error');
@@ -707,7 +718,7 @@
 				</div>
 			{:else}
 				<div class="flex flex-col gap-2.5">
-					{#each activeItems as item, i (item.musicbrainz_id)}
+					{#each activeItems as item, i (itemRequestKey(item))}
 						<div in:fly={{ y: 12, duration: 200, delay: i * 30 }}>
 							<RequestCard
 								{item}
@@ -802,11 +813,12 @@
 				</div>
 			{:else}
 				<div class="flex flex-col gap-2.5">
-					{#each historyItems as item (item.musicbrainz_id)}
+					{#each historyItems as item (itemRequestKey(item))}
 						<RequestCard
 							{item}
 							mode="history"
-							watchState={['failed', 'incomplete', 'cancelled'].includes(item.status)
+							watchState={(item.request_kind ?? 'album') === 'album' &&
+							['failed', 'incomplete', 'cancelled'].includes(item.status)
 								? wantedStates.get(item.musicbrainz_id.toLowerCase())
 								: undefined}
 							onretry={authStore.isAdmin || item.user_id === authStore.user?.id
@@ -951,7 +963,7 @@
 				</div>
 			{:else}
 				<div class="flex flex-col gap-2.5">
-					{#each approvalItems as item, i (item.musicbrainz_id)}
+					{#each approvalItems as item, i (itemRequestKey(item))}
 						<div
 							in:fly={{ y: 12, duration: 200, delay: i * 30 }}
 							class="flex items-center gap-3 sm:gap-4 p-3 sm:p-4 bg-base-200 rounded-box"
@@ -960,7 +972,9 @@
 								class="w-14 h-14 sm:w-16 sm:h-16 shrink-0 rounded-lg overflow-hidden bg-base-300"
 							>
 								<AlbumImage
-									mbid={item.musicbrainz_id}
+									mbid={(item.request_kind ?? 'album') === 'track'
+										? (item.track_release_group_mbid ?? '')
+										: item.musicbrainz_id}
 									customUrl={item.cover_url ?? null}
 									alt={item.album_title}
 									size="sm"
@@ -969,7 +983,19 @@
 								/>
 							</div>
 							<div class="flex-1 min-w-0">
-								<p class="font-semibold text-sm truncate">{item.album_title}</p>
+								{#if (item.request_kind ?? 'album') === 'track'}
+									<div class="flex items-center gap-1.5 min-w-0">
+										<span class="badge badge-ghost badge-xs shrink-0">Track</span>
+										<p class="font-semibold text-sm truncate">
+											{item.track_title ?? 'Unknown track'}
+										</p>
+									</div>
+									<p class="text-base-content/60 text-xs truncate">
+										Album: {item.album_title}
+									</p>
+								{:else}
+									<p class="font-semibold text-sm truncate">{item.album_title}</p>
+								{/if}
 								<p class="text-base-content/60 text-xs truncate">{item.artist_name}</p>
 								<div class="flex items-center gap-1.5 flex-wrap">
 									{#if item.year}
@@ -986,14 +1012,16 @@
 							<div class="flex gap-2 shrink-0">
 								<button
 									class="btn btn-success btn-sm gap-1"
-									onclick={() => void handleApprove(item.musicbrainz_id)}
+									onclick={() =>
+										void handleApprove(item.musicbrainz_id, item.request_kind ?? 'album')}
 								>
 									<Check class="h-3.5 w-3.5" />
 									Approve
 								</button>
 								<button
 									class="btn btn-error btn-sm btn-outline gap-1"
-									onclick={() => void handleReject(item.musicbrainz_id)}
+									onclick={() =>
+										void handleReject(item.musicbrainz_id, item.request_kind ?? 'album')}
 								>
 									<X class="h-3.5 w-3.5" />
 									Reject

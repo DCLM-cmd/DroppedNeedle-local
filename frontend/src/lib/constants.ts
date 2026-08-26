@@ -1,4 +1,5 @@
 import type { MusicSource } from './stores/musicSource';
+import type { RequestKind } from './types';
 
 export const AUTH_FREE_PATHS = ['/login', '/setup', '/auth/callback', '/recover-password'];
 
@@ -129,11 +130,14 @@ export const STATUS_COLORS = {
 } as const;
 
 export const YOUTUBE_PLAYER_ELEMENT_ID = 'yt-player-embed';
+const requestKindQuery = (requestKind: RequestKind = 'album') =>
+	`?request_kind=${encodeURIComponent(requestKind)}`;
 
 export const API = {
 	auth: {
 		setupStatus: () => '/api/v1/auth/setup/status',
 		me: () => '/api/v1/auth/me',
+		deviceSessions: () => '/api/v1/auth/device-sessions',
 		passwordRecoveryReset: () => '/api/v1/auth/password-recovery/reset',
 		adminPasswordRecovery: (userId: string) =>
 			`/api/v1/auth/admin/users/${encodeURIComponent(userId)}/password-recovery`
@@ -828,6 +832,24 @@ export const API = {
 	},
 	requests: {
 		new: () => '/api/v1/requests/new',
+		active: () => '/api/v1/requests/active',
+		history: (page = 1, pageSize = 20, status?: string, sort?: string) => {
+			const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+			if (status) params.set('status', status);
+			if (sort) params.set('sort', sort);
+			return `/api/v1/requests/history?${params.toString()}`;
+		},
+		pendingApprovals: () => '/api/v1/requests/pending-approvals',
+		cancel: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/active/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
+		retry: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/retry/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
+		clearHistoryItem: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/history/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
+		approve: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/approve/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
+		reject: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/reject/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
 		pendingApprovalCount: () => '/api/v1/requests/pending-approvals/count',
 		autoDownloadApprovals: () => '/api/v1/requests/auto-download-approvals',
 		approveAutoDownload: (userId: string, mbid: string) =>

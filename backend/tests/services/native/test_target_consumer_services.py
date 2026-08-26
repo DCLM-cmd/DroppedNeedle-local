@@ -657,6 +657,29 @@ async def test_target_repository_projects_durable_requested_state(
 
     assert await repository.get_requested_mbids() == {"requested-release"}
 
+@pytest.mark.asyncio
+async def test_target_repository_requested_mbids_exclude_track_keys(
+    target_services,
+) -> None:
+    store, _view, _favorites, _history, _root = target_services
+    requests = RequestHistoryStore(store.db_path, threading.Lock())
+    await requests.async_record_request(
+        "requested-release", "Requested Artist", "Requested Album"
+    )
+    await requests.async_record_request(
+        "recording-1",
+        "Requested Artist",
+        "Requested Album",
+        track_title="Requested Track",
+        request_kind="track",
+    )
+
+    repository = TargetLibraryRepository(store, requests)
+
+    requested = await repository.get_requested_mbids()
+    assert "track:recording-1" not in requested
+    assert requested == {"requested-release"}
+
 
 @pytest.mark.asyncio
 async def test_shared_provider_identities_aggregate_active_local_copies(
@@ -2140,6 +2163,9 @@ async def test_target_native_contract_separates_local_and_provider_ids_and_redir
         "mbids": [RELEASE_GROUP_MBID],
         "requested_mbids": [],
     }
+    request_history.async_get_requested_mbids.assert_awaited_once_with(
+        request_kind="album"
+    )
     assert redirect.status_code == 308
     assert redirect.headers["location"].endswith(
         f"/library/albums/{IDENTIFIED_ALBUM_ID}/tracks"
