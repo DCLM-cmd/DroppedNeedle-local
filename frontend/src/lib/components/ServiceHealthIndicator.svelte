@@ -1,3 +1,10 @@
+<script module lang="ts">
+	import { SvelteMap } from 'svelte/reactivity';
+
+	const NOTIFICATION_COOLDOWN_MS = 10 * 60 * 1000;
+	const notifiedAt = new SvelteMap<string, number>();
+</script>
+
 <script lang="ts">
 	import { Activity, TriangleAlert } from 'lucide-svelte';
 	import { getSystemHealthQuery } from '$lib/queries/system/SystemHealthQuery.svelte';
@@ -23,44 +30,51 @@
 		return serviceLabel(f);
 	}
 
-	// First-time toast: fire once per distinct outage (keyed by the set of degraded
-	// service:capability pairs) so we inform without nagging on every poll.
-	let notifiedKey = $state('');
+	// Track each service:capability independently so a healing outage stays quiet
+	// when it returns, while a newly degraded capability can still speak up.
 	$effect(() => {
-		const key = degraded
-			.map((d) => `${d.service}:${d.capability}`)
-			.sort()
-			.join('|');
-		if (key && key !== notifiedKey) {
-			notifiedKey = key;
-			const cleanup = degraded.find((d) => d.service === 'acquisition_cleanup');
-			if (cleanup && degraded.length === 1) {
-				toastStore.show({
-					message: `${cleanup.message} Checking again automatically.`,
-					type: 'info'
-				});
-				return;
+		const now = Date.now();
+		for (const [key, lastNotified] of notifiedAt) {
+			if (now - lastNotified >= NOTIFICATION_COOLDOWN_MS) {
+				notifiedAt.delete(key);
 			}
-			const names = [...new Set(degraded.map((d) => serviceLabel(d.service)))].join(', ');
-			if (cleanup) {
-				toastStore.show({
-					message: `${names} are having problems. Retrying automatically.`,
-					type: 'info'
-				});
-				return;
-			}
-			// only claim "using a fallback" when every degraded service has one; most
-			// (MusicBrainz, Last.fm, Wikipedia) don't, and the blanket line would lie
-			const tail = degraded.every((d) => d.fallback)
-				? 'using a fallback for now.'
-				: 'auto-retrying.';
+		}
+
+		const eligible = degraded.filter((item) => {
+			const key = `${item.service}:${item.capability}`;
+			return !notifiedAt.has(key);
+		});
+
+		if (!eligible.length) return;
+
+		for (const item of eligible) {
+			notifiedAt.set(`${item.service}:${item.capability}`, now);
+		}
+
+		const names = [...new Set(eligible.map((d) => serviceLabel(d.service)))];
+		const cleanup = eligible.find((d) => d.service === 'acquisition_cleanup');
+		if (cleanup && eligible.length === 1) {
 			toastStore.show({
-				message: `Trouble reaching ${names} - ${tail}`,
+				message: `${cleanup.message} Checking again automatically.`,
 				type: 'info'
 			});
-		} else if (!key) {
-			notifiedKey = '';
+			return;
 		}
+		if (cleanup) {
+			const serviceVerb = names.length === 1 ? 'is' : 'are';
+			toastStore.show({
+				message: `${names.join(', ')} ${serviceVerb} having problems. Retrying automatically.`,
+				type: 'info'
+			});
+			return;
+		}
+		// only claim "using a fallback" when every eligible service has one; most
+		// (MusicBrainz, Last.fm, Wikipedia) don't, and the blanket line would lie
+		const tail = eligible.every((d) => d.fallback) ? 'using a fallback for now.' : 'auto-retrying.';
+		toastStore.show({
+			message: `Trouble reaching ${names.join(', ')} - ${tail}`,
+			type: 'info'
+		});
 	});
 
 	let open = $state(false);

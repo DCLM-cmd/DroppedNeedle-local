@@ -1,4 +1,4 @@
-"""Tests for SettingsService.verify_navidrome / verify_youtube / verify_lastfm."""
+"""Tests for SettingsService connection verification methods."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -6,6 +6,7 @@ import pytest
 
 from services.settings_service import (
     SettingsService,
+    ListenBrainzVerifyResult,
     NavidromeVerifyResult,
     YouTubeVerifyResult,
     LastFmVerifyResult,
@@ -15,12 +16,64 @@ from services.settings_service import (
 def _make_service(*, preferences=None):
     prefs = preferences or MagicMock()
     cache = MagicMock()
-    cache.clear_by_prefix = AsyncMock(return_value=0)
+    cache.clear_prefix = AsyncMock(return_value=0)
     service = SettingsService(
         preferences_service=prefs,
         cache=cache,
     )
     return service
+
+
+@pytest.mark.asyncio
+async def test_verify_listenbrainz_does_not_reset_circuit_breaker():
+    from api.v1.schemas.settings import ListenBrainzConnectionSettings
+
+    service = _make_service()
+    settings = ListenBrainzConnectionSettings(username="alice")
+    mock_repo_instance = MagicMock()
+    mock_repo_instance.validate_username = AsyncMock(
+        return_value=(True, "User found with 12 listens")
+    )
+
+    with (
+        patch("services.settings_service.get_settings", return_value=MagicMock()),
+        patch("services.settings_service.get_http_client", return_value=MagicMock()),
+        patch(
+            "repositories.listenbrainz_repository.ListenBrainzRepository"
+        ) as MockRepo,
+    ):
+        MockRepo.return_value = mock_repo_instance
+        MockRepo.reset_circuit_breaker = MagicMock()
+
+        result = await service.verify_listenbrainz(settings)
+
+    assert isinstance(result, ListenBrainzVerifyResult)
+    assert result.valid is True
+    MockRepo.reset_circuit_breaker.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_listenbrainz_connection_change_resets_shared_state_only():
+    service = _make_service()
+    service.clear_home_cache = AsyncMock()
+
+    with (
+        patch(
+            "repositories.listenbrainz_repository.ListenBrainzRepository"
+        ) as MockRepo,
+        patch("core.dependencies.clear_listenbrainz_dependent_caches") as clear_caches,
+        patch(
+            "repositories.listenbrainz_repository._reset_listenbrainz_rate_limit_state"
+        ) as reset_rate_limit,
+    ):
+        MockRepo.reset_circuit_breaker = MagicMock()
+
+        await service.on_listenbrainz_connection_changed()
+
+    MockRepo.reset_circuit_breaker.assert_called_once_with()
+    clear_caches.assert_called_once_with()
+    service.clear_home_cache.assert_awaited_once_with()
+    reset_rate_limit.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -33,6 +86,7 @@ async def test_verify_navidrome_success():
     service = _make_service(preferences=prefs)
 
     from api.v1.schemas.settings import NavidromeConnectionSettings
+
     settings = NavidromeConnectionSettings(
         enabled=True,
         navidrome_url="http://navidrome.local",
@@ -43,10 +97,12 @@ async def test_verify_navidrome_success():
     mock_repo_instance = MagicMock()
     mock_repo_instance.ping = AsyncMock(return_value=True)
 
-    with patch("infrastructure.validators.validate_service_url"), \
-         patch("services.settings_service.get_settings", return_value=MagicMock()), \
-         patch("services.settings_service.get_http_client", return_value=MagicMock()), \
-         patch("repositories.navidrome_repository.NavidromeRepository") as MockRepo:
+    with (
+        patch("infrastructure.validators.validate_service_url"),
+        patch("services.settings_service.get_settings", return_value=MagicMock()),
+        patch("services.settings_service.get_http_client", return_value=MagicMock()),
+        patch("repositories.navidrome_repository.NavidromeRepository") as MockRepo,
+    ):
         MockRepo.return_value = mock_repo_instance
         MockRepo.reset_circuit_breaker = MagicMock()
 
@@ -67,6 +123,7 @@ async def test_verify_navidrome_ping_fail():
     service = _make_service(preferences=prefs)
 
     from api.v1.schemas.settings import NavidromeConnectionSettings
+
     settings = NavidromeConnectionSettings(
         enabled=True,
         navidrome_url="http://navidrome.local",
@@ -77,10 +134,12 @@ async def test_verify_navidrome_ping_fail():
     mock_repo_instance = MagicMock()
     mock_repo_instance.ping = AsyncMock(return_value=False)
 
-    with patch("infrastructure.validators.validate_service_url"), \
-         patch("services.settings_service.get_settings", return_value=MagicMock()), \
-         patch("services.settings_service.get_http_client", return_value=MagicMock()), \
-         patch("repositories.navidrome_repository.NavidromeRepository") as MockRepo:
+    with (
+        patch("infrastructure.validators.validate_service_url"),
+        patch("services.settings_service.get_settings", return_value=MagicMock()),
+        patch("services.settings_service.get_http_client", return_value=MagicMock()),
+        patch("repositories.navidrome_repository.NavidromeRepository") as MockRepo,
+    ):
         MockRepo.return_value = mock_repo_instance
         MockRepo.reset_circuit_breaker = MagicMock()
 
@@ -94,6 +153,7 @@ async def test_verify_youtube_success():
     service = _make_service()
 
     from api.v1.schemas.settings import YouTubeConnectionSettings
+
     settings = YouTubeConnectionSettings(
         enabled=True,
         api_key="test-key",
@@ -103,9 +163,11 @@ async def test_verify_youtube_success():
     mock_repo_instance = MagicMock()
     mock_repo_instance.verify_api_key = AsyncMock(return_value=(True, "Valid"))
 
-    with patch("services.settings_service.get_settings", return_value=MagicMock()), \
-         patch("services.settings_service.get_http_client", return_value=MagicMock()), \
-         patch("repositories.youtube.YouTubeRepository") as MockRepo:
+    with (
+        patch("services.settings_service.get_settings", return_value=MagicMock()),
+        patch("services.settings_service.get_http_client", return_value=MagicMock()),
+        patch("repositories.youtube.YouTubeRepository") as MockRepo,
+    ):
         MockRepo.return_value = mock_repo_instance
 
         result = await service.verify_youtube(settings)
@@ -125,6 +187,7 @@ async def test_verify_lastfm_api_key_invalid():
     service = _make_service(preferences=prefs)
 
     from api.v1.schemas.settings import LastFmConnectionSettings
+
     settings = LastFmConnectionSettings(
         enabled=True,
         api_key="bad-key",
@@ -133,11 +196,15 @@ async def test_verify_lastfm_api_key_invalid():
     )
 
     mock_repo_instance = MagicMock()
-    mock_repo_instance.validate_api_key = AsyncMock(return_value=(False, "Invalid API key"))
+    mock_repo_instance.validate_api_key = AsyncMock(
+        return_value=(False, "Invalid API key")
+    )
 
-    with patch("services.settings_service.get_settings", return_value=MagicMock()), \
-         patch("services.settings_service.get_http_client", return_value=MagicMock()), \
-         patch("repositories.lastfm_repository.LastFmRepository") as MockRepo:
+    with (
+        patch("services.settings_service.get_settings", return_value=MagicMock()),
+        patch("services.settings_service.get_http_client", return_value=MagicMock()),
+        patch("repositories.lastfm_repository.LastFmRepository") as MockRepo,
+    ):
         MockRepo.return_value = mock_repo_instance
 
         result = await service.verify_lastfm(settings)
@@ -158,6 +225,7 @@ async def test_verify_lastfm_with_session_key():
     service = _make_service(preferences=prefs)
 
     from api.v1.schemas.settings import LastFmConnectionSettings, LASTFM_SECRET_MASK
+
     settings = LastFmConnectionSettings(
         enabled=True,
         api_key="good-key",
@@ -167,11 +235,15 @@ async def test_verify_lastfm_with_session_key():
 
     mock_repo_instance = MagicMock()
     mock_repo_instance.validate_api_key = AsyncMock(return_value=(True, "OK"))
-    mock_repo_instance.validate_session = AsyncMock(return_value=(True, "Session valid"))
+    mock_repo_instance.validate_session = AsyncMock(
+        return_value=(True, "Session valid")
+    )
 
-    with patch("services.settings_service.get_settings", return_value=MagicMock()), \
-         patch("services.settings_service.get_http_client", return_value=MagicMock()), \
-         patch("repositories.lastfm_repository.LastFmRepository") as MockRepo:
+    with (
+        patch("services.settings_service.get_settings", return_value=MagicMock()),
+        patch("services.settings_service.get_http_client", return_value=MagicMock()),
+        patch("repositories.lastfm_repository.LastFmRepository") as MockRepo,
+    ):
         MockRepo.return_value = mock_repo_instance
 
         result = await service.verify_lastfm(settings)
@@ -186,11 +258,15 @@ async def test_verify_download_client_uses_submitted_values():
     from api.v1.schemas.settings import DownloadClientConnectionSettings
 
     service = _make_service()
-    settings = DownloadClientConnectionSettings(url="https://slskd.example.com", api_key="typed-key")
+    settings = DownloadClientConnectionSettings(
+        url="https://slskd.example.com", api_key="typed-key"
+    )
 
     repo = MagicMock()
     repo.health_check = AsyncMock(
-        return_value=ServiceStatus(status="ok", version="0.25.1.0", message="slskd 0.25.1.0")
+        return_value=ServiceStatus(
+            status="ok", version="0.25.1.0", message="slskd 0.25.1.0"
+        )
     )
     with patch("core.dependencies.build_slskd_repository", return_value=repo) as build:
         result = await service.verify_download_client(settings)

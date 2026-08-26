@@ -120,6 +120,101 @@ async def test_warm_one_user_runs_thorough_build_and_tracks_attempts():
 
 
 @pytest.mark.asyncio
+async def test_warm_one_user_aborts_when_cooldown_opens_during_first_inner_gate_wait():
+    gate = MagicMock()
+    cooldown_active = False
+
+    async def wait_until_available():
+        nonlocal cooldown_active
+        cooldown_active = True
+
+    gate.wait_until_available = AsyncMock(side_effect=wait_until_available)
+    discover = MagicMock()
+    discover.warm_cache_thorough = AsyncMock()
+    discover.peek_freshness = AsyncMock()
+    home = MagicMock()
+    home.warm_cache = AsyncMock()
+    queue = MagicMock()
+    queue.start_build = AsyncMock()
+    queue.wait_for_build = AsyncMock()
+    last_warmed = {"u1": 10.0}
+    attempts = {"u1": 2}
+
+    with patch(
+        "core.tasks.listenbrainz_rate_limit_cooldown_active",
+        side_effect=lambda: cooldown_active,
+    ) as cooldown:
+        await T._warm_one_user(
+            "u1",
+            discover,
+            home,
+            last_warmed,
+            attempts,
+            queue,
+            workload_gate=gate,
+        )
+
+    gate.wait_until_available.assert_awaited_once()
+    cooldown.assert_called_once_with()
+    discover.warm_cache_thorough.assert_not_awaited()
+    discover.peek_freshness.assert_not_awaited()
+    home.warm_cache.assert_not_awaited()
+    queue.start_build.assert_not_awaited()
+    queue.wait_for_build.assert_not_awaited()
+    assert last_warmed == {"u1": 10.0}
+    assert attempts == {"u1": 2}
+
+
+@pytest.mark.asyncio
+async def test_warm_one_user_aborts_later_stages_when_cooldown_opens_between_stages():
+    gate = MagicMock()
+    cooldown_active = False
+    wait_calls = 0
+
+    async def wait_until_available():
+        nonlocal cooldown_active, wait_calls
+        wait_calls += 1
+        if wait_calls == 2:
+            cooldown_active = True
+
+    gate.wait_until_available = AsyncMock(side_effect=wait_until_available)
+    discover = MagicMock()
+    discover.warm_cache_thorough = AsyncMock()
+    discover.peek_freshness = AsyncMock()
+    home = MagicMock()
+    home.warm_cache = AsyncMock()
+    queue = MagicMock()
+    queue.start_build = AsyncMock()
+    queue.wait_for_build = AsyncMock()
+    last_warmed = {"u1": 10.0}
+    attempts = {"u1": 2}
+
+    with patch(
+        "core.tasks.listenbrainz_rate_limit_cooldown_active",
+        side_effect=lambda: cooldown_active,
+    ) as cooldown:
+        await T._warm_one_user(
+            "u1",
+            discover,
+            home,
+            last_warmed,
+            attempts,
+            queue,
+            workload_gate=gate,
+        )
+
+    assert gate.wait_until_available.await_count == 2
+    assert cooldown.call_count == 2
+    discover.warm_cache_thorough.assert_awaited_once_with("u1")
+    home.warm_cache.assert_not_awaited()
+    queue.start_build.assert_not_awaited()
+    queue.wait_for_build.assert_not_awaited()
+    discover.peek_freshness.assert_not_awaited()
+    assert last_warmed == {"u1": 10.0}
+    assert attempts == {"u1": 2}
+
+
+@pytest.mark.asyncio
 async def test_warm_one_user_skips_when_live_build_running():
     registry = TaskRegistry.get_instance()
     live = asyncio.create_task(asyncio.sleep(5))
@@ -170,6 +265,10 @@ async def test_loop_routes_one_user_unit_through_shared_warmer_gate():
     gate.run_warmer_unit = AsyncMock(side_effect=run_warmer_unit)
 
     with (
+        patch(
+            "core.tasks.listenbrainz_rate_limit_cooldown_active",
+            return_value=False,
+        ),
         patch("core.tasks.asyncio.sleep", new=AsyncMock()),
         patch(
             "core.config.get_settings",
@@ -190,6 +289,165 @@ async def test_loop_routes_one_user_unit_through_shared_warmer_gate():
         )
 
     gate.run_warmer_unit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_loop_skips_one_user_unit_during_listenbrainz_rate_limit_cooldown():
+    gate = MagicMock()
+    gate.wait_until_available = AsyncMock()
+    gate.run_warmer_unit = AsyncMock()
+    discover = MagicMock()
+    events: list[str] = []
+
+    def resolve_discover():
+        events.append("discover")
+        return discover
+
+    get_discover = MagicMock(side_effect=resolve_discover)
+    get_home = MagicMock()
+    sleeps: list = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    async def record_selection(*args):
+        events.append("selection")
+        return "u1"
+
+    pick_due = AsyncMock(side_effect=record_selection)
+
+    def cooldown_active():
+        events.append("cooldown")
+        return True
+
+    interval = 17
+    with (
+        patch("core.tasks.asyncio.sleep", side_effect=fake_sleep),
+        patch(
+            "core.config.get_settings",
+            side_effect=[
+                MagicMock(discover_warmer_enabled=True),
+                asyncio.CancelledError(),
+            ],
+        ) as get_settings,
+        patch(
+            "core.tasks._enumerate_warmer_users",
+            new=AsyncMock(return_value=["u1"]),
+        ),
+        patch("core.tasks._pick_due_warmer_user", new=pick_due),
+        patch(
+            "core.tasks.listenbrainz_rate_limit_cooldown_active",
+            side_effect=cooldown_active,
+        ) as cooldown,
+        patch("core.tasks._warm_one_user", new=AsyncMock()) as warm_one_user,
+    ):
+        await T.warm_discover_home_periodically(
+            get_discover,
+            get_home,
+            MagicMock(),
+            interval=interval,
+            workload_gate=gate,
+        )
+
+    assert events == ["discover", "selection", "cooldown"]
+    pick_due.assert_awaited_once()
+    selected_args = pick_due.await_args.args
+    assert selected_args[0] == ["u1"]
+    assert selected_args[1] == {}
+    assert selected_args[2] == {}
+    assert selected_args[4] is discover
+    cooldown.assert_called_once_with()
+    gate.run_warmer_unit.assert_not_awaited()
+    warm_one_user.assert_not_awaited()
+    get_home.assert_not_called()
+    get_discover.assert_called_once_with()
+    assert get_settings.call_count == 2  # enabled pass, then deterministic cancellation
+    assert sleeps == [T.DISCOVER_WARMER_STARTUP_DELAY, interval]
+
+
+@pytest.mark.asyncio
+async def test_loop_rechecks_cooldown_after_gate_wait_before_warming():
+    settings = MagicMock(discover_warmer_enabled=True)
+    gate = MagicMock()
+    wait_calls = 0
+    cooldown = False
+
+    async def wait_until_available():
+        nonlocal wait_calls, cooldown
+        wait_calls += 1
+        if wait_calls == 2:
+            cooldown = True
+
+    gate.wait_until_available = AsyncMock(side_effect=wait_until_available)
+
+    async def run_warmer_unit(operation):
+        await gate.wait_until_available()
+        await operation()
+
+    gate.run_warmer_unit = AsyncMock(side_effect=run_warmer_unit)
+
+    discover = MagicMock()
+    discover.warm_cache_thorough = AsyncMock()
+    home = MagicMock()
+    home.warm_cache = AsyncMock()
+    queue = MagicMock()
+    queue.start_build = AsyncMock()
+    queue.wait_for_build = AsyncMock()
+    get_discover = MagicMock(return_value=discover)
+    get_home = MagicMock(return_value=home)
+    get_queue = MagicMock(return_value=queue)
+    last_warmed: dict = {}
+    attempts: dict = {}
+    cooldown_checks: list[bool] = []
+    sleeps: list = []
+
+    def cooldown_active():
+        cooldown_checks.append(cooldown)
+        return cooldown
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    with (
+        patch("core.tasks.asyncio.sleep", side_effect=fake_sleep),
+        patch(
+            "core.config.get_settings",
+            side_effect=[settings, asyncio.CancelledError()],
+        ),
+        patch(
+            "core.tasks._enumerate_warmer_users",
+            new=AsyncMock(return_value=["u1"]),
+        ),
+        patch(
+            "core.tasks._pick_due_warmer_user",
+            new=AsyncMock(return_value="u1"),
+        ),
+        patch(
+            "core.tasks.listenbrainz_rate_limit_cooldown_active",
+            side_effect=cooldown_active,
+        ),
+    ):
+        await T.warm_discover_home_periodically(
+            get_discover,
+            get_home,
+            MagicMock(),
+            get_queue,
+            interval=17,
+            workload_gate=gate,
+        )
+
+    assert cooldown_checks == [False, True]
+    assert gate.wait_until_available.await_count == 3
+    gate.run_warmer_unit.assert_awaited_once()
+    discover.warm_cache_thorough.assert_not_awaited()
+    home.warm_cache.assert_not_awaited()
+    queue.start_build.assert_not_awaited()
+    queue.wait_for_build.assert_not_awaited()
+    get_home.assert_not_called()
+    get_queue.assert_not_called()
+    assert last_warmed == {}
+    assert attempts == {}
+    assert sleeps == [T.DISCOVER_WARMER_STARTUP_DELAY, 17]
 
 
 # the two homepage-service methods the warmer drives

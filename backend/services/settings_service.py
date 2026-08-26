@@ -131,8 +131,6 @@ class SettingsService:
         try:
             from repositories.listenbrainz_repository import ListenBrainzRepository
 
-            ListenBrainzRepository.reset_circuit_breaker()
-
             app_settings = get_settings()
             http_client = get_http_client(app_settings)
             temp_cache = InMemoryCache(max_entries=100)
@@ -336,6 +334,21 @@ class SettingsService:
         clear_listenbrainz_dependent_caches()
         await self.clear_home_cache()
         logger.info("ListenBrainz settings change: all caches/singletons reset")
+
+    async def on_listenbrainz_connection_changed(self) -> None:
+        """Invalidate shared ListenBrainz state after a per-user mutation.
+
+        This deliberately resets only the circuit breaker.  The process-global
+        rate-limit response window and cooldown remain intact so a user changing
+        credentials cannot bypass upstream pacing for other requests.
+        """
+        from repositories.listenbrainz_repository import ListenBrainzRepository
+        from core.dependencies import clear_listenbrainz_dependent_caches
+
+        ListenBrainzRepository.reset_circuit_breaker()
+        clear_listenbrainz_dependent_caches()
+        await self.clear_home_cache()
+        logger.info("ListenBrainz user connection changed: caches/singletons reset")
 
     async def on_youtube_settings_changed(self) -> None:
         from core.dependencies import get_youtube_repo

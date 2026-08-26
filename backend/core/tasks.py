@@ -12,6 +12,7 @@ from infrastructure.validators import is_unknown_mbid, is_valid_mbid
 from services.library_service import LibraryService
 from services.preferences_service import PreferencesService
 from core.task_registry import TaskRegistry
+from repositories.listenbrainz_repository import listenbrainz_rate_limit_cooldown_active
 
 if TYPE_CHECKING:
     from services.album_service import AlbumService
@@ -509,15 +510,21 @@ async def _warm_one_user(
     # _run_registered_warmer_build hard-caps it at DISCOVER_WARMER_HARD_CAP.
     if workload_gate is not None:
         await workload_gate.wait_until_available()
+        if listenbrainz_rate_limit_cooldown_active():
+            return
     await _run_registered_warmer_build(
         f"discover-homepage-warm-{uid}", discover.warm_cache_thorough(uid)
     )
     if workload_gate is not None:
         await workload_gate.wait_until_available()
+        if listenbrainz_rate_limit_cooldown_active():
+            return
     await _run_registered_warmer_build(f"home-warm-{uid}", home.warm_cache(uid))
     if queue_manager is not None:
         if workload_gate is not None:
             await workload_gate.wait_until_available()
+            if listenbrainz_rate_limit_cooldown_active():
+                return
         await queue_manager.start_build(uid)
         try:
             await asyncio.wait_for(
@@ -577,20 +584,11 @@ async def warm_discover_home_periodically(
                 uid = await _pick_due_warmer_user(
                     eligible, last_warmed, attempts, now, get_discover_service()
                 )
-                if uid is not None:
-                    if workload_gate is not None:
-                        await workload_gate.run_warmer_unit(
-                            lambda: _warm_one_user(
-                                uid,
-                                get_discover_service(),
-                                get_home_service(),
-                                last_warmed,
-                                attempts,
-                                get_queue_manager() if get_queue_manager else None,
-                                workload_gate,
-                            )
-                        )
-                    else:
+                if uid is not None and not listenbrainz_rate_limit_cooldown_active():
+
+                    async def warm_if_not_cooling_down() -> None:
+                        if listenbrainz_rate_limit_cooldown_active():
+                            return
                         await _warm_one_user(
                             uid,
                             get_discover_service(),
@@ -600,6 +598,11 @@ async def warm_discover_home_periodically(
                             get_queue_manager() if get_queue_manager else None,
                             workload_gate,
                         )
+
+                    if workload_gate is not None:
+                        await workload_gate.run_warmer_unit(warm_if_not_cooling_down)
+                    else:
+                        await warm_if_not_cooling_down()
         except asyncio.CancelledError:
             break
         except Exception as e:

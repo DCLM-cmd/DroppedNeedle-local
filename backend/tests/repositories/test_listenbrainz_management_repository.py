@@ -12,10 +12,22 @@ from infrastructure.cache.cache_keys import (
     listenbrainz_prefixes,
 )
 from infrastructure.cache.memory_cache import InMemoryCache
-from repositories.listenbrainz_repository import ListenBrainzRepository
+from repositories.listenbrainz_repository import (
+    ListenBrainzRepository,
+    _listenbrainz_rate_limiter,
+    _reset_listenbrainz_rate_limit_state,
+)
 from repositories.protocols.listenbrainz_management import (
     ListenBrainzGenreRepositoryProtocol,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limit_state():
+    _reset_listenbrainz_rate_limit_state()
+    yield
+    _reset_listenbrainz_rate_limit_state()
+
 
 _FIXTURE = (
     Path(__file__).resolve().parents[1]
@@ -83,11 +95,16 @@ async def test_release_group_genres_bound_get_batches_and_cache_missing_ids() ->
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_headers_produce_bounded_retry_hint(monkeypatch) -> None:
+async def test_rate_limit_429_is_single_attempt_without_retry_sleep(
+    monkeypatch,
+) -> None:
     retry_sleep = AsyncMock()
+    monkeypatch.setattr(_listenbrainz_rate_limiter, "acquire", AsyncMock())
     monkeypatch.setattr("infrastructure.resilience.retry.asyncio.sleep", retry_sleep)
+    requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(
             429,
             text="slow down",
@@ -99,8 +116,9 @@ async def test_rate_limit_headers_produce_bounded_retry_hint(monkeypatch) -> Non
         repository = ListenBrainzRepository(client, InMemoryCache())
         with pytest.raises(RateLimitedError) as raised:
             await repository.get_release_group_genres_batch([_RG])
-    assert raised.value.retry_after_seconds == 7
-    assert [call.args[0] for call in retry_sleep.await_args_list] == [7, 7]
+    assert len(requests) == 1
+    assert raised.value.retry_after_seconds == pytest.approx(7.5)
+    assert retry_sleep.await_args_list == []
 
 
 def test_management_method_conforms_to_narrow_protocol() -> None:

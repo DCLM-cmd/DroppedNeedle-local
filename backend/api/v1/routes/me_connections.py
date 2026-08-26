@@ -296,6 +296,8 @@ async def connect_listenbrainz(
     await store.upsert(
         current_user.id, "listenbrainz", {"user_token": body.user_token, "username": body.username}
     )
+    await settings_service.on_listenbrainz_connection_changed()
+
     return ConnectionStatus(service="listenbrainz", enabled=True, username=body.username)
 
 
@@ -487,12 +489,15 @@ async def disconnect(
     service: str,
     store: UserConnectionsStore = Depends(get_user_connections_store),
     client_factory: PerUserClientFactory = Depends(get_per_user_client_factory),
+    settings_service: SettingsService = Depends(get_settings_service),
 ) -> ConnectionActionResponse:
     if service not in _SUPPORTED_SERVICES:
         raise HTTPException(status_code=404, detail="Unknown service")
     deleted = await store.delete(current_user.id, service)
     if deleted:
         await client_factory.invalidate_playlist_cache(current_user.id, service)
+        if service == "listenbrainz":
+            await settings_service.on_listenbrainz_connection_changed()
     return ConnectionActionResponse(service=service, deleted=deleted)
 
 

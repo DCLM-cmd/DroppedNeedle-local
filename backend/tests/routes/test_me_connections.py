@@ -165,6 +165,7 @@ def test_connect_listenbrainz(ctx):
     assert resp.json()["username"] == "alice_lb"
     listing = ctx.client.get("/me/connections").json()["connections"]
     assert [c["service"] for c in listing] == ["listenbrainz"]
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_awaited_once_with()
 
 
 def test_connect_listenbrainz_empty_username_400(ctx):
@@ -181,6 +182,7 @@ def test_connect_listenbrainz_invalid_token_400(ctx):
         "/me/connections/listenbrainz", json={"user_token": "bad", "username": "x"}
     )
     assert resp.status_code == 400
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_not_awaited()
 
 
 def test_scrobble_preferences_default(ctx):
@@ -245,6 +247,7 @@ def test_disconnect(ctx):
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
     assert ctx.client.get("/me/connections").json()["connections"] == []
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_not_awaited()
 
 
 def test_disconnect_unknown_service_404(ctx):
@@ -455,3 +458,37 @@ def test_disconnect_supports_media_server_services(ctx):
     assert resp.status_code == 200
     assert resp.json() == {"service": "navidrome", "deleted": True}
     assert asyncio.run(ctx.conn_store.get("user-a", "navidrome")) is None
+
+
+def test_connect_listenbrainz_persistence_failure_does_not_run_hook(ctx):
+    ctx.conn_store.upsert = AsyncMock(side_effect=RuntimeError("persist failed"))
+
+    resp = ctx.client.put(
+        "/me/connections/listenbrainz",
+        json={"user_token": "lb-tok", "username": "alice_lb"},
+    )
+
+    assert resp.status_code == 500
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_not_awaited()
+
+
+def test_disconnect_listenbrainz_runs_hook_after_deletion(ctx):
+    asyncio.run(
+        ctx.conn_store.upsert(
+            "user-a", "listenbrainz", {"user_token": "lb-tok", "username": "alice_lb"}
+        )
+    )
+
+    resp = ctx.client.delete("/me/connections/listenbrainz")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"service": "listenbrainz", "deleted": True}
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_awaited_once_with()
+
+
+def test_disconnect_absent_listenbrainz_does_not_run_hook(ctx):
+    resp = ctx.client.delete("/me/connections/listenbrainz")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"service": "listenbrainz", "deleted": False}
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_not_awaited()
