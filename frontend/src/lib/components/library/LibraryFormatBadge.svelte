@@ -1,7 +1,8 @@
 <script lang="ts">
-	// Album-level format badge with the Q3-C quality-tier colour mapping. The album
-	// summary only carries a format string (the highest-quality format present), so
-	// there is no bitrate here — the per-track AudioQualityBadge handles bitrate.
+	// Album-level format badge. The album summary carries the normalized format
+	// for a homogeneous album, or the literal 'mixed' when its indexed tracks use
+	// more than one format (F-PERF-10 display policy - not a quality ranking).
+	// There is no bitrate here; the per-track AudioQualityBadge handles bitrate.
 	interface Props {
 		format: string | null | undefined;
 		size?: string;
@@ -12,6 +13,7 @@
 	const config = $derived.by(() => {
 		const f = (format ?? '').toLowerCase();
 		if (!f) return null;
+		if (f === 'mixed') return { label: 'MIXED', cls: 'badge-ghost' };
 		if (f === 'flac' || f === 'wav' || f === 'alac')
 			return { label: f.toUpperCase(), cls: 'badge-success' };
 		if (f === 'mp3') return { label: 'MP3', cls: 'badge-info' };

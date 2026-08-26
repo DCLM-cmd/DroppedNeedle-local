@@ -2828,7 +2828,10 @@ class NativeLibraryStore(PersistenceBase):
                     "SUM(t.file_size_bytes) AS total_size_bytes, "
                     "SUM(COALESCE(t.duration_seconds, 0)) AS total_duration_seconds, "
                     "MAX(t.imported_at) AS last_imported_at, "
-                    "MAX(t.file_format) AS file_format, MAX(t.album_sort) AS album_sort_name, "
+                    # F-PERF-10 display policy: normalized format for a homogeneous
+                    # album; literal 'mixed' when grouped indexed tracks carry more
+                    # than one normalized non-empty format. Lexical MAX is not a rank.
+                    f"CASE WHEN COUNT(DISTINCT LOWER(NULLIF(t.file_format, ''))) <= 1 THEN COALESCE(MIN(NULLIF(LOWER(t.file_format), '')), '') ELSE 'mixed' END AS file_format, MAX(t.album_sort) AS album_sort_name, "
                     "GROUP_CONCAT(DISTINCT NULLIF(t.genre, '')) AS genres, "
                     "ae.release_group_mbid AS provider_release_group_mbid, "
                     "ae.release_mbid AS provider_release_mbid, "
@@ -3259,7 +3262,10 @@ class NativeLibraryStore(PersistenceBase):
                 "SUM(t.file_size_bytes) AS total_size_bytes, "
                 "SUM(COALESCE(t.duration_seconds, 0)) AS total_duration_seconds, "
                 "MAX(t.imported_at) AS last_imported_at, "
-                "MAX(t.file_format) AS file_format, MAX(t.album_sort) AS album_sort_name, "
+                # F-PERF-10 display policy: normalized format for a homogeneous
+                # album; literal 'mixed' when grouped indexed tracks carry more
+                # than one normalized non-empty format. Lexical MAX is not a rank.
+                f"CASE WHEN COUNT(DISTINCT LOWER(NULLIF(t.file_format, ''))) <= 1 THEN COALESCE(MIN(NULLIF(LOWER(t.file_format), '')), '') ELSE 'mixed' END AS file_format, MAX(t.album_sort) AS album_sort_name, "
                 "GROUP_CONCAT(DISTINCT NULLIF(t.genre, '')) AS genres, "
                 "ae.release_group_mbid AS provider_release_group_mbid, "
                 "ae.release_mbid AS provider_release_mbid, "
