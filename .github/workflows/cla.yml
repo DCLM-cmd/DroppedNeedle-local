@@ -43,6 +43,7 @@ jobs:
   cla:
     name: Check CLA signature
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check or record CLA signature
         if: >-

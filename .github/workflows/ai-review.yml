@@ -17,6 +17,7 @@ jobs:
   review:
     name: AI Review
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     # ------------------------------------------------------------------
     # Gate: only run for PR events, /ai-review comments, or ai-review labels.
@@ -42,6 +43,7 @@ jobs:
         (
           github.event_name == 'issue_comment' &&
           github.event.issue.pull_request != null &&
+          github.event.comment.author_association in ('OWNER', 'MEMBER', 'COLLABORATOR') &&
           startsWith(github.event.comment.body, '/ai-review')
         )
       )
@@ -53,7 +55,7 @@ jobs:
 
     steps:
       - name: Checkout base branch (guidelines + script only)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.base_ref || github.ref }}
           sparse-checkout: |
@@ -62,12 +64,12 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.13'
 
       - name: Install dependencies
-        run: pip install httpx==0.28.1 openai>=1.0
+        run: pip install httpx==0.28.1 openai==2.6.1
 
       - name: Run AI review
         env:
