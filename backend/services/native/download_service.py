@@ -44,7 +44,10 @@ from services.native.album_preflight_scorer import (
     AlbumPreflightScorer,
     rank_stored_candidates,
 )
-from services.native.download_orchestrator import DownloadOrchestrator
+from services.native.download_orchestrator import (
+    DownloadOrchestrator,
+    _DefaultPolicyShim,
+)
 from services.native.library_manager import LibraryManager
 from services.native.quality_tiers import should_acquire, tier_for, tier_rank
 
@@ -512,12 +515,14 @@ class DownloadService:
                 return await self._track_matcher.rank(
                     track_target,
                     results,
+                    snapshot=self._search_snapshot(),
                     auto_accept_threshold=self._auto,
                     manual_threshold=self._manual,
                 )
         return await self._scorer.rank(
             target,
             results,
+            snapshot=self._search_snapshot(),
             auto_accept_threshold=self._auto,
             manual_threshold=self._manual,
         )
@@ -530,6 +535,7 @@ class DownloadService:
         return await self._usenet_scorer.rank(
             target,
             releases,
+            snapshot=self._search_snapshot(),
             auto_accept_threshold=self._auto,
             manual_threshold=self._manual,
             track_count=target.track_count,
@@ -890,6 +896,15 @@ class DownloadService:
         self._orchestrator.dispatch(task.id)
         return task.id
 
+    def _search_snapshot(self):
+        """The manual-search lane scores under the CURRENT global policy (the
+        auto path pins each task's creation-time snapshot instead). Legacy
+        constructions without a factory keep the pre-cutover default range."""
+        if self._snapshot_factory is not None:
+            return self._snapshot_factory()
+        from services.native.acquisition.quality import build_snapshot
+
+        return build_snapshot(_DefaultPolicyShim())
 
     def _pinned_snapshot(self):
         """Creation-time immutable policy snapshot; tests/legacy constructions
@@ -1132,8 +1147,8 @@ class DownloadService:
             if not self._upgrade_allowed:
                 continue
             held_tier = tier_for(
-            row.get("file_format") or "", row.get("bit_rate"), row.get("bit_depth")
-        )
+                row.get("file_format") or "", row.get("bit_rate"), row.get("bit_depth")
+            )
             if tier_rank(held_tier) >= tier_rank(self._quality_cutoff):
                 continue
             recording = row.get("recording_mbid") or track.recording_id

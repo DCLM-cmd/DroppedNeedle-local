@@ -5,7 +5,7 @@
 	"type": "module",
 	"packageManager": "pnpm@10.33.0",
 	"engines": {
-		"node": ">=25"
+		"node": ">=20"
 	},
 	"devEngines": {
 		"runtime": {
@@ -68,5 +68,11 @@
 		"lucide-svelte": "^0.575.0",
 		"marked": "^18.0.0",
 		"runed": "^0.37.1"
+	},
+	"pnpm": {
+		"overrides": {
+			"js-yaml@<4.3.1": "~4.3.1",
+			"nanoid@<3.3.16": "~3.3.16"
+		}
 	}
 }

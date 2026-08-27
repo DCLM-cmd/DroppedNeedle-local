@@ -35,6 +35,8 @@ from repositories.protocols.download_client import (
     TaskHandle,
 )
 from repositories.protocols.indexer import IndexerResult
+from api.v1.schemas.settings import DownloadPolicySettings
+from services.native.acquisition.quality import build_snapshot
 from services.native.album_preflight_scorer import AlbumPreflightScorer
 from services.native.acquisition_cleanup_service import AcquisitionCleanupService
 from services.native.download_orchestrator import DownloadOrchestrator
@@ -259,8 +261,8 @@ def _build(tmp_path: Path, *, album=None, status="completed"):
         download_store=store,
         file_processor=fp,
         library_manager=manager,
-        scorer=AlbumPreflightScorer(store, quality_min="low", flac_mp3_only=False),
-        track_matcher=TrackMatcher(store, quality_min="low", flac_mp3_only=False),
+        scorer=AlbumPreflightScorer(store),
+        track_matcher=TrackMatcher(store),
         manifest_codec=ManifestCodec(),
         event_bus=SSEPublisher(),
         staging_path=staging,
@@ -268,6 +270,11 @@ def _build(tmp_path: Path, *, album=None, status="completed"):
         poll_interval=0.0,
         auto_accept_threshold=0.5,
         manual_threshold=0.1,
+        # The scorers read quality from a task-derived snapshot; a permissive
+        # global policy replaces the pre-snapshot constructor kwargs.
+        get_download_policy=lambda: DownloadPolicySettings(
+            quality_min="low", flac_mp3_only=False
+        ),
         cleanup_service=cleanup,
     )
     return store, manager, orch, client, library, staging

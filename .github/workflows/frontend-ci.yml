@@ -33,8 +33,11 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
-        # No version: pnpm/action-setup reads packageManager from
-        # frontend/package.json, keeping CI on the same pnpm as local dev.
+        with:
+          # defaults.run.working-directory only affects run steps, so the
+          # action would look for packageManager in the root package.json.
+          # Point it at the file that declares the pinned pnpm version.
+          package_json_file: frontend/package.json
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -65,8 +68,11 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
-        # No version: pnpm/action-setup reads packageManager from
-        # frontend/package.json, keeping CI on the same pnpm as local dev.
+        with:
+          # defaults.run.working-directory only affects run steps, so the
+          # action would look for packageManager in the root package.json.
+          # Point it at the file that declares the pinned pnpm version.
+          package_json_file: frontend/package.json
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
