@@ -9,6 +9,7 @@
 	import { api } from '$lib/api/client';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import type { NativeTrackListItem, NativeTrackPage } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	const statsQuery = getLocalStatsQuery();
 	const recentQuery = getLocalRecentQuery();
@@ -130,7 +131,7 @@
 
 	<!-- stretched link under the content so empty area navigates, while playback buttons (pointer-events re-enabled) still act in place; avoids nested interactives -->
 	<a
-		href="/library/local"
+		href={withBasePath('/library/local')}
 		aria-label="Enter the Listening Room"
 		class="absolute inset-0 z-10 rounded-3xl focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-base-100 focus-visible:outline-none"
 		style="--tw-ring-color: rgb(var(--brand-localfiles));"

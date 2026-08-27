@@ -19,6 +19,7 @@
 	import { launchYouTubePlayback } from '$lib/player/launchYouTubePlayback';
 	import { launchTrackPlayback } from '$lib/player/launchTrackPlayback';
 	import { getCoverUrl } from '$lib/utils/errorHandling';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { api } from '$lib/api/client';
 	import {
 		buildQueueItemFromYouTube,
@@ -125,13 +126,13 @@
 		if (!canNavigate || !link) return;
 		const albumId = link.album_id;
 		handleClose();
-		goto(`/album/${albumId}`);
+		goto(withBasePath(`/album/${albumId}`));
 	}
 
 	function searchArtist(): void {
 		if (!link) return;
 		handleClose();
-		goto(`/search?q=${encodeURIComponent(link.artist_name)}`);
+		goto(withBasePath(`/search?q=${encodeURIComponent(link.artist_name)}`));
 	}
 
 	async function playFullAlbum(): Promise<void> {

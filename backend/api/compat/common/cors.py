@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
+from core.base_path import application_path
 
 _PREFIXES = ("/subsonic", "/jellyfin")
 _CORS_HEADERS = {
@@ -25,7 +26,7 @@ _CORS_HEADERS = {
 
 class CompatCORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        if not request.url.path.startswith(_PREFIXES):
+        if not application_path(request.scope).startswith(_PREFIXES):
             return await call_next(request)
         if request.method == "OPTIONS":
             return Response(status_code=204, headers=_CORS_HEADERS)

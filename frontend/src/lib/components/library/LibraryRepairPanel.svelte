@@ -12,6 +12,7 @@
 		createLibraryRepair
 	} from '$lib/queries/library/LibraryRepairMutations.svelte';
 	import type { OperationResponse } from '$lib/queries/library/LibraryOperationsTypes';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	const DEFAULT_VISIBLE_REPAIRS = 3;
 	const repairsQuery = getLibraryRepairsQuery();
@@ -211,8 +212,9 @@
 					{#if repair.state === 'succeeded' && repair.repair_summary?.estimated_apply_changes}
 						<a
 							class="text-sm link link-primary sm:col-span-2 sm:justify-self-end"
-							href="/library/review?state=needs_review&reason=LEGACY_IDENTITY_FAILED_SAFETY_RULES"
-							>Review detached albums</a
+							href={withBasePath(
+								'/library/review?state=needs_review&reason=LEGACY_IDENTITY_FAILED_SAFETY_RULES'
+							)}>Review detached albums</a
 						>
 					{/if}
 				</div>
@@ -313,8 +315,8 @@
 							<a
 								class="btn btn-ghost btn-xs"
 								href={finding.review_id
-									? `/library/review?review=${finding.review_id}`
-									: `/album/${finding.local_album_id}`}
+									? withBasePath(`/library/review?review=${finding.review_id}`)
+									: withBasePath(`/album/${finding.local_album_id}`)}
 								>{finding.review_id ? 'Open evidence' : 'Open local album'}</a
 							>
 						</article>{/each}

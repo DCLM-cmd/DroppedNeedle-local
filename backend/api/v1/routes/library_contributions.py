@@ -15,6 +15,7 @@ from api.v1.schemas.library_contributions import (
     ContributionMusicBrainzResultRequest,
     MusicBrainzSeedResponse,
 )
+from core.base_path import scope_base_path
 from core.dependencies import LibraryContributionServiceDep
 from core.exceptions import ConflictError, ResourceNotFoundError, ValidationError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
@@ -29,9 +30,11 @@ router = APIRouter(
 _CALLBACK_ERROR_PATH = "/library?musicbrainz=callback-error"
 
 
-def _callback_redirect(path: str) -> RedirectResponse:
+def _callback_redirect(path: str, request: Request) -> RedirectResponse:
+    """Same-site SPA destination under the deployment base prefix exactly once."""
+    base_path = scope_base_path(request.scope)
     return RedirectResponse(
-        path,
+        f"{base_path}{path}",
         status_code=303,
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )
@@ -39,6 +42,7 @@ def _callback_redirect(path: str) -> RedirectResponse:
 
 @router.get("/contributions/musicbrainz/callback", include_in_schema=False)
 async def musicbrainz_contribution_callback(
+    request: Request,
     service: LibraryContributionServiceDep,
     token: str | None = None,
     release_mbid: str | None = None,
@@ -48,9 +52,10 @@ async def musicbrainz_contribution_callback(
             token, release_mbid
         )
     except (ValidationError, ResourceNotFoundError, ConflictError):
-        return _callback_redirect(_CALLBACK_ERROR_PATH)
+        return _callback_redirect(_CALLBACK_ERROR_PATH, request)
     return _callback_redirect(
-        f"/library/contributions/{quote(contribution_id, safe='')}?musicbrainz=returned"
+        f"/library/contributions/{quote(contribution_id, safe='')}?musicbrainz=returned",
+        request,
     )
 
 

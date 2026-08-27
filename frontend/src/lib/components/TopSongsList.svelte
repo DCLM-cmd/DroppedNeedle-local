@@ -3,6 +3,7 @@
 	import type { QueueItem, SourceType } from '$lib/player/types';
 	import { API } from '$lib/constants';
 	import { api } from '$lib/api/client';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import TrackRow from './TrackRow.svelte';
 	import { SvelteMap } from 'svelte/reactivity';
@@ -135,7 +136,9 @@
 		<div class="bg-base-200 rounded-lg p-4 text-center flex-1 flex items-center justify-center">
 			<div>
 				<p class="text-base-content/70 text-sm">Connect a music service to see popular songs</p>
-				<a href="/profile#scrobbling" class="btn btn-primary btn-xs mt-2">Configure</a>
+				<a href={withBasePath('/profile#scrobbling')} class="btn btn-primary btn-xs mt-2"
+					>Configure</a
+				>
 			</div>
 		</div>
 	{:else if songs.length === 0}

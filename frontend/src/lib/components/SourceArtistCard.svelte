@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { getApiUrl } from '$lib/api/api-utils';
 	import ArtistImage from './ArtistImage.svelte';
 	import ArtistCardDownloadButton from './ArtistCardDownloadButton.svelte';
 	import { Users } from 'lucide-svelte';
@@ -35,7 +36,7 @@
 				/>
 			{:else if imageUrl}
 				<img
-					src={imageUrl}
+					src={getApiUrl(imageUrl)}
 					alt={name}
 					class="w-full h-full rounded-full object-cover"
 					loading="lazy"
@@ -69,7 +70,7 @@
 				/>
 			{:else if imageUrl}
 				<img
-					src={imageUrl}
+					src={getApiUrl(imageUrl)}
 					alt={name}
 					class="w-full h-full rounded-full object-cover"
 					loading="lazy"

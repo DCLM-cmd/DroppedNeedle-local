@@ -12,6 +12,7 @@
 	import PlexIcon from '$lib/components/PlexIcon.svelte';
 	import SidebarServiceHint from '$lib/components/SidebarServiceHint.svelte';
 	import SidebarVisualiser from '$lib/components/SidebarVisualiser.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	const integrations = fromStore(integrationStore);
 
@@ -47,7 +48,7 @@
 	{#if integrations.current.youtube}
 		<li>
 			<a
-				href="/library/youtube"
+				href={withBasePath('/library/youtube')}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 				data-tip="YouTube"
 			>
@@ -66,7 +67,7 @@
 	{#if integrations.current.jellyfin}
 		<li>
 			<a
-				href="/library/jellyfin"
+				href={withBasePath('/library/jellyfin')}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 				data-tip="Jellyfin"
 			>
@@ -96,7 +97,7 @@
 	{#if integrations.current.navidrome}
 		<li>
 			<a
-				href="/library/navidrome"
+				href={withBasePath('/library/navidrome')}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 				data-tip="Navidrome"
 			>
@@ -126,7 +127,7 @@
 	{#if integrations.current.plex}
 		<li>
 			<a
-				href="/library/plex"
+				href={withBasePath('/library/plex')}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 				data-tip="Plex"
 			>
@@ -156,7 +157,7 @@
 	{#if integrations.current.localfiles}
 		<li>
 			<a
-				href="/library/local"
+				href={withBasePath('/library/local')}
 				class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 				data-tip="Local Files"
 			>

@@ -42,6 +42,7 @@
 		startEditionConversion
 	} from '$lib/queries/library/EditionConversionQueries.svelte';
 	import { rememberLibraryManagementPreviewToken } from '$lib/queries/library-management/LibraryManagementPreviewTokens';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	interface Props {
 		album: LibraryAlbumDetail;
@@ -378,7 +379,11 @@
 		});
 		if (!result.status.final_preview_job_id) return;
 		rememberLibraryManagementPreviewToken(result.status.final_preview_job_id, result.preview_token);
-		window.location.assign(`/library/management/previews/${result.status.final_preview_job_id}`);
+		window.location.assign(
+			withBasePath(
+				`/library/management/previews/${encodeURIComponent(result.status.final_preview_job_id)}`
+			)
+		);
 	}
 
 	function candidateErrorMessage(): string {
@@ -661,8 +666,7 @@
 							<button
 								class="btn btn-primary gap-2"
 								disabled={start.isPending}
-								onclick={() =>
-									void begin(album.musicbrainz_release_id ?? null)}
+								onclick={() => void begin(album.musicbrainz_release_id ?? null)}
 							>
 								{#if start.isPending}<span class="loading loading-spinner loading-sm"
 									></span>{:else}<Fingerprint class="h-4 w-4" />{/if}

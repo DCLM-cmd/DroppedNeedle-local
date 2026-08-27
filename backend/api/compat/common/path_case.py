@@ -17,6 +17,7 @@ import re
 from collections.abc import Iterable
 
 from starlette.types import ASGIApp, Receive, Scope, Send
+from core.base_path import application_path
 
 _PREFIXES = ("/subsonic", "/jellyfin")
 
@@ -51,11 +52,11 @@ class CompatPathCaseMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") == "http":
-            path = scope.get("path", "")
+            path = application_path(scope)
             if path.lower().startswith(_PREFIXES):
                 canon = self._canonical(path)
                 if canon is not None:
                     scope = dict(scope)
-                    scope["path"] = canon
-                    scope["raw_path"] = canon.encode("ascii", "ignore")
+                    scope["path"] = f"{scope.get('root_path', '')}{canon}"
+                    scope.pop("raw_path", None)
         await self.app(scope, receive, send)

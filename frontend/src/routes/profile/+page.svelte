@@ -26,7 +26,9 @@
 		KeyRound
 	} from 'lucide-svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { logout } from '$lib/utils/logout';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { getProfileQuery } from '$lib/queries/profile/ProfileQuery.svelte';
 	import {
 		createUpdateDisplayNameMutation,
@@ -148,10 +150,10 @@
 			await invalidateQueriesWithPersister({
 				queryKey: ConnectionsQueryKeyFactory.list(authStore.user?.id)
 			});
-			if (browser) history.replaceState({}, '', '/profile');
+			if (browser) history.replaceState({}, '', withBasePath('/profile'));
 		} else if (spotify === 'error') {
 			toastStore.show({ message: 'Spotify connection failed. Please try again.', type: 'error' });
-			if (browser) history.replaceState({}, '', '/profile');
+			if (browser) history.replaceState({}, '', withBasePath('/profile'));
 		}
 	});
 
@@ -392,7 +394,7 @@
 						>
 							{#if profile.avatar_url}
 								<img
-									src={profile.avatar_url}
+									src={getApiUrl(profile.avatar_url)}
 									alt="Profile"
 									class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-110"
 								/>
@@ -856,7 +858,7 @@
 
 				<section class="flex justify-center gap-3 pt-2 xl:ml-40">
 					<a
-						href="/settings"
+						href={withBasePath('/settings')}
 						class="btn btn-outline btn-sm gap-2 rounded-full border-base-content/20 text-base-content/60 transition-all hover:border-primary hover:text-primary"
 					>
 						<Settings class="h-4 w-4" />
@@ -900,7 +902,7 @@
 		>
 			{#if avatarPreview}
 				<img
-					src={avatarPreview}
+					src={getApiUrl(avatarPreview)}
 					alt="Preview"
 					class="h-24 w-24 rounded-full object-cover ring-2 ring-base-content/10"
 				/>

@@ -28,6 +28,7 @@
 		getLibraryManagementOperationResultsQuery
 	} from '$lib/queries/library-management/LibraryManagementQueries.svelte';
 	import { rememberLibraryManagementPreviewToken } from '$lib/queries/library-management/LibraryManagementPreviewTokens';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { createUuid } from '$lib/utils/uuid';
 	import {
 		managementAudioFormat,
@@ -85,7 +86,7 @@
 	$effect(() => {
 		if (!redirectingReadyPreview && operation?.mode === 'preview' && operation.state === 'ready') {
 			redirectingReadyPreview = true;
-			void goto(`/library/management/previews/${encodeURIComponent(jobId)}`, {
+			void goto(withBasePath(`/library/management/previews/${encodeURIComponent(jobId)}`), {
 				replaceState: true
 			});
 		}
@@ -238,7 +239,7 @@
 			});
 			rememberLibraryManagementPreviewToken(handle.job_id, handle.preview_token);
 			undoDialog.close();
-			await goto(`/library/management/previews/${encodeURIComponent(handle.job_id)}`);
+			await goto(withBasePath(`/library/management/previews/${encodeURIComponent(handle.job_id)}`));
 		} catch (error) {
 			undoError = error instanceof Error ? error.message : 'Could not create the undo preview.';
 		}
@@ -310,7 +311,7 @@
 
 <div class="management-preview-shell px-4 py-8 sm:px-6 lg:px-8">
 	<main class="mx-auto max-w-7xl space-y-5">
-		<BackButton fallback="/library/management?tab=organize" />
+		<BackButton fallback={withBasePath('/library/management?tab=organize')} />
 
 		{#if operationQuery.isLoading || redirectingReadyPreview}
 			<div class="space-y-4">
@@ -478,7 +479,7 @@
 						<p class="management-step">Audit trail</p>
 						<h2 class="font-display text-xl font-semibold">Per-file results</h2>
 					</div>
-					<a href="/library/management/history" class="btn btn-ghost btn-sm"
+					<a href={withBasePath('/library/management/history')} class="btn btn-ghost btn-sm"
 						><History class="h-4 w-4" /> All history</a
 					>
 				</div>
@@ -540,8 +541,9 @@
 					{#if operation.baseline_available_count > 0}<p class="mt-2 text-xs text-base-content/55">
 							{baselineStatus}
 						</p>{/if}
-					<a href="/library/management?runner=baseline_restore" class="btn btn-ghost btn-sm mt-3"
-						>Open baseline restore...</a
+					<a
+						href={withBasePath('/library/management?runner=baseline_restore')}
+						class="btn btn-ghost btn-sm mt-3">Open baseline restore...</a
 					>
 				</div>
 			</section>

@@ -24,6 +24,7 @@
 	} from '$lib/queries/library/LibraryQueries.svelte';
 	import { getAlbumEditionsQuery } from '$lib/queries/albums/EditionQueries.svelte';
 	import { createLibraryContributionMutation } from '$lib/queries/libraryContributions/LibraryContributionMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { artistHref } from '$lib/utils/entityRoutes';
 
 	interface Props {
@@ -80,7 +81,7 @@
 	function openContribution(): void {
 		if (!album) return;
 		if (album.contribution_id) {
-			void goto(`/library/contributions/${album.contribution_id}`);
+			void goto(withBasePath(`/library/contributions/${album.contribution_id}`));
 			return;
 		}
 		contributionMutation.mutate(album.id);
@@ -90,7 +91,10 @@
 <svelte:head><title>{album?.title ?? 'Album'} · Library</title></svelte:head>
 
 <main class="container mx-auto p-4 md:p-6 lg:p-8">
-	<button class="btn btn-ghost btn-sm mb-5 gap-2" onclick={() => goto('/library/albums')}>
+	<button
+		class="btn btn-ghost btn-sm mb-5 gap-2"
+		onclick={() => goto(withBasePath('/library/albums'))}
+	>
 		<ChevronLeft class="h-4 w-4" /> Albums
 	</button>
 
@@ -169,7 +173,8 @@
 				{#if album.review_id && authStore.isAdmin}
 					<a
 						class="link link-warning mt-3 inline-block text-sm"
-						href={`/library/review?review=${album.review_id}`}>Open identification review</a
+						href={withBasePath(`/library/review?review=${album.review_id}`)}
+						>Open identification review</a
 					>
 				{/if}
 			</div>

@@ -1007,3 +1007,90 @@ def test_store_prune_task_receives_the_native_library_singleton() -> None:
         and isinstance(native.func, ast.Name)
         and native.func.id == "get_native_library_store"
     ), "native_store must come from get_native_library_store()"
+
+
+def _build_production_app_with_base(
+    monkeypatch: pytest.MonkeyPatch, base_path: str
+):
+    """Build the production target app with BASE_PATH forced and settings fresh."""
+    monkeypatch.setenv("BASE_PATH", base_path)
+    import core.config as config_module
+
+    monkeypatch.setattr(config_module, "_settings", None)
+    return build_test_client(create_production_target_application())
+
+
+def test_production_target_places_base_path_inside_proxy_headers() -> None:
+    from api.compat.common.path_case import CompatPathCaseMiddleware
+    from core.base_path import BasePathMiddleware
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    app = create_production_target_application()
+    outermost = [middleware.cls for middleware in app.user_middleware[:3]]
+    assert outermost == [
+        ProxyHeadersMiddleware,
+        BasePathMiddleware,
+        CompatPathCaseMiddleware,
+    ]
+
+
+def test_prefixed_surface_serves_health_and_api_under_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "/music")
+
+    prefixed_health = client.get("/music/health")
+    assert prefixed_health.status_code == 200
+    assert prefixed_health.json() == {
+        "status": "ok",
+        "message": "DroppedNeedle backend running",
+    }
+
+    unprefixed_health = client.get("/health")
+    assert unprefixed_health.status_code == 404
+    assert unprefixed_health.json() == {
+        "error": {"code": "NOT_FOUND", "message": "Not found", "details": None}
+    }
+
+    assert client.get("/music/api/v1/openapi.json").status_code == 200
+    assert client.get("/api/v1/openapi.json").status_code == 404
+
+
+def test_prefix_matching_is_segment_exact_and_strips_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "/music")
+
+    for path in ["//music/health", "/music-x/health", "/musicx/health"]:
+        response = client.get(path)
+        assert response.status_code == 404, path
+        assert response.json()["error"]["code"] == "NOT_FOUND", path
+
+    assert client.get("/music/music/health").status_code == 404
+
+
+def test_auth_middleware_guards_prefixed_api_but_sees_nothing_unprefixed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "/music")
+
+    protected = client.get("/music/api/v1/artists")
+    assert protected.status_code == 401
+    assert protected.json()["error"]["code"] == "UNAUTHORIZED"
+
+    hidden = client.get("/api/v1/artists")
+    assert hidden.status_code == 404
+    assert hidden.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_empty_base_path_keeps_today_unprefixed_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "")
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/api/v1/openapi.json").status_code == 200
+
+    protected = client.get("/api/v1/artists")
+    assert protected.status_code == 401
+    assert protected.json()["error"]["code"] == "UNAUTHORIZED"

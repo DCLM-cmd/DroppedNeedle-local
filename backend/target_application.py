@@ -159,6 +159,7 @@ from core.dependencies import (
     get_library_policy_resolver,
     get_library_management_recovery_service,
 )
+from core.base_path import BasePathMiddleware
 from core.config import get_settings
 from core.exception_handlers import (
     circuit_open_error_handler,
@@ -800,6 +801,8 @@ def create_production_target_application() -> FastAPI:
         CompatPathCaseMiddleware,
         routes=[*subsonic_router.routes, *jellyfin_router.routes],
     )
+    # Legacy settings doubles omit base_path; absence means unprefixed serving.
+    app.add_middleware(BasePathMiddleware, base_path=getattr(get_settings(), "base_path", ""))
     app.add_middleware(
         ProxyHeadersMiddleware, trusted_hosts=get_settings().trusted_proxy_ips
     )

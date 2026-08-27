@@ -5,6 +5,7 @@
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import { createLibraryTrackLoader } from '$lib/utils/libraryTrackLoader.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import NowPlayingIndicator from '$lib/components/NowPlayingIndicator.svelte';
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
@@ -172,7 +173,7 @@
 		class="mb-6 rounded-xl bg-base-200/30 backdrop-blur-sm border border-base-content/5 px-5 py-4 shadow-sm flex items-center gap-3"
 	>
 		<a
-			href="/library/jellyfin"
+			href={withBasePath('/library/jellyfin')}
 			class="btn btn-ghost btn-sm gap-1"
 			aria-label="Back to Jellyfin library"
 		>

@@ -2,6 +2,7 @@
 	import { ArrowRight, Eraser, FileClock, Image, RotateCcw, Tags } from 'lucide-svelte';
 
 	import { API } from '$lib/constants';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import type { LibraryManagementPlanItem } from '$lib/queries/library-management/types';
 	import {
 		formatManagementValue,
@@ -113,7 +114,7 @@
 	function artworkPreviewUrl(choice: Record<string, unknown>): string | null {
 		const sha256 = managementArtworkPreviewHash(choice);
 		if (!sha256) return null;
-		return API.libraryManagement.previewArtwork(jobId, item.ordinal, sha256);
+		return getApiUrl(API.libraryManagement.previewArtwork(jobId, item.ordinal, sha256));
 	}
 </script>
 

@@ -979,11 +979,28 @@ class PreferencesService:
         endpoint all derive through this one method. An admin-configured
         ``spotify_redirect_origin`` wins; empty keeps the historical
         request-derived base (which collapses to localhost behind untrusted
-        proxies).
+        proxies). The deployment base path (``Settings.base_path``, always
+        canonical via its validator) goes between the origin and the callback
+        path, exactly once - an effective origin that already ends with it
+        (the mounted app's request-derived base, or a stored origin baked in
+        with the prefix) is not doubled.
         """
         origin = self.get_spotify_settings_raw().spotify_redirect_origin.strip()
         base = (origin or request_base_url).rstrip("/")
+        prefix = self._settings.base_path
+        if prefix and not base.endswith(prefix):
+            base += prefix
         return base + SPOTIFY_CALLBACK_PATH
+
+    def with_base_path(self, target_path: str) -> str:
+        """Prefix an app-relative browser redirect target with the base path.
+
+        Same-site redirects (profile success/error pages after OAuth flows)
+        must stay relative so browsers resolve them against the page they are
+        issued from, while still carrying the deployment base path once.
+        ``target_path`` must start with "/" and must never already include it.
+        """
+        return self._settings.base_path + target_path
 
     def get_get_it_settings(self) -> GetItSettings:
         """Return the regional storefront used by purchase-link fallbacks."""

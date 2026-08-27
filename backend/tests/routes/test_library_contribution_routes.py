@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 import pytest
 
 from api.v1.routes.library_contributions import router
@@ -15,7 +16,11 @@ from models.library_contribution import (
     ReleaseDraft,
     MusicBrainzSeed,
 )
-from tests.helpers import build_test_client, override_user_auth
+from tests.helpers import (
+    add_production_exception_handlers,
+    build_test_client,
+    override_user_auth,
+)
 
 
 def _contribution() -> ContributionRecord:
@@ -252,6 +257,48 @@ def test_invalid_public_callback_uses_fixed_error_redirect(app: FastAPI) -> None
 
     assert response.status_code == 303
     assert response.headers["location"] == "/library?musicbrainz=callback-error"
+    assert "private" not in response.text
+
+
+def _prefixed_client(app: FastAPI, root_path: str) -> TestClient:
+    """Expose the router behind an ASGI root_path, like the base-aware proxy."""
+    add_production_exception_handlers(app)
+    return TestClient(app, raise_server_exceptions=False, root_path=root_path)
+
+
+def test_valid_public_callback_redirect_stays_under_configured_base_path(
+    app: FastAPI,
+) -> None:
+    client = _prefixed_client(app, "/music")
+    response = client.get(
+        "/library/contributions/musicbrainz/callback",
+        params={
+            "token": "a" * 43,
+            "release_mbid": "11111111-1111-4111-8111-111111111111",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        "/music/library/contributions/contribution-1?musicbrainz=returned"
+    )
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_invalid_public_callback_error_redirect_honors_base_path(
+    app: FastAPI,
+) -> None:
+    service = app.dependency_overrides[get_library_contribution_service]()
+    service.consume_musicbrainz_callback.side_effect = ValidationError("private detail")
+    client = _prefixed_client(app, "/music")
+    response = client.get(
+        "/library/contributions/musicbrainz/callback?token=bad",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/music/library?musicbrainz=callback-error"
     assert "private" not in response.text
 
 

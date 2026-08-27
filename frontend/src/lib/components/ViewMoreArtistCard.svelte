@@ -2,6 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { colors } from '$lib/colors';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { ChevronRight } from 'lucide-svelte';
 
 	let imgError = $state(false);
@@ -13,7 +14,7 @@
 	function handleClick() {
 		const query = page.url.searchParams.get('q') || '';
 		if (query) {
-			goto(`/search/artists?q=${encodeURIComponent(query)}`);
+			goto(withBasePath(`/search/artists?q=${encodeURIComponent(query)}`));
 		}
 	}
 </script>
@@ -28,8 +29,8 @@
 		<div class="absolute inset-0 overflow-hidden">
 			<img
 				data-testid="view-more-artist-background"
-				src="/img/artist_bg-250.webp"
-				srcset="/img/artist_bg-250.webp 250w, /img/artist_bg-500.webp 500w"
+				src={withBasePath('/img/artist_bg-250.webp')}
+				srcset={`${withBasePath('/img/artist_bg-250.webp')} 250w, ${withBasePath('/img/artist_bg-500.webp')} 500w`}
 				sizes="200px"
 				width="500"
 				height="500"

@@ -41,6 +41,28 @@ check_writable() {
     return "$_rc"
 }
 
+# Run a command under the runtime identity: directly when this process is
+# already non-root, gosu'd down when starting as root. Keeps all startup work
+# owned by the account uvicorn eventually runs as.
+run_as_runtime() {
+    if [ "$(id -u)" -ne 0 ]; then
+        "$@"
+    else
+        gosu droppedneedle:droppedneedle "$@"
+    fi
+}
+
+configure_static_base_path() {
+    echo "[init] Configuring frontend static bundle."
+    if ! run_as_runtime python -m maintenance.configure_frontend_base; then
+        echo "[init] FATAL: Failed to stamp BASE_PATH into the frontend static bundle."
+        echo "[init]   Fix the BASE_PATH value reported above, or make DROPPEDNEEDLE_STATIC_DIR"
+        echo "[init]   writable by this UID (the image default lives under /app/cache), then restart."
+        exit 1
+    fi
+}
+
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "[init] Running as uid=$(id -u) gid=$(id -g) (non-root); skipping user/group setup."
     for dir in /app/cache /app/config; do
@@ -52,6 +74,7 @@ if [ "$(id -u)" -ne 0 ]; then
             exit 1
         fi
     done
+    configure_static_base_path
     exec "$@"
 fi
 
@@ -100,5 +123,6 @@ for dir in /app/cache /app/config; do
         exit 1
     fi
 done
+configure_static_base_path
 
 exec gosu droppedneedle:droppedneedle "$@"

@@ -11,6 +11,7 @@
 <script lang="ts">
 	import { Check, Pause, Play, X } from 'lucide-svelte';
 
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { API } from '$lib/constants';
 	import {
 		discardHeldTrack,
@@ -69,7 +70,7 @@
 
 	function ensureSource(): void {
 		if (audioEl && !sourced) {
-			audioEl.src = API.downloads.heldAudio(held.id);
+			audioEl.src = getApiUrl(API.downloads.heldAudio(held.id));
 			sourced = true;
 		}
 	}

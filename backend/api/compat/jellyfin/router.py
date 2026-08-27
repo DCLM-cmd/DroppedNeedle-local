@@ -41,6 +41,7 @@ from core.exceptions import (
     JellyfinError,
     RangeNotSatisfiableError,
 )
+from core.base_path import application_path, scope_base_path
 from infrastructure.constants import JELLYFIN_TICKS_PER_SECOND
 from infrastructure.msgspec_fastapi import MsgSpecRoute
 
@@ -68,6 +69,7 @@ async def _handle(
     **extra,
 ) -> Response:
     client_ip = trusted_client_ip(request)
+    path = application_path(request.scope)
     try:
         settings = services.preferences.get_connect_apps_settings()
         if not settings.jellyfin_enabled:
@@ -85,10 +87,10 @@ async def _handle(
                     if retry_after is not None:
                         return reject_jellyfin(retry_after)
                 raise
-            if not is_media_request(request.url.path):
+            if not is_media_request(path):
                 retry_after = await compat_rate_limits.principal_retry_after(
                     user.id,
-                    mutation=is_mutation_request(request.method, request.url.path),
+                    mutation=is_mutation_request(request.method, path),
                 )
                 if retry_after is not None:
                     return reject_jellyfin(retry_after)
@@ -96,7 +98,7 @@ async def _handle(
             retry_after = compat_rate_limits.auth_failure_retry_after(client_ip)
             if retry_after is not None:
                 return reject_jellyfin(retry_after)
-        elif not is_media_request(request.url.path):
+        elif not is_media_request(path):
             retry_after = await compat_rate_limits.public_retry_after(client_ip)
             if retry_after is not None:
                 return reject_jellyfin(retry_after)
@@ -117,10 +119,16 @@ async def _handle(
         return error_response(status, body)
 
 
+
+
 def _local_address(request: Request) -> str:
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.url.netloc
-    return f"{proto}://{host}/jellyfin"
+    """Public origin plus shim prefix for advertised URLs.
+
+    ``request.base_url`` already includes the ASGI root path installed by
+    ``BasePathMiddleware``. Proxy-derived host and scheme are accepted only
+    through uvicorn's trusted ``ProxyHeadersMiddleware``.
+    """
+    return f"{str(request.base_url).rstrip('/')}/jellyfin"
 
 
 # ===== System / identity =====
@@ -1000,9 +1008,12 @@ async def _playback_info(request, services, user, *, item_id):
     )
     if will_transcode:
         out = settings.transcode_default_format
+        # Root-relative yet inside the deployment prefix: players resolve this
+        # against the advertised origin, so a bare /jellyfin/... path would
+        # escape the base path under non-empty BASE_PATH deployments.
         src.TranscodingUrl = (
-            f"/jellyfin/Audio/{item_id}/universal?AudioCodec={out}&Container={out}"
-            f"&PlaySessionId={psid}"
+            f"{scope_base_path(request.scope)}/jellyfin/Audio/{item_id}/universal"
+            f"?AudioCodec={out}&Container={out}&PlaySessionId={psid}"
         )
         src.TranscodingSubProtocol = "http"
         src.TranscodingContainer = "mp3" if out == "mp3" else "ogg"

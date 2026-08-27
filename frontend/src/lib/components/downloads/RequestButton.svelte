@@ -2,6 +2,7 @@
 	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { integrationStore } from '$lib/stores/integration';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	// inLibrary/requested are derived by the album page from GET /library/albums/{mbid}/status and passed in
 	interface Props {
@@ -52,7 +53,7 @@
 	<button class="btn btn-info {klass}" disabled>Requested</button>
 {:else if !configured}
 	{#if isAdmin}
-		<a href="/settings?tab=download-client" class="btn btn-warning {klass}"
+		<a href={withBasePath('/settings?tab=download-client')} class="btn btn-warning {klass}"
 			>Configure Download Client</a
 		>
 	{:else}

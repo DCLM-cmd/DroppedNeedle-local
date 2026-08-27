@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import http.client
 import json
@@ -63,8 +64,12 @@ class _WorkingMigrationError(AutomaticUpgradeError):
 
 
 class _UpgradeHealthHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args: Any, health_path: str, **kwargs: Any) -> None:
+        self.health_path = health_path
+        super().__init__(*args, **kwargs)
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path == "/health":
+        if self.path == self.health_path:
             body = b'{"status":"upgrading"}'
             self.send_response(200)
         else:
@@ -80,8 +85,11 @@ class _UpgradeHealthHandler(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def _upgrade_health_server(port: int):
-    server = ThreadingHTTPServer(("0.0.0.0", port), _UpgradeHealthHandler)
+def _upgrade_health_server(port: int, base_path: str):
+    handler = functools.partial(
+        _UpgradeHealthHandler, health_path=f"{base_path}/health"
+    )
+    server = ThreadingHTTPServer(("0.0.0.0", port), handler)
     thread = Thread(target=server.serve_forever, name="upgrade-health", daemon=True)
     thread.start()
     try:
@@ -1036,10 +1044,10 @@ def _config_path_before_settings() -> Path:
     return root / "config" / "config.json"
 
 
-def _target_ready(port: int) -> bool:
+def _target_ready(port: int, base_path: str) -> bool:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
     try:
-        connection.request("GET", "/health")
+        connection.request("GET", f"{base_path}/health")
         response = connection.getresponse()
         payload = json.loads(response.read())
         return response.status == 200 and payload.get("status") == "ok"
@@ -1452,7 +1460,7 @@ def run_target_supervisor(
             target_became_ready = False
             while process.poll() is None:
                 readiness_idle_deadline = observe_progress(readiness_idle_deadline)
-                if _target_ready(port):
+                if _target_ready(port, settings.base_path):
                     target_became_ready = True
                     _clear_post_admission_startup_failure(settings)
                     if progress_path is not None:
@@ -1603,7 +1611,9 @@ def main() -> int:
             in {"running", "migrating", "promoting", "promoted_pending_startup"}
         )
         if needs_upgrade:
-            with _upgrade_health_server(_container_port(settings)):
+            with _upgrade_health_server(
+                _container_port(settings), settings.base_path
+            ):
                 run_automatic_copy_upgrade(
                     settings, require_target_admission=start_target
                 )

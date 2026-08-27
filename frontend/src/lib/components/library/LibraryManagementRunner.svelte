@@ -28,6 +28,7 @@
 		LibraryManagementSettingsResponse,
 		ManagementSelectionKind
 	} from '$lib/queries/library-management/types';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { createUuid } from '$lib/utils/uuid';
 
 	interface Props {
@@ -296,7 +297,7 @@
 						});
 			rememberLibraryManagementPreviewToken(handle.job_id, handle.preview_token);
 			dialog.close();
-			await goto(`/library/management/previews/${encodeURIComponent(handle.job_id)}`);
+			await goto(withBasePath(`/library/management/previews/${encodeURIComponent(handle.job_id)}`));
 		} catch (error) {
 			localError = error instanceof Error ? error.message : 'Could not create the preview.';
 		}

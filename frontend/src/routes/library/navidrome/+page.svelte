@@ -28,6 +28,8 @@
 	import { reveal } from '$lib/actions/reveal';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import type {
 		NavidromeHubResponse,
 		NavidromeAlbumSummary,
@@ -264,7 +266,7 @@
 		{
 			label: 'Albums',
 			value: hub?.stats?.total_albums ?? null,
-			href: '/library/navidrome/albums',
+			href: withBasePath('/library/navidrome/albums'),
 			subtitle: 'in your library',
 			colorScheme: 'primary',
 			icon: 'disc'
@@ -272,7 +274,7 @@
 		{
 			label: 'Artists',
 			value: hub?.stats?.total_artists ?? null,
-			href: '/library/navidrome/artists',
+			href: withBasePath('/library/navidrome/artists'),
 			subtitle: 'in your library',
 			colorScheme: 'secondary',
 			icon: 'users'
@@ -280,7 +282,7 @@
 		{
 			label: 'Tracks',
 			value: hub?.stats?.total_tracks ?? null,
-			href: '/library/navidrome/tracks',
+			href: withBasePath('/library/navidrome/tracks'),
 			subtitle: 'in your library',
 			colorScheme: 'accent',
 			icon: 'music'
@@ -332,7 +334,7 @@
 		errorCode={playlistErrorCode}
 		onretry={() => void playlistsQuery.refetch()}
 		sourceLabel="Navidrome"
-		playlistsHref="/library/navidrome/playlists"
+		playlistsHref={withBasePath('/library/navidrome/playlists')}
 	>
 		{#snippet sourceIcon()}
 			<span style="color: rgb(var(--brand-navidrome));">
@@ -589,7 +591,7 @@
 					<div class="flex gap-4 items-start">
 						{#if artistInfo.image_url}
 							<img
-								src={artistInfo.image_url}
+								src={getApiUrl(artistInfo.image_url)}
 								alt={artistInfo.name}
 								class="w-24 h-24 rounded-full object-cover shrink-0"
 							/>
@@ -623,9 +625,13 @@
 						index={genericArtistIndex}
 						onselect={(artist) => {
 							if (artist.musicbrainz_id) {
-								goto(`/artist/${artist.musicbrainz_id}`);
+								goto(withBasePath(`/artist/${artist.musicbrainz_id}`));
 							} else {
-								goto(`/library/navidrome/albums?search=${encodeURIComponent(artist.name)}`);
+								goto(
+									withBasePath(
+										`/library/navidrome/albums?search=${encodeURIComponent(artist.name)}`
+									)
+								);
 							}
 						}}
 					/>
@@ -634,7 +640,11 @@
 				{/if}
 			</HubShelf>
 
-			<HubShelf title="Browse Albums" seeAllHref="/library/navidrome/albums" {loading}>
+			<HubShelf
+				title="Browse Albums"
+				seeAllHref={withBasePath('/library/navidrome/albums')}
+				{loading}
+			>
 				{#if hub && hub.all_albums_preview.length > 0}
 					<HorizontalCarousel>
 						{#each hub?.all_albums_preview ?? [] as album (album.navidrome_id)}

@@ -11,6 +11,7 @@
 		createPlexPinMutation
 	} from '$lib/queries/auth/AuthMutations.svelte';
 	import { AUTH_ENDPOINTS } from '$lib/queries/auth/endpoints';
+	import { withBasePath } from '$lib/utils/basePath';
 	import {
 		toAuthUser,
 		type AuthProviders,
@@ -73,7 +74,7 @@
 
 	function storeSession(data: AuthSessionResponse) {
 		authStore.setUser(toAuthUser(data.user));
-		goto('/');
+		goto(withBasePath('/'));
 	}
 
 	async function handleLocalLogin() {
@@ -145,7 +146,7 @@
 <div class="login-wrap grain min-h-screen flex items-center justify-center p-4">
 	<div class="w-full max-w-md">
 		<div class="login-brand">
-			<img src="/logo_icon.png" alt="" aria-hidden="true" class="login-mark" />
+			<img src={withBasePath('/logo_icon.png')} alt="" aria-hidden="true" class="login-mark" />
 			<h1 class="login-wordmark">DroppedNeedle</h1>
 			<div class="login-rule" aria-hidden="true"></div>
 			<p class="login-sub">Sign in to continue</p>
@@ -225,7 +226,10 @@
 								</button>
 							</label>
 							<div class="mt-1 flex justify-end">
-								<a href="/recover-password" class="link link-primary text-xs font-medium">
+								<a
+									href={withBasePath('/recover-password')}
+									class="link link-primary text-xs font-medium"
+								>
 									Forgot password?
 								</a>
 							</div>

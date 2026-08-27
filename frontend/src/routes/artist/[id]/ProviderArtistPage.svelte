@@ -15,6 +15,7 @@
 	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
 	import PageSectionToc from '$lib/components/PageSectionToc.svelte';
 	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { libraryStore } from '$lib/stores/library';
 	import { type MusicSource, isMusicSource } from '$lib/stores/musicSource';
 	import {
@@ -284,7 +285,7 @@
 						<div class="flex flex-wrap gap-2 justify-center sm:justify-start -mt-2">
 							{#each [...new Set(artist.tags)].slice(0, 10) as tag (tag)}
 								<a
-									href="/genre?name={encodeURIComponent(tag)}"
+									href={withBasePath(`/genre?name=${encodeURIComponent(tag)}`)}
 									class="badge badge-lg cursor-pointer hover:opacity-80 transition-opacity"
 									style="background-color: {colors.primary}; color: {colors.secondary};">{tag}</a
 								>

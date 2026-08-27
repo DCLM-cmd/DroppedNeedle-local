@@ -10,6 +10,7 @@
 		getLibraryManagementOperationsQuery,
 		getLibraryManagementSettingsQuery
 	} from '$lib/queries/library-management/LibraryManagementQueries.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { isRecord, titleManagementValue } from './LibraryManagementDisplay';
 
 	let origin = $state('');
@@ -57,8 +58,8 @@
 
 	function operationHref(jobId: string, value: string, terminalCode: string | null): string {
 		return value === 'ready' || terminalCode === 'PREVIEW_DISCARDED'
-			? `/library/management/previews/${encodeURIComponent(jobId)}`
-			: `/library/management/operations/${encodeURIComponent(jobId)}`;
+			? withBasePath(`/library/management/previews/${encodeURIComponent(jobId)}`)
+			: withBasePath(`/library/management/operations/${encodeURIComponent(jobId)}`);
 	}
 
 	function rootLabel(value: string | null): string {

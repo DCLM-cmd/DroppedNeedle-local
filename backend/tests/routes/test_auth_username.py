@@ -8,7 +8,8 @@ import hashlib
 import sqlite3
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.v1.routes.auth import router
@@ -16,7 +17,8 @@ from core.dependencies.auth_providers import get_auth_service
 from infrastructure.persistence.auth_store import AuthStore, TokenRecord, UserRecord
 from middleware import AuthMiddleware, _get_current_admin, _get_current_token, _get_current_user
 from services.auth_service import AuthService
-from tests.helpers import build_test_client, mock_admin_user, mock_user
+from core.base_path import BasePathMiddleware
+from tests.helpers import build_test_client, add_production_exception_handlers, mock_admin_user, mock_user
 
 PASSWORD = "correct horse battery staple"
 
@@ -480,3 +482,93 @@ def test_password_recovery_code_generation_forbidden_for_non_admin(tmp_path):
 
     response = client.post("/auth/admin/users/user-1/password-recovery")
     assert response.status_code == 403
+
+
+def _seed_admin(client) -> None:
+    resp = client.post(
+        "/auth/setup",
+        json={"display_name": "Jane", "username": "jane", "password": PASSWORD},
+    )
+    assert resp.status_code == 201
+
+
+def test_session_cookie_scopes_to_api_root_without_base(tmp_path):
+    """Hosted at the domain root the session cookie must stay scoped to /api."""
+    app, _ = _app(tmp_path)
+    client = build_test_client(app)
+    _seed_admin(client)
+
+    login = client.post("/auth/login", json={"username": "jane", "password": PASSWORD})
+    assert login.status_code == 200
+    assert "droppedneedle_session=" in login.headers["set-cookie"]
+    assert "Path=/api;" in login.headers["set-cookie"]
+
+    logout = client.post("/auth/logout")
+    assert logout.status_code == 204
+    assert 'droppedneedle_session=""' in logout.headers["set-cookie"]
+    assert "Path=/api;" in logout.headers["set-cookie"]
+
+
+def test_session_cookie_scopes_to_base_api_and_logout_clears_same_path(tmp_path):
+    """Under BASE_PATH=/music the cookie lives at /music/api only.
+
+    A root-relative ``Path=/api`` cookie would be withheld from the intended
+    ``/music/api/v1/*`` endpoints yet still ride along to any co-hosted
+    domain-root application exposing ``/api``. Logout must delete against the
+    identical scoped path or the browser keeps a stale session forever.
+    """
+    app, _ = _app(tmp_path)
+
+    @app.get("/api/v1/auth/cookie-probe")
+    async def _cookie_probe(request: Request) -> dict:
+        return {"session": request.cookies.get("droppedneedle_session")}
+
+    sent_cookies: list[bytes] = []
+
+    def _capture_cookie_header(inner):
+        async def record(scope, receive, send):
+            for header_name, header_value in scope.get("headers", []):
+                if header_name == b"cookie":
+                    sent_cookies.append(header_value)
+            await inner(scope, receive, send)
+
+        return record
+
+    add_production_exception_handlers(app)
+    client = TestClient(
+        _capture_cookie_header(BasePathMiddleware(app, "/music")),
+        raise_server_exceptions=False,
+    )
+
+    setup = client.post("/music/auth/setup", json={
+        "display_name": "Jane", "username": "jane", "password": PASSWORD,
+    })
+    assert setup.status_code == 201
+
+    login = client.post("/music/auth/login", json={"username": "jane", "password": PASSWORD})
+    assert login.status_code == 200
+    login_cookie = login.headers["set-cookie"]
+    assert "droppedneedle_session=" in login_cookie
+    assert "Path=/music/api;" in login_cookie
+    assert "Path=/api;" not in login_cookie
+    raw_token = login.json()["token"]
+
+    # Inside the base: the scoped cookie follows requests to <base>/api paths.
+    inside = client.get("/music/api/v1/auth/cookie-probe")
+    assert inside.status_code == 200
+    assert inside.json()["session"] == raw_token
+
+    # Domain-root surface under the same host: the browser path-match rule
+    # (RFC 6265 Path=/music/api) must withhold the session cookie entirely.
+    sent_cookies.clear()
+    outside = client.get("/api/v1/auth/sessions")
+    assert outside.status_code in (401, 404)
+    assert b"droppedneedle_session=" not in "\n".join(sent_cookies).encode()
+
+    logout = client.post("/music/auth/logout")
+    assert logout.status_code == 204
+    delete_cookie = logout.headers["set-cookie"]
+    assert 'droppedneedle_session=""' in delete_cookie
+    assert "Max-Age=0" in delete_cookie
+    assert "Path=/music/api;" in delete_cookie
+    assert "Path=/api;" not in delete_cookie

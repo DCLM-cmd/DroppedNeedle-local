@@ -1,5 +1,6 @@
 import { pageFetch } from '$lib/utils/navigationAbort';
 import { getApiUrl } from '$lib/api/api-utils';
+import { withBasePath } from '$lib/utils/basePath';
 import { browser } from '$app/environment';
 import { authStore } from '$lib/stores/authStore.svelte';
 
@@ -66,7 +67,7 @@ async function handleResponse<T = void>(res: Response): Promise<T> {
 		// Session expired mid-use: hard redirect so layout re-initialises cleanly
 		if (res.status === 401 && browser && authStore.isAuthenticated) {
 			authStore.clear();
-			window.location.href = '/login';
+			window.location.href = withBasePath('/login');
 			throw new SessionExpiredError();
 		}
 

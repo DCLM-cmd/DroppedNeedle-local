@@ -14,6 +14,8 @@
 	import { toastStore } from '$lib/stores/toast';
 	import type { SourceType } from '$lib/player/types';
 	import { formatDurationSec } from '$lib/utils/formatting';
+	import { withBasePath } from '$lib/utils/basePath';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import type { MenuItem } from '$lib/components/ContextMenu.svelte';
 	import SourcePickerDropdown from '$lib/components/SourcePickerDropdown.svelte';
@@ -434,7 +436,12 @@
 
 					<div class="w-10 h-10 rounded-md overflow-hidden shrink-0 bg-base-300">
 						{#if track.cover_url}
-							<img src={track.cover_url} alt="" class="w-full h-full object-cover" loading="lazy" />
+							<img
+								src={getApiUrl(track.cover_url)}
+								alt=""
+								class="w-full h-full object-cover"
+								loading="lazy"
+							/>
 						{:else}
 							<div class="w-full h-full flex items-center justify-center">
 								<Music class="h-4 w-4 text-base-content/30" />
@@ -445,7 +452,7 @@
 					<div class="flex-1 min-w-0">
 						{#if track.album_id}
 							<a
-								href="/album/{track.album_id}"
+								href={withBasePath(`/album/${track.album_id}`)}
 								class="font-medium truncate text-sm block hover:underline {isCurrentlyPlaying
 									? 'text-accent'
 									: ''}">{track.track_name}</a
@@ -458,15 +465,18 @@
 						{/if}
 						<span class="text-xs text-base-content/60 truncate block">
 							{#if track.artist_id}
-								<a href="/artist/{track.artist_id}" class="hover:underline">{track.artist_name}</a>
+								<a href={withBasePath(`/artist/${track.artist_id}`)} class="hover:underline"
+									>{track.artist_name}</a
+								>
 							{:else}
 								{track.artist_name}
 							{/if}
 							{#if track.album_name}
 								<span class="text-base-content/30"> · </span>
 								{#if track.album_id}
-									<a href="/album/{track.album_id}" class="text-base-content/40 hover:underline"
-										>{track.album_name}</a
+									<a
+										href={withBasePath(`/album/${track.album_id}`)}
+										class="text-base-content/40 hover:underline">{track.album_name}</a
 									>
 								{:else}
 									<span class="text-base-content/40">{track.album_name}</span>

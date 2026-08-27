@@ -10,6 +10,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -22,6 +23,7 @@ from core.config import Settings
 from maintenance.automatic_upgrade import (
     AutomaticUpgradeError,
     UPGRADE_ID,
+    _target_ready,
     _upgrade_health_server,
     run_automatic_copy_upgrade,
     run_target_supervisor,
@@ -766,7 +768,7 @@ def test_docker_image_runs_automatic_upgrade_before_target_application() -> None
 def test_upgrade_health_endpoint_keeps_existing_orchestrators_waiting() -> None:
     port = _free_port()
 
-    with _upgrade_health_server(port):
+    with _upgrade_health_server(port, ""):
         with urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
             assert response.status == 200
             assert json.loads(response.read()) == {"status": "upgrading"}
@@ -774,6 +776,59 @@ def test_upgrade_health_endpoint_keeps_existing_orchestrators_waiting() -> None:
             urlopen(f"http://127.0.0.1:{port}/api/v1/library", timeout=2)
 
     assert error.value.code == 503
+
+
+def test_upgrade_health_endpoint_serves_only_prefixed_health_under_base_path() -> None:
+    port = _free_port()
+
+    with _upgrade_health_server(port, "/music"):
+        with urlopen(f"http://127.0.0.1:{port}/music/health", timeout=2) as response:
+            assert response.status == 200
+            assert json.loads(response.read()) == {"status": "upgrading"}
+        for path in ("/health", "/music/api/v1/library"):
+            with pytest.raises(HTTPError) as error:
+                urlopen(f"http://127.0.0.1:{port}{path}", timeout=2)
+            assert error.value.code == 503
+
+
+@contextmanager
+def _operational_target(port: int, base_path: str):
+    """Serve an ok health payload exactly where the operational app would."""
+    health_path = f"{base_path}/health"
+
+    class OperationalHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            ready = self.path == health_path
+            body = b'{"status":"ok"}' if ready else b'{"error":"not found"}'
+            self.send_response(200 if ready else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), OperationalHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("base_path,other", [("", "/music"), ("/music", "")])
+def test_target_ready_requires_normalized_base_health(
+    base_path: str, other: str
+) -> None:
+    port = _free_port()
+
+    with _operational_target(port, base_path):
+        assert _target_ready(port, base_path)
+        assert not _target_ready(port, other)
 
 
 def test_copy_upgrade_promotes_only_after_the_working_database_passes(
@@ -991,7 +1046,9 @@ def test_target_clean_exit_before_readiness_is_still_a_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(tmp_path)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: False)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: False
+    )
 
     result = run_target_supervisor(
         settings,
@@ -1040,7 +1097,9 @@ def test_target_validation_commits_before_releasing_operational_startup(
         return FakeProcess()
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: True)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: True
+    )
 
     assert run_target_supervisor(settings, command=["target"]) == 0
     state = json.loads(
@@ -1173,7 +1232,9 @@ def test_target_startup_heartbeat_extends_idle_deadline_until_validation(
         return process
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: True)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: True
+    )
 
     assert (
         run_target_supervisor(
@@ -1354,7 +1415,9 @@ def test_post_admission_readiness_timeout_records_failure_without_rollback(
         return StalledProcess()
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: False)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: False
+    )
 
     assert (
         run_target_supervisor(
@@ -1382,7 +1445,9 @@ def test_post_admission_readiness_timeout_records_failure_without_rollback(
         "Popen",
         lambda *_args, **_kwargs: StalledProcess(),
     )
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: True)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: True
+    )
     assert run_target_supervisor(settings, command=["target"]) == 0
     recovered_state = json.loads(
         (settings.cache_dir / f"automatic-upgrade-{UPGRADE_ID}.json").read_text(
@@ -1435,7 +1500,9 @@ def test_post_admission_clean_exit_records_failure_without_rollback(
         return ExitingProcess(admitted)
 
     monkeypatch.setattr(automatic_upgrade.subprocess, "Popen", start)
-    monkeypatch.setattr(automatic_upgrade, "_target_ready", lambda _port: False)
+    monkeypatch.setattr(
+        automatic_upgrade, "_target_ready", lambda _port, _base_path: False
+    )
 
     assert run_target_supervisor(settings, command=["target"]) == 1
     state = json.loads(
@@ -1601,7 +1668,7 @@ def test_main_uses_the_container_port_for_upgrade_health(
     observed: list[int] = []
 
     @contextmanager
-    def fake_health(port: int):
+    def fake_health(port: int, base_path: str):
         observed.append(port)
         yield
 
@@ -1630,7 +1697,7 @@ def test_main_removes_default_config_when_fresh_upgrade_fails(
         return settings
 
     @contextmanager
-    def fake_health(_port: int):
+    def fake_health(_port: int, _base_path: str):
         yield
 
     def fail(_settings: Settings, **_kwargs: object) -> str:

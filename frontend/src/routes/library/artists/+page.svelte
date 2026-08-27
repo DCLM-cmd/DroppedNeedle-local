@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
 	import ArtistCardSkeleton from '$lib/components/ArtistCardSkeleton.svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import LocalIdentityBadge from '$lib/components/library/LocalIdentityBadge.svelte';
@@ -100,7 +101,7 @@
 	<header class="mb-6 flex items-center gap-4">
 		<button
 			class="btn btn-ghost btn-circle"
-			onclick={() => goto('/library')}
+			onclick={() => goto(withBasePath('/library'))}
 			aria-label="Back to library"
 		>
 			<ChevronLeft class="h-6 w-6" />

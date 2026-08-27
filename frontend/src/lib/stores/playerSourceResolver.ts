@@ -1,7 +1,10 @@
+import { getApiUrl } from '$lib/api/api-utils';
 import { API } from '$lib/constants';
 import type { NowPlaying, QueueItem, SourceType } from '$lib/player/types';
 
-export function resolveSourceUrl(item: QueueItem): string | undefined {
+// Raw URL computation only - base-path composition happens once at each
+// exported boundary below.
+function rawSourceUrl(item: QueueItem): string | undefined {
 	switch (item.sourceType) {
 		case 'youtube':
 			return item.streamUrl;
@@ -16,7 +19,7 @@ export function resolveSourceUrl(item: QueueItem): string | undefined {
 	}
 }
 
-export function buildPrefetchUrl(item: QueueItem): string | null {
+function rawPrefetchUrl(item: QueueItem): string | null {
 	switch (item.sourceType) {
 		case 'youtube':
 			return null;
@@ -33,10 +36,20 @@ export function buildPrefetchUrl(item: QueueItem): string | null {
 	}
 }
 
-export function buildStreamUrlForSource(
-	sourceType: SourceType,
-	trackSourceId: string
-): string | undefined {
+export function resolveSourceUrl(item: QueueItem): string | undefined {
+	const url = rawSourceUrl(item);
+	// YouTube stream URLs stay byte-for-byte; everything else gets the base.
+	if (item.sourceType === 'youtube' || url === undefined) return url;
+	return getApiUrl(url);
+}
+
+export function buildPrefetchUrl(item: QueueItem): string | null {
+	const url = rawPrefetchUrl(item);
+	if (url === null) return null;
+	return getApiUrl(url);
+}
+
+function rawStreamUrlForSource(sourceType: SourceType, trackSourceId: string): string | undefined {
 	switch (sourceType) {
 		case 'local':
 			return API.stream.local(trackSourceId);
@@ -49,6 +62,15 @@ export function buildStreamUrlForSource(
 		default:
 			return undefined;
 	}
+}
+
+export function buildStreamUrlForSource(
+	sourceType: SourceType,
+	trackSourceId: string
+): string | undefined {
+	const url = rawStreamUrlForSource(sourceType, trackSourceId);
+	if (url === undefined) return undefined;
+	return getApiUrl(url);
 }
 
 export function buildNowPlayingMetadata(item: QueueItem): NowPlaying {

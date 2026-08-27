@@ -11,6 +11,7 @@
 	import { getConnectionsQuery } from '$lib/queries/connections/ConnectionsQuery.svelte';
 	import { getPlaylistListQuery } from '$lib/queries/playlists/PlaylistQuery.svelte';
 	import { createCreatePlaylistMutation } from '$lib/queries/playlists/PlaylistMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { ListMusic, Plus, Lock } from 'lucide-svelte';
 	import SpotifyIcon from '$lib/components/SpotifyIcon.svelte';
 	import PlaylistCard from '$lib/components/PlaylistCard.svelte';
@@ -61,7 +62,7 @@
 			const created = await createMutation.mutateAsync(trimmed);
 			newName = '';
 			showNewInput = false;
-			await goto(`/playlists/${created.id}`);
+			await goto(withBasePath(`/playlists/${created.id}`));
 		} catch (_e) {
 			toastStore.show({ message: "Couldn't create the playlist", type: 'error' });
 		}
@@ -90,7 +91,7 @@
 		<div class="flex items-center gap-2">
 			{#if spotifyLinked}
 				<a
-					href="/playlists/spotify"
+					href={withBasePath('/playlists/spotify')}
 					class="btn btn-sm gap-1.5 bg-green-600 text-white hover:bg-green-500"
 				>
 					<SpotifyIcon class="h-3.5 w-3.5" />

@@ -10,6 +10,7 @@
 		localArtistHref
 	} from '$lib/utils/entityRoutes';
 	import { getGenreGradient } from '$lib/utils/genreGradient';
+	import { withBasePath } from '$lib/utils/basePath';
 	import {
 		getGenreAlbumPagesQuery,
 		getGenreDetailQuery
@@ -105,7 +106,10 @@
 <div class="min-h-screen bg-base-100 relative overflow-hidden">
 	<div class="container mx-auto p-4 max-w-7xl relative" style="z-index: 1;">
 		<header class="mb-10 pt-2">
-			<a href="/" class="btn btn-ghost btn-sm gap-2 mb-6 -ml-2 opacity-70 hover:opacity-100">
+			<a
+				href={withBasePath('/')}
+				class="btn btn-ghost btn-sm gap-2 mb-6 -ml-2 opacity-70 hover:opacity-100"
+			>
 				<ArrowLeft class="w-4 h-4" />
 				Back
 			</a>

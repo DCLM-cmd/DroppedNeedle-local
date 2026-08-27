@@ -119,6 +119,7 @@
 			? appendAudioDBSizeSuffix(remoteUrl, 'lg')
 			: null
 	);
+	let resolvedCustomUrl = $derived(customUrl === null ? null : getApiUrl(customUrl));
 
 	let canonicalAlbumCoverUrl = $derived(
 		imageType === 'album' && isValidMbid(mbid)
@@ -129,7 +130,7 @@
 	let hasSource = $derived(
 		available &&
 			((useRemoteUrl && resolvedRemoteUrl) ||
-				(imageType === 'album' ? canonicalAlbumCoverUrl || customUrl || mbid : validMbid))
+				(imageType === 'album' ? canonicalAlbumCoverUrl || resolvedCustomUrl || mbid : validMbid))
 	);
 	let apiEndpoint = $derived(imageType === 'album' ? 'release-group' : 'artist');
 	let fallbackCoverUrl = $derived(
@@ -142,7 +143,7 @@
 	);
 	let coverUrl = $derived(
 		imageType === 'album'
-			? (canonicalAlbumCoverUrl ?? customUrl ?? fallbackCoverUrl)
+			? (canonicalAlbumCoverUrl ?? resolvedCustomUrl ?? fallbackCoverUrl)
 			: fallbackCoverUrl
 	);
 	let displayCoverUrl = $derived(warmResolvedUrl ?? coverUrl);
@@ -192,7 +193,8 @@
 	});
 
 	$effect(() => {
-		const source = imageType === 'album' ? (canonicalAlbumCoverUrl ?? customUrl ?? mbid) : mbid;
+		const source =
+			imageType === 'album' ? (canonicalAlbumCoverUrl ?? resolvedCustomUrl ?? mbid) : mbid;
 		if (source && imgElement && source !== currentSource) {
 			currentSource = source;
 			imgError = false;
@@ -244,7 +246,7 @@
 
 	function handleWarmUpdate(update: CoverWarmUpdate) {
 		if (update.status === 'ready') {
-			warmResolvedUrl = update.url;
+			warmResolvedUrl = getApiUrl(update.url);
 			imgError = false;
 			failed = false;
 			visualSettled = false;

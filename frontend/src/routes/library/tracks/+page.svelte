@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { API } from '$lib/constants';
 	import { api } from '$lib/api/client';
 	import { buildDiscoveryQueueFromLocal } from '$lib/player/queueHelpers';
@@ -148,7 +149,7 @@
 	<div class="flex items-center gap-4 mb-6">
 		<button
 			class="btn btn-ghost btn-circle"
-			onclick={() => goto('/library')}
+			onclick={() => goto(withBasePath('/library'))}
 			aria-label="Back to library"
 		>
 			<ChevronLeft class="w-6 h-6" />

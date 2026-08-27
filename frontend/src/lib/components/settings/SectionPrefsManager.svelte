@@ -8,6 +8,7 @@
 		saveSectionPrefs
 	} from '$lib/queries/section-prefs/SectionPrefsQuery.svelte';
 	import { toastStore } from '$lib/stores/toast';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	interface Props {
 		page: 'home' | 'discover' | 'sidebar';
@@ -175,7 +176,7 @@
 									</div>
 									{#if !section.available && section.requires}
 										<a
-											href="/settings?tab=connect-apps"
+											href={withBasePath('/settings?tab=connect-apps')}
 											class="link flex shrink-0 items-center gap-1 text-xs text-primary/80"
 										>
 											Connect {section.requires === 'listenbrainz'

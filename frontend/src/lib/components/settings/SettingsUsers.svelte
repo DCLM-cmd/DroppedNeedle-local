@@ -31,6 +31,7 @@
 	import { toastStore } from '$lib/stores/toast';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { createPasswordRecoveryCodeMutation } from '$lib/queries/auth/AuthMutations.svelte';
+	import { getApiUrl } from '$lib/api/api-utils';
 
 	interface UserRecord {
 		id: string;
@@ -498,7 +499,7 @@
 					>
 						{#if user.avatar_url}
 							<img
-								src={user.avatar_url}
+								src={getApiUrl(user.avatar_url)}
 								alt={user.display_name}
 								class="h-full w-full object-cover"
 							/>

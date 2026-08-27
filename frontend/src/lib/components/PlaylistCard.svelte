@@ -7,6 +7,7 @@
 	import { toastStore } from '$lib/stores/toast';
 	import { formatTotalDurationSec } from '$lib/utils/formatting';
 	import { getSourceColor, getSourceLabel } from '$lib/utils/sources';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { Play, Shuffle, Trash2, Tv, Lock, Globe } from 'lucide-svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';
@@ -151,7 +152,7 @@
 		: 'oklch(from var(--color-primary) l c h / 0.15)'}
 >
 	<a
-		href="/playlists/{playlist.id}"
+		href={withBasePath(`/playlists/${playlist.id}`)}
 		class="block relative z-0 transition-transform active:scale-95 focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-base-100 rounded-t-box"
 		aria-label="Open {playlist.name}"
 	>

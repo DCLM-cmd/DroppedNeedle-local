@@ -28,6 +28,7 @@
 		rebuildLibraryContributionMutation,
 		updateLibraryContributionMutation
 	} from '$lib/queries/libraryContributions/LibraryContributionMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	let { data }: { data: PageData } = $props();
 	const contributionQuery = getLibraryContributionQuery(() => data.contributionId);
@@ -245,7 +246,7 @@
 		<div class="mb-6 flex flex-wrap items-center justify-between gap-3">
 			<button
 				class="btn btn-ghost btn-sm gap-2"
-				onclick={() => goto(`/album/${contribution.local_album_id}`)}
+				onclick={() => goto(withBasePath(`/album/${contribution.local_album_id}`))}
 			>
 				<ArrowLeft class="h-4 w-4" /> Back to album
 			</button>

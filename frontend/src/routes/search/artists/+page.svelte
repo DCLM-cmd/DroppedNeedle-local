@@ -4,6 +4,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
 	import SearchArtistCard from '$lib/components/SearchArtistCard.svelte';
 	import ArtistCardSkeleton from '$lib/components/ArtistCardSkeleton.svelte';
 	import SearchTopResult from '$lib/components/SearchTopResult.svelte';
@@ -47,13 +48,13 @@
 
 	function navigateBack() {
 		if (data.query) {
-			goto(`/search?q=${encodeURIComponent(data.query)}`);
+			goto(withBasePath(`/search?q=${encodeURIComponent(data.query)}`));
 		}
 	}
 
 	function navigateToBucket(bucket: 'albums') {
 		if (data.query) {
-			goto(`/search/${bucket}?q=${encodeURIComponent(data.query)}`);
+			goto(withBasePath(`/search/${bucket}?q=${encodeURIComponent(data.query)}`));
 		}
 	}
 	function retryRemoteSearch() {

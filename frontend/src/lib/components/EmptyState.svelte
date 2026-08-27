@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { ComponentType } from 'svelte';
 
+	import { withBasePath } from '$lib/utils/basePath';
 	interface Props {
 		icon: ComponentType;
 		title: string;
@@ -23,7 +24,7 @@
 		<p class="es-desc">{description}</p>
 	{/if}
 	{#if ctaLabel && ctaHref}
-		<a href={ctaHref} class="btn btn-primary btn-sm mt-5">{ctaLabel}</a>
+		<a href={withBasePath(ctaHref)} class="btn btn-primary btn-sm mt-5">{ctaLabel}</a>
 	{/if}
 </div>
 

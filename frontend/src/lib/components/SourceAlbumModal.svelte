@@ -27,6 +27,7 @@
 	} from '$lib/player/queueHelpers';
 	import type { QueueItem } from '$lib/player/types';
 	import { getCoverUrl } from '$lib/utils/errorHandling';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { api } from '$lib/api/client';
 	import NowPlayingIndicator from '$lib/components/NowPlayingIndicator.svelte';
 	import AudioQualityBadge from '$lib/components/AudioQualityBadge.svelte';
@@ -201,10 +202,10 @@
 		if (mbid) {
 			const target = mbid;
 			handleClose();
-			goto(`/album/${target}`);
+			goto(withBasePath(`/album/${target}`));
 		} else if (albumName) {
 			handleClose();
-			goto(`/search?q=${encodeURIComponent(albumName)}`);
+			goto(withBasePath(`/search?q=${encodeURIComponent(albumName)}`));
 		}
 	}
 
@@ -212,7 +213,7 @@
 		if (!canNavigateArtist || !artistMbid) return;
 		const target = artistMbid;
 		handleClose();
-		goto(`/artist/${target}`);
+		goto(withBasePath(`/artist/${target}`));
 	}
 
 	async function launchInstantMix() {

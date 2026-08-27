@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request, status
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
+from core.base_path import application_path
 
 from infrastructure.degradation import (
     init_degradation_context,
@@ -85,7 +86,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return self._default
 
     async def dispatch(self, request: Request, call_next):
-        path = request.url.path
+        path = application_path(request.scope)
         if not path.startswith("/api/"):
             return await call_next(request)
 
@@ -169,7 +170,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     """
  
     async def dispatch(self, request: Request, call_next):
-        path = request.url.path
+        path = application_path(request.scope)
  
         # Non-API paths: SPA routes, static files, favicons, etc.
         if not path.startswith("/api/") and path != "/health":

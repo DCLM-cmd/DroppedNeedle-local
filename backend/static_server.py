@@ -120,7 +120,12 @@ class CacheControlledStaticFiles(StaticFiles):
 def mount_frontend(app: FastAPI) -> None:
     backend_static = Path(__file__).parent / "static"
     frontend_root = Path(__file__).resolve().parents[1] / "frontend"
-    build_candidates = [backend_static, frontend_root / "build"]
+    runtime_static = os.getenv("DROPPEDNEEDLE_STATIC_DIR")
+    build_candidates = [
+        *([Path(runtime_static)] if runtime_static else []),
+        backend_static,
+        frontend_root / "build",
+    ]
 
     def first_existing_build() -> Path:
         for candidate in build_candidates:

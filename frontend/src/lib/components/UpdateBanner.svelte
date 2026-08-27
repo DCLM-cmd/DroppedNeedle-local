@@ -3,6 +3,7 @@
 	import { fromStore } from 'svelte/store';
 	import { PersistedState } from 'runed';
 	import { ArrowUpCircle, X } from 'lucide-svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	interface Props {
 		updateAvailable: boolean;
@@ -45,7 +46,9 @@
 					<span class="font-semibold">({latestVersion})</span>
 				{/if}
 			</span>
-			<a href="/settings?tab=about" class="btn btn-accent btn-xs btn-outline">Details</a>
+			<a href={withBasePath('/settings?tab=about')} class="btn btn-accent btn-xs btn-outline"
+				>Details</a
+			>
 			<button
 				class="btn btn-ghost btn-sm btn-circle"
 				onclick={dismiss}

@@ -29,6 +29,8 @@
 	import { reveal } from '$lib/actions/reveal';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { Tv } from 'lucide-svelte';
 	import type {
 		JellyfinHubResponse,
@@ -111,7 +113,7 @@
 			artist_name: t.artist_name,
 			album_name: t.album_name,
 			album_id: t.album_id,
-			image_url: t.album_id ? `/api/v1/jellyfin/image/${t.album_id}` : null,
+			image_url: t.album_id ? getApiUrl(`/api/v1/jellyfin/image/${t.album_id}`) : null,
 			duration_seconds: t.duration_seconds
 		}));
 	}
@@ -197,7 +199,7 @@
 		{
 			label: 'Albums',
 			value: hub?.stats?.total_albums ?? null,
-			href: '/library/jellyfin/albums',
+			href: withBasePath('/library/jellyfin/albums'),
 			subtitle: 'in your library',
 			colorScheme: 'primary',
 			icon: 'disc'
@@ -205,7 +207,7 @@
 		{
 			label: 'Artists',
 			value: hub?.stats?.total_artists ?? null,
-			href: '/library/jellyfin/artists',
+			href: withBasePath('/library/jellyfin/artists'),
 			subtitle: 'in your library',
 			colorScheme: 'secondary',
 			icon: 'users'
@@ -213,7 +215,7 @@
 		{
 			label: 'Tracks',
 			value: hub?.stats?.total_tracks ?? null,
-			href: '/library/jellyfin/tracks',
+			href: withBasePath('/library/jellyfin/tracks'),
 			subtitle: 'in your library',
 			colorScheme: 'accent',
 			icon: 'music'
@@ -285,7 +287,7 @@
 		errorCode={playlistErrorCode}
 		onretry={() => void playlistsQuery.refetch()}
 		sourceLabel="Jellyfin"
-		playlistsHref="/library/jellyfin/playlists"
+		playlistsHref={withBasePath('/library/jellyfin/playlists')}
 	>
 		{#snippet sourceIcon()}
 			<Tv class="h-4 w-4 text-info" />
@@ -504,9 +506,13 @@
 						index={genericArtistIndex}
 						onselect={(artist) => {
 							if (artist.musicbrainz_id) {
-								goto(`/artist/${artist.musicbrainz_id}`);
+								goto(withBasePath(`/artist/${artist.musicbrainz_id}`));
 							} else {
-								goto(`/library/jellyfin/artists?search=${encodeURIComponent(artist.name)}`);
+								goto(
+									withBasePath(
+										`/library/jellyfin/artists?search=${encodeURIComponent(artist.name)}`
+									)
+								);
 							}
 						}}
 					/>
@@ -515,7 +521,11 @@
 				{/if}
 			</HubShelf>
 
-			<HubShelf title="Browse Albums" seeAllHref="/library/jellyfin/albums" {loading}>
+			<HubShelf
+				title="Browse Albums"
+				seeAllHref={withBasePath('/library/jellyfin/albums')}
+				{loading}
+			>
 				{#if hub && hub.all_albums_preview.length > 0}
 					<HorizontalCarousel>
 						{#each hub?.all_albums_preview ?? [] as album (album.jellyfin_id)}

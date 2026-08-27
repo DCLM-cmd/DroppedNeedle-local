@@ -2,6 +2,7 @@
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
 	import { ChevronLeft } from 'lucide-svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	interface Props {
 		fallback?: string;
@@ -13,7 +14,7 @@
 		if (browser && window.history.length > 1) {
 			window.history.back();
 		} else {
-			goto(fallback);
+			goto(withBasePath(fallback));
 		}
 	}
 </script>

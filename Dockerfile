@@ -14,6 +14,11 @@ COPY frontend/pnpm-workspace.yaml ./
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 
 COPY frontend/ .
+
+# Build SvelteKit with the literal base-path placeholder instead of an empty
+# prefix so container startup can stamp in any BASE_PATH without rebuilding
+# (see frontend/svelte.config.js and backend/maintenance/configure_frontend_base.py).
+ENV DROPPEDNEEDLE_BASE_PATH_PLACEHOLDER=1
 RUN pnpm run build
 
 FROM python:3.13.5-slim AS python-deps
@@ -40,6 +45,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     MALLOC_ARENA_MAX=2 \
     PORT=8688 \
+    DROPPEDNEEDLE_STATIC_DIR=/app/cache/frontend-static \
     COMMIT_TAG=${COMMIT_TAG} \
     BUILD_DATE=${BUILD_DATE} \
     DROPPEDNEEDLE_SOURCE_REVISION=${DROPPEDNEEDLE_SOURCE_REVISION}
@@ -61,7 +67,9 @@ RUN groupadd -r -g 1000 droppedneedle \
     && useradd -r -u 1000 -g droppedneedle -d /app -s /sbin/nologin droppedneedle
 
 COPY backend/ .
-COPY --from=frontend-build /app/frontend/build ./static
+# Pristine, never-served input for entrypoint.sh, which writes the resolved
+# frontend to DROPPEDNEEDLE_STATIC_DIR before uvicorn starts.
+COPY --from=frontend-build /app/frontend/build ./static-template
 COPY entrypoint.sh /entrypoint.sh
 
 RUN find /app -type f -print0 \
@@ -77,8 +85,11 @@ RUN mkdir -p /app/cache /app/config \
 
 EXPOSE ${PORT}
 
+# Shell form is required: ${PORT}/${BASE_PATH} must expand at probe time from
+# container env. Empty BASE_PATH reproduces today's URL exactly; a nonempty
+# value reaches the same prefixed surface reverse proxies forward to.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10m --retries=3 \
-    CMD curl -f http://localhost:${PORT}/health || exit 1
+    CMD curl -f http://localhost:${PORT}${BASE_PATH:-}/health || exit 1
 
 ENTRYPOINT ["tini", "--", "/entrypoint.sh"]
 CMD ["python", "-m", "maintenance.automatic_upgrade", "--start-target"]

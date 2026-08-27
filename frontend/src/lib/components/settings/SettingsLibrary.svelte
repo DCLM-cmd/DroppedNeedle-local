@@ -22,6 +22,7 @@
 	import LibraryScanScheduleControl from '$lib/components/library/LibraryScanScheduleControl.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
+	import { withBasePath } from '$lib/utils/basePath';
 	import type {
 		LibraryRootSettings,
 		TargetLibrarySettingsResponse,
@@ -497,7 +498,9 @@
 						workspace under the Automation tab.
 					</p>
 				</div>
-				<a href="/library/management?tab=automation" class="btn management-btn btn-sm"
+				<a
+					href={withBasePath('/library/management?tab=automation')}
+					class="btn management-btn btn-sm"
 					>Open Organize files settings <ArrowRight class="h-4 w-4" /></a
 				>
 			</section>

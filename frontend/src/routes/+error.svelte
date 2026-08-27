@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Home, RotateCw } from 'lucide-svelte';
 	import { page } from '$app/state';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	const status = $derived(page.status);
 	const isNotFound = $derived(status === 404);
@@ -23,7 +24,7 @@
 	<h1 class="err-head">{heading}</h1>
 	<p class="err-blurb">{blurb}</p>
 	<div class="err-actions">
-		<a href="/" class="btn btn-ghost btn-sm">
+		<a href={withBasePath('/')} class="btn btn-ghost btn-sm">
 			<Home class="h-4 w-4" />
 			Home
 		</a>

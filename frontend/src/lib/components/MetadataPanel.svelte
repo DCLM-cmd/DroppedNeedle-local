@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { X, Info, ExternalLink } from 'lucide-svelte';
 	import { slide } from 'svelte/transition';
+	import { getApiUrl } from '$lib/api/api-utils';
 
 	interface Props {
 		open: boolean;
@@ -73,7 +74,11 @@
 
 			<div class="overflow-y-auto px-4 py-4 flex-1 space-y-4">
 				{#if imageUrl}
-					<img src={imageUrl} alt={title} class="w-full rounded-lg object-cover max-h-48" />
+					<img
+						src={getApiUrl(imageUrl)}
+						alt={title}
+						class="w-full rounded-lg object-cover max-h-48"
+					/>
 				{/if}
 
 				{#if notes}

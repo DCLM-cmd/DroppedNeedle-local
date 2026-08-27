@@ -4,6 +4,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { CACHE_KEYS, CACHE_TTL } from '$lib/constants';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { albumHref, artistHref } from '$lib/utils/entityRoutes';
 	import { createLocalStorageCache } from '$lib/utils/localStorageCache';
 	import { overviewCacheSuffix } from '$lib/utils/timeRangeCache';
@@ -238,7 +239,7 @@
 	function handleItemClick(item: HomeAlbum | HomeArtist) {
 		const fallbackPath = getFallbackSearchPath(item);
 		if (fallbackPath) {
-			goto(fallbackPath);
+			goto(withBasePath(fallbackPath));
 		}
 	}
 
@@ -268,7 +269,11 @@
 
 <div class="container mx-auto p-4 md:p-6 lg:p-8">
 	<div class="mb-6 flex items-center gap-4">
-		<button class="btn btn-circle btn-ghost" onclick={() => goto('/')} aria-label="Back to home">
+		<button
+			class="btn btn-circle btn-ghost"
+			onclick={() => goto(withBasePath('/'))}
+			aria-label="Back to home"
+		>
 			<ChevronLeft class="h-6 w-6" />
 		</button>
 		<div>

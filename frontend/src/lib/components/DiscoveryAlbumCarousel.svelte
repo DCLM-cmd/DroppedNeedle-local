@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { DiscoveryAlbum, Album } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 	import HorizontalCarousel from './HorizontalCarousel.svelte';
 	import CarouselSkeleton from './CarouselSkeleton.svelte';
 	import AlbumCard from './AlbumCard.svelte';
@@ -41,7 +42,8 @@
 	{:else if !configured}
 		<div class="bg-base-200 rounded-lg p-6 text-center">
 			<p class="text-base-content/70">Connect a music service to see recommendations</p>
-			<a href="/profile#scrobbling" class="btn btn-primary btn-sm mt-3">Configure</a>
+			<a href={withBasePath('/profile#scrobbling')} class="btn btn-primary btn-sm mt-3">Configure</a
+			>
 		</div>
 	{:else if albums.length === 0}
 		<div class="bg-base-200 rounded-lg p-6 text-center">

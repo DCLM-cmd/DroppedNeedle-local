@@ -7,6 +7,7 @@ import { DEFAULT_SOURCE, isMusicSource, musicSourceStore } from '$lib/stores/mus
 import { scrobbleManager } from '$lib/stores/scrobble.svelte';
 import { authStore, LAST_USER_ID_KEY } from '$lib/stores/authStore.svelte';
 import { clearUserScopedLocalCaches } from '$lib/utils/userScopedCaches';
+import { withBasePath, withoutBasePath } from '$lib/utils/basePath';
 import { error, redirect } from '@sveltejs/kit';
 import type { LayoutLoad } from './$types';
 
@@ -17,7 +18,7 @@ const BOOTSTRAP_TIMEOUT_MS = 10_000;
 const BUSY_MESSAGE = 'The server is busy. Your session is safe - try again shortly.';
 
 export const load: LayoutLoad = async ({ url }) => {
-	const path = url.pathname;
+	const path = withoutBasePath(url.pathname);
 	const isAuthFree = AUTH_FREE_PATHS.some((p) => path.startsWith(p));
 
 	let setupRequired = authStore.setupRequired;
@@ -71,10 +72,10 @@ export const load: LayoutLoad = async ({ url }) => {
 	}
 
 	if (setupRequired && !isAuthFree) {
-		throw redirect(302, '/setup');
+		throw redirect(302, withBasePath('/setup'));
 	}
 	if (!setupRequired && path.startsWith('/setup')) {
-		throw redirect(302, authStore.isAuthenticated ? '/' : '/login');
+		throw redirect(302, withBasePath(authStore.isAuthenticated ? '/' : '/login'));
 	}
 
 	// initialized stays true after in-app login; reset persisted caches on account switches
@@ -90,7 +91,7 @@ export const load: LayoutLoad = async ({ url }) => {
 	}
 
 	if (!setupRequired && !isAuthFree && !authStore.isAuthenticated) {
-		throw redirect(302, '/login');
+		throw redirect(302, withBasePath('/login'));
 	}
 
 	// the primary source is user-specific; connection defaults are global

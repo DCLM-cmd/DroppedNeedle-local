@@ -10,6 +10,7 @@
 		adminRevokeAppPassword,
 		saveConnectAppsSettings
 	} from '$lib/queries/connect-apps/ConnectAppsMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import type { AdminAppPasswordView, ConnectAppsSettings } from '$lib/types';
 
 	const settingsQuery = getConnectAppsSettingsQuery();
@@ -105,7 +106,9 @@
 		</p>
 		<p class="mt-1 max-w-2xl text-sm text-base-content/50">
 			These are server-wide switches. Each person creates their own app-password from their
-			<a href="/profile#connect-apps" class="link link-accent">Profile → Connect Apps</a>.
+			<a href={withBasePath('/profile#connect-apps')} class="link link-accent"
+				>Profile → Connect Apps</a
+			>.
 		</p>
 	</header>
 

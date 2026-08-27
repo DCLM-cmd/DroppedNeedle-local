@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Pause, Play, Trash2, TriangleAlert, X } from 'lucide-svelte';
 
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { API } from '$lib/constants';
 	import { removeLibraryTrack } from '$lib/queries/library/LibraryMutations.svelte';
 	import { formatCountdown } from '$lib/queries/downloads/downloadStatus';
@@ -64,7 +65,7 @@
 		activeId = file.id;
 		currentTime = 0;
 		mediaDuration = 0;
-		audioEl.src = API.stream.local(file.id);
+		audioEl.src = getApiUrl(API.stream.local(file.id));
 		void audioEl.play().catch(() => (failed = true));
 	}
 

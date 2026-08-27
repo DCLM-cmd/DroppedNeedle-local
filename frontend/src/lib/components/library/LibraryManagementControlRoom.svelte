@@ -21,6 +21,7 @@
 	import { getTargetLibrarySettingsQuery } from '$lib/queries/library/LibraryPolicyQueries.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { createLibraryManagementEvents } from '$lib/queries/library-management/LibraryManagementEvents';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { controlLibraryManagementOperationMutation } from '$lib/queries/library-management/LibraryManagementMutations.svelte';
 	import {
 		getLibraryManagementOperationsQuery,
@@ -126,8 +127,8 @@
 		mode: string
 	): string {
 		return mode === 'preview' || state === 'ready' || terminalCode === 'PREVIEW_DISCARDED'
-			? `/library/management/previews/${encodeURIComponent(jobId)}`
-			: `/library/management/operations/${encodeURIComponent(jobId)}`;
+			? withBasePath(`/library/management/previews/${encodeURIComponent(jobId)}`)
+			: withBasePath(`/library/management/operations/${encodeURIComponent(jobId)}`);
 	}
 
 	function date(value: number): string {
@@ -161,7 +162,7 @@
 					onclick={(event) => openRunner('baseline_restore', event.currentTarget)}
 					><RotateCcw class="h-4 w-4" /> Restore original state...</button
 				>
-				<a href="/library/management?tab=automation" class="btn btn-ghost btn-sm"
+				<a href={withBasePath('/library/management?tab=automation')} class="btn btn-ghost btn-sm"
 					><Settings2 class="h-4 w-4" /> Automation</a
 				>
 			</div>
@@ -299,7 +300,7 @@
 						<p class="management-step">Audit trail</p>
 						<h3 id="recent-management-work" class="font-semibold">Recent management work</h3>
 					</div>
-					<a class="link text-xs" href="/library/management/history">All history</a>
+					<a class="link text-xs" href={withBasePath('/library/management/history')}>All history</a>
 				</div>
 				{#if recent.length}{#each recent as item (item.operation.id)}<a
 							href={operationHref(

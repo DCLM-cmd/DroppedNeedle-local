@@ -303,3 +303,84 @@ async def test_xml_format_drilldown(compat_env):
     assert b'<artists' in r.content and b'name="Radiohead"' in r.content
 async def test_random_album_lists_use_sqlite_random_order():
     assert _ALBUM_AGG_SORTS["random"] == "RANDOM()"
+
+
+_COVER_SIZES = (
+    ("250", "smallImageUrl"),
+    ("500", "mediumImageUrl"),
+    ("1200", "largeImageUrl"),
+)
+
+
+def _cover_client(env, root_path):
+    """Mirror BasePathMiddleware's stripped-proxy scope: route paths stay bare
+    while scope.root_path carries the deployment base."""
+    from fastapi.testclient import TestClient
+
+    return TestClient(env.app, root_path=root_path)
+
+
+def _assert_cover_urls(prefix, info, cover_id):
+    # Each advertised URL must carry the compat route exactly once, so the
+    # expected form is <origin><base>/subsonic/rest/getCoverArt?id=..&size=..
+    for size, key in _COVER_SIZES:
+        expected = (
+            f"{prefix}/subsonic/rest/getCoverArt?id={cover_id}&size={size}"
+        )
+        assert info[key] == expected
+        assert info[key].count("/subsonic/") == 1
+
+
+async def test_artist_info_cover_urls_absolute_without_base(compat_env):
+    artist_id = _get(compat_env, "getArtists")["artists"]["index"][0]["artist"][0]["id"]
+    info = _get(compat_env, "getArtistInfo2", id=artist_id)["artistInfo2"]
+    _assert_cover_urls("http://testserver", info, artist_id)
+
+
+async def test_album_info_cover_urls_absolute_without_base(compat_env):
+    album_id = _get(compat_env, "getAlbumList2", type="newest")["albumList2"]["album"][0]["id"]
+    info = _get(compat_env, "getAlbumInfo2", id=album_id)["albumInfo2"]
+    _assert_cover_urls("http://testserver", info, album_id)
+
+
+async def test_artist_info_cover_urls_include_base_once(compat_env):
+    client = _cover_client(compat_env, root_path="/dn")
+    q = {"v": "1.16.1", "c": "pytest", "f": "json", "apiKey": compat_env.secret}
+    artists = _sub(client.get("/subsonic/rest/getArtists", params=q))["artists"]
+    artist_id = artists["index"][0]["artist"][0]["id"]
+    info = _sub(client.get("/subsonic/rest/getArtistInfo2", params={**q, "id": artist_id}))[
+        "artistInfo2"
+    ]
+    _assert_cover_urls("http://testserver/dn", info, artist_id)
+
+
+async def test_artist_info_cover_urls_include_multi_segment_base_once(compat_env):
+    client = _cover_client(compat_env, root_path="/apps/music")
+    q = {"v": "1.16.1", "c": "pytest", "f": "json", "apiKey": compat_env.secret}
+    artists = _sub(client.get("/subsonic/rest/getArtists", params=q))["artists"]
+    artist_id = artists["index"][0]["artist"][0]["id"]
+    info = _sub(client.get("/subsonic/rest/getArtistInfo2", params={**q, "id": artist_id}))[
+        "artistInfo2"
+    ]
+    _assert_cover_urls("http://testserver/apps/music", info, artist_id)
+
+
+async def test_album_info_cover_urls_include_base_once(compat_env):
+    client = _cover_client(compat_env, root_path="/dn")
+    q = {"v": "1.16.1", "c": "pytest", "f": "json", "apiKey": compat_env.secret}
+    albums = _sub(client.get("/subsonic/rest/getAlbumList2", params={**q, "type": "newest"}))[
+        "albumList2"
+    ]["album"]
+    album_id = albums[0]["id"]
+    info = _sub(client.get("/subsonic/rest/getAlbumInfo2", params={**q, "id": album_id}))[
+        "albumInfo2"
+    ]
+    _assert_cover_urls("http://testserver/dn", info, album_id)
+
+
+async def test_unknown_album_info_id_error_unchanged_under_base(compat_env):
+    client = _cover_client(compat_env, root_path="/dn")
+    q = {"v": "1.16.1", "c": "pytest", "f": "json", "apiKey": compat_env.secret,
+         "id": "al-does-not-exist"}
+    body = _sub(client.get("/subsonic/rest/getAlbumInfo2", params=q))
+    assert body["error"]["code"] == 70

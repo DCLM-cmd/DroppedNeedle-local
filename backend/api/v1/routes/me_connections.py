@@ -335,11 +335,15 @@ async def spotify_auth_callback(
     error: str | None = None,
 ) -> fastapi_responses.RedirectResponse:
     if error or not code or not state:
-        return fastapi_responses.RedirectResponse("/profile?spotify=error")
+        return fastapi_responses.RedirectResponse(
+            preferences_service.with_base_path("/profile?spotify=error")
+        )
 
     user_id = await auth_store.consume_spotify_state(state)
     if not user_id:
-        return fastapi_responses.RedirectResponse("/profile?spotify=error&reason=state")
+        return fastapi_responses.RedirectResponse(
+            preferences_service.with_base_path("/profile?spotify=error&reason=state")
+        )
 
     settings = preferences_service.get_spotify_settings_raw()
     redirect_uri = preferences_service.spotify_redirect_uri(str(request.base_url))
@@ -354,7 +358,9 @@ async def spotify_auth_callback(
             )
             if token_resp.status_code != 200:
                 logger.warning(f"Spotify token exchange failed: status={token_resp.status_code}")
-                return fastapi_responses.RedirectResponse("/profile?spotify=error&reason=token")
+                return fastapi_responses.RedirectResponse(
+                    preferences_service.with_base_path("/profile?spotify=error&reason=token")
+                )
             token_data = token_resp.json()
 
             me_resp = await client.get(
@@ -363,7 +369,9 @@ async def spotify_auth_callback(
             )
     except Exception:  # noqa: BLE001
         logger.exception("Spotify OAuth callback failed")
-        return fastapi_responses.RedirectResponse("/profile?spotify=error&reason=network")
+        return fastapi_responses.RedirectResponse(
+            preferences_service.with_base_path("/profile?spotify=error&reason=network")
+        )
 
     spotify_user = me_resp.json() if me_resp.status_code == 200 else {}
     expires_at = (
@@ -377,7 +385,9 @@ async def spotify_auth_callback(
         "username": spotify_user.get("display_name") or spotify_user.get("id") or "Spotify",
         "spotify_user_id": spotify_user.get("id", ""),
     })
-    return fastapi_responses.RedirectResponse("/profile?spotify=connected")
+    return fastapi_responses.RedirectResponse(
+        preferences_service.with_base_path("/profile?spotify=connected")
+    )
 
 
 @router.put("/connections/navidrome", response_model=ConnectionStatus)

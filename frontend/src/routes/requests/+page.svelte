@@ -60,6 +60,7 @@
 		createApprovePersonalMixMutation,
 		createRejectPersonalMixMutation
 	} from '$lib/queries/scrobble-preferences/ScrobblePreferencesMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { isAbortError } from '$lib/utils/errorHandling';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import {
@@ -1069,7 +1070,10 @@
 						your quality cutoff.
 					</p>
 					{#if authStore.isAdmin}
-						<a href="/settings?tab=download-client" class="btn btn-sm btn-primary mt-4">
+						<a
+							href={withBasePath('/settings?tab=download-client')}
+							class="btn btn-sm btn-primary mt-4"
+						>
 							Open download settings
 						</a>
 					{/if}
@@ -1114,7 +1118,7 @@
 							</div>
 							<div class="flex-1 min-w-0">
 								<a
-									href="/album/{item.release_group_mbid}"
+									href={withBasePath(`/album/${item.release_group_mbid}`)}
 									class="block font-semibold text-sm truncate hover:text-accent hover:underline"
 								>
 									{item.album_title ?? 'Unknown album'}
@@ -1213,7 +1217,7 @@
 							</div>
 							<div class="flex-1 min-w-0">
 								<a
-									href="/artist/{item.artist_mbid}"
+									href={withBasePath(`/artist/${item.artist_mbid}`)}
 									class="block font-semibold text-sm truncate hover:text-accent hover:underline"
 									title={item.artist_name}>{item.artist_name}</a
 								>

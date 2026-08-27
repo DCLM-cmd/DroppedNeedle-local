@@ -20,6 +20,7 @@
 	} from '$lib/types';
 	import CarouselSkeleton from '$lib/components/CarouselSkeleton.svelte';
 	import PageHeader from '$lib/components/PageHeader.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { getGreeting } from '$lib/utils/homeCache';
 	import { isDismissed } from '$lib/utils/dismissedPrompts';
 	import HomeSectionNowPlaying from '$lib/components/HomeSectionNowPlaying.svelte';
@@ -51,7 +52,7 @@
 				key: 'popular_albums',
 				kind: 'section',
 				section: homeData.popular_albums,
-				link: '/popular'
+				link: withBasePath('/popular')
 			});
 		}
 		if (homeData.trending_artists && homeData.trending_artists.items.length > 0) {
@@ -59,7 +60,7 @@
 				key: 'trending_artists',
 				kind: 'section',
 				section: homeData.trending_artists,
-				link: '/trending'
+				link: withBasePath('/trending')
 			});
 		}
 		if (homeData.weekly_exploration && homeData.weekly_exploration.tracks.length > 0) {
@@ -74,7 +75,7 @@
 				key: 'your_top_albums',
 				kind: 'section',
 				section: homeData.your_top_albums,
-				link: '/your-top',
+				link: withBasePath('/your-top'),
 				showPreview: false
 			});
 		}
@@ -90,7 +91,7 @@
 				key: 'recently_added',
 				kind: 'section',
 				section: homeData.recently_added,
-				link: '/library/albums',
+				link: withBasePath('/library/albums'),
 				showPreview: false
 			});
 		}
@@ -110,14 +111,14 @@
 			sections.push({
 				key: 'library_artists',
 				section: homeData.library_artists,
-				link: '/library/artists'
+				link: withBasePath('/library/artists')
 			});
 		}
 		if (homeData.library_albums && homeData.library_albums.items.length > 0) {
 			sections.push({
 				key: 'library_albums',
 				section: homeData.library_albums,
-				link: '/library/albums'
+				link: withBasePath('/library/albums')
 			});
 		}
 		return sections;
@@ -166,7 +167,7 @@
 
 	<div class="flex justify-end px-4 -mt-4 mb-4 sm:px-6 lg:px-8">
 		<a
-			href="/settings?tab=home"
+			href={withBasePath('/settings?tab=home')}
 			class="btn btn-ghost btn-sm gap-2 text-base-content/60 hover:text-base-content"
 			title="Choose which sections appear here"
 		>
@@ -211,7 +212,10 @@
 									<span class="badge badge-accent badge-lg">{feature}</span>
 								{/each}
 							</div>
-							<a href="/settings?tab=download-client" class="btn btn-accent btn-lg gap-2">
+							<a
+								href={withBasePath('/settings?tab=download-client')}
+								class="btn btn-accent btn-lg gap-2"
+							>
 								<Download class="h-5 w-5" />
 								Configure Download Client
 							</a>
@@ -342,14 +346,16 @@
 								Your library is empty. Add a library path and start a scan to fill it.
 							</p>
 							<div class="flex flex-wrap justify-center gap-2">
-								<a href="/settings?tab=library" class="btn btn-primary">Start scan</a>
-								<a href="/library" class="btn btn-ghost">Go to Library</a>
+								<a href={withBasePath('/settings?tab=library')} class="btn btn-primary"
+									>Start scan</a
+								>
+								<a href={withBasePath('/library')} class="btn btn-ghost">Go to Library</a>
 							</div>
 						{:else}
 							<p class="mb-6 max-w-md px-4 text-center text-sm text-base-content/70 sm:text-base">
 								Your library is being prepared. An admin is setting things up - check back soon.
 							</p>
-							<a href="/library" class="btn btn-ghost">Go to Library</a>
+							<a href={withBasePath('/library')} class="btn btn-ghost">Go to Library</a>
 						{/if}
 					</div>
 				{/if}

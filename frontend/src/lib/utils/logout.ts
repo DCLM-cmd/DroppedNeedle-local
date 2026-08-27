@@ -1,6 +1,8 @@
 import { browser } from '$app/environment';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
+import { api } from '$lib/api/client';
+import { API } from '$lib/constants';
 import { resetQueryCacheForUserSwitch } from '$lib/queries/QueryClient';
 import { authStore, LAST_USER_ID_KEY } from '$lib/stores/authStore.svelte';
 import { musicSourceStore } from '$lib/stores/musicSource';
@@ -11,7 +13,7 @@ import { clearUserScopedLocalCaches } from '$lib/utils/userScopedCaches';
 // sees no prior personalized data; local state clears regardless of network success.
 export async function logout(): Promise<void> {
 	try {
-		await fetch('/api/v1/auth/logout', { method: 'POST', credentials: 'include' });
+		await api.global.post(API.auth.logout());
 	} catch {
 		// A failed revoke must not strand the user in a signed-in UI.
 	}

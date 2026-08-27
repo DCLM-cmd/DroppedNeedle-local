@@ -2,6 +2,7 @@
 	import CarouselSkeleton from '$lib/components/CarouselSkeleton.svelte';
 	import { ChevronRight } from 'lucide-svelte';
 	import type { Snippet } from 'svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	interface Props {
 		title: string;
@@ -17,7 +18,7 @@
 	<div class="flex items-center justify-between px-1">
 		{#if seeAllHref}
 			<a
-				href={seeAllHref}
+				href={withBasePath(seeAllHref)}
 				class="group/title flex items-center gap-1 transition-colors hover:text-primary"
 			>
 				<h2
@@ -31,7 +32,7 @@
 		{/if}
 		{#if seeAllHref}
 			<a
-				href={seeAllHref}
+				href={withBasePath(seeAllHref)}
 				class="btn btn-ghost btn-sm gap-1 text-xs font-medium text-base-content/60 hover:text-base-content"
 			>
 				View all

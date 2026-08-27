@@ -7,6 +7,7 @@
 	import { createMarkNewReleasesSeenMutation } from '$lib/queries/following/FollowMutations.svelte';
 	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import type { NewRelease } from '$lib/queries/following/types';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { SvelteSet } from 'svelte/reactivity';
 
 	const PAGE = 48;
@@ -54,7 +55,11 @@
 
 <div class="mx-auto w-full max-w-6xl px-2 py-4 sm:px-4 sm:py-8 lg:px-8">
 	<div class="mb-6 flex flex-wrap items-center gap-3">
-		<a href="/following" class="btn btn-ghost btn-sm btn-circle" aria-label="Back to Following">
+		<a
+			href={withBasePath('/following')}
+			class="btn btn-ghost btn-sm btn-circle"
+			aria-label="Back to Following"
+		>
 			<ArrowLeft class="h-5 w-5" />
 		</a>
 		<Disc3 class="h-6 w-6 text-primary" aria-hidden="true" />
@@ -87,7 +92,7 @@
 				? 'Every release from this period is already in your library.'
 				: 'When an artist you follow puts out something new, it shows up here.'}
 			ctaLabel="Your Artists"
-			ctaHref="/following/artists"
+			ctaHref={withBasePath('/following/artists')}
 		/>
 	{:else}
 		<div class="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
@@ -95,7 +100,7 @@
 				{@const isRequested = requested.has(item.release_group_mbid)}
 				<div class="group flex flex-col gap-2">
 					<a
-						href="/album/{item.release_group_mbid}"
+						href={withBasePath(`/album/${item.release_group_mbid}`)}
 						class="relative block aspect-square w-full overflow-hidden rounded-2xl"
 						aria-label="Open {item.title}"
 					>
@@ -117,11 +122,14 @@
 							</span>
 						{/if}
 					</a>
-					<a href="/album/{item.release_group_mbid}" class="truncate font-semibold hover:underline">
+					<a
+						href={withBasePath(`/album/${item.release_group_mbid}`)}
+						class="truncate font-semibold hover:underline"
+					>
 						{item.title}
 					</a>
 					<a
-						href="/artist/{item.artist_mbid}"
+						href={withBasePath(`/artist/${item.artist_mbid}`)}
 						class="truncate text-sm text-base-content/70 hover:underline"
 					>
 						{item.artist_name}

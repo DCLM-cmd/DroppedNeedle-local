@@ -16,6 +16,7 @@
 	import type { CitySearchResult, Concert } from '$lib/queries/following/types';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { KM_PER_MILE } from '$lib/constants';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	const concertsQuery = getConcertsQuery();
 	const citiesQuery = getEventCitiesQuery();
@@ -94,7 +95,11 @@
 
 <div class="mx-auto w-full max-w-4xl px-2 py-4 sm:px-4 sm:py-8 lg:px-8">
 	<div class="mb-6 flex items-center gap-3">
-		<a href="/following" class="btn btn-ghost btn-sm btn-circle" aria-label="Back to Following">
+		<a
+			href={withBasePath('/following')}
+			class="btn btn-ghost btn-sm btn-circle"
+			aria-label="Back to Following"
+		>
 			<ArrowLeft class="h-5 w-5" />
 		</a>
 		<CalendarClock class="h-6 w-6 text-primary" aria-hidden="true" />
@@ -128,7 +133,7 @@
 				{/if}
 			</p>
 			{#if authStore.isAdmin}
-				<a href="/settings" class="btn btn-primary btn-sm mt-4 gap-2 rounded-full">
+				<a href={withBasePath('/settings')} class="btn btn-primary btn-sm mt-4 gap-2 rounded-full">
 					<Settings class="h-4 w-4" aria-hidden="true" /> Open Settings
 				</a>
 			{/if}
@@ -158,8 +163,8 @@
 				icon={CalendarClock}
 				title="No gigs found in your cities yet"
 				description="When an artist you follow announces a show near one of your cities, it shows up here."
+				ctaHref={withBasePath('/following/artists')}
 				ctaLabel="Your Artists"
-				ctaHref="/following/artists"
 			/>
 		{:else}
 			{#each monthGroups as group (group.label)}
@@ -188,9 +193,9 @@
 							</div>
 
 							<a
-								href="/artist/{concert.artist_mbid}"
-								class="shrink-0"
+								href={withBasePath(`/artist/${concert.artist_mbid}`)}
 								aria-label="Open {concert.artist_name}"
+								class="shrink-0"
 							>
 								<ArtistImage
 									mbid={concert.artist_mbid}
@@ -203,7 +208,7 @@
 							<div class="min-w-0 flex-1">
 								<div class="flex items-center gap-2">
 									<a
-										href="/artist/{concert.artist_mbid}"
+										href={withBasePath(`/artist/${concert.artist_mbid}`)}
 										class="truncate font-semibold hover:text-primary"
 									>
 										{concert.artist_name}

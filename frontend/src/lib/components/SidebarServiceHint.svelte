@@ -2,6 +2,8 @@
 	import { Plus } from 'lucide-svelte';
 	import type { Snippet } from 'svelte';
 
+	import { withBasePath } from '$lib/utils/basePath';
+
 	interface Props {
 		icon: Snippet;
 		label: string;
@@ -13,7 +15,7 @@
 
 <li class="opacity-30 hover:opacity-70 transition-opacity duration-200">
 	<a
-		href="/settings?tab={settingsTab}"
+		href={withBasePath(`/settings?tab=${settingsTab}`)}
 		class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 		data-tip="Connect {label}"
 	>

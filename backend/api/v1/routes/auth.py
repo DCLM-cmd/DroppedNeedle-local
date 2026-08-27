@@ -35,6 +35,8 @@ from api.v1.schemas.auth import (
     session_to_response,
     user_to_response,
 )
+from core.base_path import scope_base_path
+from core.config import get_settings
 from core.dependencies import get_quota_service
 from core.dependencies.auth_providers import get_auth_service, get_plex_user_auth_service, get_jellyfin_user_auth_service, get_oidc_user_auth_service, get_user_import_service
 from core.exceptions import AuthenticationError, ConfigurationError, ExternalServiceError, RegistrationError
@@ -54,6 +56,11 @@ _COOKIE_NAME = "droppedneedle_session"
 _COOKIE_MAX_AGE = 30 * 24 * 60 * 60  # 30 days
 
 
+def _deployment_base(request: Request) -> str:
+    """Canonical externally visible base path, or empty at the domain root."""
+    return scope_base_path(request.scope, get_settings().base_path)
+
+
 def _set_session_cookie(response: Response, request: Request, token: str) -> None:
     """Attach an httpOnly session cookie. Marks Secure automatically when the
     request arrived over HTTPS (direct or via X-Forwarded-Proto)."""
@@ -68,12 +75,12 @@ def _set_session_cookie(response: Response, request: Request, token: str) -> Non
         samesite = "lax",
         secure = secure,
         max_age = _COOKIE_MAX_AGE,
-        path = "/api",
+        path = f"{_deployment_base(request)}/api",
     )
 
 
-def _clear_session_cookie(response: Response) -> None:
-    response.delete_cookie(key = _COOKIE_NAME, path = "/api")
+def _clear_session_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(key = _COOKIE_NAME, path = f"{_deployment_base(request)}/api")
 
 
 def _bearer_token(request: Request) -> str | None:
@@ -204,7 +211,7 @@ async def logout(
     token = _bearer_token(request) or request.cookies.get(_COOKIE_NAME)
     if token:
         await auth.logout(token)
-    _clear_session_cookie(response)
+    _clear_session_cookie(response, request)
 
 
 @router.post("/logout-all", status_code = status.HTTP_204_NO_CONTENT)
@@ -546,7 +553,12 @@ async def oidc_callback(
         raise HTTPException(status_code = status.HTTP_401_UNAUTHORIZED, detail = "OIDC authentication failed")
     except ExternalServiceError:
         raise HTTPException(status_code = status.HTTP_503_SERVICE_UNAVAILABLE, detail = "OIDC provider unavailable")
-    return responses.RedirectResponse(url = f"/auth/callback?code={exchange_code}")
+    # Same-site hand-off: a RELATIVE Location keeps Host/X-Forwarded-* out of
+    # a URL carrying the one-time exchange code; base is prefixed exactly once.
+    return responses.RedirectResponse(
+        url = f"{_deployment_base(request)}/auth/callback?code={exchange_code}",
+        headers = {"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 @router.post("/oidc/exchange", response_model = AuthResponse)

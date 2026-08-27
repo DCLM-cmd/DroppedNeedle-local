@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { LastFmConnectionSettingsResponse } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
 	import { Radio, ExternalLink } from 'lucide-svelte';
 	import { onMount, onDestroy } from 'svelte';
@@ -36,7 +37,7 @@
 		<div class="rounded-xl border border-info/20 bg-info/5 p-3 text-sm text-base-content/70">
 			These are the shared credentials for one registered Last.fm application. Each user links
 			<span class="font-medium">their own</span> Last.fm account and toggles scrobbling from their
-			<a href="/profile" class="link link-primary">profile</a>.
+			<a href={withBasePath('/profile')} class="link link-primary">profile</a>.
 		</div>
 
 		{#if form.loading}

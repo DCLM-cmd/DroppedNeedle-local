@@ -25,6 +25,7 @@
 	import { buildDiscoveryQueueFromPlex } from '$lib/player/queueHelpers';
 	import PlexIcon from '$lib/components/PlexIcon.svelte';
 	import { reveal } from '$lib/actions/reveal';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import type {
@@ -180,7 +181,7 @@
 		{
 			label: 'Albums',
 			value: hub?.stats?.total_albums ?? null,
-			href: '/library/plex/albums',
+			href: withBasePath('/library/plex/albums'),
 			subtitle: 'in your library',
 			colorScheme: 'primary',
 			icon: 'disc'
@@ -188,7 +189,7 @@
 		{
 			label: 'Artists',
 			value: hub?.stats?.total_artists ?? null,
-			href: '/library/plex/artists',
+			href: withBasePath('/library/plex/artists'),
 			subtitle: 'in your library',
 			colorScheme: 'secondary',
 			icon: 'users'
@@ -196,7 +197,7 @@
 		{
 			label: 'Tracks',
 			value: hub?.stats?.total_tracks ?? null,
-			href: '/library/plex/tracks',
+			href: withBasePath('/library/plex/tracks'),
 			subtitle: 'in your library',
 			colorScheme: 'accent',
 			icon: 'music'
@@ -316,7 +317,7 @@
 		errorCode={playlistErrorCode}
 		onretry={() => void playlistsQuery.refetch()}
 		sourceLabel="Plex"
-		playlistsHref="/library/plex/playlists"
+		playlistsHref={withBasePath('/library/plex/playlists')}
 	>
 		{#snippet sourceIcon()}
 			<PlexIcon class="h-4 w-4" style="color: rgb(var(--brand-plex));" />
@@ -387,12 +388,16 @@
 		</DiscoveryZone>
 
 		<div use:reveal>
-			<HubShelf title="Recently Added" {loading} seeAllHref="/library/plex/albums?sort=date_added">
+			<HubShelf
+				title="Recently Added"
+				{loading}
+				seeAllHref={withBasePath('/library/plex/albums?sort=date_added')}
+			>
 				{#if hub && hub.recently_added.length > 0}
 					<AlbumGrid
 						albums={hub.recently_added}
 						idKey="plex_id"
-						seeAllHref="/library/plex/albums?sort=date_added"
+						seeAllHref={withBasePath('/library/plex/albums?sort=date_added')}
 						onAlbumClick={(a) => openAlbumDetail(a as PlexAlbumSummary)}
 					/>
 				{:else if hub}
@@ -434,7 +439,7 @@
 					</div>
 					{#if historyTotal > 10}
 						<div class="mt-2 flex gap-2">
-							<a href="/library/plex/activity" class="btn btn-sm btn-outline">
+							<a href={withBasePath('/library/plex/activity')} class="btn btn-sm btn-outline">
 								View full history and analytics ({historyTotal.toLocaleString()} plays)
 							</a>
 						</div>
@@ -454,9 +459,11 @@
 						index={genericArtistIndex}
 						onselect={(artist) => {
 							if (artist.musicbrainz_id) {
-								goto(`/artist/${artist.musicbrainz_id}`);
+								goto(withBasePath(`/artist/${artist.musicbrainz_id}`));
 							} else {
-								goto(`/library/plex/artists?search=${encodeURIComponent(artist.name)}`);
+								goto(
+									withBasePath(`/library/plex/artists?search=${encodeURIComponent(artist.name)}`)
+								);
 							}
 						}}
 					/>
@@ -465,7 +472,7 @@
 				{/if}
 			</HubShelf>
 
-			<HubShelf title="Browse Albums" seeAllHref="/library/plex/albums" {loading}>
+			<HubShelf title="Browse Albums" seeAllHref={withBasePath('/library/plex/albums')} {loading}>
 				{#if hub && hub.all_albums_preview.length > 0}
 					<HorizontalCarousel>
 						{#each hub?.all_albums_preview ?? [] as album (album.plex_id)}

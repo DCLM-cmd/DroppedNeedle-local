@@ -4,6 +4,7 @@
 	import { UserRound } from 'lucide-svelte';
 	import { getImportCandidatesQuery } from '$lib/queries/auth/ImportCandidatesQuery.svelte';
 	import { createImportUsersMutation } from '$lib/queries/auth/UserImportMutations.svelte';
+	import { getApiUrl } from '$lib/api/api-utils';
 
 	let { open = $bindable(false), onImported }: { open?: boolean; onImported?: () => void } =
 		$props();
@@ -134,7 +135,7 @@
 						>
 							{#if candidate.avatar_url && !broken.includes(candidate.provider_uid)}
 								<img
-									src={candidate.avatar_url}
+									src={getApiUrl(candidate.avatar_url)}
 									alt={candidate.display_name}
 									class="h-full w-full object-cover"
 									onerror={() => (broken = [...broken, candidate.provider_uid])}

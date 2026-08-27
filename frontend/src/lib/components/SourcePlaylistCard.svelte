@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { SourcePlaylistSummary } from '$lib/types';
 	import { formatTotalDurationSec } from '$lib/utils/formatting';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { Disc3 } from 'lucide-svelte';
 
 	interface Props {
@@ -35,7 +36,7 @@
 			>
 				{#if playlist.cover_url && !imgFailed}
 					<img
-						src={playlist.cover_url}
+						src={getApiUrl(playlist.cover_url)}
 						alt={playlist.name}
 						class="w-full h-full object-cover"
 						loading="lazy"

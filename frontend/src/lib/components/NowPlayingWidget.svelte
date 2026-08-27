@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Music, Pause, User } from 'lucide-svelte';
 	import AudioQualityBadge from '$lib/components/AudioQualityBadge.svelte';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import type { NowPlayingSession } from '$lib/types';
 
 	interface Props {
@@ -57,7 +58,7 @@
 					<div class="relative h-[4.5rem] w-[4.5rem] shrink-0 overflow-hidden rounded-lg shadow">
 						{#if session.cover_url}
 							<img
-								src={session.cover_url}
+								src={getApiUrl(session.cover_url)}
 								alt={session.album_name}
 								class="h-full w-full object-cover {session.is_paused ? 'grayscale' : ''}"
 								loading="lazy"

@@ -6,6 +6,7 @@
 	import { colors } from '$lib/colors';
 	import { libraryStore } from '$lib/stores/library';
 	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { withBasePath } from '$lib/utils/basePath';
 	import AlbumImage from './AlbumImage.svelte';
 	import LibraryBadge from './LibraryBadge.svelte';
 	import LastFmPlaceholder from './LastFmPlaceholder.svelte';
@@ -89,7 +90,9 @@
 		<div class="bg-base-200 rounded-lg p-4 text-center flex-1 flex items-center justify-center">
 			<div>
 				<p class="text-base-content/70 text-sm">Connect a music service to see popular albums</p>
-				<a href="/profile#scrobbling" class="btn btn-primary btn-xs mt-2">Configure</a>
+				<a href={withBasePath('/profile#scrobbling')} class="btn btn-primary btn-xs mt-2"
+					>Configure</a
+				>
 			</div>
 		</div>
 	{:else if albums.length === 0}

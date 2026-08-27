@@ -100,3 +100,41 @@ async def test_get_cover_art_unknown_playlist_is_404(compat_env):
 async def test_get_cover_art_unknown_prefix_404(compat_env):
     r = _get(compat_env, "getCoverArt", id="zz-bogus")
     assert r.status_code == 404  # binary endpoint: 70 -> real HTTP 404
+
+
+async def test_advertised_cover_url_resolves_under_base_scope(compat_env):
+    """The URLs getArtistInfo2 advertises must survive the base-path scope:
+    only id (+size) in the query - no credentials - and fetchable at the
+    stripped route a client would hit."""
+    from urllib.parse import parse_qs, urlparse
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(compat_env.app, root_path="/dn")
+    q = {"v": "1.16.1", "c": "pytest", "f": "json", "apiKey": compat_env.secret}
+    artists = _sub(client.get("/subsonic/rest/getArtists", params=q))["artists"]
+    artist_id = artists["index"][0]["artist"][0]["id"]
+    info = _sub(client.get("/subsonic/rest/getArtistInfo2", params={**q, "id": artist_id}))[
+        "artistInfo2"
+    ]
+    medium = urlparse(info["mediumImageUrl"])
+    assert info["mediumImageUrl"].startswith("http://testserver/dn/subsonic/")
+    params = parse_qs(medium.query)
+    assert set(params) == {"id", "size"}
+    assert params["size"] == ["500"]
+
+    fetched = client.get(
+        "/subsonic/rest/getCoverArt",
+        params={"id": params["id"][0], "size": params["size"][0], **q},
+    )
+    assert fetched.status_code == 200
+    assert fetched.headers["content-type"].startswith("image/")
+
+
+async def test_get_cover_art_unknown_prefix_404_under_base(compat_env):
+    from fastapi.testclient import TestClient
+
+    client = TestClient(compat_env.app, root_path="/dn")
+    q = {"v": "1.16.1", "c": "pytest", "f": "json", "apiKey": compat_env.secret}
+    r = client.get("/subsonic/rest/getCoverArt", params={**q, "id": "zz-bogus"})
+    assert r.status_code == 404

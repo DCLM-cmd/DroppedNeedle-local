@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { WeeklyExplorationTrack } from '$lib/types';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { Music2, Disc3 } from 'lucide-svelte';
 	import { albumHrefOrNull, artistHrefOrNull } from '$lib/utils/entityRoutes';
 	import { integrationStore } from '$lib/stores/integration';
@@ -40,7 +41,7 @@
 		>
 			{#if track.cover_url && !imgError}
 				<img
-					src={track.cover_url}
+					src={getApiUrl(track.cover_url)}
 					alt={track.album_name || track.title}
 					class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
 					loading="lazy"
@@ -67,7 +68,7 @@
 		<div class="relative aspect-square w-full overflow-hidden rounded-t-xl bg-base-200">
 			{#if track.cover_url && !imgError}
 				<img
-					src={track.cover_url}
+					src={getApiUrl(track.cover_url)}
 					alt={track.album_name || track.title}
 					class="h-full w-full object-cover"
 					loading="lazy"

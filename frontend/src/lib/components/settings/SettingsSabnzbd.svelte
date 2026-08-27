@@ -9,6 +9,7 @@
 	import { getIndexersQuery } from '$lib/queries/downloads/IndexerQueries.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import type { SabnzbdConnectionSettings, SabnzbdTestResult } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	import DownloadClientCard from './DownloadClientCard.svelte';
 
@@ -130,7 +131,7 @@
 						<span class="font-semibold">No indexers configured.</span> SABnzbd downloads the NZBs your
 						indexers find - with none set up, Usenet search returns nothing and this client stays idle.
 					</p>
-					<a class="link link-warning font-medium" href="/settings?tab=indexers">
+					<a class="link link-warning font-medium" href={withBasePath('/settings?tab=indexers')}>
 						Add an indexer →
 					</a>
 				</div>

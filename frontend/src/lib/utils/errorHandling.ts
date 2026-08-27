@@ -12,5 +12,7 @@ export function getCoverUrl(coverUrl: string | null | undefined, albumId: string
 	if (isValidMbid(albumId)) {
 		return getApiUrl(`/api/v1/covers/release-group/${albumId}?size=250`);
 	}
-	return coverUrl || getApiUrl(`/api/v1/covers/release-group/${albumId}?size=250`);
+	return coverUrl
+		? getApiUrl(coverUrl)
+		: getApiUrl(`/api/v1/covers/release-group/${albumId}?size=250`);
 }

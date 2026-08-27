@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { ChevronLeft, Disc3, Search, X } from 'lucide-svelte';
 	import { getLibraryAlbumsQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import LibraryAlbumCard from '$lib/components/library/LibraryAlbumCard.svelte';
@@ -67,7 +68,7 @@
 	<div class="flex items-center gap-4 mb-6">
 		<button
 			class="btn btn-ghost btn-circle"
-			onclick={() => goto('/library')}
+			onclick={() => goto(withBasePath('/library'))}
 			aria-label="Back to library"
 		>
 			<ChevronLeft class="w-6 h-6" />

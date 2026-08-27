@@ -9,6 +9,7 @@
 	import { getLibraryReviewsQuery } from '$lib/queries/library/LibraryReviewQueries.svelte';
 	import { getLibraryPolicyTreeQuery } from '$lib/queries/library/LibraryPolicyQueries.svelte';
 	import type { LibraryReviewFilters as Filters } from '$lib/queries/library/LibraryReviewQueries.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	const filters = $derived<Filters>({
 		cursor: page.url.searchParams.get('cursor') ?? undefined,
@@ -52,7 +53,7 @@
 		if (next.policy) params.set('policy', next.policy);
 		if (next.search) params.set('q', next.search);
 		if (next.sort && next.sort !== 'newest') params.set('sort', next.sort);
-		void goto(`/library/review${params.size ? `?${params.toString()}` : ''}`, {
+		void goto(withBasePath(`/library/review${params.size ? `?${params.toString()}` : ''}`), {
 			noScroll: true,
 			keepFocus: true
 		});
@@ -63,13 +64,16 @@
 	function openReview(id: string): void {
 		const params = new SvelteURLSearchParams(page.url.searchParams);
 		params.set('review', id);
-		void goto(`/library/review?${params.toString()}`, { noScroll: true, keepFocus: true });
+		void goto(withBasePath(`/library/review?${params.toString()}`), {
+			noScroll: true,
+			keepFocus: true
+		});
 	}
 
 	function closeReview(): void {
 		const params = new SvelteURLSearchParams(page.url.searchParams);
 		params.delete('review');
-		void goto(`/library/review${params.size ? `?${params.toString()}` : ''}`, {
+		void goto(withBasePath(`/library/review${params.size ? `?${params.toString()}` : ''}`), {
 			noScroll: true,
 			keepFocus: true,
 			replaceState: true

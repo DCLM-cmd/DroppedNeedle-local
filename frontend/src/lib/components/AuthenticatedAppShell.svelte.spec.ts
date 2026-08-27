@@ -23,7 +23,7 @@ vi.mock('$app/navigation', () => ({
 	afterNavigate: vi.fn()
 }));
 vi.mock('$app/paths', () => ({
-	base: '',
+	base: '/dn',
 	assets: '',
 	resolve: vi.fn((_route: string, params: Record<string, string>) => `/${params?.id ?? ''}`),
 	resolveRoute: vi.fn((_route: string, params: Record<string, string>) => `/${params?.id ?? ''}`),

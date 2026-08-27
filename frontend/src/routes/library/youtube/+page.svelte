@@ -3,6 +3,7 @@
 	import { API } from '$lib/constants';
 	import { integrationStore } from '$lib/stores/integration';
 	import { api } from '$lib/api/client';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { isAbortError } from '$lib/utils/errorHandling';
 	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
@@ -169,7 +170,7 @@
 		<div class="alert alert-warning mb-4">
 			<Info class="h-4 w-4" />
 			<span
-				>YouTube is not enabled. <a href="/settings?tab=youtube" class="link"
+				>YouTube is not enabled. <a href={withBasePath('/settings?tab=youtube')} class="link"
 					>Enable it in settings</a
 				> to use YouTube features.</span
 			>
@@ -179,7 +180,7 @@
 			<Info class="h-4 w-4" />
 			<span
 				>YouTube API is not configured. You can add links manually, or <a
-					href="/settings?tab=youtube"
+					href={withBasePath('/settings?tab=youtube')}
 					class="link">enable the API in settings</a
 				> for auto-generation.</span
 			>

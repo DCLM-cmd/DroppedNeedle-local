@@ -9,6 +9,8 @@
 	import type { Snippet } from 'svelte';
 	import { ArrowRight, X, Check, Disc3, Music2, Tv, Sparkles, Search } from 'lucide-svelte';
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import {
 		albumHrefOrNull,
 		artistHrefOrNull,
@@ -45,13 +47,13 @@
 	}: Props = $props();
 
 	function getGenreHref(genre: HomeGenre): string {
-		return `/genre?name=${encodeURIComponent(genre.name)}`;
+		return withBasePath(`/genre?name=${encodeURIComponent(genre.name)}`);
 	}
 
 	function handleAlbumSearch(album: HomeAlbum) {
 		const query = [album.artist_name, album.name].filter(Boolean).join(' ').trim();
 		if (query) {
-			goto(`/search/albums?q=${encodeURIComponent(query)}`);
+			goto(withBasePath(`/search/albums?q=${encodeURIComponent(query)}`));
 		}
 	}
 
@@ -61,7 +63,7 @@
 			.join(' ')
 			.trim();
 		if (query) {
-			goto(`/search/albums?q=${encodeURIComponent(query)}`);
+			goto(withBasePath(`/search/albums?q=${encodeURIComponent(query)}`));
 		}
 	}
 
@@ -88,7 +90,7 @@
 			<div class="flex items-center gap-2">
 				{#if headerLink}
 					<a
-						href={headerLink}
+						href={withBasePath(headerLink)}
 						class="section-title text-lg sm:text-xl font-bold hover:text-primary transition-colors"
 					>
 						{section.title}
@@ -103,7 +105,7 @@
 			{/if}
 			{#if headerLink}
 				<a
-					href={headerLink}
+					href={withBasePath(headerLink)}
 					class="text-sm text-base-content/50 hover:text-primary transition-colors flex items-center gap-1"
 				>
 					See all
@@ -129,7 +131,7 @@
 				</div>
 				<p class="text-base-content/70 text-sm">{section.fallback_message}</p>
 				{#if section.connect_service}
-					<a href="/settings" class="btn btn-primary btn-sm mt-2">
+					<a href={withBasePath('/settings')} class="btn btn-primary btn-sm mt-2">
 						Connect {section.connect_service === 'listenbrainz'
 							? 'ListenBrainz'
 							: section.connect_service === 'lastfm'
@@ -288,7 +290,7 @@
 							<figure class="w-16 h-16 shrink-0">
 								{#if item.image_url}
 									<img
-										src={item.image_url}
+										src={getApiUrl(item.image_url)}
 										alt={item.album_name || item.name}
 										class="w-full h-full object-cover"
 									/>

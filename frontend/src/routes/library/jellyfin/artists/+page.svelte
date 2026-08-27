@@ -5,6 +5,7 @@
 	import ArtistCardSkeleton from '$lib/components/ArtistCardSkeleton.svelte';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import { artistHrefOrNull } from '$lib/utils/entityRoutes';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { reveal } from '$lib/actions/reveal';
 	import LibraryFilterBar from '$lib/components/LibraryFilterBar.svelte';
 	import { ChevronLeft, ChevronRight } from 'lucide-svelte';
@@ -91,7 +92,7 @@
 		class="mb-6 rounded-xl bg-base-200/30 backdrop-blur-sm border border-base-content/5 px-5 py-4 shadow-sm flex items-center gap-3"
 	>
 		<a
-			href="/library/jellyfin"
+			href={withBasePath('/library/jellyfin')}
 			class="btn btn-ghost btn-sm gap-1"
 			aria-label="Back to Jellyfin library"
 		>

@@ -16,6 +16,7 @@
 	import SourceAlbumModal from '$lib/components/SourceAlbumModal.svelte';
 	import LibraryFilterBar from '$lib/components/LibraryFilterBar.svelte';
 	import { ChevronLeft, CircleX, Play, Shuffle } from 'lucide-svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { onMount, onDestroy } from 'svelte';
 
 	interface Props {
@@ -69,7 +70,7 @@
 <div class="container mx-auto p-6">
 	<div class="flex items-center gap-3 mb-2">
 		{#if backHref}
-			<a href={backHref} class="btn btn-ghost btn-circle btn-sm" aria-label="Back">
+			<a href={withBasePath(backHref)} class="btn btn-ghost btn-circle btn-sm" aria-label="Back">
 				<ChevronLeft class="h-5 w-5" />
 			</a>
 		{/if}
@@ -180,7 +181,7 @@
 			<div class="flex flex-col gap-1">
 				<span>{ctrl.fetchError}</span>
 				{#if ctrl.fetchErrorCode === 'CIRCUIT_BREAKER_OPEN' || /connection|DNS|not configured/i.test(ctrl.fetchError)}
-					<a href="/settings" class="link link-primary text-sm">Open settings</a>
+					<a href={withBasePath('/settings')} class="link link-primary text-sm">Open settings</a>
 				{/if}
 			</div>
 			<button class="btn btn-sm btn-ghost" onclick={() => ctrl.fetchAlbums(true)}>Retry</button>

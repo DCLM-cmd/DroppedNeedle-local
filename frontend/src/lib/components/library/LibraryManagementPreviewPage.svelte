@@ -37,6 +37,7 @@
 		readLibraryManagementPreviewToken,
 		rememberLibraryManagementPreviewToken
 	} from '$lib/queries/library-management/LibraryManagementPreviewTokens';
+	import { withBasePath } from '$lib/utils/basePath';
 	import type {
 		DuplicateResolutionAction,
 		LibraryManagementPlanItem,
@@ -376,7 +377,9 @@
 			});
 			forgetLibraryManagementPreviewToken(jobId);
 			applyDialog.close();
-			await goto(`/library/management/operations/${encodeURIComponent(operation.id)}`);
+			await goto(
+				withBasePath(`/library/management/operations/${encodeURIComponent(operation.id)}`)
+			);
 		} catch (error) {
 			applyError = error instanceof Error ? error.message : 'Could not apply this preview.';
 		}
@@ -431,7 +434,7 @@
 			});
 			rememberLibraryManagementPreviewToken(handle.job_id, handle.preview_token);
 			collisionDialog.close();
-			await goto(`/library/management/previews/${encodeURIComponent(handle.job_id)}`);
+			await goto(withBasePath(`/library/management/previews/${encodeURIComponent(handle.job_id)}`));
 		} catch (error) {
 			collisionError =
 				error instanceof Error ? error.message : 'Could not create a resolution preview.';
@@ -456,7 +459,7 @@
 
 <div class="management-preview-shell px-4 py-8 sm:px-6 lg:px-8">
 	<main class="mx-auto max-w-7xl space-y-5">
-		<BackButton fallback="/library/management?tab=organize" />
+		<BackButton fallback={withBasePath('/library/management?tab=organize')} />
 
 		{#if previewQuery.isLoading || settingsQuery.isLoading || policyQuery.isLoading}
 			<div class="space-y-4">
@@ -582,7 +585,9 @@
 							Selecting a root chooses files; it does not choose each release's exact MusicBrainz
 							edition. Prepare identities first, then generate a fresh management preview.
 						</p>
-						<a class="btn btn-outline btn-sm mt-3" href="/library/management?tab=organize"
+						<a
+							class="btn btn-outline btn-sm mt-3"
+							href={withBasePath('/library/management?tab=organize')}
 							>Open identity readiness <ArrowRight class="h-4 w-4" /></a
 						>
 					</div>
@@ -797,9 +802,11 @@
 								{jobId}
 								expectedRevision={preview.operation_row_revision}
 								profileName={preview.profile_name}
-								ondiscard={() => goto('/library/management?tab=organize')}
+								ondiscard={() => goto(withBasePath('/library/management?tab=organize'))}
 							/>
-							<a href="/settings?tab=library" class="btn btn-ghost btn-sm">Library settings</a>
+							<a href={withBasePath('/settings?tab=library')} class="btn btn-ghost btn-sm"
+								>Library settings</a
+							>
 						</div>
 					</div>{:else}<div
 						bind:this={stickyFooterElement}
@@ -824,7 +831,7 @@
 								{jobId}
 								expectedRevision={preview.operation_row_revision}
 								profileName={preview.profile_name}
-								ondiscard={() => goto('/library/management?tab=organize')}
+								ondiscard={() => goto(withBasePath('/library/management?tab=organize'))}
 							/>
 							<button
 								class="btn management-btn"

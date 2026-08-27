@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
 	import SearchArtistCard from '$lib/components/SearchArtistCard.svelte';
 	import ViewMoreAlbumCard from '$lib/components/ViewMoreAlbumCard.svelte';
@@ -98,7 +99,7 @@
 
 	function navigateToBucket(bucket: 'artists' | 'albums') {
 		if (data.query) {
-			goto(`/search/${bucket}?q=${encodeURIComponent(data.query)}`);
+			goto(withBasePath(`/search/${bucket}?q=${encodeURIComponent(data.query)}`));
 		}
 	}
 

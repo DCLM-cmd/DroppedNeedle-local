@@ -16,6 +16,7 @@
 	} from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import type { HeldImport } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { albumHref } from '$lib/utils/entityRoutes';
 
 	interface Props {
@@ -241,7 +242,10 @@
 							/>
 							{retry.isPending ? 'Retrying organizer…' : 'Retry organizer'}
 						</button>
-						<a href="/library/management?tab=automation" class="btn btn-ghost btn-sm">
+						<a
+							href={withBasePath('/library/management?tab=automation')}
+							class="btn btn-ghost btn-sm"
+						>
 							<Settings2 class="size-4" aria-hidden="true" /> Review automation
 						</a>
 						<button

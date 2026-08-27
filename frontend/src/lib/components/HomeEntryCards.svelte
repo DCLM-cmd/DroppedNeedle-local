@@ -9,6 +9,7 @@
 	import { getLibraryStatsQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import { formatLastUpdated } from '$lib/utils/formatting';
 	import type { FormatInfo } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	type CardState = 'loading' | 'prompt' | 'error' | 'stats';
 	interface Stat {
@@ -118,7 +119,7 @@
 {#snippet entryCard(card: EntryCard)}
 	{@const Icon = card.icon}
 	<a
-		href={card.href}
+		href={withBasePath(card.href)}
 		class="group card relative overflow-hidden border border-base-content/10 bg-gradient-to-br {card.gradient} shadow-lg transition-all duration-300 hover:-translate-y-1 hover:shadow-2xl focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-base-100 focus-visible:outline-none"
 	>
 		<div
@@ -215,7 +216,7 @@
 		<div class="flex flex-col">
 			<DropImportZone className="flex-1 [&>button]:h-full" />
 			<a
-				href="/downloads?tab=import"
+				href={withBasePath('/downloads?tab=import')}
 				class="mt-2 self-end text-xs font-semibold text-primary hover:underline"
 			>
 				View import history

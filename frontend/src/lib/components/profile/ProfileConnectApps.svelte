@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Copy, Plus, Trash2, TriangleAlert, Waypoints } from 'lucide-svelte';
 
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import {
@@ -12,6 +13,7 @@
 		revokeAppPassword
 	} from '$lib/queries/connect-apps/ConnectAppsMutations.svelte';
 	import type { AppPasswordView } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	const settingsQuery = getConnectAppsSettingsQuery();
 	const passwordsQuery = getAppPasswordsQuery();
@@ -38,9 +40,8 @@
 	});
 
 	const isAdmin = $derived(authStore.isAdmin);
-	const origin = $derived(typeof window !== 'undefined' ? window.location.origin : '');
-	const subsonicUrl = $derived(`${origin}/subsonic`);
-	const jellyfinUrl = $derived(`${origin}/jellyfin`);
+	const subsonicUrl = $derived(new URL(getApiUrl('/subsonic'), window.location.origin).toString());
+	const jellyfinUrl = $derived(new URL(getApiUrl('/jellyfin'), window.location.origin).toString());
 	const username = $derived(authStore.user?.username ?? '');
 
 	const subsonicOn = $derived(settingsQuery.data?.subsonic_enabled ?? false);
@@ -160,7 +161,8 @@
 					{#if isAdmin}
 						<p>
 							Streaming isn't turned on yet. You can still create an app-password below, then
-							<a href="/settings?tab=connect-apps" class="link link-accent">enable it in Settings</a
+							<a href={withBasePath('/settings?tab=connect-apps')} class="link link-accent"
+								>enable it in Settings</a
 							>.
 						</p>
 					{:else}

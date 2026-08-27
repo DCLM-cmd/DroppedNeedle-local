@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { getApiUrl } from '$lib/api/api-utils';
+
 	interface Props {
 		imageUrl: string | null;
 		opacity?: number;
@@ -36,7 +38,7 @@
 		style:--hb-hover-blur="{hoverBlur}px"
 	>
 		<img
-			src={imageUrl}
+			src={getApiUrl(imageUrl)}
 			alt=""
 			loading="lazy"
 			aria-hidden="true"

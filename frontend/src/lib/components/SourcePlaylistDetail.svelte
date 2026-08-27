@@ -4,7 +4,9 @@
 	import { createSourcePlaylistImportMutation } from '$lib/queries/source-playlists/SourcePlaylistMutations.svelte';
 	import { getSourcePlaylistDetailQuery } from '$lib/queries/source-playlists/SourcePlaylistQueries.svelte';
 	import { toastStore } from '$lib/stores/toast';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { formatTotalDurationSec } from '$lib/utils/formatting';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { Disc3, Download } from 'lucide-svelte';
 	import type { SourcePlaylistSource } from '$lib/types';
 	import type { Snippet } from 'svelte';
@@ -83,9 +85,11 @@
 						: "Couldn't load this playlist."}
 			</span>
 			{#if relinkRequired}
-				<a class="btn btn-primary btn-sm" href="/profile#media-accounts">Reconnect</a>
+				<a class="btn btn-primary btn-sm" href={withBasePath('/profile#media-accounts')}
+					>Reconnect</a
+				>
 			{:else if notFound}
-				<a class="btn btn-primary btn-sm" href={backFallback}>Back to playlists</a>
+				<a class="btn btn-primary btn-sm" href={withBasePath(backFallback)}>Back to playlists</a>
 			{:else}
 				<button class="btn btn-ghost btn-sm" onclick={() => void detailQuery.refetch()}
 					>Retry</button
@@ -96,7 +100,11 @@
 		<div class="flex flex-col sm:flex-row gap-6">
 			<div class="w-48 h-48 shrink-0 rounded-lg overflow-hidden shadow-md">
 				{#if detail.cover_url}
-					<img src={detail.cover_url} alt={detail.name} class="w-full h-full object-cover" />
+					<img
+						src={getApiUrl(detail.cover_url)}
+						alt={detail.name}
+						class="w-full h-full object-cover"
+					/>
 				{:else}
 					<div class="w-full h-full bg-base-200 flex items-center justify-center">
 						<Disc3 class="w-16 h-16 text-base-content/20" />
@@ -136,7 +144,7 @@
 				{#if importRelinkRequired}
 					<p class="text-sm text-error">
 						Reconnect the linked account to continue.
-						<a class="link font-medium" href="/profile#media-accounts">Reconnect</a>
+						<a class="link font-medium" href={withBasePath('/profile#media-accounts')}>Reconnect</a>
 					</p>
 				{/if}
 			</div>

@@ -32,6 +32,7 @@
 		ArtistReconciliationGroupState
 	} from '$lib/queries/artist-reconciliation/ArtistReconciliationTypes';
 	import { authStore } from '$lib/stores/authStore.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	import ArtistIdentityDeskSkeleton from './ArtistIdentityDeskSkeleton.svelte';
 
@@ -154,11 +155,14 @@
 		if (nextFilterState) params.set('state', nextFilterState);
 		if (nextSearch) params.set('q', nextSearch);
 		if (!options.clearGroup && selectedGroupId) params.set('group', selectedGroupId);
-		void goto(`/library/management/artists${params.size ? `?${params.toString()}` : ''}`, {
-			noScroll: true,
-			keepFocus: true,
-			replaceState: true
-		});
+		void goto(
+			withBasePath(`/library/management/artists${params.size ? `?${params.toString()}` : ''}`),
+			{
+				noScroll: true,
+				keepFocus: true,
+				replaceState: true
+			}
+		);
 	}
 
 	function selectGroup(group: ArtistDuplicateGroupSummary): void {
@@ -266,7 +270,7 @@
 				artists.
 			</p>
 		</div>
-		<a href="/library/management?tab=scanning" class="btn btn-ghost btn-sm">
+		<a href={withBasePath('/library/management?tab=scanning')} class="btn btn-ghost btn-sm">
 			Back to Scan &amp; identify
 		</a>
 	</header>
@@ -536,7 +540,7 @@
 													>
 													<a
 														class="btn btn-ghost btn-xs"
-														href={`/album/${release.id}`}
+														href={withBasePath(`/album/${release.id}`)}
 														aria-label={`Open ${release.name}`}
 														><ArrowUpRight class="h-3.5 w-3.5" /></a
 													>

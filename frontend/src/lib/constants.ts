@@ -138,6 +138,7 @@ export const API = {
 		setupStatus: () => '/api/v1/auth/setup/status',
 		me: () => '/api/v1/auth/me',
 		deviceSessions: () => '/api/v1/auth/device-sessions',
+		logout: () => '/api/v1/auth/logout',
 		passwordRecoveryReset: () => '/api/v1/auth/password-recovery/reset',
 		adminPasswordRecovery: (userId: string) =>
 			`/api/v1/auth/admin/users/${encodeURIComponent(userId)}/password-recovery`

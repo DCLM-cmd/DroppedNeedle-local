@@ -4,6 +4,7 @@
 	import { RotateCcw } from 'lucide-svelte';
 	import type { WantedRetryingItem } from '$lib/queries/wanted/types';
 	import { nowSeconds, startSharedClock } from '$lib/stores/clock.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	interface Props {
 		item: WantedRetryingItem;
@@ -41,7 +42,7 @@
 
 	<div class="flex-1 min-w-0">
 		<a
-			href="/album/{item.release_group_mbid}"
+			href={withBasePath(`/album/${item.release_group_mbid}`)}
 			class="block font-semibold text-sm truncate hover:text-accent hover:underline"
 			title={item.album_title}
 		>
@@ -67,6 +68,8 @@
 	</div>
 
 	<div class="shrink-0">
-		<a href="/downloads" class="btn btn-ghost btn-sm text-base-content/50">Manage in Downloads</a>
+		<a href={withBasePath('/downloads')} class="btn btn-ghost btn-sm text-base-content/50"
+			>Manage in Downloads</a
+		>
 	</div>
 </div>

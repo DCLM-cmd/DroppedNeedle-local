@@ -1,19 +1,19 @@
 {
   "name": "DroppedNeedle",
   "short_name": "DroppedNeedle",
-  "id": "/",
-  "start_url": "/",
-  "scope": "/",
+  "id": "/__DROPPEDNEEDLE_BASE__/",
+  "start_url": "/__DROPPEDNEEDLE_BASE__/",
+  "scope": "/__DROPPEDNEEDLE_BASE__/",
   "display": "standalone",
   "display_override": ["standalone", "fullscreen"],
   "icons": [
     {
-      "src": "/android-chrome-192x192.png",
+      "src": "/__DROPPEDNEEDLE_BASE__/android-chrome-192x192.png",
       "sizes": "192x192",
       "type": "image/png"
     },
     {
-      "src": "/android-chrome-512x512.png",
+      "src": "/__DROPPEDNEEDLE_BASE__/android-chrome-512x512.png",
       "sizes": "512x512",
       "type": "image/png"
     }

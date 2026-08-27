@@ -3,6 +3,7 @@
 	import type { Snippet } from 'svelte';
 	import { formatLastUpdated } from '$lib/utils/formatting';
 	import LiveUpdatingBadge from './LiveUpdatingBadge.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	interface Breadcrumb {
 		label: string;
@@ -54,7 +55,11 @@
 	></div>
 	<div class="relative px-4 py-8 sm:px-6 sm:py-12 lg:px-8">
 		{#if backHref}
-			<a href={backHref} class="btn btn-ghost btn-circle -ml-2 mb-3" aria-label={backLabel}>
+			<a
+				href={withBasePath(backHref)}
+				class="btn btn-ghost btn-circle -ml-2 mb-3"
+				aria-label={backLabel}
+			>
 				<ChevronLeft class="h-6 w-6" aria-hidden="true" />
 			</a>
 		{/if}

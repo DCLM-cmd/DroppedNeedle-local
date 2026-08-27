@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { Disc3 } from 'lucide-svelte';
+	import { getApiUrl } from '$lib/api/api-utils';
 
 	interface Props {
 		coverUrls?: string[];
@@ -21,7 +22,8 @@
 		imageErrors[index] = true;
 	}
 
-	let urls = $derived(coverUrls.slice(0, 4));
+	let customCoverSrc = $derived(customCoverUrl ? getApiUrl(customCoverUrl) : '');
+	let urls = $derived(coverUrls.slice(0, 4).map((url) => getApiUrl(url)));
 </script>
 
 {#snippet gridFallback()}
@@ -33,7 +35,7 @@
 <div class="overflow-hidden {rounded} {size}">
 	{#if customCoverUrl}
 		<img
-			src={customCoverUrl}
+			src={customCoverSrc}
 			alt="Playlist cover"
 			class="object-cover w-full h-full"
 			loading="lazy"

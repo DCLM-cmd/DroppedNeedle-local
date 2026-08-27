@@ -15,6 +15,7 @@
 	} from '$lib/queries/downloads/downloadStatus';
 	import { downloadStatusConfig } from '$lib/queries/downloads/downloadStatusConfig';
 	import type { DownloadTask, HeldImport } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	import DownloadProgressBar from './DownloadProgressBar.svelte';
 	import DownloadSourceStatus from './DownloadSourceStatus.svelte';
@@ -130,7 +131,7 @@
 
 	<div class="flex shrink-0 items-center gap-1.5">
 		{#if isReview}
-			<a href="/downloads" class="btn btn-primary btn-xs">
+			<a href={withBasePath('/downloads')} class="btn btn-primary btn-xs">
 				{isManagementHold ? 'Review organizer' : 'Review'}
 			</a>
 		{/if}

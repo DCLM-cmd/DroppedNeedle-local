@@ -127,6 +127,24 @@ def test_static_fonts_and_images_receive_bounded_shared_cache(tmp_path):
     assert response.headers["content-type"] == "font/woff2"
 
 
+def test_mount_frontend_prefers_configured_runtime_static_dir(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime-static"
+    runtime.mkdir()
+    (runtime / "index.html").write_text("<main>runtime</main>", encoding="utf-8")
+    (runtime / "logo.png").write_bytes(b"runtime-logo")
+    monkeypatch.setenv("DROPPEDNEEDLE_STATIC_DIR", str(runtime))
+    monkeypatch.setattr(
+        static_server, "__file__", str(tmp_path / "backend" / "static_server.py")
+    )
+
+    app = FastAPI()
+    mount_frontend(app)
+    client = TestClient(app)
+
+    assert client.get("/").text == "<main>runtime</main>"
+    assert client.get("/logo.png").content == b"runtime-logo"
+
+
 def test_frontend_entry_and_named_assets_keep_intended_cache_policy(
     tmp_path, monkeypatch
 ):

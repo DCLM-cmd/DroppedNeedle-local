@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Music, ArrowLeft } from 'lucide-svelte';
 	import { page } from '$app/state';
+	import { withBasePath } from '$lib/utils/basePath';
 </script>
 
 <svelte:head>
@@ -18,7 +19,7 @@
 			{/if}
 		</p>
 		<div class="flex items-center gap-2">
-			<a href="/playlists" class="btn btn-ghost btn-sm">
+			<a href={withBasePath('/playlists')} class="btn btn-ghost btn-sm">
 				<ArrowLeft class="h-4 w-4" />
 				Back to Playlists
 			</a>

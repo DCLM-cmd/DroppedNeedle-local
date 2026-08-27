@@ -5,6 +5,7 @@
 	import SourcePlaylistCard from '$lib/components/SourcePlaylistCard.svelte';
 	import { getSourcePlaylistsQuery } from '$lib/queries/source-playlists/SourcePlaylistQueries.svelte';
 	import type { SourcePlaylistSource } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { CircleAlert, Link2, ListMusic, RefreshCw } from 'lucide-svelte';
 
 	interface Props {
@@ -64,7 +65,7 @@
 			</p>
 			<div class="mt-4 flex flex-wrap justify-center gap-2">
 				{#if relinkRequired}
-					<a class="btn btn-primary btn-sm gap-2" href="/profile#media-accounts">
+					<a class="btn btn-primary btn-sm gap-2" href={withBasePath('/profile#media-accounts')}>
 						<Link2 class="h-4 w-4" />
 						Reconnect account
 					</a>
@@ -86,7 +87,7 @@
 			</p>
 			<div class="mt-4 flex flex-wrap justify-center gap-2">
 				{#if collection}
-					<a class="btn btn-primary btn-sm gap-2" href="/profile#media-accounts">
+					<a class="btn btn-primary btn-sm gap-2" href={withBasePath('/profile#media-accounts')}>
 						<Link2 class="h-4 w-4" />
 						{collection.account_mode === 'shared' ? 'Link your account' : 'Manage account'}
 					</a>
@@ -100,7 +101,7 @@
 	{:else}
 		<div class="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
 			{#each playlists as playlist (playlist.id)}
-				<SourcePlaylistCard {playlist} href="{playlistBaseHref}/{playlist.id}" />
+				<SourcePlaylistCard {playlist} href={withBasePath(`${playlistBaseHref}/${playlist.id}`)} />
 			{/each}
 		</div>
 	{/if}

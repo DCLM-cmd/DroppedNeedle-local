@@ -6,6 +6,7 @@
 		createConnectSpotifyMutation,
 		createDisconnectMutation
 	} from '$lib/queries/connections/ConnectionsMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	const connectionsQuery = getConnectionsQuery();
 	const spotify = $derived(
@@ -98,8 +99,9 @@
 
 		{#if spotify}
 			<p class="px-1 text-xs text-base-content/50">
-				Connected. Go to your <a href="/playlists" class="link link-primary">Playlists</a> to import from
-				Spotify.
+				Connected. Go to your <a href={withBasePath('/playlists')} class="link link-primary"
+					>Playlists</a
+				> to import from Spotify.
 			</p>
 		{:else}
 			<p class="px-1 text-xs text-base-content/40">
