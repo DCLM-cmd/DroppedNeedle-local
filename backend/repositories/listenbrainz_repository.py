@@ -1519,7 +1519,14 @@ class ListenBrainzRepository:
         if cached is not None:
             return cached
 
-        result = await self._get(f"/1/user/{user}/playlists/recommendations")
+        # 404 means the user has no recommendation playlists yet: absence, not
+        # failure (same accepted_statuses pattern as validate_username).
+        try:
+            result = await self._get(
+                f"/1/user/{user}/playlists/recommendations", accepted_statuses=(404,)
+            )
+        except _ListenBrainzValidationOutcome:
+            return []
         if not result or not isinstance(result, dict):
             return []
 
@@ -1564,7 +1571,14 @@ class ListenBrainzRepository:
         if cached is not None:
             return cached
 
-        result = await self._get(f"/1/playlist/{playlist_id}")
+        # 404 means the playlist no longer exists upstream: absence, not
+        # failure (same accepted_statuses pattern as validate_username).
+        try:
+            result = await self._get(
+                f"/1/playlist/{playlist_id}", accepted_statuses=(404,)
+            )
+        except _ListenBrainzValidationOutcome:
+            return None
         if not result or not isinstance(result, dict):
             return None
 

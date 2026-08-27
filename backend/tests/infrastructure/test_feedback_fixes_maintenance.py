@@ -9,9 +9,6 @@ import pytest
 from maintenance import feedback_fixes
 
 
-_REPOSITORY_ROOT = Path(__file__).parents[3]
-
-
 def _synthetic_repository(tmp_path: Path) -> Path:
     """Hermetic git worktree: one commit plus one untracked file, so
     capture_source_identity legitimately reports a dirty tree on any checkout."""
@@ -326,7 +323,7 @@ def test_prepare_refuses_active_work(tmp_path: Path) -> None:
     ):
         feedback_fixes.prepare(
             state_path=tmp_path / "state.json",
-            repository_root=_REPOSITORY_ROOT,
+            repository_root=_synthetic_repository(tmp_path),
             data_root=data_root,
             manifest_root=tmp_path / "manifest",
             runner=FakeDocker(),
@@ -352,7 +349,7 @@ def test_prepare_requires_recovery_files_outside_data_root(
     with pytest.raises(feedback_fixes.MaintenanceStageError, match="must be outside"):
         feedback_fixes.prepare(
             state_path=state_path,
-            repository_root=_REPOSITORY_ROOT,
+            repository_root=_synthetic_repository(tmp_path),
             data_root=data_root,
             manifest_root=manifest_root,
             runner=FakeDocker(),
@@ -368,7 +365,7 @@ def _prepare_and_build(
     monkeypatch.setattr(feedback_fixes, "_wait_for_health", lambda _url: 200)
     prepared = feedback_fixes.prepare(
         state_path=state_path,
-        repository_root=_REPOSITORY_ROOT,
+        repository_root=_synthetic_repository(tmp_path),
         data_root=data_root,
         manifest_root=tmp_path / "manifest",
         runner=docker,
@@ -535,7 +532,7 @@ def test_build_refuses_when_source_changes_during_image_build(
     docker = FakeDocker()
     prepared = feedback_fixes.prepare(
         state_path=state_path,
-        repository_root=_REPOSITORY_ROOT,
+        repository_root=_synthetic_repository(tmp_path),
         data_root=data_root,
         manifest_root=tmp_path / "manifest",
         runner=docker,

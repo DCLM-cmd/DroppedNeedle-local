@@ -23,9 +23,7 @@ describe('LibraryFormatBadge (F-PERF-10 display policy)', () => {
 			props: { format: 'flac' }
 		} as unknown as Parameters<typeof render>[1]);
 		await expect.element(page.getByText('FLAC')).toBeVisible();
-		await expect
-			.element(page.getByText('FLAC'))
-			.toHaveClass(/badge-success/);
+		await expect.element(page.getByText('FLAC')).toHaveClass(/badge-success/);
 		unmount();
 
 		render(LibraryFormatBadge, {

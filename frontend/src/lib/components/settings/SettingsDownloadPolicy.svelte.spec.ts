@@ -79,7 +79,12 @@ describe('SettingsDownloadPolicy upgrade controls', () => {
 	});
 
 	it('seeds the cutoff and upgrades toggle from the saved policy', async () => {
-		h.policy = { ...basePolicy, ...qualityFields, quality_cutoff: 'mp3_320', upgrade_allowed: true };
+		h.policy = {
+			...basePolicy,
+			...qualityFields,
+			quality_cutoff: 'mp3_320',
+			upgrade_allowed: true
+		};
 		const { container } = render(SettingsDownloadPolicy);
 
 		await expect
@@ -224,9 +229,7 @@ describe('SettingsDownloadPolicy acquisition fields', () => {
 	it('opens a confirm modal over a modified order; Cancel keeps it and restores focus', async () => {
 		const { container } = render(SettingsDownloadPolicy);
 		// dirty a preset-covered field so applying requires confirmation
-		await page
-			.getByRole('button', { name: 'Move Lossy 192-255 to position 3' })
-			.click();
+		await page.getByRole('button', { name: 'Move Lossy 192-255 to position 3' }).click();
 		const trigger = page.getByRole('button', { name: 'Apply Best available preset' });
 		await trigger.click();
 
@@ -238,12 +241,14 @@ describe('SettingsDownloadPolicy acquisition fields', () => {
 		// old order preserved: still the (modified) Balanced ladder with four
 		// tiers - Cancel must NOT have applied Best available
 		const tiers = [
-			...(container.querySelectorAll('[data-motion="acq-order"] ol [data-tier]') as NodeListOf<HTMLElement>)
+			...(container.querySelectorAll(
+				'[data-motion="acq-order"] ol [data-tier]'
+			) as NodeListOf<HTMLElement>)
 		].map((el) => el.getAttribute('data-tier'));
 		expect(tiers).toEqual(['lossless', 'mp3_320', 'mp3_192', 'mp3_256']);
 		// focus returned to the preset trigger
 		expect(container.ownerDocument.activeElement?.getAttribute('data-preset')).toBe(
 			'best_available'
-	);
+		);
 	});
 });

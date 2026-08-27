@@ -795,7 +795,8 @@ export const API = {
 		activitySummary: () => '/api/v1/downloads/activity-summary',
 		searchAlbum: () => '/api/v1/downloads/search/album',
 		searchJob: (jobId: string) => `/api/v1/downloads/search/${jobId}`,
-		restartWithPolicy: (taskId: string) => `/api/v1/downloads/${taskId}/restart-with-current-policy`,
+		restartWithPolicy: (taskId: string) =>
+			`/api/v1/downloads/${taskId}/restart-with-current-policy`,
 		pick: (jobId: string) => `/api/v1/downloads/search/${jobId}/pick`,
 		dismissReview: (jobId: string) => `/api/v1/downloads/search/${jobId}/dismiss`,
 		cancelSearch: (jobId: string) => `/api/v1/downloads/search/${jobId}/cancel`,
