@@ -443,10 +443,13 @@ security-tests: $(BACKEND_VENV_STAMP) ## Phase 9: security suite (no-secrets-in-
 	$(PYTEST) tests/security -v
 
 docs-check: ## Phase 9: verify the native-engine docs exist and are non-empty
-	@for f in docs/SETUP.md docs/NATIVE_ENGINE.md docs/SLSKD_SETUP.md; do \
-		test -s "$(ROOT_DIR)/$$f" || { echo "docs-check FAILED: missing or empty $$f"; exit 1; }; \
+	@# The three planned docs/ files were folded into README sections instead of
+	@# separate files; this gate checks the README sections that now carry them.
+	@for anchor in "Native engine" "Setup" "slskd setup" "Troubleshooting"; do \
+		grep -q "^## $${anchor}$$" "$(ROOT_DIR)/README.md" \
+			|| { echo "docs-check FAILED: README.md missing '## $${anchor}' section"; exit 1; }; \
 	done
-	@echo "docs-check OK: SETUP.md, NATIVE_ENGINE.md, SLSKD_SETUP.md present and non-empty"
+	@echo "docs-check OK: README.md Native engine, Setup, slskd setup, and Troubleshooting sections present"
 
 e2e: $(BACKEND_VENV_STAMP) ## Phase 9: full e2e suite (mock + optional real-slskd container)
 	$(PYTEST) tests/e2e tests/infrastructure/test_e2e_download.py -v
@@ -859,26 +862,36 @@ test-mus14-all: backend-test-dedup-cancellation backend-test-request-service ## 
 
 test-sync-all: backend-test-sync-watchdog backend-test-sync-resume backend-test-audiodb-parallel backend-test-sync-generation ## Run all sync reliability tests
 
+# Frontend targets require Node >= 25 (declared in frontend/package.json
+# engines.node). CI and the Dockerfile use Node 25; a local Node 20 can still
+# run with: make frontend-check NPM_ENGINE_STRICT=false
+NPM_ENGINE_STRICT ?= true
+ifeq ($(NPM_ENGINE_STRICT),false)
+MAKE_NPM_ENV := npm_config_engine_strict=false
+else
+MAKE_NPM_ENV :=
+endif
+
 frontend-install: ## Install frontend npm dependencies
-	cd "$(FRONTEND_DIR)" && $(NPM) install
+	cd "$(FRONTEND_DIR)" && $(MAKE_NPM_ENV) $(NPM) install
 
 frontend-build: ## Run frontend production build
-	cd "$(FRONTEND_DIR)" && $(NPM) run build
+	cd "$(FRONTEND_DIR)" && $(MAKE_NPM_ENV) $(NPM) run build
 
 frontend-browser-install: ## Install Playwright Chromium for browser tests
-	cd "$(FRONTEND_DIR)" && $(NPM) exec playwright install chromium
+	cd "$(FRONTEND_DIR)" && $(MAKE_NPM_ENV) $(NPM) exec playwright install chromium
 
 frontend-format-check: ## Run frontend formatting checks
-	cd "$(FRONTEND_DIR)" && $(NPM) run format:check
+	cd "$(FRONTEND_DIR)" && $(MAKE_NPM_ENV) $(NPM) run format:check
 
 frontend-check: ## Run frontend type checks
-	cd "$(FRONTEND_DIR)" && $(NPM) run check
+	cd "$(FRONTEND_DIR)" && $(MAKE_NPM_ENV) $(NPM) run check
 
 frontend-lint: ## Run frontend linting
-	cd "$(FRONTEND_DIR)" && $(NPM) run lint
+	cd "$(FRONTEND_DIR)" && $(MAKE_NPM_ENV) $(NPM) run lint
 
 frontend-test: ## Run the frontend vitest suite (all projects, needs Playwright)
-	cd "$(FRONTEND_DIR)" && $(NPM) run test
+	cd "$(FRONTEND_DIR)" && $(MAKE_NPM_ENV) $(NPM) run test
 
 .PHONY: backend-test-acquisition-quality
 backend-test-acquisition-quality: ## Focused acquisition-quality backend suites (classifier, pins, persistence, routes)
