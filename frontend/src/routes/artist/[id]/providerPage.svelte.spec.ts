@@ -86,7 +86,13 @@ vi.mock('$lib/queries/artist/ArtistQueries.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/QueryClient', () => ({ invalidateQueriesWithPersister: vi.fn() }));
-vi.mock('$lib/utils/albumRequest', () => ({ requestAlbum: vi.fn() }));
+vi.mock('$lib/queries/downloads/DownloadMutations.svelte', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/queries/downloads/DownloadMutations.svelte')>()),
+	requestAlbum: () => ({
+		mutateAsync: vi.fn().mockResolvedValue({ success: true }),
+		isPending: false
+	})
+}));
 vi.mock('$lib/stores/musicSource', () => ({
 	isMusicSource: (value: unknown) => value === 'listenbrainz' || value === 'lastfm'
 }));

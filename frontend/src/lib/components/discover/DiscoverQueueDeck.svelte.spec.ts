@@ -96,8 +96,10 @@ vi.mock('$lib/stores/player.svelte', () => ({
 	playerStore: { isPlaying: false, pause: vi.fn() }
 }));
 
-vi.mock('$lib/utils/albumRequest', () => ({
-	requestAlbum: (...args: unknown[]) => requestAlbum(...args)
+vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	requestAlbum: () => ({
+		mutateAsync: (input: unknown) => requestAlbum(input as { release_group_mbid: string })
+	})
 }));
 
 vi.mock('$lib/stores/integration', async () => {
@@ -165,10 +167,11 @@ describe('DiscoverQueueDeck', () => {
 
 		await page.getByRole('button', { name: /^Request$/ }).click();
 		await vi.waitFor(() => {
-			expect(requestAlbum).toHaveBeenCalledWith('rg-1', {
-				artist: 'The Verve',
-				album: 'The Bends',
-				artistMbid: 'artist-1'
+			expect(requestAlbum).toHaveBeenCalledWith({
+				release_group_mbid: 'rg-1',
+				artist_name: 'The Verve',
+				album_title: 'The Bends',
+				artist_mbid: 'artist-1'
 			});
 		});
 		expect(deckMock.markCurrentRequested).toHaveBeenCalled();

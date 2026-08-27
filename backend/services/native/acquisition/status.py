@@ -2,12 +2,12 @@
 
 Lidarr reconstructs TrackedDownload state implicitly each poll; we make the states
 explicit and typed. ``DownloadStatus`` is a ``StrEnum`` so each member IS its wire
-string — it's drop-in everywhere the bare strings were used (DB column, SSE payloads,
+string - it's drop-in everywhere the bare strings were used (DB column, SSE payloads,
 the frontend contract are all byte-identical) while giving one typed source of truth.
 
 The PERSISTED members are mirrored in the ``download_tasks.status`` CHECK constraint
 (``infrastructure/persistence/download_store.py``); keep the two in sync. ``RETRYING`` /
-``AWAITING_REVIEW`` are TRANSIENT UI signals published over SSE only — they are never
+``AWAITING_REVIEW`` are TRANSIENT UI signals published over SSE only - they are never
 written to the DB, so they are deliberately NOT in the CHECK.
 """
 

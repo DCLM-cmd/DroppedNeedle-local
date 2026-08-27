@@ -6,6 +6,7 @@ is a real SQLite file; downloads write real bytes into tmp_path.
 """
 
 import asyncio
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,10 +64,19 @@ def _build(
     drop_import.incoming_dir = lambda: incoming
     drop_import.create_job = AsyncMock()
 
+    from api.v1.schemas.settings import DownloadPolicySettings
+
+    def _policy():
+        # Existing-install migration flavour: every tier accepted,
+        # hi-res-first lossless, unknown evidence allowed as final fallback -
+        # i.e. today's behaviour expressed through the snapshot fields.
+        return DownloadPolicySettings(quality_min="low")
+
     prefs = SimpleNamespace(
         get_free_music_settings=lambda: SimpleNamespace(
             enabled=enabled, preferred_format=preferred
-        )
+        ),
+        get_download_policy=_policy,
     )
     service = FreeMusicService(
         store=store,
@@ -217,9 +227,12 @@ async def test_a_title_that_does_not_resemble_the_request_is_rejected(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_preferred_format_wins(tmp_path):
+async def test_snapshot_preference_orders_flac_above_unknown_bitrate_mp3(tmp_path):
+    """free_music.preferred_format is no longer read for ranking: the stored
+    snapshot's global preference step decides - lossless first, proven-lossy-
+    unknown-bitrate as its canonical ``low`` projection."""
     both = _files("VBR MP3", 10) + _files("FLAC", 10, size=5000)
-    service, store, _, _ = _build(tmp_path, files=both, preferred="flac")
+    service, store, _, _ = _build(tmp_path, files=both, preferred="mp3")
 
     task_id = await service.request_album(
         user_id="u1",
@@ -229,6 +242,12 @@ async def test_preferred_format_wins(tmp_path):
     )
     task = await _settle(service, store, task_id)
     assert task.format == "flac"
+    # creation-time snapshot is pinned onto the row
+    assert task.quality_snapshot_hash
+    ladder = json.loads(task.tried_candidates_json or "[]")
+    assert {"identifier": "jamendo-117853", "format": "FLAC"} in [
+        {k: v for k, v in entry.items() if k != "reason"} for entry in ladder
+    ]
 
 
 @pytest.mark.asyncio

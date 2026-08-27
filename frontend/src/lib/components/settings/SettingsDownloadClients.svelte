@@ -15,10 +15,10 @@
 			tried first, and tune the shared policy.
 		</p>
 	</div>
-	<SettingsDownloadPolicy />
-	<SettingsWanted />
-	<SettingsSourcePriority />
 	<SettingsDownloadClient />
 	<SettingsSabnzbd />
+	<SettingsSourcePriority />
+	<SettingsDownloadPolicy />
+	<SettingsWanted />
 	<SettingsOnboardingChecklist />
 </div>

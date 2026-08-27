@@ -17,9 +17,22 @@ _COLUMNS = (
     "format, files_total, files_completed, bytes_total, bytes_downloaded, "
     "attempts, error, created_at, updated_at, track_count, origin, "
     "release_group_mbid, release_mbid, release_track_mbid, recording_mbid, "
-    "duration_seconds, album_title, track_number, disc_number"
+    "duration_seconds, album_title, track_number, disc_number, "
+    "quality_snapshot_json, quality_snapshot_hash, "
+    "quality_snapshot_summary, tried_candidates_json"
 )
 
+
+# Quality-field writer whitelist (update_free_music_quality_fields): the
+# pinned snapshot plus the persisted tried-candidate ladder.
+_FREE_MUSIC_QUALITY_UPDATABLE = frozenset(
+    {
+        "quality_snapshot_json",
+        "quality_snapshot_hash",
+        "quality_snapshot_summary",
+        "tried_candidates_json",
+    }
+)
 
 def _row_to_task(row: sqlite3.Row) -> FreeMusicTask:
     return FreeMusicTask(
@@ -49,6 +62,10 @@ def _row_to_task(row: sqlite3.Row) -> FreeMusicTask:
         album_title=row["album_title"],
         track_number=row["track_number"],
         disc_number=row["disc_number"],
+        quality_snapshot_json=row["quality_snapshot_json"],
+        quality_snapshot_hash=row["quality_snapshot_hash"],
+        quality_snapshot_summary=row["quality_snapshot_summary"],
+        tried_candidates_json=row["tried_candidates_json"] or "[]",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -92,6 +109,10 @@ class FreeMusicStore(PersistenceBase):
                     ,album_title TEXT
                     ,track_number INTEGER
                     ,disc_number INTEGER
+                    ,quality_snapshot_json TEXT
+                    ,quality_snapshot_hash TEXT
+                    ,quality_snapshot_summary TEXT
+                    ,tried_candidates_json TEXT NOT NULL DEFAULT '[]'
                 );
                 CREATE INDEX IF NOT EXISTS idx_free_music_user
                     ON free_music_tasks(user_id, created_at);
@@ -116,6 +137,11 @@ class FreeMusicStore(PersistenceBase):
                 "ALTER TABLE free_music_tasks ADD COLUMN album_title TEXT",
                 "ALTER TABLE free_music_tasks ADD COLUMN track_number INTEGER",
                 "ALTER TABLE free_music_tasks ADD COLUMN disc_number INTEGER",
+                "ALTER TABLE free_music_tasks ADD COLUMN quality_snapshot_json TEXT",
+                "ALTER TABLE free_music_tasks ADD COLUMN quality_snapshot_hash TEXT",
+                "ALTER TABLE free_music_tasks ADD COLUMN quality_snapshot_summary TEXT",
+                "ALTER TABLE free_music_tasks ADD COLUMN tried_candidates_json "
+                "TEXT NOT NULL DEFAULT '[]'",
             ):
                 try:
                     conn.execute(statement)
@@ -145,6 +171,10 @@ class FreeMusicStore(PersistenceBase):
         album_title: str | None = None,
         track_number: int | None = None,
         disc_number: int | None = None,
+        quality_snapshot_hash: str | None = None,
+        quality_snapshot_json: str | None = None,
+        quality_snapshot_summary: str | None = None,
+        tried_candidates_json: str = "[]",
     ) -> None:
         now = time.time()
 
@@ -154,8 +184,11 @@ class FreeMusicStore(PersistenceBase):
                 "(id, user_id, kind, mbid, artist, title, status, created_at, updated_at, "
                 "track_count, origin, release_group_mbid, release_mbid, "
                 "release_track_mbid, recording_mbid, duration_seconds, "
-                "album_title, track_number, disc_number) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "album_title, track_number, disc_number, "
+                "quality_snapshot_json, quality_snapshot_hash, "
+                "quality_snapshot_summary, tried_candidates_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?)",
                 (
                     task_id,
                     user_id,
@@ -176,6 +209,10 @@ class FreeMusicStore(PersistenceBase):
                     album_title,
                     track_number,
                     disc_number,
+                    quality_snapshot_json,
+                    quality_snapshot_hash,
+                    quality_snapshot_summary,
+                    tried_candidates_json,
                 ),
             )
 
@@ -212,6 +249,23 @@ class FreeMusicStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def list_tasks_missing_snapshot(
+        self, *, limit: int = 500
+    ) -> list[FreeMusicTask]:
+        """Backfill feed: tasks without a pinned snapshot, ALL statuses included
+        - terminal history keeps its policy summary for display."""
+
+        def operation(conn: sqlite3.Connection) -> list[FreeMusicTask]:
+            rows = conn.execute(
+                f"SELECT {_COLUMNS} FROM free_music_tasks "
+                "WHERE quality_snapshot_json IS NULL "
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [_row_to_task(r) for r in rows]
+
+        return await self._read(operation)
+
     async def update(
         self,
         task_id: str,
@@ -226,6 +280,10 @@ class FreeMusicStore(PersistenceBase):
         bytes_downloaded: int | None = None,
         attempts: int | None = None,
         error: str | None = None,
+        quality_snapshot_hash: str | None = None,
+        quality_snapshot_json: str | None = None,
+        quality_snapshot_summary: str | None = None,
+        tried_candidates_json: str | None = None,
         expected_statuses: tuple[str, ...] | None = None,
     ) -> bool:
         now = time.time()
@@ -240,6 +298,10 @@ class FreeMusicStore(PersistenceBase):
             "bytes_downloaded": bytes_downloaded,
             "attempts": attempts,
             "error": error,
+            "quality_snapshot_json": quality_snapshot_json,
+            "quality_snapshot_hash": quality_snapshot_hash,
+            "quality_snapshot_summary": quality_snapshot_summary,
+            "tried_candidates_json": tried_candidates_json,
         }
         sets = ["updated_at = ?"]
         params: list = [now]
@@ -260,6 +322,43 @@ class FreeMusicStore(PersistenceBase):
                 tuple(params),
             )
             return cursor.rowcount == 1
+
+        return await self._write(operation)
+
+    async def update_free_music_quality_fields(self, updates: list[dict]) -> None:
+        """Persist acquisition-quality snapshot/ladder fields onto Free Music
+        tasks in ONE transaction. Provided-key-writes-value like
+        ``DownloadStore.update_task_quality_fields`` (keys absent from a dict
+        stay untouched; a present key writes verbatim, including an explicit
+        None). Validation completes before any SQL runs."""
+        if not updates:
+            return
+        now = time.time()
+        statements: list[tuple[str, tuple[Any, ...]]] = []
+        for change in updates:
+            task_id = change.get("id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("each quality-field update needs a task id")
+            sets = ["updated_at = ?"]
+            params: list[Any] = [now]
+            for key, value in change.items():
+                if key == "id":
+                    continue
+                if key not in _FREE_MUSIC_QUALITY_UPDATABLE:
+                    raise ValueError(f"free_music_tasks column not updatable: {key}")
+                sets.append(f"{key} = ?")
+                params.append(value)
+            params.append(task_id)
+            statements.append(
+                (
+                    f"UPDATE free_music_tasks SET {', '.join(sets)} WHERE id = ?",
+                    tuple(params),
+                )
+            )
+
+        def operation(conn: sqlite3.Connection) -> None:
+            for sql, sql_params in statements:
+                conn.execute(sql, sql_params)
 
         return await self._write(operation)
 

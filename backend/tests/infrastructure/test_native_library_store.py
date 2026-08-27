@@ -1586,6 +1586,11 @@ async def test_identification_activity_snapshot_and_revisioned_controls(
             "last_failure_code = 'PROVIDER_TEMPORARY', updated_at = 12, terminal_at = 12 "
             "WHERE id = 'job-failed'"
         )
+        connection.execute(
+            "UPDATE library_identification_jobs SET "
+            "last_failure_code = 'UNEXPECTED_ERROR', attempt_count = 3, "
+            "updated_at = 11 WHERE id = 'job-waiting'"
+        )
 
     snapshot = await store.get_identification_activity_snapshot(now=12)
     assert snapshot["counts"] == {"failed": 1, "queued": 1}
@@ -1595,6 +1600,18 @@ async def test_identification_activity_snapshot_and_revisioned_controls(
     assert snapshot["foreground_operation_count"] == 0
     assert snapshot["active_priority"] == 100
     assert snapshot["kept_local_count"] == 0
+    assert snapshot["deferred_jobs"] == [
+        {
+            "job_id": "job-waiting",
+            "local_album_id": "album-1",
+            "album_title": "Album 1",
+            "artist_name": "Artist 1",
+            "last_failure_code": "UNEXPECTED_ERROR",
+            "attempt_count": 3,
+            "not_before": 0.0,
+            "updated_at": 11.0,
+        }
+    ]
 
     await store.create_operation_with_work(
         OperationJob(id="foreground-operation", kind="repair", created_at=13),

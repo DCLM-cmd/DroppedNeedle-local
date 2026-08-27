@@ -66,6 +66,17 @@ class ScanRunFailuresResponse(AppStruct):
     next_cursor: int | None = None
 
 
+class DeferredIdentificationJobSummary(AppStruct):
+    job_id: str
+    local_album_id: str | None
+    album_title: str | None
+    artist_name: str | None
+    last_failure_code: str
+    attempt_count: int
+    not_before: float | None
+    updated_at: float
+
+
 class LibraryActivityItem(AppStruct):
     kind: Literal["scan", "identification"]
     state: str
@@ -82,6 +93,9 @@ class LibraryActivityItem(AppStruct):
     failed_count: int = 0
     deferred_count: int = 0
     deferred_reason_counts: dict[str, int] = msgspec.field(default_factory=dict)
+    deferred_jobs: list[DeferredIdentificationJobSummary] = msgspec.field(
+        default_factory=list
+    )
     attention_count: int = 0
     priority_band: str | None = None
     oldest_backlog_at: float | None = None

@@ -1,5 +1,5 @@
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Mapping
 
 import msgspec
 
@@ -226,6 +226,21 @@ class DownloadPolicySettings(AppStruct):
     background_upgrade_scan_interval_hours: int = 12
     background_upgrade_max_per_run: int = 3
 
+    # --- Acquisition-quality preference fields (Acquisition plan, 2026-08-27).
+    # Additive so a pre-feature config keeps decoding (existing install keeps
+    # today's behavior); empty ``quality_preference_order`` derives the legacy
+    # highest-to-lowest order inside [quality_min, quality_max].
+    quality_preference_order: list[str] = msgspec.field(default_factory=list)
+    preferred_lossy_bitrate_kbps: int | None = None
+    lossy_min_bitrate_kbps: int | None = None
+    lossy_max_bitrate_kbps: int | None = None
+    # Within-lossless detail target/caps - canonical tier stays ``lossless``.
+    lossless_preference: str = "highest"  # cd|24_48|24_96|24_192|highest
+    lossless_max_bit_depth: int | None = None
+    lossless_max_sample_rate_hz: int | None = None
+    unknown_quality_behavior: str = "allow_as_fallback"  # reject|review|allow_as_fallback
+    source_selection_mode: str = "source_first"  # source_first|quality_first
+
     def __post_init__(self) -> None:
         _validate_range(
             self.download_stall_timeout_minutes,
@@ -306,7 +321,117 @@ class DownloadPolicySettings(AppStruct):
         if _rank[self.quality_cutoff] > _rank[self.quality_max]:
             self.quality_cutoff = self.quality_max
 
+        # --- Acquisition-quality field normalization (stored-data resilient,
+        # mirrors the legacy tier-key handling above: an invalid STORED value
+        # heals to the existing-install default instead of bricking every
+        # config load). User-submitted policies go through
+        # ``validate_new_quality_fields`` first, which raises instead of
+        # healing - submitted fields are never silently clamped.
+        from services.native.acquisition.quality import derive_default_order
 
+        accepted = derive_default_order(self.quality_min, self.quality_max)
+        order = list(self.quality_preference_order)
+        order_ok = len(order) == len(accepted) and sorted(order) == sorted(accepted)
+        self.quality_preference_order = (
+            order if order_ok else list(accepted)
+        )
+        _lossless_prefs = {"cd", "24_48", "24_96", "24_192", "highest"}
+        if self.lossless_preference not in _lossless_prefs:
+            self.lossless_preference = "highest"
+        _unknown_rules = {"reject", "review", "allow_as_fallback"}
+        if self.unknown_quality_behavior not in _unknown_rules:
+            self.unknown_quality_behavior = "allow_as_fallback"
+        _source_modes = {"source_first", "quality_first"}
+        if self.source_selection_mode not in _source_modes:
+            self.source_selection_mode = "source_first"
+        for name in (
+            "preferred_lossy_bitrate_kbps",
+            "lossy_min_bitrate_kbps",
+            "lossy_max_bitrate_kbps",
+        ):
+            value = getattr(self, name)
+            if value is not None and not (_QUALITY_KBPS_MIN <= value <= _QUALITY_KBPS_MAX):
+                setattr(self, name, None)
+        if (
+            self.lossy_min_bitrate_kbps is not None
+            and self.lossy_max_bitrate_kbps is not None
+            and self.lossy_min_bitrate_kbps > self.lossy_max_bitrate_kbps
+        ):
+            self.lossy_min_bitrate_kbps = None
+            self.lossy_max_bitrate_kbps = None
+        for name, low, high in (
+            ("lossless_max_bit_depth", 1, 64),
+            ("lossless_max_sample_rate_hz", 8000, 768000),
+        ):
+            value = getattr(self, name)
+            if value is not None and not (low <= value <= high):
+                setattr(self, name, None)
+
+_QUALITY_KBPS_MIN = 16
+_QUALITY_KBPS_MAX = 2048
+
+
+def validate_new_quality_fields(payload: Mapping[str, Any]) -> None:
+    """STRICT validation of a user-submitted download-policy BODY (the raw
+    deserialized mapping, BEFORE ``DownloadPolicySettings`` construction -
+    its ``__post_init__`` heals stored-data drift and would erase the evidence).
+    Duplicates, missing accepted tiers, out-of-range endpoints, invalid
+    bounds, impossible target/bound combinations and unknown enum labels
+    raise ValueError; the route maps that to a 400."""
+    from services.native.acquisition.quality import normalize_order
+
+    quality_min = payload.get("quality_min", "mp3_320")
+    quality_max = payload.get("quality_max", "lossless")
+    submitted_order = payload.get("quality_preference_order")
+    if submitted_order:  # [] / missing = derive (same contract as GET→PUT round-trip)
+        normalize_order(list(submitted_order), quality_min, quality_max)
+    _lossless_prefs = {"cd", "24_48", "24_96", "24_192", "highest"}
+    _unknown_rules = {"reject", "review", "allow_as_fallback"}
+    _source_modes = {"source_first", "quality_first"}
+    lossless_preference = payload.get("lossless_preference", "highest")
+    if lossless_preference not in _lossless_prefs:
+        raise ValueError(f"invalid lossless_preference: {lossless_preference!r}")
+    unknown_quality_behavior = payload.get("unknown_quality_behavior", "allow_as_fallback")
+    if unknown_quality_behavior not in _unknown_rules:
+        raise ValueError(
+            f"invalid unknown_quality_behavior: {unknown_quality_behavior!r}"
+        )
+    source_selection_mode = payload.get("source_selection_mode", "source_first")
+    if source_selection_mode not in _source_modes:
+        raise ValueError(f"invalid source_selection_mode: {source_selection_mode!r}")
+    numbers = (
+        ("preferred_lossy_bitrate_kbps", payload.get("preferred_lossy_bitrate_kbps")),
+        ("lossy_min_bitrate_kbps", payload.get("lossy_min_bitrate_kbps")),
+        ("lossy_max_bitrate_kbps", payload.get("lossy_max_bitrate_kbps")),
+    )
+    for name, value in numbers:
+        if value is not None and not (_QUALITY_KBPS_MIN <= value <= _QUALITY_KBPS_MAX):
+            raise ValueError(
+                f"{name} must be between {_QUALITY_KBPS_MIN} and {_QUALITY_KBPS_MAX} kbps"
+            )
+    lossy_min = payload.get("lossy_min_bitrate_kbps")
+    lossy_max = payload.get("lossy_max_bitrate_kbps")
+    if (
+        lossy_min is not None
+        and lossy_max is not None
+        and lossy_min > lossy_max
+    ):
+        raise ValueError("lossy_min_bitrate_kbps exceeds lossy_max_bitrate_kbps")
+    target = payload.get("preferred_lossy_bitrate_kbps")
+    if target is not None:
+        if (lossy_min is not None and target < lossy_min) or (
+            lossy_max is not None and target > lossy_max
+        ):
+            raise ValueError(
+                "preferred_lossy_bitrate_kbps must sit inside "
+                "[lossy_min_bitrate_kbps, lossy_max_bitrate_kbps]"
+            )
+    depth = payload.get("lossless_max_bit_depth")
+    if depth is not None and not 1 <= depth <= 64:
+        raise ValueError("lossless_max_bit_depth must be 1..64 bits")
+    rate = payload.get("lossless_max_sample_rate_hz")
+    if rate is not None and not 8000 <= rate <= 768000:
+        raise ValueError("lossless_max_sample_rate_hz must be 8000..768000 Hz")
 class WantedWatcherSettings(AppStruct):
     """The wanted watcher (Wanted plan §5.4): granular opt-out toggles, no secrets.
     Cadence stays code constants on purpose - fewer knobs."""

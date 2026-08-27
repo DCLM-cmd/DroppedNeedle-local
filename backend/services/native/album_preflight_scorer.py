@@ -27,8 +27,23 @@ from rapidfuzz import fuzz
 from unidecode import unidecode
 
 from infrastructure.persistence.download_store import DownloadStore
+from models.acquisition_quality import (
+    AcquisitionQualitySnapshot,
+    AudioQualityEvidence,
+    CodecFamily,
+    EvidenceCertainty,
+    EvidenceProvenance,
+)
 from models.download import ScoredCandidate, TargetAlbum
 from models.download_identity import soulseek_identity
+from models.acquisition_quality import (
+    AudioQualityEvidence,
+    CodecFamily,
+    EvidenceCertainty,
+    EvidenceProvenance,
+    QualityDecision,
+)
+from services.native.acquisition import quality as acq_quality
 from repositories.protocols.download_client import DownloadSearchResult
 from services.native.acquisition import pipeline
 from services.native.acquisition.context import build_context
@@ -52,6 +67,7 @@ from services.native.quality_tiers import (
     folder_hires_key,
     is_audio,
     is_flac_or_mp3,
+    tier_for,
     tier_rank,
 )
 
@@ -155,7 +171,31 @@ def _availability_key(candidate: ScoredCandidate) -> tuple[int, int, int, int, i
     )
 
 
-def _candidate_rank_key(candidate: ScoredCandidate) -> tuple[int | float, ...]:
+def _file_evidence(file: DownloadSearchResult) -> AudioQualityEvidence:
+    """Per-file source-metadata projection (peer-supplied => ``partial``)."""
+    ext = _effective_extension(file)
+    tier = tier_for(ext, file.bitrate, file.bit_depth)
+    family = (
+        CodecFamily.LOSSLESS
+        if tier == "lossless"
+        else CodecFamily.LOSSY
+    )
+    return AudioQualityEvidence(
+        extension=ext,
+        codec_family=family,
+        bitrate_kbps=file.bitrate,
+        bit_depth=file.bit_depth,
+        sample_rate_hz=file.sample_rate,
+        total_bytes=file.size,
+        audio_file_count=1,
+        mixed_format=False,
+        mixed_quality=False,
+        certainty=EvidenceCertainty.PARTIAL,
+        provenance=EvidenceProvenance.SOURCE_METADATA,
+    )
+
+
+def _legacy_candidate_rank_key(candidate: ScoredCandidate):
     return (
         _ACCEPTANCE_RANK.get(candidate.tier, 0),
         tier_rank(candidate_tier(candidate.files)),
@@ -193,7 +233,7 @@ def rank_stored_candidates(
     projected: list[ScoredCandidate] = []
     for source in source_order:
         projected.extend(
-            sorted(by_source[source], key=_candidate_rank_key, reverse=True)
+            sorted(by_source[source], key=_legacy_candidate_rank_key, reverse=True)
         )
     return projected
 
@@ -285,35 +325,45 @@ def _file_confidence(
 
 
 class AlbumPreflightScorer:
-    def __init__(
-        self,
-        download_store: DownloadStore,
-        *,
-        quality_min: str = DEFAULT_QUALITY_MIN,
-        quality_max: str = DEFAULT_QUALITY_MAX,
-        flac_mp3_only: bool = True,
-        policy: SpecPolicy | None = None,
-    ):
+    """Quality moves EXCLUSIVELY through the per-call ``AcquisitionQualitySnapshot``
+    (spec Snapshot rule). Non-quality spec gates ride ``spec_extras`` supplied
+    fresh by the caller so a stale singleton can never hide them."""
+
+    def __init__(self, download_store: DownloadStore):
         self._store = download_store
-        self._flac_mp3_only = flac_mp3_only
-        # The full spec policy: passed by the composition root (built from
-        # DownloadPolicySettings) or derived from the quality kwargs in tests. The size/
-        # term/age gates default off, so a quality-only construction is behaviour-unchanged.
-        self._policy = policy or SpecPolicy(
-            quality_min=quality_min, quality_max=quality_max
-        )
 
     async def rank(
         self,
         target: TargetAlbum,
         results: list[DownloadSearchResult],
         *,
+        snapshot: AcquisitionQualitySnapshot,
+        spec_extras: "SpecPolicy | None" = None,
         auto_accept_threshold: float = 0.70,
         manual_threshold: float = 0.50,
         held_tier: str | None = None,
     ) -> list[ScoredCandidate]:
         context = await build_context(self._store, held_tier=held_tier)
-        policy = self._policy
+        # Canonical quality endpoints come from the SNAPSHOT; non-quality gates
+        # (max size / terms / retention) arrive via spec_extras, fresh per call.
+        policy = SpecPolicy(
+            quality_min=snapshot.quality_preference_order[-1],
+            quality_max=snapshot.quality_preference_order[0],
+        )
+        if spec_extras is not None:
+            import msgspec as _ms
+
+            policy = _ms.structs.replace(
+                policy,
+                max_size_mb=spec_extras.max_size_mb,
+                ignored_terms=tuple(spec_extras.ignored_terms),
+                required_terms=tuple(spec_extras.required_terms),
+                usenet_retention_days=spec_extras.usenet_retention_days,
+                usenet_min_age_minutes=getattr(
+                    spec_extras, "usenet_min_age_minutes", 0
+                ),
+            )
+        flac_mp3_only = snapshot.flac_mp3_only
         # Soulseek quarantine is file-granular (a peer may have just one bad file): apply
         # it as a pool pre-filter via the shared spec, so a quarantined file is dropped
         # before grouping while the folder's other files survive.
@@ -352,7 +402,7 @@ class AlbumPreflightScorer:
                 continue
             # a folder is rated by its worst audio file (downloaded whole): drop on a
             # disallowed codec before the shared pipeline judges identity + quality range.
-            if self._flac_mp3_only and not all(is_flac_or_mp3(f) for f in audio):
+            if flac_mp3_only and not all(is_flac_or_mp3(f) for f in audio):
                 drop_codec += 1
                 continue
             # Positive artist evidence lets the wrong-album spec judge the album-level
@@ -449,6 +499,13 @@ class AlbumPreflightScorer:
             else:
                 tier = "rejected"
 
+            # Folder-worst evidence from per-file projections; attached so the
+            # orchestrator's stored-snapshot recheck and the review UI reuse the
+            # SAME evaluation instead of re-deriving from raw files.
+            file_evidence = [
+                _file_evidence(f) for f in audio
+            ]
+            folder_decision = acq_quality.evaluate_worst(snapshot, file_evidence)
             scored.append(
                 ScoredCandidate(
                     username=username,
@@ -458,14 +515,48 @@ class AlbumPreflightScorer:
                     file_confidence=avg_confidence,
                     final_score=final,
                     tier=tier,
+                    quality_evidence=folder_decision.evidence,
+                    quality_decision=folder_decision,
                 )
             )
 
-        # Eligibility is absolute: a rejected/manual hi-res folder must never hide a
-        # safe automatic result. Once candidates pass the same safety tier, quality
-        # and resolution are absolute. Complete-folder availability (free slot,
-        # slowest queue, slowest advertised speed, then size) breaks quality ties.
-        scored.sort(key=_candidate_rank_key, reverse=True)
+        # Identity first (unchanged), then the SNAPSHOT'S global preference step,
+        # then same-step refinement: exact beats partial evidence and a candidate
+        # closer to the configured lossy target wins its band. The legacy
+        # availability tuple + final score remain the tail tie-breaks. A legacy
+        # composite key (fidelity-first) survives as _legacy_candidate_rank_key
+        # for the pre-cutover characterization suite.
+        def _rank_key(candidate: ScoredCandidate):
+            step = None
+            dist = None
+            certainty = EvidenceCertainty.PARTIAL
+            if candidate.quality_decision is not None:
+                step = candidate.quality_decision.preference_step
+                certainty = candidate.quality_evidence.certainty
+                if (
+                    snapshot.lossy_target_kbps is not None
+                    and candidate.quality_evidence.codec_family is CodecFamily.LOSSY
+                ):
+                    dist = acq_quality.lossy_target_distance(
+                        snapshot, candidate.quality_evidence
+                    )
+            worst_step = len(snapshot.quality_preference_order) + 2
+            return (
+                # Identity band FIRST (legacy guarantee: a rejected/manual
+                # hi-res folder must never hide a safe automatic result),
+                _ACCEPTANCE_RANK.get(candidate.tier, 0),
+                # Preference STEP, smaller = preferred; encoded NEGATIVE so
+                # reverse=True ranks the smallest step first.
+                -(step if step is not None else worst_step),
+                -acq_quality.CERTAINTY_RANK[certainty],
+                -(dist if dist is not None else -1),
+                # Availability tuple and identity score are already
+                # bigger-is-better for the descending comparison.
+                *_availability_key(candidate),
+                candidate.final_score,
+            )
+
+        scored.sort(key=_rank_key, reverse=True)
         ranked = scored[:50]
         logger.info(
             "preflight.ranked",

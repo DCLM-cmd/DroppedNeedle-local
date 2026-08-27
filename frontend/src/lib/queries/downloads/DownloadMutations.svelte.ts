@@ -5,24 +5,56 @@ import { API } from '$lib/constants';
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
 import { authStore } from '$lib/stores/authStore.svelte';
+import { libraryStore } from '$lib/stores/library';
 import { toastStore } from '$lib/stores/toast';
-import type {
-	CancelDownloadResponse,
-	NextSourceResponse,
-	ReimportDownloadResponse,
-	RequestAccepted,
-	RetryDownloadResponse,
-	TrackRequestResponse
-} from '$lib/types';
+// Request-surface copy lives beside the other acquisition label mappings.
+import { batchRequestCopy, requestStatusCopy } from '$lib/utils/acquisitionLabels';
+import { albumRequestOutcome } from '$lib/utils/requestOutcome';
 
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
 
+// Response mirrors for the consolidated request paths. $lib/types intentionally has
+// no hand-mirror for these shapes yet and this module may not extend it, so they are
+// declared narrowly here instead. `RequestAccepted.task` stays optional: current
+// /requests/new payloads omit it, but a snapshot-carrying backend can fill it.
+interface CancelDownloadResponse {
+	status?: string;
+}
+
+interface NextSourceResponse {
+	started?: boolean;
+}
+
+interface ReimportDownloadResponse {
+	status: string;
+	error_message?: string | null;
+}
+
+interface RequestAccepted {
+	success: boolean;
+	message: string;
+	musicbrainz_id: string;
+	status: string;
+	task?: { quality_snapshot_summary?: string | null } | null;
+}
+
+interface RetryDownloadResponse {
+	started?: boolean;
+}
+
+interface TrackRequestResponse {
+	status: string;
+	task_id?: string | null;
+}
+
 interface AlbumRequestInput {
 	release_group_mbid: string;
-	artist_name: string;
-	album_title: string;
+	artist_name?: string | null;
+	album_title?: string | null;
 	year?: number | null;
 	artist_mbid?: string | null;
+	monitor_artist?: boolean;
+	auto_download_artist?: boolean;
 }
 
 interface TrackRequestInput {
@@ -45,68 +77,149 @@ function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
 }
 
-// UX-2: one toast at click time; the async search outcome surfaces later via the task's live status in /downloads
+// One consolidated request surface means one invalidation pair (Acquisition plan):
+// an accepted/dispatched/duplicate album answer may have created tasks or history
+// rows. DownloadQueryKeyFactory.all already prefixes tasks/activity/held/policy;
+// ['requests'] has no factory yet (the requests page still fetches imperatively),
+// so the literal prefix carries the future convention.
+async function invalidateRequestSurface(): Promise<void> {
+	await Promise.all([
+		invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.all }),
+		invalidateQueriesWithPersister({ queryKey: ['requests'] })
+	]);
+}
+
+// One click, one toast, one cache path (Acquisition "Request surfaces"). The
+// response status is mapped to the spec's four copy lines by albumRequestOutcome;
+// the summary sentence comes from the response when the backend carries one.
 export function requestAlbum() {
 	return createMutation(() => ({
-		mutationFn: (input: AlbumRequestInput) =>
-			api.global.post<RequestAccepted>(API.requests.new(), {
-				musicbrainz_id: input.release_group_mbid,
-				artist: input.artist_name,
-				album: input.album_title,
-				year: input.year ?? null,
-				artist_mbid: input.artist_mbid ?? null
-			}),
-		onSuccess: (data: RequestAccepted) => {
-			if (!data.success) {
-				toastStore.show({
-					message: data.message || 'Request failed',
-					type: 'error'
+		mutationFn: async (input: AlbumRequestInput): Promise<RequestAccepted> => {
+			const initiatingUserId = authStore.user?.id;
+			let data: RequestAccepted;
+			try {
+				data = await api.global.post<RequestAccepted>(API.requests.new(), {
+					musicbrainz_id: input.release_group_mbid,
+					artist: input.artist_name ?? null,
+					album: input.album_title ?? null,
+					year: input.year ?? null,
+					artist_mbid: input.artist_mbid ?? null,
+					...(input.monitor_artist || input.auto_download_artist
+						? {
+								monitor_artist: input.monitor_artist === true,
+								auto_download_artist: input.auto_download_artist === true
+							}
+						: {})
 				});
-			} else {
-				switch (data.status) {
-					case 'pending':
-						toastStore.show({
-							message: 'Request submitted - searching for downloads',
-							type: 'success'
-						});
-						break;
-					case 'awaiting_approval':
-						toastStore.show({
-							message: 'Request submitted for admin approval',
-							type: 'success'
-						});
-						break;
-					case 'queued':
-					case 'downloading':
-						toastStore.show({
-							message: data.message || 'Request already in progress',
-							type: 'info'
-						});
-						break;
-					case 'cancelling':
-						toastStore.show({
-							message: data.message || 'Request is being cancelled',
-							type: 'info'
-						});
-						break;
-					case 'failed':
-						toastStore.show({
-							message: data.message || 'Request failed',
-							type: 'error'
-						});
-						break;
-					case 'imported':
-						toastStore.show({
-							message: data.message || 'Album is already in the library',
-							type: 'info'
-						});
-						break;
-				}
+			} catch (err) {
+				toastStore.show({ message: errorMessage(err, 'Request failed'), type: 'error' });
+				throw err;
 			}
-			void invalidateTasks();
-		},
-		onError: (err: unknown) =>
-			toastStore.show({ message: errorMessage(err, 'Request failed'), type: 'error' })
+			// Session switched while the POST was in flight: touch nothing cached and
+			// report a plain failure so no badge or toast fires for the previous user.
+			if (!initiatingUserId || authStore.user?.id !== initiatingUserId) {
+				return { ...data, success: false };
+			}
+
+			if (data.success) {
+				libraryStore.addRequested(input.release_group_mbid);
+			}
+			void invalidateRequestSurface();
+
+			if (!data.success) {
+				toastStore.show({ message: data.message || 'Request failed', type: 'error' });
+				return data;
+			}
+			if (data.status === 'cancelling') {
+				toastStore.show({
+					message: data.message || 'Request is being cancelled',
+					type: 'info'
+				});
+				return data;
+			}
+			const outcome = albumRequestOutcome(data);
+			const summary = data.task?.quality_snapshot_summary ?? undefined;
+			toastStore.show({
+				message: requestStatusCopy(outcome ?? 'dispatched', summary),
+				type: outcome === 'duplicate_active' || outcome === 'in_library' ? 'info' : 'success'
+			});
+			return data;
+		}
+	}));
+}
+
+export interface BatchAlbumItem {
+	musicbrainz_id: string;
+	artist_name?: string;
+	album_title?: string;
+	year?: number | null;
+	artist_mbid?: string;
+}
+
+export interface BatchRequestResult {
+	success: boolean;
+	requested: number;
+	skipped: number;
+	overflow: number;
+	error?: string;
+}
+
+// constants.ts carries registry rows only; the batch endpoint predates this
+// slice's read-only rule for that file, so its URL stays local to this module.
+const REQUEST_BATCH_URL = '/api/v1/requests/batch';
+
+// Discography/discovery bulk requests. Counts are rendered verbatim by
+// batchRequestCopy - skipped and over-limit albums are never claimed as queued.
+export function requestBatch() {
+	return createMutation(() => ({
+		mutationFn: async (input: {
+			items: BatchAlbumItem[];
+			monitorArtist?: boolean;
+			autoDownloadArtist?: boolean;
+		}): Promise<BatchRequestResult> => {
+			const initiatingUserId = authStore.user?.id;
+			try {
+				const response = await api.global.post<{
+					success: boolean;
+					message: string;
+					requested: number;
+					skipped: number;
+					overflow: number;
+				}>(REQUEST_BATCH_URL, {
+					items: input.items,
+					monitor_artist: input.monitorArtist === true,
+					auto_download_artist: input.autoDownloadArtist === true
+				});
+				if (!initiatingUserId || authStore.user?.id !== initiatingUserId) {
+					return {
+						success: false,
+						requested: response.requested,
+						skipped: response.skipped,
+						overflow: response.overflow
+					};
+				}
+				if (response.success) {
+					for (const item of input.items) {
+						libraryStore.addRequested(item.musicbrainz_id);
+					}
+				}
+				void invalidateRequestSurface();
+				toastStore.show({
+					message: batchRequestCopy(response.requested, response.skipped, response.overflow),
+					type: 'info'
+				});
+				return {
+					success: response.success,
+					requested: response.requested,
+					skipped: response.skipped,
+					overflow: response.overflow
+				};
+			} catch (err) {
+				const detail = err instanceof Error && err.message ? err.message : 'Network error occurred';
+				toastStore.show({ message: detail, type: 'error' });
+				return { success: false, requested: 0, skipped: 0, overflow: 0, error: detail };
+			}
+		}
 	}));
 }
 

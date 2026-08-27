@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { BadgeCheck, Disc3, Download, Files, Library, Signal } from 'lucide-svelte';
 
+	import { BLOCKED_PICK_REASON, candidateQualityLabel } from '$lib/utils/acquisitionLabels';
 	import type { ScoredCandidate } from '$lib/types';
 
 	interface Props {
@@ -70,6 +71,22 @@
 				? 'ring-warning text-warning'
 				: 'ring-base-content/30 text-base-content/50'
 	);
+	type CandidateQualityExtras = {
+		preference_step?: number | null;
+		preference_steps_total?: number | null;
+		certainty?: string | null;
+	};
+
+	const hardBlocked = $derived(candidate.tier === 'rejected');
+	const qualityLabel = $derived.by(() => {
+		if (hardBlocked) return 'Outside policy';
+		const extras = candidate as ScoredCandidate & CandidateQualityExtras;
+		return candidateQualityLabel({
+			preference_step: extras.preference_step,
+			preference_steps_total: extras.preference_steps_total,
+			certainty: extras.certainty
+		});
+	});
 
 	const breakdown = $derived(
 		isUsenet
@@ -106,6 +123,13 @@
 		<p class="truncate font-semibold" title={heading}>{heading}</p>
 		<p class="truncate text-sm text-base-content/60" title={subtitle}>{subtitle}</p>
 		<div class="mt-1.5 flex flex-wrap items-center gap-1.5">
+			<span
+				class="badge badge-sm"
+				class:badge-error={hardBlocked}
+				title={`Quality: ${qualityLabel}`}
+			>
+				{qualityLabel}
+			</span>
 			{#if isUsenet}
 				<span class="badge badge-ghost badge-sm gap-1">
 					<Library class="size-3" aria-hidden="true" />{rel?.indexer_name}
@@ -185,13 +209,20 @@
 		type="button"
 		class="btn btn-primary btn-sm shrink-0"
 		onclick={onPick}
-		disabled={picking || disabled}
+		disabled={hardBlocked || picking || disabled}
+		title={hardBlocked ? BLOCKED_PICK_REASON : undefined}
 		aria-label={isUsenet
-			? `Pick release from ${rel?.indexer_name}`
-			: `Pick candidate from ${candidate.username}`}
+			? `Pick candidate from ${rel?.indexer_name}${hardBlocked ? ` - ${BLOCKED_PICK_REASON}` : ''}`
+			: `Pick candidate from ${candidate.username}${hardBlocked ? ` - ${BLOCKED_PICK_REASON}` : ''}`}
 	>
 		{#if picking}<span class="loading loading-spinner loading-xs"></span>{/if}
-		Pick
+		{#if hardBlocked}
+			Unavailable
+		{:else if candidate.tier === 'auto'}
+			Pick
+		{:else}
+			Pick anyway
+		{/if}
 	</button>
 </div>
 

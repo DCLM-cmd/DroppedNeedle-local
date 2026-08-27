@@ -23,7 +23,7 @@
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { integrationStore } from '$lib/stores/integration';
 	import { libraryStore } from '$lib/stores/library';
-	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import HeroBackdrop from '$lib/components/HeroBackdrop.svelte';
 	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
@@ -159,16 +159,21 @@
 		if (!current || requesting) return;
 		requesting = true;
 		try {
-			const result = await requestAlbum(current.release_group_mbid, {
-				artist: current.artist_name,
-				album: current.album_name,
-				artistMbid: current.artist_mbid || undefined
-			});
-			if (result.success) deck.markCurrentRequested();
+			const result = await deckRequest
+				.mutateAsync({
+					release_group_mbid: current.release_group_mbid,
+					artist_name: current.artist_name,
+					album_title: current.album_name,
+					artist_mbid: current.artist_mbid || undefined
+				})
+				.catch(() => null);
+			if (result?.success) deck.markCurrentRequested();
 		} finally {
 			requesting = false;
 		}
 	}
+
+	const deckRequest = requestAlbum();
 
 	function handleAdvance() {
 		deckSampler.stop();

@@ -167,7 +167,16 @@ class DownloadTaskResponse(AppStruct):
     retry_ladder_minutes: list[int] = []
     acquisition_cleanup_state: str = "not_tracked"
     quality_format: str | None = None
+    quality_bitrate: int | None = None
     quality_bit_depth: int | None = None
+    # Acquisition-quality projection (Acquisition plan): the snapshot contract,
+    # stable step, evidence labels and manual-override marker for queue/review UI.
+    quality_snapshot_summary: str | None = None
+    quality_snapshot_hash: str | None = None
+    quality_preference_step: int | None = None
+    quality_certainty: str | None = None
+    quality_provenance: str | None = None
+    manual_quality_override: bool = False
     quality_sample_rate: int | None = None
     advertised_queue_depth: int | None = None
     queue_position_start: int | None = None
@@ -179,6 +188,42 @@ class DownloadTaskResponse(AppStruct):
     has_next_source: bool = False
     held_for_review: bool = False
 
+
+class PolicySummaryResponse(AppStruct):
+    """Safe, signed-in-user projection of the acquisition policy (spec):
+    quality summary sentence + source-mode label only - no admin internals."""
+
+    summary: str
+    source_mode: str
+    legacy_rollback_compatible: bool
+
+
+class PolicyImpactResponse(AppStruct):
+    """Admin preview of an UNSAVED policy against persisted state (spec).
+    ``legacy_representable`` reports whether a down-level image would preserve
+    acquisition behaviour."""
+
+    manual_search_jobs: int = 0
+    queued_without_attempts: int = 0
+    awaiting_review: int = 0
+    remote_queued_zero_byte: int = 0
+    transferring_immutable: int = 0
+    held_reviews: int = 0
+    legacy_representable: bool = True
+
+
+
+class RestartWithPolicyRequest(AppStruct):
+    """Guard against acting on a stale view: the caller echoes the stored
+    hash it saw; a mismatch aborts the atomic restart."""
+
+    expected_snapshot_hash: str | None = None
+
+
+class RestartWithPolicyResponse(AppStruct):
+    accepted: bool
+    snapshot_summary: str | None = None
+    message: str | None = None
 
 class HeldImportResponse(AppStruct):
     """A downloaded track held for an "import anyway" review: the audio matched the track by

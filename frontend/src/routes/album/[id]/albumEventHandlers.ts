@@ -2,7 +2,7 @@ import { goto } from '$app/navigation';
 import { artistHref } from '$lib/utils/entityRoutes';
 import type { AlbumBasicInfo, YouTubeTrackLink, YouTubeLink, YouTubeQuotaStatus } from '$lib/types';
 import { compareDiscTrack, getDiscTrackKey } from '$lib/player/queueHelpers';
-import { requestAlbum } from '$lib/utils/albumRequest';
+import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 
 export interface EventHandlerDeps {
 	getAlbum: () => AlbumBasicInfo | null;
@@ -22,6 +22,10 @@ export interface EventHandlerDeps {
 }
 
 export function createEventHandlers(deps: EventHandlerDeps) {
+	// createEventHandlers runs inside the album page's component initialization, so
+	// the TanStack mutation hook resolves its QueryClient context here.
+	const pageRequest = requestAlbum();
+
 	function handleTrackGenerated(link: YouTubeTrackLink): void {
 		const linkKey = getDiscTrackKey(link);
 		deps.setTrackLinks(
@@ -48,14 +52,17 @@ export function createEventHandlers(deps: EventHandlerDeps) {
 		if (!album || deps.getRequesting()) return;
 		deps.setRequesting(true);
 		try {
-			const result = await requestAlbum(album.musicbrainz_id, {
-				artist: album.artist_name ?? undefined,
-				album: album.title,
-				year: album.year ?? undefined,
-				artistMbid: album.artist_id
-			});
+			const result = await pageRequest
+				.mutateAsync({
+					release_group_mbid: album.musicbrainz_id,
+					artist_name: album.artist_name ?? undefined,
+					album_title: album.title,
+					year: album.year ?? undefined,
+					artist_mbid: album.artist_id
+				})
+				.catch(() => null);
 			const current = deps.getAlbum();
-			if (result.success && current) {
+			if (result?.success && current) {
 				current.requested = true;
 				deps.setAlbum(current);
 				deps.albumBasicCacheSet(current, deps.getAlbumId());

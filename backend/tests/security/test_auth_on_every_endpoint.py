@@ -408,6 +408,8 @@ _ADMIN_ENDPOINTS = [
     # Wanted watcher settings (admin, download-clients router)
     ("GET", "/api/v1/download-clients/wanted", None),
     ("PUT", "/api/v1/download-clients/wanted", {}),
+    # Acquisition-quality policy routes (Acquisition plan) - admin preview
+    ("POST", "/api/v1/download-clients/policy/impact", {}),
     # Free Music settings (admin, settings router)
     ("GET", "/api/v1/settings/free-music", None),
     (
@@ -851,6 +853,12 @@ _USER_ENDPOINTS = [
     ),
     ("GET", "/api/v1/download-client/status", None),
     ("GET", "/api/v1/downloads", None),
+    # Acquisition-quality user surfaces (Acquisition plan): safe summary for any
+    # signed-in user; owner-or-admin restart (non-owner gets 404/403, never 500).
+    ("GET", "/api/v1/download-clients/policy-summary", None),
+    ("POST",
+     "/api/v1/downloads/task-1/restart-with-current-policy",
+     {"expected_snapshot_hash": None}),
     ("GET", "/api/v1/downloads/activity-summary", None),
     ("GET", "/api/v1/downloads/task-1/files", None),
     ("POST", "/api/v1/downloads/task-1/cancel", None),

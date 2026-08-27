@@ -163,3 +163,40 @@ def test_test_sabnzbd_reports_version_and_categories(monkeypatch):
     assert body["version"] == "5.0.4"
     assert "audio" in body["categories"]
     assert body["complete_dir"] == "/data/Downloads/complete"
+
+
+# --- Acquisition-quality policy routes
+
+
+def test_policy_impact_maps_invalid_submission_to_domain_error():
+    """Malformed order submissions must become the domain ValidationError
+    (handled as 400), never an unhandled ValueError (500)."""
+    from types import SimpleNamespace
+
+    from api.v1.routes.download_clients import preview_policy_impact
+    from core.exceptions import ValidationError
+
+    _ = None  # CurrentAdminDep value is unused inside the route body
+
+    class _Prefs:
+        @staticmethod
+        def get_download_policy():
+            raise AssertionError("stored policy must not be read for invalid input")
+
+    import anyio
+
+    async def run():
+        await preview_policy_impact(
+            _,  # noqa: ARG001 - the dependency value is unused in the route body
+            preferences=_Prefs(),
+            payload={"quality_preference_order": ["lossless"]},
+        )
+
+    try:
+        anyio.run(run)
+    except ValidationError:
+        return
+    except ValueError as exc:  # pragma: no cover - regression signal
+        raise AssertionError(f"unmapped ValueError leaked to routing: {exc}")
+    raise AssertionError("expected ValidationError")
+

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
 
@@ -23,14 +23,25 @@ const { mockInvalidate } = vi.hoisted(() => ({ mockInvalidate: vi.fn() }));
 vi.mock('$lib/queries/QueryClient', () => ({
 	invalidateQueriesWithPersister: (...args: unknown[]) => mockInvalidate(...args)
 }));
-
+const authStoreUser = vi.hoisted(() => ({ current: { id: 'user-1' } }));
 vi.mock('$lib/stores/authStore.svelte', () => ({
-	authStore: { user: { id: 'user-1' } }
+	authStore: {
+		get user() {
+			return authStoreUser.current;
+		}
+	}
 }));
 
-const { mockToast } = vi.hoisted(() => ({ mockToast: vi.fn() }));
+const { mockToast, mockAddRequested } = vi.hoisted(() => ({
+	mockToast: vi.fn(),
+	mockAddRequested: vi.fn()
+}));
 vi.mock('$lib/stores/toast', () => ({
 	toastStore: { show: (...args: unknown[]) => mockToast(...args) }
+}));
+
+vi.mock('$lib/stores/library', () => ({
+	libraryStore: { addRequested: (...args: unknown[]) => mockAddRequested(...args) }
 }));
 
 import {
@@ -40,15 +51,32 @@ import {
 import {
 	cancelDownload,
 	requestAlbum,
+	requestBatch,
 	requestTrack,
 	retryHeldManagementUnit,
 	retryDownload,
 	tryNextSource
 } from './DownloadMutations.svelte';
-
 describe('download queue queries', () => {
+	// Promise.withResolvers needs Node 22+; this repo runs Node 20. The deferred
+	// below keeps the same linear hand-off for the session-switch tests.
+	function deferred<T>() {
+		let resolve!: (value: T) => void;
+		const promise = new Promise<T>((settle) => {
+			resolve = settle;
+		});
+		return { promise, resolve };
+	}
+
+	beforeEach(() => {
+		authStoreUser.current.id = 'user-1';
+		mockToast.mockClear();
+		mockAddRequested.mockClear();
+	});
+
 	it('the downloads list query hits /api/v1/downloads', async () => {
 		const opts = getDownloadsQueryOptions() as { queryFn: (a: unknown) => unknown };
+
 		await opts.queryFn({ signal: undefined });
 		expect(String(mockGet.mock.calls.at(-1)?.[0])).toContain('/api/v1/downloads');
 	});
@@ -93,7 +121,13 @@ describe('download queue queries', () => {
 	});
 
 	it('requestAlbum posts to /requests/new with the mapped body', async () => {
-		const m = requestAlbum() as unknown as { mutationFn: (i: unknown) => unknown };
+		mockPost.mockResolvedValueOnce({
+			success: true,
+			message: 'Request accepted',
+			musicbrainz_id: 'rg',
+			status: 'pending'
+		});
+		const m = requestAlbum() as unknown as { mutationFn: (i: unknown) => Promise<unknown> };
 		await m.mutationFn({
 			release_group_mbid: 'rg',
 			artist_name: 'A',
@@ -186,82 +220,179 @@ describe('download queue queries', () => {
 	it.each([
 		{
 			status: 'pending',
-			success: true,
-			message: '',
-			expectedMessage: 'Request submitted - searching for downloads',
+			message: 'Request accepted',
+			expectedMessage: 'Requested - searching now.',
 			type: 'success'
 		},
 		{
 			status: 'awaiting_approval',
-			success: true,
-			message: '',
-			expectedMessage: 'Request submitted for admin approval',
+			message: 'Request submitted, awaiting admin approval',
+			expectedMessage:
+				'Submitted for approval. The current server policy will apply when approved.',
 			type: 'success'
 		},
 		{
 			status: 'queued',
-			success: true,
 			message: 'Request already in progress',
-			expectedMessage: 'Request already in progress',
+			expectedMessage: 'Already being acquired.',
 			type: 'info'
 		},
 		{
 			status: 'downloading',
-			success: true,
 			message: 'Request already in progress',
-			expectedMessage: 'Request already in progress',
+			expectedMessage: 'Already being acquired.',
+			type: 'info'
+		},
+		{
+			status: 'pending',
+			message: 'Album is already in the library',
+			expectedMessage: 'Album is already in the library',
 			type: 'info'
 		},
 		{
 			status: 'cancelling',
-			success: true,
 			message: 'Request is being cancelled',
 			expectedMessage: 'Request is being cancelled',
 			type: 'info'
-		},
-		{
-			status: 'failed',
-			success: true,
-			message: 'Request could not be recorded',
-			expectedMessage: 'Request could not be recorded',
-			type: 'error'
-		},
-		{
-			status: 'imported',
-			success: true,
-			message: 'Album is already in the library',
-			expectedMessage: 'Album is already in the library',
-			type: 'info'
 		}
-	] as const)('requestAlbum shows the correct toast for $status', (response) => {
+	] as const)('requestAlbum shows the spec copy for $status responses', async (response) => {
 		mockToast.mockClear();
-		const m = requestAlbum() as unknown as { onSuccess: (d: unknown) => unknown };
-		m.onSuccess({
-			success: response.success,
+		mockPost.mockResolvedValueOnce({
+			success: true,
 			message: response.message,
 			musicbrainz_id: 'rg',
 			status: response.status
 		});
-		expect(mockToast).toHaveBeenCalledWith({
+		const m = requestAlbum() as unknown as { mutationFn: (i: unknown) => Promise<unknown> };
+
+		await m.mutationFn({ release_group_mbid: 'rg' });
+
+		expect(mockAddRequested).toHaveBeenCalledWith('rg');
+		expect(mockInvalidate).toHaveBeenCalledWith({ queryKey: ['downloads'] });
+		expect(mockInvalidate).toHaveBeenCalledWith({ queryKey: ['requests'] });
+		expect(mockToast).toHaveBeenLastCalledWith({
 			message: response.expectedMessage,
 			type: response.type
 		});
 	});
 
-	it('requestAlbum reports an unsuccessful response before handling its status', () => {
+	it('requestAlbum names the snapshot summary in dispatched and duplicate copy when carried', async () => {
+		for (const [status, expected] of [
+			['pending', 'Requested - searching now using Balanced.'],
+			['queued', 'Already being acquired using Balanced.']
+		] as const) {
+			mockToast.mockClear();
+			mockPost.mockResolvedValueOnce({
+				success: true,
+				message: status === 'pending' ? 'Request accepted' : 'Request already in progress',
+				musicbrainz_id: 'rg',
+				status,
+				task: { quality_snapshot_summary: 'Balanced' }
+			});
+			const m = requestAlbum() as unknown as { mutationFn: (i: unknown) => Promise<unknown> };
+			await m.mutationFn({ release_group_mbid: 'rg' });
+			expect(mockToast).toHaveBeenCalledWith({
+				message: expected,
+				type: status === 'pending' ? 'success' : 'info'
+			});
+		}
+	});
+
+	it('requestAlbum reports an unsuccessful response without touching badges', async () => {
 		mockToast.mockClear();
-		const m = requestAlbum() as unknown as { onSuccess: (d: unknown) => unknown };
-		m.onSuccess({
+		mockPost.mockResolvedValueOnce({
 			success: false,
 			message: 'Request could not be recorded',
 			musicbrainz_id: 'rg',
-			status: 'pending'
+			status: 'failed'
 		});
-		expect(mockToast).toHaveBeenCalledWith({
+		const m = requestAlbum() as unknown as { mutationFn: (i: unknown) => Promise<unknown> };
+
+		const result = await m.mutationFn({ release_group_mbid: 'rg' });
+
+		expect(result).toMatchObject({ success: false });
+		expect(mockAddRequested).not.toHaveBeenCalled();
+		expect(mockToast).toHaveBeenLastCalledWith({
 			message: 'Request could not be recorded',
 			type: 'error'
 		});
 	});
+
+	it('drops single-album badge writes when the account changes before the response', async () => {
+		const { promise, resolve } = deferred<{
+			success: boolean;
+			message: string;
+			musicbrainz_id: string;
+			status: string;
+		}>();
+		mockPost.mockReturnValueOnce(promise);
+		const m = requestAlbum() as unknown as {
+			mutationFn: (i: unknown) => Promise<{ success: boolean }>;
+		};
+
+		const pending = m.mutationFn({ release_group_mbid: 'release-a' });
+		authStoreUser.current.id = 'user-b';
+		resolve({ success: true, message: '', musicbrainz_id: 'release-a', status: 'pending' });
+
+		const result = await pending;
+		expect(result.success).toBe(false);
+		expect(mockAddRequested).not.toHaveBeenCalled();
+		expect(mockToast).not.toHaveBeenCalled();
+	});
+
+	it('requestBatch posts the mapped payload and renders counts verbatim', async () => {
+		mockPost.mockResolvedValueOnce({
+			success: true,
+			message: '',
+			requested: 3,
+			skipped: 1,
+			overflow: 2
+		});
+		const m = requestBatch() as unknown as { mutationFn: (i: unknown) => Promise<unknown> };
+
+		const result = await m.mutationFn({
+			items: [{ musicbrainz_id: 'rg-1' }, { musicbrainz_id: 'rg-2' }],
+			monitorArtist: true,
+			autoDownloadArtist: false
+		});
+
+		const call = mockPost.mock.calls.at(-1);
+		expect(String(call?.[0])).toBe('/api/v1/requests/batch');
+		expect(call?.[1]).toEqual({
+			items: [{ musicbrainz_id: 'rg-1' }, { musicbrainz_id: 'rg-2' }],
+			monitor_artist: true,
+			auto_download_artist: false
+		});
+		expect(result).toMatchObject({ success: true, requested: 3, skipped: 1, overflow: 2 });
+		expect(mockToast).toHaveBeenLastCalledWith({
+			message: '3 requested, 1 skipped, 2 were over the batch request limit',
+			type: 'info'
+		});
+	});
+
+	it('drops batch badge writes when the account changes before the response', async () => {
+		const { promise, resolve } = deferred<{
+			success: boolean;
+			message: string;
+			requested: number;
+			skipped: number;
+			overflow: number;
+		}>();
+		mockPost.mockReturnValueOnce(promise);
+		const m = requestBatch() as unknown as {
+			mutationFn: (i: unknown) => Promise<{ success: boolean; requested: number }>;
+		};
+
+		const pending = m.mutationFn({ items: [{ musicbrainz_id: 'release-a' }] });
+		authStoreUser.current.id = 'user-b';
+		resolve({ success: true, message: 'ok', requested: 1, skipped: 0, overflow: 0 });
+
+		const result = await pending;
+		expect(result).toMatchObject({ success: false, requested: 1 });
+		expect(mockAddRequested).not.toHaveBeenCalled();
+		expect(mockToast).not.toHaveBeenCalled();
+	});
+
 	it.each([
 		['already_in_library', 'That track is already in your library'],
 		['awaiting_approval', 'Track request submitted for admin approval'],

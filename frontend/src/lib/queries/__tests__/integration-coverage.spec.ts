@@ -36,6 +36,19 @@ const COVERAGE: Array<[string, string, string]> = [
 	['download next source', API.downloads.nextSource('T1'), '/api/v1/downloads/T1/next-source'],
 	['download retry', API.downloads.retry('T1'), '/api/v1/downloads/T1/retry'],
 	['download reimport', API.downloads.reimport('T1'), '/api/v1/downloads/T1/reimport'],
+	['download restart with policy', API.downloads.restartWithPolicy('T1'), '/api/v1/downloads/T1/restart-with-current-policy'],
+	// download-clients policy (Acquisition plan)
+	[
+		'download-client policy summary',
+		API.downloadClients.policySummary(),
+		'/api/v1/download-clients/policy-summary'
+	],
+	[
+		'download-client policy impact',
+		API.downloadClients.policyImpact(),
+		'/api/v1/download-clients/policy/impact'
+	],
+
 	[
 		'management hold retry',
 		API.downloads.heldManagementRetry('T1'),

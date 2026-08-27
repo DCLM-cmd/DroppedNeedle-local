@@ -6,6 +6,7 @@ service/persistence-layer domain types.
 """
 
 from infrastructure.msgspec_fastapi import AppStruct
+from models.acquisition_quality import AudioQualityEvidence, QualityDecision
 from repositories.protocols.download_client import DownloadSearchResult
 from repositories.protocols.indexer import UsenetRelease
 
@@ -38,6 +39,11 @@ class ScoredCandidate(AppStruct):
     # Response-only pointer into the persisted candidate list. It lets a current-policy
     # review projection reorder/filter older blobs without changing what a Pick indexes.
     candidate_index: int | None = None
+    # Nested acquisition-quality evaluation (Acquisition plan). Optional +
+    # defaulted so pre-feature blobs decode unchanged; new blobs carry the
+    # per-candidate evidence/decision used by review and restart flows.
+    quality_evidence: AudioQualityEvidence | None = None
+    quality_decision: QualityDecision | None = None
 
 
 class DownloadsMountStatus(AppStruct):
@@ -78,6 +84,9 @@ class TargetTrack(AppStruct):
     release_group_mbid: str | None = None
 
 
+
+
+
 class SearchJob(AppStruct):
     """A search job row (``search_jobs``). Candidates are stored separately in
     the ``candidates_blob`` column and exposed via the store's
@@ -97,6 +106,11 @@ class SearchJob(AppStruct):
     created_at: float = 0.0
     completed_at: float | None = None
     updated_at: float = 0.0
+    # Immutable acquisition-quality snapshot pinned at creation for manual and
+    # task-linked searches; old rows decode as None.
+    quality_snapshot_json: str | None = None
+    quality_snapshot_hash: str | None = None
+    quality_snapshot_summary: str | None = None
 
 
 class DownloadActivitySummary(AppStruct):
@@ -172,6 +186,18 @@ class DownloadTask(AppStruct):
     attempt_number: int = 0
     attempt_total: int = 0
     has_next_source: bool = False
+    # Immutable acquisition-quality snapshot pinned at task creation (the
+    # policy that governs search/score/failover for THIS row; later settings
+    # saves never mutate it - restart-with-current-policy is the refresh).
+    quality_snapshot_json: str | None = None
+    quality_snapshot_hash: str | None = None
+    quality_snapshot_summary: str | None = None
+    # Stable step index within the snapshot order (None = unknown/legacy row).
+    quality_preference_step: int | None = None
+    # Evidence labels for the selected candidate (probed or source-reported).
+    quality_certainty: str | None = None
+    quality_provenance: str | None = None
+    manual_quality_override: bool = False
     staging_path: str | None = None
     final_path: str | None = None
     error_message: str | None = None

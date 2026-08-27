@@ -127,6 +127,8 @@ NPM    ?= pnpm
 	frontend-format-check frontend-check frontend-lint frontend-test frontend-test-server \
 	frontend-test-client frontend-test-connections \
 	frontend-test-album-page \
+	backend-test-acquisition-quality \
+	frontend-test-acquisition-quality \
 	frontend-test-audiodb-images \
 	frontend-test-auth \
 	frontend-test-auth-username \
@@ -494,6 +496,7 @@ test-library-management-profile-sharing: $(BACKEND_VENV_STAMP) ## Run portable L
 	$(PYTEST) \
 		tests/services/native/test_library_management_profile_sharing.py \
 		tests/routes/test_library_management_routes.py \
+		tests/services/test_acquisition_dispatch_matrix.py \
 		tests/security/test_auth_on_every_endpoint.py
 	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project server \
 		src/lib/queries/library-management/LibraryManagementMutations.spec.ts \
@@ -876,6 +879,22 @@ frontend-lint: ## Run frontend linting
 
 frontend-test: ## Run the frontend vitest suite (all projects, needs Playwright)
 	cd "$(FRONTEND_DIR)" && $(NPM) run test
+
+.PHONY: backend-test-acquisition-quality
+backend-test-acquisition-quality: ## Focused acquisition-quality backend suites (classifier, pins, persistence, routes)
+	cd $(BACKEND_DIR) && .venv/bin/python -m pytest \
+		tests/services/test_acquisition_quality_classifier.py \
+		tests/services/test_acq_characterization_ranking.py \
+		tests/services/test_acq_characterization_autopick.py \
+		tests/services/test_free_music_service.py \
+		tests/services/test_download_orchestrator.py \
+		tests/infrastructure/test_acquisition_snapshot_persistence.py \
+		tests/security/test_auth_on_every_endpoint.py
+
+.PHONY: frontend-test-acquisition-quality
+frontend-test-acquisition-quality: ## Focused acquisition-quality frontend specs (server + chromium client)
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project server src/lib/queries/downloads src/lib/utils --passWithNoTests
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/settings src/lib/components/downloads --passWithNoTests
 
 frontend-test-server: ## Run frontend server-project tests only (no Playwright)
 	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project server

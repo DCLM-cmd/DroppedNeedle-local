@@ -58,6 +58,12 @@ def _log_worker_error(task: asyncio.Task[None], *, name: str) -> None:
         )
 
 
+def _job_log_context(job: dict | None) -> str:
+    if job is None:
+        return ""
+    return f" [job={job.get('id')} album={job.get('local_album_id')}]"
+
+
 async def run_target_identification_worker(
     queue_getter: Callable[[], IdentificationQueueService],
     service_getter: Callable[[], AlbumIdentificationService],
@@ -94,7 +100,10 @@ async def run_target_identification_worker(
                         await service_getter().run_claimed_job(job, owner)
                         processed = True
         except CircuitOpenError as exc:
-            logger.exception("Target identification worker iteration failed")
+            logger.exception(
+                "Target identification worker iteration failed%s",
+                _job_log_context(job),
+            )
             retry_after = getattr(exc, "retry_after_seconds", None)
             try:
                 candidate = float(retry_after) if retry_after is not None else 0.0
@@ -113,7 +122,12 @@ async def run_target_identification_worker(
                             retry_after_for_defer = ra
                     except (TypeError, ValueError):
                         retry_after_for_defer = None
-                    await queue.defer(job, owner, "UNEXPECTED_ERROR", retry_after_seconds=retry_after_for_defer)
+                    await queue.defer(
+                        job,
+                        owner,
+                        "PROVIDER_TEMPORARILY_UNAVAILABLE",
+                        retry_after_seconds=retry_after_for_defer,
+                    )
                 except Exception:  # noqa: BLE001 - a crashed job must not kill the worker
                     logger.exception("Failed to defer crashed identification job")
         except StaleRevisionError as exc:
@@ -121,8 +135,8 @@ async def run_target_identification_worker(
             # the revision checks exist for - defer under its own code instead
             # of burning the crash budget as UNEXPECTED_ERROR.
             logger.warning(
-                "Target identification job %s hit stale input: %s",
-                str(job["id"]) if job else "<unknown>",
+                "Target identification job hit stale input%s: %s",
+                _job_log_context(job),
                 exc,
             )
             if job is not None:
@@ -132,7 +146,10 @@ async def run_target_identification_worker(
                     logger.exception("Failed to defer stale identification job")
             wait_seconds = ERROR_RETRY_INTERVAL_SECONDS
         except Exception:  # noqa: BLE001 - a durable worker must survive one failed item
-            logger.exception("Target identification worker iteration failed")
+            logger.exception(
+                "Target identification worker iteration failed%s",
+                _job_log_context(job),
+            )
             if job is not None:
                 try:
                     await queue.defer(job, owner, "UNEXPECTED_ERROR")

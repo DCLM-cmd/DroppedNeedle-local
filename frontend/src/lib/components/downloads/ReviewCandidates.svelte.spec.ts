@@ -115,4 +115,24 @@ describe('ReviewCandidates.svelte', () => {
 		await expect.element(page.getByText('On the watchlist')).toBeVisible();
 		await expect.element(page.getByText('Cancel request')).toBeDisabled();
 	});
+
+	it('keeps outside-policy importable cards visible via Show all with Quality chips', async () => {
+		h.candidates = [
+			candidate('solid-pick', 'auto', 0.81),
+			candidate('policy-reject', 'rejected', 0.32)
+		];
+		renderReview(makeTask());
+
+		await expect.element(page.getByText('Within policy', { exact: true })).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Pick candidate from solid-pick' }))
+			.toBeVisible();
+
+		await page.getByText('Show all 2 candidates').click();
+		await expect.element(page.getByText('policy-reject')).toBeVisible();
+		const blocked = page.getByRole('button', {
+			name: /Blocked: outside the accepted quality policy/
+		});
+		await expect.element(blocked).toBeDisabled();
+	});
 });

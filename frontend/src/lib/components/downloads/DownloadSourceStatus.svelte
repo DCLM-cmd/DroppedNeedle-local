@@ -1,6 +1,14 @@
 <script lang="ts">
 	import { Clock3, ListOrdered, SkipForward } from 'lucide-svelte';
 
+	import {
+		NO_FALLBACK_COPY,
+		fallbackCopy,
+		labelForQualityStep,
+		nextPreferenceLabel
+	} from '$lib/utils/acquisitionLabels';
+	import { withBasePath } from '$lib/utils/basePath';
+
 	import { tryNextSource } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import type { DownloadSourceUpdate, DownloadTask } from '$lib/types';
 
@@ -25,7 +33,12 @@
 
 	const candidateIndex = $derived(live ? live.candidate_index : task.candidate_index);
 	const source = $derived(live?.source ?? task.source);
-	const qualityFormat = $derived(live ? live.quality_format : task.quality_format);
+	const qualityFormat = $derived(
+		live
+			? ((live as unknown as { quality_format?: string | null }).quality_format ??
+					task.quality_format)
+			: task.quality_format
+	);
 	const qualityBitDepth = $derived(live ? live.quality_bit_depth : task.quality_bit_depth);
 	const qualitySampleRate = $derived(live ? live.quality_sample_rate : task.quality_sample_rate);
 	const advertisedQueueDepth = $derived(
@@ -77,6 +90,45 @@
 		fallbackAt == null ? null : Math.max(0, Math.ceil((fallbackAt * 1000 - now) / 60_000))
 	);
 
+	const nextPreferenceName = $derived(
+		nextPreferenceLabel({
+			format: qualityFormat,
+			bitrate: task.quality_bitrate,
+			bit_depth: qualityBitDepth,
+			sample_rate: qualitySampleRate
+		})
+	);
+	// Replacement for the old hard-coded "Lower-quality fallback in Nm" line; when a
+	// deadline never starts and no further source exists we explicitly say so.
+	const fallbackLine = $derived.by(() => {
+		if (!isQueued) return null;
+		if (fallbackMinutes !== null) return fallbackCopy(nextPreferenceName, fallbackMinutes);
+		return hasNext ? null : NO_FALLBACK_COPY;
+	});
+	const awaitingReview = $derived(
+		task.status === 'queued' &&
+			Boolean(task.search_job_id) &&
+			task.candidate_index === null &&
+			!task.held_for_review
+	);
+	const evidenceChips = $derived.by(() => {
+		const chips: string[] = [];
+		if (task.quality_bitrate) chips.push(`${task.quality_bitrate} kbps`);
+		if (typeof task.quality_preference_step === 'number') {
+			chips.push(labelForQualityStep(task.quality_preference_step, null));
+		}
+		if (task.quality_certainty) {
+			chips.push(
+				`Certainty: ${task.quality_certainty[0].toUpperCase()}${task.quality_certainty.slice(1)}`
+			);
+		}
+		if (task.quality_provenance) {
+			chips.push(`Provenance: ${task.quality_provenance.replaceAll('_', ' ')}`);
+		}
+		if (task.manual_quality_override) chips.push('Manual pick');
+		return chips;
+	});
+
 	$effect(() => {
 		if (fallbackAt == null) return;
 		const timer = window.setInterval(() => (now = Date.now()), 30_000);
@@ -110,6 +162,21 @@
 	});
 </script>
 
+<!-- Awaiting review is a display-only derivation: queued + search job + no picked
+		candidate means only unknown-resolution copies were found (Acquisition plan). -->
+{#if awaitingReview}
+	<div
+		class="mt-2 rounded-box border border-base-content/15 bg-base-200 px-3 py-2 text-xs"
+		role="status"
+	>
+		<p class="font-semibold text-warning">
+			Waiting: only unknown-resolution copies were found - review required
+		</p>
+		<a href={withBasePath('/downloads')} class="link link-hover font-semibold text-primary">
+			Review candidates
+		</a>
+	</div>
+{/if}
 {#if source === 'soulseek' && task.status === 'downloading' && !task.held_for_review}
 	<div
 		class:source-telemetry-compact={compact}
@@ -136,9 +203,18 @@
 			{#if isQueued && livePosition}
 				<span>Live position {livePosition}</span>
 			{/if}
-			{#if isQueued && fallbackMinutes !== null}
+			{#if isQueued && fallbackLine}
 				<span class="text-warning">
-					<Clock3 class="size-3" aria-hidden="true" /> Lower-quality fallback in {fallbackMinutes}m
+					<Clock3 class="size-3" aria-hidden="true" />
+					{fallbackLine}
+				</span>
+			{/if}
+			{#each evidenceChips as chip (chip)}
+				<span class="badge badge-ghost badge-sm">{chip}</span>
+			{/each}
+			{#if task.quality_snapshot_summary}
+				<span class="max-w-full truncate" title={task.quality_snapshot_summary}>
+					{task.quality_snapshot_summary}
 				</span>
 			{/if}
 		</div>

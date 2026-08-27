@@ -14,7 +14,7 @@
 	import LibraryAlbumsCarousel from '$lib/components/LibraryAlbumsCarousel.svelte';
 	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
 	import PageSectionToc from '$lib/components/PageSectionToc.svelte';
-	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import { libraryStore } from '$lib/stores/library';
 	import { type MusicSource, isMusicSource } from '$lib/stores/musicSource';
@@ -143,17 +143,22 @@
 		invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.basic(data.artistId) });
 	}
 
+	const providerReleaseRequest = requestAlbum();
+
 	async function handleRequest(releaseId: string, releaseTitle?: string) {
 		requestedReleaseIds.add(releaseId);
 		requestedReleaseIds = requestedReleaseIds;
 
 		try {
-			const result = await requestAlbum(releaseId, {
-				artist: artist?.name,
-				album: releaseTitle
-			});
+			const result = await providerReleaseRequest
+				.mutateAsync({
+					release_group_mbid: releaseId,
+					artist_name: artist?.name,
+					album_title: releaseTitle
+				})
+				.catch(() => null);
 
-			if (result.success && artist) {
+			if (result?.success && artist) {
 				await updateArtistReleaseInCache(data.artistId, {
 					id: releaseId,
 					requested: true

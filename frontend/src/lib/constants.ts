@@ -778,6 +778,9 @@ export const API = {
 		sabnzbd: () => '/api/v1/download-clients/sabnzbd',
 		sabnzbdTest: () => '/api/v1/download-clients/sabnzbd/test',
 		policy: () => '/api/v1/download-clients/policy',
+		policySave: () => '/api/v1/download-clients/policy',
+		policySummary: () => '/api/v1/download-clients/policy-summary',
+		policyImpact: () => '/api/v1/download-clients/policy/impact',
 		sourcePriority: () => '/api/v1/download-clients/source-priority',
 		wanted: () => '/api/v1/download-clients/wanted'
 	},
@@ -792,6 +795,7 @@ export const API = {
 		activitySummary: () => '/api/v1/downloads/activity-summary',
 		searchAlbum: () => '/api/v1/downloads/search/album',
 		searchJob: (jobId: string) => `/api/v1/downloads/search/${jobId}`,
+		restartWithPolicy: (taskId: string) => `/api/v1/downloads/${taskId}/restart-with-current-policy`,
 		pick: (jobId: string) => `/api/v1/downloads/search/${jobId}/pick`,
 		dismissReview: (jobId: string) => `/api/v1/downloads/search/${jobId}/dismiss`,
 		cancelSearch: (jobId: string) => `/api/v1/downloads/search/${jobId}/cancel`,

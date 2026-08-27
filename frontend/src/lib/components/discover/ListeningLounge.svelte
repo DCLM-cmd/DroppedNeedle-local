@@ -5,7 +5,7 @@
 	import { deckSampler, type SampleEntry } from '$lib/stores/deckSampler.svelte';
 	import { integrationStore } from '$lib/stores/integration';
 	import { libraryStore } from '$lib/stores/library';
-	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { albumHrefOrNull } from '$lib/utils/entityRoutes';
 	import type { HomeAlbum, HomeSection, TopPicksSection } from '$lib/types';
 	import LiveUpdatingBadge from '$lib/components/LiveUpdatingBadge.svelte';
@@ -77,15 +77,20 @@
 		deckSampler.startStation('Listening Lounge', pool.map(albumEntry));
 	}
 
+	const loungeRequest = requestAlbum();
+
 	async function requestActive() {
 		if (!activeAlbum?.mbid || requesting) return;
 		requesting = true;
 		try {
-			await requestAlbum(activeAlbum.mbid, {
-				artist: activeAlbum.artist_name ?? undefined,
-				album: activeAlbum.name,
-				artistMbid: activeAlbum.artist_mbid ?? undefined
-			});
+			await loungeRequest
+				.mutateAsync({
+					release_group_mbid: activeAlbum.mbid,
+					artist_name: activeAlbum.artist_name ?? undefined,
+					album_title: activeAlbum.name,
+					artist_mbid: activeAlbum.artist_mbid ?? undefined
+				})
+				.catch(() => null);
 		} finally {
 			requesting = false;
 		}

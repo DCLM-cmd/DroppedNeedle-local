@@ -148,7 +148,11 @@ vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
 	stopAutoRetry: () => ({ mutate: vi.fn(), isPending: false }),
 	requestTrack: () => ({ mutate: vi.fn(), isPending: false }),
 	importHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),
-	discardHeldTrack: () => ({ mutate: vi.fn(), isPending: false })
+	discardHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),
+	requestAlbum: () => ({
+		mutateAsync: vi.fn().mockResolvedValue({ success: true }),
+		isPending: false
+	})
 }));
 
 vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
@@ -196,11 +200,6 @@ vi.mock('$lib/queries/library/LibraryMutations.svelte', async (importOriginal) =
 	// so the page renders without a QueryClientProvider
 	removeLibraryTrack: () => ({ mutate: vi.fn(), isPending: false })
 }));
-
-vi.mock('$lib/utils/albumRequest', () => ({
-	requestAlbum: vi.fn().mockResolvedValue({ success: true })
-}));
-
 vi.mock('$lib/components/AlbumImage.svelte', () => {
 	const Comp = function () {};
 	Comp.prototype = {};

@@ -1,6 +1,7 @@
 // left to right = worst to best; mirrors backend services.native.quality_tiers
-// (TIER_KEYS reversed). Shared by the quality range slider and the upgrade
-// cutoff selector so the two can never disagree about the tier axis.
+// (TIER_KEYS reversed). Consumed by the acquisition order editor, the upgrade
+// cutoff selector and the requests page tier labels so none can disagree about
+// the tier axis. Labels use lossy wording throughout ("MP3" never appears).
 export interface QualityTier {
 	key: string;
 	label: string;
@@ -8,11 +9,11 @@ export interface QualityTier {
 }
 
 export const QUALITY_TIERS: QualityTier[] = [
-	{ key: 'low', label: '<192', full: 'below 192 kbps' },
-	{ key: 'mp3_192', label: '192', full: '192 kbps' },
-	{ key: 'mp3_256', label: '256', full: '256 kbps' },
-	{ key: 'mp3_320', label: '320', full: '320 kbps' },
-	{ key: 'lossless', label: 'FLAC', full: 'FLAC / lossless' }
+	{ key: 'low', label: 'Lossy below 192', full: 'Lossy below 192 kbps' },
+	{ key: 'mp3_192', label: 'Lossy 192-255', full: 'Lossy 192-255 kbps' },
+	{ key: 'mp3_256', label: 'Lossy 256-319', full: 'Lossy 256-319 kbps' },
+	{ key: 'mp3_320', label: 'Lossy 320 kbps', full: 'Lossy 320 kbps' },
+	{ key: 'lossless', label: 'Lossless', full: 'Lossless' }
 ];
 
 export function tierIndex(key: string): number {

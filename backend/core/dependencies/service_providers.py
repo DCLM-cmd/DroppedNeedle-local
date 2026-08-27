@@ -1177,6 +1177,7 @@ def _build_free_music_service(drop_import, file_processor) -> "FreeMusicService"
         preferences_service=get_preferences_service(),
         sse_publisher=get_sse_publisher(),
         file_processor=file_processor,
+        probe_tagger=get_audio_tagger(),
     )
 
 
@@ -2580,6 +2581,16 @@ def get_version_service() -> "VersionService":
     return VersionService(github_repo)
 
 
+def _acquisition_snapshot_factory():
+    from services.native.acquisition.quality import build_snapshot
+
+    prefs = get_preferences_service()
+
+    def factory():
+        return build_snapshot(prefs.get_download_policy())
+
+    return factory
+
 def _build_spec_policy(policy):
     """Map the API ``DownloadPolicySettings`` onto the decoupled spec ``SpecPolicy`` (the
     composition root is the one place coupling the two is fine). The size/term gates
@@ -2603,12 +2614,9 @@ def get_album_preflight_scorer() -> "AlbumPreflightScorer":
 
     from .repo_providers import get_download_store
 
-    policy = get_preferences_service().get_download_policy()
-    return AlbumPreflightScorer(
-        get_download_store(),
-        flac_mp3_only=policy.flac_mp3_only,
-        policy=_build_spec_policy(policy),
-    )
+    # Quality travels via the task's persisted snapshot at rank() time; the
+    # scorer singleton holds nothing policy-shaped (freshness by construction).
+    return AlbumPreflightScorer(get_download_store())
 
 
 @singleton
@@ -2617,13 +2625,7 @@ def get_track_matcher() -> "TrackMatcher":
 
     from .repo_providers import get_download_store
 
-    policy = get_preferences_service().get_download_policy()
-    return TrackMatcher(
-        get_download_store(),
-        quality_min=policy.quality_min,
-        quality_max=policy.quality_max,
-        flac_mp3_only=policy.flac_mp3_only,
-    )
+    return TrackMatcher(get_download_store())
 
 
 @singleton
@@ -2632,12 +2634,7 @@ def get_newznab_release_scorer() -> "NewznabReleaseScorer":
 
     from .repo_providers import get_download_store
 
-    policy = get_preferences_service().get_download_policy()
-    return NewznabReleaseScorer(
-        get_download_store(),
-        flac_mp3_only=policy.flac_mp3_only,
-        policy=_build_spec_policy(policy),
-    )
+    return NewznabReleaseScorer(get_download_store())
 
 
 @singleton
@@ -2700,6 +2697,10 @@ def _build_download_orchestrator(
         else Path(get_settings().cache_dir) / "download-staging"
     )
     return DownloadOrchestrator(
+        spec_policy_extras=lambda: _build_spec_policy(
+            get_preferences_service().get_download_policy()
+        ),
+        probe_tagger=get_audio_tagger(),
         client=get_download_client_repository(),
         indexer=get_slskd_indexer(),
         download_store=get_download_store(),
@@ -2787,6 +2788,7 @@ def _build_download_service(
     # The service is "enabled" if ANY source can act (slskd OR usenet), so a Usenet-only
     # install isn't blocked by the slskd-disabled guard.
     return DownloadService(
+        snapshot_factory=_acquisition_snapshot_factory(),
         download_client=get_download_client_repository(),
         indexer=get_slskd_indexer(),
         scorer=get_album_preflight_scorer(),

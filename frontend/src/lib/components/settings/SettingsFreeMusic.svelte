@@ -3,6 +3,7 @@
 	import { ExternalLink, Landmark } from 'lucide-svelte';
 	import { API } from '$lib/constants';
 	import { HomeQueryKeyFactory } from '$lib/queries/HomeQueryKeyFactory';
+	import { getPolicySummaryQuery } from '$lib/queries/downloads/PolicyQueries.svelte';
 	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 	import type { FreeMusicSettings } from '$lib/types';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
@@ -20,6 +21,10 @@
 	});
 
 	onMount(() => form.load());
+
+	// Read-only consumption of the global acquisition policy (spec): the Archive
+	// flow no longer carries its own format choice - the shared order governs it.
+	const policySummary = getPolicySummaryQuery();
 	onDestroy(() => form.cleanup());
 </script>
 
@@ -62,20 +67,17 @@
 			</div>
 
 			<div class="form-control pt-2">
-				<label class="label" for="free-music-format">
-					<span class="label-text font-medium">Preferred format</span>
-				</label>
-				<select
-					id="free-music-format"
-					class="select select-bordered w-full max-w-xs"
-					bind:value={form.data.preferred_format}
-				>
-					<option value="flac">FLAC, when the Archive has it</option>
-					<option value="mp3">MP3, smaller downloads</option>
-				</select>
+				<span class="label-text font-medium">Quality</span>
+				<p class="text-sm text-base-content/70" data-testid="free-music-policy-summary">
+					{#if policySummary.data?.summary}
+						{policySummary.data.summary}
+					{:else}
+						Use the admin policy summary
+					{/if}
+				</p>
 				<p class="mt-1 text-xs text-base-content/50">
-					An album that matches your MusicBrainz track count wins over a preferred format, so a
-					two-track sampler never beats the real record.
+					Archive requests follow the server's download-quality order, so no separate format is
+					chosen here.
 				</p>
 			</div>
 

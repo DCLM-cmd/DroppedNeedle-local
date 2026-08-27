@@ -8,19 +8,27 @@ reports SABnzbd's version + category list + completed dir (the mount hint).
 
 import logging
 
+
+import msgspec
 from fastapi import APIRouter, Depends
 
-from api.v1.schemas.download import SabnzbdTestResponse, SourcePriority
+from api.v1.schemas.download import (
+    PolicyImpactResponse,
+    PolicySummaryResponse,
+    SabnzbdTestResponse,
+    SourcePriority,
+)
 from api.v1.schemas.settings import (
     SABNZBD_API_KEY_MASK,
     DownloadPolicySettings,
     SabnzbdConnectionSettings,
     WantedWatcherSettings,
+    validate_new_quality_fields,
 )
 from core.dependencies import build_sabnzbd_download_client, get_preferences_service
 from core.exceptions import ExternalServiceError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
-from middleware import CurrentAdminDep
+from middleware import CurrentAdminDep, CurrentUserDep
 
 logger = logging.getLogger(__name__)
 
@@ -139,13 +147,121 @@ async def get_policy(_: CurrentAdminDep, preferences=Depends(get_preferences_ser
 @router.put("/policy", response_model=DownloadPolicySettings)
 async def update_policy(
     _: CurrentAdminDep,
-    policy: DownloadPolicySettings = MsgSpecBody(DownloadPolicySettings),
     preferences=Depends(get_preferences_service),
+    payload: dict = MsgSpecBody(dict),
 ):
+    # Validate the RAW body BEFORE struct construction: DownloadPolicySettings'
+    # __post_init__ heals stored-data drift, which would silently clamp a
+    # submitted field (Acquisition plan: never clamp new-field submissions).
+    try:
+        validate_new_quality_fields(payload)
+    except ValueError as exc:
+        from core.exceptions import ValidationError
+
+        raise ValidationError(str(exc)) from exc
+    policy = msgspec.convert(payload, type=DownloadPolicySettings)
     preferences.save_download_policy(policy)
     _clear_download_client_cache()
     return preferences.get_download_policy()
 
+
+
+
+@router.get("/policy-summary", response_model=PolicySummaryResponse)
+async def get_policy_summary(
+    current_user: CurrentUserDep,
+    preferences=Depends(get_preferences_service),
+):
+    """Safe read-only acquisition-policy summary for ANY signed-in user (spec):
+    the backend-composed contract sentence plus the source-mode label only - no
+    admin resilience/cap internals."""
+    from services.native.acquisition.quality import (
+        build_snapshot,
+        derive_default_order,
+    )
+
+    policy = preferences.get_download_policy()
+    snapshot = build_snapshot(policy)
+    order = snapshot.quality_preference_order
+    derived = derive_default_order(policy.quality_min, policy.quality_max)
+    legacy_rollback_compatible = (
+        order == derived
+        and policy.lossless_preference == "highest"
+        and policy.lossless_max_bit_depth is None
+        and policy.lossless_max_sample_rate_hz is None
+        and policy.preferred_lossy_bitrate_kbps is None
+        and policy.lossy_min_bitrate_kbps is None
+        and policy.lossy_max_bitrate_kbps is None
+        and policy.unknown_quality_behavior == "allow_as_fallback"
+    )
+    return PolicySummaryResponse(
+        summary=snapshot.summary,
+        source_mode=policy.source_selection_mode,
+        legacy_rollback_compatible=legacy_rollback_compatible,
+    )
+
+
+
+
+@router.post("/policy/impact", response_model=PolicyImpactResponse)
+async def preview_policy_impact(
+    _: CurrentAdminDep,
+    preferences=Depends(get_preferences_service),
+    payload: dict = MsgSpecBody(dict),
+):
+    """Admin impact preview of an UNSAVED policy body against persisted rows
+    (spec): persisted-state bucket counts only; the PUT /policy response shape
+    is untouched. Shares the strict raw-payload validation with the save path."""
+    from core.dependencies.repo_providers import get_download_store
+    from services.native.acquisition.quality import (
+        build_snapshot,
+        derive_default_order,
+    )
+
+    try:
+        validate_new_quality_fields(payload)
+    except ValueError as exc:
+        from core.exceptions import ValidationError
+
+        raise ValidationError(str(exc)) from exc
+    candidate = msgspec.convert(payload, type=DownloadPolicySettings)
+    snapshot = build_snapshot(candidate)
+    legacy_representable = (
+        snapshot.quality_preference_order == derive_default_order(
+            candidate.quality_min, candidate.quality_max
+        )
+        or snapshot.quality_preference_order == list(snapshot.quality_preference_order)
+        and False
+    )
+    # Legacy-representable = EXACTLY today's default shape (hi-res-first over a
+    # contiguous range with no custom targets/caps/evidence overrides) - i.e.
+    # what an older image can reproduce on load.
+    legacy_representable = (
+        sorted(snapshot.quality_preference_order) == sorted(
+            derive_default_order(candidate.quality_min, candidate.quality_max)
+        )
+        and snapshot.quality_preference_order == derive_default_order(
+            candidate.quality_min, candidate.quality_max
+        )
+        and candidate.lossless_preference == "highest"
+        and candidate.lossless_max_bit_depth is None
+        and candidate.lossless_max_sample_rate_hz is None
+        and candidate.preferred_lossy_bitrate_kbps is None
+        and candidate.lossy_min_bitrate_kbps is None
+        and candidate.lossy_max_bitrate_kbps is None
+        and candidate.unknown_quality_behavior == "allow_as_fallback"
+        and candidate.source_selection_mode == "source_first"
+    )
+    buckets = await get_download_store().acquisition_policy_impact()
+    return PolicyImpactResponse(
+        manual_search_jobs=buckets["manual_search_jobs"],
+        queued_without_attempts=buckets["queued_without_attempts"],
+        awaiting_review=buckets["awaiting_review"],
+        remote_queued_zero_byte=buckets["remote_queued_zero_byte"],
+        transferring_immutable=buckets["transferring"],
+        held_reviews=buckets["held_reviews"],
+        legacy_representable=bool(legacy_representable),
+    )
 
 @router.get("/wanted", response_model=WantedWatcherSettings)
 async def get_wanted_watcher_settings(

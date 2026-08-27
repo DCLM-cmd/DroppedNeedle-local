@@ -366,8 +366,9 @@ async def test_activity_snapshot_statement_shapes_and_index_plan(
     selects = [
         s for s in store.statements if s.lstrip().upper().startswith("SELECT")
     ]
-    # one bounded fixed set of aggregates, NOT one statement per job row
-    assert len(selects) <= 10
+    # one bounded fixed set of aggregates plus the joined deferred-job
+    # summary query, NOT one statement per job row
+    assert len(selects) <= 11
     assert snapshot["counts"] == {"queued": 1, "failed": 1, "succeeded": 1}
     assert snapshot["failure_event_id"] == "job-failed-latest"
 

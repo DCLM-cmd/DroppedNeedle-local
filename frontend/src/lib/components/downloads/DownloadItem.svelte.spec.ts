@@ -176,4 +176,19 @@ describe('DownloadItem.svelte', () => {
 			.element(page.getByRole('button', { name: 'Retry import from slskd' }))
 			.not.toBeInTheDocument();
 	});
+
+	it('classifies failure causes into distinct empty-state copy', async () => {
+		renderItem(
+			task({ status: 'failed', error_message: 'Every candidate was outside policy for this task.' })
+		);
+		await expect.element(page.getByText('Copies were outside your quality policy')).toBeVisible();
+
+		renderItem(task({ status: 'failed', manual_quality_override: true }));
+		await expect.element(page.getByText('Quality did not match what was promised')).toBeVisible();
+	});
+
+	it('suppresses the empty-state block while the task is held for review', async () => {
+		renderItem(task({ status: 'failed', held_for_review: true, error_message: 'source died' }));
+		await expect.element(page.getByText(/The source gave up/)).not.toBeInTheDocument();
+	});
 });

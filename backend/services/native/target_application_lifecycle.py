@@ -247,7 +247,10 @@ async def start_target_operational_runtime(
     )
     from core.dependencies.auth_providers import get_auth_store
     from core.dependencies.cache_providers import get_native_library_store
-    from core.dependencies.repo_providers import get_download_store
+    from core.dependencies.repo_providers import (
+        get_download_store,
+        get_free_music_store,
+    )
     from core.dependencies.service_providers import get_plugin_host
     from core.tasks import (
         start_acquisition_cleanup_task,
@@ -323,6 +326,20 @@ async def start_target_operational_runtime(
         await get_download_store().delete_expired_search_jobs()
     except Exception as error:  # noqa: BLE001 - cleanup cannot block startup
         logger.warning("Download search-job cleanup skipped: %s", error)
+    try:
+        from services.native.acquisition.backfill import (
+            run_acquisition_snapshot_backfill,
+        )
+
+        await run_acquisition_snapshot_backfill(
+            get_download_store(),
+            get_free_music_store(),
+            lambda: preferences.get_download_policy(),
+        )
+    except Exception as error:  # noqa: BLE001 - backfill cannot block startup
+        logger.warning(
+            "startup.acquisition_snapshot_backfill_failed", extra={"error": str(error)}
+        )
     try:
         client = get_download_client_repository()
         if client.is_configured():

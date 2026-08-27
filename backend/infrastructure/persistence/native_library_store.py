@@ -165,6 +165,7 @@ AUTOMATIC_SAFE_EVIDENCE_REASONS = frozenset(
     {"SUPPORTED", "ACCEPTED", "SUPPORTED_EMBEDDED_IDS"}
 )
 ATTENTION_FAILURE_CODES = frozenset({"MAX_DEFERRALS_EXCEEDED", "SUBJECT_NOT_AVAILABLE"})
+_ACTIVITY_DEFERRED_JOB_LIMIT = 20
 BULK_PREVIEW_BATCH_SIZE = 500
 BULK_PREVIEW_CLEANUP_BATCH_SIZE = 5_000
 MANAGEMENT_PERSISTENCE_BATCH_SIZE = 500
@@ -8480,7 +8481,7 @@ class NativeLibraryStore(PersistenceBase):
     async def get_identification_activity_snapshot(
         self, *, now: float
     ) -> dict[str, Any]:
-        """Return redacted aggregate queue state for activity and admin progress UI."""
+        """Return redacted aggregate queue state plus bounded deferred-job summaries."""
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             control = dict(
@@ -8546,6 +8547,19 @@ class NativeLibraryStore(PersistenceBase):
                     "AND last_failure_code IS NOT NULL GROUP BY last_failure_code"
                 ).fetchall()
             }
+            deferred_job_rows = connection.execute(
+                "SELECT j.id AS job_id, j.local_album_id AS local_album_id, "
+                "a.title AS album_title, ar.display_name AS artist_name, "
+                "j.last_failure_code AS last_failure_code, j.attempt_count AS attempt_count, "
+                "j.not_before AS not_before, j.updated_at AS updated_at "
+                "FROM library_identification_jobs j "
+                "LEFT JOIN local_albums a ON a.id = j.local_album_id "
+                "LEFT JOIN local_artists ar ON ar.id = a.album_artist_id "
+                "WHERE j.state IN ('queued','running','paused') "
+                "AND j.last_failure_code IS NOT NULL "
+                "ORDER BY j.priority ASC, j.enqueue_sequence ASC LIMIT ?",
+                (_ACTIVITY_DEFERRED_JOB_LIMIT,),
+            ).fetchall()
             return {
                 "control_state": str(control["state"]),
                 "control_revision": int(control["row_revision"]),
@@ -8565,6 +8579,7 @@ class NativeLibraryStore(PersistenceBase):
                 "failure_event_id": str(failure["id"]) if failure else None,
                 "failure_at": float(failure["terminal_at"]) if failure else None,
                 "foreground_operation_count": foreground_operation_count,
+                "deferred_jobs": [dict(row) for row in deferred_job_rows],
             }
 
         return await self._read(operation)

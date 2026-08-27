@@ -2369,8 +2369,16 @@ export interface DownloadTask {
 		| 'preserved'
 		| 'needs_attention';
 	quality_format: string | null;
+	quality_bitrate?: number | null;
 	quality_bit_depth: number | null;
 	quality_sample_rate: number | null;
+	/** Acquisition-quality projection (Acquisition plan). */
+	quality_snapshot_summary?: string | null;
+	quality_snapshot_hash?: string | null;
+	quality_preference_step?: number | null;
+	quality_certainty?: string | null;
+	quality_provenance?: string | null;
+	manual_quality_override?: boolean;
 	advertised_queue_depth: number | null;
 	queue_position_start: number | null;
 	queue_position_end: number | null;
@@ -2434,8 +2442,9 @@ export interface HeldListResponse {
 export interface DownloadSourceUpdate {
 	candidate_index: number | null;
 	source: string | null;
-	quality_format: string | null;
-	quality_bit_depth: number | null;
+	quality_format?: string | null;
+	quality_bitrate?: number | null;
+	quality_bit_depth?: number | null;
 	quality_sample_rate: number | null;
 	advertised_queue_depth: number | null;
 	queue_position_start: number | null;
@@ -2447,240 +2456,36 @@ export interface DownloadSourceUpdate {
 	has_next_source: boolean;
 }
 
-// SSE payload on the `download:{task_id}` channel `progress` event
-export interface DownloadProgress extends DownloadSourceUpdate {
-	bytes_downloaded: number;
-	bytes_total: number;
-	files_completed: number;
-	files_total: number;
-	progress_percent: number;
+// SSE payload on the `download:
+
+// ---------------------------------------------------------------------------
+// Acquisition-quality policy (Acquisition plan, 2026-08-27) - hand-mirrored.
+// ---------------------------------------------------------------------------
+
+export type QualityPreferenceOrder = string[];
+
+export interface PolicySummary {
+	summary: string;
+	source_mode: 'source_first' | 'quality_first' | string;
+	legacy_rollback_compatible: boolean;
 }
 
-// mirrors backend RequestAcceptedResponse (api/v1/schemas/request.py)
-export type RequestAcceptedStatus =
-	| 'pending'
-	| 'awaiting_approval'
-	| 'queued'
-	| 'downloading'
-	| 'cancelling'
-	| 'failed'
-	| 'imported';
-
-export interface RequestAccepted {
-	success: boolean;
-	message: string;
-	musicbrainz_id: string;
-	status: RequestAcceptedStatus;
+export interface PolicyImpactResponse {
+	manual_search_jobs: number;
+	queued_without_attempts: number;
+	awaiting_review: number;
+	remote_queued_zero_byte: number;
+	transferring_immutable: number;
+	held_reviews: number;
+	legacy_representable: boolean;
 }
 
-export type TrackRequestStatus = 'awaiting_approval' | 'queued' | 'already_in_library';
-
-export interface TrackRequestResponse {
-	status: TrackRequestStatus;
-	task_id?: string | null;
+export interface RestartWithPolicyRequest {
+	expected_snapshot_hash?: string | null;
 }
 
-export interface CancelDownloadResponse {
-	success: boolean;
-	status?: string;
-}
-
-export interface NextSourceResponse {
-	success: boolean;
-	status: string;
-	candidate_index: number;
-}
-
-export interface RetryDownloadResponse {
-	success: boolean;
-	task_id: string;
-}
-
-export interface ReimportDownloadResponse {
-	success: boolean;
-	status: string;
-	files_imported: number;
-	files_failed: number;
-	error_message?: string | null;
-}
-
-export interface QuarantineEntry {
-	id: number;
-	client_id: string;
-	username: string;
-	filename: string;
-	reason: string;
-	quarantined_at: number;
-	release_group_mbid?: string | null;
-}
-
-export interface QuarantineListResponse {
-	items: QuarantineEntry[];
-	page: number;
-}
-
-// Connect Apps (inbound OpenSubsonic + Jellyfin compatibility)
-export interface ConnectAppsSettings {
-	subsonic_enabled: boolean;
-	jellyfin_enabled: boolean;
-	exact_track_approval_supported?: boolean;
-	transcoding_enabled: boolean;
-	transcode_default_format: 'mp3' | 'opus';
-	transcode_max_bitrate_kbps: number;
-	advertise_server_name: string;
-	advertise_server_version: string;
-	discover_mode: 'local-only' | 'lazy-mb' | 'use-scrobble-targets';
-}
-
-export interface AppPasswordView {
-	id: string;
-	name: string;
-	created_at: string;
-	last_used_at: string | null;
-	last_client: string | null;
-}
-
-export interface AppPasswordListResponse {
-	items: AppPasswordView[];
-	cap: number;
-	active_count: number;
-}
-
-export interface AppPasswordCreateResponse {
-	secret: string;
-	app_password: AppPasswordView;
-}
-
-// Admin oversight roster: every user's active app-passwords (never a secret).
-export interface AdminAppPasswordView {
-	id: string;
-	user_id: string;
-	owner_username: string;
-	owner_display_name: string;
-	name: string;
-	created_at: string;
-	last_used_at: string | null;
-	last_client: string | null;
-}
-
-export interface AdminAppPasswordListResponse {
-	items: AdminAppPasswordView[];
-	active_count: number;
-}
-
-export interface SectionPrefItem {
-	key: string;
-	title: string;
-	description: string;
-	zone: string;
-	enabled: boolean;
-	available: boolean;
-	requires: string | null;
-}
-
-export interface SectionPrefsResponse {
-	pages: Record<string, SectionPrefItem[]>;
-}
-
-export interface SectionPrefsUpdate {
-	page: 'home' | 'discover' | 'sidebar';
-	sections: { key: string; enabled: boolean }[];
-}
-
-export interface PreviewTrackItem {
-	title: string;
-	artist_name: string;
-	preview_url: string;
-	duration_s: number | null;
-	position: number | null;
-}
-
-export interface TrackPreviewResponse {
-	preview_url: string | null;
-	title: string | null;
-	duration_s: number | null;
-	provider: string | null;
-}
-
-export interface AlbumPreviewResponse {
-	tracks: PreviewTrackItem[];
-	provider: string | null;
-}
-
-export interface RadioSeedItem {
-	artist_mbid: string;
-	artist_name?: string;
-	album_mbid?: string | null;
-	album_name?: string;
-}
-
-export interface RadioPlanRequest {
-	seed_type: 'artist' | 'album' | 'genre' | 'items';
-	seed_id?: string | null;
-	items?: RadioSeedItem[];
-	mode?: 'library' | 'hybrid';
-	count?: number;
-	exclude_recording_mbids?: string[];
-	fast?: boolean;
-}
-
-export interface RadioPlanTrack {
-	track_name: string;
-	artist_name: string;
-	artist_mbid: string;
-	recording_mbid: string | null;
-	album_mbid: string | null;
-	album_name: string | null;
-	in_library: boolean;
-	local_file_id: string | null;
-	file_format: string | null;
-	duration_s: number | null;
-}
-
-export interface RadioPlanResponse {
-	title: string;
-	tracks: RadioPlanTrack[];
-}
-
-export interface DiscoveryBatchItemIn {
-	release_group_mbid: string;
-	artist_mbid: string;
-	album_name: string;
-	artist_name: string;
-}
-
-export interface DiscoveryBatchCreate {
-	name: string;
-	source_section: string;
-	items: DiscoveryBatchItemIn[];
-}
-
-export interface DiscoveryBatchItemStatus extends DiscoveryBatchItemIn {
-	outcome: 'requested' | 'skipped_in_library' | 'skipped_duplicate';
-	request_status: string | null;
-	in_library: boolean;
-}
-
-export interface DiscoveryBatchSummary {
-	id: string;
-	name: string;
-	source_section: string;
-	created_at: string;
-	item_count: number;
-	imported_count: number;
-	pending_count: number;
-}
-
-export interface DiscoveryBatchDetail extends DiscoveryBatchSummary {
-	items: DiscoveryBatchItemStatus[];
-}
-
-export interface DiscoveryBatchListResponse {
-	batches: DiscoveryBatchSummary[];
-}
-
-export interface DiscoveryBatchRemoveResult {
-	removed_albums: number;
-	cancelled_requests: number;
-	kept: number;
+export interface RestartWithPolicyResponse {
+	accepted: boolean;
+	snapshot_summary: string | null;
+	message?: string | null;
 }

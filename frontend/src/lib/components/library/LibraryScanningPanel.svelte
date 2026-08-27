@@ -91,6 +91,10 @@
 			.map(([code, count]) => `${deferredReasonLabel(code)}: ${count.toLocaleString()}`)
 			.join(', ')
 	);
+	const deferredJobs = $derived((identification?.deferred_jobs ?? []).slice(0, 5));
+	const hiddenDeferredJobs = $derived(
+		Math.max(0, (identification?.deferred_jobs?.length ?? 0) - 5)
+	);
 
 	function deferredReasonLabel(code: string): string {
 		const labels: Record<string, string> = {
@@ -472,6 +476,26 @@
 							{(identification?.deferred_count ?? 0) === 1 ? 'check is' : 'checks are'} deferred{deferredReasonBreakdown
 								? ` (${deferredReasonBreakdown})`
 								: ''}. They retry automatically.
+							{#if deferredJobs.length > 0}
+								<ul class="mt-1 space-y-0.5">
+									{#each deferredJobs as job (job.job_id)}
+										<li class="text-xs">
+											<span class="font-medium">{job.album_title ?? 'Track-level work'}</span
+											>{#if job.artist_name}<span class="text-base-content/55">
+													- {job.artist_name}</span
+												>{/if}
+											<span class="text-base-content/50">
+												· {deferredReasonLabel(job.last_failure_code)} · attempt {job.attempt_count.toLocaleString()}</span
+											>
+										</li>
+									{/each}
+									{#if hiddenDeferredJobs > 0}
+										<li class="text-xs text-base-content/50">
+											and {hiddenDeferredJobs.toLocaleString()} more
+										</li>
+									{/if}
+								</ul>
+							{/if}
 						</div>
 					{/if}
 					<div class="flex flex-wrap items-center justify-between gap-2 text-sm">

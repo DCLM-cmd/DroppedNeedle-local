@@ -14,6 +14,8 @@ import threading
 import time as _t
 from pathlib import Path
 from types import SimpleNamespace
+
+import msgspec
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -3421,58 +3423,103 @@ def _ogg_candidate(username: str = "oggpeer", bitrate: int = 320) -> ScoredCandi
 
 @pytest.mark.asyncio
 async def test_candidate_passes_quality_regates_against_current_policy(tmp_path: Path):
+    """STORED snapshot governs the re-gate: tightening the LIVE policy after the
+    task exists must NOT flip its verdicts - restart-with-current-policy is the
+    explicit refresh (Acquisition plan live-vs-stored resolution)."""
     from types import SimpleNamespace
 
-    _, orch, _, _ = _build(tmp_path)
-    flac = _candidate(0.9)  # .flac -> tier lossless
+    from api.v1.schemas.settings import DownloadPolicySettings
+    from services.native.acquisition.quality import build_snapshot
 
-    # Unwired (no policy reader, e.g. tests / default construction): pass -> unchanged.
-    assert orch._candidate_passes_quality(flac) is True
+    _, orch, _, _ = _build(tmp_path)
+    snap = build_snapshot(DownloadPolicySettings(quality_min="mp3_256", quality_max="mp3_320"))
+    task = SimpleNamespace(id="t", track_count=None,
+                           quality_snapshot_json=msgspec.json.encode(snap).decode())
+    flac = _candidate(0.9)  # .flac -> lossless -> outside [mp3_256, mp3_320]
+    mp3 = _mp3_candidate()  # 320 inside
+
+    assert await orch._candidate_passes_quality(task, flac) is False
+    assert await orch._candidate_passes_quality(task, mp3) is True
+
+    # Later settings saves never mutate the stored verdict:
+    from types import SimpleNamespace as _NS2
 
     orch._get_download_policy = lambda: SimpleNamespace(
-        quality_min="mp3_256", quality_max="mp3_320", flac_mp3_only=False
-    )
-    assert (
-        orch._candidate_passes_quality(flac) is False
-    )  # lossless > mp3_320 -> rejected
-    assert (
-        orch._candidate_passes_quality(_mp3_candidate()) is True
-    )  # 320 within [256, 320]
+        quality_min="low",
+        quality_max="lossless",
+        quality_preference_order=["lossless", "mp3_320", "mp3_256", "mp3_192", "low"],
+        preferred_lossy_bitrate_kbps=None,
+        lossy_min_bitrate_kbps=None,
+        lossy_max_bitrate_kbps=None,
+        lossless_preference="highest",
+        lossless_max_bit_depth=None,
+        lossless_max_sample_rate_hz=None,
+        flac_mp3_only=False,
+        unknown_quality_behavior="allow_as_fallback",
+        source_selection_mode="source_first",
+    ) if False else _full_policy_ns()
 
-    # Usenet is re-judged via the release tier (not blanket-passed): a determinable
-    # lossless release is rejected under mp3_320; one we can't judge (no release) passes.
+    def _full_policy_ns():
+        raise AssertionError("legacy fallback must NOT be consulted for stored snapshots")
+
+    assert await orch._candidate_passes_quality(task, flac) is False
+
+    # Legacy row WITHOUT a stored snapshot falls back to a migration snapshot of
+    # the live policy: same range, same verdicts, still fails open when unwired.
+    orch._get_download_policy = lambda: SimpleNamespace(
+        quality_min="mp3_256", quality_max="mp3_320",
+        quality_preference_order=["mp3_320", "mp3_256"],
+        preferred_lossy_bitrate_kbps=None,
+        lossy_min_bitrate_kbps=None,
+        lossy_max_bitrate_kbps=None,
+        lossless_preference="highest",
+        lossless_max_bit_depth=None,
+        lossless_max_sample_rate_hz=None,
+        flac_mp3_only=False,
+        unknown_quality_behavior="allow_as_fallback",
+        source_selection_mode="source_first",
+    )
+    legacy_task = SimpleNamespace(id="t2", track_count=10,
+                                  quality_snapshot_json=None)
     orch._usenet_scorer = SimpleNamespace(release_tier=lambda release, tc: "lossless")
-    usenet_flac = ScoredCandidate(
-        source="usenet",
-        files=[],
-        usenet_release=SimpleNamespace(),
-        final_score=0.9,
-        tier="auto",
-    )
-    assert orch._candidate_passes_quality(usenet_flac, track_count=10) is False
-    usenet_unknown = ScoredCandidate(
-        source="usenet", files=[], usenet_release=None, final_score=0.9
-    )
-    assert orch._candidate_passes_quality(usenet_unknown) is True
+    usenet_flac = ScoredCandidate(source="usenet", files=[],
+                                  usenet_release=SimpleNamespace(title='R - X FLAC', category_ids=[3040], size_bytes=1), final_score=0.9)
+    assert await orch._candidate_passes_quality(legacy_task, usenet_flac) is False
+    unwired_task = SimpleNamespace(id="t3", track_count=None, quality_snapshot_json=None)
+    orch._get_download_policy = None
+    usenet_unknown = ScoredCandidate(source="usenet", files=[], final_score=0.9)
+    assert await orch._candidate_passes_quality(unwired_task, usenet_unknown) is True
 
 
 @pytest.mark.asyncio
 async def test_candidate_passes_quality_enforces_flac_mp3_only(tmp_path: Path):
+    """The codec gate rides the STORED snapshot's flac_mp3_only flag."""
     from types import SimpleNamespace
 
-    _, orch, _, _ = _build(tmp_path)
-    ogg = _ogg_candidate()  # .ogg @320 -> tier mp3_320, but not FLAC/MP3
+    from api.v1.schemas.settings import DownloadPolicySettings
+    from services.native.acquisition.quality import build_snapshot
 
-    orch._get_download_policy = lambda: SimpleNamespace(
-        quality_min="mp3_256", quality_max="mp3_320", flac_mp3_only=False
-    )
-    assert orch._candidate_passes_quality(ogg) is True  # in range, codec gate off
-    orch._get_download_policy = lambda: SimpleNamespace(
-        quality_min="mp3_256", quality_max="mp3_320", flac_mp3_only=True
-    )
-    assert (
-        orch._candidate_passes_quality(ogg) is False
-    )  # codec gate on -> non-flac/mp3 dropped
+    _, orch, _, _ = _build(tmp_path)
+    ogg_task_snapshot = build_snapshot(
+        DownloadPolicySettings(quality_min="low", quality_max="lossless",
+                               quality_preference_order=["lossless","mp3_320","mp3_256","mp3_192","low"],
+                               flac_mp3_only=False))
+    task_off = SimpleNamespace(id="t-off", track_count=None,
+        quality_snapshot_json=msgspec.json.encode(ogg_task_snapshot).decode())
+    ogg_candidate = _mp3_candidate()
+    ogg_candidate.files[0].extension = "ogg"
+    ogg_candidate.files[0].filename = "01.ogg"
+    # codec gate off: unknown-family-by-classifier OGG projects low -> accepted.
+    assert await orch._candidate_passes_quality(task_off, ogg_candidate) is True
+
+    strict_snapshot = build_snapshot(
+        DownloadPolicySettings(quality_min="low", quality_max="lossless",
+                               quality_preference_order=["lossless","mp3_320","mp3_256","mp3_192","low"],
+                               flac_mp3_only=True))
+    task_on = SimpleNamespace(id="t-on", track_count=None,
+        quality_snapshot_json=msgspec.json.encode(strict_snapshot).decode())
+    # Strict codec gate rejects the non-FLAC/MP3 container outright.
+    assert await orch._candidate_passes_quality(task_on, ogg_candidate) is False
 
 
 @pytest.mark.asyncio
@@ -3480,12 +3527,23 @@ async def test_advance_candidate_skips_out_of_policy(tmp_path: Path):
     from types import SimpleNamespace
 
     store, orch, _, _ = _build(tmp_path)
-    orch._get_download_policy = lambda: SimpleNamespace(
-        quality_min="mp3_256", quality_max="mp3_320"
+    from api.v1.schemas.settings import DownloadPolicySettings
+    from models.acquisition_quality import (
+        AudioQualityEvidence as EV, CodecFamily as F,
     )
+    from services.native.acquisition.quality import build_snapshot
+
+    snap = build_snapshot(DownloadPolicySettings(quality_min="mp3_256", quality_max="mp3_320"))
+    orch._get_download_policy = None  # no snapshot on legacy task -> fail-open path
+    current = _candidate(0.9, username="tried")
+    stale_flac = _candidate(0.9, username="flacpeer")  # index 1 -> out of policy via evidence
+    ok_mp3 = _candidate(0.9, username="mp3peer2")
+    from services.native.acquisition.quality import evaluate as _qeval
+    stale_flac.quality_evidence = EV(extension="flac", codec_family=F.LOSSLESS)
+    stale_flac.quality_decision = _qeval(snap, stale_flac.quality_evidence)  # outside policy
+    ok_mp3.quality_evidence = EV(extension="mp3", codec_family=F.LOSSY, bitrate_kbps=320)
+    ok_mp3.quality_decision = _qeval(snap, ok_mp3.quality_evidence)  # in policy
     current = _candidate(0.9, username="tried")  # index 0 (the current pick)
-    stale_flac = _candidate(0.9, username="flacpeer")  # index 1 -> now out of policy
-    ok_mp3 = _mp3_candidate(username="mp3peer")  # index 2 -> in policy
     job = await store.create_search_job(
         user_id="user-a",
         artist_name="Artist",
@@ -3507,6 +3565,18 @@ async def test_advance_candidate_skips_out_of_policy(tmp_path: Path):
         status="downloading",
     )
 
+    await store.update_task_quality_fields(
+        [
+            {
+                "id": task.id,
+                "quality_snapshot_json": msgspec.json.encode(snap).decode(),
+                "quality_snapshot_hash": snap.snapshot_hash,
+                "quality_preference_step": None,
+            }
+        ]
+    )
+
+    task = await store.get_task(task.id)  # reload: stored snapshot governs
     refreshed = await orch._advance_candidate(task, set())
 
     # index 1 (FLAC) is skipped by the re-gate; failover lands on index 2 (the mp3).

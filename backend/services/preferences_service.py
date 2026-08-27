@@ -86,6 +86,10 @@ class PreferencesService:
         self._config_path = settings.config_file_path
         self._config_cache: Optional[dict] = None
         self._cache_lock = threading.RLock()
+        # Owner decision #1/#2 (Acquisition plan): a FRESH config seeds the
+        # Balanced preset before any normalization reads it. Existing
+        # installs (config file present) never receive these values.
+        self._seed_initial_acquisition_defaults()
         self._normalize_get_it_settings()
         self._migrate_musicbrainz_settings()
         self._ensure_instance_id()
@@ -275,8 +279,6 @@ class PreferencesService:
             logger.error("Failed to save download client settings: %s", e)
             raise ConfigurationError(f"Failed to save download client settings: {e}")
 
-    # --- Shared download policy (M5) - source-agnostic, migrated from slskd struct ---
-
     def get_download_policy(self) -> DownloadPolicySettings:
         """The source-agnostic acquisition policy. Reads ``download_policy`` if present;
         otherwise derives it (migration-on-read, COPY-not-delete) from the legacy
@@ -315,10 +317,67 @@ class PreferencesService:
 
     def save_download_policy(self, policy: DownloadPolicySettings) -> None:
         try:
-            self._save_section("download_policy", policy)
+            config = self._load_config().copy()
+            section = to_jsonable(policy)
+            # Legacy rollback mirrors (Acquisition plan): after every new-policy
+            # save, keep the closest legacy-representable values populated so a
+            # down-level image still loads a sane policy. Range/codec/wait keys
+            # are identity; Free Music's preferred_format tracks whether the
+            # accepted range includes lossless.
+            section["quality_min"] = policy.quality_min
+            section["quality_max"] = policy.quality_max
+            section["flac_mp3_only"] = policy.flac_mp3_only
+            section["preferred_quality_wait_minutes"] = (
+                policy.preferred_quality_wait_minutes
+            )
+            config["download_policy"] = section
+            free_music = config.get("free_music")
+            if not isinstance(free_music, dict):
+                free_music = {}
+            free_music["preferred_format"] = (
+                "flac" if "lossless" in policy.quality_preference_order else "mp3"
+            )
+            config["free_music"] = free_music
+            self._save_config(config)
+            logger.info("Saved download policy to %s", self._config_path)
         except Exception as e:  # noqa: BLE001
             logger.error("Failed to save download policy: %s", e)
             raise ConfigurationError(f"Failed to save download policy: {e}")
+
+    def _seed_initial_acquisition_defaults(self) -> None:
+        """First-boot seeding of ``download_policy`` for NEW installs only
+        (owner decisions 2026-08-27): Balanced preset - lossless→320→256→192,
+        lossy target 320, CD-quality lossless preferred and capped at
+        16-bit/48 kHz, unknown evidence parked for review, source-first."""
+        if self._config_path.exists():
+            return
+        try:
+            self._save_config(
+                {
+                    "download_policy": {
+                        "quality_min": "mp3_192",
+                        "quality_max": "lossless",
+                        "flac_mp3_only": True,
+                        "quality_preference_order": [
+                            "lossless",
+                            "mp3_320",
+                            "mp3_256",
+                            "mp3_192",
+                        ],
+                        "preferred_lossy_bitrate_kbps": 320,
+                        "lossless_preference": "cd",
+                        "lossless_max_bit_depth": 16,
+                        "lossless_max_sample_rate_hz": 48000,
+                        "unknown_quality_behavior": "review",
+                        "source_selection_mode": "source_first",
+                    }
+                }
+            )
+            logger.info(
+                "Seeded new-install acquisition defaults (Balanced preset)"
+            )
+        except Exception as exc:  # noqa: BLE001 - seeding must not block startup
+            logger.error("Failed to seed acquisition defaults: %s", exc)
 
     # --- Wanted watcher (Wanted plan §5.4) - mask-free, no secrets -------------------
 

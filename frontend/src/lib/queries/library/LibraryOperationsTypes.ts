@@ -13,6 +13,17 @@ export type LibraryWorkState =
 	| 'running'
 	| 'idle';
 
+export interface DeferredJobSummary {
+	job_id: string;
+	local_album_id: string | null;
+	album_title: string | null;
+	artist_name: string | null;
+	last_failure_code: string;
+	attempt_count: number;
+	not_before: number | null;
+	updated_at: number;
+}
+
 export interface LibraryActivityItem {
 	kind: 'scan' | 'identification';
 	state: LibraryWorkState;
@@ -29,6 +40,7 @@ export interface LibraryActivityItem {
 	failed_count: number;
 	deferred_count: number;
 	deferred_reason_counts: Record<string, number>;
+	deferred_jobs: DeferredJobSummary[];
 	attention_count: number;
 	priority_band: string | null;
 	oldest_backlog_at: number | null;

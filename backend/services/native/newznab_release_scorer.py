@@ -28,10 +28,16 @@ from services.native.acquisition.decision import (
     RejectCode,
     SpecPolicy,
 )
-from services.native.quality_tiers import (
-    DEFAULT_QUALITY_MAX,
-    DEFAULT_QUALITY_MIN,
+from models.acquisition_quality import (
+    AcquisitionQualitySnapshot,
+    AudioQualityEvidence,
+    CodecFamily,
+    EvidenceCertainty,
+    EvidenceProvenance,
+    QualityReason,
 )
+from services.native.acquisition import quality as acq_quality
+from services.native.quality_tiers import tier_rank
 from services.native.title_match import fold
 
 logger = logging.getLogger(__name__)
@@ -88,35 +94,84 @@ def _hires_rank(title: str) -> int:
     return 0
 
 
+def _release_evidence(release: UsenetRelease, tier: str) -> AudioQualityEvidence:
+    """Category/title provenance on a release-level projection. Title regexes can
+    carry bit-rate hints for lossy bands; Usenet exposes no trustworthy depth/rate."""
+    title = release.title or ""
+    provenance = (
+        EvidenceProvenance.CATEGORY
+        if _CAT_LOSSLESS in set(release.category_ids)
+        or _CAT_MP3 in set(release.category_ids)
+        else EvidenceProvenance.RELEASE_TITLE
+    )
+    bitrate = None
+    family = CodecFamily.UNKNOWN
+    certainty = EvidenceCertainty.INFERRED
+    ext = ""
+    if tier == "lossless":
+        family = CodecFamily.LOSSLESS
+        ext = "flac"
+    elif tier == "mp3_320":
+        family = CodecFamily.LOSSY
+        bitrate = 320
+        ext = "mp3"
+        certainty = (
+            EvidenceCertainty.PARTIAL
+            if _MP3_320_RE.search(title) or _MP3_GENERIC_RE.search(title)
+            else EvidenceCertainty.INFERRED
+        )
+    elif tier == "mp3_256":
+        family, bitrate, ext = CodecFamily.LOSSY, 256, "mp3"
+    elif tier == "mp3_192":
+        family, bitrate, ext = CodecFamily.LOSSY, 192, "mp3"
+    return AudioQualityEvidence(
+        extension=ext,
+        codec_family=family,
+        bitrate_kbps=bitrate,
+        total_bytes=release.size_bytes,
+        audio_file_count=1,
+        certainty=certainty,
+        provenance=provenance,
+    )
+
+
 class NewznabReleaseScorer:
-    def __init__(
-        self,
-        download_store: DownloadStore,
-        *,
-        quality_min: str = DEFAULT_QUALITY_MIN,
-        quality_max: str = DEFAULT_QUALITY_MAX,
-        flac_mp3_only: bool = True,
-        policy: SpecPolicy | None = None,
-    ) -> None:
+    """Quality flows exclusively through the per-call ``AcquisitionQualitySnapshot``;
+    identity/health weighting and distrust heuristics are unchanged. The ONE
+    sanctioned ``unknown``-tier semantics change (spec): the family-unknown rule now
+    reads ``snapshot.unknown_quality_behavior`` instead of an unconditional pass."""
+
+    def __init__(self, download_store: DownloadStore) -> None:
         self._store = download_store
-        self._flac_mp3_only = flac_mp3_only
-        # Full spec policy: passed by the composition root (built from DownloadPolicySettings)
-        # or derived from the quality kwargs in tests. Off-by-default gates leave behaviour
-        # unchanged for a quality-only construction.
-        self._policy = policy or SpecPolicy(quality_min=quality_min, quality_max=quality_max)
 
     async def rank(
         self,
         target: TargetAlbum,
         releases: list[UsenetRelease],
         *,
+        snapshot: AcquisitionQualitySnapshot,
+        spec_extras: "SpecPolicy | None" = None,
         auto_accept_threshold: float = 0.70,
         manual_threshold: float = 0.50,
         track_count: int | None = None,
         held_tier: str | None = None,
     ) -> list[ScoredCandidate]:
         context = await build_context(self._store, held_tier=held_tier)
-        policy = self._policy
+        import msgspec as _ms
+
+        order = snapshot.quality_preference_order
+        policy = SpecPolicy(
+            quality_min=order[-1] if order else "low",
+            quality_max=order[0] if order else "lossless",
+        )
+        if spec_extras is not None:
+            policy = _ms.structs.replace(
+                policy,
+                max_size_mb=spec_extras.max_size_mb,
+                ignored_terms=tuple(spec_extras.ignored_terms),
+                required_terms=tuple(spec_extras.required_terms),
+                usenet_retention_days=spec_extras.usenet_retention_days,
+            )
         tracks = track_count if track_count is not None else target.track_count
         scored: list[ScoredCandidate] = []
         dropped_video = dropped_size = 0
@@ -151,6 +206,16 @@ class NewznabReleaseScorer:
             if isinstance(decision, Reject):
                 pipeline_drops[decision.code] += 1
                 continue
+            # The ONE sanctioned change (spec): a literal 'unknown' tier no longer
+            # passes unconditionally - it obeys the snapshot's family-unknown rule.
+            if tier == "unknown":
+                rule = snapshot.unknown_quality_behavior
+                if rule == "reject":
+                    pipeline_drops[RejectCode.QUALITY_REJECTED] += 1
+                    continue
+                # 'review' and 'allow_as_fallback' stay scoreable here; review parks
+                # downstream when NO auto/manual candidate exists, and the fallback
+                # ordering slot is applied by the sort key below.
             # Size-plausibility MIN (min_size, Usenet-only) stays inline: it needs the DECLARED
             # tier's nominal bitrate + the album runtime, not just the candidate's bytes.
             if self._size_implausible(release, declared, tracks, target.duration_seconds):
@@ -166,6 +231,8 @@ class NewznabReleaseScorer:
                 else "manual" if final >= manual_threshold
                 else "rejected"
             )
+            decision_ev = _release_evidence(release, tier)
+            release_decision = acq_quality.evaluate(snapshot, decision_ev)
             scored.append(
                 ScoredCandidate(
                     source="usenet",
@@ -174,15 +241,34 @@ class NewznabReleaseScorer:
                     file_confidence=quality,
                     final_score=round(final, 4),
                     tier=band,
+                    quality_evidence=decision_ev,
+                    quality_decision=release_decision,
                 )
             )
 
         # Best score first; hi-res breaks an exact tie (a 24/96 release over a 16/44 one of
         # equal identity+quality+health) - H1, parallel to the Soulseek bit-depth/rate sort.
-        scored.sort(
-            key=lambda c: (c.final_score, _hires_rank(c.usenet_release.title if c.usenet_release else "")),
-            reverse=True,
-        )
+        band_rank = {"auto": 2, "manual": 1, "rejected": 0}
+        worst_step = len(order) + 2
+
+        def _sort_key(cand):
+            decision_ = cand.quality_decision
+            evidence_ = cand.quality_evidence
+            step = decision_.preference_step if decision_ else None
+            certainty = acq_quality.CERTAINTY_RANK[
+                evidence_.certainty if evidence_ else EvidenceCertainty.PARTIAL
+            ]
+            return (
+                band_rank.get(cand.tier, 0),
+                -(step if step is not None else worst_step),
+                -certainty,
+                cand.final_score,
+                _hires_rank(
+                    cand.usenet_release.title if cand.usenet_release else ""
+                ),
+            )
+
+        scored.sort(key=_sort_key, reverse=True)
         if dropped_video or dropped_size or pipeline_drops:
             logger.info(
                 "newznab.scored",

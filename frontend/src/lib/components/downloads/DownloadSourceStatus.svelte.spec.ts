@@ -97,7 +97,7 @@ describe('DownloadSourceStatus.svelte', () => {
 		await expect.element(page.getByText('Waiting for Soulseek · queue 2,710')).toBeVisible();
 		await expect.element(page.getByText('Trying source 1 of 3')).toBeVisible();
 		await expect.element(page.getByText('Live position 91–100')).toBeVisible();
-		await expect.element(page.getByText('Lower-quality fallback in 14m')).toBeVisible();
+		await expect.element(page.getByText('24-bit/48 kHz lossless fallback in 14m')).toBeVisible();
 		await expect.element(page.getByRole('status')).toHaveAttribute('aria-live', 'polite');
 	});
 
@@ -192,7 +192,7 @@ describe('DownloadSourceStatus.svelte', () => {
 		renderStatus(task({ downloaded_bytes: 1 }), 1);
 
 		await expect.element(page.getByText('Downloading from Soulseek')).toBeVisible();
-		await expect.element(page.getByText(/Lower-quality fallback/)).not.toBeInTheDocument();
+		await expect.element(page.getByText(/fallback in/)).not.toBeInTheDocument();
 		await expect
 			.element(page.getByRole('button', { name: 'Try the next ranked download source' }))
 			.not.toBeInTheDocument();
@@ -213,5 +213,76 @@ describe('DownloadSourceStatus.svelte', () => {
 		await expect.element(page.getByText('24-bit / 48 kHz FLAC')).not.toBeInTheDocument();
 		await expect.element(page.getByText('Downloading from Soulseek')).not.toBeInTheDocument();
 		await expect.element(page.getByText('Trying source 1 of 3')).not.toBeInTheDocument();
+	});
+
+	it('names the awaited preference from advertised lossy bitrate', async () => {
+		renderStatus(
+			task({
+				quality_format: 'mp3',
+				quality_bit_depth: null,
+				quality_sample_rate: null,
+				quality_bitrate: 320
+			})
+		);
+
+		await expect.element(page.getByText('Lossy 320 fallback in 14m')).toBeVisible();
+	});
+
+	it('states explicitly that no further fallback is accepted without a deadline', async () => {
+		renderStatus(task({ preferred_quality_fallback_at: null, has_next_source: false }));
+
+		await expect.element(page.getByText('No fallback accepted')).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Try the next ranked download source' }))
+			.not.toBeInTheDocument();
+	});
+
+	it('renders the display-only awaiting-review state with a candidates link', async () => {
+		renderStatus(task({ status: 'queued', search_job_id: 'job-9', candidate_index: null }));
+
+		await expect
+			.element(
+				page.getByText('Waiting: only unknown-resolution copies were found - review required')
+			)
+			.toBeVisible();
+		const link = page.getByRole('link', { name: 'Review candidates' });
+		await expect.element(link).toBeVisible();
+		await expect.element(link).toHaveAttribute('href', '/downloads');
+	});
+
+	it('hides the awaiting-review card once a candidate is picked or held', async () => {
+		renderStatus(task({ status: 'queued', candidate_index: 0 }));
+		await expect
+			.element(page.getByText(/unknown-resolution copies were found/))
+			.not.toBeInTheDocument();
+	});
+
+	it('shows quality evidence chips and the verbatim snapshot summary', async () => {
+		renderStatus(
+			task({
+				quality_bitrate: 320,
+				quality_preference_step: 1,
+				quality_certainty: 'inferred',
+				quality_provenance: 'release_title',
+				manual_quality_override: true,
+				quality_snapshot_summary:
+					'Lossless preferred up to 24-bit/192 kHz; lossy target 320 kbps within bounds.'
+			})
+		);
+
+		await expect.element(page.getByText('320 kbps', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('Fallback 1', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('Certainty: Inferred', { exact: true })).toBeVisible();
+		await expect
+			.element(page.getByText('Provenance: release title', { exact: true }))
+			.toBeVisible();
+		await expect.element(page.getByText('Manual pick', { exact: true })).toBeVisible();
+		await expect
+			.element(
+				page.getByTitle(
+					'Lossless preferred up to 24-bit/192 kHz; lossy target 320 kbps within bounds.'
+				)
+			)
+			.toBeVisible();
 	});
 });

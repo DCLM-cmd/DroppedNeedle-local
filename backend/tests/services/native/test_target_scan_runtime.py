@@ -2315,7 +2315,7 @@ async def test_target_identification_worker_circuit_open_defers_exact_and_one_wa
         worker_id="test-worker",
         work_wakeups=wakeups,
     )
-    queue.defer.assert_awaited_once_with({"id": "job1", "attempt_count": 1, "row_revision": 1}, "test-worker", "UNEXPECTED_ERROR", retry_after_seconds=10)
+    queue.defer.assert_awaited_once_with({"id": "job1", "attempt_count": 1, "row_revision": 1}, "test-worker", "PROVIDER_TEMPORARILY_UNAVAILABLE", retry_after_seconds=10)
     assert wakeups.wait.await_count == 1
     assert wakeups.wait.await_args.kwargs["timeout_seconds"] == 10
     assert queue.claim.await_count == 1

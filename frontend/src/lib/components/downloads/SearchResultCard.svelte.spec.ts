@@ -12,7 +12,15 @@ function renderCard(props: Record<string, unknown>) {
 	return render(SearchResultCard, { props } as unknown as RenderOpts);
 }
 
-function makeCandidate(overrides: Partial<ScoredCandidate> = {}): ScoredCandidate {
+type CandidateExtras = {
+	preference_step?: number | null;
+	preference_steps_total?: number | null;
+	certainty?: string | null;
+};
+
+function makeCandidate(
+	overrides: Partial<ScoredCandidate> & CandidateExtras = {}
+): ScoredCandidate & CandidateExtras {
 	return {
 		username: 'alice',
 		parent_directory: 'Radiohead - OK Computer (1997)',
@@ -118,5 +126,47 @@ describe('SearchResultCard.svelte', () => {
 		});
 		renderCard({ candidate: usenet, albumTitle: 'Some Album' });
 		await expect.element(page.getByText('unknown')).toBeInTheDocument();
+	});
+
+	it('labels legacy candidates Within policy and keeps the pick action as Pick anyway', async () => {
+		renderCard({ candidate: makeCandidate() });
+		await expect.element(page.getByText('Within policy', { exact: true })).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: /Pick candidate from alice/ }))
+			.toHaveTextContent('Pick anyway');
+	});
+
+	it('marks the top-ranked step as Preferred with a plain Pick button', async () => {
+		renderCard({ candidate: makeCandidate({ tier: 'auto', preference_step: 0 }) });
+		await expect.element(page.getByText('Preferred', { exact: true })).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: /Pick candidate from alice/ }))
+			.toHaveTextContent('Pick');
+	});
+
+	it('maps computed fallback steps into the Quality chip', async () => {
+		renderCard({
+			candidate: makeCandidate({
+				preference_step: 2,
+				preference_steps_total: 5,
+				certainty: 'partial'
+			})
+		});
+		await expect.element(page.getByText('Fallback 2', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('Unknown', { exact: true })).not.toBeInTheDocument();
+		renderCard({ candidate: makeCandidate({ preference_step: 2, certainty: 'unknown' }) });
+		await expect.element(page.getByText('Unknown', { exact: true })).toBeVisible();
+	});
+
+	it('blocks unimportable candidates while outside-policy imports stay reachable via Show all', async () => {
+		const onPick = vi.fn();
+		renderCard({ candidate: makeCandidate({ tier: 'rejected' }), onPick });
+		const button = page.getByRole('button', {
+			name: /Blocked: outside the accepted quality policy/
+		});
+		await expect.element(button).toBeDisabled();
+		await expect.element(button).toHaveTextContent('Unavailable');
+		await expect.element(page.getByText('Outside policy', { exact: true })).toBeVisible();
+		expect(onPick).not.toHaveBeenCalled();
 	});
 });

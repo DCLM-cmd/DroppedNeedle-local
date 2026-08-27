@@ -2,9 +2,10 @@
 	import { Download, X, Disc3, Check, Loader2, Library } from 'lucide-svelte';
 	import { discographyDownloadStore } from '$lib/stores/discographyDownload.svelte';
 	import { batchDownloadStore } from '$lib/stores/batchDownloadStatus.svelte';
-	import { requestBatch, type BatchAlbumItem } from '$lib/utils/albumRequest';
-	import { toastStore } from '$lib/stores/toast';
-	import { authStore } from '$lib/stores/authStore.svelte';
+	import {
+		requestBatch,
+		type BatchAlbumItem
+	} from '$lib/queries/downloads/DownloadMutations.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 
 	let dialogEl: HTMLDialogElement | undefined = $state();
@@ -15,6 +16,7 @@
 	let monitorArtist = $state(false);
 	let autoDownload = $state(false);
 
+	const batchRequest = requestBatch();
 	$effect(() => {
 		if (discographyDownloadStore.open) {
 			includeAlbums = true;
@@ -67,8 +69,6 @@
 
 	async function handleDownload() {
 		if (filteredReleases.length === 0) return;
-		const initiatingUserId = authStore.user?.id;
-		if (!initiatingUserId) return;
 		const artistName = discographyDownloadStore.artistName;
 		const artistId = discographyDownloadStore.artistId;
 		submitting = true;
@@ -81,24 +81,20 @@
 			artist_mbid: artistId
 		}));
 
-		const result = await requestBatch(items, {
-			monitorArtist,
-			autoDownloadArtist: autoDownload
-		});
-		if (authStore.user?.id !== initiatingUserId) {
-			return;
-		}
+		const result = await batchRequest
+			.mutateAsync({
+				items,
+				monitorArtist,
+				autoDownloadArtist: autoDownload
+			})
+			.catch(() => null);
 
-		if (result.success) {
+		if (result?.success) {
 			batchDownloadStore.addJob(
 				artistName,
 				artistId,
 				items.map((i) => i.musicbrainz_id)
 			);
-			toastStore.show({
-				message: `Requested ${result.requested} album${result.requested !== 1 ? 's' : ''} for ${artistName}`,
-				type: 'success'
-			});
 			handleClose();
 		}
 

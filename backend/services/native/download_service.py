@@ -145,6 +145,7 @@ class DownloadService:
         release_pin_store=None,  # AlbumReleasePinStore | None - edition pins (Feature E)
         ownership_service: "LibraryOwnershipService | None" = None,
         library_reconciler=None,
+        snapshot_factory=None,  # Callable[[], AcquisitionQualitySnapshot] (post-cutover)
     ):
         self._client = download_client
         self._indexer = indexer
@@ -168,6 +169,7 @@ class DownloadService:
         # Per-file scorer for 1-track releases in the manual-search lane (the auto path
         # branches inside SoulseekStrategy; this covers _search_soulseek + pick).
         self._track_matcher = track_matcher
+        self._snapshot_factory = snapshot_factory
         self._auto = auto_accept_threshold
         self._manual = manual_threshold
         self._enabled = enabled
@@ -883,9 +885,27 @@ class DownloadService:
             track_count=track_count,
             track_duration_seconds=track_duration_seconds,
             origin=origin,
+            **self._pinned_snapshot(),
         )
         self._orchestrator.dispatch(task.id)
         return task.id
+
+
+    def _pinned_snapshot(self):
+        """Creation-time immutable policy snapshot; tests/legacy constructions
+        without a factory produce untagged rows the startup backfill covers."""
+        if self._snapshot_factory is None:
+            return {}
+        import json as _json
+
+        from infrastructure.serialization import to_jsonable as _to
+
+        snapshot = self._snapshot_factory()
+        return {
+            "quality_snapshot_json": _json.dumps(_to(snapshot)),
+            "quality_snapshot_hash": snapshot.snapshot_hash,
+            "quality_snapshot_summary": snapshot.summary,
+        }
 
     async def request_track(
         self,

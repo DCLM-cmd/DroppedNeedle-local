@@ -43,6 +43,13 @@ class FreeMusicTask(AppStruct):
     album_title: str | None = None
     track_number: int | None = None
     disc_number: int | None = None
+    # Immutable acquisition-quality snapshot pinned at task creation, plus the
+    # persisted tried-candidate ladder (identifier+format pairs) so restart and
+    # mismatch failover are deterministic (Acquisition plan).
+    quality_snapshot_json: str | None = None
+    quality_snapshot_hash: str | None = None
+    quality_snapshot_summary: str | None = None
+    tried_candidates_json: str = "[]"
 
 
 class FreeMusicCandidate(AppStruct):

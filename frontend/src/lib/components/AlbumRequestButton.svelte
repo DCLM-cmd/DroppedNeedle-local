@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Download } from 'lucide-svelte';
-	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { colors } from '$lib/colors';
 
 	interface Props {
@@ -16,18 +16,23 @@
 
 	let requesting = $state(false);
 
+	const albumRequest = requestAlbum();
+
 	async function handleRequest(e: MouseEvent) {
 		e.stopPropagation();
 		e.preventDefault();
 		if (requesting) return;
 		requesting = true;
 		try {
-			await requestAlbum(mbid, {
-				artist: artistName || undefined,
-				album: albumName,
-				year: year ?? undefined,
-				artistMbid
-			});
+			await albumRequest
+				.mutateAsync({
+					release_group_mbid: mbid,
+					artist_name: artistName || undefined,
+					album_title: albumName,
+					year: year ?? undefined,
+					artist_mbid: artistMbid
+				})
+				.catch(() => null);
 		} finally {
 			requesting = false;
 		}

@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import msgspec
+import msgspec as _msgspec
 
 from core.exceptions import (
     ConflictError,
@@ -33,6 +34,8 @@ from core.task_registry import TaskRegistry
 from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.sse_publisher import SSEPublisher
+from models.acquisition_quality import AcquisitionQualitySnapshot
+from services.native.acquisition import quality as acq_quality
 from models.download_manifest import (
     DownloadManifest,
     ExpectedFile,
@@ -179,6 +182,30 @@ def _log_task_exception(task: "asyncio.Task") -> None:
         logger.error("Background download task failed: %s", exc, exc_info=exc)
 
 
+def json_dumps_safe(snapshot) -> str:
+    import json as _json
+    from infrastructure.serialization import to_jsonable as _to
+
+    return _json.dumps(_to(snapshot))
+
+
+class _DefaultPolicyShim:
+    """Last-resort legacy-default policy mirror for tests constructing the
+    orchestrator without a policy getter."""
+    quality_min = "mp3_320"
+    quality_max = "lossless"
+    quality_preference_order: list[str] = []
+    preferred_lossy_bitrate_kbps = None
+    lossy_min_bitrate_kbps = None
+    lossy_max_bitrate_kbps = None
+    lossless_preference = "highest"
+    lossless_max_bit_depth = None
+    lossless_max_sample_rate_hz = None
+    flac_mp3_only = True
+    unknown_quality_behavior = "allow_as_fallback"
+    source_selection_mode = "source_first"
+
+
 class DownloadOrchestrator:
     def __init__(
         self,
@@ -218,10 +245,15 @@ class DownloadOrchestrator:
         usenet_post_processing: int | None = None,
         usenet_min_release_age_minutes: float = 30.0,
         usenet_import_settle_seconds: float = 2.0,
-        # Fresh reader of the current download policy: re-check a stored candidate
-        # against the live quality range before an automatic re-dispatch (failover /
-        # track-repull). None = not wired (tests) -> re-gate skipped.
-        get_download_policy=None,  # Callable[[], DownloadPolicySettings] | None
+        # Fresh reader of the current download policy: ONLY used to synthesise a
+        # migration snapshot for legacy rows lacking one. Quality for live work
+        # comes from each task's STORED snapshot; restart-with-current-policy is
+        # the explicit refresh.
+        get_download_policy=None,
+        # Live non-quality spec gates (max size / terms / retention), refreshed
+        # per search - never quality-shaped.
+        spec_policy_extras=None,
+        probe_tagger=None,  # AudioTagger for the pre-publication quality probe
         wanted_store=None,  # WantedStore | None
         cleanup_service: AcquisitionCleanupService | None = None,
     ) -> None:
@@ -266,6 +298,8 @@ class DownloadOrchestrator:
         self._request_history = request_history
         self._on_import = on_import_callback
         self._get_download_policy = get_download_policy
+        self._spec_policy_extras = spec_policy_extras
+        self._probe_tagger = probe_tagger
         self._wanted_store = wanted_store
         self._cleanup = cleanup_service
         self._usenet_scorer = usenet_scorer  # for the Usenet re-gate tier (Phase 2)
@@ -290,6 +324,8 @@ class DownloadOrchestrator:
                 naming_template=naming_template,
                 library=library_manager,
                 album_service=album_service,
+                policy_extras=self._spec_policy_extras,
+                probe_tagger=probe_tagger,
             ),
         }
         # Created whenever a SABnzbd client exists (not gated on the indexer), so a Usenet
@@ -312,6 +348,8 @@ class DownloadOrchestrator:
                 post_processing=usenet_post_processing,
                 min_release_age_seconds=usenet_min_release_age_minutes * 60.0,
                 library=library_manager,
+                policy_extras=self._spec_policy_extras,
+                probe_tagger=probe_tagger,
             )
 
     def dispatch(self, task_id: str) -> "asyncio.Task":
@@ -488,22 +526,140 @@ class DownloadOrchestrator:
         joined = " or ".join(names) if names else "any source"
         return f"{_NO_MATCH_MSG} on {joined}"
 
-    async def _search_and_score(self, task, source: str):  # noqa: ANN001, ANN201
-        """Search ONE source and return its scored candidates (tagged with ``source``),
-        via the source strategy (step 4). Called only for sources that ``_source_enabled``
-        passed, so the strategy is always present."""
+    async def _search_and_score(
+        self, task, source: str, *, snapshot=None
+    ):  # noqa: ANN001, ANN201
+        """Search ONE source under ``snapshot`` (resolved per task when omitted),
+        returning its snapshot-ranked candidates via the source strategy."""
+        if snapshot is None:
+            snapshot = await self._task_quality_snapshot(task)
         timeout = 30.0 + 15.0 * min(task.retry_count, 4)
         return await self._strategies[source].search_and_score(
-            task, timeout=timeout, auto=self._auto, manual=self._manual
+            task,
+            timeout=timeout,
+            auto=self._auto,
+            manual=self._manual,
+            snapshot=snapshot,
+        )
+
+    async def _task_quality_snapshot(self, task):  # noqa: ANN001
+        """Decode-or-derive the snapshot for THIS task (stored governs; legacy
+        rows synthesise a migration-tagged snapshot from the live policy so
+        pre-backfill behaviour is preserved without ever re-snapshotting new
+        work against mutable settings)."""
+        raw = getattr(task, "quality_snapshot_json", None)
+        if raw:
+            try:
+                return _msgspec.json.decode(raw, type=AcquisitionQualitySnapshot)
+            except ValueError:
+                logger.warning("download.snapshot_decode_failed task=%s", task.id)
+        if self._get_download_policy is not None:
+            return acq_quality.migration_snapshot(self._get_download_policy())
+        return acq_quality.build_snapshot(
+            _DefaultPolicyShim()
+        )
+
+    def _source_selection_mode(self) -> str:
+        if self._get_download_policy is not None:
+            return self._get_download_policy().source_selection_mode
+        return "source_first"
+
+    async def _concurrent_search_and_score(self, task):  # noqa: ANN001
+        """quality_first (opt-in): search every enabled source CONCURRENTLY under
+        the existing per-source timeout, pooling results per source. One failed
+        or slow source never erases another's candidates."""
+        enabled = [s for s in self._source_priority if self._source_enabled(s)]
+        snapshot = await self._task_quality_snapshot(task)
+
+        async def run_one(source):
+            try:
+                return source, await self._search_and_score(
+                    task, source, snapshot=snapshot
+                )
+            except Exception:  # noqa: BLE001 - isolation by design
+                logger.exception("download.source_search_failed source=%s", source)
+                return source, []
+
+        outcomes = await asyncio.gather(*(run_one(source) for source in enabled))
+        return dict(outcomes)
+
+    @staticmethod
+    def _remember_offsets(groups):
+        offsets = []
+        running = 0
+        for group in groups:
+            offsets.append(running)
+            running += len(group)
+        return offsets
+
+    def _global_preference_pick(self, pooled, offsets):
+        """Earliest GLOBAL preference step among identity-automatic candidates;
+        configured source order breaks ties (opt-in quality_first mode)."""
+        best = None
+        for group_index, candidate in enumerate(pooled):
+            if candidate.tier != "auto":
+                continue
+            decision = getattr(candidate, "quality_decision", None)
+            step = (
+                decision.preference_step
+                if decision is not None and decision.preference_step is not None
+                else 10_000
+            )
+            key = (
+                step,
+                -acq_quality.CERTAINTY_RANK[
+                    candidate.quality_evidence.certainty
+                    if candidate.quality_evidence is not None
+                    else __import__("models.acquisition_quality", fromlist=["EvidenceCertainty"]).EvidenceCertainty.PARTIAL
+                ],
+                next(
+                    (
+                        group_index - offset
+                        for offset in reversed(offsets)
+                        if group_index >= offset
+                    ),
+                    0,
+                ),
+            )
+            if best is None or key < best[0]:
+                best = (key, group_index, candidate)
+        if best is None:
+            return None
+        return best[1], best[2]
+
+    async def _finish_no_candidates(self, job_id, task):  # noqa: ANN001
+        await self._store.update_search_job_status(job_id, "completed")
+        if task.origin == "upgrade":
+            await self._store.update_status(
+                task.id,
+                DownloadStatus.CANCELLED,
+                error_message="No better copy found",
+                cancelled_at=time.time(),
+            )
+            await self._bus.publish(
+                f"download:{task.id}",
+                "complete",
+                {"status": DownloadStatus.CANCELLED, "error": "no better copy found"},
+            )
+            return
+        await self._store.update_status(
+            task.id, DownloadStatus.FAILED, error_message=self._no_match_message()
+        )
+        await self._bus.publish(
+            f"download:{task.id}",
+            "complete",
+            {"status": DownloadStatus.FAILED, "error": "no match"},
         )
 
     async def _search_score_autopick(self, task) -> bool:  # noqa: ANN001 - DownloadTask
-        """Route the automatic path across ``source_priority`` (D3: Soulseek-first,
-        Usenet-fallback). A source's auto-accept candidate is picked immediately and
-        later sources are NOT searched. If no source auto-accepts, all candidates are
-        pooled into ONE source-grouped review job (D16) and parked, or failed.
-
-        Returns True iff a candidate was auto-picked + linked; False when parked/failed."""
+        """Route the automatic path across ``source_priority``. DEFAULT
+        (``source_first``): walk configured order; use the first source with an
+        identity-automatic candidate; candidates inside each source arrive
+        ranked by the task snapshot's global preference step. Opt-in
+        (``quality_first``): search all sources concurrently and take the
+        earliest global preference step among automatics, source order breaking
+        ties. No auto anywhere pools ONE source-grouped review job (D16)."""
+        snapshot = await self._task_quality_snapshot(task)
         job = await self._store.create_search_job(
             user_id=task.user_id,
             artist_name=task.artist_name,
@@ -513,13 +669,53 @@ class DownloadOrchestrator:
             release_group_mbid=task.release_group_mbid,
             artist_mbid=task.artist_mbid,
             search_query=f"{task.artist_name} - {task.album_title}",
+            quality_snapshot_json=json_dumps_safe(snapshot),
+            quality_snapshot_hash=snapshot.snapshot_hash,
+            quality_snapshot_summary=snapshot.summary,
         )
 
         remembered: list[list] = []
+        if self._source_selection_mode() == "quality_first":
+            by_source = await self._concurrent_search_and_score(task)
+            for source in self._source_priority:
+                if self._source_enabled(source):
+                    remembered.append(by_source.get(source, []))
+            pooled_flat = [c for group in remembered for c in group]
+            await self._store.set_search_job_candidates(job.id, pooled_flat)
+            picked = self._global_preference_pick(
+                pooled_flat, self._remember_offsets(remembered)
+            )
+            if picked is not None:
+                index, selected = picked
+                await self._store.link_picked_candidate(
+                    task_id=task.id,
+                    search_job_id=job.id,
+                    candidate_index=index,
+                    source_username=selected.username,
+                    source_directory=selected.parent_directory,
+                    preflight_score=selected.final_score,
+                    source=selected.source,
+                    download_client=_CLIENT_FOR_SOURCE.get(selected.source, "slskd"),
+                )
+                return True
+            if any(c.tier in ("auto", "manual") for c in pooled_flat):
+                await self._store.set_search_job_id_and_candidate(task.id, job.id, None)
+                await self._store.update_search_job_status(job.id, "completed")
+                await self._bus.publish(
+                    f"download:{task.id}",
+                    "status",
+                    {"status": DownloadStatus.AWAITING_REVIEW, "search_job_id": job.id},
+                )
+                return False
+            await self._finish_no_candidates(job.id, task)
+            return False
+
         for source in self._source_priority:
             if not self._source_enabled(source):
                 continue
-            candidates = await self._search_and_score(task, source)
+            candidates = await self._search_and_score(
+                task, source, snapshot=snapshot
+            )
             remembered.append(candidates)
             logger.info(
                 "download.search.completed",
@@ -555,7 +751,7 @@ class DownloadOrchestrator:
                 )
                 return True
 
-        # No source auto-accepted: pool all candidates (source-grouped, D16) for review.
+        # No source auto-accepted: pool all candidates (source-grouped, D16).
         pooled = [c for group in remembered for c in group]
         await self._store.set_search_job_candidates(job.id, pooled)
         if any(c.tier in ("auto", "manual") for c in pooled):
@@ -567,32 +763,7 @@ class DownloadOrchestrator:
                 {"status": DownloadStatus.AWAITING_REVIEW, "search_job_id": job.id},
             )
             return False
-
-        await self._store.update_search_job_status(job.id, "completed")
-        if task.origin == "upgrade":
-            # No candidate beat the upgrade floor: NOT a failure - the library is
-            # intact and nothing was attempted. End without entering the failed
-            # bucket; upgrades are excluded from auto-retry anyway).
-            await self._store.update_status(
-                task.id,
-                DownloadStatus.CANCELLED,
-                error_message="No better copy found",
-                cancelled_at=time.time(),
-            )
-            await self._bus.publish(
-                f"download:{task.id}",
-                "complete",
-                {"status": DownloadStatus.CANCELLED, "error": "no better copy found"},
-            )
-            return False
-        await self._store.update_status(
-            task.id, DownloadStatus.FAILED, error_message=self._no_match_message()
-        )
-        await self._bus.publish(
-            f"download:{task.id}",
-            "complete",
-            {"status": DownloadStatus.FAILED, "error": "no match"},
-        )
+        await self._finish_no_candidates(job.id, task)
         return False
 
     def _strategy(self, source: str) -> SourceStrategy:
@@ -1175,7 +1346,7 @@ class DownloadOrchestrator:
             return
         cand = candidates[0]
         # Re-gate before re-pulling: don't fetch a candidate the live policy now rejects.
-        if not self._candidate_passes_quality(cand, task.track_count):
+        if not await self._candidate_passes_quality(task, cand):
             await self._settle_incomplete(task, False)
             return
         await self._store.link_picked_candidate(
@@ -1325,6 +1496,15 @@ class DownloadOrchestrator:
         queue_depths = [
             file.queue_length for file in audio if file.queue_length is not None
         ]
+        decision = getattr(candidate, "quality_decision", None)
+        step = decision.preference_step if decision is not None else None
+        if step is None:
+            # Legacy blob: derive from canonical tier via fidelity rank so the
+            # deadline ordering degrades gracefully pre-backfill.
+            legacy_step = {k: i for i, k in enumerate(
+                ("low", "mp3_192", "mp3_256", "mp3_320", "lossless")
+            )}.get(tier)
+            step = 10_000 - (legacy_step or 0)
         return {
             "format": "/".join(formats) or None,
             "bit_depth": (
@@ -1334,8 +1514,12 @@ class DownloadOrchestrator:
                 rank_sample_rate if all(file.sample_rate for file in audio) else None
             ),
             "queue_depth": max(queue_depths) if queue_depths else None,
-            "pool_key": f"{tier}:{rank_bit_depth}:{rank_sample_rate}",
-            "rank": (tier_rank(tier), rank_bit_depth, rank_sample_rate),
+            # STABLE policy-step key (Acquisition plan): a same-step replacement
+            # never resets the zero-byte clock; only a strictly less-preferred
+            # STEP starts/countinues it.
+            "pool_key": f"step:{step}",
+            "step": step,
+            "rank": (step, tier_rank(tier), rank_bit_depth, rank_sample_rate),
         }
 
     @staticmethod
@@ -1381,7 +1565,7 @@ class DownloadOrchestrator:
             if self._candidate_source_identity(cand) in tried_usernames:
                 continue
             # re-gate: failover must not fall through to a now out-of-policy candidate (D2)
-            if not self._candidate_passes_quality(cand, task.track_count):
+            if not await self._candidate_passes_quality(task, cand):
                 continue
             if lower_than is not None:
                 details = self._candidate_quality_details(cand)
@@ -1510,36 +1694,76 @@ class DownloadOrchestrator:
     def _candidate_source_identity(self, cand) -> str:  # noqa: ANN001 - ScoredCandidate
         return self._strategy(cand.source).candidate_identity(cand)
 
-    def _candidate_passes_quality(self, cand, track_count=None) -> bool:  # noqa: ANN001
-        """Re-check a STORED candidate against the CURRENT quality policy before an
-        AUTOMATIC re-dispatch (failover / track-repull). A policy tightened after the
-        candidate was scored must not be defeated by re-dispatching a now out-of-range
-        stored candidate. Explicit user picks (``pick_candidate``) and ``reimport_task``
-        (an admin re-import of files already fetched by hand) are intentionally NOT gated
-        (owner decision D2). Mirrors the score-time gates: the ``flac_mp3_only`` codec
-        gate + quality range for Soulseek, and the release tier for Usenet; an
-        ``unknown`` tier passes exactly as ``quality_range`` does. Returns True (pass)
-        when unwired or when the tier can't be determined, so behaviour is unchanged by
-        default."""
-        if self._get_download_policy is None:
+    def _stored_snapshot(self, task):  # noqa: ANN001
+        """The task's persisted creation-time snapshot; legacy rows (pre-backfill
+        blobs without JSON) fall back to a migration-tagged derivation from the
+        LIVE getter so they still re-gate against today's range instead of none."""
+        raw = getattr(task, "quality_snapshot_json", None)
+        if raw:
+            try:
+                return _msgspec.json.decode(
+                    raw, type=AcquisitionQualitySnapshot
+                )
+            except ValueError:
+                logger.warning("download.snapshot_decode_failed task=%s", task.id)
+        if self._get_download_policy is not None:
+            return acq_quality.migration_snapshot(self._get_download_policy())
+        return None
+
+    async def _candidate_passes_quality(self, task, cand) -> bool:  # noqa: ANN001
+        """Re-check a STORED candidate under the TASK'S STORED snapshot before an
+        AUTOMATIC re-dispatch (failover / track-repull). Deliberate resolution of
+        live-vs-stored (Acquisition plan): what governed the search governs the
+        re-pull; ``restart-with-current-policy`` is the explicit refresh. Explicit
+        user picks (``pick_candidate``) and ``reimport_task`` are intentionally NOT
+        gated (owner decision D2). Candidates scored after the cutover carry their
+        quality_decision; legacy blobs are re-evaluated from source fields under
+        the SAME snapshot. True when unsnapshotted and unwired, or undeterminable,
+        preserving fail-open behaviour."""
+        snapshot = self._stored_snapshot(task)
+        if snapshot is None:
             return True
-        policy = self._get_download_policy()
+        # Codec gate mirrors the score-time filter for Soulseek folders.
+        if (
+            getattr(snapshot, "flac_mp3_only", False)
+            and cand.source != "usenet"
+        ):
+            from services.native.quality_tiers import is_audio as _is_audio
+            from services.native.quality_tiers import is_flac_or_mp3 as _is_flac
+
+            audio_files = [f for f in cand.files if _is_audio(f)]
+            if audio_files and not all(_is_flac(f) for f in audio_files):
+                return False
+        if cand.quality_evidence is not None:
+            # Post-cutover candidate: its evaluation is embedded in the blob.
+            decision = acq_quality.evaluate(snapshot, cand.quality_evidence)
+            return bool(decision.eligible)
+        # Legacy blob projection.
         if cand.source == "usenet":
             if cand.usenet_release is None or self._usenet_scorer is None:
                 return True  # can't judge -> don't block
-            tier = self._usenet_scorer.release_tier(cand.usenet_release, track_count)
+            from services.native.newznab_release_scorer import _release_evidence
+
+            tier = self._usenet_scorer.release_tier(cand.usenet_release, task.track_count)
+            evidence = _release_evidence(cand.usenet_release, tier)
         else:
+            from services.native.album_preflight_scorer import _file_evidence
+
             audio = [f for f in cand.files if is_audio(f)]
             if not audio:
                 return True  # no judgeable audio -> don't block
-            if getattr(policy, "flac_mp3_only", False) and not all(
-                is_flac_or_mp3(f) for f in audio
-            ):
-                return False
-            tier = candidate_tier(audio)
-        if tier == "unknown":
-            return True
-        return in_range(tier, policy.quality_min, policy.quality_max)
+            decision_files = [_file_evidence(f) for f in audio]
+            merged = acq_quality.evaluate_worst(snapshot, decision_files)
+            evidence = merged.evidence
+        decision = acq_quality.evaluate(snapshot, evidence)
+        return bool(decision.eligible)
+
+    def _candidate_preference_step(self, cand, track_count=None):  # noqa: ANN001
+        """Stable step index for THIS candidate under its own evaluation -
+        the zero-byte fallback deadline keys to this (not (tier,depth,rate))."""
+        if cand.quality_decision is not None:
+            return cand.quality_decision.preference_step
+        return None
 
     async def _mark_candidate_tried(self, task, tried: set) -> None:  # noqa: ANN001
         if task.search_job_id is None or task.candidate_index is None:
@@ -2514,6 +2738,12 @@ class DownloadOrchestrator:
             # everything else becomes 'retry' so quota counts ignore it.
             origin=task.origin if task.origin == "upgrade" else "retry",
             retry_count=task.retry_count + 1,
+            # Retry REUSES the stored snapshot (spec): the original policy
+            # governs; restart-with-current-policy is the explicit refresh.
+            quality_snapshot_json=getattr(task, "quality_snapshot_json", None),
+            quality_snapshot_hash=getattr(task, "quality_snapshot_hash", None),
+            quality_snapshot_summary=getattr(task, "quality_snapshot_summary", None),
+            quality_preference_step=getattr(task, "quality_preference_step", None),
         )
         # The retried task owns its staging dir from birth (#285 class): every
         # manifest write in the enqueue path targets <staging>/<new_id>/, and a

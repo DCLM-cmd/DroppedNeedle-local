@@ -4,8 +4,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from api.v1.schemas.settings import DownloadPolicySettings
 from models.download import TargetTrack
 from repositories.protocols.download_client import DownloadSearchResult
+from services.native.acquisition.quality import build_snapshot
 from services.native.track_matcher import TrackMatcher
 
 
@@ -13,6 +15,13 @@ def _store(quarantine=None):
     store = AsyncMock()
     store.load_quarantine_set.return_value = set(quarantine or set())
     return store
+
+
+def policy_snapshot(**over):
+    """Legacy quality kwargs moved onto the required keyword-only snapshot."""
+    base = dict(quality_min="mp3_320", quality_max="lossless")
+    base.update(over)
+    return build_snapshot(DownloadPolicySettings(**base))
 
 
 def _file(
@@ -54,7 +63,7 @@ _TARGET = TargetTrack(
 async def test_match_returns_single_file_candidate():
     results = [_file("Radiohead - OK Computer/Airbag.flac", "Radiohead - OK Computer")]
     matcher = TrackMatcher(_store())
-    candidate = await matcher.match(_TARGET, results)
+    candidate = await matcher.match(_TARGET, results, snapshot=policy_snapshot())
     assert candidate is not None
     assert len(candidate.files) == 1
     assert candidate.tier == "auto"
@@ -64,7 +73,7 @@ async def test_match_returns_single_file_candidate():
 @pytest.mark.asyncio
 async def test_match_no_results_returns_none():
     matcher = TrackMatcher(_store())
-    assert await matcher.match(_TARGET, []) is None
+    assert await matcher.match(_TARGET, [], snapshot=policy_snapshot()) is None
 
 
 @pytest.mark.asyncio
@@ -76,7 +85,7 @@ async def test_match_excludes_quarantined():
         ("soulseek", soulseek_identity(results[0].username, results[0].filename))
     }
     matcher = TrackMatcher(_store(quarantine=quarantined))
-    assert await matcher.match(_TARGET, results) is None
+    assert await matcher.match(_TARGET, results, snapshot=policy_snapshot()) is None
 
 
 @pytest.mark.asyncio
@@ -84,7 +93,9 @@ async def test_match_picks_highest_confidence():
     good = _file("Radiohead - OK Computer/Airbag.flac", "Radiohead - OK Computer")
     wrong = _file("Misc/Some Other Track.flac", "Misc", duration=120.0)
     matcher = TrackMatcher(_store())
-    candidate = await matcher.match(_TARGET, [wrong, good])
+    candidate = await matcher.match(
+        _TARGET, [wrong, good], snapshot=policy_snapshot()
+    )
     assert candidate.files[0].filename == good.filename
 
 
@@ -92,10 +103,13 @@ async def test_match_picks_highest_confidence():
 async def test_match_flac_mp3_only_excludes_other_codecs():
     ogg = _file("Artist/Airbag.ogg", "Artist", ext="ogg", bitrate=320)
     assert (
-        await TrackMatcher(_store()).match(_TARGET, [ogg]) is None
+        await TrackMatcher(_store()).match(_TARGET, [ogg], snapshot=policy_snapshot())
+        is None
     )  # default: flac_mp3_only
     assert (
-        await TrackMatcher(_store(), flac_mp3_only=False).match(_TARGET, [ogg])
+        await TrackMatcher(_store()).match(
+            _TARGET, [ogg], snapshot=policy_snapshot(flac_mp3_only=False)
+        )
         is not None
     )
 
@@ -108,8 +122,15 @@ async def test_match_only_lossless_drops_mp3():
         ext="mp3",
         bitrate=320,
     )
-    matcher = TrackMatcher(_store(), quality_min="lossless", quality_max="lossless")
-    assert await matcher.match(_TARGET, [mp3]) is None
+    matcher = TrackMatcher(_store())
+    assert (
+        await matcher.match(
+            _TARGET,
+            [mp3],
+            snapshot=policy_snapshot(quality_min="lossless", quality_max="lossless"),
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -121,7 +142,9 @@ async def test_match_prefers_higher_identity_band_before_format():
         bitrate=320,
     )
     flac = _file("OKC/Airbag.flac", "OKC", ext="flac", username="bob")
-    candidate = await TrackMatcher(_store()).match(_TARGET, [mp3, flac])
+    candidate = await TrackMatcher(_store()).match(
+        _TARGET, [mp3, flac], snapshot=policy_snapshot()
+    )
     assert candidate is not None
     assert candidate.files[0].username == "alice"
 
@@ -149,7 +172,9 @@ async def test_match_prefers_hires_lossless_over_free_redbook_peer():
         speed=20_000_000,
     )
 
-    ranked = await TrackMatcher(_store()).rank(_TARGET, [free_redbook, queued_hires])
+    ranked = await TrackMatcher(_store()).rank(
+        _TARGET, [free_redbook, queued_hires], snapshot=policy_snapshot()
+    )
 
     assert [candidate.username for candidate in ranked] == [
         "queued-hires",
@@ -179,6 +204,7 @@ async def test_match_uses_slot_queue_and_speed_within_identical_resolution():
             peer("short-fast", free=False, queue_length=1, speed=5_000_000),
             peer("free-slow", free=True, queue_length=0, speed=500_000),
         ],
+        snapshot=policy_snapshot(),
     )
 
     assert [candidate.username for candidate in ranked] == [
@@ -198,14 +224,21 @@ async def test_rank_held_tier_floor_keeps_only_strictly_better():
         _file("B/Airbag.mp3", "B", ext="mp3", bitrate=320, username="mp3320-peer"),
         _file("C/Airbag.mp3", "C", ext="mp3", bitrate=192, username="mp3192-peer"),
     ]
-    matcher = TrackMatcher(_store(), quality_min="low")
+    matcher = TrackMatcher(_store())
 
-    ranked = await matcher.rank(_TARGET, results, held_tier="mp3_320")
+    ranked = await matcher.rank(
+        _TARGET,
+        results,
+        snapshot=policy_snapshot(quality_min="low"),
+        held_tier="mp3_320",
+    )
 
     assert [c.username for c in ranked] == ["flac-peer"]  # only lossless beats mp3_320
 
     # no floor (not an upgrade run): everything in range still ranks
-    ranked = await matcher.rank(_TARGET, results)
+    ranked = await matcher.rank(
+        _TARGET, results, snapshot=policy_snapshot(quality_min="low")
+    )
     assert {c.username for c in ranked} == {"flac-peer", "mp3320-peer", "mp3192-peer"}
 
 
@@ -220,7 +253,9 @@ async def test_auto_requires_artist_evidence_in_path():
     wrong = _file(
         "Dan Romer - Some Soundtrack/Airbag.flac", "Dan Romer - Some Soundtrack"
     )
-    ranked = await TrackMatcher(_store()).rank(_TARGET, [wrong])
+    ranked = await TrackMatcher(_store()).rank(
+        _TARGET, [wrong], snapshot=policy_snapshot()
+    )
     assert len(ranked) == 1
     assert ranked[0].tier == "manual"
 
@@ -230,7 +265,9 @@ async def test_auto_kept_when_artist_is_a_grandparent_dir():
     # Artist/Album share layout: evidence lives in the full remote path, not the
     # parent folder name.
     nested = _file("@@x\\Radiohead\\OK Computer\\Airbag.flac", "OK Computer")
-    ranked = await TrackMatcher(_store()).rank(_TARGET, [nested])
+    ranked = await TrackMatcher(_store()).rank(
+        _TARGET, [nested], snapshot=policy_snapshot()
+    )
     assert ranked[0].tier == "auto"
 
 
@@ -240,7 +277,9 @@ async def test_obfuscated_folder_caps_at_manual_not_fabricated_auto():
     (``_artist_from_path`` falls back to the target artist). Score may stay high,
     but the tier must be 'manual' - absence of evidence is unknown, not a match."""
     bare = _file("@@abc\\the arrival\\Airbag.flac", "the arrival")
-    ranked = await TrackMatcher(_store()).rank(_TARGET, [bare])
+    ranked = await TrackMatcher(_store()).rank(
+        _TARGET, [bare], snapshot=policy_snapshot()
+    )
     assert ranked[0].tier == "manual"
 
 
@@ -261,7 +300,9 @@ async def test_incident_candidate_replay_never_auto():
         duration=137.0,
         username="Fabrizio83a",
     )
-    ranked = await TrackMatcher(_store()).rank(target, [incident])
+    ranked = await TrackMatcher(_store()).rank(
+        target, [incident], snapshot=policy_snapshot()
+    )
     assert len(ranked) == 1
     assert ranked[0].tier != "auto"
     assert ranked[0].final_score < 0.70

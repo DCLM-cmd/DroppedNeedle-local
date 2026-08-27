@@ -39,13 +39,22 @@ from api.v1.schemas.download import (
     NextSourceResponse,
     ReimportDownloadResponse,
     RetryAllResponse,
+    RestartWithPolicyRequest,
+    RestartWithPolicyResponse,
     RetryDownloadResponse,
     StopRetriesResponse,
     UpgradeAlbumRequestBody,
     UpgradeRequestResponse,
     UpgradeTrackRequestBody,
 )
-from core.dependencies import get_download_service, get_sse_publisher
+from core.dependencies import (
+    get_download_orchestrator,
+    get_download_service,
+    get_download_store,
+    get_preferences_service,
+    get_quota_service,
+    get_sse_publisher,
+)
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from middleware import CurrentAdminDep, CurrentCuratorDep, CurrentUserDep
 from services.native.download_service import ALREADY_IN_LIBRARY
@@ -106,7 +115,14 @@ def _to_response(  # noqa: ANN001 - DownloadTask
         retry_ladder_minutes=retry_ladder_minutes or [],
         acquisition_cleanup_state=acquisition_cleanup_state,
         quality_format=task.quality_format,
+        quality_bitrate=task.quality_bitrate,
         quality_bit_depth=task.quality_bit_depth,
+        quality_snapshot_summary=task.quality_snapshot_summary,
+        quality_snapshot_hash=task.quality_snapshot_hash,
+        quality_preference_step=task.quality_preference_step,
+        quality_certainty=task.quality_certainty,
+        quality_provenance=task.quality_provenance,
+        manual_quality_override=bool(task.manual_quality_override),
         quality_sample_rate=task.quality_sample_rate,
         advertised_queue_depth=task.advertised_queue_depth,
         queue_position_start=task.queue_position_start,
@@ -219,6 +235,81 @@ async def get_download_files(
             DownloadFileItem(filename=f.filename, size=f.size, duration=f.duration)
             for f in files
         ],
+    )
+
+
+@router.post(
+    "/{task_id}/restart-with-current-policy",
+    response_model=RestartWithPolicyResponse,
+)
+async def restart_with_current_policy(
+    task_id: str,
+    current_user: CurrentUserDep,
+    body: "RestartWithPolicyRequest | None" = None,
+):
+    """Owner-or-admin safe restart under the CURRENT global policy (spec).
+    Zero transferred bytes required; remote-queued tasks are refused with
+    guidance (their dedicated abort path is cancel/re-request). Storage
+    admission re-runs before reset; the whole swap is one atomic transaction
+    that retains the old snapshot on any failure."""
+    import json
+
+    from core.dependencies import get_download_orchestrator, get_quota_service
+    from core.exceptions import ConflictError, ResourceNotFoundError, ValidationError
+    from infrastructure.serialization import to_jsonable
+    from services.native.acquisition.quality import build_snapshot
+
+    store = get_download_store()
+    prefs = get_preferences_service()
+    role = getattr(current_user, "role", "user")
+    task = await store.get_task_for_user(task_id, current_user.id, role)
+    if task is None:
+        raise ResourceNotFoundError("Download not found")
+
+    if task.downloaded_bytes > 0:
+        raise ConflictError(
+            "This download already transferred files - restart only works before any bytes move"
+        )
+    if task.remote_queued:
+        raise ConflictError(
+            "This download sits in the source's remote queue - cancel it, then "
+            "request again so the new policy applies"
+        )
+    if task.status not in ("queued", "downloading", "processing"):
+        raise ValidationError("Only an active search or queued download can be restarted")
+
+    quota = get_quota_service()
+    await quota.check_storage_admission(task.user_id, task.origin or "user")
+
+    snapshot = build_snapshot(prefs.get_download_policy())
+    expected = getattr(body, "expected_snapshot_hash", None) if body else None
+    ok = await store.apply_quality_policy_restart(
+        task.id,
+        expected_snapshot_hash=expected,
+        new_snapshot_json=json.dumps(to_jsonable(snapshot)),
+        new_snapshot_hash=snapshot.snapshot_hash,
+        new_snapshot_summary=snapshot.summary,
+    )
+    if not ok:
+        raise ConflictError(
+            "The stored policy changed since you opened this view - refresh and retry"
+        )
+    # Stop any still-live poll loop for the previous candidate before
+    # re-dispatching; cancellation is in-memory only (the persisted row was
+    # already reset above), so a registry duplicate can never 500 the swap.
+    orchestrator = get_download_orchestrator()
+    stale_handle = getattr(orchestrator, "_active_tasks", {}).get(task_id)
+    if stale_handle is not None and not stale_handle.done():
+        stale_handle.cancel()
+        try:
+            await stale_handle
+        except BaseException:  # noqa: BLE001 - joined either way
+            pass
+    orchestrator.dispatch(task.id)
+    return RestartWithPolicyResponse(
+        accepted=True,
+        snapshot_summary=snapshot.summary,
+        message="Restarting with the current server quality policy",
     )
 
 

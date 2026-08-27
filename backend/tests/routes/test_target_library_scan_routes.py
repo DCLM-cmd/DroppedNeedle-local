@@ -97,6 +97,18 @@ def identification_queue() -> AsyncMock:
         "deferred_count": 0,
         "claimable_count": 0,
         "deferred_reason_counts": {},
+        "deferred_jobs": [
+            {
+                "job_id": "job-d1",
+                "local_album_id": "a1",
+                "album_title": "Stuck Album",
+                "artist_name": "Stuck Artist",
+                "last_failure_code": "UNEXPECTED_ERROR",
+                "attempt_count": 3,
+                "not_before": 100.0,
+                "updated_at": 90.0,
+            }
+        ],
         "attention_count": 0,
         "failure_event_id": None,
         "failure_at": None,
@@ -316,6 +328,18 @@ def test_activity_is_authenticated_and_redacted(
         "updated_at": 11.0,
         "deferred_count": 1,
         "deferred_reason_counts": {"PROVIDER_TEMPORARILY_UNAVAILABLE": 1},
+        "deferred_jobs": [
+            {
+                "job_id": "job-d2",
+                "local_album_id": "a2",
+                "album_title": "Paused Album",
+                "artist_name": "Paused Artist",
+                "last_failure_code": "UNEXPECTED_ERROR",
+                "attempt_count": 2,
+                "not_before": 12.0,
+                "updated_at": 11.0,
+            }
+        ],
         "attention_count": 2,
         "kept_local_count": 4,
         "active_priority": 30,
@@ -341,6 +365,18 @@ def test_activity_is_authenticated_and_redacted(
         "failed_count": 0,
         "deferred_count": 1,
         "deferred_reason_counts": {"PROVIDER_TEMPORARILY_UNAVAILABLE": 1},
+        "deferred_jobs": [
+            {
+                "job_id": "job-d2",
+                "local_album_id": "a2",
+                "album_title": "Paused Album",
+                "artist_name": "Paused Artist",
+                "last_failure_code": "UNEXPECTED_ERROR",
+                "attempt_count": 2,
+                "not_before": 12.0,
+                "updated_at": 11.0,
+            }
+        ],
         "attention_count": 2,
         "priority_band": "Administrator retries",
         "oldest_backlog_at": 2.0,

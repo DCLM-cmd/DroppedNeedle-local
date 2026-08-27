@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 
 from api.v1.schemas.library_scan_target import (
+    DeferredIdentificationJobSummary,
     IdentificationControlRequestBody,
     IdentificationControlResponse,
     LibraryActivityItem,
@@ -303,6 +304,10 @@ async def library_activity(
                 deferred_count=identification_snapshot["deferred_count"],
                 deferred_reason_counts=identification_snapshot[
                     "deferred_reason_counts"
+                ],
+                deferred_jobs=[
+                    DeferredIdentificationJobSummary(**row)
+                    for row in identification_snapshot.get("deferred_jobs", [])
                 ],
                 attention_count=identification_snapshot["attention_count"],
                 priority_band=(
