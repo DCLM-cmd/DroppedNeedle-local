@@ -1371,6 +1371,7 @@ def _build_artist_service(
     library_repo, library_db=None, ownership_service=None
 ) -> "ArtistService":
     from services.artist_service import ArtistService
+    from .cache_providers import get_native_library_store
 
     mb_repo = get_musicbrainz_repository()
     wikidata_repo = get_wikidata_repository()
@@ -1390,6 +1391,7 @@ def _build_artist_service(
         browse_queue,
         library_db,
         ownership_service,
+        native_library_store=get_native_library_store(),
     )
 
 
@@ -2591,6 +2593,7 @@ def _acquisition_snapshot_factory():
 
     return factory
 
+
 def _build_spec_policy(policy):
     """Map the API ``DownloadPolicySettings`` onto the decoupled spec ``SpecPolicy`` (the
     composition root is the one place coupling the two is fine). The size/term gates
@@ -2660,9 +2663,9 @@ def get_acquisition_cleanup_service() -> "AcquisitionCleanupService":
         lambda: Path(
             get_preferences_service().get_sabnzbd_connection_raw().downloads_mount
         ),
-        sab_category_getter=lambda: get_preferences_service()
-        .get_sabnzbd_connection_raw()
-        .category,
+        sab_category_getter=lambda: (
+            get_preferences_service().get_sabnzbd_connection_raw().category
+        ),
     )
 
 

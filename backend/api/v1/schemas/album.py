@@ -17,6 +17,7 @@ class AlbumBasicInfo(AppStruct):
     requested: bool = False
     cover_url: str | None = None
     album_thumb_url: str | None = None
+    service_status: dict[str, str] | None = None
 
 
 class AlbumTracksInfo(AppStruct):

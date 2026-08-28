@@ -1,6 +1,14 @@
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
 from core.exceptions import ClientDisconnectedError
 from api.v1.schemas.album import (
     AlbumBasicInfo,
@@ -15,7 +23,14 @@ from api.v1.schemas.album import (
 )
 from api.v1.schemas.discovery import SimilarAlbumsResponse, MoreByArtistResponse
 from api.v1.schemas.get_it import PurchaseOptionsResponse
-from core.dependencies import get_album_service, get_album_discovery_service, get_album_enrichment_service, get_download_service, get_get_it_service, get_navidrome_library_service
+from core.dependencies import (
+    get_album_service,
+    get_album_discovery_service,
+    get_album_enrichment_service,
+    get_download_service,
+    get_get_it_service,
+    get_navidrome_library_service,
+)
 from services.album_service import AlbumService
 from services.album_discovery_service import AlbumDiscoveryService
 from services.album_enrichment_service import AlbumEnrichmentService
@@ -37,25 +52,25 @@ router = APIRouter(route_class=MsgSpecRoute, prefix="/albums", tags=["album"])
 
 @router.get("/{album_id}", response_model=AlbumInfo)
 async def get_album(
-    album_id: str,
-    album_service: AlbumService = Depends(get_album_service)
+    album_id: str, album_service: AlbumService = Depends(get_album_service)
 ):
     if is_unknown_mbid(album_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid or unknown album ID: {album_id}"
+            detail=f"Invalid or unknown album ID: {album_id}",
         )
-    
+
     try:
         result = await album_service.get_album_info(album_id)
         ctx = try_get_degradation_context()
         if ctx is not None and ctx.has_degradation():
-            result = msgspec.structs.replace(result, service_status=ctx.degraded_summary())
+            result = msgspec.structs.replace(
+                result, service_status=ctx.degraded_summary()
+            )
         return result
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid album request"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
         )
 
 
@@ -68,7 +83,7 @@ async def refresh_album(
     if is_unknown_mbid(album_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid or unknown album ID: {album_id}"
+            detail=f"Invalid or unknown album ID: {album_id}",
         )
 
     try:
@@ -77,8 +92,7 @@ async def refresh_album(
         return await album_service.get_album_basic_info(album_id)
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid album request"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
         )
 
 
@@ -104,25 +118,29 @@ async def get_album_basic(
     album_id: str,
     request: Request,
     background_tasks: BackgroundTasks,
-    album_service: AlbumService = Depends(get_album_service)
+    album_service: AlbumService = Depends(get_album_service),
 ):
     if await request.is_disconnected():
         raise ClientDisconnectedError("Client disconnected")
-    
+
     if is_unknown_mbid(album_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid or unknown album ID: {album_id}"
+            detail=f"Invalid or unknown album ID: {album_id}",
         )
-    
+
     try:
         result = await album_service.get_album_basic_info(album_id)
+        ctx = try_get_degradation_context()
+        if ctx is not None and ctx.has_degradation():
+            result = msgspec.structs.replace(
+                result, service_status=ctx.degraded_summary()
+            )
         background_tasks.add_task(album_service.warm_full_album_cache, album_id)
         return result
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid album request"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
         )
 
 
@@ -130,23 +148,22 @@ async def get_album_basic(
 async def get_album_tracks(
     album_id: str,
     request: Request,
-    album_service: AlbumService = Depends(get_album_service)
+    album_service: AlbumService = Depends(get_album_service),
 ):
     if await request.is_disconnected():
         raise ClientDisconnectedError("Client disconnected")
-    
+
     if is_unknown_mbid(album_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid or unknown album ID: {album_id}"
+            detail=f"Invalid or unknown album ID: {album_id}",
         )
-    
+
     try:
         return await album_service.get_album_tracks_info(album_id)
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid album request"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
         )
 
 
@@ -156,14 +173,16 @@ async def get_similar_albums(
     current_user: CurrentUserDep,
     artist_id: str = Query(..., description="Artist MBID for similarity lookup"),
     count: int = Query(default=10, ge=1, le=30),
-    discovery_service: AlbumDiscoveryService = Depends(get_album_discovery_service)
+    discovery_service: AlbumDiscoveryService = Depends(get_album_discovery_service),
 ):
     if is_unknown_mbid(album_id) or is_unknown_mbid(artist_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or unknown album/artist ID"
+            detail="Invalid or unknown album/artist ID",
         )
-    return await discovery_service.get_similar_albums(album_id, artist_id, count, user_id=current_user.id)
+    return await discovery_service.get_similar_albums(
+        album_id, artist_id, count, user_id=current_user.id
+    )
 
 
 @router.get("/{album_id}/more-by-artist", response_model=MoreByArtistResponse)
@@ -171,12 +190,12 @@ async def get_more_by_artist(
     album_id: str,
     artist_id: str = Query(..., description="Artist MBID"),
     count: int = Query(default=10, ge=1, le=30),
-    discovery_service: AlbumDiscoveryService = Depends(get_album_discovery_service)
+    discovery_service: AlbumDiscoveryService = Depends(get_album_discovery_service),
 ):
     if is_unknown_mbid(artist_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or unknown artist ID"
+            detail="Invalid or unknown artist ID",
         )
     return await discovery_service.get_more_by_artist(
         artist_id, album_id, count, priority=RequestPriority.USER_INITIATED
@@ -193,7 +212,7 @@ async def get_album_lastfm_enrichment(
     if is_unknown_mbid(album_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid or unknown album ID: {album_id}"
+            detail=f"Invalid or unknown album ID: {album_id}",
         )
     result = await enrichment_service.get_lastfm_enrichment(
         artist_name=artist_name, album_name=album_name, album_mbid=album_id
@@ -201,6 +220,7 @@ async def get_album_lastfm_enrichment(
     if result is None:
         return LastFmAlbumEnrichment()
     return result
+
 
 # --- Album edition selection (CollectionManagement Feature E) -------------------
 
@@ -217,8 +237,7 @@ async def list_album_editions(
         data = await album_service.list_editions(album_id)
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid album request"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
         )
     return AlbumEditionsResponse(
         items=[AlbumEditionItem(**item) for item in data["items"]],
@@ -238,11 +257,12 @@ async def set_album_edition(
     """Pin an edition (admin/trusted, D16): the album page and acquisition follow it
     until cleared. Busts the album caches."""
     try:
-        await album_service.set_edition_pin(album_id, body.release_mbid, current_user.id)
+        await album_service.set_edition_pin(
+            album_id, body.release_mbid, current_user.id
+        )
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid album request"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
         )
     return EditionPinResponse(pinned_release_mbid=body.release_mbid)
 
@@ -258,8 +278,7 @@ async def clear_album_edition(
         await album_service.clear_edition_pin(album_id)
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid album request"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
         )
     return EditionPinResponse(pinned_release_mbid=None)
 

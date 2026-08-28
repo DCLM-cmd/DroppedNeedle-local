@@ -16,7 +16,11 @@
 	import WhereToBuy from './WhereToBuy.svelte';
 	import { albumHref } from '$lib/utils/entityRoutes';
 	import LibraryAlbumCard from '$lib/components/library/LibraryAlbumCard.svelte';
-	import { getLibraryAlbumCopiesQuery } from '$lib/queries/library/LibraryQueries.svelte';
+	import {
+		getLibraryAlbumCopiesQuery,
+		getLibraryAlbumDetailQuery
+	} from '$lib/queries/library/LibraryQueries.svelte';
+	import LocalAlbumPage from './LocalAlbumPage.svelte';
 
 	interface Props {
 		data: { albumId: string };
@@ -27,6 +31,12 @@
 	const state = createAlbumPageState(() => data.albumId);
 	const localCopiesQuery = getLibraryAlbumCopiesQuery(() => data.albumId);
 	const localCopies = $derived(localCopiesQuery.data?.items ?? []);
+	// MusicBrainz-down fallback: the library detail endpoint is MB-free, so a
+	// locally owned album still renders (and plays) when the provider fetch
+	// fails. The service_status stamp on the degraded payload drives the
+	// global banner; this branch covers cold caches and restarts.
+	const localDetailQuery = getLibraryAlbumDetailQuery(() => data.albumId);
+	const degradedLocalAlbum = $derived(localDetailQuery.data ?? null);
 
 	$effect(() => {
 		const canonicalId = state.album?.musicbrainz_id;
@@ -41,7 +51,17 @@
 		<BackButton />
 	</div>
 
-	{#if state.error}
+	{#if state.error && degradedLocalAlbum}
+		<div class="mb-4 flex justify-center">
+			<div class="alert alert-info text-sm">
+				<span
+					>MusicBrainz is unreachable right now, so this page is built from your local files. Some
+					extras are hidden until it returns.</span
+				>
+			</div>
+		</div>
+		<LocalAlbumPage albumId={degradedLocalAlbum.id} />
+	{:else if state.error}
 		<div class="flex items-center justify-center min-h-[50vh]">
 			<div class="alert alert-error">
 				<span>{state.error}</span>

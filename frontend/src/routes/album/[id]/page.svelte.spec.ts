@@ -122,7 +122,15 @@ vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
 		data: undefined,
 		isLoading: false,
 		isError: false
-	})
+	}),
+	// ProviderAlbumPage now statically imports LocalAlbumPage →
+	// LocalAlbumTrackList + AlbumOrganizationDialog, which need these at
+	// import time.
+	getLibraryAlbumTracksQuery: () => ({
+		data: { items: [], total: 0 },
+		isLoading: false
+	}),
+	getLibraryAlbumsQuery: () => ({ data: { items: [] }, isLoading: false })
 }));
 
 // Where-to-buy section (Get it): stub so the page renders without a QueryClientProvider

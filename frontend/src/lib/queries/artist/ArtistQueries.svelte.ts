@@ -14,16 +14,21 @@ import type {
 	TopSongsResponse
 } from '$lib/types';
 import type { MusicSource } from '$lib/stores/musicSource';
+import { extractServiceStatus } from '$lib/utils/serviceStatus';
 import { setQueryDataWithPersister } from '../QueryClient';
 
 export const getBasicArtistQueryOptions = (artistId: string) =>
 	queryOptions({
 		staleTime: CACHE_TTL.ARTIST_DETAIL_BASIC,
 		queryKey: ArtistQueryKeyFactory.basic(artistId),
-		queryFn: ({ signal }) =>
-			api.global.get<ArtistInfoBasic>(API.artist.basic(artistId), {
-				signal
-			})
+		queryFn: async ({ signal }) => {
+			const data = await api.global.get<ArtistInfoBasic>(API.artist.basic(artistId), { signal });
+			// mirrors albumPageState: the degraded payload carries
+			// service_status and api.global bypasses the header-recording
+			// fetch wrapper
+			extractServiceStatus(data);
+			return data;
+		}
 	});
 
 export const getBasicArtistQuery = (getArtistId: Getter<string>) =>

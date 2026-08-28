@@ -42,6 +42,7 @@ from core.task_registry import TaskRegistry
 
 if TYPE_CHECKING:
     from infrastructure.persistence import LibraryDB
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
     from services.native.library_ownership_service import LibraryOwnershipService
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ class ArtistService:
         audiodb_browse_queue: Any = None,
         library_db: "LibraryDB | None" = None,
         ownership_service: "LibraryOwnershipService | None" = None,
+        native_library_store: "NativeLibraryStore | None" = None,
     ):
         self._mb_repo = mb_repo
         self._library_repo = library_repo
@@ -96,6 +98,7 @@ class ArtistService:
         self._audiodb_browse_queue = audiodb_browse_queue
         self._library_db = library_db
         self._ownership = ownership_service
+        self._native_library_store = native_library_store
         self._artist_in_flight: dict[str, asyncio.Future[ArtistInfo]] = {}
         self._artist_basic_in_flight: dict[str, asyncio.Future[ArtistInfo]] = {}
         # B1: coalesces concurrent cold /extended renders onto one leader chain.
@@ -289,9 +292,22 @@ class ArtistService:
         library_artist_mbids: set[str] | None,
         library_album_mbids: dict[str, Any] | None,
     ) -> ArtistInfo:
-        artist_info = await self._build_artist_from_musicbrainz(
-            artist_id, library_artist_mbids, library_album_mbids
-        )
+        try:
+            artist_info = await self._build_artist_from_musicbrainz(
+                artist_id, library_artist_mbids, library_album_mbids
+            )
+        except ResourceNotFoundError:
+            # MB down: a locally known artist renders from its local rows.
+            # Runs inside the coalesced leader so followers settle to the
+            # degraded result too. Not cached.
+            local_info = await self._build_artist_info_from_local(artist_id)
+            if local_info is not None:
+                logger.warning(
+                    "Artist detail artist=%s source=local-degraded (musicbrainz unavailable)",
+                    artist_id[:8],
+                )
+                return local_info
+            raise
         await self._refresh_library_flags(artist_info)
         artist_info = await self._apply_audiodb_artist_images(
             artist_info,
@@ -302,6 +318,34 @@ class ArtistService:
         )
         await self._save_artist_to_cache(artist_id, artist_info)
         return artist_info
+
+    async def _build_artist_info_from_local(self, artist_id: str) -> ArtistInfo | None:
+        """Degraded-mode artist payload built purely from local catalog rows.
+
+        Serves locally known artists when MusicBrainz cannot answer. Nothing
+        here consults MB, so the result is never cached under the MB-derived
+        key. Releases stay empty: the page's album grid is library-backed
+        elsewhere, and the MB discography degrades to empty on its own.
+        """
+        if self._native_library_store is None:
+            return None
+        artist_rows, _total = await self._native_library_store.list_target_artists(
+            limit=1, artist_ids=[artist_id], scope="all"
+        )
+        if not artist_rows:
+            return None
+        row = artist_rows[0]
+        provider_artist_mbid = row.get("provider_artist_mbid")
+        return ArtistInfo(
+            name=str(row["artist_name"] or ""),
+            musicbrainz_id=(
+                str(provider_artist_mbid) if provider_artist_mbid else artist_id
+            ),
+            in_library=True,
+            appears_in_library=True,
+            release_group_count=int(row.get("album_count") or 0),
+            service_status=None,
+        )
 
     async def _build_artist_from_musicbrainz(
         self,
@@ -379,9 +423,24 @@ class ArtistService:
         future: asyncio.Future[ArtistInfo] = loop.create_future()
         self._artist_basic_in_flight[artist_id] = future
         try:
-            artist_info = await self._build_artist_from_musicbrainz(
-                artist_id, include_extended=False, include_releases=False
-            )
+            try:
+                artist_info = await self._build_artist_from_musicbrainz(
+                    artist_id, include_extended=False, include_releases=False
+                )
+            except ResourceNotFoundError:
+                # MB down: a locally known artist renders from its local
+                # rows. Runs inside the coalesced leader so followers settle
+                # to the degraded result too. Not cached.
+                local_info = await self._build_artist_info_from_local(artist_id)
+                if local_info is not None:
+                    logger.warning(
+                        "Artist info artist=%s source=local-degraded (musicbrainz unavailable)",
+                        artist_id[:8],
+                    )
+                    if not future.done():
+                        future.set_result(local_info)
+                    return local_info
+                raise
             # B3.1: same disjoint-field gather as the cached path above.
             await asyncio.gather(
                 self._refresh_library_flags(artist_info),
@@ -487,6 +546,8 @@ class ArtistService:
                 )
                 await self._disk_cache.delete_artist(artist_id)
                 return None
+            return artist_info
+        return None
 
     async def _save_artist_to_cache(
         self, artist_id: str, artist_info: ArtistInfo

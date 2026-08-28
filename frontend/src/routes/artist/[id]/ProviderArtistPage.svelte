@@ -13,6 +13,8 @@
 	import LastFmEnrichment from '$lib/components/LastFmEnrichment.svelte';
 	import LibraryAlbumsCarousel from '$lib/components/LibraryAlbumsCarousel.svelte';
 	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
+	import LocalArtistPage from './LocalArtistPage.svelte';
+	import { getLibraryArtistDetailQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import PageSectionToc from '$lib/components/PageSectionToc.svelte';
 	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
@@ -115,7 +117,12 @@
 		}
 		return null;
 	});
-
+	// MusicBrainz-down fallback: the library artist endpoint is MB-free, so a
+	// locally known artist still renders (and plays) when the provider fetch
+	// fails. The service_status stamp on the degraded payload drives the
+	// global banner; this branch covers cold caches and restarts.
+	const localArtistDetailQuery = getLibraryArtistDetailQuery(() => data.artistId);
+	const degradedLocalArtist = $derived(localArtistDetailQuery.data ?? null);
 	const artist = $derived.by(() => {
 		if (!artistBasic) return null;
 		return {
@@ -237,7 +244,17 @@
 </script>
 
 <div class="w-full px-2 sm:px-4 lg:px-8 py-4 sm:py-8 max-w-7xl mx-auto">
-	{#if error}
+	{#if artistBasicQuery.error && degradedLocalArtist}
+		<div class="mb-4 flex justify-center">
+			<div class="alert alert-info text-sm">
+				<span
+					>MusicBrainz is unreachable right now, so this page is built from your local files. Some
+					extras are hidden until it returns.</span
+				>
+			</div>
+		</div>
+		<LocalArtistPage artistId={degradedLocalArtist.id} />
+	{:else if error}
 		<div class="flex items-center justify-center min-h-[50vh]">
 			<div class="alert alert-error">
 				<span>{error}</span>

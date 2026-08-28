@@ -153,6 +153,7 @@ export type ArtistInfoBasic = {
 	auto_download?: boolean;
 	auto_download_state?: 'none' | 'pending' | 'approved' | 'rejected' | 'revoked';
 	release_group_count?: number;
+	service_status?: Record<string, string> | null;
 };
 
 export type ArtistInfoExtended = {
@@ -211,6 +212,7 @@ export type AlbumBasicInfo = {
 	requested?: boolean;
 	cover_url?: string | null;
 	album_thumb_url?: string | null;
+	service_status?: Record<string, string> | null;
 };
 
 export type AlbumTracksInfo = {

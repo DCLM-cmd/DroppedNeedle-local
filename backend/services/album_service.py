@@ -342,9 +342,23 @@ class AlbumService:
         library_mbids: set[str] | None,
         priority: RequestPriority,
     ) -> AlbumInfo:
-        album_info = await self._build_album_from_musicbrainz(
-            release_group_id, library_mbids, priority
-        )
+        try:
+            album_info = await self._build_album_from_musicbrainz(
+                release_group_id, library_mbids, priority
+            )
+        except ResourceNotFoundError:
+            # MB down: a locally owned album still renders from its own rows.
+            # Runs inside the coalesced leader so followers settle to the
+            # degraded result too. Not cached; the next MB-healthy request
+            # rebuilds the full payload.
+            local_info = await self._build_album_info_from_local(release_group_id)
+            if local_info is not None:
+                logger.warning(
+                    "Album info album=%s source=local-degraded (musicbrainz unavailable)",
+                    release_group_id[:8],
+                )
+                return local_info
+            raise
         album_info = await self._apply_audiodb_album_images(
             album_info,
             release_group_id,
@@ -355,6 +369,114 @@ class AlbumService:
         )
         await self._save_album_to_cache(release_group_id, album_info)
         return album_info
+
+    async def _build_album_info_from_local(
+        self, release_group_id: str
+    ) -> AlbumInfo | None:
+        """Degraded-mode album payload built purely from local catalog rows.
+
+        Serves library-owned albums when MusicBrainz cannot answer: the page
+        needs title/artist/year and a playable tracklist, which local_albums +
+        local_tracks hold. Nothing here consults MB, so the result must not be
+        cached under the MB-derived key (it would pin an enrichment-poor copy).
+        """
+        if self._native_library_store is None:
+            return None
+        ownership = await self._native_library_store.target_album_ownership_rows(
+            provider_ids={release_group_id.casefold()}
+        )
+        if len(ownership) != 1:
+            return None
+        row = ownership[0]
+        local_album_id = str(row["local_album_id"])
+        track_rows = await self._native_library_store.get_target_album_tracks(
+            local_album_id
+        )
+        if not track_rows:
+            return None
+
+        track_items: list[Track] = []
+        total_length = 0
+        for track in track_rows:
+            length: int | None = None
+            duration = track.get("duration_seconds")
+            if duration is not None:
+                try:
+                    seconds = float(duration)
+                    if math.isfinite(seconds) and seconds > 0:
+                        length = round(seconds * 1000)
+                except (TypeError, ValueError):
+                    pass
+            if length is not None:
+                total_length += length
+            recording_mbid = track.get("recording_mbid")
+            release_track_mbid = track.get("release_track_mbid")
+            track_items.append(
+                Track(
+                    position=int(track.get("track_number") or 0),
+                    disc_number=int(track.get("disc_number") or 1),
+                    title=str(track.get("track_title") or track.get("title") or ""),
+                    length=length,
+                    recording_id=(str(recording_mbid) if recording_mbid else None),
+                    release_track_id=(
+                        str(release_track_mbid) if release_track_mbid else None
+                    ),
+                )
+            )
+
+        title = str(row["title"] or "")
+        artist_name = str(row["album_artist_name"] or "")
+        # The album projection carries provider_artist_mbid from
+        # local_artist_external_identities.
+        albums, _total = await self._native_library_store.list_target_albums(
+            limit=1, album_ids=[local_album_id]
+        )
+        provider_artist = albums[0].get("provider_artist_mbid") if albums else None
+        artist_id = str(provider_artist or "")
+        year = row.get("year")
+        return AlbumInfo(
+            title=title,
+            musicbrainz_id=release_group_id,
+            artist_name=artist_name,
+            artist_id=artist_id,
+            release_date=None,
+            year=int(year) if year is not None else None,
+            type=None,
+            disambiguation=None,
+            tracks=track_items,
+            total_tracks=len(track_items),
+            total_length=total_length if total_length > 0 else None,
+            in_library=True,
+            requested=False,
+            cover_url=None,
+            album_thumb_url=None,
+            service_status=None,
+        )
+
+    async def _build_album_basic_info_from_local(
+        self, release_group_id: str
+    ) -> AlbumBasicInfo | None:
+        """Basic-info variant of the degraded payload: same local rows, no
+        tracklist. The page's first call is /basic; the full variant backs
+        GET /albums/{id}."""
+        info = await self._build_album_info_from_local(release_group_id)
+        if info is None:
+            return None
+        return AlbumBasicInfo(
+            title=info.title,
+            musicbrainz_id=info.musicbrainz_id,
+            artist_name=info.artist_name,
+            artist_id=info.artist_id,
+            release_date=info.release_date,
+            year=info.year,
+            type=info.type,
+            disambiguation=info.disambiguation,
+            in_library=info.in_library,
+            requested=info.requested,
+            cover_url=info.cover_url,
+            album_thumb_url=info.album_thumb_url,
+            service_status=info.service_status,
+        )
 
     async def get_album_basic_info(self, release_group_id: str) -> AlbumBasicInfo:
         release_group_id = await self._provider_album_id(release_group_id)
@@ -406,7 +528,23 @@ class AlbumService:
                     album_thumb_url=album_thumb,
                 )
 
-            release_group = await self._fetch_release_group(release_group_id)
+            try:
+                release_group = await self._fetch_release_group(release_group_id)
+            except ResourceNotFoundError:
+                # MB down: a locally owned album still renders from its own
+                # rows. Only after _fetch_release_group exhausted the #78
+                # release→RG retry, so a real miss on a non-library album
+                # still 404s. Not cached.
+                local_basic = await self._build_album_basic_info_from_local(
+                    release_group_id
+                )
+                if local_basic is not None:
+                    logger.warning(
+                        "Album basic album=%s source=local-degraded (musicbrainz unavailable)",
+                        release_group_id[:8],
+                    )
+                    return local_basic
+                raise
             # in_library means non-deleted local files exist; the materialised
             # library_albums row lags removals and misses manually-added files.
             # Key the check on the canonical RG id - when the requested id was a
