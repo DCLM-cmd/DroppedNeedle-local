@@ -31,6 +31,7 @@ from infrastructure.cache.cache_keys import (
 )
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
+from infrastructure.degradation import try_get_degradation_context
 from infrastructure.validators import validate_mbid
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.http.disconnect import DisconnectCallable, check_disconnected
@@ -652,7 +653,7 @@ class ArtistService:
             included_primary_types = set(t.lower() for t in prefs.primary_types)
             included_secondary_types = set(t.lower() for t in prefs.secondary_types)
 
-            return await self._filter_aware_release_page(
+            result = await self._filter_aware_release_page(
                 artist_id,
                 offset,
                 limit,
@@ -662,6 +663,25 @@ class ArtistService:
                 included_secondary_types,
                 is_disconnected,
             )
+            if (
+                result.returned_count == 0
+                and result.source_total_count == 0
+                and not result.warming
+            ):
+                # get_artist_release_groups collapses every MB failure into
+                # ([], 0): an outage looks like an empty catalog. Locally
+                # owned artists serve their local discography instead.
+                # Not cached.
+                local = await self._build_artist_releases_from_local(
+                    artist_id, offset, limit
+                )
+                if local is not None:
+                    logger.warning(
+                        "Artist releases artist=%s source=local-degraded (musicbrainz unavailable)",
+                        artist_id[:8],
+                    )
+                    return local
+            return result
         except ClientDisconnectedError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -679,6 +699,89 @@ class ArtistService:
                 has_more=False,
                 source_total_count=None,
             )
+
+    async def _build_artist_releases_from_local(
+        self, artist_id: str, offset: int, limit: int
+    ) -> ArtistReleases | None:
+        """Degraded-mode discography built purely from local catalog rows.
+
+        Serves the in-library slice of an artist's discography when MB cannot
+        answer. Type buckets follow each album's primary identity (compilations
+        count as albums); the external-only part of the catalog reappears when
+        MB does. Requested flags are unknown here (the MB catalog is what
+        carries them) and stay False.
+        """
+        if self._native_library_store is None:
+            return None
+        artist_rows, _total = await self._native_library_store.list_target_artists(
+            limit=1, artist_ids=[artist_id], scope="all"
+        )
+        if not artist_rows:
+            return None
+        rows, _albums_total = await self._native_library_store.list_target_albums(
+            limit=10_000,
+            offset=0,
+            sort="name",
+            artist_id=str(artist_rows[0]["artist_mbid"]),
+        )
+        if not rows:
+            return None
+
+        albums: list[ReleaseItem] = []
+        eps: list[ReleaseItem] = []
+        singles: list[ReleaseItem] = []
+        for row in rows:
+            rg_id = row.get("provider_release_group_mbid") or str(
+                row["release_group_mbid"]
+            )
+            release_date = row.get("original_release_date")
+            year = row.get("year")
+            if year is None and release_date:
+                head = str(release_date)[:4]
+                year = int(head) if head.isdigit() else None
+            track_count = int(row.get("track_count") or 0)
+            # A single-track local row is usually a single; type is display
+            # metadata only, so bucket heuristics are fine here.
+            bucket = albums
+            item_type = "Album"
+            if row.get("is_compilation"):
+                item_type = "Album"
+            elif track_count <= 2:
+                bucket = singles
+                item_type = "Single"
+            elif track_count <= 6:
+                bucket = eps
+                item_type = "EP"
+            bucket.append(
+                ReleaseItem(
+                    id=rg_id,
+                    title=str(row["album_title"]),
+                    type=item_type,
+                    first_release_date=str(release_date) if release_date else None,
+                    year=int(year) if year is not None else None,
+                    in_library=True,
+                )
+            )
+        for lst in (albums, eps, singles):
+            lst.sort(key=lambda x: (x.year is None, -(x.year or 0)))
+        tagged: list[tuple[str, ReleaseItem]] = (
+            [("albums", item) for item in albums]
+            + [("eps", item) for item in eps]
+            + [("singles", item) for item in singles]
+        )
+        page = tagged[offset : offset + limit]
+        next_offset = offset + limit if offset + limit < len(tagged) else None
+        return ArtistReleases(
+            albums=[item for kind, item in page if kind == "albums"],
+            singles=[item for kind, item in page if kind == "singles"],
+            eps=[item for kind, item in page if kind == "eps"],
+            offset=offset,
+            limit=limit,
+            returned_count=len(page),
+            next_offset=next_offset,
+            has_more=next_offset is not None,
+            source_total_count=len(tagged),
+        )
 
     async def _filter_aware_release_page(
         self,

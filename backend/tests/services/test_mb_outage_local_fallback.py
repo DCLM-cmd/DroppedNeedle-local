@@ -7,6 +7,7 @@ is served from NativeLibraryStore rows with service_status=None, instead of
 404ing. Non-library MBIDs keep raising.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -179,3 +180,124 @@ async def test_artist_still_404s_when_not_locally_known():
     with pytest.raises(Exception) as exc:
         await service.get_artist_info_basic("00000000-0000-4000-8000-000000000001")
     assert "Artist not found" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_artist_releases_fall_back_to_local_discography():
+    rows = [
+        {
+            "artist_mbid": "local-artist-1",
+            "artist_name": "Local Artist",
+            "provider_artist_mbid": ARTIST_ID,
+            "album_count": 2,
+        }
+    ]
+    store = MagicMock()
+    store.list_target_artists = AsyncMock(return_value=(rows, 1))
+    store.list_target_albums = AsyncMock(
+        return_value=(
+            [
+                {
+                    "release_group_mbid": "local-rg-1",
+                    "provider_release_group_mbid": "rg-mbid-1",
+                    "album_title": "Local Album",
+                    "year": 2024,
+                    "original_release_date": "2024-01-12",
+                    "track_count": 10,
+                    "is_compilation": False,
+                },
+                {
+                    "release_group_mbid": "local-rg-2",
+                    "provider_release_group_mbid": None,
+                    "album_title": "Local Single",
+                    "year": 2025,
+                    "original_release_date": None,
+                    "track_count": 1,
+                    "is_compilation": False,
+                },
+            ],
+            2,
+        )
+    )
+    mb_repo = MagicMock()
+    mb_repo.get_artist_release_groups = AsyncMock(return_value=([], 0))
+    memory_cache = MagicMock()
+    memory_cache.get = AsyncMock(return_value=None)
+    disk_cache = MagicMock()
+    disk_cache.get_artist = AsyncMock(return_value=None)
+    prefs = MagicMock()
+    prefs.get_preferences.return_value = SimpleNamespace(
+        primary_types=["Album", "Single", "EP"],
+        secondary_types=["Studio"],
+    )
+    service = ArtistService(
+        mb_repo,
+        MagicMock(),
+        MagicMock(),
+        prefs,
+        memory_cache,
+        disk_cache,
+        None,
+        None,
+        None,
+        None,
+        native_library_store=store,
+    )
+    service._ownership = MagicMock()
+    service._ownership.provider_artist_relationship = AsyncMock(
+        return_value=(False, set())
+    )
+    service._get_library_cache_mbids = AsyncMock(return_value=set())
+    service._library_repo.is_configured = MagicMock(return_value=False)
+    service._library_repo.get_requested_mbids = AsyncMock(return_value=set())
+
+    releases = await service.get_artist_releases(ARTIST_ID)
+    assert [r.title for r in releases.albums] == ["Local Album"]
+    assert releases.albums[0].id == "rg-mbid-1"
+    assert releases.albums[0].in_library is True
+    assert releases.albums[0].year == 2024
+    assert [r.title for r in releases.singles] == ["Local Single"]
+    assert releases.source_total_count == 2
+
+
+@pytest.mark.asyncio
+async def test_artist_releases_stay_empty_for_non_library_artist():
+    store = MagicMock()
+    store.list_target_artists = AsyncMock(return_value=([], 0))
+    mb_repo = MagicMock()
+    mb_repo.get_artist_release_groups = AsyncMock(return_value=([], 0))
+    memory_cache = MagicMock()
+    memory_cache.get = AsyncMock(return_value=None)
+    disk_cache = MagicMock()
+    disk_cache.get_artist = AsyncMock(return_value=None)
+    prefs = MagicMock()
+    prefs.get_preferences.return_value = SimpleNamespace(
+        primary_types=["Album", "Single", "EP"],
+        secondary_types=["Studio"],
+    )
+    service = ArtistService(
+        mb_repo,
+        MagicMock(),
+        MagicMock(),
+        prefs,
+        memory_cache,
+        disk_cache,
+        None,
+        None,
+        None,
+        None,
+        native_library_store=store,
+    )
+    service._ownership = MagicMock()
+    service._ownership.provider_artist_relationship = AsyncMock(
+        return_value=(False, set())
+    )
+    service._get_library_cache_mbids = AsyncMock(return_value=set())
+    service._library_repo.is_configured = MagicMock(return_value=False)
+    service._library_repo.get_requested_mbids = AsyncMock(return_value=set())
+
+    releases = await service.get_artist_releases("00000000-0000-4000-8000-000000000001")
+    assert releases.albums == []
+    assert releases.singles == []
+    assert releases.eps == []
+    assert releases.source_total_count == 0

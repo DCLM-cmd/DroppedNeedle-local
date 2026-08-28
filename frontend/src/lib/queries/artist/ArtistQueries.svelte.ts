@@ -127,6 +127,10 @@ export const getArtistReleasesInfiniteQuery = (getArtistId: Getter<string>) =>
 				API.artist.releases(getArtistId(), pageParam, BATCH_SIZE),
 				{ signal }
 			);
+			// mirrors the basic query: the degraded discography payload
+			// carries service_status and api.global bypasses the
+			// header-recording fetch wrapper
+			extractServiceStatus(response);
 			return response;
 		},
 		getNextPageParam: (lastPage) => {

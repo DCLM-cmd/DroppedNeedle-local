@@ -29,6 +29,8 @@ class ArtistReleases(AppStruct):
     # (a partial count would truncate the pagination UI). Additive default
     # keeps old payloads a strict prefix.
     warming: bool = False
+    # Degraded-source marker for the frontend banner plumbing (extractServiceStatus).
+    service_status: dict[str, str] | None = None
 
 
 class LastFmSimilarArtistSchema(AppStruct):

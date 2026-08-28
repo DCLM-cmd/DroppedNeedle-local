@@ -172,11 +172,9 @@ export type ArtistReleases = {
 	returned_count: number;
 	next_offset: number | null;
 	has_more: boolean;
-	source_total_count: number | null;
-	/** A3: true while the backend background walker is still completing the catalog;
-	 * page-1 slices served mid-warm carry source_total_count=null. Absent (undefined)
-	 * on pre-A3 payloads - treat as false. */
+	source_total_count?: number | null;
 	warming?: boolean;
+	service_status?: Record<string, string> | null;
 };
 
 export type UserPreferences = {
