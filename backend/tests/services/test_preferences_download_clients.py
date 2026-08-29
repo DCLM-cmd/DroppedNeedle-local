@@ -91,7 +91,7 @@ def test_usenet_only_is_ready_even_with_slskd_disabled(prefs):
 
 def test_policy_defaults_when_unset(prefs):
     policy = prefs.get_download_policy()
-    assert policy.quality_min == "mp3_320"
+    assert policy.quality_min == "mp3_192"
     assert policy.preflight_score_auto_accept == 0.70
     assert policy.usenet_min_release_age_minutes == 30
     assert policy.preferred_quality_wait_minutes == 15
@@ -114,6 +114,7 @@ def test_policy_migrates_from_legacy_download_client(prefs):
     # An upgraded install has policy fields on the old slskd section and NO
     # download_policy section -> get_download_policy derives them (copy-not-delete).
     config = prefs._load_config().copy()
+    config.pop("download_policy", None)
     config["download_client"] = {
         "enabled": True,
         "client_type": "slskd",

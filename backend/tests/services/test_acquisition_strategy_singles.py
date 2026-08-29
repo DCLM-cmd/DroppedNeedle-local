@@ -12,15 +12,21 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from api.v1.schemas.settings import DownloadPolicySettings
 
 from models.download import DownloadTask, ScoredCandidate
 from models.download_identity import soulseek_identity
 from models.download_manifest import DownloadManifest, ExpectedFile, ManifestCodec
 from repositories.protocols.download_client import DownloadSearchResult, TaskHandle
 from services.native.acquisition.strategy import SoulseekStrategy
+from services.native.acquisition.quality import build_snapshot
 from services.native.file_processor import FileFailure, ProcessResult
 
 _CANONICAL = 155.556  # "the arrival" (recording 180ceef5...), seconds
+
+
+def _policy_snapshot():
+    return build_snapshot(DownloadPolicySettings())
 
 
 def _search_result(username="peer", filename="peer/01.flac", duration=155.0):
@@ -113,7 +119,13 @@ def _strategy(tmp_path: Path):
 async def test_single_album_task_scores_via_track_matcher(tmp_path: Path):
     strategy, indexer, scorer, track_matcher = _strategy(tmp_path)
 
-    await strategy.search_and_score(_single_task(), timeout=30, auto=0.7, manual=0.5)
+    await strategy.search_and_score(
+        _single_task(),
+        timeout=30,
+        auto=0.7,
+        manual=0.5,
+        snapshot=_policy_snapshot(),
+    )
 
     # searched with the ALBUM query ladder, scored with the per-file track matcher
     indexer.search_album.assert_awaited_once()
@@ -140,6 +152,7 @@ async def test_single_without_threaded_identity_falls_back_to_folder_scorer(
         timeout=30,
         auto=0.7,
         manual=0.5,
+        snapshot=_policy_snapshot(),
     )
 
     scorer.rank.assert_awaited_once()
@@ -155,6 +168,7 @@ async def test_multi_track_album_still_uses_folder_scorer(tmp_path: Path):
         timeout=30,
         auto=0.7,
         manual=0.5,
+        snapshot=_policy_snapshot(),
     )
 
     scorer.rank.assert_awaited_once()
@@ -256,9 +270,7 @@ async def test_tag_mismatch_keeps_failure_reason_and_uses_verify_quarantine(
         succeeded=[],
         failed=[FileFailure(filename=filename, reason="tag_mismatch")],
     )
-    strategy._file_processor.process_downloaded = AsyncMock(
-        return_value=process_result
-    )
+    strategy._file_processor.process_downloaded = AsyncMock(return_value=process_result)
     task = _single_task(source_username="Fabrizio83a")
     manifest = DownloadManifest(
         task_id=task.id,

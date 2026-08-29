@@ -108,7 +108,9 @@ async def test_new_tasks_take_the_current_snapshot_and_old_rows_are_frozen(
     assert reloaded.quality_snapshot_json == created.quality_snapshot_json
 
 
-async def test_retry_creation_reuses_parent_snapshot(tmp_path: Path):
+async def test_retry_creation_reuses_parent_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """Directly pin the orchestrator contract: `_create_retry_task` copies the
     parent's snapshot triple; no live-policy read happens for retries."""
     from services.native.download_orchestrator import DownloadOrchestrator
@@ -162,15 +164,9 @@ async def test_retry_creation_reuses_parent_snapshot(tmp_path: Path):
         quality_snapshot_summary="Try lossless.",
         quality_preference_step=0,
     )
-    # Bypass heavy collaborators by stubbing their methods on the instance.
-    DownloadOrchestrator._relink_request = staticmethod(relink)
+    monkeypatch.setattr(DownloadOrchestrator, "_relink_request", relink)
 
-    prev_orchestrator_dispatch = getattr(DownloadOrchestrator, "dispatch", None)
-    try:
-        new_id = await DownloadOrchestrator._create_retry_task(orch, parent)
-        assert new_id == "retry-id"
-    finally:
-        if prev_orchestrator_dispatch is not None:
-            DownloadOrchestrator.dispatch = prev_orchestrator_dispatch
+    new_id = await DownloadOrchestrator._create_retry_task(orch, parent)
+    assert new_id == "retry-id"
     assert captured["quality_snapshot_hash"] == "deadbeef"
     assert captured["quality_preference_step"] == 0

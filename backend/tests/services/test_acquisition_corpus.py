@@ -18,11 +18,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from api.v1.schemas.settings import DownloadPolicySettings
 
 from models.download import TargetAlbum, TargetTrack
 from repositories.protocols.download_client import DownloadSearchResult
 from services.native.album_preflight_scorer import AlbumPreflightScorer
 from services.native.track_matcher import TrackMatcher
+from services.native.acquisition.quality import build_snapshot
 
 _CORPUS_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "acquisition_corpus"
 _CASES = sorted(_CORPUS_DIR.glob("*.json"))
@@ -58,6 +60,10 @@ def _store():
     return store
 
 
+def _policy_snapshot():
+    return build_snapshot(DownloadPolicySettings())
+
+
 async def _rank_album(case: dict):
     target = case["target"]
     scorer = AlbumPreflightScorer(_store())
@@ -69,6 +75,7 @@ async def _rank_album(case: dict):
             track_count=target["track_count"],
         ),
         _results(case),
+        snapshot=_policy_snapshot(),
     )
 
 
@@ -84,6 +91,7 @@ async def _rank_single(case: dict):
             recording_mbid=target.get("recording_mbid"),
         ),
         _results(case),
+        snapshot=_policy_snapshot(),
     )
 
 
@@ -99,7 +107,9 @@ async def test_corpus_case(path: Path):
     case = _load(path)
     expect = case["expect"]
 
-    ranked = await (_rank_single(case) if case["kind"] == "single" else _rank_album(case))
+    ranked = await (
+        _rank_single(case) if case["kind"] == "single" else _rank_album(case)
+    )
     assert ranked, f"{case['name']}: scorer returned no candidates"
 
     if expect.get("no_auto"):

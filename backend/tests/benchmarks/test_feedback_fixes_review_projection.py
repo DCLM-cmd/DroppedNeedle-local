@@ -73,7 +73,6 @@ def _seed_reviews(path: Path) -> None:
                     for index in range(start, stop)
                 ],
             )
-            connection.commit()
         connection.execute("ANALYZE")
 
 

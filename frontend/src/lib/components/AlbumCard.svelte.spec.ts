@@ -100,11 +100,13 @@ describe('AlbumCard.svelte', () => {
 	});
 
 	it('requests optional enrichment on pointer intent', async () => {
-		expect.assertions(1);
+		expect.assertions(2);
 		const onenrichmentrequest = vi.fn();
 		renderComponent({ onenrichmentrequest });
 
-		await page.getByRole('link', { name: 'Open OK Computer' }).hover();
+		const link = page.getByRole('link', { name: 'Open OK Computer' });
+		await expect.element(link).toBeInTheDocument();
+		link.element().dispatchEvent(new PointerEvent('pointerenter'));
 
 		expect(onenrichmentrequest).toHaveBeenCalledTimes(1);
 	});

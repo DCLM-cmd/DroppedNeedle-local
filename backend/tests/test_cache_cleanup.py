@@ -277,6 +277,18 @@ class TestRequestHistoryPruning:
             "musicbrainz_id_lower TEXT PRIMARY KEY, status TEXT, "
             "requested_at TEXT, completed_at TEXT, download_task_id TEXT)"
         )
+        conn.execute(
+            "CREATE TABLE request_history_requesters ("
+            "user_id TEXT NOT NULL, musicbrainz_id_lower TEXT NOT NULL, "
+            "requested_at TEXT NOT NULL, requested_by_name TEXT, "
+            "PRIMARY KEY (user_id, musicbrainz_id_lower))"
+        )
+        conn.execute(
+            "CREATE TABLE request_history_dismissals ("
+            "user_id TEXT NOT NULL, musicbrainz_id_lower TEXT NOT NULL, "
+            "dismissed_at TEXT NOT NULL, "
+            "PRIMARY KEY (user_id, musicbrainz_id_lower))"
+        )
         old_date = "2020-01-01T00:00:00"
         recent_date = datetime.now().isoformat()
         conn.execute(
