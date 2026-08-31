@@ -521,6 +521,29 @@ _ARTIST_SORTS = {
 }
 
 
+def _years(request: Request) -> list[int] | None:
+    """Jellyfin's ``Years``: a LIST of production years, not a range."""
+    values = [v for v in _csv_param(request, "Years") if v.strip().isdigit()]
+    return [int(v) for v in values] or None
+
+
+def _genre(request: Request) -> str | None:
+    """Jellyfin's ``Genres`` is pipe- or comma-separated. The catalog filters on one
+    genre, so the first is used - narrowing to one of the asked-for genres, never
+    widening past them."""
+    raw = _params(request).get("Genres") or ""
+    for part in raw.replace("|", ",").split(","):
+        if part.strip():
+            return part.strip()
+    return None
+
+
+def _name_starts_with(request: Request) -> str | None:
+    """Jellyfin's ``NameStartsWith`` - the A-Z jump bar every music client shows."""
+    value = (_params(request).get("NameStartsWith") or "").strip()
+    return value or None
+
+
 def _sort_descending(request: Request) -> bool:
     return _params(request).get("SortOrder", "").casefold().startswith("desc")
 
@@ -629,6 +652,9 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
         q=search,
         user=user,
         sort=_sort_key(request, _ALBUM_SORTS, "recent"),
+        years=_years(request),
+        genre=_genre(request),
+        name_starts_with=_name_starts_with(request),
     )
     return await _build_qr(b.album, albums, total, start)
 

@@ -83,6 +83,9 @@ class TargetLibraryViewService:
         q: str | None = None,
         file_format: str | None = None,
         decade: int | None = None,
+        years: list[int] | None = None,
+        genre: str | None = None,
+        name_starts_with: str | None = None,
         user: "UserRecord | None" = None,
     ) -> tuple[list[ViewAlbum], int]:
         del file_format
@@ -93,6 +96,9 @@ class TargetLibraryViewService:
             q=q,
             from_year=decade,
             to_year=decade + 9 if decade is not None else None,
+            years=years,
+            genre=genre,
+            name_starts_with=name_starts_with,
             user=user,
         )
 
@@ -106,6 +112,8 @@ class TargetLibraryViewService:
         from_year: int | None = None,
         to_year: int | None = None,
         genre: str | None = None,
+        years: list[int] | None = None,
+        name_starts_with: str | None = None,
         user: "UserRecord | None" = None,
     ) -> tuple[list[ViewAlbum], int]:
         rows, total = await self._store.list_target_albums(
@@ -113,6 +121,8 @@ class TargetLibraryViewService:
             offset=offset,
             sort=sort,
             search=q,
+            years=years,
+            name_starts_with=name_starts_with,
             from_year=from_year,
             to_year=to_year,
             genre=genre,

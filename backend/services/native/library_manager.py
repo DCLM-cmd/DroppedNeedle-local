@@ -276,11 +276,22 @@ class LibraryManager:
         q: str | None = None,
         file_format: str | None = None,
         decade: int | None = None,
+        years: list[int] | None = None,
+        genre: str | None = None,
+        name_starts_with: str | None = None,
     ) -> tuple[list[LibraryAlbumSummary], int]:
         """Paginated albums + total count (drives the browse route's items/total)."""
         offset = (max(page, 1) - 1) * max(page_size, 1)
         rows, total = await self._db.get_albums_aggregated(
-            limit=page_size, offset=offset, sort=sort, q=q, file_format=file_format, decade=decade
+            limit=page_size,
+            offset=offset,
+            sort=sort,
+            q=q,
+            file_format=file_format,
+            decade=decade,
+            years=years,
+            genre=genre,
+            name_starts_with=name_starts_with,
         )
         return [self._to_summary(row) for row in rows], total
 

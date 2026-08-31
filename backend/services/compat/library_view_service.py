@@ -109,12 +109,18 @@ class LibraryViewService:
         q: str | None = None,
         file_format: str | None = None,
         decade: int | None = None,
+        years: list[int] | None = None,
+        genre: str | None = None,
+        name_starts_with: str | None = None,
         user: "UserRecord | None" = None,
     ) -> tuple[list[ViewAlbum], int]:
         items, total = await self._lm.get_albums_page(
             page=page,
             page_size=page_size,
             sort=sort,
+            years=years,
+            genre=genre,
+            name_starts_with=name_starts_with,
             q=q,
             file_format=file_format,
             decade=decade,

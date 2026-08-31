@@ -108,3 +108,66 @@ async def test_artists_honour_their_sort_key():
     passed = view._store.list_target_artists.await_args.kwargs
     assert passed["sort_by"] == "album_count"
     assert passed["sort_order"] == "desc"
+
+
+async def test_name_starts_with_narrows_the_album_list(compat_env):
+    """Jellyfin's A-Z jump bar. Ignored, a letter tap returned the whole library."""
+    everything = _jget(
+        compat_env, "/Users/user-alice/Items", IncludeItemTypes="MusicAlbum"
+    )["Items"]
+    assert everything, "fixture has no albums to filter"
+    letter = everything[0]["Name"][0]
+
+    narrowed = _jget(
+        compat_env,
+        "/Users/user-alice/Items",
+        IncludeItemTypes="MusicAlbum",
+        NameStartsWith=letter,
+    )["Items"]
+
+    assert narrowed, f"nothing matched {letter!r}"
+    assert all(i["Name"].upper().startswith(letter.upper()) for i in narrowed), [
+        i["Name"] for i in narrowed
+    ]
+    assert len(narrowed) <= len(everything)
+
+
+async def test_name_starts_with_treats_wildcards_literally(compat_env):
+    """An unescaped LIKE pattern would make "%" match the entire catalog."""
+    body = _jget(
+        compat_env,
+        "/Users/user-alice/Items",
+        IncludeItemTypes="MusicAlbum",
+        NameStartsWith="%",
+    )
+    assert body["Items"] == []
+
+
+async def test_years_is_a_list_not_a_range(compat_env):
+    """Asking for two years must not also return everything between them."""
+    albums = _jget(
+        compat_env, "/Users/user-alice/Items", IncludeItemTypes="MusicAlbum"
+    )["Items"]
+    years = sorted({a.get("ProductionYear") for a in albums if a.get("ProductionYear")})
+    if not years:
+        pytest.skip("fixture albums carry no production year")
+
+    filtered = _jget(
+        compat_env,
+        "/Users/user-alice/Items",
+        IncludeItemTypes="MusicAlbum",
+        Years=str(years[0]),
+    )["Items"]
+
+    assert filtered, "the year filter matched nothing"
+    assert {a.get("ProductionYear") for a in filtered} == {years[0]}
+
+
+async def test_an_unmatched_year_returns_nothing_rather_than_everything(compat_env):
+    body = _jget(
+        compat_env,
+        "/Users/user-alice/Items",
+        IncludeItemTypes="MusicAlbum",
+        Years="1066",
+    )
+    assert body["Items"] == []

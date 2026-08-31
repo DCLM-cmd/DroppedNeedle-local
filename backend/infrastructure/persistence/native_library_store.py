@@ -703,6 +703,43 @@ def _bulk_preview_ineligibility(
 # records carry can no longer be needed by the tag writer.
 # A track's own satellite data, which has no meaning without it. Play history and
 # playlists are deliberately NOT here: those belong to the user, not to the file.
+def _like_prefix(value: str) -> str:
+    """A LIKE pattern matching everything starting with ``value``.
+
+    ``%`` and ``_`` are escaped: a search for "R_E_M" is a literal prefix, not a
+    wildcard that would quietly match half the catalog.
+    """
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
+
+
+def _tables_referencing_local_albums(conn: sqlite3.Connection) -> list[str]:
+    """Every table with a foreign key onto ``local_albums``, read from the schema."""
+    tables = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' AND name <> 'local_albums'"
+        )
+    ]
+    return [
+        table
+        for table in tables
+        if any(
+            str(fk[2]) == "local_albums"
+            for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")')
+        )
+    ]
+
+
+def _local_album_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [
+        str(fk[3])
+        for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")')
+        if str(fk[2]) == "local_albums"
+    ]
+
+
 def _tables_referencing_local_tracks(conn: sqlite3.Connection) -> list[str]:
     """Every table with a foreign key onto ``local_tracks``, read from the schema."""
     tables = [
@@ -2880,6 +2917,8 @@ class NativeLibraryStore(PersistenceBase):
         artist_id: str | None = None,
         album_ids: list[str] | None = None,
         file_format: str | None = None,
+        years: list[int] | None = None,
+        name_starts_with: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """F-PERF-05: revision-keyed ordered album projection + page slice.
 
@@ -2911,6 +2950,17 @@ class NativeLibraryStore(PersistenceBase):
                 if to_year is not None:
                     clauses.append("a.year <= ?")
                     parameters.append(to_year)
+                # Jellyfin's Years is a LIST, not a range: asking for 1997 and 2016
+                # must not also return everything between them.
+                if years:
+                    placeholders = ",".join("?" for _ in years)
+                    clauses.append(f"a.year IN ({placeholders})")
+                    parameters.extend(years)
+                # Jellyfin's NameStartsWith drives the A-Z jump bar. Folded on both
+                # sides so "Ä" lands under A, the way the sort already groups it.
+                if name_starts_with:
+                    clauses.append("a.title_folded LIKE ? ESCAPE '\\'")
+                    parameters.append(_like_prefix(_fold(name_starts_with)))
                 if genre:
                     clauses.append(
                         "EXISTS (SELECT 1 FROM local_track_genres genre "
@@ -7471,6 +7521,68 @@ class NativeLibraryStore(PersistenceBase):
             if removed:
                 self._bump_catalog(connection)
             return {"removed": removed, "kept": kept}
+
+        return await self._write(operation)
+
+    async def purge_empty_album_rows(self, *, dry_run: bool = False) -> dict[str, Any]:
+        """Remove album rows that hold no tracks at all.
+
+        Every failed import attempt left a row behind, so one album could carry twenty
+        of them - all empty, all still named in listings that do not filter on track
+        count, and all pointing at nothing. They are invisible in the compat API
+        (which requires a track) but they are what makes the catalog read as chaos.
+
+        Only rows with ZERO tracks of any availability go: a row still owning a
+        ``missing`` track is a record of something the library expects to find again,
+        not debris. References are cleared from the schema rather than a fixed list -
+        the album satellites carry ON DELETE RESTRICT, so one table left behind would
+        abort the delete rather than degrade.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            empty = [
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT a.id FROM local_albums a "
+                    "WHERE NOT EXISTS (SELECT 1 FROM local_tracks t "
+                    "WHERE t.local_album_id = a.id)"
+                )
+            ]
+            if dry_run or not empty:
+                return {"removed": 0, "candidates": len(empty), "references": {}}
+            tables = _tables_referencing_local_albums(connection)
+            references: dict[str, int] = {}
+            removed = 0
+            for album_id in empty:
+                # Per row, so one undeletable album cannot take the whole pass down.
+                connection.execute("SAVEPOINT purge_album")
+                try:
+                    for table in tables:
+                        for column in _local_album_columns(connection, table):
+                            cursor = connection.execute(
+                                f'DELETE FROM "{table}" WHERE "{column}" = ?',
+                                (album_id,),
+                            )
+                            if cursor.rowcount:
+                                references[table] = (
+                                    references.get(table, 0) + cursor.rowcount
+                                )
+                    connection.execute(
+                        "DELETE FROM local_albums WHERE id = ?", (album_id,)
+                    )
+                except sqlite3.IntegrityError:
+                    connection.execute("ROLLBACK TO purge_album")
+                else:
+                    removed += 1
+                finally:
+                    connection.execute("RELEASE purge_album")
+            if removed:
+                self._bump_catalog(connection)
+            return {
+                "removed": removed,
+                "candidates": len(empty),
+                "references": references,
+            }
 
         return await self._write(operation)
 

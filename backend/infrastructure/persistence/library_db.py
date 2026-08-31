@@ -1028,6 +1028,8 @@ class LibraryDB(PersistenceBase):
         q: str | None = None,
         file_format: str | None = None,
         decade: int | None = None,
+        years: list[int] | None = None,
+        name_starts_with: str | None = None,
         from_year: int | None = None,
         to_year: int | None = None,
         genre: str | None = None,
@@ -1067,6 +1069,16 @@ class LibraryDB(PersistenceBase):
         if genre is not None:
             filters.append("fold(lf.genre) = fold(?)")
             params.append(genre)
+        # Kept in step with the target runtime so a compat client gets the same
+        # answer from either implementation. Years is a LIST (Jellyfin semantics),
+        # not a range; NameStartsWith drives the A-Z jump bar.
+        if years:
+            placeholders = ", ".join("?" for _ in years)
+            filters.append(f"lf.year IN ({placeholders})")
+            params.extend(years)
+        if name_starts_with:
+            filters.append("lf.album_title_folded LIKE fold(?) ESCAPE '\\'")
+            params.append(f"{_escape_like(name_starts_with)}%")
         if release_group_mbids is not None:
             if not release_group_mbids:
                 return [], 0
