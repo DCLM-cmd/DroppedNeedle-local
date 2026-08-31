@@ -499,13 +499,31 @@ def get_target_library_scan_coordinator() -> "LibraryScanCoordinator":
     from services.native.library_scan_events import LibraryScanEventPublisher
     from services.native.local_album_grouping_service import LocalAlbumGroupingService
 
+    from pathlib import Path
+
+    from services.native.recycle_bin import resolve_bin_path
+
     from .cache_providers import get_native_library_store
 
     store = get_native_library_store()
     filesystem = get_library_filesystem_coordinator()
+
+    # Read per scan, not captured here, so a bin moved in settings takes effect on
+    # the next run. Without it a bin named without a leading dot is walked as if it
+    # were library content, and files put aside come straight back in.
+    def scan_recycle_bin() -> Path | None:
+        return resolve_bin_path(
+            get_preferences_service().get_download_policy().recycle_bin_path,
+            [root.path for root in get_library_policy_resolver().settings.library_roots],
+        )
+
     return LibraryScanCoordinator(
         store,
-        LibraryInventoryScanner(store, filesystem_coordinator=filesystem),
+        LibraryInventoryScanner(
+            store,
+            filesystem_coordinator=filesystem,
+            recycle_bin_getter=scan_recycle_bin,
+        ),
         LibraryIndexer(
             store,
             get_audio_tagger(),

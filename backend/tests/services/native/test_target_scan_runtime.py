@@ -2774,3 +2774,45 @@ async def test_tag_read_failures_persist_safe_class_detail(
     if expected_class == "OSError":
         # Redaction: the raw strerror never enters the persisted row.
         assert "input/output error" not in failure.failure_detail
+
+
+@pytest.mark.asyncio
+async def test_a_recycle_bin_that_is_not_dot_prefixed_is_still_skipped(
+    tmp_path: Path,
+) -> None:
+    """The bin is skipped because its default name starts with a dot - and
+    ``recycle_bin_path`` is a setting. Point it at ``<library>/Recycle`` and the
+    scanner walks straight in, indexing every file the Organizer set aside back
+    into the library it was removed from.
+    """
+    root = tmp_path / "music"
+    (root / "Artist" / "Album").mkdir(parents=True)
+    (root / "Artist" / "Album" / "01 - Song.mp3").write_bytes(b"x")
+    bin_path = root / "Recycle" / "20260101T000000-x"
+    bin_path.mkdir(parents=True)
+    (bin_path / "02 - Recycled.mp3").write_bytes(b"x")
+
+    store = AsyncMock()
+    store.classify_scan_paths.side_effect = lambda _root, entries: {
+        entry[0]: ("new", None) for entry in entries
+    }
+    store.add_scan_inventory_batch.return_value = (0, 0)
+
+    scanner = LibraryInventoryScanner(
+        store, recycle_bin_getter=lambda: root / "Recycle"
+    )
+    await scanner._walk_scope(
+        _scan_run(),
+        ScanScope(root_id="root", policy_revision="policy-1"),
+        root,
+        root,
+        SimpleNamespace(resolve=lambda _path: None),
+        AsyncMock(return_value=True),
+    )
+
+    seen = [
+        entry.relative_path
+        for call in store.add_scan_inventory_batch.await_args_list
+        for entry in call.args[1]
+    ]
+    assert seen == ["Artist/Album/01 - Song.mp3"]

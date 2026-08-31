@@ -48,8 +48,20 @@ def _is_hidden_directory(name: str) -> bool:
     cover it: that only matches the reserved ``.droppedneedle-management-``
     namespace. This also keeps the other dot-directories that share a media
     volume out (.Trash, .stfolder, sync state).
+
+    The dot only holds for the DEFAULT bin. ``recycle_bin_path`` is a setting, and
+    an operator who points it at ``<library>/Recycle`` gets a bin the scanner walks
+    straight into - which is why the bin is matched by path as well, below.
     """
     return name.startswith(".")
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    """True when ``candidate`` is ``root`` or sits underneath it."""
+    try:
+        return candidate == root or root in candidate.parents
+    except (OSError, ValueError):  # pragma: no cover - defensive on odd paths
+        return False
 
 
 
@@ -85,6 +97,7 @@ class LibraryInventoryScanner:
         *,
         directory_walker: DirectoryWalker = os.walk,
         filesystem_coordinator: LibraryFilesystemCoordinator | None = None,
+        recycle_bin_getter: Callable[[], Path | None] | None = None,
         walk_deadline_seconds: float = 30.0,
         directory_probe: DirectoryProbe = Path.is_dir,
         max_detached_walkers: int = 4,
@@ -94,6 +107,7 @@ class LibraryInventoryScanner:
         self._store = store
         self._directory_walker = directory_walker
         self._filesystem = filesystem_coordinator
+        self._recycle_bin_getter = recycle_bin_getter
         self._walk_deadline_seconds = walk_deadline_seconds
         self._directory_probe = directory_probe
         self._max_detached_walkers = max_detached_walkers
@@ -691,6 +705,8 @@ class LibraryInventoryScanner:
             def onerror(error: OSError) -> None:
                 walk_errors.append(error)
 
+            # Read once: a setting that changed mid-walk would prune half a tree.
+            recycle_bin = self._recycle_bin_getter() if self._recycle_bin_getter else None
             try:
                 walker = iter(
                     self._directory_walker(selected, followlinks=False, onerror=onerror)
@@ -708,6 +724,10 @@ class LibraryInventoryScanner:
                         for name in subdirectories
                         if not is_management_artifact(Path(name))
                         and not _is_hidden_directory(name)
+                        and not (
+                            recycle_bin is not None
+                            and _is_within(Path(directory) / name, recycle_bin)
+                        )
                     ]
                     inspected: list[
                         tuple[Path, os.stat_result] | BaseException

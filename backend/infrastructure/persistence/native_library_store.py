@@ -11,7 +11,7 @@ import sqlite3
 import unicodedata
 import uuid
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path, PurePosixPath
 import threading
 import time
@@ -768,12 +768,144 @@ def _local_track_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     ]
 
 
-_TRACK_OWNED_TABLES = (
-    "local_track_genres",
-    "local_track_artists",
-    "local_track_external_identities",
-    "library_artist_credit_proofs",
+# Rows that belong to the person using the library, not to the file. A recycled
+# file's catalog row is kept alive when one of these still names it, because
+# silently dropping a song out of someone's playlist or listening history to tidy
+# up a folder move is a worse outcome than an untidy row.
+_USER_OWNED_TRACK_TABLES = frozenset(
+    {
+        "library_play_history",
+        "library_playlist_tracks",
+        "library_compat_bookmarks",
+        "library_compat_play_queue_items",
+    }
 )
+
+
+class _ProtectedReference(Exception):
+    """A dependency closure reached a row that has to outlive its subject."""
+
+    def __init__(self, table: str) -> None:
+        super().__init__(f"{table} still references this row")
+        self.table = table
+
+
+def _primary_key_column(conn: sqlite3.Connection, table: str) -> str:
+    for row in conn.execute(f'PRAGMA table_info("{table}")'):
+        if row[5]:
+            return str(row[1])
+    return "rowid"
+
+
+def _child_references(
+    conn: sqlite3.Connection, parent: str
+) -> list[tuple[str, tuple[str, ...], tuple[str, ...]]]:
+    """``(child table, child columns, parent columns)`` for every FK onto ``parent``.
+
+    Grouped by constraint rather than by column, because a composite key must be
+    matched as a whole. ``library_file_mutation_journal`` points at a plan item by
+    ``(job_id, ordinal)``; matching ``job_id`` alone would collect every journal row
+    in the job and delete the entries of plan items nobody asked about.
+    """
+    found: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+    for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ):
+        table = str(row[0])
+        grouped: dict[int, list[tuple[str, str]]] = {}
+        for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")'):
+            if str(fk[2]) != parent:
+                continue
+            target = fk[4] or _primary_key_column(conn, parent)
+            grouped.setdefault(int(fk[0]), []).append((str(fk[3]), str(target)))
+        for pairs in grouped.values():
+            found.append(
+                (table, tuple(p[0] for p in pairs), tuple(p[1] for p in pairs))
+            )
+    return found
+
+
+def _chunked(values: list[Any], size: int = 400) -> Iterator[list[Any]]:
+    for offset in range(0, len(values), size):
+        yield values[offset : offset + size]
+
+
+def _cascade_delete(
+    conn: sqlite3.Connection,
+    table: str,
+    row_ids: list[int],
+    *,
+    protected: frozenset[str] = frozenset(),
+    counts: dict[str, int] | None = None,
+    graph: dict[str, list[tuple[str, str, str]]] | None = None,
+    seen: set[tuple[str, int]] | None = None,
+) -> dict[str, int]:
+    """Delete rows together with everything that depends on them.
+
+    Nearly every foreign key in this schema is ON DELETE RESTRICT, which makes
+    deleting anything an all-or-nothing proposition: one surviving reference in one
+    of 176 tables aborts the statement. The code this replaces cleared a hand-written
+    list of four tables, so the twenty-four others each turned a routine cleanup into
+    a failure - and the failure path then blanked the row's path to get out of the
+    way, which is how a hundred and forty-eight rows ended up permanently stranded,
+    unfindable by the very function meant to collect them, each still holding an
+    album in the listing.
+
+    Following the schema instead of a list is what makes this reliable, and it has to
+    be transitive rather than one level deep: an album's plan item is referenced by a
+    mutation journal entry keyed on the track, so clearing only the rows that name
+    the album leaves the journal pointing at a row that is about to vanish. The walk
+    therefore descends to the leaves and deletes on the way back up.
+
+    ``protected`` names tables whose rows must survive. Reaching one raises
+    ``_ProtectedReference`` rather than deleting it, leaving the caller to decide
+    what to do with a subject it may not remove.
+    """
+    counts = {} if counts is None else counts
+    graph = {} if graph is None else graph
+    seen = set() if seen is None else seen
+    pending = [
+        row_id for row_id in dict.fromkeys(row_ids) if (table, row_id) not in seen
+    ]
+    if not pending:
+        return counts
+    if table in protected:
+        raise _ProtectedReference(table)
+    seen.update((table, row_id) for row_id in pending)
+    if table not in graph:
+        graph[table] = _child_references(conn, table)
+    for child_table, child_columns, parent_columns in graph[table]:
+        child_tuple = ",".join(f'"{column}"' for column in child_columns)
+        parent_tuple = ",".join(f'"{column}"' for column in parent_columns)
+        for chunk in _chunked(pending):
+            marks = ",".join("?" * len(chunk))
+            children = [
+                int(row[0])
+                for row in conn.execute(
+                    f'SELECT rowid FROM "{child_table}" WHERE ({child_tuple}) IN '
+                    f'(SELECT {parent_tuple} FROM "{table}" '
+                    f"WHERE rowid IN ({marks}))",
+                    chunk,
+                )
+            ]
+            if children:
+                _cascade_delete(
+                    conn,
+                    child_table,
+                    children,
+                    protected=protected,
+                    counts=counts,
+                    graph=graph,
+                    seen=seen,
+                )
+    for chunk in _chunked(pending):
+        marks = ",".join("?" * len(chunk))
+        cursor = conn.execute(
+            f'DELETE FROM "{table}" WHERE rowid IN ({marks})', chunk
+        )
+        if cursor.rowcount > 0:
+            counts[table] = counts.get(table, 0) + cursor.rowcount
+    return counts
 
 
 _TERMINAL_JOB_STATES_SQL = "('succeeded','failed','cancelled','stopped')"
@@ -7485,7 +7617,7 @@ class NativeLibraryStore(PersistenceBase):
 
         def operation(connection: sqlite3.Connection) -> dict[str, int]:
             rows = connection.execute(
-                "SELECT gone.id FROM local_tracks gone "
+                "SELECT gone.rowid, gone.id FROM local_tracks gone "
                 "WHERE gone.availability = 'missing' "
                 "AND gone.track_number IS NOT NULL "
                 "AND EXISTS ("
@@ -7498,18 +7630,15 @@ class NativeLibraryStore(PersistenceBase):
             ).fetchall()
             removed = kept = 0
             for row in rows:
-                track_id = str(row["id"])
                 connection.execute("SAVEPOINT purge_superseded")
                 try:
-                    for table in _TRACK_OWNED_TABLES:
-                        connection.execute(
-                            f"DELETE FROM {table} WHERE local_track_id = ?",
-                            (track_id,),
-                        )
-                    connection.execute(
-                        "DELETE FROM local_tracks WHERE id = ?", (track_id,)
+                    _cascade_delete(
+                        connection,
+                        "local_tracks",
+                        [int(row["rowid"])],
+                        protected=_USER_OWNED_TRACK_TABLES,
                     )
-                except sqlite3.IntegrityError:
+                except (_ProtectedReference, sqlite3.IntegrityError):
                     # Play history or a playlist still names it. Those belong to the
                     # user, not to the file, so the row stays.
                     connection.execute("ROLLBACK TO purge_superseded")
@@ -7534,46 +7663,47 @@ class NativeLibraryStore(PersistenceBase):
 
         Only rows with ZERO tracks of any availability go: a row still owning a
         ``missing`` track is a record of something the library expects to find again,
-        not debris. References are cleared from the schema rather than a fixed list -
-        the album satellites carry ON DELETE RESTRICT, so one table left behind would
-        abort the delete rather than degrade.
+        not debris. Because the candidates hold no tracks, the walk below can never
+        reach one - it collects identification attempts, plans and operation work.
+
+        Clearing the tables that name the album is not enough on its own. A mutation
+        journal entry hangs off a management plan item, and a snapshot off a unit of
+        operation work; both are keyed on the track, so neither is found by looking
+        for the album. Deleting the rows that name the album while those still point
+        at them is what made this pass remove none of fifty-one candidates. The walk
+        follows the schema all the way down instead.
         """
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             empty = [
-                str(row["id"])
+                (int(row["rowid"]), str(row["id"]))
                 for row in connection.execute(
-                    "SELECT a.id FROM local_albums a "
+                    "SELECT a.rowid, a.id FROM local_albums a "
                     "WHERE NOT EXISTS (SELECT 1 FROM local_tracks t "
                     "WHERE t.local_album_id = a.id)"
                 )
             ]
             if dry_run or not empty:
                 return {"removed": 0, "candidates": len(empty), "references": {}}
-            tables = _tables_referencing_local_albums(connection)
             references: dict[str, int] = {}
             removed = 0
-            for album_id in empty:
+            for row_id, _album_id in empty:
                 # Per row, so one undeletable album cannot take the whole pass down.
                 connection.execute("SAVEPOINT purge_album")
                 try:
-                    for table in tables:
-                        for column in _local_album_columns(connection, table):
-                            cursor = connection.execute(
-                                f'DELETE FROM "{table}" WHERE "{column}" = ?',
-                                (album_id,),
-                            )
-                            if cursor.rowcount:
-                                references[table] = (
-                                    references.get(table, 0) + cursor.rowcount
-                                )
-                    connection.execute(
-                        "DELETE FROM local_albums WHERE id = ?", (album_id,)
+                    counts = _cascade_delete(
+                        connection,
+                        "local_albums",
+                        [row_id],
+                        protected=_USER_OWNED_TRACK_TABLES,
                     )
-                except sqlite3.IntegrityError:
+                except (_ProtectedReference, sqlite3.IntegrityError):
                     connection.execute("ROLLBACK TO purge_album")
                 else:
                     removed += 1
+                    for table, count in counts.items():
+                        if table != "local_albums":
+                            references[table] = references.get(table, 0) + count
                 finally:
                     connection.execute("RELEASE purge_album")
             if removed:
@@ -7654,44 +7784,61 @@ class NativeLibraryStore(PersistenceBase):
 
         A recycled file is not part of the library any more - it was deliberately set
         aside - but its row stayed behind still naming the bin as its location. One
-        such row was enough to make an album read as having a track it does not have.
+        such row was enough to make an album read as holding a track it does not have.
 
-        The row's OWN satellite data goes with it. Anything else still pointing at the
-        track - play history, a playlist - keeps it alive; those rows are kept and
-        merely stop claiming to be somewhere they are not, because silently dropping a
-        track someone has in a playlist would be worse than an untidy row.
+        Everything the catalog DERIVED about the file goes with it: genres, credits,
+        identification attempts, management plans, scan evidence. All of it describes
+        a file the library no longer has. Only what belongs to the person - play
+        history, playlists, bookmarks, the play queue - can keep a row alive, and such
+        a row is detached rather than deleted: it stops claiming a location and keeps
+        a marker so a later pass can finish the job once that last reference goes.
+
+        That marker is now read on the way IN as well, which is the point. Detached
+        rows were written with their path blanked and then searched for by that same
+        path, so every row this function could not delete became one it could never
+        see again - a hundred and forty-eight of them here, each still holding an
+        album row in the listing, and the purge reporting nothing left to do.
         """
         prefix = bin_path.rstrip("/")
-        if not prefix:
-            return {"removed": 0, "detached": 0}
 
         def operation(connection: sqlite3.Connection) -> dict[str, int]:
+            clauses = [
+                "(COALESCE(file_path,'') = '' AND relative_path LIKE '%.recycled')"
+            ]
+            params: list[str] = []
+            if prefix:
+                clauses.append("file_path LIKE ? ESCAPE '\\'")
+                params.append(f"{_escape_like(prefix)}/%")
             rows = connection.execute(
-                "SELECT id FROM local_tracks WHERE file_path LIKE ? ESCAPE '\\'",
-                (f"{_escape_like(prefix)}/%",),
+                "SELECT rowid, id, file_path FROM local_tracks WHERE "
+                + " OR ".join(clauses),
+                params,
             ).fetchall()
             removed = detached = 0
             for row in rows:
-                track_id = str(row["id"])
+                # Per row, so one track someone still owns cannot take the pass down.
                 connection.execute("SAVEPOINT purge_recycled")
                 try:
-                    for table in _TRACK_OWNED_TABLES:
-                        connection.execute(
-                            f"DELETE FROM {table} WHERE local_track_id = ?",
-                            (track_id,),
-                        )
-                    connection.execute(
-                        "DELETE FROM local_tracks WHERE id = ?", (track_id,)
+                    _cascade_delete(
+                        connection,
+                        "local_tracks",
+                        [int(row["rowid"])],
+                        protected=_USER_OWNED_TRACK_TABLES,
                     )
-                except sqlite3.IntegrityError:
+                except (_ProtectedReference, sqlite3.IntegrityError):
                     connection.execute("ROLLBACK TO purge_recycled")
-                    connection.execute(
-                        "UPDATE local_tracks SET file_path = '', relative_path = ?,"
-                        "availability = 'missing',"
-                        "row_revision = row_revision + 1 WHERE id = ?",
-                        (f"{track_id}.recycled", track_id),
-                    )
-                    detached += 1
+                    if str(row["file_path"] or ""):
+                        track_id = str(row["id"])
+                        connection.execute(
+                            "UPDATE local_tracks SET file_path = '',"
+                            "relative_path = ?, availability = 'missing',"
+                            "row_revision = row_revision + 1 WHERE id = ?",
+                            (f"{track_id}.recycled", track_id),
+                        )
+                        detached += 1
+                    # An already-detached row that is still spoken for is left
+                    # exactly as it is: rewriting it every pass would churn the
+                    # revision other caches key on to say nothing new.
                 else:
                     removed += 1
                 finally:
