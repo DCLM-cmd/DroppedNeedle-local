@@ -58,11 +58,14 @@ class TargetLibraryViewService:
         user: "UserRecord | None" = None,
         scope: str = "album",
     ) -> tuple[list[ViewArtist], int]:
-        del sort_by
+        # The store has always accepted a sort key and this discarded it, so an
+        # artist list asked for by album count or date added came back alphabetical
+        # and gave no sign the request had been dropped.
         rows, total = await self._store.list_target_artists(
             limit=limit,
             offset=offset,
             search=q,
+            sort_by=sort_by,
             sort_order=sort_order,
             scope=scope,
         )

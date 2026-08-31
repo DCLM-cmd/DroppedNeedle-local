@@ -87,3 +87,24 @@ async def test_an_unknown_sort_still_answers(compat_env):
         SortBy="SomethingJellyfinNeverDefined",
     )
     assert "Items" in body
+
+
+async def test_artists_honour_their_sort_key():
+    """The target view discarded sort_by outright, so every artist list came back
+    alphabetical however it was asked for."""
+    from unittest.mock import AsyncMock
+
+    from services.compat.target_library_view_service import TargetLibraryViewService
+
+    view = TargetLibraryViewService.__new__(TargetLibraryViewService)
+    view._store = AsyncMock()
+    view._store.list_target_artists.return_value = ([], 0)
+    view._artist = lambda row: row
+    view._overlay_favorites = AsyncMock()
+    view._overlay_plays = AsyncMock()
+
+    await view.get_artists(sort_by="album_count", sort_order="desc")
+
+    passed = view._store.list_target_artists.await_args.kwargs
+    assert passed["sort_by"] == "album_count"
+    assert passed["sort_order"] == "desc"
