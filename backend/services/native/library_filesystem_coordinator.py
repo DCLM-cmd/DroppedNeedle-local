@@ -23,6 +23,16 @@ _NOREPLACE_UNSUPPORTED_ERRNOS = frozenset(
     {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTTY}
 )
 _LIBC = ctypes.CDLL(None, use_errno=True)
+# renameat2 is Linux-only. On a platform that simply does not export it (macOS, and
+# any libc without the syscall) resolving the symbol raises AttributeError rather
+# than returning an errno, which escaped the caller's fallback and turned every
+# publication into a crash instead of the documented recheck-then-replace. Resolved
+# once here so the missing symbol reports as ENOSYS - the same condition the errno
+# path already handles - and the fallback below covers both.
+try:
+    _RENAMEAT2 = _LIBC.renameat2
+except AttributeError:
+    _RENAMEAT2 = None
 
 
 class _RootLeaseState:
@@ -217,6 +227,13 @@ class LibraryFilesystemCoordinator:
                 acquired.append(state)
             yield
         finally:
+            # Both are required, and neither substitutes for the other: the leases
+            # gate other writers on this root, while the counter is what tells a
+            # waiting quiesce that the library has stopped moving. Releasing only
+            # the leases leaves _active_writes climbing forever, so the first write
+            # of the process makes every later dry run wait for a drain that can
+            # never happen.
+            self._exit_write()
             for state in reversed(acquired):
                 state.release_write()
             # acquire_registered_write consumes its own registration, so only
@@ -288,7 +305,11 @@ def _renameat2_noreplace(
 ) -> None:
     """renameat2(RENAME_NOREPLACE): fail with EEXIST instead of overwriting."""
 
-    result = _LIBC.renameat2(
+    if _RENAMEAT2 is None:
+        raise OSError(
+            errno.ENOSYS, os.strerror(errno.ENOSYS), os.fspath(new_name)
+        )
+    result = _RENAMEAT2(
         ctypes.c_int(old_dir_fd),
         ctypes.c_char_p(os.fsencode(old_name)),
         ctypes.c_int(new_dir_fd),

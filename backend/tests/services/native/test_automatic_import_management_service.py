@@ -347,12 +347,33 @@ async def test_automatic_import_holds_stale_activation_and_unmapped_files(
     )
     assert all(value.pinned_profile is None for value in unmanaged.files)
 
+    # An accepted mapping may name its track by release-track MBID OR by
+    # (medium, position); the projection resolves the position against the chosen
+    # release below and still cross-checks the recording. Requiring the id form
+    # rejected the ONLY form a held import produces - file_processor stamps
+    # release_track_mbid=None and treats release+position as authoritative - so
+    # confirming a held file demanded a mapping no screen offers.
     mapped_bundle = _bundle(tmp_path, source, policy_revision)
-    broken = msgspec.structs.replace(
+    by_position_only = msgspec.structs.replace(
         mapped_bundle.files[0], release_track_mbid=None
     )
+    prepared = await service.prepare(
+        msgspec.structs.replace(mapped_bundle, files=(by_position_only,))
+    )
+    assert all(value.pinned_profile is not None for value in prepared.files)
+
+    # What still holds is a mapping that names NEITHER: no id and no usable
+    # position leaves nothing to resolve against.
+    positionless = msgspec.structs.replace(
+        mapped_bundle.files[0],
+        release_track_mbid=None,
+        release_track_position=0,
+        tag=msgspec.structs.replace(mapped_bundle.files[0].tag, track_number=0),
+    )
     with pytest.raises(AutomaticManagementHoldError) as unmapped:
-        await service.prepare(msgspec.structs.replace(mapped_bundle, files=(broken,)))
+        await service.prepare(
+            msgspec.structs.replace(mapped_bundle, files=(positionless,))
+        )
     assert unmapped.value.reason_code == TRACK_NOT_MAPPED
 
 

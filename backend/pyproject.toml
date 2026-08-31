@@ -27,3 +27,20 @@ dependencies = [
     "unidecode>=1.3,<2",
     "uvicorn[standard]==0.37.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest-timeout>=2.4.0",
+]
+
+[tool.pytest.ini_options]
+# A hung test used to block the whole run indefinitely - the suite never finished and
+# reported nothing, so a single deadlock hid every other result. With a per-test cap
+# the deadlock is reported as one failure and the remaining tests still run.
+# "signal" interrupts the blocked thread in place and lets the session continue;
+# "thread" would abort the entire run, which is the behaviour being fixed.
+# 30s is five times the slowest legitimate test measured here (6.1s), so it cannot
+# fail honest work, while a deadlock is reported in half a minute instead of never.
+# A genuinely slow test can raise its own with @pytest.mark.timeout(n).
+timeout = 30
+timeout_method = "signal"

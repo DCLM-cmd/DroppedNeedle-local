@@ -2041,6 +2041,8 @@ class LibraryManagementPublisher:
                 catalog_revision=snapshot.catalog_revision,
                 snapshot_revision=snapshot.row_revision,
                 committed_journal_ids=(),
+                # Nothing was committed, so there are no journal revisions to report.
+                committed_journal_revisions={},
             )
 
         existing = await self._store.list_file_mutation_journals_for_bundle(

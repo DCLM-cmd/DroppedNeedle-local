@@ -453,6 +453,19 @@ def _tag_conflict_reason(tag, info, manifest, expected_track) -> str | None:  # 
     return None
 
 
+# Below this, the fingerprint named a different song than the one expected.
+#
+# ``similarity`` is token_set_ratio over the punctuation/case-folded form, which
+# scores 100 whenever one title's tokens are a subset of the other's - so every
+# legitimate difference lands there: "Avalon" vs "Avalon (Live)", "Song (Remastered)"
+# vs "Song [Remastered]", a featuring credit on one side only. Measured against real
+# pairs, genuine mismatches sit at 18-50 and legitimate ones at 100, so the floor
+# belongs inside that gap rather than on either edge. The previous ``< 50`` sat
+# exactly on the mismatch ceiling, and a pair scoring precisely 50 - half its tokens
+# unrelated - was read as agreement.
+_WRONG_SONG_TITLE_FLOOR = 60
+
+
 def _fingerprint_disagrees(
     fp,
     expected_track,
@@ -490,7 +503,7 @@ def _fingerprint_disagrees(
     if (
         fp_title
         and expected_title
-        and similarity(fp_title, expected_title) < 50
+        and similarity(fp_title, expected_title) < _WRONG_SONG_TITLE_FLOOR
     ):
         return True  # clearly the wrong song
 

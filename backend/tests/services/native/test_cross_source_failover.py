@@ -27,7 +27,12 @@ def _orchestrator(candidates, *, enabled=("soulseek", "usenet")):
     orch._store.get_search_job_candidates = AsyncMock(return_value=candidates)
     orch._source_enabled = lambda source: source in enabled
     orch._candidate_source_identity = lambda cand: f"{cand.source}:{cand.username}"
-    orch._candidate_passes_quality = lambda cand, track_count=None: True
+    # async, and (task, cand): upstream moved the quality re-gate onto the task's
+    # STORED snapshot, so it reads persisted state rather than a bare track count.
+    async def _passes(task, cand):  # noqa: ANN001, ARG001
+        return True
+
+    orch._candidate_passes_quality = _passes
     orch._candidate_quality_details = lambda cand: {"rank": 1}
     return orch
 

@@ -240,6 +240,26 @@ class PooledSqliteStore:
     def _connect(self) -> sqlite3.Connection:
         raise NotImplementedError
 
+    @property
+    def _pool_key(self) -> tuple[int, str]:
+        """This store INSTANCE's slot in the per-thread connection cache.
+
+        Keyed per instance, not per class: two stores of the same class over the same
+        file each layer their own PRAGMAs (and a test may wrap ``_connect`` to trace
+        statements), so sharing one connection between them silently hands the second
+        the first one's connection and discards whatever it configured. Production
+        builds each store once, so per-instance keying pools exactly as widely in
+        practice while removing that trap.
+
+        The token is created per instance and lives as long as it, so ``id()`` cannot
+        be recycled underneath a live entry the way ``id(self)`` could.
+        """
+        token = getattr(self, "_pool_token", None)
+        if token is None:
+            token = object()
+            object.__setattr__(self, "_pool_token", token)
+        return (id(token), str(self.db_path))
+
     def _pooled_connection(self) -> sqlite3.Connection:
         """Borrow this thread's connection for this store, opening it on first use.
 
@@ -250,7 +270,7 @@ class PooledSqliteStore:
         if _pool.generation != _pool_generation:
             close_pooled_connections()
             _pool.generation = _pool_generation
-        key = (id(type(self)), str(self.db_path))
+        key = self._pool_key
         conn = _pool.connections.get(key)
         if conn is None:
             conn = self._connect()
@@ -258,8 +278,7 @@ class PooledSqliteStore:
         return conn
 
     def _discard_pooled_connection(self) -> None:
-        key = (id(type(self)), str(self.db_path))
-        conn = _pool.connections.pop(key, None)
+        conn = _pool.connections.pop(self._pool_key, None)
         if conn is not None:
             try:
                 conn.close()

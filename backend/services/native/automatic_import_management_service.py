@@ -212,10 +212,10 @@ class AutomaticImportManagementService:
                     not request.authoritative_mapping
                     or not request.release_group_mbid
                     or not request.release_mbid
-                    or not request.release_track_mbid
                 ):
                     raise ProviderIdentityRequiredError(
-                        "Every automatic import file needs an accepted release-track mapping."
+                        "Every automatic import file needs an accepted release and "
+                        "track position before it can be filed automatically."
                     )
                 groups.setdefault(
                     (
@@ -256,7 +256,19 @@ class AutomaticImportManagementService:
                     )
                     for request in requests
                 )
-                if any(value.release_track_position < 1 for value in mappings):
+                # The release-track MBID is NOT required here: a mapping may name the
+                # track by id OR by (medium, position), and build_for_import resolves
+                # the position against the selected release's own tracklist below.
+                # Demanding the id up front rejected the position form outright - which
+                # is the ONLY form a held import produces (file_processor stamps
+                # release_track_mbid=None and calls release+position authoritative), so
+                # confirming a held file asked the user for a mapping that no screen
+                # offers and that the code was about to derive anyway.
+                if any(
+                    value.release_track_position is None
+                    or value.release_track_position < 1
+                    for value in mappings
+                ):
                     raise ProviderIdentityRequiredError(
                         "Every automatic import file needs an accepted track position."
                     )
