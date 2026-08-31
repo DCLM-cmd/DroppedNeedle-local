@@ -6,7 +6,7 @@ import {
 } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 import { API, CACHE_TTL } from '$lib/constants';
-import { api } from '$lib/api/client';
+import { api, ApiError } from '$lib/api/client';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import type {
 	Album,
@@ -158,8 +158,22 @@ export const getLibraryAlbumDetailQueryOptions = (albumId: string) =>
 	queryOptions({
 		staleTime: CACHE_TTL.LIBRARY_NATIVE,
 		queryKey: LibraryQueryKeyFactory.albumDetail(albumId),
-		queryFn: ({ signal }) =>
-			api.global.get<LibraryAlbumDetail>(API.library.albumDetail(albumId), { signal })
+		// A 404 is the ANSWER "this album is not in your library", not a failure.
+		// As an error it never settled: an errored query refetches for every new
+		// observer, and this key carries two - the album route and the provider page
+		// it falls through to - so each one's state change re-mounted the other and
+		// the pair hammered the endpoint at ~240 requests a second until the whole
+		// app was rate-limited and nothing else could load.
+		queryFn: async ({ signal }) => {
+			try {
+				return await api.global.get<LibraryAlbumDetail>(API.library.albumDetail(albumId), {
+					signal
+				});
+			} catch (err) {
+				if (err instanceof ApiError && err.status === 404) return null;
+				throw err;
+			}
+		}
 	});
 
 export const getLibraryAlbumDetailQuery = (getAlbumId: Getter<string>) =>

@@ -105,4 +105,12 @@ export const createPlexLinkPollMutation = () =>
 			data.completed ? invalidateConnectionAndPlaylists('plex') : Promise.resolve()
 	}));
 
-type ConnectionStatusResponse = { service: string; enabled: boolean; username: string };
+type ConnectionStatusResponse = {
+	service: string;
+	enabled: boolean;
+	username: string;
+	/** Absent when the provider confirmed it. False means it was stored without a
+	 *  verdict because the provider could not be reached; `message` says why. */
+	verified?: boolean;
+	message?: string | null;
+};
