@@ -1418,7 +1418,11 @@ def _build_drop_import_service(
         wanted_store=get_wanted_store(),
         sse_publisher=get_sse_publisher(),
         on_import=on_import,
-        staging_root=get_settings().root_app_dir / "imports",
+        # Under cache_dir, which is the persisted volume. root_app_dir/"imports"
+        # lives in the container's writable layer, so every image update replaced
+        # the container and destroyed whatever was still waiting to be matched by
+        # hand - the drop's only copy, since create_job MOVES the upload in.
+        staging_root=get_settings().cache_dir / "imports",
         publish_import_bundle=publish_import_bundle,
         policy_revision_getter=policy_revision_getter,
     )
