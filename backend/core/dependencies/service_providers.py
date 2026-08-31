@@ -2926,6 +2926,8 @@ def _build_download_service(
 ) -> "DownloadService":
     from services.native.download_service import DownloadService
 
+    from .cache_providers import get_native_library_store
+
     from .repo_providers import (
         get_album_release_pin_store,
         get_download_client_repository,
@@ -2985,7 +2987,6 @@ def get_target_download_service() -> "DownloadService":
         file_processor=get_target_file_processor(),
         album_service=get_target_album_service(),
         library_reconciler=get_target_import_library_service(),
-        native_library_store=get_native_library_store(),
         quota_service=get_target_quota_service(),
         release_pin_store=get_target_album_release_pin_store(),
     )
