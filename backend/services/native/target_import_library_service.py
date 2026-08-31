@@ -142,6 +142,15 @@ class TargetImportLibraryService:
         except LibraryManagementDestinationConflictError as error:
             if not automatic:
                 raise
+            # The user-facing text names neither the destination nor which of the
+            # several conflict checks fired, and the hold is then retried by hand -
+            # each retry re-planning the whole bundle and failing the same way. Log
+            # what actually collided so it can be looked at once instead of guessed at.
+            logger.warning(
+                "Import bundle %s held on a destination conflict: %s",
+                bundle.bundle_id if hasattr(bundle, "bundle_id") else "?",
+                error,
+            )
             raise AutomaticManagementHoldError(
                 PATH_COLLISION_DIFFERENT,
                 "A planned destination is occupied by different content. Nothing was overwritten.",

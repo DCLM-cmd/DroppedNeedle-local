@@ -64,6 +64,7 @@ from services.native.quality_tiers import (
     in_range,
     is_audio,
     is_flac_or_mp3,
+    tier_for,
     tier_rank,
 )
 from services.native.file_processor import (
@@ -75,6 +76,8 @@ from services.native.file_processor import (
 )
 from services.native.library_manager import LibraryManager
 from services.native.track_matcher import TrackMatcher
+
+from services.native.title_match import is_placeholder_artist
 
 logger = logging.getLogger(__name__)
 
@@ -153,11 +156,64 @@ _IMPORT_FAILED_MSG = (
     "Files downloaded, but couldn't be saved into your library - check the library "
     "folder is writable and has free space"
 )
+# What the processor actually rejected, said plainly. Without these every rejection
+# that was not a write failure fell through to _IMPORT_FAILED_MSG or "no working
+# source": a release whose audio fingerprints identified different recordings told the
+# user to "check the library folder is writable and has free space", which is not the
+# problem and sends them looking at disks and permissions for a bad release.
+_REASON_MESSAGES = {
+    "fingerprint_mismatch": (
+        "The downloaded files are not this release - their audio fingerprints "
+        "identify different recordings. Looking for another source."
+    ),
+    "duration_mismatch": (
+        "The downloaded files are not this release - their track lengths do not "
+        "match it. Looking for another source."
+    ),
+    "verify_failed": (
+        "The downloaded files could not be verified as playable audio. Looking for "
+        "another source."
+    ),
+    "corrupt": (
+        "The downloaded files are damaged. Looking for another source."
+    ),
+    "wrong_track": (
+        "The downloaded file is a different recording than the one requested."
+    ),
+    "the old copy cannot be preserved - no recycle bin is configured": (
+        "A better copy was found, but the old one could not be set aside: no recycle "
+        "bin is configured. Nothing was overwritten - set one up and run this again."
+    ),
+    "not better than the copy already in the library": (
+        "This release is no better than the copy already in your library. Looking "
+        "for a genuinely higher-quality one."
+    ),
+}
 _MANAGEMENT_HELD_MSG = "Download complete. The files are secured while Library Management waits for attention."
 _MANAGEMENT_HOLD_STORAGE_MSG = (
     "Download complete, but DroppedNeedle could not secure its Library Management "
     "review copy. The original download was preserved."
 )
+
+
+def _rejection_message(result) -> str | None:  # noqa: ANN001 - ProcessResult
+    """The message for what the processor rejected, or None if it says nothing new.
+
+    Most specific first: a local fault is the user's to fix, a bad release is ours to
+    fail over from, and only what we cannot name falls through to the generic wording.
+    """
+    reasons = [f.reason for f in getattr(result, "failed", None) or ()]
+    if not reasons:
+        return None
+    if SOURCE_FILE_MISSING in reasons:
+        return _FILES_NOT_FOUND_MSG
+    if IMPORT_FAILED in reasons:
+        return _IMPORT_FAILED_MSG
+    for reason in reasons:
+        message = _REASON_MESSAGES.get(reason)
+        if message is not None:
+            return message
+    return None
 
 
 class _Cancelled(Exception):
@@ -240,6 +296,9 @@ class DownloadOrchestrator:
         soulseek_enabled: bool = True,  # the slskd enable toggle (separate from is_configured)
         source_priority=None,  # list[str] | None - default ["soulseek", "usenet"]
         album_service=None,  # AlbumService | None - for the Usenet MB tracklist
+        # async (artist_mbid) -> [alias name]. Lets a Soulseek search fall back to the
+        # transliterations peers actually share under; None disables the alias pass.
+        alias_resolver=None,
         usenet_category: str | None = None,
         usenet_priority: int | None = None,
         usenet_post_processing: int | None = None,
@@ -326,6 +385,7 @@ class DownloadOrchestrator:
                 album_service=album_service,
                 policy_extras=self._spec_policy_extras,
                 probe_tagger=probe_tagger,
+                alias_resolver=alias_resolver,
             ),
         }
         # Created whenever a SABnzbd client exists (not gated on the indexer), so a Usenet
@@ -1231,6 +1291,16 @@ class DownloadOrchestrator:
                 if attempts < self._max_failover
                 else None
             )
+            if entry is None and attempts < self._max_failover:
+                # The pool is empty of usable candidates - but it may never have held
+                # every source. ``_search_score_autopick`` stops at the first source
+                # that auto-accepts, so with source_priority ['usenet','soulseek'] a
+                # Usenet auto-accept means Soulseek was NEVER SEARCHED. When that
+                # Usenet release then failed, the task settled as "no working source on
+                # Soulseek or Usenet" having asked exactly one of them. Search the ones
+                # that were skipped before giving up.
+                if await self._extend_pool_with_unsearched_sources(task):
+                    entry = await self._next_candidate_entry(task, tried_usernames)
             # Per-file failover (#292): measure what the library is still missing.
             # An EMPTY remaining set means earlier attempts (or a manual import) already
             # delivered everything - settle COMPLETED instead of re-downloading the
@@ -1272,6 +1342,10 @@ class DownloadOrchestrator:
                 )
                 return
             if enqueued and outcome not in (_OUT_COMPLETED, _OUT_TERMINAL):
+                # Abandoned (stalled, queued-timeout, never started): blame the peer for
+                # what it did not deliver, or the next search picks the same dead source.
+                if not local_fault and not attempt_import_fault:
+                    await strategy.maybe_blocklist_on_abandon(task, status)
                 await self._abort_abandoned_transfer(task)
             await self._schedule_attempt_cleanup(
                 task,
@@ -1543,6 +1617,51 @@ class DownloadOrchestrator:
             "has_next_source": task.has_next_source,
         }
 
+    async def _extend_pool_with_unsearched_sources(self, task) -> bool:  # noqa: ANN001
+        """Search every enabled source absent from the task's candidate pool and append
+        what it finds, keeping the pool source-grouped.
+
+        Returns True when the pool grew, so the caller can retry ``_next_candidate_entry``
+        instead of settling. Reached only at exhaustion, so a source that returns nothing
+        is simply searched once and the task settles as before.
+        """
+        if task.search_job_id is None:
+            return False
+        pooled = list(await self._store.get_search_job_candidates(task.search_job_id))
+        searched = {candidate.source for candidate in pooled} | {task.source}
+        missing = [
+            source
+            for source in self._source_priority
+            if source not in searched and self._source_enabled(source)
+        ]
+        if not missing:
+            return False
+
+        added = 0
+        for source in missing:
+            try:
+                found = await self._search_and_score(task, source)
+            except Exception:  # noqa: BLE001 - one dead source must not sink the rest
+                logger.exception(
+                    "Late %s search failed for task %s", source, task.id
+                )
+                continue
+            logger.info(
+                "download.search.late_failover",
+                extra={
+                    "task_id": task.id,
+                    "source": source,
+                    "candidates_count": len(found),
+                    "top_score": found[0].final_score if found else 0.0,
+                },
+            )
+            pooled.extend(found)
+            added += len(found)
+        if not added:
+            return False
+        await self._store.set_search_job_candidates(task.search_job_id, pooled)
+        return True
+
     async def _next_candidate_entry(
         self,
         task,
@@ -1550,28 +1669,57 @@ class DownloadOrchestrator:
         *,
         lower_than=None,
     ):  # noqa: ANN001, ANN201
-        """The next eligible stored candidate without mutating durable task state."""
+        """The next eligible stored candidate without mutating durable task state.
+
+        The task's own source is walked first, in rank order. Once it is exhausted the
+        OTHER source in the same pooled job is considered rather than giving up: a
+        Usenet release that stalls or gets aborted says nothing about whether Soulseek
+        has the album, and settling straight to "no working source" threw away
+        candidates that were already searched, scored and stored. Crossing is safe -
+        ``link_picked_candidate`` rewrites the task's ``source``/``download_client``
+        together with the candidate - and stays bounded by ``_max_failover``.
+
+        The cross-source pass scans from index 0, not from ``candidate_index``: the
+        pooled job is source-GROUPED (Soulseek first, then Usenet), so the other
+        source's candidates usually sit at LOWER indices than a Usenet task's own.
+        ``tried_usernames`` still keeps an identity from being retried, and a disabled
+        source is never crossed to.
+        """
 
         if task.search_job_id is None:
             return None
         candidates = await self._store.get_search_job_candidates(task.search_job_id)
-        start = (task.candidate_index or 0) + 1
-        for idx in range(start, len(candidates)):
-            cand = candidates[idx]
-            # Stay within the task's source (never cross Soulseek<->Usenet in the pooled
-            # job) and skip an identity we've already tried (review M2).
-            if cand.source != task.source:
-                continue
+
+        # Async because the quality re-gate reads the task's STORED snapshot; the
+        # closure keeps the two candidate walks below to one eligibility rule.
+        async def eligible(cand) -> bool:  # noqa: ANN001 - ScoredCandidate
             if self._candidate_source_identity(cand) in tried_usernames:
-                continue
+                return False
             # re-gate: failover must not fall through to a now out-of-policy candidate (D2)
             if not await self._candidate_passes_quality(task, cand):
-                continue
+                return False
             if lower_than is not None:
                 details = self._candidate_quality_details(cand)
                 if details is None or details["rank"] >= lower_than:
-                    continue
-            return idx, cand
+                    return False
+            return True
+
+        start = (task.candidate_index or 0) + 1
+        for idx in range(start, len(candidates)):
+            cand = candidates[idx]
+            if cand.source != task.source:
+                continue
+            if await eligible(cand):
+                return idx, cand
+        # ``lower_than`` is the preferred-quality wait, a within-pool concern: a
+        # cross-source switch is about exhaustion, not about trading quality down.
+        if lower_than is not None:
+            return None
+        for idx, cand in enumerate(candidates):
+            if cand.source == task.source or not self._source_enabled(cand.source):
+                continue
+            if await eligible(cand):
+                return idx, cand
         return None
 
     async def _prepare_candidate_state(
@@ -1845,6 +1993,26 @@ class DownloadOrchestrator:
         )
         return covered, len(tracks), orphans
 
+    async def _upgrade_left_worse_files(self, task) -> bool:  # noqa: ANN001
+        """Whether the album still holds files below the best quality it now has.
+
+        Judged exactly like the scanner and the import gate judge quality, so an album
+        counts as upgraded only once it is uniform. Fail-open: when the rows cannot be
+        read the upgrade is allowed to settle rather than looping forever.
+        """
+        if not task.release_group_mbid:
+            return False
+        try:
+            rows = await self._library.get_file_rows_for_album(task.release_group_mbid)
+        except Exception:  # noqa: BLE001 - a quality check must not crash the task
+            return False
+        ranks = [
+            tier_rank(tier_for(row.get("file_format") or "", row.get("bit_rate")))
+            for row in rows or ()
+        ]
+        ranks = [rank for rank in ranks if rank > 0]
+        return bool(ranks) and min(ranks) < max(ranks)
+
     async def _download_is_complete(
         self, task, imported_any: bool, result=None
     ) -> bool:  # noqa: ANN001
@@ -1867,6 +2035,14 @@ class DownloadOrchestrator:
         fallback: at least ``track_count`` distinct positions present."""
         if task.download_type == "track":
             return imported_any
+        if task.origin == "upgrade":
+            if not imported_any:
+                return False
+            # Replacing SOME files is not finishing the job. One live run swapped a
+            # single track and left nine at the old quality, then reported success:
+            # the album sat at 1 FLAC + 9 MP3 and the failover never went looking for
+            # a release that could deliver the rest.
+            return not await self._upgrade_left_worse_files(task)
         coverage = await self._coverage(task, context="completeness")
         if coverage is not None:
             covered, expected_total, _orphans = coverage
@@ -1948,12 +2124,26 @@ class DownloadOrchestrator:
         elif tag_mismatch:
             fail_msg = _TAG_MISMATCH_MSG
         else:
-            fail_msg = self._no_source_message()
+            # Name what was actually rejected when the processor said so; only a
+            # genuinely sourceless search falls through to the generic wording.
+            fail_msg = _rejection_message(process_result) or self._no_source_message()
         if task.download_type == "track":
             await self._finalize(
                 task,
                 DownloadStatus.FAILED,
                 error_message=fail_msg,
+                process_result=process_result,
+            )
+            return
+        if task.origin == "upgrade" and not imported_any:
+            # Nothing was replaced and the library is exactly as it was. That is not a
+            # failure to report as one - it is the same outcome as "no candidate beat
+            # the upgrade floor", which already ends this way. Saying "no source on
+            # Soulseek" instead sent the user looking for a problem that is not there.
+            await self._finalize(
+                task,
+                DownloadStatus.CANCELLED,
+                error_message="No better copy could be imported",
                 process_result=process_result,
             )
             return
@@ -2712,10 +2902,38 @@ class DownloadOrchestrator:
 
         return await self._store.get_task(task.id)
 
+    async def _retry_identity(self, task) -> tuple[str, str]:  # noqa: ANN001
+        """The ``(artist_name, album_title)`` a retry should search for.
+
+        Copying the task verbatim carried a placeholder artist forward forever: a task
+        created as "Unknown" retried as "Unknown", long after the pipeline stopped
+        inventing that name. The matchers no longer accept a placeholder as identity
+        evidence, so such a retry cannot grab the wrong album any more - it just burns
+        a search that was never going to match. Repair it from a sibling task for the
+        same release group when one names the album properly.
+        """
+        artist_name = task.artist_name or ""
+        album_title = task.album_title or ""
+        if not is_placeholder_artist(artist_name) or not task.release_group_mbid:
+            return artist_name, album_title
+        known = await self._store.find_release_group_identity(task.release_group_mbid)
+        if known is None:
+            return artist_name, album_title
+        logger.info(
+            "download.retry_identity_repaired",
+            extra={
+                "task_id": task.id,
+                "release_group_mbid": task.release_group_mbid,
+                "artist_name": known[0],
+            },
+        )
+        return known[0], known[1] or album_title
+
     async def _create_retry_task(self, task) -> str:  # noqa: ANN001 - DownloadTask
         """Create a fresh queued task carrying ``retry_count + 1`` and dispatch it.
         The original is kept (terminal) for audit. Shared by manual retry and
         auto-retry."""
+        artist_name, album_title = await self._retry_identity(task)
         new_task = await self._store.create_task(
             user_id=task.user_id,
             download_type=task.download_type,
@@ -2724,8 +2942,8 @@ class DownloadOrchestrator:
             release_track_mbid=task.release_track_mbid,
             recording_mbid=task.recording_mbid,
             artist_mbid=task.artist_mbid,
-            artist_name=task.artist_name,
-            album_title=task.album_title,
+            artist_name=artist_name,
+            album_title=album_title,
             track_title=task.track_title,
             track_number=task.track_number,
             disc_number=task.disc_number,

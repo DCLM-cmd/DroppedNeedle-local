@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import PurePosixPath
 
@@ -121,9 +122,14 @@ async def library_activity(
     administrative_work: LibraryAdministrativeWorkServiceDep,
     mb_provider_available: MbProviderAvailabilityDep,
 ) -> LibraryActivityResponse:
-    revisions = await identification.stream_revisions()
-    runs = await coordinator.current()
-    recent_history = await coordinator.history(limit=1)
+    # The UI polls this endpoint continuously, and these three reads do not depend
+    # on each other - awaiting them in sequence made every poll three round-trips
+    # deep before any work started.
+    revisions, runs, recent_history = await asyncio.gather(
+        identification.stream_revisions(),
+        coordinator.current(),
+        coordinator.history(limit=1),
+    )
     latest_failure = next(
         (
             run

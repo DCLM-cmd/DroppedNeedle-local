@@ -293,6 +293,12 @@ class ArtworkProjectionService:
             except (ArtworkProcessingError, ExternalServiceError, OSError):
                 self._defer(provider, deferred, "artwork provider failed")
                 continue
+            except ValueError:
+                # A stored MBID that isn't a well-formed UUID (legacy rows, or an
+                # "unknown_*" placeholder) is rejected by validate_mbid. Artwork is
+                # an enrichment step - degrade it, never fail the album's plan.
+                self._defer(provider, deferred, "artwork identifier is unusable")
+                continue
             await self._select_candidates(
                 candidates=candidates,
                 settings=settings,
@@ -357,6 +363,11 @@ class ArtworkProjectionService:
         pass_cache: _LocalArtworkPassCache | None = None,
     ) -> tuple[ArtworkCandidate, ...]:
         if provider == "cover_art_archive_release":
+            # An album can legitimately carry no release MBID (scan-discovered, or
+            # matched only at release-group level). That is missing data, not a
+            # failure: there is simply nothing to ask Cover Art Archive for.
+            if not release_mbid:
+                return ()
             return await self._repository.list_management_artwork(
                 entity_kind="release",
                 mbid=release_mbid,
@@ -364,6 +375,8 @@ class ArtworkProjectionService:
                 priority=priority,
             )
         if provider == "cover_art_archive_release_group":
+            if not release_group_mbid:
+                return ()
             return await self._repository.list_management_artwork(
                 entity_kind="release-group",
                 mbid=release_group_mbid,

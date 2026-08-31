@@ -21,6 +21,7 @@ from services.native.album_preflight_scorer import _file_confidence
 from services.native.title_match import artist_evidence
 from services.native.acquisition import quality as acq_quality
 from services.native.quality_tiers import (
+    exceeds_lossless_cap,
     in_range,
     file_tier,
     folder_hires_key,
@@ -34,8 +35,10 @@ class TrackMatcher:
     """Quality flows exclusively through the per-call ``AcquisitionQualitySnapshot``
     (spec Snapshot rule); non-quality spec gates ride ``spec_extras``."""
 
-    def __init__(self, download_store: DownloadStore):
+    def __init__(self, download_store: DownloadStore, *, lossless_max_kbps: int = 0):
         self._store = download_store
+        # 0 = no cap; see AlbumPreflightScorer for why the tier axis cannot carry this.
+        self._lossless_max_kbps = lossless_max_kbps
 
     async def match(
         self,
@@ -82,6 +85,9 @@ class TrackMatcher:
         filtered = [r for r in filtered if is_audio(r)]
         if snapshot.flac_mp3_only:
             filtered = [r for r in filtered if is_flac_or_mp3(r)]
+        filtered = [
+            r for r in filtered if not exceeds_lossless_cap(r, self._lossless_max_kbps)
+        ]
         order = snapshot.quality_preference_order
 
         def _inside_range(candidate_result) -> bool:

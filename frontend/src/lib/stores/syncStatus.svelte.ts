@@ -85,9 +85,35 @@ function createSyncStatusStore() {
 
 		handleStatusUpdate(newStatus);
 
-		if (connectionMode === 'polling' && wasSyncing !== newStatus.is_syncing) {
+		if (wasSyncing !== newStatus.is_syncing) {
+			if (newStatus.is_syncing) {
+				// A sync is live: take the stream for per-item progress.
+				upgradeToStream();
+			} else {
+				// Idle again - give the connection slot back.
+				downgradeToPolling();
+			}
+		} else if (connectionMode === 'polling') {
 			schedulePoll();
 		}
+	}
+
+	function upgradeToStream(): void {
+		if (!connected || eventSource || document.hidden) return;
+		reconnectAttempts = 0;
+		connectSSE();
+	}
+
+	function downgradeToPolling(): void {
+		if (!connected) return;
+		eventSource?.close();
+		eventSource = null;
+		if (reconnectTimeout) {
+			clearTimeout(reconnectTimeout);
+			reconnectTimeout = null;
+		}
+		connectionMode = 'polling';
+		schedulePoll();
 	}
 
 	function handleStatusUpdate(newStatus: SyncStatus): void {
@@ -210,7 +236,7 @@ function createSyncStatusStore() {
 				pollInterval = null;
 			}
 		} else {
-			if (connectionMode === 'sse') {
+			if (connectionMode === 'sse' && status.is_syncing) {
 				reconnectAttempts = 0;
 				connectSSE();
 			} else {
@@ -271,7 +297,15 @@ function createSyncStatusStore() {
 		connect(): void {
 			if (!browser || connected) return;
 			connected = true;
-			connectSSE();
+			// Poll while idle, and only hold an SSE connection open while a sync is
+			// actually running. A browser allows ~6 connections per origin on
+			// HTTP/1.1 and the app shell keeps several streams open permanently, so
+			// a stream that exists to drive an indicator which is HIDDEN when idle
+			// was spending one of those slots for nothing - and once the six are
+			// gone, ordinary API requests just queue. Polling here is the store's
+			// own supported mode, at POLL_IDLE_MS.
+			connectionMode = 'polling';
+			startPolling();
 			document.addEventListener('visibilitychange', handleVisibilityChange);
 		},
 

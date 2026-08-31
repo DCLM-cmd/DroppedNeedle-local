@@ -63,6 +63,90 @@ def fold(text: str) -> str:
 def strip_featuring(text: str) -> str:
     return _FEAT_RE.sub("", text or "").strip()
 
+
+# Track and tag text disagrees on punctuation constantly - "Don't" / "Dont",
+# "Rock & Roll" / "Rock and Roll", "Song (Remastered)" / "Song [Remastered]" - and none
+# of it changes which song is meant, so it must not change whether two titles match.
+#
+# Apostrophes are DELETED rather than blanked: they sit inside a word, so blanking them
+# turns "Don't" into "don t", which no longer matches "dont". Every other punctuation
+# mark separates words and becomes a space.
+_MATCH_APOSTROPHE = re.compile(r"['\u2018\u2019\u02bc`]")
+_MATCH_PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
+
+# How a credit naming several artists is split. Downloaded tags write these in every
+# combination ("A feat. B", "A; B", "A & B") while the provider records them as
+# separate credits, so a whole-string comparison of the two is close to meaningless.
+_ARTIST_SPLIT = re.compile(
+    r"\s*(?:;|,|/|\bfeat\b\.?|\bft\b\.?|\bfeaturing\b|&|\+|\bvs\b\.?|\bwith\b|\bx\b)\s*",
+    re.IGNORECASE,
+)
+
+# Below this, two names are not the same artist/title. Deliberately generous: the
+# comparison form has already removed the differences that are pure formatting.
+MATCH_FLOOR = 85
+
+
+def match_key(text: str) -> str:
+    """The form two strings are compared in: case-, accent- and punctuation-folded.
+
+    ``fold`` already handles case and accents; this additionally drops punctuation and
+    collapses whitespace, so "Mötley Crüe - Dr. Feelgood!" and "motley crue dr feelgood"
+    are the same key. CJK is preserved by ``fold``.
+    """
+    folded = _MATCH_APOSTROPHE.sub("", fold(text))
+    return " ".join(_MATCH_PUNCTUATION.sub(" ", folded).split())
+
+
+def similarity(left: str, right: str) -> int:
+    """0-100 token-set similarity of two strings in comparison form.
+
+    Prefer this over calling ``token_set_ratio`` directly: raw rapidfuzz is case- AND
+    punctuation-sensitive, so "THE TITLE" vs "The Title" and "Don't" vs "Dont" scored
+    as partial mismatches and pushed correct imports into review.
+    """
+    left_key, right_key = match_key(left), match_key(right)
+    if not left_key or not right_key:
+        return 0
+    return int(fuzz.token_set_ratio(left_key, right_key))
+
+
+def artist_names(credit: str) -> list[str]:
+    """The individual artists named by one credit string, in comparison form."""
+    if not credit:
+        return []
+    return [
+        key
+        for part in _ARTIST_SPLIT.split(credit)
+        if (key := match_key(part))
+    ]
+
+
+def artists_overlap(left: str, right: str, *, floor: int = MATCH_FLOOR) -> bool:
+    """True when the two credits name at least one artist in common.
+
+    A downloaded file often credits every performer ("Artist feat. Guest") where the
+    provider credits only the primary, or the reverse. Requiring the whole credit to
+    match calls those different artists and holds a correct file for review; requiring
+    only that ONE named artist appears on both sides treats them as the same release,
+    which is what they are. Either side being unnamed is not evidence of a conflict,
+    so it reports overlap and lets the caller's other signals decide.
+    """
+    if not (left or "").strip() or not (right or "").strip():
+        return True
+    left_names, right_names = artist_names(left), artist_names(right)
+    if not left_names or not right_names:
+        return True
+    if set(left_names) & set(right_names):
+        return True
+    # Split credits still disagree on spelling ("Jay Z" / "Jay-Z"), so compare each
+    # pair fuzzily too, and fall back to the whole credit for unsplittable names.
+    for one in left_names:
+        for other in right_names:
+            if fuzz.token_set_ratio(one, other) >= floor:
+                return True
+    return similarity(left, right) >= floor
+
 # Tokens that begin the format/source/quality run: the album name ends before the first of
 # these. Codecs, media, and online sources - none of which are album-name words. Bit-depth /
 # sample-rate / year / catalog tokens carry a digit and are caught generically (see below).
@@ -214,6 +298,22 @@ def title_containment_score(
     return coverage * penalty
 
 
+# Names that stand in for "we don't know who this is". They are not identities: a
+# request carrying one must never earn auto-acceptance off it, or "Unknown" matches
+# every share that happens to hold an "Unknown" folder - which is how a Gregorian
+# chant collection was auto-accepted as "A Moon Shaped Pool".
+_PLACEHOLDER_ARTISTS = frozenset({
+    "unknown", "unknown artist", "various", "various artists", "va", "untitled",
+    "no artist", "none", "n a", "nan", "null", "artist",
+})
+
+
+def is_placeholder_artist(artist_name: str) -> bool:
+    """True when the name carries no identity at all - a filler the pipeline invented
+    or a tag dump's default, not somebody to search for."""
+    return " ".join(_tokens(artist_name)) in _PLACEHOLDER_ARTISTS
+
+
 def artist_evidence(artist_name: str, candidate_path: str) -> bool:
     """POSITIVE evidence that the requested artist is named somewhere in a candidate's
     full remote path (all folder levels + filename): a majority of the artist's
@@ -228,7 +328,12 @@ def artist_evidence(artist_name: str, candidate_path: str) -> bool:
     ``Artist/Album/track`` share layouts, where the artist is a grandparent directory.
 
     Stopwords are dropped from the artist's words so "The Who" needs "who", not the
-    ubiquitous "the" (fallback to all words when the name is entirely stopwords)."""
+    ubiquitous "the" (fallback to all words when the name is entirely stopwords).
+
+    A placeholder name is no evidence whatever the path says: matching "Unknown"
+    against a path containing "Unknown" is a coincidence of filler, not identity."""
+    if is_placeholder_artist(artist_name):
+        return False
     # GH-284: digit-bearing names (deadmau5, u2) keep their alphanumeric tokens -
     # ``isalpha()`` alone dropped them, so no candidate could ever earn evidence.
     # Pure-numeric names (311) are excluded here: a bare number must match an
@@ -269,7 +374,13 @@ def names_different_album(album_title: str, artist_name: str, candidate_title: s
     # F-EDITION-03: fold the ``box`` + ``set`` compound to the canonical
     # ``boxset`` descriptor on both sides so dotted/hyphenated/underscored
     # spellings compare identically. A bare ``set`` stays an album word.
-    artist = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2}
+    # A placeholder name contributes no artist tokens: "Unknown" appearing on both
+    # sides is filler agreeing with filler, not an artist match.
+    artist = (
+        set()
+        if is_placeholder_artist(artist_name)
+        else {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2}
+    )
     candidate = _fold_box_set(_tokens(candidate_title))
     if not _artist_present(candidate, artist):
         return False

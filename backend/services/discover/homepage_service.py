@@ -24,6 +24,7 @@ from api.v1.schemas.home import (
     ServicePrompt,
     DiscoverPreview,
 )
+from core.exceptions import RateLimitedError
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.cache_keys import DAILY_MIX_PREFIX, TOP_PICKS_PREFIX
 from infrastructure.cover_urls import prefer_artist_cover_url
@@ -1326,6 +1327,16 @@ class DiscoverHomepageService:
                         if mbid and mbid not in seen_mbids:
                             seeds.append(a)
                             seen_mbids.add(mbid)
+                except RateLimitedError as e:
+                    # The server is refusing us, not lacking data for this window:
+                    # asking about the next three can only add to what it already
+                    # declined. One page load used to fire four such calls.
+                    logger.warning(
+                        "ListenBrainz is rate limiting; skipping the remaining "
+                        "top-artist windows (%s)",
+                        e,
+                    )
+                    break
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to get LB top artists ({range_}): {e}")
 

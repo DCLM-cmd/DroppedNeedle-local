@@ -1,6 +1,8 @@
 import { getApiUrl } from '$lib/api/api-utils';
 import { API } from '$lib/constants';
 
+import { subscribeShared, type SharedEventSourceSubscription } from '../sharedEventSource';
+
 import { invalidateLibraryManagementSurfaces } from './LibraryManagementInvalidation';
 
 export interface LibraryManagementActivityEvent {
@@ -40,7 +42,7 @@ export function parseLibraryManagementActivityEvent(
 }
 
 export function createLibraryManagementEvents() {
-	let source: EventSource | null = null;
+	let subscription: SharedEventSourceSubscription | null = null;
 	const seenIds = new Set<string>();
 	const seenOrder: string[] = [];
 
@@ -70,14 +72,18 @@ export function createLibraryManagementEvents() {
 
 	function start(): void {
 		stop();
-		source = new EventSource(getApiUrl(API.library.operationsStream()));
-		source.addEventListener('open', refresh);
-		source.addEventListener('activity.changed', handleActivity);
+		// Shared: the app shell already holds this stream open for admins, and up to
+		// four management components mount this helper. Each own connection spent one
+		// of the browser's six per-origin slots on identical data.
+		subscription = subscribeShared(API.library.operationsStream(), {
+			open: refresh,
+			'activity.changed': handleActivity
+		});
 	}
 
 	function stop(): void {
-		source?.close();
-		source = null;
+		subscription?.close();
+		subscription = null;
 	}
 
 	return { start, stop };

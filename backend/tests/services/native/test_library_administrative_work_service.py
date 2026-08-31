@@ -137,5 +137,10 @@ async def test_recovery_attention_outranks_ordinary_work_and_cannot_look_idle() 
 
     assert [item.kind for item in items] == ["recovery", "identity_preparation"]
     assert items[0].effect == "attention"
-    assert items[0].remaining_count == 3
-    assert items[0].failure_event_id == "recovery:3"
+    # Only what actually needs a person. A bundle in cleanup_pending has already
+    # PUBLISHED - its files are organized and only the staged-source tidy-up is
+    # outstanding, which the cleanup worker does on its own - so counting it here
+    # raised a failure flag over routine background work.
+    assert items[0].remaining_count == 2
+    assert items[0].failure_event_id == "recovery:2"
+    assert items[0].warning_count == 1  # still reported, just not as attention

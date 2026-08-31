@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk -F: '{print $1}')",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('services/native/album_preflight_scorer.py'\\).read\\(\\)\\)\")",
+      "Bash(ls .venv/bin/python 2>/dev/null; which python3 uv; head -20 pyproject.toml)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_album_preflight_scorer.py tests/services/test_track_matcher.py tests/repositories/test_slskd_repository.py tests/services/test_acquisition_strategy_singles.py -x -q)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_album_preflight_scorer.py::test_perfect_album_auto_accepted -x -q)",
+      "Bash(.venv/bin/python -m pip list)",
+      "Bash(uv pip *)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_album_preflight_scorer.py tests/services/test_track_matcher.py tests/repositories/test_slskd_repository.py tests/services/test_acquisition_strategy_singles.py -q)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_download_orchestrator.py -q -p no:warnings)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_acquisition_strategy_aliases.py -q -p no:warnings)",
+      "Bash(sed -i '' 's/^from repositories.protocols.download_client import DownloadSearchResult/import pytest\\\\n\\\\nfrom repositories.protocols.download_client import DownloadSearchResult/' tests/services/test_quality_tiers.py)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_quality_tiers.py -q -p no:warnings)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_album_preflight_scorer.py -q -p no:warnings)",
+      "Bash(.venv/bin/python -m pytest tests/services/test_track_matcher.py -q -p no:warnings)",
+      "Bash(.venv/bin/python -m pytest tests/repositories/test_slskd_repository.py -q -p no:warnings)",
+      "Bash(.venv/bin/python -)",
+      "Bash(cd ../frontend && grep -n '\"test\\\\|\"check' package.json | head -6)"
+    ]
+  }
+}

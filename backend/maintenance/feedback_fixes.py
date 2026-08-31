@@ -299,7 +299,15 @@ def _database_holders(database_path: Path) -> list[int]:
     }
     holders: set[int] = set()
     proc = Path("/proc")
-    for process in proc.iterdir():
+    try:
+        processes = list(proc.iterdir())
+    except OSError:
+        # /proc is Linux-only. Enumerating holders is corroborating evidence; the
+        # authoritative check is the write-lock probe in closed_writer_evidence,
+        # which works everywhere. Crashing here made the whole maintenance flow
+        # unusable off Linux instead of merely less informative.
+        return []
+    for process in processes:
         if not process.name.isdigit() or int(process.name) == os.getpid():
             continue
         file_descriptors = process / "fd"

@@ -10,7 +10,7 @@
 	import {
 		Settings2,
 		Music,
-		Youtube,
+		Play as Youtube,
 		Database,
 		Settings,
 		Radio,

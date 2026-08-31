@@ -11,15 +11,27 @@ _aio = pytest.mark.asyncio
 
 
 class _Cover:
-    def __init__(self, album_tag=None, artist_tag=None):
+    def __init__(self, album_tag=None, artist_tag=None, artist_blurhash="LEHV6n"):
         self._album_tag = album_tag
         self._artist_tag = artist_tag
+        self._artist_blurhash = artist_blurhash
 
     async def get_release_group_cover_etag(self, rg, size="500"):
         return self._album_tag
 
     async def get_artist_image_etag(self, aid, size=None):
         return self._artist_tag
+
+    async def get_artist_image_blurhash(self, aid, size=None):
+        return self._artist_blurhash
+
+    # The builders ask for tag and hash in ONE call so a listing resolves each picture
+    # once rather than twice; both real cover compositions provide this.
+    async def get_release_group_cover_image_info(self, rg, size="500"):
+        return self._album_tag, "LEHV6nWB"
+
+    async def get_artist_image_info(self, aid, size=None):
+        return self._artist_tag, self._artist_blurhash
 
 
 def _track(**over) -> ViewTrack:
@@ -109,3 +121,138 @@ def test_server_id_stable_32hex():
     # deterministic across imports
     from api.compat.jellyfin.models import SERVER_ID as again
     assert SERVER_ID == again
+
+
+@_aio
+async def test_an_artist_picture_is_only_advertised_with_its_blurhash(
+    compat_id_map_service,
+):
+    """Finamp reads a tag whose hash is missing as a broken server and says so.
+
+    Artist pictures are fetched on demand, so one can enter the cache - and gain a
+    tag - between two organization runs, before its hash has been computed. Publishing
+    the tag alone put the user in front of a warning about server misconfiguration.
+    """
+    builder = JellyfinBuilder(
+        compat_id_map_service,
+        _Cover(artist_tag="art", artist_blurhash=None),
+        SERVER_ID,
+    )
+
+    artist = await builder.artist(
+        ViewArtist(artist_mbid="ar-mb", name="Radiohead", album_count=9)
+    )
+
+    assert artist.ImageTags == {}
+    assert artist.ImageBlurHashes == {}
+
+
+# ---- sorting ---------------------------------------------------------------------
+
+def _request(params: dict):
+    """A stand-in carrying real QueryParams, which is what _params() reads."""
+    from types import SimpleNamespace
+
+    from starlette.datastructures import QueryParams
+
+    return SimpleNamespace(query_params=QueryParams(params))
+
+
+@pytest.mark.parametrize(
+    "sort_by,order,expected",
+    [
+        ("SortName", "Ascending", "name"),
+        ("SortName", "Descending", "name_desc"),
+        ("Album", "Ascending", "name"),
+        ("AlbumArtist", "Ascending", "artist"),
+        ("AlbumArtist", "Descending", "artist_desc"),
+        ("DateCreated", "Descending", "recent"),
+        ("DateCreated", "Ascending", "recent_asc"),
+        ("ProductionYear", "Descending", "newest"),
+        ("ProductionYear", "Ascending", "oldest"),
+        ("Random", "Ascending", "random"),
+    ],
+)
+def test_album_sorts_translate_from_jellyfins_vocabulary(sort_by, order, expected):
+    """Clients send SortBy with SortOrder on every list request. None of it was read,
+    so however the user set the control the answer came back in the default order -
+    which in Finamp looks like sorting being stuck on newest-first."""
+    from api.compat.jellyfin.router import _ALBUM_SORTS, _sort_key
+
+    request = _request({"SortBy": sort_by, "SortOrder": order})
+
+    assert _sort_key(request, _ALBUM_SORTS, "recent") == expected
+
+
+@pytest.mark.parametrize(
+    "sort_by,order,expected",
+    [
+        ("SortName", "Ascending", "title"),
+        ("SortName", "Descending", "title_desc"),
+        ("Album", "Ascending", "album"),
+        ("Artist", "Descending", "artist_desc"),
+    ],
+)
+def test_track_sorts_translate_too(sort_by, order, expected):
+    from api.compat.jellyfin.router import _TRACK_SORTS, _sort_key
+
+    request = _request({"SortBy": sort_by, "SortOrder": order})
+
+    assert _sort_key(request, _TRACK_SORTS, "recent") == expected
+
+
+def test_a_sort_we_cannot_express_keeps_the_default_rather_than_guessing():
+    """PlayCount and friends have no catalog equivalent. Sorting by something else
+    entirely would be worse than not sorting."""
+    from api.compat.jellyfin.router import _ALBUM_SORTS, _sort_key
+
+    request = _request({"SortBy": "PlayCount"})
+
+    assert _sort_key(request, _ALBUM_SORTS, "recent") == "recent"
+
+
+def test_the_first_understood_key_in_a_list_wins():
+    """Clients send comma-separated lists like "PlayCount,SortName"."""
+    from api.compat.jellyfin.router import _ALBUM_SORTS, _sort_key
+
+    request = _request({"SortBy": "PlayCount,SortName"})
+
+    assert _sort_key(request, _ALBUM_SORTS, "recent") == "name"
+
+
+def test_no_sort_at_all_is_the_default():
+    from api.compat.jellyfin.router import _ALBUM_SORTS, _sort_key
+
+    assert _sort_key(_request({}), _ALBUM_SORTS, "recent") == "recent"
+
+
+# ---- the library view is an item too, and clients read it first --------------------
+
+def test_the_library_cover_is_a_readable_image() -> None:
+    """It was a 1x1 PNG that no decoder would open - Pillow reports "broken PNG file".
+    Clients were served a corrupt image from the very first thing they fetch."""
+    import io
+
+    from PIL import Image
+
+    from api.compat.jellyfin.router import _LIBRARY_COVER_PNG
+
+    with Image.open(io.BytesIO(_LIBRARY_COVER_PNG)) as image:
+        image.load()
+        assert min(image.size) >= 16
+
+
+def test_the_library_view_carries_a_blurhash_beside_its_tag() -> None:
+    """A tag whose hash is missing is what makes Finamp announce that the server
+    computes no blurhashes - and the library view is the FIRST item it asks for, so
+    the warning survived every album and artist getting one.
+    """
+    from api.compat.jellyfin.router import _music_view
+
+    view = _music_view("library-1")
+
+    assert view.ImageTags == {"Primary": "library-1"}
+    assert view.ImageBlurHashes == {
+        "Primary": {"library-1": view.ImageBlurHashes["Primary"]["library-1"]}
+    }
+    assert view.ImageBlurHashes["Primary"]["library-1"]

@@ -34,7 +34,11 @@ from api.v1.schemas.library_management import (
     MANAGED_FIELD_NAMES,
     REPLAYGAIN_MANAGED_FIELD_NAMES,
 )
-from core.exceptions import AudioFormatMismatchError, UnsupportedAudioFormatError
+from core.exceptions import (
+    AudioFormatMismatchError,
+    AudioWriteError,
+    UnsupportedAudioFormatError,
+)
 from infrastructure.audio.riff_info import read_riff_info
 from infrastructure.audio.lyrics import parse_lrc, render_lrc
 from models.audio import AudioArtistCredit, AudioInfo, AudioTag
@@ -2244,6 +2248,18 @@ class AudioMetadataEngine:
             if desired.artwork is None
             else desired.artwork
         )
+        missing = [
+            image.sha256 for image in desired_artwork if image.content is None
+        ]
+        if missing:
+            # A compacted document reached the writer. Those keep the descriptor and
+            # drop the bytes, so writing this plan would replace the album's artwork
+            # with nothing. Refuse instead - compacted documents describe runs that
+            # already finished and must never be replayed as a write.
+            raise AudioWriteError(
+                "Artwork bytes are unavailable for "
+                f"{len(missing)} image(s): {', '.join(missing[:3])}"
+            )
         artwork_changes = desired_artwork != current.artwork
         requires_write = bool(
             changes or artwork_changes or scrubbed_raw or cleanup_actions

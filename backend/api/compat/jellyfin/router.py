@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import logging
+from functools import lru_cache
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Request
+import msgspec
+from fastapi import APIRouter, Depends, Request, WebSocket
+from fastapi.websockets import WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
+
+from infrastructure.images.blurhash import blurhash_for_bytes
+from infrastructure.images.thumbnails import resize_to_fit
 
 from api.compat.common.deps import CompatServices, get_compat_services
 from api.compat.common.ratelimit import (
     compat_rate_limits,
+    is_artwork_request,
     is_media_request,
     is_mutation_request,
     reject_jellyfin,
@@ -96,6 +104,12 @@ async def _handle(
                     return reject_jellyfin(retry_after)
         elif fn is _authenticate:
             retry_after = compat_rate_limits.auth_failure_retry_after(client_ip)
+            if retry_after is not None:
+                return reject_jellyfin(retry_after)
+        elif is_artwork_request(path):
+            # Artwork has its own, far larger budget: it is served without a token but
+            # is bulk read-only asset traffic, not a login or discovery endpoint.
+            retry_after = await compat_rate_limits.artwork_retry_after(client_ip)
             if retry_after is not None:
                 return reject_jellyfin(retry_after)
         elif not is_media_request(path):
@@ -193,34 +207,9 @@ def _user_dto(user) -> jm.UserDto:
         Id=user.id,
         Name=user.username_display or user.username or user.display_name,
         HasPassword=True,
-        Policy={
-            # Without EnableAllFolders strict clients (Manet) conclude "no libraries"
-            # and never call /UserViews; rest are permissive defaults.
-            "IsAdministrator": user.role == "admin",
-            "IsHidden": False,
-            "IsDisabled": False,
-            "EnableAllFolders": True,
-            "EnabledFolders": [],
-            "EnableAllChannels": True,
-            "EnabledChannels": [],
-            "EnableAllDevices": True,
-            "EnabledDevices": [],
-            "EnableMediaPlayback": True,
-            "EnableAudioPlaybackTranscoding": True,
-            "EnableVideoPlaybackTranscoding": True,
-            "EnablePlaybackRemuxing": True,
-            "EnableContentDownloading": True,
-            "EnableRemoteAccess": True,
-            "EnableSyncTranscoding": True,
-            "EnableUserPreferenceAccess": True,
-            "EnableLiveTvAccess": False,
-            "EnableRemoteControlOfOtherUsers": False,
-            "EnableSharedDeviceControl": False,
-            "BlockedTags": [],
-            "AllowedTags": [],
-            "AccessSchedules": [],
-            "BlockUnratedItems": [],
-        },
+        # Fully populated (see jm.UserPolicy): strict clients hard-cast the policy
+        # booleans, so a missing key arrives as null and crashes the login.
+        Policy=jm.UserPolicy(IsAdministrator=user.role == "admin"),
     )
 
 
@@ -267,6 +256,23 @@ async def users_me(
     return await _handle(request, services, lambda r, s, u: _user_dto(u))
 
 
+# MUST be declared before /Users/{user_id}, or "Public" is swallowed as a user id -
+# which is exactly what happened: the request answered 401 unauthenticated and, with a
+# token, a single UserDto OBJECT. Jellyfin returns an ARRAY here and clients parse it
+# as one, so Finamp's loadPublicUsers threw and the login screen never got its user
+# list. The endpoint is public by definition (it is what a client reads BEFORE
+# logging in), so it must not require a token.
+#
+# The list is empty on purpose: publishing usernames to anyone who can reach the port
+# is a disclosure this server has no reason to make, and a client that gets [] simply
+# asks for a username instead - which is what the real Jellyfin next to it also does.
+@router.get("/Users/Public")
+async def users_public(
+    request: Request, services: CompatServices = Depends(get_compat_services)
+) -> Response:
+    return await _handle(request, services, lambda r, s, u: [], auth=False)
+
+
 @router.get("/Users/{user_id}")
 async def users_by_id(
     user_id: str,
@@ -279,10 +285,27 @@ async def users_by_id(
 # ===== Library browsing =====
 
 
-def _builder(services: CompatServices):
+def _requested_fields(request: Request | None) -> set[str]:
+    """The client's ``Fields=`` list. Jellyfin only attaches the costly extras when
+    they are asked for by name, and a listing that attaches them unasked pays for
+    every row nobody reads."""
+    if request is None:
+        return set()
+    out: set[str] = set()
+    for value in _params(request).getlist("fields"):
+        out.update(part for part in value.split(",") if part)
+    return out
+
+
+def _builder(services: CompatServices, request: Request | None = None):
     from api.compat.jellyfin.builders import JellyfinBuilder
 
-    return JellyfinBuilder(services.id_map, services.coverart, jm.SERVER_ID)
+    return JellyfinBuilder(
+        services.id_map,
+        services.coverart,
+        jm.SERVER_ID,
+        fields=_requested_fields(request),
+    )
 
 
 class _CIParams:
@@ -359,9 +382,23 @@ async def _build_page(build_fn, items, start, limit):
     return await _build_qr(build_fn, page, total, start)
 
 
+@lru_cache(maxsize=1)
+def _library_cover_blurhash() -> str | None:
+    """The blurhash of the built-in library cover.
+
+    The library view is the FIRST item a client fetches, and it advertises an image
+    tag - with no hash beside it. Finamp reads a tag whose hash is missing as a server
+    that computes none and warns the user about it, which is why the warning survived
+    every album and artist getting one. The cover is a fixed asset, so this is computed
+    once for the life of the process.
+    """
+    return blurhash_for_bytes(_LIBRARY_COVER_PNG, "jellyfin-library-cover")
+
+
 def _music_view(library_id: str) -> jm.BaseItemDto:
     # Strict clients (Manet) report "No music libraries found" unless the view carries
     # UserData / non-empty ImageTags.Primary / LocationType (06-data-mapping).
+    blurhash = _library_cover_blurhash()
     return jm.BaseItemDto(
         Id=library_id,
         Name="Music",
@@ -371,6 +408,9 @@ def _music_view(library_id: str) -> jm.BaseItemDto:
         MediaType="Unknown",
         CollectionType="music",
         ImageTags={"Primary": library_id},
+        ImageBlurHashes=(
+            {"Primary": {library_id: blurhash}} if blurhash else {}
+        ),
         UserData=jm.UserItemDataDto(ItemId=library_id, Key=library_id),
     )
 
@@ -405,9 +445,60 @@ def _primary_type(types: set[str], parent_kind: str | None) -> str:
     return "MusicAlbum"
 
 
+# Jellyfin's sort vocabulary, mapped onto the catalog's. Clients send SortBy with
+# SortOrder on every list request; none of it was read, so albums, artists and tracks
+# all came back in the default order however the user had set the control - which in
+# Finamp looks like "sorting is stuck on newest first".
+#
+# What a name is sorted by differs per type: an album sorts by its title, a track by
+# its own title, an artist by name. Keys not listed here (PlayCount, CommunityRating,
+# DatePlayed, Runtime) have no catalog equivalent and keep the default rather than
+# silently sorting by something else.
+_ALBUM_SORTS = {
+    "sortname": ("name", "name_desc"),
+    "album": ("name", "name_desc"),
+    "name": ("name", "name_desc"),
+    "albumartist": ("artist", "artist_desc"),
+    "artist": ("artist", "artist_desc"),
+    "datecreated": ("recent_asc", "recent"),
+    "premieredate": ("oldest", "newest"),
+    "productionyear": ("oldest", "newest"),
+    "random": ("random", "random"),
+}
+_TRACK_SORTS = {
+    "sortname": ("title", "title_desc"),
+    "name": ("title", "title_desc"),
+    "album": ("album", "album_desc"),
+    "albumartist": ("artist", "artist_desc"),
+    "artist": ("artist", "artist_desc"),
+    "datecreated": ("recent_asc", "recent"),
+    "random": ("random", "random"),
+}
+# The artist listing takes a key and a direction separately, so it needs no twins.
+_ARTIST_SORTS = {
+    "sortname": "name",
+    "name": "name",
+    "albumcount": "album_count",
+    "datecreated": "date_added",
+}
+
+
+def _sort_descending(request: Request) -> bool:
+    return _params(request).get("SortOrder", "").casefold().startswith("desc")
+
+
+def _sort_key(request: Request, table: dict, default: str) -> str:
+    """The catalog sort for this request's SortBy/SortOrder, or ``default``."""
+    for raw in _csv_param(request, "SortBy"):
+        pair = table.get(raw.casefold())
+        if pair is not None:
+            return pair[1] if _sort_descending(request) else pair[0]
+    return default
+
+
 async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
     q = _params(request)
-    b = _builder(services)
+    b = _builder(services, request)
     start = max(_qint(request, "StartIndex", 0), 0)
     limit = max(_qint(request, "Limit", 100), 0)
     search = q.get("SearchTerm") or None
@@ -441,7 +532,12 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
 
     if primary == "MusicArtist":
         artists, total = await services.view.get_artists(
-            limit=limit or 100_000, offset=start, q=search, user=user
+            limit=limit or 100_000,
+            offset=start,
+            q=search,
+            user=user,
+            sort_by=_sort_key(request, _ARTIST_SORTS, "name"),
+            sort_order="desc" if _sort_descending(request) else "asc",
         )
         return await _build_qr(b.artist, artists, total, start)
 
@@ -473,7 +569,11 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
             tracks = await services.view.get_tracks_by_artist_mbids(mbids, user=user)
             return await _build_page(b.audio, tracks, start, limit)
         tracks, total = await services.view.get_tracks_page(
-            limit=limit or 100, offset=start, q=search, user=user
+            limit=limit or 100,
+            offset=start,
+            q=search,
+            user=user,
+            sort=_sort_key(request, _TRACK_SORTS, "recent"),
         )
         return await _build_qr(b.audio, tracks, total, start)
 
@@ -486,7 +586,11 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
         return await _build_page(b.album, albums, start, limit)
     page = start // limit + 1 if limit else 1
     albums, total = await services.view.get_albums(
-        page=page, page_size=limit or 100, q=search, user=user
+        page=page,
+        page_size=limit or 100,
+        q=search,
+        user=user,
+        sort=_sort_key(request, _ALBUM_SORTS, "recent"),
     )
     return await _build_qr(b.album, albums, total, start)
 
@@ -539,6 +643,20 @@ async def _single_item(services, b, kind, internal, user):
                 streamable = await services.playlists.get_streamable_counts()
                 return await b.playlist(_to_view_playlist(rec, streamable))
         return None
+    # A client that was handed an id must be able to fetch it back. ``library`` and
+    # ``genre`` ids ARE handed out - the music view comes from /Users/{id}/Views and
+    # genre items from browsing - but resolving them was missing, so Finamp's
+    # "GET /Users/{id}/Items/{view id}" (its first call after listing the views)
+    # answered 404 and no content ever loaded.
+    if kind == "library":
+        return _music_view(await services.id_map.to_jf("library", internal))
+    if kind == "genre":
+        from api.compat.jellyfin.builders import genre_slug
+
+        for value in await services.view.get_genres():
+            if genre_slug(getattr(value, "name", "")) == internal:
+                return await b.genre(value)
+        return None
     return None
 
 
@@ -561,7 +679,7 @@ async def items_modern(
 async def _artists(
     request, services, user, *, scope="all", **_
 ) -> jm.BaseItemDtoQueryResult:
-    b = _builder(services)
+    b = _builder(services, request)
     start = max(_qint(request, "StartIndex", 0), 0)
     limit = max(_qint(request, "Limit", 100), 0)
     search = _params(request).get("SearchTerm") or None
@@ -593,7 +711,7 @@ async def album_artists(
 
 
 async def _genres(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
-    b = _builder(services)
+    b = _builder(services, request)
     start = max(_qint(request, "StartIndex", 0), 0)
     limit = max(_qint(request, "Limit", 100), 0)
     genres = await services.view.get_genres()
@@ -644,7 +762,7 @@ async def items_filters_legacy(
 
 
 async def _single_item_handler(request, services, user, *, item_id) -> jm.BaseItemDto:
-    b = _builder(services)
+    b = _builder(services, request)
     try:
         kind, internal = await services.id_map.from_jf(item_id)
     except JellyfinError:
@@ -678,19 +796,36 @@ async def single_item_modern(
 
 # 1x1 opaque PNG for the library view's advertised ImageTags.Primary so the request
 # resolves instead of 404ing (clients scale it).
+# The library's placeholder cover: a 96x96 gradient tile. The previous constant was a
+# 1x1 PNG that no decoder would read - Pillow reports "broken PNG file" - so clients
+# were served a corrupt image AND the view could carry no blurhash, which is what kept
+# Finamp saying the server computes none however many albums got one.
 _LIBRARY_COVER_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
+    "iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAIAAABt+uBvAAAA3ElEQVR42u3ZwQ3AIAxD0QQxRSWu7D8iE0AP"
+    "CNrD8wiW/QNJPq0HzVVYwKAt1YjkwtIg/qwNSg5hEIPOMkjFXhhExrwxL0EYZMwb8xIE0gTSGIRBDPobg1RM"
+    "gox5CfqUQUxQMRWTICtXl1UMUjGQJgszCcIgCcIg7yBXDQkikLZRVDEVkyCXVQnCIAki7yAVUzG/eQlyWZUg"
+    "Vw0y5l01JAiDTDHvIBUDacIgCbJRVDEVkyCXVQmSIAzy1bAwUzGQdlmVIJAGafIOkiAMMuaNeQa5rBrzZMxj"
+    "kKX9JQ39zwH1rEGZugAAAABJRU5ErkJggg=="
 )
 
 
-def _image_size(request: Request) -> str:
+def _requested_pixels(request: Request) -> int | None:
+    """The largest edge the client asked for, or None when it asked for no size."""
     p = _params(request)
+    found: list[int] = []
     for key in ("fillWidth", "maxWidth", "width", "fillHeight", "maxHeight", "height"):
         raw = p.get(key)
         if raw and raw.isdigit():
-            px = int(raw)
-            return "250" if px <= 300 else "500" if px <= 750 else "1200"
-    return "500"
+            found.append(int(raw))
+    return max(found) if found else None
+
+
+def _image_size(request: Request) -> str:
+    """Which cached variant to reach for. Only ever a hint - see ``_image``."""
+    px = _requested_pixels(request)
+    if px is None:
+        return "500"
+    return "250" if px <= 300 else "500" if px <= 750 else "1200"
 
 
 async def _image(request, services, _user, *, item_id, image_type):
@@ -722,6 +857,12 @@ async def _image(request, services, _user, *, item_id, image_type):
     if not result:
         raise JellyfinError(404, "No image")
     data, content_type, _ = result
+    # The cached variant is whatever happened to be stored, which for locally held
+    # artwork is the full-size cover regardless of the size asked for - a 484 KB image
+    # for a 300px tile, and a hundred of those per screen. Jellyfin resizes; so do we.
+    data, content_type = await asyncio.to_thread(
+        resize_to_fit, data, content_type, _requested_pixels(request)
+    )
     return Response(
         content=data,
         media_type=content_type,
@@ -925,6 +1066,37 @@ async def _audio_stream(request, services, user, *, item_id):
         start_s=start_s,
         force=False,
     )
+
+
+# Jellyfin also serves the untouched file at /Items/{id}/File and /Items/{id}/Download,
+# and that is what Finamp's player actually opens - not the DirectStreamUrl it was
+# handed. Neither path was routed, so the request fell through to the SPA catch-all and
+# the player received index.html: 3 KB of "text/html" answered with a cheerful 206,
+# which iOS rejects as AVError -11828 ("cannot open"). Always a direct copy, never a
+# transcode: "File" means the file.
+async def _item_file(request, services, user, *, item_id):  # noqa: ANN001, ARG001
+    internal = await _decode_track(services, item_id)
+    return await _serve_direct(services, internal, request)
+
+
+@router.get("/Items/{item_id}/File")
+@router.get("/Items/{item_id}/Download")
+async def item_file(
+    item_id: str,
+    request: Request,
+    services: CompatServices = Depends(get_compat_services),
+) -> Response:
+    return await _handle(request, services, _item_file, auth=False, item_id=item_id)
+
+
+@router.head("/Items/{item_id}/File")
+@router.head("/Items/{item_id}/Download")
+async def item_file_head(
+    item_id: str,
+    request: Request,
+    services: CompatServices = Depends(get_compat_services),
+) -> Response:
+    return await _handle(request, services, _audio_stream_head, auth=False, item_id=item_id)
 
 
 @router.get("/Audio/{item_id}/stream")
@@ -1267,12 +1439,88 @@ async def sessions_ping(
     return await _handle(request, services, lambda r, s, u: None)
 
 
+# Jellyfin exposes BOTH forms and clients pick either: ``/Full`` takes a
+# ClientCapabilitiesDto body, the bare path takes the same fields as query parameters.
+# Only ``/Full`` existed here, so Finamp's bare POST answered 405 - and Finamp does not
+# treat that as optional: updateCapabilities() throws on it and takes the rest of
+# startup down with it, so the app never got as far as ASKING for any items. That is
+# what "no items load at all" looked like from the outside, with a server log full of
+# 200s.
+@router.post("/Sessions/Capabilities")
 @router.post("/Sessions/Capabilities/Full")
 async def sessions_capabilities(
     request: Request, services: CompatServices = Depends(get_compat_services)
 ) -> Response:
     # No session registry to store reported capabilities; accept and 204 to avoid a 404.
     return await _handle(request, services, lambda r, s, u: None)
+
+
+# ===== Session socket =====
+
+# Jellyfin clients open a websocket right after signing in and keep it open for the
+# whole session. There was no route for it, so Starlette rejected the upgrade with
+# 403 and Finamp reconnected in a loop for as long as it was running.
+#
+# What flows over it is server->client push (remote control, library-changed
+# notifications). We have no session registry to push from, so this speaks the half
+# of the protocol that a client needs to consider itself connected: the keep-alive
+# handshake. Subscription requests are accepted and simply produce no updates, which
+# is the same thing a Jellyfin server with nothing to report does.
+_KEEPALIVE_SECONDS = 60
+
+
+@router.websocket("/socket")
+async def session_socket(
+    websocket: WebSocket, services: CompatServices = Depends(get_compat_services)
+) -> None:
+    settings = services.preferences.get_connect_apps_settings()
+    if not settings.jellyfin_enabled:
+        await websocket.close(code=1008)
+        return
+    # The token arrives as ?ApiKey=/?api_key= here rather than in a header; verify it
+    # BEFORE accepting so an unauthenticated client is refused the upgrade outright.
+    token = extract_token(websocket)  # type: ignore[arg-type]  # same headers/query API
+    user = await services.app_passwords.verify_token(token) if token else None
+    if user is None:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    try:
+        # ForceKeepAlive tells the client how long it may stay silent. Jellyfin sends
+        # it unprompted on connect and clients wait for it, so it goes first.
+        await websocket.send_text(_socket_message("ForceKeepAlive", _KEEPALIVE_SECONDS))
+        while True:
+            raw = await websocket.receive_text()
+            if _socket_message_type(raw) == "KeepAlive":
+                await websocket.send_text(_socket_message("KeepAlive", None))
+            # Anything else is a subscription (SessionsStart, ActivityLogEntryStart,
+            # ScheduledTasksInfoStart, ...) or a stop. Accepting silently is correct:
+            # the protocol has no acknowledgement for them, only the updates we have
+            # nothing to send.
+    except WebSocketDisconnect:
+        return
+    except Exception:  # noqa: BLE001 - boundary: a dropped socket must not log a trace
+        logger.debug("Jellyfin session socket closed unexpectedly", exc_info=True)
+        return
+
+
+def _socket_message(message_type: str, data: object) -> str:
+    payload: dict[str, object] = {
+        "MessageId": uuid4().hex,
+        "MessageType": message_type,
+    }
+    if data is not None:
+        payload["Data"] = data
+    return msgspec.json.encode(payload).decode()
+
+
+def _socket_message_type(raw: str) -> str:
+    try:
+        decoded = msgspec.json.decode(raw)
+    except msgspec.DecodeError:
+        return ""
+    return decoded.get("MessageType", "") if isinstance(decoded, dict) else ""
 
 
 # ===== Playlists (06-data-mapping.md s10) =====
@@ -1371,7 +1619,7 @@ async def get_playlist(
 async def _playlist_items(request, services, user, *, playlist_id):
     internal = await _decode_playlist(services, playlist_id)
     detail = await _playlist_detail(services, user, internal)
-    b = _builder(services)
+    b = _builder(services, request)
     start = max(_qint(request, "startIndex", 0) or _qint(request, "StartIndex", 0), 0)
     limit = max(_qint(request, "limit", 0) or _qint(request, "Limit", 0), 0)
     streamable = [e for e in detail.tracks if e.library_file_id]
@@ -1474,7 +1722,7 @@ async def _resolve_artist_mbid(services, kind, internal) -> str | None:
 
 
 async def _similar(request, services, user, *, item_id):
-    b = _builder(services)
+    b = _builder(services, request)
     limit = max(_qint(request, "Limit", 50) or 50, 1)
     try:
         kind, internal = await services.id_map.from_jf(item_id)

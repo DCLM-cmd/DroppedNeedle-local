@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -101,6 +102,75 @@ class CachedLocalArtworkService:
                     hashlib.sha1(content).hexdigest(),
                 )
         return None
+
+    async def read_identity(self, context: dict[str, Any]) -> str | None:
+        """The artwork's content hash, without reading the artwork.
+
+        Listings need this - it is the image's ETag, and the key the stored blurhash
+        hangs on - but they do not need the picture. Deriving it through ``read`` meant
+        every listed album's cover was loaded in full and re-hashed: 181 MB of image
+        I/O for one 100-album page, paid twice over because the ETag and the blurhash
+        each asked separately. Jellyfin never touches an image file to serve a listing;
+        it keeps the identity on the item record.
+
+        The value is byte-for-byte the one ``read`` returns. For cached artwork the
+        disk cache already recorded it at write time, so this is a small JSON read; the
+        candidates are walked in ``read``'s order and the first usable one wins, so
+        both paths agree on WHICH image an album's identity comes from.
+        """
+        source = str(context.get("source") or "")
+        if source == "embedded":
+            # Nothing is cached beside an audio file, so the tag still has to be read;
+            # memoised on the file's identity, which is what makes it cheap on repeat.
+            resolved = await self.read(context)
+            return None if resolved is None else resolved[3]
+        if source not in {"provider", "cover_cache", "manual"}:
+            return None
+        for path in self._cache_paths(context):
+            digest = await self._identity_of(path)
+            if digest is not None:
+                return digest
+        return None
+
+    async def _identity_of(self, path: Path) -> str | None:
+        """The stored content hash of one cached image, or None if it is not usable."""
+
+        def read_meta() -> str | None:
+            if not path.exists():
+                return None
+            meta_path = path.with_suffix(".meta.json")
+            try:
+                raw = meta_path.read_text()
+            except (OSError, ValueError):
+                return None
+            try:
+                meta = json.loads(raw)
+            except ValueError:
+                return None
+            if not isinstance(meta, dict):
+                return None
+            digest = meta.get("content_sha1")
+            content_type = meta.get("content_type")
+            # Only trust the recorded hash when the entry also looks like the image
+            # ``read`` would have accepted, so the two never disagree.
+            if not isinstance(digest, str) or not digest:
+                return None
+            if isinstance(content_type, str) and not content_type.startswith("image/"):
+                return None
+            return digest
+
+        digest = await asyncio.to_thread(read_meta)
+        if digest is not None:
+            return digest
+        # No usable metadata - fall back to what read() does, so an entry written
+        # before the hash was recorded still resolves rather than being skipped.
+        try:
+            content = await asyncio.to_thread(path.read_bytes)
+        except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
+            return None
+        if _content_type(content) is None:
+            return None
+        return hashlib.sha1(content).hexdigest()
 
     async def get(
         self, album_id: str, cover_version: int

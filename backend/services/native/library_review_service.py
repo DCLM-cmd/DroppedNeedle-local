@@ -107,10 +107,16 @@ class LibraryReviewService:
         store: NativeLibraryStore,
         resolver_getter: Callable[[], LibraryPolicyResolver] | None = None,
         on_identified: Callable[[str, str], Awaitable[object]] | None = None,
+        on_mapping_accepted: (
+            Callable[[str, str], Awaitable[object]] | None
+        ) = None,
     ) -> None:
         self._store = store
         self._resolver_getter = resolver_getter
         self._on_identified = on_identified
+        # Called with (local_album_id, actor_user_id) once a mapping is accepted, so
+        # whatever the mapping names but the library lacks can be fetched.
+        self._on_mapping_accepted = on_mapping_accepted
 
     def _resolve_selection_filter(
         self, normalized_filter: dict[str, str]
@@ -481,6 +487,9 @@ class LibraryReviewService:
         review = result["review"]
         if review["local_album_id"] is not None:
             await self._schedule_scan_management(str(review["local_album_id"]))
+            await self._request_uncovered_content(
+                str(review["local_album_id"]), actor_user_id
+            )
         return ReviewActionResponse(
             review_id=review_id,
             state=str(review["state"]),
@@ -488,6 +497,24 @@ class LibraryReviewService:
             catalog_revision=int(result["catalog_revision"]),
             action_id=str(result["action_id"]),
         )
+
+    async def _request_uncovered_content(
+        self, local_album_id: str, actor_user_id: str
+    ) -> None:
+        """Ask for whatever the accepted mapping names and the library does not hold.
+
+        Best-effort by design: the identity decision is already committed, so a
+        provider outage here must not turn an accepted mapping into an error.
+        """
+        if self._on_mapping_accepted is None:
+            return
+        try:
+            await self._on_mapping_accepted(local_album_id, actor_user_id)
+        except Exception:  # noqa: BLE001 - the acceptance itself already succeeded
+            logger.warning(
+                "Could not enrol the accepted mapping for missing content",
+                exc_info=True,
+            )
 
     async def _schedule_scan_management(self, local_album_id: str) -> None:
         if self._on_identified is None:

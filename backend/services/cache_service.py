@@ -36,6 +36,19 @@ class CacheService:
         self._stats_cache_ttl: float = 30.0
         self._stats_lock = asyncio.Lock()
 
+    @staticmethod
+    def _unlink_tree(directory: Path) -> int:
+        """Delete every file under ``directory``. Runs in a thread - see callers."""
+        cleared = 0
+        for file_path in directory.rglob("*"):
+            try:
+                if file_path.is_file():
+                    file_path.unlink()
+                    cleared += 1
+            except OSError:  # noqa: PERF203 - a file vanishing mid-sweep is fine
+                continue
+        return cleared
+
     def _clear_genre_disk_cache(self) -> int:
         from core.config import get_settings
 
@@ -207,14 +220,15 @@ class CacheService:
             metadata_count = metadata_stats["total_count"]
             await self._disk_cache.clear_all()
 
+            # A cover cache holds thousands of files; walking and unlinking it on
+            # the event loop froze every other request for the whole sweep.
             files_cleared = 0
             if covers_cache_dir.exists():
-                for file_path in covers_cache_dir.rglob("*"):
-                    if file_path.is_file():
-                        file_path.unlink()
-                        files_cleared += 1
+                files_cleared = await asyncio.to_thread(
+                    self._unlink_tree, covers_cache_dir
+                )
 
-            files_cleared += self._clear_genre_disk_cache()
+            files_cleared += await asyncio.to_thread(self._clear_genre_disk_cache)
             self._cached_stats = None
 
             return CacheClearResponse(
@@ -278,12 +292,11 @@ class CacheService:
 
             disk_files = 0
             if covers_cache_dir.exists():
-                for file_path in covers_cache_dir.rglob("*"):
-                    if file_path.is_file():
-                        file_path.unlink()
-                        disk_files += 1
+                disk_files = await asyncio.to_thread(
+                    self._unlink_tree, covers_cache_dir
+                )
 
-            disk_files += self._clear_genre_disk_cache()
+            disk_files += await asyncio.to_thread(self._clear_genre_disk_cache)
             self._cached_stats = None
 
             return CacheClearResponse(
@@ -306,10 +319,9 @@ class CacheService:
         try:
             files_cleared = 0
             if covers_cache_dir.exists():
-                for file_path in covers_cache_dir.rglob("*"):
-                    if file_path.is_file():
-                        file_path.unlink()
-                        files_cleared += 1
+                files_cleared = await asyncio.to_thread(
+                    self._unlink_tree, covers_cache_dir
+                )
 
             self._cached_stats = None
 

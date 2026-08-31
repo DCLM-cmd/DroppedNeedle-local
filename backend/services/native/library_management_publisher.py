@@ -85,6 +85,21 @@ from services.native.recycle_bin import recycle
 from services.preferences_service import PreferencesService
 
 logger = logging.getLogger(__name__)
+
+
+def _is_same_file(left: Path | None, right: Path | None) -> bool:
+    """Whether two paths name the same file on disk.
+
+    A case-only rename ("Back To Me" -> "Back to Me") is two different path strings
+    for one file on a case-insensitive filesystem, so a plain path comparison reads
+    the source as an occupant of its own destination and refuses the rename.
+    """
+    if left is None or right is None:
+        return False
+    try:
+        return os.path.samestat(left.lstat(), right.lstat())
+    except OSError:
+        return False
 _JOURNAL_NAMESPACE = uuid.UUID("c646c2dd-f0cc-4c9d-8b2c-feb0a8a660c9")
 _SNAPSHOT_NAMESPACE = uuid.UUID("77d7be20-4ff2-475a-941f-e0a575806d78")
 _BASELINE_NAMESPACE = uuid.UUID("bf48a4f8-5968-41f6-9c82-f95a976a8f21")
@@ -890,6 +905,31 @@ class LibraryManagementPublisher:
             replacement_backup=replacement_backup,
             artifacts=[],
         )
+        if current.state == "staged" and not await asyncio.to_thread(temporary.exists):
+            # The journal says this file is staged, but the staged copy is gone: the
+            # workspace of a run that failed after staging gets cleaned up, and the
+            # journal entry outlives it. Verifying a file that no longer exists can
+            # only fail, so every retry of that import failed for the same reason
+            # forever - the held upgrade could never be published.
+            #
+            # Winding the entry back to "planned" lets the staging path below rebuild
+            # it from the same source and plan; the fingerprint check that follows is
+            # unchanged, so a file that really did change is still refused.
+            logger.info(
+                "Re-staging import %s/%s: the staged copy is no longer present",
+                bundle_id,
+                request.ordinal,
+            )
+            current = await self._store.transition_library_management_import_journal(
+                bundle_id,
+                request.ordinal,
+                expected_state="staged",
+                new_state="planned",
+                expected_row_revision=current.row_revision,
+                updated_at=self._clock(),
+                staged_fingerprint=None,
+            )
+            prepared.journal = current
         if current.state == "planned":
             source_stat = await asyncio.to_thread(source.stat)
             if (
@@ -1141,6 +1181,23 @@ class LibraryManagementPublisher:
             destination = self._safe_path(
                 root, artifact.destination_relative_path, create_parent=True
             )
+            if self._artifact_already_taken(destination, artifact):
+                # The album already holds this artwork and the incoming release brought
+                # a different one. The journal-recovery path has always skipped that;
+                # the FIRST attempt did not, so a release whose cover happened to differ
+                # failed its whole bundle at publish time and took the audio with it.
+                # One album sat with nothing but a cover.jpg on disk while all sixteen
+                # of its tracks waited in the hold queue for exactly this reason.
+                logger.info(
+                    "library_management.import_artifact_kept",
+                    extra={
+                        "bundle_id": bundle_id,
+                        "ordinal": request.ordinal,
+                        "kind": artifact.kind,
+                        "destination": artifact.destination_relative_path,
+                    },
+                )
+                continue
             temporary = self._artifact_path(
                 destination,
                 bundle_id,
@@ -1258,7 +1315,15 @@ class LibraryManagementPublisher:
                 if artifact.temporary.exists():
                     if cls._hash_file(artifact.temporary) != artifact.fingerprint:
                         raise ConflictError("A staged import artifact changed.")
-                    if artifact.destination.exists():
+                    # An artifact is per-ALBUM (cover.jpg and friends), not per-track,
+                    # so importing the album's second track always finds the artwork the
+                    # first track wrote. Identical bytes mean it is already published -
+                    # only genuinely different content is a conflict. Treating "exists"
+                    # alone as a conflict meant exactly one track of an album could ever
+                    # be imported and every other track was blocked for good.
+                    if artifact.destination.exists() and (
+                        cls._hash_file(artifact.destination) != artifact.fingerprint
+                    ):
                         raise LibraryManagementDestinationConflictError(
                             "An import artifact destination is occupied."
                         )
@@ -1379,9 +1444,23 @@ class LibraryManagementPublisher:
         for artifact in value.artifacts:
             if artifact.temporary.exists():
                 if artifact.destination.exists():
-                    raise LibraryManagementDestinationConflictError(
-                        "An import artifact destination is occupied."
+                    if (
+                        await asyncio.to_thread(self._hash_file, artifact.destination)
+                        != artifact.fingerprint
+                    ):
+                        raise LibraryManagementDestinationConflictError(
+                            "An import artifact destination is occupied."
+                        )
+                    # Already published by an earlier track of the same album; the
+                    # staged copy is redundant rather than in conflict.
+                    await asyncio.to_thread(
+                        unlink_rooted,
+                        roots,
+                        artifact.destination_root_id,
+                        artifact.temporary_relative_path,
+                        missing_ok=True,
                     )
+                    continue
                 await asyncio.to_thread(
                     replace_rooted,
                     roots,
@@ -1469,6 +1548,36 @@ class LibraryManagementPublisher:
             )
         await self._rollback_import_bundle(record, prepared, roots)
 
+    @staticmethod
+    def _artifact_already_taken(
+        destination: Path, artifact: "LibraryManagementImportArtifact"
+    ) -> bool:
+        """Whether the album already holds DIFFERENT content at this artwork path.
+
+        Identical bytes are not a conflict (the album's first imported track wrote
+        them). Different bytes are a difference of taste, not a correctness problem,
+        so the existing file wins and the artifact is dropped from the plan rather
+        than failing the publication.
+        """
+        expected = artifact.source_fingerprint or ""
+        try:
+            if not destination.exists():
+                # Not there under this exact name - but the album may already hold it
+                # spelled differently, which the publish-time check reports as
+                # "collides after normalization" and which failed the whole bundle.
+                # Cover.jpg beside cover.jpg is the album's artwork either way.
+                return LibraryManagementPublisher._has_normalized_destination_sibling(
+                    destination
+                )
+            if not expected:
+                return True
+            # _hash_file, not a local read: it refuses symlinks and non-regular files,
+            # which is the whole reason this path never touches anything by name alone.
+            return LibraryManagementPublisher._hash_file(destination) != expected
+        except OSError:
+            # Unreadable: treat it as taken rather than risk overwriting it.
+            return True
+
     def _prepared_import_from_journal(
         self,
         bundle_id: str,
@@ -1495,6 +1604,23 @@ class LibraryManagementPublisher:
             artifact_destination = self._safe_path(
                 artifact_root, artifact.destination_relative_path
             )
+            if self._artifact_already_taken(artifact_destination, artifact):
+                # The album already has this artwork, and the incoming release brought
+                # a different one. That is a decorative difference; failing the bundle
+                # over it blocked the AUDIO - an mp3->flac upgrade whose release
+                # happened to ship a different cover could never publish, and the
+                # user saw only "a planned destination is occupied by different
+                # content". Keep what is on disk and import the music.
+                logger.info(
+                    "library_management.import_artifact_kept",
+                    extra={
+                        "bundle_id": bundle_id,
+                        "ordinal": request.ordinal,
+                        "kind": artifact.kind,
+                        "destination": artifact.destination_relative_path,
+                    },
+                )
+                continue
             artifacts.append(
                 _PreparedImportArtifact(
                     kind=artifact.kind,
@@ -1887,8 +2013,35 @@ class LibraryManagementPublisher:
         )
         if not items:
             raise ValidationError("The management bundle has no plan items.")
-        if any(item.eligibility not in {"eligible", "warning"} for item in items):
-            raise ValidationError("A blocked management bundle cannot be published.")
+        appliable = {"eligible", "warning"}
+        skipped = [item for item in items if item.eligibility not in appliable]
+        if skipped:
+            # One item that cannot be applied used to fail the WHOLE bundle, so running
+            # the organizer over a library where some files are already in order threw
+            # rather than leaving those alone - and the files beside them, which had
+            # nothing wrong, went nowhere either. A blocked item was already judged
+            # un-appliable when it was planned, and it keeps its reason for the user to
+            # see; the rest of the bundle has no reason to wait for it.
+            logger.info(
+                "library_management.bundle_items_skipped",
+                extra={
+                    "job_id": job_id,
+                    "bundle_ordinal": bundle_ordinal,
+                    "skipped": len(skipped),
+                    "reasons": sorted(
+                        {str(item.reason_code) for item in skipped if item.reason_code}
+                    ),
+                },
+            )
+        items = [item for item in items if item.eligibility in appliable]
+        if not items:
+            # Nothing here to apply. That is a finished bundle, not a failure: it is
+            # exactly what a run over already-organized files looks like.
+            return LibraryManagementBundleCommitResult(
+                catalog_revision=snapshot.catalog_revision,
+                snapshot_revision=snapshot.row_revision,
+                committed_journal_ids=(),
+            )
 
         existing = await self._store.list_file_mutation_journals_for_bundle(
             job_id, bundle_ordinal
@@ -3374,6 +3527,7 @@ class LibraryManagementPublisher:
                 if (
                     value.destination != value.source
                     and (value.destination.exists() or value.destination.is_symlink())
+                    and not _is_same_file(value.destination, value.source)
                     and value.destination not in recycled_sources
                 ):
                     raise LibraryManagementDestinationConflictError(
@@ -3806,6 +3960,11 @@ class LibraryManagementPublisher:
             value.remove_source
             and value.source is not None
             and value.source != value.destination
+            # A case-only rename consumed the source when it published: the two paths
+            # are one file, so the source path now resolves to the NEW content. Hashing
+            # it reports a spurious "source changed", and unlinking it would delete the
+            # file that was just published.
+            and not _is_same_file(value.source, value.destination)
         ):
             if self._hash_file(value.source) != value.source_fingerprint:
                 raise ConflictError("A management source changed before cleanup.")

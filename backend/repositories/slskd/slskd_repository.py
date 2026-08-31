@@ -17,6 +17,7 @@ stay structurally identical to the protocol for the conformance contract test.
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -219,6 +220,107 @@ class SlskdRepository:
     async def discard_client_artifacts(self, handle: TaskHandle) -> bool:
         return await self._remove_transfer_records(handle)
 
+    async def cancel(self, handle: TaskHandle) -> bool:
+        """Drop the transfers and remove whatever they left on the downloads mount.
+
+        A successful import MOVES the file into the library, so anything still
+        locatable here is a failed or abandoned download. Leaving it meant every
+        retry of an album stacked another full copy on the mount - one album grew
+        4.1 GB in two days that way.
+        """
+        ok = await self._remove_transfer_records(handle)
+        await asyncio.to_thread(self._remove_leftover_files, handle)
+        return ok
+
+    def _remove_leftover_files(self, handle: TaskHandle) -> None:
+        """Delete every on-disk copy of the handle's files, then prune emptied dirs.
+
+        All collision variants go, not just the one the locator would pick: a track
+        retried three times leaves three copies, and removing only the newest would
+        strand the rest forever.
+        """
+        emptied: set[Path] = set()
+        mount = self._downloads_mount.resolve()
+        for filename in handle.filenames:
+            located = self._locate_file(handle.username, filename)
+            if located is None:
+                continue
+            basename = located.name
+            parts = [
+                p
+                for p in re.split(r"[\\/]", filename)
+                if p and p not in (".", "..")
+            ]
+            wanted = parts[-1] if parts else basename
+            matches = self._collision_matcher(wanted)
+            for candidate in sorted(located.parent.iterdir()):
+                if not candidate.is_file():
+                    continue
+                if candidate.name != basename and not matches(candidate.name):
+                    continue
+                try:
+                    candidate.unlink()
+                except OSError as exc:
+                    logger.warning("Could not remove leftover %s: %s", candidate, exc)
+            emptied.add(located.parent)
+        for directory in emptied:
+            self._prune_empty_dirs(directory, mount)
+
+    @staticmethod
+    def _prune_empty_dirs(directory: Path, mount: Path) -> None:
+        """Remove ``directory`` and now-empty parents, never the mount root itself."""
+        current = directory.resolve()
+        while current != mount and current.is_relative_to(mount):
+            try:
+                if next(current.iterdir(), None) is not None:
+                    return
+                current.rmdir()
+            except OSError:
+                return
+            current = current.parent
+
+    @staticmethod
+    def _collision_matcher(basename: str) -> Callable[[str], bool]:
+        """Match slskd's collision suffix: ``{stem}_{ticks}{ext}``.
+
+        slskd renames a re-download that would overwrite an existing file by
+        inserting a .NET tick count. Only digits count as a suffix - ``Song_remaster``
+        and ``Song 2`` are different tracks, not variants of ``Song``.
+        """
+        stem, _, extension = basename.rpartition(".")
+        if not stem:
+            stem, extension = basename, ""
+        pattern = re.compile(
+            rf"^{re.escape(stem)}_\d+{re.escape('.' + extension) if extension else ''}$"
+        )
+        return lambda name: bool(pattern.match(name))
+
+    def _pick_in_dir(self, directory: Path, basename: str) -> Path | None:
+        """The exact filename in ``directory``, else its newest collision variant."""
+        exact = directory / basename
+        try:
+            if exact.exists():
+                return exact
+        except OSError:
+            return None
+        matches = self._collision_matcher(basename)
+        newest: Path | None = None
+        newest_mtime = -1.0
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            return None
+        for candidate in entries:
+            if not matches(candidate.name):
+                continue
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest, newest_mtime = candidate, mtime
+        return newest
+
     async def _remove_transfer_records(self, handle: TaskHandle) -> bool:
         transfers = await self._client.get_downloads(handle.username)
         matched = self._match_transfers(handle, transfers)
@@ -300,10 +402,18 @@ class SlskdRepository:
             return resolved
 
         def _find_direct_exact(directory: Path) -> Path | None:
+            # Confined to the mount first (upstream's guard), then matched with
+            # slskd's collision-renamed variant ({stem}_{ticks}{ext}) allowed as well
+            # as the exact name: a retried download lands under the renamed form, and
+            # a file only findable under its exact name could then be neither imported
+            # nor cleaned up.
             candidate = _within_mount(directory / basename)
-            if candidate is not None and candidate.is_file():
+            if candidate is None:
+                return None
+            if candidate.is_file():
                 return candidate
-            return None
+            picked = self._pick_in_dir(candidate.parent, basename)
+            return picked.resolve() if picked is not None else None
 
         def _name_matches(entry: Path) -> bool:
             return entry.name == basename

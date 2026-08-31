@@ -26,6 +26,7 @@ from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.library_reconciler import LibraryReconciler
 from services.native.library_scan_events import LibraryScanEventPublisher
 from services.native.background_workload_gate import BackgroundWorkloadGate
+from services.native.library_housekeeping_service import LibraryHousekeepingService
 
 PolicyResolverGetter = Callable[[], LibraryPolicyResolver]
 IndexedAlbumCallback = Callable[[str], Awaitable[object]]
@@ -48,6 +49,7 @@ class LibraryScanCoordinator:
         workload_gate: BackgroundWorkloadGate | None = None,
         filesystem_coordinator: LibraryFilesystemCoordinator | None = None,
         on_indexed_album: IndexedAlbumCallback | None = None,
+        housekeeping: LibraryHousekeepingService | None = None,
     ) -> None:
         self._store = store
         self._inventory = inventory
@@ -59,6 +61,11 @@ class LibraryScanCoordinator:
         self._workload_gate = workload_gate
         self._filesystem = filesystem_coordinator
         self._on_indexed_album = on_indexed_album
+        # Tidying that only makes sense once the catalog knows what is on disk:
+        # deduplication needs to see which copies exist, merging needs the albums
+        # resolved, and a folder is only empty once the files it lost have been
+        # reconciled away. Runs after the run reaches ``completed``, never before.
+        self._housekeeping = housekeeping
         self._last_progress_log: dict[str, float] = {}
         self._pending_control_run_ids: set[str] = set()
 
@@ -459,7 +466,27 @@ class LibraryScanCoordinator:
         self._last_progress_log.pop(run.id, None)
         if self._filesystem is not None:
             self._filesystem.forget_scan(run.id)
+        await self._run_housekeeping(run.id)
         return run
+
+    async def _run_housekeeping(self, run_id: str) -> None:
+        """Post-scan tidy-up: rehome, deduplicate, merge, purge, empty the bin.
+
+        Best-effort by construction - the scan itself has already succeeded and been
+        published by the time this runs, so a failure here must not turn a good scan
+        into a failed one. It only ever reports.
+        """
+        if self._housekeeping is None:
+            return
+        try:
+            counts = await self._housekeeping.run_after_scan()
+        except Exception:  # noqa: BLE001 - tidying never fails a scan
+            logger.warning(
+                "scan.housekeeping_failed", extra={"run_id": run_id}, exc_info=True
+            )
+            return
+        if any(counts.values()):
+            logger.info("scan.housekeeping", extra={"run_id": run_id, **counts})
 
     async def _schedule_pending_indexed_albums(self) -> None:
         if self._on_indexed_album is None:

@@ -321,6 +321,13 @@ class LibraryManagementRecoveryDiagnosticsResponse(AppStruct):
     state_counts: dict[str, int] = msgspec.field(default_factory=dict)
 
 
+class LibraryManagementRecoveryAcknowledgeResponse(AppStruct):
+    """How many stuck recovery items were dismissed, and what is left."""
+
+    acknowledged_count: int
+    diagnostics: LibraryManagementRecoveryDiagnosticsResponse
+
+
 class LibraryManagementProfileCreateRequest(AppStruct):
     name: str
     expected_settings_revision: str

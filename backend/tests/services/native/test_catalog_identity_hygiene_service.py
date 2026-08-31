@@ -862,3 +862,38 @@ async def test_shared_operation_supervisor_dispatches_catalog_hygiene_repair() -
 
     assert result == "response"
     hygiene.run_claimed.assert_awaited_once_with(job, "worker")
+
+
+# ---- the backfill has to be able to run more than once -----------------------------
+
+@pytest.mark.asyncio
+async def test_the_backfill_runs_again_once_the_catalog_has_changed(db_path: Path):
+    """The bug this fixes ran in production for three days.
+
+    A constant idempotency key meant this startup pass ran exactly once - at first
+    startup, against an empty catalog, enqueuing nothing - and every later startup
+    silently returned that finished job. 111 empty album shells accumulated, 107 of
+    which this pass would have retired, and one release pin had landed on one of them.
+    """
+    store = NativeLibraryStore(db_path, threading.Lock())
+    service = CatalogIdentityHygieneService(store, None, AsyncMock(), clock=lambda: 3)
+
+    revisions = iter([1, 2])
+    store.get_catalog_revision = AsyncMock(side_effect=lambda: next(revisions))
+
+    first = await service.enqueue_backfill()
+    second = await service.enqueue_backfill()
+
+    assert first["id"] != second["id"]
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_catalog_does_not_queue_the_work_twice(db_path: Path):
+    """Still idempotent - that was the point of the key, and it is kept."""
+    store = NativeLibraryStore(db_path, threading.Lock())
+    service = CatalogIdentityHygieneService(store, None, AsyncMock(), clock=lambda: 3)
+
+    first = await service.enqueue_backfill()
+    second = await service.enqueue_backfill()
+
+    assert first["id"] == second["id"]

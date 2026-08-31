@@ -2856,7 +2856,12 @@ async def test_publisher_applies_case_only_rename_of_source(tmp_path: Path) -> N
     result = await publisher.publish_bundle(job_id, 0, "apply-worker")
 
     assert len(result.committed_journal_ids) == 1
-    assert not source.exists()
+    # Compare directory ENTRIES, not Path.exists(): on a case-insensitive filesystem
+    # both spellings resolve to the same file, so exists() cannot tell the rename
+    # apart from a no-op. The entry name is the thing under test.
+    assert sorted(entry.name for entry in destination.parent.iterdir()) == [
+        "01 - Aria.flac"
+    ]
     assert destination.is_file()
     journals = await store.list_file_mutation_journals_for_bundle(job_id, 0)
     assert [journal.state for journal in journals] == ["completed"]
@@ -3489,3 +3494,129 @@ async def test_publish_refuses_destination_created_in_replace_window(
     # the external file survived untouched and nothing half-published remains
     assert planned.read_bytes() == b"external writer bytes"
     assert source.is_file()
+
+# ---- a staged copy that vanished is rebuilt, not fatal ------------------------------
+
+def test_a_staged_entry_may_be_replanned_for_recovery() -> None:
+    """The workspace of a run that fails after staging is cleaned up while its journal
+    entry survives. Verifying a file that is no longer there can only fail, so every
+    retry of that import failed identically - forever. A held upgrade could never be
+    published, which is what "upgrades still do not work" looked like from outside.
+    """
+    from infrastructure.persistence.native_library_store import (
+        _IMPORT_JOURNAL_TRANSITIONS,
+    )
+
+    assert "planned" in _IMPORT_JOURNAL_TRANSITIONS["staged"]
+
+
+def test_the_journal_still_cannot_walk_back_over_finished_work() -> None:
+    """Only staging is rebuildable. Anything that has touched the library stays put."""
+    from infrastructure.persistence.native_library_store import (
+        _IMPORT_JOURNAL_TRANSITIONS,
+    )
+
+    for state in ("validated", "replacement_backed_up", "published", "catalog_committed"):
+        assert "planned" not in _IMPORT_JOURNAL_TRANSITIONS[state], state
+
+
+# ---- a differing cover must never hold the music hostage ---------------------------
+
+def test_a_taken_artwork_destination_is_reported_as_taken(tmp_path) -> None:
+    """The live shape: an album folder holding nothing but a cover.jpg, sixteen tracks
+    waiting in the hold queue because the incoming release shipped a different one."""
+    from types import SimpleNamespace
+
+    from services.native.library_management_publisher import LibraryManagementPublisher
+
+    destination = tmp_path / "cover.jpg"
+    destination.write_bytes(b"the cover already on disk")
+    artifact = SimpleNamespace(source_fingerprint="a" * 64)
+
+    assert LibraryManagementPublisher._artifact_already_taken(destination, artifact)
+
+
+def test_identical_artwork_is_not_a_conflict(tmp_path) -> None:
+    """The album's first imported track wrote it; the second must not trip over it."""
+    import hashlib
+    from types import SimpleNamespace
+
+    from services.native.library_management_publisher import LibraryManagementPublisher
+
+    content = b"the very same cover"
+    destination = tmp_path / "cover.jpg"
+    destination.write_bytes(content)
+    artifact = SimpleNamespace(
+        source_fingerprint=hashlib.sha256(content).hexdigest()
+    )
+
+    assert not LibraryManagementPublisher._artifact_already_taken(destination, artifact)
+
+
+def test_an_empty_destination_is_free(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from services.native.library_management_publisher import LibraryManagementPublisher
+
+    artifact = SimpleNamespace(source_fingerprint="b" * 64)
+
+    assert not LibraryManagementPublisher._artifact_already_taken(
+        tmp_path / "nothing-here.jpg", artifact
+    )
+
+
+def test_artwork_already_present_under_another_spelling_is_not_a_conflict(tmp_path):
+    """"Cover.jpg" beside a planned "cover.jpg" is the album's artwork either way.
+
+    The publish-time check reported it as "collides after normalization" and failed
+    the whole bundle - the music went nowhere because of how a picture was spelled.
+    """
+    from types import SimpleNamespace
+
+    from services.native.library_management_publisher import LibraryManagementPublisher
+
+    (tmp_path / "Cover.jpg").write_bytes(b"already here")
+    artifact = SimpleNamespace(source_fingerprint="c" * 64)
+
+    assert LibraryManagementPublisher._artifact_already_taken(
+        tmp_path / "cover.jpg", artifact
+    )
+
+
+def test_a_free_destination_with_no_lookalike_is_still_free(tmp_path):
+    from types import SimpleNamespace
+
+    from services.native.library_management_publisher import LibraryManagementPublisher
+
+    (tmp_path / "backdrop.jpg").write_bytes(b"unrelated")
+    artifact = SimpleNamespace(source_fingerprint="d" * 64)
+
+    assert not LibraryManagementPublisher._artifact_already_taken(
+        tmp_path / "cover.jpg", artifact
+    )
+
+# ---- one un-appliable file must not take the bundle down with it -------------------
+
+@pytest.mark.asyncio
+async def test_a_bundle_of_already_settled_files_is_finished_not_failed(
+    tmp_path: Path,
+) -> None:
+    """Running the organizer over a library where some files are already in order
+    threw "A blocked management bundle cannot be published" - and the files beside
+    them, which had nothing wrong, went nowhere either. A blocked item was already
+    judged un-appliable when it was planned; the bundle has no reason to fail over it.
+    """
+    root, source, store, _audio, publisher, job_id = await _ready_apply_operation(
+        tmp_path
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE library_management_plan_items SET eligibility='blocked',"
+            "reason_code='PATH_COLLISION_DIFFERENT' WHERE job_id=?",
+            (job_id,),
+        )
+
+    result = await publisher.publish_bundle(job_id, 0, "apply-worker")
+
+    assert result.committed_journal_ids == ()
+    assert source.exists()  # nothing was touched

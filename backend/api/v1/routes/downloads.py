@@ -191,6 +191,40 @@ async def list_downloads(
     )
 
 
+@router.get("/stream")
+async def stream_all_downloads(
+    current_user: CurrentUserDep,
+    publisher=Depends(get_sse_publisher),
+):
+    """ONE multiplexed SSE stream for all of the user's downloads (admins: all users').
+
+    Replaces the per-task streams in the frontend: browsers cap concurrent HTTP/1.1
+    connections per origin (~6), so one EventSource per active download starved every
+    other request while downloads ran. Events carry ``task_id`` for client-side demux;
+    events for other users' tasks are filtered here (emitted as keepalives so proxies
+    never see a silent stream)."""
+    is_admin = current_user.role == "admin"
+    user_id = current_user.id
+
+    async def event_generator():
+        try:
+            async for message in publisher.subscribe("downloads:all"):
+                data = message["data"]
+                if not message["event"] or (
+                    not is_admin and (data or {}).get("user_id") != user_id
+                ):
+                    yield ": keepalive\n\n"
+                    continue
+                payload = msgspec.json.encode(data).decode("utf-8")
+                yield f"event: {message['event']}\ndata: {payload}\n\n"
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_generator(), media_type="text/event-stream", headers=_SSE_HEADERS
+    )
+
+
 @router.get("/{task_id}/stream")
 async def stream_download(
     task_id: str,
@@ -353,8 +387,10 @@ async def retry_download(
 async def clear_downloads(
     current_user: CurrentUserDep, service=Depends(get_download_service)
 ):
-    """Permanently remove the user's terminal (completed + cancelled) tasks."""
-    cleared = await service.clear_finished(current_user.id, current_user.role)
+    """Permanently remove everything in the user's queue History - completed, cancelled,
+    and failed tasks. Albums still auto-retrying ("Still hunting") or actively downloading
+    are left untouched."""
+    cleared = await service.clear_history(current_user.id, current_user.role)
     return ClearDownloadsResponse(cleared=cleared)
 
 

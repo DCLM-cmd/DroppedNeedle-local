@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
+import { playwright } from '@vitest/browser-playwright';
 import { sveltekit } from '@sveltejs/kit/vite';
 
 // `$env/dynamic/public` reads an SSR-injected global absent in the chromium test env and throws on import; alias to an empty-env stub so component tests can load

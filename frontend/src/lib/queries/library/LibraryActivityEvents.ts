@@ -1,13 +1,15 @@
 import { getApiUrl } from '$lib/api/api-utils';
 import { API } from '$lib/constants';
+
+import { subscribeShared, type SharedEventSourceSubscription } from '../sharedEventSource';
 import { invalidateQueriesWithPersister, queryClient } from '$lib/queries/QueryClient';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import { invalidateLibraryCatalog } from './LibraryCatalogInvalidation';
 import type { LibraryActivityResponse } from './LibraryOperationsTypes';
 
 export function createLibraryActivityEvents() {
-	let activitySource: EventSource | null = null;
-	let operationsSource: EventSource | null = null;
+	let activitySubscription: SharedEventSourceSubscription | null = null;
+	let operationsSubscription: SharedEventSourceSubscription | null = null;
 	let revisions: Record<string, number> | null = null;
 	let pendingInitialRevisions: Record<string, number> | null = null;
 	let admin = false;
@@ -96,20 +98,24 @@ export function createLibraryActivityEvents() {
 		unsubscribeQueryCache = queryClient.getQueryCache().subscribe(() => {
 			reconcilePendingInitialRevisions();
 		});
-		activitySource = new EventSource(getApiUrl(API.library.activityStream()));
-		activitySource.addEventListener('activity.changed', activityChanged);
+		activitySubscription = subscribeShared(API.library.activityStream(), {
+			'activity.changed': activityChanged
+		});
 		if (isAdmin) {
-			operationsSource = new EventSource(getApiUrl(API.library.operationsStream()));
-			operationsSource.addEventListener('open', invalidateOperations);
-			operationsSource.addEventListener('activity.changed', activityChanged);
+			// Shared with the Library Management pages, which listen to the same
+			// stream - see sharedEventSource for why a duplicate costs so much.
+			operationsSubscription = subscribeShared(API.library.operationsStream(), {
+				open: invalidateOperations,
+				'activity.changed': activityChanged
+			});
 		}
 	}
 
 	function stop(): void {
-		activitySource?.close();
-		operationsSource?.close();
-		activitySource = null;
-		operationsSource = null;
+		activitySubscription?.close();
+		operationsSubscription?.close();
+		activitySubscription = null;
+		operationsSubscription = null;
 		revisions = null;
 		pendingInitialRevisions = null;
 		admin = false;

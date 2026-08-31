@@ -10,6 +10,7 @@ from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.serialization import clone_with_updates
 from infrastructure.validators import is_unknown_mbid, is_valid_mbid
 from services.library_service import LibraryService
+from services.native.title_match import is_placeholder_artist
 from services.preferences_service import PreferencesService
 from core.task_registry import TaskRegistry
 from repositories.listenbrainz_repository import listenbrainz_rate_limit_cooldown_active
@@ -391,6 +392,75 @@ async def warm_artist_discovery_cache_periodically(
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
             break
+
+
+def start_artwork_blurhash_task(get_hash_service) -> asyncio.Task:
+    """Hash any artwork that has none yet, once, shortly after startup.
+
+    Organization runs are what normally fill the store, but a library that has not
+    been organized since this was introduced would otherwise carry no hashes at all,
+    and Finamp tells the user outright when a server returns none. Jellyfin has the
+    same safety net: it scans on startup and its ImageNeedsRefresh picks up every
+    image that is missing a hash.
+
+    Deliberately a background task - it decodes images, and startup must not wait.
+    """
+
+    async def _fill() -> None:
+        try:
+            await get_hash_service().backfill()
+        except Exception as error:  # noqa: BLE001 - decorative work, never fatal
+            logger.warning(
+                "startup.artwork_blurhash_failed", extra={"error": str(error)}
+            )
+
+    task = asyncio.create_task(_fill())
+    TaskRegistry.get_instance().register("artwork-blurhash-backfill", task)
+    task.add_done_callback(
+        lambda t: logger.error("Artwork blurhash task error: %s", t.exception())
+        if not t.cancelled() and t.exception()
+        else None
+    )
+    return task
+
+
+def start_organization_compaction_task(get_store) -> asyncio.Task:
+    """Reclaim the artwork bytes finished organization runs are still holding.
+
+    Runs do this themselves as they finish, but a library organized before this
+    existed carries the whole backlog - 2.67 GB of a 2.90 GB database here. Background,
+    bounded, and never blocking startup.
+    """
+
+    async def _compact() -> None:
+        try:
+            counts = await get_store().compact_finished_organization_records()
+            if any(counts.values()):
+                logger.info("Compacted organization records at startup: %s", counts)
+        except Exception as error:  # noqa: BLE001 - housekeeping, never fatal
+            logger.warning(
+                "startup.organization_compaction_failed", extra={"error": str(error)}
+            )
+        try:
+            repaired = await get_store().repair_target_compat_mappings()
+            if repaired:
+                logger.info(
+                    "Dropped %d compat ids that pointed at the wrong catalog row",
+                    repaired,
+                )
+        except Exception as error:  # noqa: BLE001 - housekeeping, never fatal
+            logger.warning(
+                "startup.compat_id_repair_failed", extra={"error": str(error)}
+            )
+
+    task = asyncio.create_task(_compact())
+    TaskRegistry.get_instance().register("organization-compaction", task)
+    task.add_done_callback(
+        lambda t: logger.error("Organization compaction error: %s", t.exception())
+        if not t.cancelled() and t.exception()
+        else None
+    )
+    return task
 
 
 def start_artist_discovery_cache_warming_task(
@@ -1304,19 +1374,37 @@ async def run_background_upgrade_sweep(
     owner = admins[0]
     items = await download_service.list_cutoff_unmet()
     enqueued = 0
+    skipped = 0
     for item in items:
         if enqueued >= policy.background_upgrade_max_per_run:
             break
+        artist_name = (item.get("artist_name") or "").strip()
+        album_title = (item.get("album_title") or "").strip()
+        # An untagged album has no identity to search for. Substituting a filler here
+        # used to send "Unknown" to the matchers, where it matched any share holding an
+        # "Unknown" folder and auto-accepted whatever was inside - the grab then landed
+        # untagged too, so the next sweep found one more identity-less album and the
+        # library poisoned itself one pass at a time. Skip instead: an upgrade the
+        # sweep cannot name is not one it may guess at.
+        if not artist_name or not album_title or is_placeholder_artist(artist_name):
+            skipped += 1
+            continue
         task_id = await download_service.request_upgrade_album(
             user_id=owner.id,
             release_group_mbid=item["release_group_mbid"],
-            artist_name=item.get("artist_name") or "Unknown",
-            album_title=item.get("album_title") or "Unknown",
+            artist_name=artist_name,
+            album_title=album_title,
             year=item.get("year"),
             artist_mbid=item.get("artist_mbid"),
         )
         if task_id != "already_in_library":
             enqueued += 1
+    if skipped:
+        logger.info(
+            "Background upgrade sweep skipped %d album(s) with no usable artist/album "
+            "name - they need identification before they can be upgraded",
+            skipped,
+        )
     if enqueued:
         logger.info("Background upgrade sweep enqueued %d upgrade(s)", enqueued)
     return enqueued

@@ -187,6 +187,8 @@ def _service_fixture(
         "baseline_available_count": 2,
     }
     store.get_catalog_revision.return_value = 0
+    # Staleness is judged against THIS plan's own subjects, not the whole catalog.
+    store.library_management_plan_subjects_changed.return_value = False
     store.list_library_management_plan_items.return_value = []
     store.list_library_management_external_refreshes.return_value = []
     planner = AsyncMock(spec=LibraryManagementPlanner)
@@ -488,11 +490,13 @@ async def test_detail_reports_expiry_and_current_staleness(tmp_path: Path) -> No
     snapshot.settings_revision = settings_revision(
         preferences.get_library_management_settings_raw()
     )
-    store.get_catalog_revision.return_value = 1
+    # A file this plan covers moved underneath it - the only kind of catalog change
+    # that can invalidate the plan. An unrelated write elsewhere must not.
+    store.library_management_plan_subjects_changed.return_value = True
     changed_catalog = await service.detail("job-1")
     assert changed_catalog.stale_reasons == ["FILE_CHANGED"]
 
-    store.get_catalog_revision.return_value = 0
+    store.library_management_plan_subjects_changed.return_value = False
     snapshot.preview_expires_at = 99.0
     store.get_library_management_job_snapshot.return_value = snapshot
     expired = await service.detail("job-1")
@@ -931,3 +935,37 @@ async def test_activation_confirmation_validates_all_roots_before_saving(
     assert all(
         value.activation_confirmed_at == 100.0 for value in saved.root_assignments
     )
+
+
+@pytest.mark.asyncio
+async def test_an_unrelated_catalog_write_no_longer_makes_a_preview_unappliable(
+    tmp_path: Path,
+):
+    """The reported symptom: the Confirm button did nothing.
+
+    Staleness was judged against the GLOBAL catalog revision, which every catalog
+    write anywhere bumps - a scan, an import, an artwork hash. On a system that was
+    doing anything at all it changed between building a preview and pressing Confirm,
+    so the apply was refused as "not current" and the click had no visible effect.
+    """
+    service, store, _preferences, snapshot = _service_fixture(tmp_path)
+    store.library_management_plan_subjects_changed.return_value = False
+    store.get_catalog_revision.return_value = snapshot.catalog_revision + 99
+
+    detail = await service.detail("job-1")
+
+    assert detail.stale_reasons == []
+    assert detail.ready_for_confirmation is True
+
+
+@pytest.mark.asyncio
+async def test_a_file_this_plan_covers_still_makes_it_stale(tmp_path: Path):
+    """The protection that matters is kept: a plan whose subjects moved underneath it
+    must not be applied."""
+    service, store, _preferences, _snapshot = _service_fixture(tmp_path)
+    store.library_management_plan_subjects_changed.return_value = True
+
+    detail = await service.detail("job-1")
+
+    assert detail.stale_reasons == ["FILE_CHANGED"]
+    assert detail.ready_for_confirmation is False

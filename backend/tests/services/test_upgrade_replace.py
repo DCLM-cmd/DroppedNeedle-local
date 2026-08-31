@@ -186,6 +186,15 @@ async def test_upgrade_replaces_worse_file_at_different_path(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_upgrade_never_replaces_equal_or_better(tmp_path: Path):
+    """The held copy wins, and the run must NOT call that an import.
+
+    Handing back the existing file's own path counts it as a track imported, so an
+    upgrade that replaced nothing announced itself as finished - the album stayed as
+    it was, the run reported 11 of 11, and the failover never looked for a copy that
+    would actually be better. It is a refusal, and it is reported as one.
+    """
+    from services.native.file_processor import NOT_AN_UPGRADE
+
     fp, manager, library, downloads, bin_path = _make(tmp_path)
     old = await _seed_existing(
         manager,
@@ -199,8 +208,9 @@ async def test_upgrade_never_replaces_equal_or_better(tmp_path: Path):
         _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
     )
 
-    assert result.succeeded == [str(old)]  # dedup kept the existing copy
-    assert old.exists()
+    assert result.succeeded == []
+    assert [f.reason for f in result.failed] == [NOT_AN_UPGRADE]
+    assert old.exists()  # the good copy is untouched
     assert not (library / _NEW_REL).exists()
     assert _bin_files(bin_path) == []
 
@@ -259,7 +269,13 @@ async def test_no_recycle_bin_disables_replacement(tmp_path: Path):
         _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
     )
 
-    assert result.succeeded == [str(old)]
+    from services.native.file_processor import UPGRADE_NEEDS_RECYCLE_BIN
+
+    # A better copy WAS found; it simply cannot be applied without somewhere to put
+    # the bytes it would displace. Saying "no better copy" here sent the user hunting
+    # for releases over what is really a setting.
+    assert result.succeeded == []
+    assert [f.reason for f in result.failed] == [UPGRADE_NEEDS_RECYCLE_BIN]
     assert old.exists()
 
 
@@ -458,3 +474,34 @@ async def test_place_held_file_replace_without_recycle_bin_consumes_source(tmp_p
     assert Path(target) == existing
     assert existing.read_bytes() == b"OLD-BYTES"
     assert not held_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_non_upgrade_import_still_counts_an_existing_track_as_done(
+    tmp_path: Path,
+):
+    """Only upgrades change meaning here. For any other origin an already-present
+    track is nothing to do, which is a success and must stay one."""
+    fp, manager, library, downloads, bin_path = _make(tmp_path)
+    old = await _seed_existing(
+        manager,
+        library / "Radiohead/OK Computer (1997)/old-copy.flac",
+        file_format="flac",
+        bit_rate=900,
+    )
+    shutil.copy(_FLAC, downloads / "01 Airbag.flac")
+
+    result = await fp.process_downloaded(
+        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="user")
+    )
+
+    assert result.failed == []
+    assert result.succeeded == [str(old)]
+
+
+def test_a_refused_upgrade_never_blacklists_the_file() -> None:
+    """The file is perfectly good, it is simply not an improvement. Quarantining it
+    would blacklist a healthy release for everyone."""
+    from services.native.file_processor import NOT_AN_UPGRADE, QUARANTINE_REASONS
+
+    assert NOT_AN_UPGRADE not in QUARANTINE_REASONS

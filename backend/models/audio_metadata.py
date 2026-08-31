@@ -66,7 +66,14 @@ class EmbeddedArtworkDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     height: int | None
     byte_size: int
     sha256: str
-    content: bytes
+    # Absent in a COMPACTED document. Artwork bytes are only needed while a run is in
+    # flight; once the run reaches a terminal state they are dead weight, and they are
+    # enormous - inline base64 covers accounted for 2.67 GB of a 2.90 GB database. A
+    # compacted descriptor keeps everything that describes the image, including the
+    # sha256 that identifies it, and drops only the pixels. Optional rather than empty
+    # so that a document which somehow reaches the tag writer fails loudly instead of
+    # silently erasing an album's artwork.
+    content: bytes | None = None
     format_supported: bool
 
 

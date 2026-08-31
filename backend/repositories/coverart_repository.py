@@ -15,6 +15,7 @@ import msgspec
 from core.exceptions import (
     ArtworkProcessingError,
     ExternalServiceError,
+    RateLimitBlockedError,
     RateLimitedError,
     ClientDisconnectedError,
 )
@@ -48,6 +49,8 @@ if TYPE_CHECKING:
     from services.audiodb_browse_queue import AudioDBBrowseQueue
     from infrastructure.persistence.library_db import LibraryDB
     from infrastructure.persistence.native_library_store import NativeLibraryStore
+
+from infrastructure.images.blurhash import blurhash_for_file
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +412,13 @@ class CoverArtRepository:
             retry_after = CoverArtRepository._parse_retry_after_seconds(
                 response.headers.get("Retry-After")
             )
+            if retry_after is None:
+                # No interval named: a refusal, not a throttle. Re-sending it is how
+                # an address earns a hard block at the edge - and the Cover Art
+                # Archive shares one with MusicBrainz and ListenBrainz.
+                raise RateLimitBlockedError(
+                    f"{source} refused the request (429) without a retry hint: {url}"
+                )
             raise RateLimitedError(
                 f"{source} rate limited (429): {url}",
                 retry_after_seconds=retry_after,
@@ -438,7 +448,12 @@ class CoverArtRepository:
     @with_retry(
         max_attempts=2,
         circuit_breaker=_coverart_circuit_breaker,
+        # A throttle that names an interval is waited out; a 429 with no hint at all
+        # is a refusal and is not re-sent, because retrying it multiplies exactly the
+        # traffic that earned it. The Cover Art Archive shares its address with
+        # MusicBrainz and ListenBrainz, so a block earned here takes all three down.
         retriable_exceptions=(httpx.HTTPError, ExternalServiceError, RateLimitedError),
+        non_retriable_exceptions=(RateLimitBlockedError,),
     )
     async def _http_get_coverart(
         self, url: str, priority: RequestPriority, **kwargs
@@ -705,7 +720,12 @@ class CoverArtRepository:
     @with_retry(
         max_attempts=2,
         circuit_breaker=_coverart_circuit_breaker,
+        # A throttle that names an interval is waited out; a 429 with no hint at all
+        # is a refusal and is not re-sent, because retrying it multiplies exactly the
+        # traffic that earned it. The Cover Art Archive shares its address with
+        # MusicBrainz and ListenBrainz, so a block earned here takes all three down.
         retriable_exceptions=(httpx.HTTPError, ExternalServiceError, RateLimitedError),
+        non_retriable_exceptions=(RateLimitBlockedError,),
     )
     async def _stream_management_artwork(
         self,
@@ -754,6 +774,71 @@ class CoverArtRepository:
             except (httpx.HTTPError, ExternalServiceError, RateLimitedError):
                 record_provider_call("coverart", priority, None)
                 raise
+
+    async def _blurhash_of_cached(self, identifier: str, suffix: str) -> Optional[str]:
+        """The blurhash of an already-cached image, or None if it is not on disk.
+
+        Deliberately never fetches: this is called once per item while BUILDING a
+        listing, so a miss must cost nothing. An image that arrives later gets its
+        hash on the next listing.
+        """
+        file_path = self._disk_cache.get_file_path(identifier, suffix)
+        return await asyncio.to_thread(blurhash_for_file, file_path)
+
+    async def get_release_group_cover_blurhash(
+        self, release_group_id: str, size: Optional[str] = "500"
+    ) -> Optional[str]:
+        """BlurHash for an album cover, for the compat APIs' ``ImageBlurHashes``.
+
+        Jellyfin publishes one per image and clients use it both as the loading
+        placeholder and to DE-DUPLICATE image downloads - Finamp warns the user when a
+        server returns none and then re-fetches artwork it already has.
+        """
+        try:
+            release_group_id = validate_mbid(release_group_id, "release-group")
+        except ValueError:
+            return None
+        return await self._blurhash_of_cached(f"rg_{release_group_id}", size or "orig")
+
+    async def get_artist_image_blurhash(
+        self, artist_id: str, size: Optional[int] = None
+    ) -> Optional[str]:
+        """BlurHash for an artist image. See ``get_release_group_cover_blurhash``."""
+        try:
+            artist_id = validate_mbid(artist_id, "artist")
+        except ValueError:
+            return None
+        identifier = f"artist_{artist_id}" + (f"_{size}" if size else "")
+        found = await self._blurhash_of_cached(identifier, "img")
+        if found or size:
+            return found
+        # Same 250 fallback the etag lookup needs: that is where an unsized artist
+        # image actually lands.
+        return await self._blurhash_of_cached(f"artist_{artist_id}_250", "img")
+
+    async def get_release_group_cover_image_info(
+        self, release_group_id: str, size: Optional[str] = "500"
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The album cover's tag and blurhash together.
+
+        The compat builders ask for the pair in one call so a listing resolves each
+        picture once instead of twice. This composition reads both from the same disk
+        cache, so there is no shared work to save here - the method exists so the
+        builders never have to know which composition they are talking to.
+        """
+        return (
+            await self.get_release_group_cover_etag(release_group_id, size),
+            await self.get_release_group_cover_blurhash(release_group_id, size),
+        )
+
+    async def get_artist_image_info(
+        self, artist_id: str, size: Optional[int] = None
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The artist picture's tag and blurhash together. See the album variant."""
+        return (
+            await self.get_artist_image_etag(artist_id, size),
+            await self.get_artist_image_blurhash(artist_id, size),
+        )
 
     async def get_release_group_cover_etag(
         self,
@@ -814,6 +899,20 @@ class CoverArtRepository:
         content_hash = await self._disk_cache.get_content_hash(file_path)
         if content_hash:
             return content_hash
+
+        # Artist images are stored at 250 unless a size was requested, so an
+        # UNSIZED lookup - which is what the compat DTO builders do - missed the only
+        # entry that exists. The guard below only covered a request for some OTHER
+        # size, so every artist reported no image tag at all and no client ever asked
+        # for the picture.
+        if not size:
+            unsized_fallback = self._disk_cache.get_file_path(
+                f"artist_{artist_id}_250", "img"
+            )
+            if content_hash := await self._disk_cache.get_content_hash(
+                unsized_fallback
+            ):
+                return content_hash
 
         if size and size != 250:
             fallback_identifier = f"artist_{artist_id}_250"

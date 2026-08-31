@@ -323,7 +323,7 @@ function pluralDownloads(n: number): string {
 	return `${n} download${n === 1 ? '' : 's'}`;
 }
 
-export function clearFinished() {
+export function clearHistory() {
 	return createMutation(() => ({
 		mutationFn: () => api.global.post<{ cleared: number }>(API.downloads.clear(), {}),
 		onSuccess: (data: { cleared: number }) => {

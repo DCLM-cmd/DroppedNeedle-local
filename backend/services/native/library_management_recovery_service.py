@@ -230,6 +230,24 @@ class LibraryManagementRecoveryService:
     async def diagnostics(self) -> dict[str, object]:
         return await self._store.library_management_recovery_diagnostics()
 
+    async def acknowledge_attention(self) -> int:
+        """Dismiss the items automated recovery cannot finish. Returns the count.
+
+        These are genuinely stuck - typically both the destination and the backup
+        are gone, so there is nothing left to roll forward or back - and recovery
+        already excludes them from its scan. Without a way to acknowledge them the
+        operator was left with a permanent alert and no action to take on it.
+        """
+        acknowledged = await self._store.acknowledge_library_management_recovery_attention(
+            now=self._clock()
+        )
+        if acknowledged:
+            logger.info(
+                "library_management.recovery_attention_acknowledged count=%d",
+                acknowledged,
+            )
+        return acknowledged
+
     async def _recover_bundle(
         self,
         job_id: str,

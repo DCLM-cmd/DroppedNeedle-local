@@ -98,6 +98,29 @@ def is_flac_or_mp3(file: DownloadSearchResult) -> bool:
     return effective_extension(file) in _FLAC_MP3_EXT
 
 
+def effective_kbps(file: DownloadSearchResult) -> float | None:
+    """A file's bitrate in kbps: the reported ``bitRate`` when present, else derived
+    from size/duration (``bitRate`` is ABSENT for lossless files on slskd, but size
+    and length are reported - a 40 MB, 4-minute FLAC is ~1365 kbps). ``None`` when
+    it cannot be judged (no bitrate, and no usable size/duration pair)."""
+    if file.bitrate:
+        return float(file.bitrate)
+    if file.size and file.duration and file.duration > 0:
+        return file.size * 8.0 / file.duration / 1000.0
+    return None
+
+
+def exceeds_lossless_cap(file: DownloadSearchResult, lossless_max_kbps: int) -> bool:
+    """Whether a LOSSLESS file's effective bitrate exceeds the user's cap
+    (``lossless_max_kbps``; 0 = no cap). Lossy files never hit this cap - their
+    bitrate bands are the tier axis itself. Unknown bitrate fails open (a cap must
+    not reject files that simply didn't report size/length)."""
+    if lossless_max_kbps <= 0 or file_tier(file) != "lossless":
+        return False
+    kbps = effective_kbps(file)
+    return kbps is not None and kbps > lossless_max_kbps
+
+
 def is_audio(file: DownloadSearchResult) -> bool:
     """True for audio files; False for the art/cue/log/m3u sidecars a Soulseek
     folder search returns alongside the tracks."""

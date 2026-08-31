@@ -67,7 +67,7 @@ async def test_put_settings_admin_persists(app_password_service, tmp_path):
         "subsonic_enabled": True, "jellyfin_enabled": True,
         "transcoding_enabled": True, "transcode_default_format": "opus",
         "transcode_max_bitrate_kbps": 192, "advertise_server_name": "DroppedNeedle",
-        "advertise_server_version": "10.10.6", "discover_mode": "lazy-mb",
+        "advertise_server_version": "12.0.0", "discover_mode": "lazy-mb",
     })
     assert r.status_code == 200
     assert r.json()["discover_mode"] == "lazy-mb"

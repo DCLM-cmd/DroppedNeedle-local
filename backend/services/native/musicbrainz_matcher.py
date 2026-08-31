@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 
 from rapidfuzz.distance import Levenshtein
 from rapidfuzz.fuzz import token_set_ratio
+
+from services.native.title_match import artists_overlap
 from unidecode import unidecode
 
 from infrastructure.msgspec_fastapi import AppStruct
@@ -115,6 +117,16 @@ class MusicBrainzMatcher:
             return True
         result_artist = self._normalize(candidate_artist)
         if not result_artist:
+            return True
+        # Either side may credit several artists ("A feat. B" against MusicBrainz's
+        # primary credit alone, or a collaboration recorded as separate credits). One
+        # artist named on both sides identifies the same release, so compare the sets
+        # rather than the whole credit string.
+        if artists_overlap(
+            target_artist,
+            candidate_artist,
+            floor=int(self.ARTIST_MATCH_FLOOR * 100),
+        ):
             return True
         return (
             token_set_ratio(self._normalize(target_artist), result_artist) / 100.0

@@ -443,7 +443,15 @@ async def test_optional_genre_outage_preserves_local_value_and_records_warning(
         settings, expected_settings_revision=current.settings_revision
     )
     _activate(preferences, policy_revision)
-    service, _planner_value = _service(tmp_path, preferences, store)
+    service, planner_value = _service(tmp_path, preferences, store)
+    # A genuine OUTAGE, which is what this test is about. Leaving the provider
+    # unwired instead would now mean "the source is switched off", and an off source
+    # correctly warns about nothing - see test_genre_source_deferral.
+    outage = AsyncMock()
+    outage.get_release_group_genres_batch.side_effect = ExternalServiceError(
+        "ListenBrainz is unreachable"
+    )
+    planner_value._genres._listenbrainz = outage
 
     prepared = await service.prepare(_bundle(tmp_path, source, policy_revision))
 

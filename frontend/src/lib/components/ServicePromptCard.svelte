@@ -2,9 +2,9 @@
 	import type { ServicePrompt } from '$lib/types';
 	import { ArrowRight, Headphones, Tv, Download, Radio, Music, X } from 'lucide-svelte';
 	import { dismiss } from '$lib/utils/dismissedPrompts';
-	import type { ComponentType } from 'svelte';
+	import type { Component } from 'svelte';
 
-	const serviceIcons: Record<string, ComponentType> = {
+	const serviceIcons: Record<string, Component> = {
 		listenbrainz: Headphones,
 		jellyfin: Tv,
 		'download-client': Download,

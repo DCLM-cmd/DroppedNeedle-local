@@ -117,6 +117,68 @@ class SessionInfo(msgspec.Struct, kw_only=True):
     ServerId: str = SERVER_ID
 
 
+class UserPolicy(msgspec.Struct, kw_only=True):
+    """Real Jellyfin sends this fully populated, and strict clients hard-cast the
+    bools - the same trap as UserConfiguration/SessionInfo (issue #144), which were
+    typed for exactly this reason while Policy stayed a hand-written dict. Nine of
+    Jellyfin's policy booleans were missing from that dict, and a missing key reaches
+    Finamp as null: "type 'Null' is not a subtype of 'bool' in type cast" on login.
+
+    Every boolean is non-optional here so it can never serialise as null.
+    """
+
+    IsAdministrator: bool = False
+    IsHidden: bool = False
+    IsDisabled: bool = False
+    # Without EnableAllFolders strict clients (Manet) conclude "no libraries" and
+    # never call /UserViews.
+    EnableAllFolders: bool = True
+    EnabledFolders: list[str] = []
+    EnableAllChannels: bool = True
+    EnabledChannels: list[str] = []
+    EnableAllDevices: bool = True
+    EnabledDevices: list[str] = []
+    EnableMediaPlayback: bool = True
+    EnableAudioPlaybackTranscoding: bool = True
+    EnableVideoPlaybackTranscoding: bool = True
+    EnablePlaybackRemuxing: bool = True
+    ForceRemoteSourceTranscoding: bool = False
+    EnableContentDownloading: bool = True
+    EnableContentDeletion: bool = False
+    EnableContentDeletionFromFolders: list[str] = []
+    EnableRemoteAccess: bool = True
+    EnableSyncTranscoding: bool = True
+    EnableMediaConversion: bool = False
+    EnableUserPreferenceAccess: bool = True
+    EnableLiveTvAccess: bool = False
+    EnableLiveTvManagement: bool = False
+    EnableRemoteControlOfOtherUsers: bool = False
+    EnableSharedDeviceControl: bool = False
+    EnablePublicSharing: bool = False
+    EnableCollectionManagement: bool = False
+    EnableSubtitleManagement: bool = False
+    EnableLyricManagement: bool = False
+    EnableSubtitleDownloading: bool = False
+    BlockedTags: list[str] = []
+    AllowedTags: list[str] = []
+    BlockedChannels: list[str] = []
+    BlockedMediaFolders: list[str] = []
+    BlockUnratedItems: list[str] = []
+    AccessSchedules: list[dict[str, Any]] = []
+    MaxParentalRating: int | None = None
+    InvalidLoginAttemptCount: int = 0
+    LoginAttemptsBeforeLockout: int = -1
+    MaxActiveSessions: int = 0
+    RemoteClientBitrateLimit: int = 0
+    AuthenticationProviderId: str = (
+        "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider"
+    )
+    PasswordResetProviderId: str = (
+        "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider"
+    )
+    SyncPlayAccess: str = "CreateAndJoinGroups"
+
+
 class UserDto(msgspec.Struct, kw_only=True):
     Id: str
     Name: str
@@ -126,7 +188,7 @@ class UserDto(msgspec.Struct, kw_only=True):
     # deprecated upstream but still sent by real servers; Finamp requires it non-null
     HasConfiguredEasyPassword: bool = False
     Configuration: UserConfiguration = msgspec.field(default_factory=UserConfiguration)
-    Policy: dict[str, Any] = {}
+    Policy: UserPolicy = msgspec.field(default_factory=UserPolicy)
 
 
 class AuthenticationResult(msgspec.Struct, kw_only=True):
@@ -151,6 +213,18 @@ class UserItemDataDto(msgspec.Struct, kw_only=True):
     LastPlayedDate: str | None = None
     Rating: float | None = None
     PlayedPercentage: float | None = None
+
+
+class BaseItemPerson(msgspec.Struct, kw_only=True):
+    """A credited person. For music Jellyfin lists the artists here, and clients read
+    ``People`` when they want the credits behind a track rather than the flat
+    ``Artists`` strings."""
+
+    Name: str
+    Id: str
+    Role: str = ""
+    Type: str = "Artist"
+    PrimaryImageTag: str | None = None
 
 
 class BaseItemDto(msgspec.Struct, kw_only=True):
@@ -189,6 +263,46 @@ class BaseItemDto(msgspec.Struct, kw_only=True):
     BackdropImageTags: list[str] = []
     ImageBlurHashes: dict[str, dict[str, str]] = {}
 
+    # --- fields clients ask for by name -----------------------------------------
+    # Finamp's every listing carries
+    # Fields=ChildCount,DateCreated,DateLastMediaAdded,Etag,Genres,ParentId,
+    #        ProviderIds,Tags,SortName,People,MediaSources
+    # and five of those were simply never emitted. A field a client ASKED for and did
+    # not get is not a neutral omission: it silently disables the feature behind it.
+    Etag: str | None = None
+    Tags: list[str] = []
+    People: list[BaseItemPerson] = []
+    DateLastMediaAdded: str | None = None
+    # Attaching the media source to the item saves a PlaybackInfo round-trip PER TRACK
+    # when a client asks for it, which is most of the request storm behind "Finamp is
+    # slow to load". Only populated when Fields names it - it is the expensive part.
+    MediaSources: list["MediaSourceInfo"] | None = None
+    MediaStreams: list["MediaStream"] | None = None
+    MediaSourceCount: int | None = None
+
+    # --- music metadata we hold and never published -------------------------------
+    # ReplayGain. Clients use these to level playback across albums; without them
+    # every track plays at whatever level it was mastered at.
+    NormalizationGain: float | None = None
+    AlbumNormalizationGain: float | None = None
+    # Genres as navigable items, not just names - this is what a client links to when
+    # you tap a genre.
+    GenreItems: list[NameGuidPair] | None = None
+    PremiereDate: str | None = None
+    AlbumCount: int | None = None
+    SongCount: int | None = None
+    ArtistCount: int | None = None
+    RecursiveItemCount: int | None = None
+    CumulativeRunTimeTicks: int | None = None
+    HasLyrics: bool | None = None
+    Overview: str | None = None
+
+    # --- capability flags a client gates its UI on --------------------------------
+    # CanDownload decides whether a client offers offline downloads at all.
+    CanDownload: bool = True
+    CanDelete: bool = False
+    PlayAccess: str = "Full"
+
 
 class BaseItemDtoQueryResult(msgspec.Struct, kw_only=True):
     Items: list[BaseItemDto] = []
@@ -197,6 +311,15 @@ class BaseItemDtoQueryResult(msgspec.Struct, kw_only=True):
 
 
 class MediaStream(msgspec.Struct, kw_only=True):
+    """A stream inside a media source, in Jellyfin's shape.
+
+    The booleans below are NOT optional decoration. Clients generate their model from
+    Jellyfin's OpenAPI schema, where these are non-nullable, and hard-cast them - the
+    same trap that broke login twice (issue #144's UserConfiguration/SessionInfo, then
+    UserPolicy). Fields whose value is None are dropped from the response entirely, so
+    every one of these carries a real default rather than None.
+    """
+
     Type: str = "Audio"
     Codec: str | None = None
     Index: int = 0
@@ -206,11 +329,32 @@ class MediaStream(msgspec.Struct, kw_only=True):
     SampleRate: int | None = None
     BitDepth: int | None = None
     IsDefault: bool = True
+    IsInterlaced: bool = False
+    IsForced: bool = False
+    IsExternal: bool = False
+    IsTextSubtitleStream: bool = False
+    SupportsExternalStream: bool = False
+    IsHearingImpaired: bool = False
+    Level: float = 0.0
 
 
 class MediaSourceInfo(msgspec.Struct, kw_only=True):
+    """One playable source for an item, in Jellyfin's shape.
+
+    Finamp parses this with a generated ``_$MediaSourceInfoFromJson``, and a missing
+    non-nullable field throws INSIDE the parser - so the item's whole metadata fetch
+    fails ("Failed to fetch metadata for 'SKIT'") even though the HTTP call was a 200.
+    Only a handful of these fields were emitted, so every track Finamp opened failed
+    to parse.
+
+    Fields set to None are dropped from the response, so anything a client may
+    hard-cast has to carry a real default here, not None. Same rule as
+    ``MediaStream``, ``UserPolicy`` and issue #144's structs.
+    """
+
     Id: str
     Protocol: str = "File"
+    Type: str = "Default"
     Container: str | None = None
     Size: int | None = None
     Bitrate: int | None = None
@@ -220,8 +364,22 @@ class MediaSourceInfo(msgspec.Struct, kw_only=True):
     SupportsTranscoding: bool = False
     DefaultAudioStreamIndex: int = 0
     MediaStreams: list[MediaStream] = []
-    Name: str | None = None
+    MediaAttachments: list[dict] = []
+    Formats: list[str] = []
+    RequiredHttpHeaders: dict[str, str] = {}
+    Name: str = ""
+    ETag: str = ""
     IsRemote: bool = False
+    ReadAtNativeFramerate: bool = False
+    IgnoreDts: bool = False
+    IgnoreIndex: bool = False
+    GenPtsInput: bool = False
+    IsInfiniteStream: bool = False
+    RequiresOpening: bool = False
+    RequiresClosing: bool = False
+    RequiresLooping: bool = False
+    SupportsProbing: bool = True
+    HasSegments: bool = False
     # api_key must be embedded in the URL: clients (Finamp, Jellify, Manet) fetch it
     # without auth headers, so the stream 401s otherwise.
     DirectStreamUrl: str | None = None

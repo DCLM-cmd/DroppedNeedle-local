@@ -373,7 +373,12 @@ def test_offline_replacement_entrypoint_is_complete_and_single_worker() -> None:
     )
     from maintenance.automatic_upgrade import _target_command
 
-    assert _target_command(8688)[-2:] == ["--workers", "1"]
+    command = _target_command(8688)
+    # Assert the contract, not the argument order: one worker, and the forwarding
+    # headers the TLS proxy in front of it depends on.
+    assert command[command.index("--workers") + 1] == "1"
+    assert "--proxy-headers" in command
+    assert command[command.index("--forwarded-allow-ips") + 1]
 
 
 def test_production_target_application_always_runs_startup_validation(

@@ -265,50 +265,58 @@ class CoverDiskCache:
 
             self._last_eviction_check = now
 
-            total_bytes = 0
-            candidates: list[tuple[float, Path, int]] = []
+            # One thread hop for the whole sweep. This used to run on the event
+            # loop, globbing the cache and awaiting an aiofiles open+read of a
+            # .meta.json for EVERY cached cover - thousands of sequential I/O
+            # round-trips, taken while holding the eviction lock, so every cover
+            # request queued behind it. The work is plain local file I/O; doing it
+            # synchronously off-loop is both faster and keeps the loop free.
+            return await asyncio.to_thread(self._enforce_size_limit_sync)
 
-            for file_path in self.cache_dir.glob('*.bin'):
-                try:
-                    size_bytes = file_path.stat().st_size
-                except FileNotFoundError:
-                    continue
+    def _enforce_size_limit_sync(self) -> int:
+        assert self.max_size_bytes is not None
+        total_bytes = 0
+        candidates: list[tuple[float, Path, int]] = []
 
-                total_bytes += size_bytes
+        for file_path in self.cache_dir.glob('*.bin'):
+            try:
+                size_bytes = file_path.stat().st_size
+            except FileNotFoundError:
+                continue
 
-                meta_path = file_path.with_suffix('.meta.json')
-                meta: dict = {}
-                if meta_path.exists():
-                    try:
-                        async with aiofiles.open(meta_path, 'r') as f:
-                            meta = _decode_json(await f.read())
-                    except Exception:  # noqa: BLE001
-                        meta = {}
+            total_bytes += size_bytes
 
-                if meta.get('is_monitored', False):
-                    continue
+            meta_path = file_path.with_suffix('.meta.json')
+            meta: dict = {}
+            try:
+                meta = _decode_json(meta_path.read_text())
+            except (OSError, ValueError):
+                meta = {}
 
-                last_accessed = float(meta.get('last_accessed', meta.get('created_at', 0.0)) or 0.0)
-                candidates.append((last_accessed, file_path, size_bytes))
+            if meta.get('is_monitored', False):
+                continue
 
-            if total_bytes <= self.max_size_bytes:
-                return 0
+            last_accessed = float(meta.get('last_accessed', meta.get('created_at', 0.0)) or 0.0)
+            candidates.append((last_accessed, file_path, size_bytes))
 
-            bytes_to_free = total_bytes - self.max_size_bytes
-            bytes_freed = 0
+        if total_bytes <= self.max_size_bytes:
+            return 0
 
-            candidates.sort(key=lambda item: item[0])
+        bytes_to_free = total_bytes - self.max_size_bytes
+        bytes_freed = 0
 
-            for _, file_path, size_bytes in candidates:
-                file_path.unlink(missing_ok=True)
-                file_path.with_suffix('.meta.json').unlink(missing_ok=True)
-                file_path.with_suffix('.wikidata').unlink(missing_ok=True)
-                bytes_freed += size_bytes
+        candidates.sort(key=lambda item: item[0])
 
-                if bytes_freed >= bytes_to_free:
-                    break
+        for _, file_path, size_bytes in candidates:
+            file_path.unlink(missing_ok=True)
+            file_path.with_suffix('.meta.json').unlink(missing_ok=True)
+            file_path.with_suffix('.wikidata').unlink(missing_ok=True)
+            bytes_freed += size_bytes
 
-            return bytes_freed
+            if bytes_freed >= bytes_to_free:
+                break
+
+        return bytes_freed
 
     async def delete_by_identifiers(self, identifiers: list[tuple[str, str]]) -> int:
         count = 0

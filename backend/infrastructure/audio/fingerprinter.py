@@ -139,6 +139,11 @@ def split_artist_credit(credit: str) -> list[str]:
     return [token.strip() for token in tokens if token.strip()]
 
 
+# AcoustID's documented error code for a rejected client key.
+_ACOUSTID_INVALID_KEY_CODE = 4
+_INVALID_KEY_ERROR = "invalid AcoustID API key"
+
+
 def _retry_after_seconds(header: str | None) -> float:
     """AcoustID communicates pacing via Retry-After seconds; fall back to the
     historical 60s window when the header is absent or unparseable."""
@@ -155,7 +160,7 @@ def _retry_after_seconds(header: str | None) -> float:
 def _echo_partial(result: FingerprintResult) -> FingerprintResult:
     values = {field: getattr(result, field) for field in (
         "status", "score", "recording_id", "title", "artist",
-        "duration", "error", "release_group_ids",
+        "duration", "error", "release_group_ids", "recording_ids",
     )}
     values["partial_decode"] = True
     return FingerprintResult(**values)
@@ -164,7 +169,7 @@ def _echo_partial(result: FingerprintResult) -> FingerprintResult:
 def _echo_duration(result: FingerprintResult, duration: int) -> FingerprintResult:
     values = {field: getattr(result, field) for field in (
         "status", "score", "recording_id", "title", "artist",
-        "duration", "error", "release_group_ids",
+        "duration", "error", "release_group_ids", "recording_ids",
     )}
     values["duration"] = duration
     return FingerprintResult(**values)
@@ -185,6 +190,8 @@ class AudioFingerprinter:
         self._fpcalc_semaphore = asyncio.Semaphore(
             min(os.cpu_count() or 2, _MAX_FPCALC_CONCURRENCY)
         )
+        # one loud report per process, not one per file
+        self._reported_invalid_key = False
 
     async def fingerprint(self, path: Path) -> FingerprintResult:
         if not self.is_enabled():
@@ -262,6 +269,40 @@ class AudioFingerprinter:
             result = _echo_duration(result, duration)
         return result
 
+    @staticmethod
+    def _is_invalid_key(response: httpx.Response) -> bool:
+        """Whether AcoustID rejected the request because the client key is wrong."""
+        if response.status_code != 400:
+            return False
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        error = payload.get("error")
+        return isinstance(error, dict) and error.get("code") == _ACOUSTID_INVALID_KEY_CODE
+
+    def _report_invalid_key(self) -> None:
+        """A wrong key breaks *every* verification, so say so once, loudly.
+
+        Reported separately from the generic rejection because the two need
+        different actions: a 400 from a malformed lookup is a bug to chase, while
+        this one is a setting to change. Without it the misconfiguration only ever
+        surfaced as one more per-file warning among thousands, and fingerprint
+        verification silently degraded to duration/tag/filename matching for the
+        whole library.
+        """
+        if self._reported_invalid_key:
+            return
+        self._reported_invalid_key = True
+        logger.error(
+            "AcoustID rejected the configured API key. Fingerprint verification "
+            "is disabled until it is replaced: create an application key at "
+            "https://acoustid.org/new-application and save it in "
+            "Settings -> Library."
+        )
+
     @with_retry(
         max_attempts=3,
         base_delay=2.0,
@@ -303,6 +344,9 @@ class AudioFingerprinter:
                 f"AcoustID API error ({response.status_code})"
             )
         if response.status_code != 200:
+            if self._is_invalid_key(response):
+                self._report_invalid_key()
+                raise AcoustIDRejectedError(_INVALID_KEY_ERROR)
             raise AcoustIDRejectedError(
                 f"AcoustID rejected the lookup ({response.status_code})"
             )
@@ -403,7 +447,27 @@ class AudioFingerprinter:
             artist=artist,
             duration=recording.get("duration"),
             release_group_ids=self._extract_release_group_ids(recording, best),
+            recording_ids=self._recording_ids(recordings),
         )
+
+    @staticmethod
+    def _recording_ids(recordings: list[dict[str, Any]]) -> list[str]:
+        """Every recording MBID this audio match resolves to, best pick first.
+
+        One performance is frequently modelled in MusicBrainz as a separate
+        recording entity per release, so a single confident AcoustID match carries
+        several MBIDs and their order carries no meaning. Consumers that ask
+        "is this file recording X?" must test membership here rather than compare
+        against ``recording_id``, which is only whichever entity came back first.
+        Scoped to the best result: the other entries are different audio clusters,
+        and widening to them would let a merely similar recording verify.
+        """
+        ids: list[str] = []
+        for value in recordings:
+            recording_id = value.get("id")
+            if recording_id and recording_id not in ids:
+                ids.append(recording_id)
+        return ids
 
     @staticmethod
     def _extract_release_group_ids(

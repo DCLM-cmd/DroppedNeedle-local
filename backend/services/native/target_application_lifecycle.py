@@ -251,11 +251,15 @@ async def start_target_operational_runtime(
         get_download_store,
         get_free_music_store,
     )
-    from core.dependencies.service_providers import get_plugin_host
+    from core.dependencies.service_providers import (
+        get_library_image_hash_service,
+        get_plugin_host,
+    )
     from core.tasks import (
         start_acquisition_cleanup_task,
         start_acquisition_orphan_reconcile_task,
         start_artist_discovery_cache_warming_task,
+        start_artwork_blurhash_task,
         start_audiodb_sweep_task,
         start_background_upgrade_scan_task,
         start_discover_home_warmer_task,
@@ -265,6 +269,7 @@ async def start_target_operational_runtime(
         start_management_hold_auto_retry_task,
         start_events_watcher_task,
         start_orphan_cover_demotion_task,
+        start_organization_compaction_task,
         start_personal_mix_refresh_task,
         start_poll_new_releases_task,
         start_recycle_bin_prune_task,
@@ -286,6 +291,8 @@ async def start_target_operational_runtime(
         logger.exception("Acquisition cleanup startup recovery failed")
     start_acquisition_cleanup_task(get_acquisition_cleanup_service)
     start_acquisition_orphan_reconcile_task(get_acquisition_cleanup_service)
+    start_artwork_blurhash_task(get_library_image_hash_service)
+    start_organization_compaction_task(get_native_library_store)
     start_download_resume_task(get_target_download_orchestrator())
     start_download_watchdog_task(get_target_download_orchestrator)
     start_download_auto_retry_task(get_target_download_orchestrator)

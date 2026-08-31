@@ -177,6 +177,24 @@ class FakeDocker:
         raise AssertionError(f"unexpected command: {arguments}")
 
 
+def _compose_file(tmp_path: Path) -> Path:
+    """A compose file the test owns.
+
+    The real ``docker-compose.yml`` is per-deployment and gitignored, so it is absent
+    from any clean checkout - depending on it made every test here fail on a fresh
+    clone and in CI. ``prepare`` takes an explicit path for exactly this reason.
+    """
+    path = tmp_path / "docker-compose.yml"
+    path.write_text(
+        "services:\n"
+        "  droppedneedle:\n"
+        "    image: droppedneedle:local\n"
+        "    container_name: droppedneedle\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def _data_root(tmp_path: Path) -> Path:
     root = tmp_path / "data"
     config = root / "config"

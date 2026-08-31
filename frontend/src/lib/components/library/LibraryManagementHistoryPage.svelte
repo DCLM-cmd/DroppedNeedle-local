@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { ArrowRight, FolderCog, History, ShieldAlert } from 'lucide-svelte';
+	import { ArrowRight, FolderCog, History, ShieldAlert, Trash2 } from 'lucide-svelte';
 
 	import BackButton from '$lib/components/BackButton.svelte';
 	import { getTargetLibrarySettingsQuery } from '$lib/queries/library/LibraryPolicyQueries.svelte';
@@ -11,6 +11,7 @@
 		getLibraryManagementSettingsQuery
 	} from '$lib/queries/library-management/LibraryManagementQueries.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
+	import { deleteLibraryManagementOperationMutation } from '$lib/queries/library-management/LibraryManagementMutations.svelte';
 	import { isRecord, titleManagementValue } from './LibraryManagementDisplay';
 
 	let origin = $state('');
@@ -26,6 +27,7 @@
 		() => authStore.isAdmin
 	);
 	const policyQuery = getTargetLibrarySettingsQuery(() => authStore.isAdmin);
+	const deleteOperation = deleteLibraryManagementOperationMutation();
 	const historyQuery = getLibraryManagementOperationsQuery(
 		() => authStore.user?.id,
 		() => ({
@@ -214,46 +216,59 @@
 		{:else}
 			<div class="space-y-2">
 				{#each historyItems as item (item.operation.id)}
-					<a
-						class="management-history-row"
-						href={operationHref(
-							item.operation.id,
-							item.operation.state,
-							item.operation.terminal_code
-						)}
-						><History class="h-4 w-4 text-library-manage" /><span class="min-w-0 flex-1"
-							><span class="flex flex-wrap items-center gap-2"
-								><strong>{item.profile_name}</strong><span class="badge badge-outline badge-sm"
-									>{item.activation_preview
-										? 'Activation dry run'
-										: titleManagementValue(item.mode)}</span
-								><span
-									class="badge badge-sm {item.operation.state === 'failed'
-										? 'badge-error'
-										: item.operation.state === 'succeeded'
-											? 'badge-success'
-											: item.operation.state === 'ready'
-												? 'badge-warning'
-												: 'badge-outline'}">{titleManagementValue(item.operation.state)}</span
+					<div class="flex items-stretch gap-1">
+						<a
+							class="management-history-row min-w-0 flex-1"
+							href={operationHref(
+								item.operation.id,
+								item.operation.state,
+								item.operation.terminal_code
+							)}
+							><History class="h-4 w-4 text-library-manage" /><span class="min-w-0 flex-1"
+								><span class="flex flex-wrap items-center gap-2"
+									><strong>{item.profile_name}</strong><span class="badge badge-outline badge-sm"
+										>{item.activation_preview
+											? 'Activation dry run'
+											: titleManagementValue(item.mode)}</span
+									><span
+										class="badge badge-sm {item.operation.state === 'failed'
+											? 'badge-error'
+											: item.operation.state === 'succeeded'
+												? 'badge-success'
+												: item.operation.state === 'ready'
+													? 'badge-warning'
+													: 'badge-outline'}">{titleManagementValue(item.operation.state)}</span
+									></span
+								><small
+									>{titleManagementValue(item.origin)} · {scopeLabel(
+										isRecord(item.selection) ? item.selection : {},
+										item.target_root_id
+									)}</small
+								><small class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-base-content/55"
+									><span>Started {formatDate(item.operation.created_at)}</span><span
+										aria-hidden="true">·</span
+									><span
+										>{latestTimestampLabel(item.operation.state)}
+										{formatDate(item.operation.updated_at)}</span
+									></small
+								><small
+									>{item.operation.succeeded_count} succeeded · {item.operation.failed_count} failed ·
+									{item.operation.skipped_count} skipped</small
 								></span
-							><small
-								>{titleManagementValue(item.origin)} · {scopeLabel(
-									isRecord(item.selection) ? item.selection : {},
-									item.target_root_id
-								)}</small
-							><small class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-base-content/55"
-								><span>Started {formatDate(item.operation.created_at)}</span><span
-									aria-hidden="true">·</span
-								><span
-									>{latestTimestampLabel(item.operation.state)}
-									{formatDate(item.operation.updated_at)}</span
-								></small
-							><small
-								>{item.operation.succeeded_count} succeeded · {item.operation.failed_count} failed · {item
-									.operation.skipped_count} skipped</small
-							></span
-						><ArrowRight class="h-4 w-4" /></a
-					>
+							><ArrowRight class="h-4 w-4" /></a
+						>
+						{#if authStore.isAdmin && !['queued', 'running', 'paused'].includes(item.operation.state)}
+							<button
+								type="button"
+								class="btn btn-ghost btn-sm"
+								aria-label="Remove this run from the history"
+								title="Remove from history. The run can no longer be undone; what it changed in the library stays."
+								disabled={deleteOperation.isPending}
+								onclick={() => deleteOperation.mutate(item.operation.id)}
+								><Trash2 class="h-4 w-4" /></button
+							>
+						{/if}
+					</div>
 				{/each}
 			</div>
 			{#if historyQuery.hasNextPage}<button

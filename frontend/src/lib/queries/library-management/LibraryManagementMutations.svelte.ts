@@ -54,6 +54,45 @@ export const updateLibraryManagementSettingsMutation = () =>
 		onSuccess: invalidateLibraryManagementSurfaces
 	}));
 
+/** Remove one finished run from the operation history.
+ *
+ * The run's own records go with it - including its undo evidence, so a deleted run
+ * can no longer be undone. What the run recorded about the LIBRARY (the catalog audit
+ * trail, each track's management state) is kept; only its pointer to this run is
+ * cleared. A run that has not finished is refused by the server. */
+export const deleteLibraryManagementOperationMutation = () =>
+	createMutation(() => ({
+		mutationFn: (jobId: string) => api.global.delete(API.libraryManagement.operation(jobId)),
+		onSuccess: async () => {
+			await invalidateLibraryManagementSurfaces();
+			toastStore.show({ message: 'Removed the run from the history.', type: 'success' });
+		}
+	}));
+
+/** Dismiss recovery items that cannot be finished automatically.
+ *
+ * ``needs_attention`` is terminal for the recovery worker, so the alert it raised
+ * could never clear on its own and the operator had no action behind it. */
+export const acknowledgeLibraryManagementRecoveryMutation = () =>
+	createMutation(() => ({
+		mutationFn: () =>
+			api.global.post<{ acknowledged_count: number }>(
+				API.libraryManagement.acknowledgeRecovery(),
+				{}
+			),
+		onSuccess: async (result) => {
+			await invalidateLibraryManagementSurfaces();
+			toastStore.show({
+				message:
+					result.acknowledged_count === 1
+						? 'Dismissed 1 recovery item.'
+						: `Dismissed ${result.acknowledged_count} recovery items.`,
+				type: 'success'
+			});
+		},
+		onError: showActionError('Could not dismiss the recovery items.')
+	}));
+
 export const previewLibraryManagementSettingsImpactMutation = () =>
 	createMutation(() => ({
 		mutationFn: (request: LibraryManagementSettingsImpactRequest) =>

@@ -787,3 +787,43 @@ async def test_high_score_deadmau5_candidate_reaches_auto():
     assert candidates
     top = candidates[0]
     assert top.tier == "auto"
+# --- peer availability (upload speed) ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_equal_band_orders_by_peer_speed():
+    # two peers sharing the identical folder: same identity band, so the faster
+    # peer must rank first (availability is the banded tiebreaker, D3)
+    slow = [
+        _mk(_PARENT, f"OK Computer {n:02d}.flac", username="slowpoke", speed=20_000)
+        for n in range(1, 13)
+    ]
+    fast = [
+        _mk(_PARENT, f"OK Computer {n:02d}.flac", username="speedy", speed=8_000_000)
+        for n in range(1, 13)
+    ]
+    scorer = AlbumPreflightScorer(_store())
+    ranked = await scorer.rank(_TARGET, slow + fast, snapshot=policy_snapshot())
+    assert ranked[0].username == "speedy"
+    assert ranked[1].username == "slowpoke"
+
+
+# --- lossless bitrate cap -----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lossless_cap_drops_hires_folder():
+    # 120 MB / 240 s = 4000 kbps per file - a 24/192 rip; bitrate unreported (slskd
+    # omits bitRate for lossless), so the cap derives it from size/duration
+    hires = [
+        DownloadSearchResult(
+            username="alice", filename=f"{_PARENT}/OK Computer {n:02d}.flac",
+            parent_directory=_PARENT, size=120_000_000, extension="flac",
+            bitrate=None, duration=240.0,
+        )
+        for n in range(1, 13)
+    ]
+    capped = AlbumPreflightScorer(_store(), lossless_max_kbps=1500)
+    uncapped = AlbumPreflightScorer(_store())
+    assert await capped.rank(_TARGET, hires, snapshot=policy_snapshot()) == []
+    assert len(await uncapped.rank(_TARGET, hires, snapshot=policy_snapshot())) == 1

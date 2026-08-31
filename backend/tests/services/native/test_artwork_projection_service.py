@@ -756,3 +756,75 @@ async def test_cached_candidates_still_respect_symlink_safety(tmp_path: Path) ->
         settings, album, pass_cache=fresh_cache
     )
     assert rows == ()  # symlinked file excluded by the unchanged safety rules
+@pytest.mark.asyncio
+async def test_missing_release_mbid_falls_back_instead_of_raising() -> None:
+    """An album with no release MBID is ordinary missing data.
+
+    It used to reach ``validate_mbid`` and raise ValueError, which escaped the
+    planner and wedged the whole operation worker on that album forever.
+    """
+    repository = StubArtworkRepository()
+    fallback = _candidate("group-front", source="cover_art_archive_release_group")
+    repository.candidates["release-group"] = (fallback,)
+    repository.content = {fallback.candidate_id: _png(300, 300, (9, 9, 9))}
+    settings = ArtworkManagementSettings(external_enabled=False)
+
+    projection = await ArtworkProjectionService(repository, ArtworkProcessor()).project(
+        settings=settings,
+        release_mbid="",
+        release_group_mbid=_RG,
+        album_directory=None,
+        existing_embedded=(),
+        existing_external=(),
+        priority=RequestPriority.USER_INITIATED,
+    )
+
+    assert "release" not in repository.calls
+    assert [value.source for value in projection.embedded] == [
+        "cover_art_archive_release_group"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_identifiers_at_all_projects_nothing_and_does_not_raise() -> None:
+    repository = StubArtworkRepository()
+    settings = ArtworkManagementSettings(external_enabled=False)
+
+    projection = await ArtworkProjectionService(repository, ArtworkProcessor()).project(
+        settings=settings,
+        release_mbid="",
+        release_group_mbid="",
+        album_directory=None,
+        existing_embedded=(),
+        existing_external=(),
+        priority=RequestPriority.USER_INITIATED,
+    )
+
+    assert repository.calls == []
+    assert projection.embedded == ()
+
+
+@pytest.mark.asyncio
+async def test_malformed_mbid_defers_the_provider_instead_of_raising() -> None:
+    """validate_mbid also rejects non-UUID identifiers - degrade, never fail."""
+
+    class RejectingRepository(StubArtworkRepository):
+        async def list_management_artwork(self, **kwargs):
+            self.calls.append(kwargs["entity_kind"])
+            raise ValueError("Invalid release MBID format: unknown_42")
+
+    repository = RejectingRepository()
+    settings = ArtworkManagementSettings(external_enabled=False)
+
+    projection = await ArtworkProjectionService(repository, ArtworkProcessor()).project(
+        settings=settings,
+        release_mbid="unknown_42",
+        release_group_mbid="unknown_42",
+        album_directory=None,
+        existing_embedded=(),
+        existing_external=(),
+        priority=RequestPriority.USER_INITIATED,
+    )
+
+    assert projection.embedded == ()
+    assert projection.deferred_sources

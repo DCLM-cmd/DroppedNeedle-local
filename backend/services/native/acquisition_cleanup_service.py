@@ -43,6 +43,9 @@ _RECONCILIATION_BATCH = 100
 _MAX_TREE_ENTRIES = 100_000
 _ATTENTION_RECHECK_SECONDS = 3600.0
 _UNRESOLVED_JOB_RETRIES = 4
+# How long after a finished mount sweep the next one may start. Orphans accrue
+# slowly, and a full mount walk is I/O the library scan should not compete with.
+_RECONCILE_INTERVAL_SECONDS = 6 * 3600.0
 
 # A folder qualifies as orphan debris only when no attempt journal owns it; the age
 # floor must comfortably exceed any crash window between SABnzbd materialising a
@@ -492,8 +495,25 @@ class AcquisitionCleanupService:
                     attempt.cleanup_failures < _UNRESOLVED_JOB_RETRIES
                 ):
                     raise _RetryableCleanup("client_job_not_materialized")
-                await self._mark_complete(attempt)
-                return
+                # SABnzbd has forgotten the job (history purged, or it was aborted),
+                # so it can no longer tell us where it unpacked. The unpack directory
+                # is still named after the job, so look for it: without this the
+                # attempt was marked cleaned while the folder stayed on the mount
+                # forever - 19 GB of orphaned unpack folders on the live server, none
+                # of them referenced by anything.
+                derived = await self._derive_workspace(attempt)
+                if derived is None:
+                    await self._mark_complete(attempt)
+                    return
+                attempt = await self._record_and_validate_evidence(
+                    attempt,
+                    handle=attempt.handle,
+                    remote_storage=attempt.remote_storage or None,
+                    mount_root=str(Path(self._sab_mount_getter())),
+                    workspace_path=str(derived),
+                    materialized_paths=list(attempt.materialized_paths),
+                    publisher_fingerprints=attempt.materialized_fingerprints,
+                )
             exists = await asyncio.to_thread(
                 _path_exists_without_following, Path(attempt.workspace_path)
             )
@@ -533,6 +553,28 @@ class AcquisitionCleanupService:
         if not discarded:
             raise _RetryableCleanup("client_artifact_discard_failed")
         await self._mark_complete(removed)
+
+    async def _derive_workspace(self, attempt: DownloadAttempt) -> Path | None:
+        """The unpack directory for ``attempt``, found by job name.
+
+        SAB names the directory after the job, so the job name is enough to find it
+        again once SAB itself no longer reports a path. Only a directory whose name
+        is EXACTLY the job name is accepted, and only under the configured mount and
+        category - the same confinement ``_validate_job_identity`` enforces on a
+        recorded path, so a derived path is no less safe than a reported one.
+        """
+        if not attempt.job_name or not _JOB_NAME.fullmatch(attempt.job_name):
+            return None
+        mount = Path(self._sab_mount_getter())
+        if not mount.is_absolute() or mount == Path(mount.anchor):
+            return None
+        category = self._sab_category_getter()
+        roots = [mount] if category in ("", "*") else [mount / category, mount]
+        for root in roots:
+            candidate = root / attempt.job_name
+            if await asyncio.to_thread(_path_exists_without_following, candidate):
+                return candidate
+        return None
 
     async def _cleanup_slskd_files(
         self, attempt: DownloadAttempt, *, mount_healthy: bool
@@ -729,7 +771,16 @@ class AcquisitionCleanupService:
             mount_key, str(mount), now=self._clock()
         )
         if progress.completed:
-            return 0
+            # A finished pass used to end the sweep permanently, so every unpack
+            # folder orphaned AFTERWARDS stayed on the mount forever. Orphans are not
+            # a one-time legacy artifact - they appear whenever SAB forgets a job
+            # before cleanup reaches it - so re-scan on an interval instead.
+            if self._clock() - progress.updated_at < _RECONCILE_INTERVAL_SECONDS:
+                return 0
+            progress.completed = False
+            progress.pending_directories = ["."]
+            progress.current_directory = None
+            progress.last_entry = None
         if not await asyncio.to_thread(_mount_healthy, mount):
             return 0
 
@@ -790,7 +841,22 @@ class AcquisitionCleanupService:
     ) -> None:
         task_id, candidate_text = match.groups()
         job_name = relative.name
-        if await self._store.get_download_attempt_for_job("usenet", job_name):
+        existing = await self._store.get_download_attempt_for_job("usenet", job_name)
+        if existing is not None:
+            # An attempt row that never captured where its files landed leaves the
+            # directory invisible: cleanup has no target, and this sweep used to skip
+            # the folder because a row existed. Backfill the evidence so the folder is
+            # at least tracked and can be acted on; a row that already has evidence is
+            # left exactly as it is.
+            if not existing.workspace_path:
+                await self._store.transition_download_attempt(
+                    existing.id,
+                    expected_row_revision=existing.row_revision,
+                    new_state=existing.state,
+                    now=self._clock(),
+                    mount_root=existing.mount_root or str(mount),
+                    workspace_path=str(mount / relative),
+                )
             return
         task = await self._store.get_task(task_id)
         bundles = (

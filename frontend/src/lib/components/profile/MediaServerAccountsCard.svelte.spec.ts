@@ -60,7 +60,7 @@ describe('MediaServerAccountsCard.svelte', () => {
 	});
 
 	it('renders nothing when no media server is enabled', async () => {
-		const { container } = render(MediaServerAccountsCard, {
+		const { container } = await render(MediaServerAccountsCard, {
 			services: ALL_SERVICES.map((s) => ({ ...s, enabled: false }))
 		});
 		expect(container.querySelector('section')).toBeNull();

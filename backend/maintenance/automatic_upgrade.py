@@ -1166,6 +1166,13 @@ def _target_command(port: int) -> list[str]:
         "httptools",
         "--workers",
         "1",
+        # Behind the TLS-terminating proxy, trust its forwarding headers so
+        # request.url.scheme is "https" rather than the proxy's internal http.
+        # Secure cookies and HSTS read X-Forwarded-Proto directly, but anything
+        # building a URL from the request needs the scheme itself to be right.
+        "--proxy-headers",
+        "--forwarded-allow-ips",
+        os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1"),
     ]
 
 

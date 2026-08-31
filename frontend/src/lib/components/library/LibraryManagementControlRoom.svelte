@@ -24,6 +24,10 @@
 	import { withBasePath } from '$lib/utils/basePath';
 	import { controlLibraryManagementOperationMutation } from '$lib/queries/library-management/LibraryManagementMutations.svelte';
 	import {
+		acknowledgeLibraryManagementRecoveryMutation,
+		controlLibraryManagementOperationMutation
+	} from '$lib/queries/library-management/LibraryManagementMutations.svelte';
+	import {
 		getLibraryManagementOperationsQuery,
 		getLibraryManagementRecoveryQuery,
 		getLibraryManagementSettingsQuery
@@ -42,6 +46,7 @@
 		() => authStore.user?.id,
 		() => authStore.isAdmin
 	);
+	const acknowledgeRecovery = acknowledgeLibraryManagementRecoveryMutation();
 	const pauseOperation = controlLibraryManagementOperationMutation('pause');
 	const resumeOperation = controlLibraryManagementOperationMutation('resume');
 	type RunnerMode = 'manage' | 'baseline_restore';
@@ -326,14 +331,29 @@
 					</div>{/if}
 			</section>
 
-			{#if recoveryQuery.data && (recoveryQuery.data.needs_attention_count || recoveryQuery.data.cleanup_pending_count)}<div
+			<!-- Only genuine attention raises this. A bundle with cleanup pending has already
+				 published - its files are organized and the cleanup worker finishes on its own -
+				 so it must not present as something the user has to deal with. -->
+			{#if recoveryQuery.data && recoveryQuery.data.needs_attention_count}<div
 					class="alert alert-warning items-start"
 				>
-					<AlertTriangle class="mt-0.5 h-5 w-5" /><span
+					<AlertTriangle class="mt-0.5 h-5 w-5" /><span class="flex-1"
 						><strong>Recovery needs attention</strong><br />{recoveryQuery.data
 							.needs_attention_count} bundles need review; {recoveryQuery.data
-							.cleanup_pending_count} have safe cleanup pending. No uncertain file is deleted automatically.</span
+							.cleanup_pending_count} have safe cleanup pending. No uncertain file is deleted automatically.
+						{#if recoveryQuery.data.needs_attention_count}<br /><span class="text-xs opacity-80"
+								>Items needing review cannot be finished automatically - their file is missing from
+								both the destination and the backup. Dismissing keeps them in the journal as a
+								record and clears the alert.</span
+							>{/if}</span
 					>
+					{#if recoveryQuery.data.needs_attention_count}<button
+							type="button"
+							class="btn btn-sm"
+							disabled={acknowledgeRecovery.isPending}
+							onclick={() => acknowledgeRecovery.mutate()}
+							>{acknowledgeRecovery.isPending ? 'Dismissing...' : 'Dismiss'}</button
+						>{/if}
 				</div>{:else if recoveryUnavailable}<div class="alert alert-error items-start" role="alert">
 					<AlertTriangle class="mt-0.5 h-5 w-5" /><span
 						><strong>Recovery status is unavailable</strong><br />Do not start new file writes until

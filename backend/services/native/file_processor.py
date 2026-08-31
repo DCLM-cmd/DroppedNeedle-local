@@ -23,9 +23,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
-from rapidfuzz import fuzz
 
-from core.exceptions import AutomaticManagementHoldError, ConfigurationError
+from core.exceptions import (
+    AutomaticManagementHoldError,
+    ConfigurationError,
+    ValidationError,
+)
 from infrastructure.msgspec_fastapi import AppStruct
 from models.audio import AudioInfo, AudioTag
 from models.download_manifest import DownloadManifest, ExpectedFile, ExpectedTrack
@@ -38,7 +41,14 @@ from models.library_management import (
     LibraryManagementImportResult,
 )
 from services.native.quality_tiers import tier_for, tier_rank
-from services.native.title_match import names_different_album, title_containment_score
+from services.native.recycle_bin import recycle
+from services.native.title_match import (
+    artists_overlap,
+    match_key,
+    names_different_album,
+    similarity,
+    title_containment_score,
+)
 
 if TYPE_CHECKING:
     from infrastructure.audio.fingerprinter import AudioFingerprinter
@@ -70,6 +80,30 @@ WRONG_TRACK = "wrong_track"
 # downloads-mount path mismatch). The peer delivered fine; the fault is local, so
 # failing over to another peer hits the same wall - never blacklist the source.
 SOURCE_FILE_MISSING = "downloaded file not found on the downloads mount"
+# not a quarantine reason: the file is perfectly good, it is simply not an improvement
+# on the copy already held. Reporting it as a SUCCESS is what made an upgrade that
+# replaced nothing announce itself as finished - the album stayed mp3, the run said
+# 11/11, and the failover never went looking for a copy that would actually be better.
+# How firmly a file's OWN tags name a track. The order matters: this is what makes
+# tags outrank duration, which is the whole point of reading them.
+_TAG_IDENTITY_NONE = 0
+_TAG_IDENTITY_POSITIONAL = 1  # the exact title, at the exact position
+_TAG_IDENTITY_CERTAIN = 2  # a MusicBrainz id naming this exact track
+# How far a length may stray once the tags already say which track this is. A remaster,
+# a radio edit or a differently-gapped rip legitimately differs from the length
+# MusicBrainz records, and the ordinary gate (15s or 10%) rejects those outright.
+_TAGGED_DURATION_TOLERANCE_SECONDS = 90.0
+_TAGGED_DURATION_TOLERANCE_RATIO = 0.5
+
+NOT_AN_UPGRADE = "not better than the copy already in the library"
+# also not a quarantine reason, and a DIFFERENT problem: the incoming file really is
+# better, but there is nowhere to put the bytes it would displace. An upgrade must
+# never destroy the only copy of what it replaces, so it declines - and says so,
+# rather than hiding behind "no better copy found" and sending the user looking for
+# releases when the fix is a setting.
+UPGRADE_NEEDS_RECYCLE_BIN = (
+    "the old copy cannot be preserved - no recycle bin is configured"
+)
 
 
 class VerifyStatus:
@@ -273,7 +307,7 @@ def _title_conflicts(candidate: _FolderCandidate, track: ExpectedTrack) -> bool:
     tag_title = (candidate.tag.title or "").strip()
     if not tag_title:
         return False  # untagged -> trust duration/filename, don't reject on title
-    return fuzz.token_set_ratio(tag_title, track.title) < _TITLE_CONFLICT_RATIO
+    return similarity(tag_title, track.title) < _TITLE_CONFLICT_RATIO
 
 
 def _import_confidence(*, tag, info, expected_track, canonical_duration, fp) -> float:  # noqa: ANN001
@@ -372,8 +406,12 @@ def _tag_conflict_reason(tag, info, manifest, expected_track) -> str | None:  # 
         tag_artist
         and expected_artist
         and "various" not in expected_artist.lower()
-        and fuzz.token_set_ratio(tag_artist, expected_artist)
-        < _TAG_ARTIST_CONFLICT_RATIO
+        # A downloaded file frequently credits every performer where the provider
+        # credits only the primary (or the reverse). One artist named on both sides
+        # is the same release, so only a credit with NO overlap at all conflicts.
+        and not artists_overlap(
+            tag_artist, expected_artist, floor=_TAG_ARTIST_CONFLICT_RATIO
+        )
     )
     tag_title = (tag.title or "").strip()
 
@@ -382,7 +420,7 @@ def _tag_conflict_reason(tag, info, manifest, expected_track) -> str | None:  # 
         # (same rule as the folder path's _title_conflicts).
         if (
             tag_title
-            and fuzz.token_set_ratio(tag_title, expected_track.title)
+            and similarity(tag_title, expected_track.title)
             < _TITLE_CONFLICT_RATIO
         ):
             return "tag_mismatch"
@@ -415,9 +453,22 @@ def _tag_conflict_reason(tag, info, manifest, expected_track) -> str | None:  # 
     return None
 
 
-def _fingerprint_disagrees(fp, expected_track, expected_artist: str | None) -> bool:
+def _fingerprint_disagrees(
+    fp,
+    expected_track,
+    expected_artist: str | None,
+    *,
+    tag_identity_level: int = _TAG_IDENTITY_NONE,
+) -> bool:
     """True only when AcoustID CONFIDENTLY (status=pass) identified the audio as a clearly
-    different SONG, or a clearly different ARTIST, than expected. Release-group/edition is
+    different SONG, or a clearly different ARTIST, than expected.
+
+    ``tag_identity_level``: when the file's own tags carry a MusicBrainz id naming this
+    track, AcoustID does not get to overrule them. Tags are the stronger signal - they
+    were written by whoever prepared the release, while an acoustic match is an
+    inference over a crowd-sourced database, and a remaster, a live take or a
+    mislabelled fingerprint entry all produce a confident-but-wrong "different song".
+    Files were being held as ``fingerprint_mismatch`` while their tags were correct. Release-group/edition is
     deliberately NOT checked: AcoustID's RG coverage is incomplete and one recording appears
     on many editions (original / reissue / compilation), so gating on the requested RG
     false-rejects valid tracks (e.g. a 2011 reissue + its BBC-session bonuses). Lidarr
@@ -429,6 +480,8 @@ def _fingerprint_disagrees(fp, expected_track, expected_artist: str | None) -> b
     Without both IDs, the existing conservative artist gate remains in force."""
     if getattr(fp, "status", None) != "pass":
         return False
+    if tag_identity_level == _TAG_IDENTITY_CERTAIN:
+        return False
     fp_title = (getattr(fp, "title", None) or "").strip()
     fp_artist = (getattr(fp, "artist", None) or "").strip()
     expected_title = (
@@ -437,7 +490,7 @@ def _fingerprint_disagrees(fp, expected_track, expected_artist: str | None) -> b
     if (
         fp_title
         and expected_title
-        and fuzz.token_set_ratio(fp_title, expected_title) < 50
+        and similarity(fp_title, expected_title) < 50
     ):
         return True  # clearly the wrong song
 
@@ -455,9 +508,38 @@ def _fingerprint_disagrees(fp, expected_track, expected_artist: str | None) -> b
     # Wrong artist - but skip for various-artists compilations, where the album artist
     # legitimately differs from a track's performing artist.
     if fp_artist and expected_artist and "various" not in expected_artist.lower():
-        if fuzz.token_set_ratio(fp_artist, expected_artist) < 55:
+        if not artists_overlap(fp_artist, expected_artist, floor=55):
             return True
     return False
+
+
+def tag_identity(tag, disc_number: int, track: ExpectedTrack) -> int:
+    """How firmly a file's tags name this track.
+
+    A MusicBrainz id IS the track's identity - nothing else needs to agree. An exact
+    title at the exact position is strong but not proof, so it earns a wider duration
+    tolerance rather than none at all.
+    """
+    if tag is None or track is None:
+        return _TAG_IDENTITY_NONE
+    if track.recording_mbid and tag.musicbrainz_recording_id == track.recording_mbid:
+        return _TAG_IDENTITY_CERTAIN
+    release_track = getattr(track, "release_track_mbid", None)
+    if release_track and tag.musicbrainz_release_track_id == release_track:
+        return _TAG_IDENTITY_CERTAIN
+    if (
+        track.title
+        and tag.title
+        and match_key(tag.title) == match_key(track.title)
+        and tag.track_number == track.track_number
+        and disc_number == (track.disc_number or 1)
+    ):
+        return _TAG_IDENTITY_POSITIONAL
+    return _TAG_IDENTITY_NONE
+
+
+def _tag_identity(candidate: _FolderCandidate, track: ExpectedTrack) -> int:
+    return tag_identity(candidate.tag, _candidate_disc(candidate), track)
 
 
 def _pair_score(
@@ -478,10 +560,24 @@ def _pair_score(
     file_dur = candidate.info.duration_seconds
     track_dur = track.duration_seconds
     disc_ok = _candidate_disc(candidate) == (track.disc_number or 1)
+    identity = _tag_identity(candidate, track)
     score = 0.0
 
     if track_dur and file_dur:
-        tolerance = max(15.0, 0.10 * track_dur)
+        # Tags outrank the clock. A file whose tags name this track is this track,
+        # even when the release it came from runs to a different length - a remaster
+        # or an edit. Judging by duration first threw those out before anything read
+        # the tags, and the files then looked to the user like correctly tagged music
+        # that DroppedNeedle had declared wrong.
+        if identity == _TAG_IDENTITY_CERTAIN:
+            tolerance = float("inf")
+        elif identity == _TAG_IDENTITY_POSITIONAL:
+            tolerance = max(
+                _TAGGED_DURATION_TOLERANCE_SECONDS,
+                _TAGGED_DURATION_TOLERANCE_RATIO * track_dur,
+            )
+        else:
+            tolerance = max(15.0, 0.10 * track_dur)
         if abs(file_dur - track_dur) > tolerance:
             return None  # duration gate
         score += max(0.0, 100.0 - abs(file_dur - track_dur))
@@ -524,11 +620,11 @@ def _pair_score(
     if track.title:
         if (
             candidate.tag.title
-            and candidate.tag.title.strip().casefold() == track.title.strip().casefold()
+            and match_key(candidate.tag.title) == match_key(track.title)
         ):
             score += 40.0  # an exact title tag is strong identity
         else:
-            ratio = fuzz.token_set_ratio(_filename_title(candidate.path), track.title)
+            ratio = similarity(_filename_title(candidate.path), track.title)
             if ratio >= 80:
                 score += (
                     30.0 * ratio / 100.0
@@ -1212,6 +1308,11 @@ class FileProcessor:
                     original_filename=value.source.name,
                     file_format=value.info.file_format,
                     duration_seconds=value.info.duration_seconds,
+                    # A conversion hold is already verified against the target
+                    # edition, so it carries no fingerprint evidence of its own.
+                    evidence_title=None,
+                    evidence_artist=None,
+                    evidence_score=None,
                     naming_template=manifest.naming_template,
                 )
                 if held_id is None:
@@ -1289,6 +1390,16 @@ class FileProcessor:
                     self._position_upgrade_target(manifest.origin, present, info)
                     is None
                 ):
+                    if manifest.origin == "upgrade":
+                        # For any other origin this means "we already have this track",
+                        # which is a success: nothing to do. For an UPGRADE it is the
+                        # opposite - the one thing the run existed to do did not
+                        # happen. Counting it as imported let the run report 11/11 and
+                        # finish while the album stayed exactly as it was.
+                        message, reason = self._refused_upgrade(present, info)
+                        raise VerificationFailed(
+                            message, reason=reason, filename=source.name
+                        )
                     return Path(present["file_path"])
                 replacement = present
 
@@ -1304,7 +1415,12 @@ class FileProcessor:
             self._verify_downloads or conversion_verification
         ) and self._fingerprinter is not None:
             fp = await self._fingerprinter.fingerprint(source)
-            if _fingerprint_disagrees(fp, track, manifest.artist_name):
+            if _fingerprint_disagrees(
+                fp,
+                track,
+                manifest.artist_name,
+                tag_identity_level=_tag_identity(candidate, track),
+            ):
                 await self._hold_for_review(
                     source=source,
                     manifest=manifest,
@@ -1377,6 +1493,23 @@ class FileProcessor:
     # in-place publish) and different-path (mp3 -> flac - publish, soft-delete the
     # old row, recycle the old file). Everything else keeps today's add-only skips.
 
+    def _refused_upgrade(self, present: dict, info: AudioInfo) -> tuple[str, str]:
+        """``(message, reason)`` naming WHY this upgrade may not replace the held file.
+
+        The two causes need different words: a release that is no better is a reason
+        to keep looking, while a missing recycle bin is a setting the user can change.
+        Collapsing them sent people hunting for releases over a configuration problem.
+        """
+        if _is_strict_upgrade(_row_tier(present), info):
+            return (
+                "The old copy cannot be preserved: no recycle bin is configured",
+                UPGRADE_NEEDS_RECYCLE_BIN,
+            )
+        return (
+            "The downloaded copy does not improve on the one held",
+            NOT_AN_UPGRADE,
+        )
+
     def _position_upgrade_target(
         self, origin: str, present: dict, info: AudioInfo
     ) -> Path | None:
@@ -1402,6 +1535,23 @@ class FileProcessor:
         except Exception:  # noqa: BLE001 - unreadable existing file -> don't touch it
             return None
         return tier_for(info.file_format or "", info.bitrate, info.bit_depth)
+
+    async def recycle_abandoned_hold(self, path: Path) -> bool:
+        """Move a held file the Organizer gave up placing into the recycle bin.
+
+        Returns ``False`` when no bin is configured, so the caller can fall back to
+        the ordinary discard. The distinction matters: the Organizer failing to find
+        a home for a file is not the same as the user saying they do not want it, so
+        it is moved somewhere recoverable rather than unlinked.
+        """
+        if self._recycle_bin is None:
+            return False
+        try:
+            await asyncio.to_thread(recycle, path, self._recycle_bin)
+        except (OSError, shutil.Error):
+            logger.warning("Could not recycle an abandoned hold: %s", path.name)
+            return False
+        return True
 
     async def _same_path_upgrade_applies(
         self, origin: str, target_path: Path, info: AudioInfo
@@ -1594,11 +1744,15 @@ class FileProcessor:
                     release_track_mbid=held.release_track_mbid,
                     medium_position=held.disc_number or 1,
                     release_track_position=held.track_number,
+                    # ``is not None``, not truthiness: track 0 is a real position
+                    # (and some rips number the first track 0). Treating it as
+                    # falsy marked the file unmapped, which fails the automatic
+                    # import gate with TRACK_NOT_MAPPED every single time.
                     authoritative_mapping=bool(
                         held.release_mbid
                         and held.release_track_mbid
                         and held.recording_mbid
-                        and held.track_number
+                        and held.track_number is not None
                     ),
                     confidence=1.0,
                     download_task_id=held.source_task_id,
@@ -1701,7 +1855,10 @@ class FileProcessor:
                     release_track_mbid=None,
                     medium_position=held.disc_number or 1,
                     release_track_position=held.track_number,
-                    authoritative_mapping=bool(held.release_mbid and held.track_number),
+                    # see the note above: track 0 is a position, not a blank
+                    authoritative_mapping=bool(
+                        held.release_mbid and held.track_number is not None
+                    ),
                     confidence=1.0,
                     download_task_id=held.source_task_id,
                     source_path=held.held_path,
@@ -1903,6 +2060,14 @@ class FileProcessor:
                             "track": target_tag.track_number,
                         },
                     )
+                    if manifest.origin == "upgrade":
+                        # See the folder path: for any other origin this is "we
+                        # already have this track", which is done. For an upgrade it
+                        # is the one thing the run existed to do, not happening.
+                        message, reason = self._refused_upgrade(present, info)
+                        raise VerificationFailed(
+                            message, reason=reason, filename=expected.filename
+                        )
                     return Path(present["file_path"])
                 replacement = present
 
@@ -1993,7 +2158,14 @@ class FileProcessor:
             self._verify_downloads or conversion_verification
         ) and self._fingerprinter is not None:
             fp = await self._fingerprinter.fingerprint(source)
-            if _fingerprint_disagrees(fp, expected_track, manifest.artist_name):
+            if _fingerprint_disagrees(
+                fp,
+                expected_track,
+                manifest.artist_name,
+                tag_identity_level=tag_identity(
+                    tag, tag.disc_number or 1, expected_track
+                ),
+            ):
                 await self._hold_for_review(
                     source=source,
                     manifest=manifest,

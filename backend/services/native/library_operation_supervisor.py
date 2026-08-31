@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
 
 from api.v1.schemas.library_operations import OperationResponse
@@ -28,6 +30,14 @@ from services.native.catalog_identity_hygiene_service import (
     CATALOG_IDENTITY_HYGIENE_PURPOSE,
     CatalogIdentityHygieneService,
 )
+
+logger = logging.getLogger(__name__)
+
+# How many times an operation job may crash unexpectedly before it is failed for
+# good. Above 1 so a transient provider/filesystem error still gets a second look;
+# low enough that a genuinely poisoned job leaves the queue in about a minute.
+MAX_OPERATION_ATTEMPTS = 3
+OPERATION_RETRY_DELAY_SECONDS = 20.0
 
 
 class LibraryOperationSupervisor:
@@ -87,6 +97,49 @@ class LibraryOperationSupervisor:
                 if operation_id is not None:
                     return await self._operations.get(operation_id)
             return None
+        try:
+            return await self._dispatch(job, worker_id, timestamp, now)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - see _fail_unexpected
+            return await self._fail_unexpected(job, worker_id, timestamp)
+
+    async def _fail_unexpected(
+        self, job: dict, worker_id: str, timestamp: float
+    ) -> OperationResponse | None:
+        """Charge an unexpected handler crash to the job, not to the worker.
+
+        A claimed job whose handler raises something the handler didn't anticipate
+        used to escape to the worker loop, which logged it and moved on - leaving
+        the job 'running' until its lease expired, at which point recovery requeued
+        it to be claimed and to crash again, forever. One album with unusable data
+        was enough to wedge the whole operation queue and burn a row revision per
+        attempt. Retry a bounded number of times (the crash may be transient - a
+        provider timeout, a locked file), then fail the job terminally so the queue
+        drains and the user sees a real error instead of a job stuck at 0%.
+        """
+        job_id = str(job["id"])
+        logger.exception(
+            "Operation job %s (%s) raised an unexpected error", job_id, job["kind"]
+        )
+        try:
+            row = await self._store.record_operation_job_attempt_failure(
+                job_id,
+                worker_id,
+                now=timestamp,
+                max_attempts=MAX_OPERATION_ATTEMPTS,
+                retry_delay_seconds=OPERATION_RETRY_DELAY_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 - the loop must survive bookkeeping failures
+            logger.exception("Could not record the failure of operation job %s", job_id)
+            return None
+        if row is None:
+            return None
+        return self._operations._response(row)
+
+    async def _dispatch(
+        self, job: dict, worker_id: str, timestamp: float, now: float | None
+    ) -> OperationResponse | None:
         if job["kind"] == "explicit_reidentification":
             row = await self._reidentification.run_claimed(
                 job, worker_id, now=timestamp

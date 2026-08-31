@@ -306,3 +306,32 @@ async def test_incident_candidate_replay_never_auto():
     assert len(ranked) == 1
     assert ranked[0].tier != "auto"
     assert ranked[0].final_score < 0.70
+
+
+@pytest.mark.asyncio
+async def test_lossless_cap_drops_hires_file():
+    # bitrate unreported (slskd omits it for lossless): 120 MB / 284 s = ~3380 kbps
+    hires = DownloadSearchResult(
+        username="alice", filename="Radiohead - OK Computer/Airbag.flac",
+        parent_directory="Radiohead - OK Computer", size=120_000_000,
+        extension="flac", bitrate=None, duration=284.0,
+    )
+    assert await TrackMatcher(_store(), lossless_max_kbps=1500).match(_TARGET, [hires]) is None
+    assert await TrackMatcher(_store()).match(_TARGET, [hires]) is not None  # 0 = no cap
+
+
+@pytest.mark.asyncio
+async def test_equal_band_prefers_faster_peer():
+    def _peer(username, speed):
+        return DownloadSearchResult(
+            username=username, filename="Radiohead - OK Computer/Airbag.flac",
+            parent_directory="Radiohead - OK Computer", size=20_000_000,
+            extension="flac", bitrate=900, duration=284.0,
+            upload_speed=speed, has_free_slot=True,
+        )
+
+    # identical file from two peers = same identity band -> the faster peer wins
+    ranked = await TrackMatcher(_store()).rank(
+        _TARGET, [_peer("slowpoke", 20_000), _peer("speedy", 8_000_000)]
+    )
+    assert [c.username for c in ranked[:2]] == ["speedy", "slowpoke"]

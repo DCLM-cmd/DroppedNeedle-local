@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.exceptions import ConfigurationError
+from core.exceptions import ConfigurationError, RateLimitedError
 from infrastructure.queue.priority_queue import RequestPriority
 from services.native.download_service import ALREADY_IN_LIBRARY
 from services.personal_mix_service import PersonalMixService
@@ -645,3 +645,35 @@ def test_pick_seed_artists_pairs_mbid_with_name():
     ]
     seeds = PersonalMixService._pick_seed_artists(tracks)
     assert seeds == [(ARTIST_A, "Artist A"), (ARTIST_B, "Artist B")]
+
+
+# ---- an unreachable source is not an empty one -------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_unreachable_listenbrainz_is_reported_as_such(svc):
+    """These were collapsed into the same answer, and the difference matters.
+
+    ListenBrainz blocked this installation's address, every recommendation fetch
+    failed, and the mix reported "no_tracks" - which reads as "you have no
+    recommendations". From the outside the auto-request toggle simply appeared to do
+    nothing, with nothing anywhere saying why.
+    """
+    svc.lb_repo.get_recommendation_playlists = AsyncMock(
+        side_effect=RateLimitedError("ListenBrainz rate limited", "429")
+    )
+
+    result = await svc.service.build_for_user("user-a")
+
+    assert result.skipped is True
+    assert result.reason == "listenbrainz_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_empty_recommendation_list_still_says_no_tracks(svc):
+    """The other half of the distinction: nothing to build from is not a failure."""
+    svc.lb_repo.get_recommendation_playlists = AsyncMock(return_value=[])
+
+    result = await svc.service.build_for_user("user-a")
+
+    assert result.skipped is True
+    assert result.reason == "no_tracks"

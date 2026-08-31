@@ -56,7 +56,7 @@ describe('WhereToBuy', () => {
 
 	it('shows a slim skeleton while loading', async () => {
 		h.isLoading = true;
-		const { container } = render(WhereToBuy, { releaseGroupMbid: 'rg-1' });
+		const { container } = await render(WhereToBuy, { releaseGroupMbid: 'rg-1' });
 		await expect.element(page.getByText('Where to buy')).toBeVisible();
 		expect(container.querySelector('.skeleton')).not.toBeNull();
 	});

@@ -15,13 +15,25 @@ def find_primary_release(release_group: dict) -> Optional[dict]:
 
 
 def get_ranked_releases(release_group: dict) -> list[dict]:
-    """Return official releases sorted so digital/mainstream formats come first."""
+    """Return official releases sorted so digital/mainstream formats come first.
+
+    A release whose own title exactly matches the release group's title is
+    preferred above all else. MusicBrainz has no "this is the complete/main
+    release" flag, and a release group can legitimately hold releases with
+    entirely different tracklists - e.g. a "Side A"/"Side B" pair released
+    separately under one EP. Ranking on format/country alone leaves those tied,
+    falling back to comparing MBIDs lexicographically - arbitrary, and just as
+    likely to land on the partial release as the complete one.
+    """
     releases = release_group.get("releases") or release_group.get("release-list", [])
     official = [r for r in releases if r.get("status") == "Official"]
     if not official:
         official = list(releases)
 
-    def _release_sort_key(r: dict) -> tuple[int, str]:
+    group_title = (release_group.get("title") or "").strip().casefold()
+
+    def _release_sort_key(r: dict) -> tuple[int, int, str]:
+        title_rank = 0 if (r.get("title") or "").strip().casefold() == group_title else 1
         country = (r.get("country") or "").upper()
         packaging = (r.get("packaging") or "").lower()
         physical_keywords = {"vinyl", "cassette", "gatefold"}
@@ -31,7 +43,7 @@ def get_ranked_releases(release_group: dict) -> list[dict]:
             rank = 2
         else:
             rank = 1
-        return (rank, r.get("id", ""))
+        return (title_rank, rank, r.get("id", ""))
 
     official.sort(key=_release_sort_key)
     return official

@@ -13,7 +13,18 @@ from models.identification import (
     ProposedLocalAlbum,
 )
 
-_DISC_DIRECTORY = re.compile(r"^(?:cd|disc|disk)[\s._-]*0*(\d+)$", re.IGNORECASE)
+# A per-disc subfolder, and the disc number it names. Beyond "CD 1"/"Disc 2" this
+# also accepts a leading ordinal and the vinyl/LP wording real rips use
+# ("12_ Vinyl 01"), which previously fell through and made every disc of a release
+# its own catalog album - "Ants From Up There" appeared three times.
+_DISC_DIRECTORY = re.compile(
+    r"^(?:\d+[\s._-]*)?"
+    # The medium wordings the organizer's own naming produces, which are MusicBrainz
+    # medium formats: "CD 1", "12_ Vinyl 01", "Digital Media 02", "Cassette 1"...
+    r"(?:cd|cds|disc|disk|vinyl|lp|dvd|sacd|blu-?ray|cassette|digital\s*media)"
+    r"[\s._-]*0*(\d+)$",
+    re.IGNORECASE,
+)
 _SPACE = re.compile(r"\s+")
 
 

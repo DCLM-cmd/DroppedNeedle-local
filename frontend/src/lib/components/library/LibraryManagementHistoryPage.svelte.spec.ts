@@ -19,6 +19,11 @@ vi.mock('$lib/queries/library/LibraryPolicyQueries.svelte', () => ({
 vi.mock('$lib/queries/library-management/LibraryManagementEvents', () => ({
 	createLibraryManagementEvents: () => ({ start: vi.fn(), stop: vi.fn() })
 }));
+// The page can remove a finished run from the history. createMutation needs a real
+// QueryClient in context, which this component test does not provide.
+vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () => ({
+	deleteLibraryManagementOperationMutation: () => ({ mutate: vi.fn(), isPending: false })
+}));
 vi.mock('$lib/queries/library-management/LibraryManagementQueries.svelte', () => ({
 	getLibraryManagementSettingsQuery: () => ({
 		data: { profiles: [] },
@@ -70,4 +75,13 @@ describe('LibraryManagementHistoryPage', () => {
 		await expect.element(historyRow.getByText('Apply')).toBeVisible();
 		await expect.element(historyRow.getByText('Succeeded', { exact: true })).toBeVisible();
 	});
+});
+
+it('offers to remove a finished run from the history', async () => {
+	render(LibraryManagementHistoryPage);
+
+	// Wording matters here: the run's own record goes, what it changed in the library
+	// stays, and it can no longer be undone.
+	const remove = page.getByRole('button', { name: 'Remove this run from the history' });
+	await expect.element(remove.first()).toBeVisible();
 });

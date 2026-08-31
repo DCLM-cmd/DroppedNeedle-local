@@ -21,7 +21,10 @@ async def test_system_info_public_has_version_and_stable_id(compat_env):
     r = compat_env.client.get("/jellyfin/System/Info/Public")
     assert r.status_code == 200
     body = _jbody(r)
-    assert body["Version"] == "10.10.6"
+    # Clients gate on this before they try anything else - Finamp reads it when a
+    # server is added and gives up on the spot if it is older than the API it was
+    # built against, without ever attempting a login.
+    assert body["Version"] == "12.0.0"
     assert body["Id"] == SERVER_ID
     assert body["StartupWizardCompleted"] is True
     assert body["ProductName"] == "Jellyfin Server"

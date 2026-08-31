@@ -141,7 +141,9 @@ class PersonalMixService:
             )
         }
 
-        lb_tracks = await self._from_recommendation_playlists(lb_repo, username, owned)
+        fetched = await self._from_recommendation_playlists(lb_repo, username, owned)
+        upstream_unavailable = fetched is None
+        lb_tracks = fetched or []
         seed_artists = self._pick_seed_artists(lb_tracks)
         expansion_tracks: list[_MixTrack] = []
         if seed_artists and len(lb_tracks) < _TRACK_CAP:
@@ -157,7 +159,9 @@ class PersonalMixService:
             return PersonalMixResult(
                 user_id=user_id,
                 skipped=True,
-                reason="no_tracks",
+                reason=(
+                    "listenbrainz_unavailable" if upstream_unavailable else "no_tracks"
+                ),
                 playlist_id=existing.id if existing else None,
             )
         mix = await self._match_library_files(mix)
@@ -228,7 +232,8 @@ class PersonalMixService:
         lb_repo,
         username: str | None,
         owned: set[str],
-    ) -> list[_MixTrack]:
+    ) -> list[_MixTrack] | None:
+        """The user's recommended tracks, or None when ListenBrainz was unreachable."""
         try:
             playlists = await lb_repo.get_recommendation_playlists(username)
         except Exception:  # noqa: BLE001
@@ -236,7 +241,11 @@ class PersonalMixService:
                 "Personal mix: failed to fetch LB recommendation playlists",
                 exc_info=True,
             )
-            return []
+            # None, not [] - "ListenBrainz could not be reached" and "you have no
+            # recommendations" are different answers, and collapsing them made a mix
+            # that never built look like a mix with nothing in it. The user saw a
+            # toggle that appeared to do nothing at all.
+            return None
         if not playlists:
             return []
 

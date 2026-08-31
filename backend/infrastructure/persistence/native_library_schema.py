@@ -533,6 +533,23 @@ CREATE TABLE IF NOT EXISTS local_album_artwork (
     row_revision INTEGER NOT NULL DEFAULT 1 CHECK(row_revision BETWEEN 1 AND 9223372036854775807)
 );
 
+-- The image record Jellyfin keeps in BaseItemImageInfos: one row per distinct
+-- image, holding the blurhash and the source dimensions. Jellyfin computes these
+-- once while scanning and only ever READS them when serving an item; doing it per
+-- request cost a 100-album listing several seconds of pure CPU.
+--
+-- Keyed by the artwork's content hash rather than by album: it is the identity the
+-- rest of the codebase already derives for every cover (it is what we publish as the
+-- image's ETag), it is shared when two albums carry the same art, and unlike
+-- Jellyfin's path+mtime key it cannot go stale without the key changing.
+CREATE TABLE IF NOT EXISTS library_image_blurhashes (
+    content_sha1 TEXT PRIMARY KEY,
+    blurhash TEXT NOT NULL,
+    width INTEGER NOT NULL CHECK(width > 0),
+    height INTEGER NOT NULL CHECK(height > 0),
+    computed_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS library_genre_artwork_revisions (
     genre_folded TEXT PRIMARY KEY,
     value INTEGER NOT NULL DEFAULT 1 CHECK(value BETWEEN 1 AND 9223372036854775807)
@@ -638,6 +655,7 @@ CREATE TABLE IF NOT EXISTS library_operation_jobs (
     next_attempt_at REAL,
     reidentification_attempt_count INTEGER NOT NULL DEFAULT 0
         CHECK(reidentification_attempt_count >= 0),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
     created_at REAL NOT NULL,
     started_at REAL,
     phase_started_at REAL,
@@ -887,6 +905,7 @@ CREATE TABLE IF NOT EXISTS library_management_import_bundles (
         'rolled_back','needs_attention'
     )),
     result_json TEXT NOT NULL DEFAULT '{}',
+    acknowledged_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     row_revision INTEGER NOT NULL DEFAULT 1
@@ -1050,6 +1069,7 @@ CREATE TABLE IF NOT EXISTS library_file_mutation_journal (
     )),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
     failure_code TEXT,
+    acknowledged_at REAL,
     recovery_evidence_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,

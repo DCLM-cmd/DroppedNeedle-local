@@ -125,7 +125,7 @@ describe('SettingsDownloadPolicy upgrade controls', () => {
 			quality_max: 'mp3_256',
 			quality_cutoff: 'lossless'
 		};
-		const { container } = render(SettingsDownloadPolicy);
+		const { container } = await render(SettingsDownloadPolicy);
 		await expect
 			.element(page.getByRole('checkbox', { name: 'Allow automatic upgrades' }))
 			.toBeVisible();

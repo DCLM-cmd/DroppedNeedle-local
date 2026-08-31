@@ -204,3 +204,22 @@ def test_sabnzbd_masked_save_preserves_key(prefs):
     raw = prefs.get_sabnzbd_connection_raw()
     assert raw.api_key == "full-key"  # preserved
     assert raw.url == "http://new:8080"  # updated
+
+
+def test_policy_lossless_cap_defaults_off_and_roundtrips(prefs):
+    # pre-existing configs load with the cap off (0 = unlimited)
+    prefs._save_config({"download_policy": {"quality_min": "mp3_320", "quality_max": "lossless"}})
+    assert prefs.get_download_policy().lossless_max_kbps == 0
+
+    prefs.save_download_policy(DownloadPolicySettings(lossless_max_kbps=1500))
+    assert prefs.get_download_policy().lossless_max_kbps == 1500
+
+
+def test_policy_lossless_cap_rejects_out_of_range():
+    import msgspec
+    import pytest
+
+    with pytest.raises(msgspec.ValidationError):
+        DownloadPolicySettings(lossless_max_kbps=-1)
+    with pytest.raises(msgspec.ValidationError):
+        DownloadPolicySettings(lossless_max_kbps=999_999)

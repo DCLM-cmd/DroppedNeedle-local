@@ -762,7 +762,11 @@ def test_docker_image_runs_automatic_upgrade_before_target_application() -> None
     )
     assert "find /app -type f" in dockerfile
     assert "find /app/backend" not in dockerfile
-    assert automatic_upgrade._target_command(8688)[-2:] == ["--workers", "1"]
+    command = automatic_upgrade._target_command(8688)
+    # Contract, not argument order: one worker plus the forwarding headers the
+    # TLS proxy in front of it depends on.
+    assert command[command.index("--workers") + 1] == "1"
+    assert "--proxy-headers" in command
 
 
 def test_upgrade_health_endpoint_keeps_existing_orchestrators_waiting() -> None:

@@ -65,6 +65,7 @@ from services.native.quality_tiers import (
     DEFAULT_QUALITY_MIN,
     candidate_tier,
     folder_hires_key,
+    exceeds_lossless_cap,
     is_audio,
     is_flac_or_mp3,
     tier_for,
@@ -169,6 +170,33 @@ def _availability_key(candidate: ScoredCandidate) -> tuple[int, int, int, int, i
         min((file.upload_speed for file in candidate.files), default=0),
         -sum(file.size for file in candidate.files),
     )
+
+
+_COUNT_OVERSHOOT = 1.35
+
+
+def _count_ratio(counted: int, expected: int) -> float:
+    """How well a folder's audio count matches the release's track count, 0..1.
+
+    Clamping the ratio at 1.0 scored ANY overshoot as a perfect match, so a 77-file
+    dump read as a flawless 15-track album and rode a 0.40-weight freebie into
+    auto-acceptance. A folder holding five times the tracks is not this release.
+
+    Overshoot up to ``_COUNT_OVERSHOOT`` still scores full: bonus tracks, a hidden
+    track, or a deluxe edition of the requested release are the same album, and a
+    multi-disc folder legitimately carries every disc at once. Past that the ratio
+    inverts and decays, so the further a folder is from the expected size the less
+    coherent it reads - a gradient, not a cliff, because track counts themselves
+    disagree between editions.
+    """
+    if expected <= 0:
+        return 0.5
+    if counted <= expected:
+        return counted / expected
+    allowed = expected * _COUNT_OVERSHOOT
+    if counted <= allowed:
+        return 1.0
+    return allowed / counted
 
 
 def _file_evidence(file: DownloadSearchResult) -> AudioQualityEvidence:
@@ -329,8 +357,13 @@ class AlbumPreflightScorer:
     (spec Snapshot rule). Non-quality spec gates ride ``spec_extras`` supplied
     fresh by the caller so a stale singleton can never hide them."""
 
-    def __init__(self, download_store: DownloadStore):
+    def __init__(self, download_store: DownloadStore, *, lossless_max_kbps: int = 0):
         self._store = download_store
+        # 0 = no cap. Above it a 24/192 rip is rejected: several times the size of the
+        # same album at 16/44.1 for no audible gain on most setups. It is not a tier
+        # question - every one of these IS lossless - so the snapshot's tier range
+        # cannot express it, and slskd reports no bitRate for lossless either.
+        self._lossless_max_kbps = lossless_max_kbps
 
     async def rank(
         self,
@@ -403,6 +436,9 @@ class AlbumPreflightScorer:
             # a folder is rated by its worst audio file (downloaded whole): drop on a
             # disallowed codec before the shared pipeline judges identity + quality range.
             if flac_mp3_only and not all(is_flac_or_mp3(f) for f in audio):
+                drop_codec += 1
+                continue
+            if any(exceeds_lossless_cap(f, self._lossless_max_kbps) for f in audio):
                 drop_codec += 1
                 continue
             # Positive artist evidence lets the wrong-album spec judge the album-level
@@ -589,7 +625,7 @@ class AlbumPreflightScorer:
         complete single (count_ratio was a 0.40-weight freebie in the incident)."""
         counted = len(files) if qualified_count is None else qualified_count
         if target.track_count and target.track_count > 0:
-            count_ratio = min(1.0, counted / target.track_count)
+            count_ratio = _count_ratio(counted, target.track_count)
         else:
             count_ratio = 0.5
 

@@ -53,7 +53,11 @@ from services.native.wal_checkpoint_service import WalCheckpointService
 
 ARTIST_RECONCILIATION_PURPOSE = "artist_identity_reconciliation"
 ARTIST_RECONCILIATION_VERSION = "musicbrainz-artist-credit-v3"
-_BACKFILL_IDEMPOTENCY_KEY = "artist-identity-reconciliation:v3:backfill"
+# Keyed by the catalog revision, not by a constant - see the same change in
+# catalog_identity_hygiene_service. A constant key made this startup backfill run
+# exactly once, against whatever the catalog held the very first time the app came up,
+# and turned every later startup into a silent no-op.
+_BACKFILL_IDEMPOTENCY_PREFIX = "artist-identity-reconciliation:v3:backfill"
 # Provider-deferred work must not be retried immediately: the defer re-queues the
 # job, and without a not-before the operation worker instantly re-claims the same
 # item and hot-spins against an open circuit breaker. 120 s gives the shared
@@ -213,12 +217,15 @@ class ArtistIdentityReconciliationService:
 
     async def enqueue_backfill(self) -> dict:
         now = self._clock()
+        job_catalog_revision = await self._store.get_catalog_revision()
         job = OperationJob(
             id=str(uuid.uuid4()),
             kind="repair",
             requested_by_user_id=None,
-            input_catalog_revision=await self._store.get_catalog_revision(),
-            idempotency_key=_BACKFILL_IDEMPOTENCY_KEY,
+            input_catalog_revision=job_catalog_revision,
+            idempotency_key=(
+                f"{_BACKFILL_IDEMPOTENCY_PREFIX}:{job_catalog_revision}"
+            ),
             created_at=now,
         )
         return await self._store.create_repair_operation(
