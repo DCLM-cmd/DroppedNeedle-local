@@ -282,7 +282,7 @@ async def test_username_validation_uses_shared_request_funnel(monkeypatch):
         return_value=_ok_response({"payload": {"count": 12}})
     )
 
-    valid, message = await repo.validate_username("alice")
+    valid, message, _reachable = await repo.validate_username("alice")
 
     assert valid is True
     assert "12" in message
@@ -302,7 +302,7 @@ async def test_validation_preserves_not_found_and_invalid_token_single_attempts(
     not_found.status_code = 404
     http_client.request = AsyncMock(return_value=not_found)
 
-    valid, message = await repo.validate_username("missing")
+    valid, message, _reachable = await repo.validate_username("missing")
     assert valid is False
     assert message == "User 'missing' not found"
     assert http_client.request.await_count == 1
@@ -317,7 +317,7 @@ async def test_validation_preserves_not_found_and_invalid_token_single_attempts(
     invalid_token = _ok_response()
     invalid_token.status_code = status_code
     http_client.request = AsyncMock(return_value=invalid_token)
-    valid, message = await repo.validate_token()
+    valid, message, _reachable = await repo.validate_token()
     assert valid is False
     assert "invalid" in message.lower()
     assert http_client.request.await_count == 1
@@ -338,7 +338,7 @@ async def test_malformed_token_rejected_before_limiter_or_wire(
     repo, http_client = _make_repo(user_token=token)
 
     with caplog.at_level("ERROR"):
-        valid, message = await repo.validate_token()
+        valid, message, _reachable = await repo.validate_token()
 
     assert valid is False
     assert message == "Token invalid or expired"

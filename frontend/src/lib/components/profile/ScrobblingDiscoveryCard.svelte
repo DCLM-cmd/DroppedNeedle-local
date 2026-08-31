@@ -52,6 +52,9 @@
 	let lbToken = $state('');
 	let lbUsername = $state('');
 	let lbError = $state<string | null>(null);
+	// Saved, but ListenBrainz could not confirm it - the account is connected and
+	// starts working the moment the service answers again.
+	let lbUnverified = $state<string | null>(null);
 
 	let lfmPendingToken = $state<string | null>(null);
 	let lfmError = $state<string | null>(null);
@@ -82,11 +85,18 @@
 
 	async function connectListenBrainz() {
 		lbError = null;
+		lbUnverified = null;
 		try {
-			await connectLbMutation.mutateAsync({
+			const status = await connectLbMutation.mutateAsync({
 				user_token: lbToken.trim(),
 				username: lbUsername.trim()
 			});
+			// verified === false means it was stored without a verdict, not that it
+			// failed; saying nothing would look like a clean success it is not.
+			if (status && status.verified === false) {
+				lbUnverified =
+					status.message ?? 'Saved, but ListenBrainz could not be reached to confirm it.';
+			}
 			lbFormOpen = false;
 			lbToken = '';
 			lbUsername = '';
@@ -247,6 +257,9 @@
 							bind:value={lbUsername}
 							autocomplete="off"
 						/>
+						{#if lbUnverified}
+							<p class="text-xs text-warning">{lbUnverified}</p>
+						{/if}
 						{#if lbError}
 							<p class="text-xs text-error">{lbError}</p>
 						{/if}

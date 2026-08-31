@@ -44,6 +44,9 @@ class JellyfinVerifyResult(msgspec.Struct):
 class ListenBrainzVerifyResult(msgspec.Struct):
     valid: bool
     message: str
+    # False when ListenBrainz never answered. A caller storing credentials must not
+    # treat that as a rejection - the token may be perfectly good.
+    reachable: bool = True
 
 
 class NavidromeVerifyResult(msgspec.Struct):
@@ -143,15 +146,21 @@ class SettingsService:
             )
 
             if settings.user_token:
-                valid, message = await temp_repo.validate_token()
+                valid, message, reachable = await temp_repo.validate_token()
             else:
-                valid, message = await temp_repo.validate_username(settings.username)
+                valid, message, reachable = await temp_repo.validate_username(
+                    settings.username
+                )
 
-            return ListenBrainzVerifyResult(valid=valid, message=message)
+            return ListenBrainzVerifyResult(
+                valid=valid, message=message, reachable=reachable
+            )
         except Exception as e:  # noqa: BLE001
             logger.exception(f"Failed to verify ListenBrainz connection: {e}")
             return ListenBrainzVerifyResult(
-                valid=False, message="Couldn't finish the connection test"
+                valid=False,
+                message="Couldn't finish the connection test",
+                reachable=False,
             )
 
     @staticmethod

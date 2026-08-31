@@ -728,10 +728,38 @@ class ListenBrainzRepository:
             "POST", endpoint, json_data=data, require_auth=require_auth
         )
 
-    async def validate_username(self, username: str | None = None) -> tuple[bool, str]:
+    # Outcomes where the SERVICE never gave a verdict on the credential. Kept apart
+    # from a rejection because the two demand opposite handling: a rejected token
+    # must not be stored, while an unreachable service must not make a correct token
+    # unstorable. Collapsing both into "invalid" is what left an account permanently
+    # unconnectable whenever ListenBrainz was blocked or down.
+    _UNREACHABLE = (
+        RateLimitedError,
+        CircuitOpenError,
+        ServiceDisabledUpstreamError,
+        ExternalServiceError,
+        httpx.TimeoutException,
+        httpx.ConnectError,
+    )
+
+    @staticmethod
+    def _unreachable_message(error: BaseException) -> str:
+        if isinstance(error, RateLimitedError):
+            return _RATE_LIMIT_HEALTH_MESSAGE
+        if isinstance(error, httpx.TimeoutException):
+            return "Connection timed out"
+        if isinstance(error, httpx.ConnectError):
+            return "Could not connect to ListenBrainz"
+        return "ListenBrainz is temporarily unavailable. Try again shortly."
+
+    def reachability_of(self, error: BaseException | None) -> bool:
+        """False when the failure means "we could not ask", not "the answer is no"."""
+        return not isinstance(error, self._UNREACHABLE) if error is not None else True
+
+    async def validate_username(self, username: str | None = None) -> tuple[bool, str, bool]:
         user = username or self._username
         if not user:
-            return False, "No username provided"
+            return False, "No username provided", True
 
         try:
             result = await self._get(
@@ -739,33 +767,30 @@ class ListenBrainzRepository:
                 accepted_statuses=(404,),
             )
             if result is None:
-                return False, f"User '{user}' not found"
+                return False, f"User '{user}' not found", True
             if isinstance(result, dict) and "payload" in result:
                 payload = result.get("payload")
                 if isinstance(payload, dict):
                     count = payload.get("count", 0)
-                    return True, f"User found with {count:,} listens"
-            return False, "User not found"
+                    return True, f"User found with {count:,} listens", True
+            return False, "User not found", True
         except _ListenBrainzValidationOutcome:
-            return False, f"User '{user}' not found"
-        except RateLimitedError:
-            return False, _RATE_LIMIT_HEALTH_MESSAGE
-        except CircuitOpenError:
-            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
+            return False, f"User '{user}' not found", True
         except _ListenBrainzAuthenticationError:
-            return False, "ListenBrainz could not validate this username."
-        except (ServiceDisabledUpstreamError, ExternalServiceError):
-            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
-        except httpx.TimeoutException:
-            return False, "Connection timed out"
-        except httpx.ConnectError:
-            return False, "Could not connect to ListenBrainz"
+            return False, "ListenBrainz could not validate this username.", True
+        except self._UNREACHABLE as error:
+            return False, self._unreachable_message(error), False
         except Exception:  # noqa: BLE001 - validation must not leak provider details
-            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
+            return False, "ListenBrainz is temporarily unavailable. Try again shortly.", False
 
-    async def validate_token(self) -> tuple[bool, str]:
+    async def validate_token(self) -> tuple[bool, str, bool]:
+        """``(valid, message, reachable)``.
+
+        ``reachable`` is False when ListenBrainz never gave a verdict, so the caller
+        can tell a REJECTED credential from one it simply could not check.
+        """
         if not self._user_token:
-            return False, "No token provided"
+            return False, "No token provided", True
 
         try:
             result = await self._get(
@@ -774,24 +799,16 @@ class ListenBrainzRepository:
             )
             if isinstance(result, dict) and result.get("valid"):
                 username = result.get("user_name", self._username)
-                return True, f"Successfully connected as '{username}'"
-            return False, "Token invalid or expired"
+                return True, f"Successfully connected as '{username}'", True
+            return False, "Token invalid or expired", True
         except _ListenBrainzValidationOutcome:
-            return False, "Token invalid or expired"
-        except RateLimitedError:
-            return False, _RATE_LIMIT_HEALTH_MESSAGE
-        except CircuitOpenError:
-            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
+            return False, "Token invalid or expired", True
         except _ListenBrainzAuthenticationError:
-            return False, "Token invalid or expired"
-        except (ServiceDisabledUpstreamError, ExternalServiceError):
-            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
-        except httpx.TimeoutException:
-            return False, "Connection timed out"
-        except httpx.ConnectError:
-            return False, "Could not connect to ListenBrainz"
+            return False, "Token invalid or expired", True
+        except self._UNREACHABLE as error:
+            return False, self._unreachable_message(error), False
         except Exception:  # noqa: BLE001 - validation must not leak provider details
-            return False, "ListenBrainz is temporarily unavailable. Try again shortly."
+            return False, "ListenBrainz is temporarily unavailable. Try again shortly.", False
 
     async def get_user_listens(
         self,

@@ -61,7 +61,7 @@ def ctx(tmp_path: Path):
     lastfm_auth.exchange_session.return_value = ("alice_lfm", "sk-secret", "")
 
     settings_service = AsyncMock()
-    settings_service.verify_listenbrainz.return_value = SimpleNamespace(valid=True, message="ok")
+    settings_service.verify_listenbrainz.return_value = SimpleNamespace(valid=True, message="ok", reachable=True)
 
     prefs_service = MagicMock()
     prefs_service.get_lastfm_connection.return_value = SimpleNamespace(api_key="appkey", shared_secret="appsecret")
@@ -177,7 +177,10 @@ def test_connect_listenbrainz_empty_username_400(ctx):
 
 
 def test_connect_listenbrainz_invalid_token_400(ctx):
-    ctx.settings_service.verify_listenbrainz.return_value = SimpleNamespace(valid=False, message="bad token")
+    # reachable: ListenBrainz gave a verdict, so this is a real rejection
+    ctx.settings_service.verify_listenbrainz.return_value = SimpleNamespace(
+        valid=False, message="bad token", reachable=True
+    )
     resp = ctx.client.put(
         "/me/connections/listenbrainz", json={"user_token": "bad", "username": "x"}
     )

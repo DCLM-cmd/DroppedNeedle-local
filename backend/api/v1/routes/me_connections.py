@@ -291,14 +291,24 @@ async def connect_listenbrainz(
             username=body.username, user_token=body.user_token, enabled=True
         )
     )
-    if not result.valid:
+    # A credential ListenBrainz REJECTED must not be stored. One it never got to see
+    # is a different matter: refusing it makes the account unconnectable for as long
+    # as the service is down or the address is blocked, however correct the token is.
+    # It is stored unverified instead, and the message says so.
+    if not result.valid and result.reachable:
         raise HTTPException(status_code=400, detail=result.message)
     await store.upsert(
         current_user.id, "listenbrainz", {"user_token": body.user_token, "username": body.username}
     )
     await settings_service.on_listenbrainz_connection_changed()
 
-    return ConnectionStatus(service="listenbrainz", enabled=True, username=body.username)
+    return ConnectionStatus(
+        service="listenbrainz",
+        enabled=True,
+        username=body.username,
+        verified=result.valid,
+        message=None if result.valid else result.message,
+    )
 
 
 @router.get("/connections/spotify/auth/url", response_model=SpotifyAuthUrlResponse)

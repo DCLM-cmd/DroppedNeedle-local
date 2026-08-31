@@ -3,11 +3,16 @@ from typing import Literal
 from infrastructure.msgspec_fastapi import AppStruct
 
 
-class ConnectionStatus(AppStruct):
+class ConnectionStatus(AppStruct, omit_defaults=True):
     # never carries the encrypted secret - only username + enabled flag
     service: str
     enabled: bool = False
     username: str = ""
+    # True when the provider confirmed the credential. False means it was stored
+    # without a verdict because the provider could not be reached - the connection
+    # works the moment it answers again, and ``message`` says why it is unconfirmed.
+    verified: bool = True
+    message: str | None = None
 
 
 class ConnectionsResponse(AppStruct):
