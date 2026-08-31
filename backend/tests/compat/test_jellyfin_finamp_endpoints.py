@@ -87,3 +87,51 @@ async def test_lyrics_answers_a_real_404_not_the_frontend_shell(compat_env):
 async def test_playlist_users_is_an_empty_list(compat_env):
     body = _jget(compat_env, "/Playlists/whatever/Users")
     assert body == []
+
+
+async def test_albums_report_a_primary_image_aspect_ratio(compat_env):
+    """Jellyfin reports it from its stored image record; a client uses it to reserve
+    the right space before the picture arrives. It was the one field of the DTO we
+    never sent."""
+    albums = _jget(
+        compat_env, "/Users/user-alice/Items", IncludeItemTypes="MusicAlbum"
+    )["Items"]
+
+    assert albums, "fixture has no albums"
+    for album in albums:
+        # Absent when no dimensions are stored - the DTO omits its defaults, as
+        # Jellyfin does. What must never happen is a made-up value.
+        ratio = album.get("PrimaryImageAspectRatio")
+        assert ratio is None or 0.1 < ratio < 10, (album.get("Name"), ratio)
+
+
+async def test_a_stored_ratio_is_reported(compat_env, monkeypatch):
+    """With dimensions on record the field carries width / height."""
+    from api.compat.jellyfin import builders
+
+    async def _art_call(self, method, *args):  # noqa: ANN001
+        if method == "get_release_group_cover_image_info":
+            return ("tag-1", "LEHV6nWB2yk8pyo0adR*.7kCMdnj")
+        if method == "get_image_aspect_ratio":
+            return 1.5
+        return None
+
+    monkeypatch.setattr(builders.JellyfinBuilder, "_art_call", _art_call, raising=False)
+
+    albums = _jget(
+        compat_env, "/Users/user-alice/Items", IncludeItemTypes="MusicAlbum"
+    )["Items"]
+
+    assert albums
+    assert all(a.get("PrimaryImageAspectRatio") == 1.5 for a in albums), albums
+
+
+async def test_the_aspect_ratio_is_absent_rather_than_guessed(compat_env):
+    """A cover with no stored dimensions reports nothing instead of a made-up 1.0 -
+    a wrong ratio lays the grid out wrongly, a missing one lets the client decide."""
+    tracks = _jget(compat_env, "/Users/user-alice/Items", IncludeItemTypes="Audio")[
+        "Items"
+    ]
+    for track in tracks:
+        ratio = track.get("PrimaryImageAspectRatio")
+        assert ratio is None or ratio > 0

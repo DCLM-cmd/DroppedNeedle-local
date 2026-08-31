@@ -160,6 +160,21 @@ class TargetCoverArtService:
             )
         return None, None
 
+    async def get_image_aspect_ratio(self, content_hash: str | None) -> float | None:
+        """Width / height of a stored image, or None when it is not recorded.
+
+        Taken from the same record as the blurhash, so it costs no extra work at
+        serving time - which is the whole reason both are stored rather than
+        measured per request.
+        """
+        if not content_hash:
+            return None
+        stored = await self._store.get_image_dimensions([content_hash])
+        size = stored.get(content_hash)
+        if not size or not size[1]:
+            return None
+        return round(size[0] / size[1], 6)
+
     async def get_artist_image_info(
         self, artist_id: str, size: int | None = None
     ) -> tuple[str | None, str | None]:

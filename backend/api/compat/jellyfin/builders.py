@@ -68,6 +68,7 @@ class JellyfinBuilder:
         self._cover = coverart
         self._sid = server_id
         # Tag and blurhash come from one image record, so they are cached as a pair.
+        self._aspect_ratio_cache: dict[str, float | None] = {}
         self._album_image_cache: dict[str, tuple[str | None, str | None]] = {}
         # The client's ``Fields=`` list, lowercased. Jellyfin attaches the expensive
         # extras only when they are named, and so do we.
@@ -94,6 +95,18 @@ class JellyfinBuilder:
                 blurhash if isinstance(blurhash, str) and blurhash else None,
             )
         return self._album_image_cache[rg_mbid]
+
+    async def _album_aspect_ratio(self, rg_mbid: str | None) -> float | None:
+        """The cover's aspect ratio, off the same stored record as its blurhash."""
+        tag, _ = await self._album_image(rg_mbid)
+        if not tag:
+            return None
+        if tag not in self._aspect_ratio_cache:
+            self._aspect_ratio_cache[tag] = await self._art_call(
+                "get_image_aspect_ratio", tag
+            )
+        value = self._aspect_ratio_cache[tag]
+        return value if isinstance(value, (int, float)) else None
 
     async def _album_tag(self, rg_mbid: str | None) -> str | None:
         return (await self._album_image(rg_mbid))[0]
@@ -311,6 +324,7 @@ class JellyfinBuilder:
             ImageBlurHashes=self._blur_hashes(
                 album_tag, await self._album_blurhash(t.rg_mbid)
             ),
+            PrimaryImageAspectRatio=await self._album_aspect_ratio(t.rg_mbid),
             ParentId=album_id,
             Container=t.file_format or None,
             Genres=[t.genre] if t.genre else [],
@@ -365,6 +379,7 @@ class JellyfinBuilder:
             Genres=[a.genre] if a.genre else [],
             ImageTags={"Primary": tag} if tag else {},
             ImageBlurHashes=self._blur_hashes(tag, await self._album_blurhash(a.rg_mbid)),
+            PrimaryImageAspectRatio=await self._album_aspect_ratio(a.rg_mbid),
             GenreItems=await self._genre_items(a.genre),
             People=self._people(
                 [NameGuidPair(Name=a.artist_name, Id=artist_jf)]

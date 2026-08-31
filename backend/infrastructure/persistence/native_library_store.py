@@ -7702,6 +7702,36 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._write(operation)
 
+    async def get_image_dimensions(
+        self, content_hashes: list[str]
+    ) -> dict[str, tuple[int, int]]:
+        """Stored (width, height) for these artwork content hashes.
+
+        Same record the blurhash comes off, which is why the dimensions are already
+        there: Jellyfin reports PrimaryImageAspectRatio from its stored ItemImageInfo
+        rather than measuring the file per request, and a client uses it to reserve
+        the right space before the image arrives.
+        """
+        wanted = [value for value in dict.fromkeys(content_hashes) if value]
+        if not wanted:
+            return {}
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> dict[str, tuple[int, int]]:
+            placeholders = ",".join("?" * len(wanted))
+            return {
+                str(row["content_sha1"]): (int(row["width"]), int(row["height"]))
+                for row in connection.execute(
+                    "SELECT content_sha1, width, height FROM library_image_blurhashes "
+                    f"WHERE content_sha1 IN ({placeholders})",
+                    wanted,
+                )
+                if row["width"] and row["height"]
+            }
+
+        return await self._read(operation)
+
     async def get_image_blurhashes(
         self, content_hashes: list[str]
     ) -> dict[str, str]:

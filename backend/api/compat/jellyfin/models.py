@@ -262,6 +262,10 @@ class BaseItemDto(msgspec.Struct, kw_only=True):
     LocationType: str = "FileSystem"
     BackdropImageTags: list[str] = []
     ImageBlurHashes: dict[str, dict[str, str]] = {}
+    # Width / height of the Primary image. Jellyfin reports it from its stored image
+    # record and clients use it to reserve the right space before the picture
+    # arrives; omitting it leaves them guessing at the layout.
+    PrimaryImageAspectRatio: float | None = None
 
     # --- fields clients ask for by name -----------------------------------------
     # Finamp's every listing carries
