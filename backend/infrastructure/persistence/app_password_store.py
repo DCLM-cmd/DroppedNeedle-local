@@ -7,12 +7,13 @@ Lives in the shared WAL database (same ``library_db_path`` as AuthStore) so the
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 import threading
 from pathlib import Path
 
 import msgspec
+
+from infrastructure.persistence._database import PooledSqliteStore
 
 
 class AppPasswordRow(msgspec.Struct, frozen=True):
@@ -29,7 +30,7 @@ class AppPasswordRow(msgspec.Struct, frozen=True):
     revoked: bool = False
 
 
-class AppPasswordStore:
+class AppPasswordStore(PooledSqliteStore):
     def __init__(self, db_path: Path, write_lock: threading.Lock | None = None) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,27 +46,6 @@ class AppPasswordStore:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
-    def _execute(self, operation, write: bool):
-        if write:
-            with self._write_lock:
-                conn = self._connect()
-                try:
-                    result = operation(conn)
-                    conn.commit()
-                    return result
-                finally:
-                    conn.close()
-        conn = self._connect()
-        try:
-            return operation(conn)
-        finally:
-            conn.close()
-
-    async def _read(self, operation):
-        return await asyncio.to_thread(self._execute, operation, False)
-
-    async def _write(self, operation):
-        return await asyncio.to_thread(self._execute, operation, True)
 
     def _ensure_tables(self) -> None:
         conn = self._connect()

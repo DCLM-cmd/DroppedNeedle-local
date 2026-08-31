@@ -37,7 +37,7 @@
 		discographyDownloadStore,
 		type DiscographyRelease
 	} from '$lib/stores/discographyDownload.svelte';
-	import { Download } from 'lucide-svelte';
+	import { Download } from '@lucide/svelte';
 	import ArtistReleasePagination from '$lib/components/ArtistReleasePagination.svelte';
 	import { mergeArtistReleasePages } from '$lib/queries/artist/artistReleasePages';
 

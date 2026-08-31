@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { AlertTriangle, Check, ExternalLink, History, Music2, XCircle } from 'lucide-svelte';
+	import { AlertTriangle, Check, ExternalLink, History, Music2, XCircle } from '@lucide/svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import { getLibraryReviewQuery } from '$lib/queries/library/LibraryReviewQueries.svelte';
 	import {

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Download, Play } from 'lucide-svelte';
+	import { Download, Play } from '@lucide/svelte';
 	import { API, TOAST_DURATION } from '$lib/constants';
 	import { toastStore } from '$lib/stores/toast';
 	import { launchTrackPlayback } from '$lib/player/launchTrackPlayback';

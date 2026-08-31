@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { getApiUrl } from '$lib/api/api-utils';
 	import { SvelteMap } from 'svelte/reactivity';
-	import { Disc3, Search } from 'lucide-svelte';
+	import { Disc3, Search } from '@lucide/svelte';
 	import type { SearchRemoteStatus, SuggestResult } from '$lib/types';
 	import {
 		getLocalAlbumSearchQuery,

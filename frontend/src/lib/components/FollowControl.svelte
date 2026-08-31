@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Heart, Clock } from 'lucide-svelte';
+	import { Heart, Clock } from '@lucide/svelte';
 	import { getFollowStatusQuery } from '$lib/queries/following/FollowQueries.svelte';
 	import {
 		createSetAutoDownloadMutation,

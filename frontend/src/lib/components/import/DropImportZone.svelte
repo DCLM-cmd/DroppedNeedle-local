@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { PackageOpen, Loader2 } from 'lucide-svelte';
+	import { PackageOpen, Loader2 } from '@lucide/svelte';
 	import { uploadDropMutation } from '$lib/queries/import/DropImportMutations.svelte';
 	import { toastStore } from '$lib/stores/toast';
 

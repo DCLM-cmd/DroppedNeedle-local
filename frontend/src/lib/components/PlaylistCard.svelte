@@ -7,7 +7,7 @@
 	import { toastStore } from '$lib/stores/toast';
 	import { formatTotalDurationSec } from '$lib/utils/formatting';
 	import { getSourceColor, getSourceLabel } from '$lib/utils/sources';
-	import { Play, Shuffle, Trash2, Tv, Lock, Globe } from 'lucide-svelte';
+	import { Play, Shuffle, Trash2, Tv, Lock, Globe } from '@lucide/svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';
 	import PlexIcon from '$lib/components/PlexIcon.svelte';

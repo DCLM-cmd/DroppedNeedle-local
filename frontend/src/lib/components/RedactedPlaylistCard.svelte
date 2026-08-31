@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { RedactedPlaylist } from '$lib/api/playlists';
-	import { Lock } from 'lucide-svelte';
+	import { Lock } from '@lucide/svelte';
 
 	let { playlist }: { playlist: RedactedPlaylist } = $props();
 

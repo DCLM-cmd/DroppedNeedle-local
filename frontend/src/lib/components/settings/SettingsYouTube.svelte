@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
 	import { onDestroy } from 'svelte';
-	import { Info } from 'lucide-svelte';
+	import { Info } from '@lucide/svelte';
 
 	type YouTubeConnectionSettings = {
 		api_key: string;

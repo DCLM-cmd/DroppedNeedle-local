@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Music, Pause, User } from 'lucide-svelte';
+	import { Music, Pause, User } from '@lucide/svelte';
 	import AudioQualityBadge from '$lib/components/AudioQualityBadge.svelte';
 	import type { NowPlayingSession } from '$lib/types';
 

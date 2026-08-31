@@ -10,7 +10,7 @@
 		ScanLine,
 		Settings2,
 		ShieldAlert
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { getLibraryActivityQuery } from '$lib/queries/library/LibraryActivityQueries.svelte';
 	import {

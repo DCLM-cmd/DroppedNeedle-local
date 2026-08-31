@@ -18,6 +18,7 @@ from api.compat.common.deps import CompatServices, get_compat_services
 from api.compat.common.enablement import ensure_subsonic_enabled
 from api.compat.common.ratelimit import (
     compat_rate_limits,
+    is_artwork_request,
     is_media_request,
     is_mutation_request,
     reject_subsonic,
@@ -228,19 +229,25 @@ async def _dispatch(
                             server_version=server_version,
                         )
                 raise
-            if not is_media_request(request.url.path):
+            if is_artwork_request(request.url.path):
+                # Charged to the artwork budget rather than to browsing: a screen of
+                # covers must not starve the calls that produced the list itself.
+                retry_after = await compat_rate_limits.artwork_retry_after(client_ip)
+            elif not is_media_request(request.url.path):
                 retry_after = await compat_rate_limits.principal_retry_after(
                     user.id,
                     mutation=is_mutation_request(request.method, request.url.path),
                 )
-                if retry_after is not None:
-                    return reject_subsonic(
-                        fmt,
-                        callback,
-                        retry_after,
-                        server_name=settings.advertise_server_name,
-                        server_version=server_version,
-                    )
+            else:
+                retry_after = None
+            if retry_after is not None:
+                return reject_subsonic(
+                    fmt,
+                    callback,
+                    retry_after,
+                    server_name=settings.advertise_server_name,
+                    server_version=server_version,
+                )
         ctx = Ctx(
             request=request,
             endpoint_name=name,

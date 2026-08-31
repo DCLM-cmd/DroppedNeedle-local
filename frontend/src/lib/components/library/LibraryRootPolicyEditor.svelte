@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronDown, FolderPlus, Plus, Trash2 } from 'lucide-svelte';
+	import { ChevronDown, FolderPlus, Plus, Trash2 } from '@lucide/svelte';
 	import { getLibraryPolicyTreeQuery } from '$lib/queries/library/LibraryPolicyQueries.svelte';
 	import { createUuid } from '$lib/utils/uuid';
 	import type {

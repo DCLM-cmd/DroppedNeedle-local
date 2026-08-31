@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Play, Shuffle, ListPlus, CirclePlus, Loader2 } from 'lucide-svelte';
+	import { Play, Shuffle, ListPlus, CirclePlus, Loader2 } from '@lucide/svelte';
 	import { PersistedState } from 'runed';
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import type { MenuItem } from '$lib/components/ContextMenu.svelte';

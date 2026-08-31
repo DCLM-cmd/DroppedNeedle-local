@@ -36,7 +36,30 @@ from models.download import (
 from models.library_management import (
     AUTOMATIC_MANAGEMENT_RETRY_CODES,
     MANAGEMENT_RETRY_DELAYS_SECONDS,
+    BUNDLE_BLOCKED,
+    PATH_COLLISION_DIFFERENT,
+    PATH_COLLISION_IDENTICAL,
+    POSITION_COLLISION,
+    SIDECAR_COLLISION,
 )
+
+# Codes that are neither environmental nor a user decision: they are often
+# self-clearing. A collision's destination is occupied by something that is itself
+# waiting to be resolved, and freeing that frees this too; a blocked bundle means the
+# durable evidence moved under the planner, which the next attempt re-derives. So these
+# retry on the same ladder as the transient codes - but UNLIKE those they also give up,
+# because one that survived every retry needs a person, and a held row nobody can act
+# on is noise on the downloads page rather than a task.
+MANAGEMENT_ABANDONABLE_CODES = frozenset(
+    {
+        PATH_COLLISION_DIFFERENT,
+        PATH_COLLISION_IDENTICAL,
+        POSITION_COLLISION,
+        SIDECAR_COLLISION,
+        BUNDLE_BLOCKED,
+    }
+)
+MANAGEMENT_ABANDON_AFTER_ATTEMPTS = 4
 from repositories.protocols.download_client import DownloadClientProtocol
 from repositories.protocols.indexer import IndexerProtocol
 from services.native.acquisition.status import DownloadStatus
@@ -324,6 +347,16 @@ class DownloadService:
                     priority=priority,
                 )
         except Exception as error:  # noqa: BLE001 - fail closed before any task exists
+            # The user-facing message deliberately says nothing about the cause, so
+            # log it: this refusal was raised for a WEEK by a stale catalog row and
+            # nothing on the server said which album or why.
+            logger.warning(
+                "Edition verification failed for %s (release=%s): %s: %s",
+                release_group_mbid,
+                release_mbid or "-",
+                type(error).__name__,
+                error,
+            )
             raise ValidationError(
                 "The exact MusicBrainz edition could not be verified. No download was started."
             ) from error
@@ -1287,6 +1320,27 @@ class DownloadService:
         """One held track (ownership-checked) - for the in-review audio preview."""
         return await self._store.get_held_import(held_id, user_id, user_role)
 
+    async def _assert_held_file_is_free(self, held) -> None:  # noqa: ANN001
+        """Refuse to act on a file a live edition conversion has reserved.
+
+        The conversion publishes its whole tracklist as one unit and recycles the
+        files it supersedes in that same step. Importing this file by itself writes
+        into a slot the conversion has not cleared yet, which surfaces to the user
+        as "a planned destination is occupied by different content" - true, but it
+        names neither the conversion nor the way out. Say which job holds the file
+        instead, and leave it to that job's own apply or cancel.
+        """
+        job_id = await self._store.find_active_edition_conversion_for_held_path(
+            held.held_path
+        )
+        if job_id is not None:
+            raise ValidationError(
+                "This file is reserved for a pending exact-edition conversion of "
+                f"{held.album_title!r}. Apply or cancel that conversion instead - "
+                "it publishes the whole tracklist together and clears the files it "
+                "replaces."
+            )
+
     async def import_held(self, held_id: int, user_id: str, user_role: str) -> str:
         """Force-import a held track, bypassing the AcoustID identity check (a human has
         judged it correct), and mark it resolved. Returns the library path it landed at."""
@@ -1297,6 +1351,7 @@ class DownloadService:
             raise ValidationError(
                 "Library Management holds must be retried as one complete acquisition unit"
             )
+        await self._assert_held_file_is_free(held)
         if self._file_processor is None:
             raise ConfigurationError("Import is unavailable right now")
         try:
@@ -1342,6 +1397,7 @@ class DownloadService:
             raise ValidationError(
                 "Library Management holds must be discarded as one complete acquisition unit"
             )
+        await self._assert_held_file_is_free(held)
         await self._store.resolve_held_import(held_id, "discarded")
         await self._delete_discarded_held_files([held])
         logger.info(
@@ -1376,14 +1432,66 @@ class DownloadService:
         reason_codes = {value.reason.removeprefix("management:") for value in held}
         retry_count = max(value.management_retry_count for value in held)
         next_retry_at = None
-        if len(reason_codes) == 1 and reason_codes <= AUTOMATIC_MANAGEMENT_RETRY_CODES:
-            retry_count += 1
-            delay_index = min(retry_count - 1, len(MANAGEMENT_RETRY_DELAYS_SECONDS) - 1)
-            next_retry_at = time.time() + MANAGEMENT_RETRY_DELAYS_SECONDS[delay_index]
+        if len(reason_codes) == 1:
+            code = next(iter(reason_codes))
+            retryable = code in AUTOMATIC_MANAGEMENT_RETRY_CODES
+            abandonable = code in MANAGEMENT_ABANDONABLE_CODES
+            if retryable or abandonable:
+                retry_count += 1
+                if abandonable and retry_count > MANAGEMENT_ABANDON_AFTER_ATTEMPTS:
+                    await self._abandon_unresolvable_hold(source_task_id, held, code)
+                    return
+                delay_index = min(
+                    retry_count - 1, len(MANAGEMENT_RETRY_DELAYS_SECONDS) - 1
+                )
+                next_retry_at = (
+                    time.time() + MANAGEMENT_RETRY_DELAYS_SECONDS[delay_index]
+                )
         await self._store.schedule_management_hold_retry(
             [value.id for value in held],
             retry_count=retry_count,
             next_retry_at=next_retry_at,
+        )
+
+    async def _abandon_unresolvable_hold(
+        self, source_task_id: str, held: list["HeldImport"], reason_code: str
+    ) -> None:
+        """Take a hold off the downloads page once no retry can clear it.
+
+        The files are recycled where a bin is configured rather than unlinked: the
+        Organizer being unable to place a file is not the user rejecting it, so the
+        download stays recoverable for the retention window. Without a bin this
+        degrades to the same delete an explicit discard performs.
+        """
+        recycled = 0
+        if self._file_processor is not None:
+            for value in held:
+                if await self._file_processor.recycle_abandoned_hold(
+                    Path(value.held_path)
+                ):
+                    recycled += 1
+        await self._store.resolve_held_imports(
+            [value.id for value in held], "discarded"
+        )
+        # Recycled files are already gone from held_path; unlink is missing_ok, so this
+        # both cleans up whatever was not recycled and closes the cleanup intent.
+        await self._delete_discarded_held_files(held)
+        try:
+            await self._orchestrator.cancel_task(source_task_id, "system", "admin")
+        except (ResourceNotFoundError, PermissionDeniedError):
+            pass
+        except Exception:  # noqa: BLE001 - the hold is already off the page
+            logger.warning(
+                "Could not settle the task behind an abandoned hold %s", source_task_id
+            )
+        logger.info(
+            "download.management_hold_abandoned",
+            extra={
+                "task_id": source_task_id,
+                "reason_code": reason_code,
+                "files": len(held),
+                "recycled": recycled,
+            },
         )
 
     async def retry_due_management_holds(self) -> None:
@@ -1762,6 +1870,40 @@ class DownloadService:
         if cleared:
             logger.info(
                 "download.cleared_finished",
+                extra={"user_id": user_id, "count": cleared},
+            )
+        return cleared
+
+    async def clear_history(self, user_id: str, user_role: str) -> int:
+        """Empty the queue's History: completed, cancelled, and finished failures.
+
+        This is what the "Clear all" button calls. The route has always called it by
+        this name while the service only offered ``clear_finished``, so every press
+        raised an AttributeError and the button did nothing at all.
+
+        It also does what the button promises, which ``clear_finished`` did not: a
+        failed download is part of History too. What stays is what the tooltip says
+        stays - anything still working or still scheduled to try again, since removing
+        those would silently abandon an album the user is still waiting for.
+        """
+        cleared = await self._store.delete_tasks_by_status(
+            user_id,
+            user_role,
+            [DownloadStatus.COMPLETED, DownloadStatus.CANCELLED],
+        )
+        # Failed and partial rows are only History once nothing further will happen to
+        # them; one with a retry still pending is "still hunting", not finished.
+        pending = await self._store.list_tasks_by_status(
+            user_id, user_role, [DownloadStatus.FAILED, DownloadStatus.PARTIAL]
+        )
+        finished = [
+            task.id for task in pending if self.next_retry_at(task) is None
+        ]
+        if finished:
+            cleared += await self._store.delete_tasks_by_ids(finished)
+        if cleared:
+            logger.info(
+                "download.cleared_history",
                 extra={"user_id": user_id, "count": cleared},
             )
         return cleared

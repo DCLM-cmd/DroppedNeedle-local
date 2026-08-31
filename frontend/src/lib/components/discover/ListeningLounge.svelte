@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, Download, Headphones, Loader2, Play, Volume2 } from 'lucide-svelte';
+	import { Check, Download, Headphones, Loader2, Play, Volume2 } from '@lucide/svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import { deckSampler, type SampleEntry } from '$lib/stores/deckSampler.svelte';

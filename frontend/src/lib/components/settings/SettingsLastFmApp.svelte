@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { LastFmConnectionSettingsResponse } from '$lib/types';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
-	import { Radio, ExternalLink } from 'lucide-svelte';
+	import { Radio, ExternalLink } from '@lucide/svelte';
 	import { onMount, onDestroy } from 'svelte';
 
 	// instance-wide app credentials only; per-user OAuth session + scrobble toggles

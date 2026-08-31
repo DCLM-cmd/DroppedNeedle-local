@@ -141,6 +141,24 @@ class FakeDocker:
         raise AssertionError(f"unexpected command: {arguments}")
 
 
+def _compose_file(tmp_path: Path) -> Path:
+    """A compose file the test owns.
+
+    The real ``docker-compose.yml`` is per-deployment and gitignored, so it is absent
+    from any clean checkout - depending on it made every test here fail on a fresh
+    clone and in CI. ``prepare`` takes an explicit path for exactly this reason.
+    """
+    path = tmp_path / "docker-compose.yml"
+    path.write_text(
+        "services:\n"
+        "  droppedneedle:\n"
+        "    image: droppedneedle:local\n"
+        "    container_name: droppedneedle\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def _data_root(tmp_path: Path) -> Path:
     root = tmp_path / "data"
     config = root / "config"
@@ -170,6 +188,7 @@ def test_staged_runner_pins_source_captures_migrates_starts_and_rolls_back(
     prepared = feedback_fixes.prepare(
         state_path=state_path,
         repository_root=_REPOSITORY_ROOT,
+        compose_file=_compose_file(tmp_path),
         data_root=data_root,
         manifest_root=manifest_root,
         runner=docker,
@@ -283,6 +302,7 @@ def test_prepare_refuses_active_work(tmp_path: Path) -> None:
         feedback_fixes.prepare(
             state_path=tmp_path / "state.json",
             repository_root=_REPOSITORY_ROOT,
+        compose_file=_compose_file(tmp_path),
             data_root=data_root,
             manifest_root=tmp_path / "manifest",
             runner=FakeDocker(),
@@ -309,6 +329,7 @@ def test_prepare_requires_recovery_files_outside_data_root(
         feedback_fixes.prepare(
             state_path=state_path,
             repository_root=_REPOSITORY_ROOT,
+        compose_file=_compose_file(tmp_path),
             data_root=data_root,
             manifest_root=manifest_root,
             runner=FakeDocker(),
@@ -325,6 +346,7 @@ def _prepare_and_build(
     prepared = feedback_fixes.prepare(
         state_path=state_path,
         repository_root=_REPOSITORY_ROOT,
+        compose_file=_compose_file(tmp_path),
         data_root=data_root,
         manifest_root=tmp_path / "manifest",
         runner=docker,
@@ -492,6 +514,7 @@ def test_build_refuses_when_source_changes_during_image_build(
     prepared = feedback_fixes.prepare(
         state_path=state_path,
         repository_root=_REPOSITORY_ROOT,
+        compose_file=_compose_file(tmp_path),
         data_root=data_root,
         manifest_root=tmp_path / "manifest",
         runner=docker,

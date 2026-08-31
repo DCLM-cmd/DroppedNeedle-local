@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronLeft, RefreshCw } from 'lucide-svelte';
+	import { ChevronLeft, RefreshCw } from '@lucide/svelte';
 	import type { Snippet } from 'svelte';
 	import { formatLastUpdated } from '$lib/utils/formatting';
 	import LiveUpdatingBadge from './LiveUpdatingBadge.svelte';

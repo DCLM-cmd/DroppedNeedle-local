@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Circle, CircleCheck } from 'lucide-svelte';
+	import { Circle, CircleCheck } from '@lucide/svelte';
 
 	import {
 		getDownloadClientConfigQuery,

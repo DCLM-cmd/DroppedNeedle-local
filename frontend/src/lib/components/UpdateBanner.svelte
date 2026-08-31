@@ -2,7 +2,7 @@
 	import { serviceStatusStore } from '$lib/stores/serviceStatus';
 	import { fromStore } from 'svelte/store';
 	import { PersistedState } from 'runed';
-	import { ArrowUpCircle, X } from 'lucide-svelte';
+	import { ArrowUpCircle, X } from '@lucide/svelte';
 
 	interface Props {
 		updateAvailable: boolean;

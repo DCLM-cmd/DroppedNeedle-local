@@ -161,6 +161,7 @@ from core.dependencies import (
 )
 from core.config import get_settings
 from core.exception_handlers import (
+    automatic_management_hold_handler,
     circuit_open_error_handler,
     client_disconnected_handler,
     configuration_error_handler,
@@ -178,6 +179,7 @@ from core.exception_handlers import (
     validation_error_handler,
 )
 from core.exceptions import (
+    AutomaticManagementHoldError,
     ClientDisconnectedError,
     ConfigurationError,
     ConflictError,
@@ -723,6 +725,7 @@ def create_production_target_application() -> FastAPI:
         (ConfigurationError, configuration_error_handler),
         (PermissionDeniedError, permission_denied_handler),
         (ConflictError, conflict_error_handler),
+        (AutomaticManagementHoldError, automatic_management_hold_handler),
         (StaleRevisionError, stale_revision_error_handler),
         (RevisionOverflowError, revision_overflow_error_handler),
         (CircuitOpenError, circuit_open_error_handler),

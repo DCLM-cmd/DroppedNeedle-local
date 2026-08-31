@@ -348,6 +348,22 @@ class LibraryManagementPreviewService:
             type=LibraryManagementPreviewCreatedResponse,
         )
 
+    async def delete_operation(self, job_id: str) -> None:
+        """Remove one run from the operation history.
+
+        The run's own records go with it. Pointers other rows keep to "the run that
+        last touched me" are cleared rather than followed, so the catalog audit trail
+        and the per-track management state outlive the history entry.
+        """
+        outcome = await self._store.delete_library_operation(job_id)
+        if outcome == "not_found":
+            raise ResourceNotFoundError(f"Operation {job_id} was not found")
+        if outcome == "running":
+            raise ValidationError(
+                "This run has not finished yet. Stop it before removing it from the "
+                "history."
+            )
+
     async def detail(self, job_id: str) -> LibraryManagementPreviewDetailResponse:
         snapshot = await self._store.get_library_management_job_snapshot(job_id)
         operation = await self._store.get_operation_job(job_id)
@@ -852,7 +868,15 @@ class LibraryManagementPreviewService:
         )
         if policy.policy_revision != snapshot.policy_revision:
             reasons.append(POLICY_CHANGED)
-        if await self._store.get_catalog_revision() != snapshot.catalog_revision:
+        # Judged against THIS plan's own subjects, not the catalog as a whole. The
+        # global revision is bumped by every catalog write anywhere - a scan, an
+        # import, an artwork hash - so it changed between building a preview and
+        # pressing Confirm on any system that was doing anything, and applying was
+        # refused as "not current". The files this plan covers are what can actually
+        # invalidate it, and the apply path re-checks each of them per item anyway.
+        if await self._store.library_management_plan_subjects_changed(
+            snapshot.job_id
+        ):
             reasons.append(FILE_CHANGED)
         return reasons
 

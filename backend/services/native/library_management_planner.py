@@ -1823,6 +1823,16 @@ class LibraryManagementPlanner:
         except (FileNotFoundError, NotADirectoryError):
             destination_stat = None
         if destination_stat is not None:
+            # A case-only rename is not a collision. On a case-insensitive filesystem
+            # the destination path resolves to the very file being renamed, so the
+            # naive check saw the source as an occupant of its own destination and
+            # blocked every "Back To Me" -> "Back to Me" fix. Identity is decided by
+            # inode, not by comparing two spellings of one path.
+            try:
+                if os.path.samestat(destination_stat, source.lstat()):
+                    return [], None
+            except OSError:
+                pass
             identical = False
             if stat.S_ISREG(destination_stat.st_mode) and not stat.S_ISLNK(
                 destination_stat.st_mode

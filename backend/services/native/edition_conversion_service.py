@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 from pathlib import Path
 import secrets
 import shutil
@@ -69,7 +70,16 @@ if TYPE_CHECKING:
     from services.native.target_import_library_service import TargetImportLibraryService
     from services.preferences_service import PreferencesService
     from infrastructure.audio.fingerprinter import AudioFingerprinter
+    from models.audio import FingerprintResult
 
+
+logger = logging.getLogger(__name__)
+
+# Embedded-tag evidence strong enough to stand in for an audio confirmation: the
+# file's own ``release_track_mbid`` names this exact track of this exact release,
+# which is a narrower claim than a recording match. Weaker evidence kinds only say
+# "some release uses this recording" and must not authorise a destructive convert.
+_TAG_EVIDENCE_EXACT_TRACK = "release_track"
 
 _ACQUISITION_ESTIMATE_FLOOR = 8 * 1024 * 1024
 _DISK_SAFETY_BYTES = 64 * 1024 * 1024
@@ -735,6 +745,65 @@ class EditionConversionService:
             )
         return refreshed
 
+    @staticmethod
+    def _assert_retained_recording(
+        fingerprint: FingerprintResult,
+        *,
+        target: EditionConversionTarget,
+        evidence_kind: str | None,
+    ) -> None:
+        """Confirm a retained file really is the edition's track, or refuse by name.
+
+        A conversion recycles every file it does not retain, so each retained track
+        is re-checked here rather than trusted from the earlier tag match. Two
+        things this must NOT do, both of which made the check reject correct files:
+
+        * compare against a single MBID. AcoustID answers with every recording
+          entity the audio resolves to, in no meaningful order, and MusicBrainz
+          splits one performance across editions - on this library 12 of 18 Life of
+          Pablo tracks carried the wanted MBID somewhere other than first.
+        * treat "AcoustID could not tell us" as "the track is wrong". A missing key,
+          a network failure, or an entity AcoustID simply has no link for says
+          nothing about the file, and blaming the track sends the user looking for
+          a corrupt rip that does not exist.
+
+        So: an audio confirmation passes it; otherwise the file's own
+        ``release_track_mbid`` tag - which names this track of this release
+        outright - carries it, and anything weaker is refused with the reason.
+        """
+        wanted = target.recording_mbid.casefold()
+        if fingerprint.status == "pass":
+            matched = {
+                str(value).casefold()
+                for value in (*fingerprint.recording_ids, fingerprint.recording_id)
+                if value
+            }
+            if wanted in matched:
+                return
+
+        if evidence_kind == _TAG_EVIDENCE_EXACT_TRACK:
+            logger.info(
+                "Retained conversion track %s (%s) accepted on its release-track tag; "
+                "AcoustID returned %s",
+                target.track_number,
+                target.title,
+                fingerprint.status,
+            )
+            return
+
+        if fingerprint.status == "pass":
+            raise ValidationError(
+                f"The audio of retained track {target.track_number} "
+                f"({target.title!r}) matches a different recording than this "
+                "edition asks for, and its tags do not name that track either."
+            )
+        raise ValidationError(
+            f"Retained track {target.track_number} ({target.title!r}) could not be "
+            f"checked against this edition by audio (AcoustID: "
+            f"{fingerprint.error or fingerprint.status}), and its tags do not name "
+            "that track either."
+        )
+
     async def _ensure_final_preview(
         self, job: EditionConversionJob, *, preview_token: str
     ) -> EditionConversionJob:
@@ -747,6 +816,9 @@ class EditionConversionService:
         ]
         tracks_by_id = {str(value["id"]): value for value in indexed}
         artifacts = {value.target_ordinal: value for value in job.artifacts}
+        evidence_by_track = {
+            value.local_track_id: value.evidence_kind for value in job.local_files
+        }
         await asyncio.to_thread(self._held_dir.mkdir, parents=True, exist_ok=True)
         for target in job.targets:
             if target.ordinal in artifacts:
@@ -777,15 +849,11 @@ class EditionConversionService:
                     asyncio.to_thread(_sha256_file, held),
                 )
                 fingerprint = await self._fingerprinter.fingerprint(held)
-                if (
-                    fingerprint.status != "pass"
-                    or not fingerprint.recording_id
-                    or fingerprint.recording_id.casefold()
-                    != target.recording_mbid.casefold()
-                ):
-                    raise ValidationError(
-                        "A retained track could not be verified as the requested recording."
-                    )
+                self._assert_retained_recording(
+                    fingerprint,
+                    target=target,
+                    evidence_kind=evidence_by_track.get(target.kept_local_track_id),
+                )
                 artifact = EditionConversionArtifact(
                     id=str(uuid.uuid4()),
                     job_id=job.id,

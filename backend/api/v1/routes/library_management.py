@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Response, status
 
 from api.v1.schemas.library_management import (
     LibraryManagementChangeImpact,
@@ -33,6 +33,7 @@ from api.v1.schemas.library_management_preview import (
     LibraryManagementProfileDeleteRequest,
     LibraryManagementProfileMutationResponse,
     LibraryManagementProfileUpdateRequest,
+    LibraryManagementRecoveryAcknowledgeResponse,
     LibraryManagementRecoveryDiagnosticsResponse,
     LibraryManagementResultPageResponse,
     LibraryManagementSettingsImpactRequest,
@@ -460,6 +461,25 @@ async def get_library_management_operation(
     return await service.detail(job_id)
 
 
+@router.delete(
+    "/library/management/operations/{job_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_library_management_operation(
+    job_id: str,
+    admin: CurrentAdminDep,
+    service: LibraryManagementPreviewServiceDep,
+) -> None:
+    """Remove one finished run from the operation history.
+
+    The run's own records go with it - including its undo evidence, so a deleted run
+    can no longer be undone. What other rows recorded about the library (the catalog
+    audit trail, each track's management state) is kept; only their pointer to this
+    run is cleared.
+    """
+    await service.delete_operation(job_id)
+
+
 @router.post(
     "/library/management/operations/{job_id}/undo-preview",
     response_model=LibraryManagementPreviewCreatedResponse,
@@ -537,6 +557,29 @@ async def get_library_management_recovery_diagnostics(
     service: LibraryManagementRecoveryServiceDep,
 ) -> LibraryManagementRecoveryDiagnosticsResponse:
     return LibraryManagementRecoveryDiagnosticsResponse(**await service.diagnostics())
+
+
+@router.post(
+    "/library/management/recovery/acknowledge",
+    response_model=LibraryManagementRecoveryAcknowledgeResponse,
+)
+async def acknowledge_library_management_recovery_attention(
+    service: LibraryManagementRecoveryServiceDep,
+) -> LibraryManagementRecoveryAcknowledgeResponse:
+    """Dismiss recovery items that cannot be finished automatically.
+
+    Recovery marks a bundle ``needs_attention`` when it can neither roll forward
+    nor roll back (typically the destination and the backup are both gone). It then
+    stops touching it - correctly - but the alert had no way to be cleared, so it
+    stayed on screen permanently with no action available behind it.
+    """
+    acknowledged = await service.acknowledge_attention()
+    return LibraryManagementRecoveryAcknowledgeResponse(
+        acknowledged_count=acknowledged,
+        diagnostics=LibraryManagementRecoveryDiagnosticsResponse(
+            **await service.diagnostics()
+        ),
+    )
 
 
 @router.get(

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, Download, Loader2, X } from 'lucide-svelte';
+	import { Check, Download, Loader2, X } from '@lucide/svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';

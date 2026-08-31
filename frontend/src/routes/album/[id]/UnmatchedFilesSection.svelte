@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Pause, Play, Trash2, TriangleAlert, X } from 'lucide-svelte';
+	import { Pause, Play, Trash2, TriangleAlert, X } from '@lucide/svelte';
 
 	import { API } from '$lib/constants';
 	import { removeLibraryTrack } from '$lib/queries/library/LibraryMutations.svelte';

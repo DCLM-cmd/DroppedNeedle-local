@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Fingerprint } from 'lucide-svelte';
+	import { Fingerprint } from '@lucide/svelte';
 
 	import type { LibraryArtistSummary } from '$lib/types';
 

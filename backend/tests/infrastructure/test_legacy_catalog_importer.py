@@ -665,6 +665,11 @@ async def test_startup_integrity_logs_sanitized_clause_timings(
 ) -> None:
     _database, store = await _migrate_startup_fixture(tmp_path, "timed-integrity")
     caplog.set_level(logging.INFO)
+    # The migration above runs its own integrity pass. Whether those records land
+    # here depends on the root log level a PREVIOUS test happened to leave behind,
+    # which made this assertion pass or fail on test order alone. Only the records
+    # from the validate() call below are under test.
+    caplog.clear()
 
     await TargetStartupValidator(store).validate("steady_state")
 

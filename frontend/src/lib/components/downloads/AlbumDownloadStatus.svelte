@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { FolderLock, RotateCcw, TimerOff, X } from 'lucide-svelte';
+	import { FolderLock, RotateCcw, TimerOff, X } from '@lucide/svelte';
 
 	import {
 		cancelDownload,

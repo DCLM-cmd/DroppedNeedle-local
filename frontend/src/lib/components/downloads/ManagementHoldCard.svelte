@@ -7,7 +7,7 @@
 		Settings2,
 		Trash2,
 		X
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import {

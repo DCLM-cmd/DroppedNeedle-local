@@ -24,7 +24,7 @@
 		TriangleAlert,
 		ChevronDown,
 		Pin
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { rescanAlbum } from '$lib/queries/library/LibraryMutations.svelte';
 	import { requestUpgradeAlbum } from '$lib/queries/downloads/UpgradeQueries.svelte';
 	import {

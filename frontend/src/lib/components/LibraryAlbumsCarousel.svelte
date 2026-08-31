@@ -4,7 +4,7 @@
 	import CarouselSkeleton from './CarouselSkeleton.svelte';
 	import AlbumCard from './AlbumCard.svelte';
 	import { libraryStore } from '$lib/stores/library';
-	import { Library } from 'lucide-svelte';
+	import { Library } from '@lucide/svelte';
 
 	interface Props {
 		releases: ReleaseGroup[];

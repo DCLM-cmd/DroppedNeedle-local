@@ -27,7 +27,7 @@
 		getLocalDecadesQuery,
 		getLocalStatsQuery
 	} from '$lib/queries/local/LocalQueries.svelte';
-	import { ChevronDown, Headphones, Play, Shuffle, Clock } from 'lucide-svelte';
+	import { ChevronDown, Headphones, Play, Shuffle, Clock } from '@lucide/svelte';
 
 	const MBID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 	const isMbid = (id?: string | null): id is string => !!id && MBID_RE.test(id);

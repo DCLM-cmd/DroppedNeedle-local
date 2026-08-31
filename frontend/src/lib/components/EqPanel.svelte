@@ -9,7 +9,7 @@
 		EQ_PRESET_NAMES,
 		type EqPresetName
 	} from '$lib/stores/eqPresets';
-	import { X, RotateCcw } from 'lucide-svelte';
+	import { X, RotateCcw } from '@lucide/svelte';
 	import { fly } from 'svelte/transition';
 
 	let { open = $bindable(), onclose }: { open: boolean; onclose: () => void } = $props();

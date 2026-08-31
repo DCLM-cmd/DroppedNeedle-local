@@ -10,7 +10,7 @@
 		ShieldAlert,
 		Sparkles,
 		X
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';

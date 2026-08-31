@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CircleCheck, CircleX, DownloadCloud } from 'lucide-svelte';
+	import { CircleCheck, CircleX, DownloadCloud } from '@lucide/svelte';
 
 	import { getLidarrImportConfigQuery } from '$lib/queries/lidarr-import/LidarrImportQueries.svelte';
 	import {

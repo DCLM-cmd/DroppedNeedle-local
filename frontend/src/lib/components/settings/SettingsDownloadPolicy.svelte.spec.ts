@@ -64,7 +64,7 @@ describe('SettingsDownloadPolicy upgrade controls', () => {
 
 	it('seeds the cutoff and upgrades toggle from the saved policy', async () => {
 		h.policy = { ...basePolicy, quality_cutoff: 'mp3_320', upgrade_allowed: true };
-		const { container } = render(SettingsDownloadPolicy);
+		const { container } = await render(SettingsDownloadPolicy);
 
 		await expect
 			.element(page.getByRole('checkbox', { name: 'Allow automatic upgrades' }))
@@ -74,7 +74,7 @@ describe('SettingsDownloadPolicy upgrade controls', () => {
 
 	it('disables cutoff options outside the accepted quality band', async () => {
 		h.policy = { ...basePolicy, quality_min: 'mp3_256', quality_max: 'mp3_320' };
-		const { container } = render(SettingsDownloadPolicy);
+		const { container } = await render(SettingsDownloadPolicy);
 		await expect
 			.element(page.getByRole('checkbox', { name: 'Allow automatic upgrades' }))
 			.toBeVisible();
@@ -98,7 +98,7 @@ describe('SettingsDownloadPolicy upgrade controls', () => {
 			quality_max: 'mp3_256',
 			quality_cutoff: 'lossless'
 		};
-		const { container } = render(SettingsDownloadPolicy);
+		const { container } = await render(SettingsDownloadPolicy);
 		await expect
 			.element(page.getByRole('checkbox', { name: 'Allow automatic upgrades' }))
 			.toBeVisible();

@@ -23,7 +23,7 @@
 		Music2,
 		Search,
 		X
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import type { NativeTrackListItem, NativeTrackPage, TrackSort } from '$lib/types';
 	import { untrack } from 'svelte';
 

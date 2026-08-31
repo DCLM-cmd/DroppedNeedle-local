@@ -2,7 +2,7 @@
 
 Group candidate files by ``(username, parent_directory)``, score folder
 coherence, then rank by identity (coherence + per-file confidence) alone; peer
-availability (speed / free slots) is a banded tiebreaker that can never buy
+availability (free slot / queue depth / speed) is a banded tiebreaker that can never buy
 acceptance, and ``tier='auto'`` additionally requires the requested artist to be
 named somewhere in the folder's remote paths (D2/D3, 2026-07-05 incident).
 
@@ -11,19 +11,20 @@ Review tab's "Show all results anyway" needs no re-search. Quarantined
 ``(username, filename)`` sources are dropped before scoring. Non-audio sidecars
 (cover art, cue, log, m3u) a folder search returns are excluded before judging - a
 quality gate then drops folders whose audio is outside ``quality_min``..``quality_max``
-or, when ``flac_mp3_only``, contains a non-FLAC/MP3 track; ranking prefers the highest
-tier absolutely.
+or, when ``flac_mp3_only``, contains a non-FLAC/MP3 track. Acceptance tier and identity
+band precede quality, so a weak hi-res folder cannot hide a safe standard-lossless match.
 CJK strings skip ``unidecode``; off-version matches (remix/live/acoustic vs
 original) are penalised x0.3.
 """
 
-import asyncio
 import logging
 import math
 import re
 import unicodedata
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 
+import msgspec
 from rapidfuzz import fuzz
 from unidecode import unidecode
 
@@ -41,14 +42,18 @@ from services.native.acquisition.decision import (
     SpecPolicy,
 )
 from services.native.acquisition.specs.quarantine import quarantine
-from services.native.title_match import artist_evidence, title_containment_score
+from services.native.title_match import (
+    artist_evidence,
+    names_different_album,
+    title_containment_score,
+)
 from services.native.quality_tiers import (
     DEFAULT_QUALITY_MAX,
     DEFAULT_QUALITY_MIN,
     candidate_tier,
-    exceeds_lossless_cap,
     folder_hires_key,
     is_audio,
+    exceeds_lossless_cap,
     is_flac_or_mp3,
     tier_rank,
 )
@@ -69,29 +74,14 @@ _CJK_RANGES = (
     (0x3400, 0x4DBF),  # CJK Extension A
 )
 _JUNK_KEYWORDS = ("various", "unknown album", "untitled", "misc")
+_LEADING_RELEASE_YEAR = re.compile(r"^\s*(?:\[\d{4}\]|\(\d{4}\)|\d{4}\s*[-–]\s*)\s*")
+# How much larger than the tracklist a folder may be and still read as this release
+# (bonus tracks, a deluxe edition, every disc of a set in one folder).
+_COUNT_OVERSHOOT = 1.35
 
 logger = logging.getLogger(__name__)
 
-
-def peer_speed_score(speed_bps: float) -> float:
-    """Normalise a peer's reported average upload speed (slskd ``uploadSpeed``,
-    BYTES/second) to 0..1 on a log scale: 0 at <=10 KB/s, ~0.33 at 100 KB/s,
-    ~0.67 at 1 MB/s, 1.0 at >=10 MB/s. The old ``min(1, speed/1000)`` treated the
-    value as KB/s, so any peer above 1 KB/s saturated to 1.0 and speed never
-    actually differentiated candidates - picks looked random w.r.t. peer speed."""
-    if speed_bps <= 10_000:
-        return 0.0
-    return min(1.0, math.log10(speed_bps / 10_000) / 3.0)
-
-
-def peer_availability(files: list[DownloadSearchResult]) -> float:
-    """0..1 peer-availability rank signal: mostly the peer's upload speed, plus a
-    bonus for a free upload slot (a fast peer with a queue still beats a near-dead
-    one with a free slot). Shared by the album scorer and the track matcher; used
-    as a TIEBREAKER within an identity band - never to buy acceptance (D3)."""
-    speed = peer_speed_score(max((f.upload_speed for f in files), default=0))
-    slot = 1.0 if any(f.has_free_slot for f in files) else 0.0
-    return 0.7 * speed + 0.3 * slot
+_ACCEPTANCE_RANK = {"rejected": 0, "manual": 1, "auto": 2}
 
 
 def _has_cjk(text: str) -> bool:
@@ -127,7 +117,128 @@ def _ext_from_filename(filename: str) -> str:
 
 def _effective_extension(file: DownloadSearchResult) -> str:
     """slskd's ``extension`` can be empty (C6a); fall back to the filename."""
-    return file.extension.lower() if file.extension else _ext_from_filename(file.filename)
+    return (
+        file.extension.lower() if file.extension else _ext_from_filename(file.filename)
+    )
+
+
+def _has_artist_evidence(
+    target: TargetAlbum, files: list[DownloadSearchResult]
+) -> bool:
+    return "various" in (target.artist_name or "").lower() or any(
+        artist_evidence(target.artist_name, file.filename) for file in files
+    )
+
+
+def _album_identity_text(
+    target: TargetAlbum, parent: str, files: list[DownloadSearchResult]
+) -> str:
+    # A leading release year is folder organisation, not album identity. Leaving it
+    # first makes the title parser stop at the year before it can see distinguishing
+    # words ("[2025] So Long, Avalon" previously slipped through for "Avalon").
+    album_leaf = _LEADING_RELEASE_YEAR.sub("", parent) or parent
+    return (
+        f"{target.artist_name} - {album_leaf}"
+        if _has_artist_evidence(target, files)
+        else album_leaf
+    )
+
+
+# slskd reports uploadSpeed in BYTES per second. Below the floor a peer is not
+# realistically going to deliver an album; above the ceiling the difference stops
+# mattering. Between them the useful range spans three orders of magnitude, so the
+# curve is logarithmic - linear scaling would make every ordinary peer look identical.
+_PEER_SPEED_DEAD_BYTES = 5_000
+_PEER_SPEED_SATURATION_BYTES = 20_000_000
+_PEER_SPEED_SPAN = math.log(_PEER_SPEED_SATURATION_BYTES / _PEER_SPEED_DEAD_BYTES)
+
+
+def peer_speed_score(upload_speed: float | None) -> float:
+    """Normalise a peer's advertised upload speed to 0.0 - 1.0."""
+    if not upload_speed or upload_speed <= _PEER_SPEED_DEAD_BYTES:
+        return 0.0
+    if upload_speed >= _PEER_SPEED_SATURATION_BYTES:
+        return 1.0
+    return math.log(upload_speed / _PEER_SPEED_DEAD_BYTES) / _PEER_SPEED_SPAN
+
+
+def peer_availability(files: Sequence[DownloadSearchResult]) -> float:
+    """How likely this peer is to actually deliver, as one 0.0 - 1.0 score.
+
+    Speed dominates deliberately: a fast peer with a queue finishes long before a
+    peer with a free slot and no throughput, so a free slot alone must not outrank
+    real bandwidth.
+    """
+    if not files:
+        return 0.0
+    speed = min(peer_speed_score(file.upload_speed) for file in files)
+    free_slot = 1.0 if all(file.has_free_slot for file in files) else 0.0
+    queue_lengths = [
+        file.queue_length for file in files if file.queue_length is not None
+    ]
+    longest = max(queue_lengths) if queue_lengths else None
+    queue = 1.0 / (1.0 + longest) if longest is not None else 0.0
+    return 0.6 * speed + 0.25 * free_slot + 0.15 * queue
+
+
+def _availability_key(candidate: ScoredCandidate) -> tuple[int, int, int, int, int]:
+    queue_lengths = [
+        file.queue_length for file in candidate.files if file.queue_length is not None
+    ]
+    complete_queue = max(queue_lengths) if queue_lengths else 2**31 - 1
+    return (
+        int(
+            bool(candidate.files)
+            and all(file.has_free_slot for file in candidate.files)
+        ),
+        int(len(queue_lengths) == len(candidate.files)),
+        -complete_queue,
+        min((file.upload_speed for file in candidate.files), default=0),
+        -sum(file.size for file in candidate.files),
+    )
+
+
+def _candidate_rank_key(candidate: ScoredCandidate) -> tuple[int | float, ...]:
+    return (
+        _ACCEPTANCE_RANK.get(candidate.tier, 0),
+        tier_rank(candidate_tier(candidate.files)),
+        *folder_hires_key(candidate.files),
+        *_availability_key(candidate),
+        candidate.final_score,
+    )
+
+
+def rank_stored_candidates(
+    target: TargetAlbum, candidates: list[ScoredCandidate]
+) -> list[ScoredCandidate]:
+    """Apply current safety and ranking rules to a read-only review projection.
+
+    The persisted index is retained for the pick endpoint. Older parked reviews
+    improve after an upgrade without rewriting jobs or starting downloads.
+    """
+    by_source: dict[str, list[ScoredCandidate]] = {}
+    source_order: list[str] = []
+    for original_index, candidate in enumerate(candidates):
+        source = candidate.source or "soulseek"
+        if source == "soulseek" and names_different_album(
+            target.album_title,
+            target.artist_name,
+            _album_identity_text(target, candidate.parent_directory, candidate.files),
+        ):
+            continue
+        if source not in by_source:
+            by_source[source] = []
+            source_order.append(source)
+        by_source[source].append(
+            msgspec.structs.replace(candidate, candidate_index=original_index)
+        )
+
+    projected: list[ScoredCandidate] = []
+    for source in source_order:
+        projected.extend(
+            sorted(by_source[source], key=_candidate_rank_key, reverse=True)
+        )
+    return projected
 
 
 def _artist_from_path(parent_directory: str, target_artist: str = "") -> str:
@@ -216,6 +327,30 @@ def _file_confidence(
     return base * version_penalty
 
 
+def _count_ratio(counted: int, expected: int) -> float:
+    """How well a folder's audio count matches the release's track count, 0..1.
+
+    Clamping the ratio at 1.0 scored ANY overshoot as a perfect match, so a 77-file
+    dump read as a flawless 15-track album and rode a 0.40-weight freebie into
+    auto-acceptance. A folder holding five times the tracks is not this release.
+
+    Overshoot up to ``_COUNT_OVERSHOOT`` still scores full: bonus tracks, a hidden
+    track, or a deluxe edition of the requested release are the same album, and a
+    multi-disc folder legitimately carries every disc at once. Past that the ratio
+    inverts and decays, so the further a folder is from the expected size the less
+    coherent it reads - a gradient, not a cliff, because track counts themselves
+    disagree between editions.
+    """
+    if expected <= 0:
+        return 0.5
+    if counted <= expected:
+        return counted / expected
+    allowed = expected * _COUNT_OVERSHOOT
+    if counted <= allowed:
+        return 1.0
+    return allowed / counted
+
+
 class AlbumPreflightScorer:
     def __init__(
         self,
@@ -229,11 +364,16 @@ class AlbumPreflightScorer:
     ):
         self._store = download_store
         self._flac_mp3_only = flac_mp3_only
+        # 0 = no cap. Above it, a 24/192 rip is rejected: it is several times the size
+        # of the same album at 16/44.1 for no audible gain on most setups, and slskd
+        # reports no bitRate for lossless so the tier axis alone cannot express it.
         self._lossless_max_kbps = lossless_max_kbps
         # The full spec policy: passed by the composition root (built from
         # DownloadPolicySettings) or derived from the quality kwargs in tests. The size/
         # term/age gates default off, so a quality-only construction is behaviour-unchanged.
-        self._policy = policy or SpecPolicy(quality_min=quality_min, quality_max=quality_max)
+        self._policy = policy or SpecPolicy(
+            quality_min=quality_min, quality_max=quality_max
+        )
 
     async def rank(
         self,
@@ -245,39 +385,22 @@ class AlbumPreflightScorer:
         held_tier: str | None = None,
     ) -> list[ScoredCandidate]:
         context = await build_context(self._store, held_tier=held_tier)
-        # Everything below is pure-CPU (rapidfuzz/unidecode over potentially thousands
-        # of results, seconds of work): run it in a worker thread so the event loop -
-        # every other request, SSE stream and poll - keeps breathing while a search's
-        # results are being scored ("the app hangs while something loads").
-        return await asyncio.to_thread(
-            self._rank_sync,
-            target,
-            results,
-            context,
-            auto_accept_threshold=auto_accept_threshold,
-            manual_threshold=manual_threshold,
-        )
-
-    def _rank_sync(
-        self,
-        target: TargetAlbum,
-        results: list[DownloadSearchResult],
-        context,  # noqa: ANN001 - DecisionContext
-        *,
-        auto_accept_threshold: float,
-        manual_threshold: float,
-    ) -> list[ScoredCandidate]:
         policy = self._policy
         # Soulseek quarantine is file-granular (a peer may have just one bad file): apply
         # it as a pool pre-filter via the shared spec, so a quarantined file is dropped
         # before grouping while the folder's other files survive.
         filtered = [
-            r for r in results
+            r
+            for r in results
             if isinstance(
                 quarantine(
-                    Candidate(source="soulseek",
-                              identity=soulseek_identity(r.username, r.filename)),
-                    target, context, policy,
+                    Candidate(
+                        source="soulseek",
+                        identity=soulseek_identity(r.username, r.filename),
+                    ),
+                    target,
+                    context,
+                    policy,
                 ),
                 Accept,
             )
@@ -304,13 +427,20 @@ class AlbumPreflightScorer:
             if self._flac_mp3_only and not all(is_flac_or_mp3(f) for f in audio):
                 drop_codec += 1
                 continue
-            # lossless bitrate cap (0 = off): the whole folder is downloaded, so one
-            # over-cap hi-res file (e.g. a 24/192 rip at ~4000 kbps) disqualifies it.
-            if self._lossless_max_kbps and any(
+            # A folder is downloaded whole, so ONE over-cap track condemns it.
+            if any(
                 exceeds_lossless_cap(f, self._lossless_max_kbps) for f in audio
             ):
                 drop_lossless_cap += 1
                 continue
+            # Positive artist evidence lets the wrong-album spec judge the album-level
+            # leaf with trusted artist context. The leaf alone (for example
+            # "So Long, Avalon") cannot pass that spec's same-artist guard, while feeding
+            # an entire remote path would mistake share-root and track-title words for
+            # album identity. This signal also remains the independent auto-accept gate.
+            has_evidence = _has_artist_evidence(target, audio)
+            album_identity_text = _album_identity_text(target, parent, audio)
+
             # Shared spec pipeline - the SAME rules as the Usenet path: blocklist (a folder
             # carries no single identity, so it's a no-op here - quarantine was applied
             # per-file above), wrong-edition + wrong-album (a live/boxset or a different
@@ -321,10 +451,13 @@ class AlbumPreflightScorer:
                 Candidate(
                     source="soulseek",
                     match_text=parent,
+                    album_identity_text=album_identity_text,
                     tier=candidate_tier(audio),
                     size_bytes=sum(f.size for f in audio),
                 ),
-                target, context, policy,
+                target,
+                context,
+                policy,
             )
             if isinstance(decision, Reject):
                 pipeline_drops[decision.code] += 1
@@ -341,7 +474,9 @@ class AlbumPreflightScorer:
             qualified_count = None
             if target.track_count == 1:
                 artist_words = frozenset(
-                    t for t in _normalize_for_match(target.artist_name).split() if len(t) >= 2
+                    t
+                    for t in _normalize_for_match(target.artist_name).split()
+                    if len(t) >= 2
                 )
                 qualified_count = sum(
                     1
@@ -354,10 +489,15 @@ class AlbumPreflightScorer:
                     >= 0.60
                 )
 
-            coherence = self._coherence(target, audio, parent, qualified_count=qualified_count)
+            coherence = self._coherence(
+                target, audio, parent, qualified_count=qualified_count
+            )
             confidences = [
                 _file_confidence(
-                    target.album_title, target.artist_name, target.duration_seconds, f,
+                    target.album_title,
+                    target.artist_name,
+                    target.duration_seconds,
+                    f,
                     strict_title=target.track_count == 1,
                 )
                 for f in audio
@@ -370,14 +510,6 @@ class AlbumPreflightScorer:
             # coherence:confidence ratio is preserved and the scale stays 0..1, so the
             # persisted preflight_score_auto_accept keeps meaning what it always meant.
             final = 0.625 * coherence + 0.375 * avg_confidence
-
-            # Auto-acceptance must be EARNED by identity evidence (D2): a folder whose
-            # full remote paths never name the requested artist caps at 'manual' - one
-            # human click in Review instead of a silent wrong grab. Various-artists
-            # requests skip the gate (the album artist legitimately differs per track).
-            has_evidence = "various" in (target.artist_name or "").lower() or any(
-                artist_evidence(target.artist_name, f.filename) for f in audio
-            )
 
             if final >= auto_accept_threshold and has_evidence:
                 tier = "auto"
@@ -407,23 +539,11 @@ class AlbumPreflightScorer:
                 )
             )
 
-        def _availability(c: ScoredCandidate) -> float:
-            return peer_availability(c.files)
-
-        # highest tier first (any decent FLAC beats any MP3), then hi-res before 16/44
-        # within the tier (H1), then best match - with availability as a BANDED
-        # tiebreaker only (D3): candidates within the same 0.05 identity band order by
-        # peer speed/slots, but availability can never outrank a better identity match.
-        scored.sort(
-            key=lambda c: (
-                tier_rank(candidate_tier(c.files)),
-                *folder_hires_key(c.files),
-                int(c.final_score / 0.05),
-                _availability(c),
-                c.final_score,
-            ),
-            reverse=True,
-        )
+        # Eligibility is absolute: a rejected/manual hi-res folder must never hide a
+        # safe automatic result. Once candidates pass the same safety tier, quality
+        # and resolution are absolute. Complete-folder availability (free slot,
+        # slowest queue, slowest advertised speed, then size) breaks quality ties.
+        scored.sort(key=_candidate_rank_key, reverse=True)
         ranked = scored[:50]
         logger.info(
             "preflight.ranked",
@@ -457,7 +577,7 @@ class AlbumPreflightScorer:
         complete single (count_ratio was a 0.40-weight freebie in the incident)."""
         counted = len(files) if qualified_count is None else qualified_count
         if target.track_count and target.track_count > 0:
-            count_ratio = min(1.0, counted / target.track_count)
+            count_ratio = _count_ratio(counted, target.track_count)
         else:
             count_ratio = 0.5
 
@@ -473,7 +593,9 @@ class AlbumPreflightScorer:
         )
 
         formats = {_effective_extension(f) for f in files if _effective_extension(f)}
-        format_consistency = 1.0 if len(formats) == 1 else (0.5 if len(formats) <= 2 else 0.2)
+        format_consistency = (
+            1.0 if len(formats) == 1 else (0.5 if len(formats) <= 2 else 0.2)
+        )
 
         bitrates = [f.bitrate for f in files if f.bitrate]
         if bitrates:
@@ -486,7 +608,9 @@ class AlbumPreflightScorer:
         else:
             bitrate_consistency = 0.5
 
-        no_junk = 0.0 if any(k in parent_directory.lower() for k in _JUNK_KEYWORDS) else 1.0
+        no_junk = (
+            0.0 if any(k in parent_directory.lower() for k in _JUNK_KEYWORDS) else 1.0
+        )
 
         return (
             0.40 * count_ratio

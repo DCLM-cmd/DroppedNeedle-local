@@ -220,6 +220,15 @@ class SourceStrategy(Protocol):
         ...
 
 
+def _has_pickable(ranked) -> bool:  # noqa: ANN001
+    """Whether a scoring pass produced anything the orchestrator would actually grab.
+
+    ``rejected`` rows exist only to populate the Review tab, so a pass that produced
+    nothing but rejects is a miss and worth retrying under another name.
+    """
+    return any(candidate.tier in {"auto", "manual"} for candidate in ranked or [])
+
+
 class SoulseekStrategy:
     """slskd / Soulseek. Per-track grabs match a single track; albums match the folder."""
 
@@ -241,6 +250,7 @@ class SoulseekStrategy:
         naming_template,
         library=None,
         album_service=None,
+        alias_resolver=None,
     ):
         self._indexer = indexer
         self._scorer = scorer
@@ -254,6 +264,10 @@ class SoulseekStrategy:
         # Resolves the held tier an origin='upgrade' run must beat (upgrade-floor, D12).
         self._library = library
         self._album_service = album_service
+        # ``artist_mbid -> [alias name]``. Soulseek peers share under the name THEY use,
+        # which for a non-Latin-script artist is often a transliteration MusicBrainz
+        # records as an alias - so a search under the primary name finds nothing at all.
+        self._alias_resolver = alias_resolver
 
     @property
     def client(self):  # noqa: ANN201
@@ -269,9 +283,47 @@ class SoulseekStrategy:
     async def maybe_blocklist_on_failure(
         self, task, status, *, completed, enumerated_any
     ):  # noqa: ANN001, ANN201, ARG002
-        # No-op: a failed slskd peer is quarantined per-file at IMPORT (see import_files);
-        # there's no release-level blocklist to apply at failover time.
-        return
+        await self._quarantine_undelivered(task, status)
+
+    async def maybe_blocklist_on_abandon(self, task, status):  # noqa: ANN001, ANN201
+        await self._quarantine_undelivered(task, status)
+
+    async def _quarantine_undelivered(self, task, status):  # noqa: ANN001
+        """Quarantine the files this peer never delivered.
+
+        Files that arrived are already judged on their own merits at import; these are
+        the ones the peer failed or that we gave up waiting for. Without this, the next
+        search and every auto-retry re-pick the same dead source and stall the same way.
+        Best-effort: a source that cannot be blamed precisely is simply not blamed.
+        """
+        source_username = getattr(task, "source_username", None)
+        if not source_username:
+            return
+        manifest_path = self._staging / task.id / "manifest.json"
+        try:
+            manifest = self._manifest_codec.decode(manifest_path.read_bytes())
+        except (OSError, ValueError):
+            return
+        delivered = {
+            name for name in (getattr(status, "succeeded_filenames", None) or [])
+        }
+        for expected in manifest.target_files:
+            if expected.filename in delivered:
+                continue
+            await self._store.record_quarantine(
+                source="soulseek",
+                identity=soulseek_identity(source_username, expected.filename),
+                reason="download_failed",
+                release_group_mbid=task.release_group_mbid,
+            )
+        logger.info(
+            "download.source_quarantined",
+            extra={
+                "task_id": task.id,
+                "peer": source_username,
+                "undelivered": len(manifest.target_files) - len(delivered),
+            },
+        )
 
     async def search_and_score(self, task, *, timeout, auto, manual):  # noqa: ANN001, ANN201
         held_tier = await _upgrade_held_tier(self._library, task)
@@ -328,15 +380,35 @@ class SoulseekStrategy:
                 manual_threshold=manual,
                 held_tier=held_tier,
             )
+        ranked = await self._score_album_under(
+            task, task.artist_name, timeout=timeout, auto=auto, manual=manual,
+            held_tier=held_tier,
+        )
+        if _has_pickable(ranked):
+            return ranked
+        alias_ranked = await self._search_under_aliases(
+            task, timeout=timeout, auto=auto, manual=manual, held_tier=held_tier
+        )
+        # The primary pass may have produced rejected-tier rows worth showing in Review;
+        # only replace them when the alias pass actually found something pickable.
+        return alias_ranked if _has_pickable(alias_ranked) else ranked
+
+    async def _score_album_under(
+        self, task, artist_name, *, timeout, auto, manual, held_tier
+    ):  # noqa: ANN001, ANN201
+        """One album search+score pass under ``artist_name``.
+
+        The scoring target carries the same name the search used, so artist-evidence
+        judges the folder against the name the peers actually share under."""
         target = TargetAlbum(
-            artist_name=task.artist_name,
+            artist_name=artist_name,
             album_title=task.album_title,
             year=task.year,
             track_count=task.track_count,
             release_group_mbid=task.release_group_mbid,
         )
         indexer_results = await self._indexer.search_album(
-            task.artist_name,
+            artist_name,
             task.album_title,
             task.year,
             task.track_count,
@@ -350,6 +422,43 @@ class SoulseekStrategy:
             manual_threshold=manual,
             held_tier=held_tier,
         )
+
+    async def _search_under_aliases(
+        self, task, *, timeout, auto, manual, held_tier
+    ):  # noqa: ANN001, ANN201
+        """Re-search under the artist's MusicBrainz aliases, best pass wins.
+
+        Best-effort throughout: no resolver, no MBID, a resolver error or no usable
+        alias all just mean "no alias pass", never a failed acquisition."""
+        if self._alias_resolver is None or not task.artist_mbid:
+            return []
+        try:
+            aliases = await self._alias_resolver(task.artist_mbid)
+        except Exception:  # noqa: BLE001 - an alias lookup is an optional extra
+            logger.warning(
+                "Alias lookup failed for artist %s; keeping the primary result",
+                task.artist_mbid,
+            )
+            return []
+        primary = (task.artist_name or "").strip().casefold()
+        seen: set[str] = set()
+        for alias in aliases or []:
+            name = (alias or "").strip()
+            folded = name.casefold()
+            if not name or folded == primary or folded in seen:
+                continue
+            seen.add(folded)
+            ranked = await self._score_album_under(
+                task, name, timeout=timeout, auto=auto, manual=manual,
+                held_tier=held_tier,
+            )
+            if _has_pickable(ranked):
+                logger.info(
+                    "download.alias_search_hit",
+                    extra={"task_id": task.id, "alias": name},
+                )
+                return ranked
+        return []
 
     async def enqueue(
         self, task, candidate, *, strict_track_duration, hold_on_wrong_track=False

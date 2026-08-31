@@ -3,7 +3,7 @@
 	import { artistHref } from '$lib/utils/entityRoutes';
 	import { formatListenCount } from '$lib/utils/formatting';
 	import { getListenTitle } from '$lib/utils/enrichment';
-	import { Music2 } from 'lucide-svelte';
+	import { Music2 } from '@lucide/svelte';
 	import ArtistImage from './ArtistImage.svelte';
 	import ArtistCardDownloadButton from './ArtistCardDownloadButton.svelte';
 

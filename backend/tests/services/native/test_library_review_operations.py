@@ -33,6 +33,7 @@ from core.exceptions import (
     StaleRevisionError,
     ValidationError,
 )
+from infrastructure.persistence._database import reset_connection_pool
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from infrastructure.resilience.retry import CircuitOpenError
 from models.audio import FingerprintResult
@@ -1617,6 +1618,9 @@ async def test_bulk_preview_reads_evidence_setwise_and_operation_staging_resumes
         return connection
 
     monkeypatch.setattr(store, "_connect", traced_connect)
+    # Connections are pooled and this store already has one open, so force every
+    # thread to reopen through the traced factory.
+    reset_connection_pool()
     reviews = LibraryReviewService(store)
     selection = BulkReviewSelection(
         normalized_filter={"state": "needs_review"},

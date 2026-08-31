@@ -9,7 +9,7 @@
 		RotateCcw,
 		Save,
 		ImageIcon
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
 	import { onDestroy } from 'svelte';
 	import type { AdvancedSettingsForm } from './advanced-settings-types';

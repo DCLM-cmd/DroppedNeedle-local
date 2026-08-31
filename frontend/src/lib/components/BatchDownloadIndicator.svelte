@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Download, Check, Minus, ChevronUp, X } from 'lucide-svelte';
+	import { Download, Check, Minus, ChevronUp, X } from '@lucide/svelte';
 	import { batchDownloadStore } from '$lib/stores/batchDownloadStatus.svelte';
 	import { libraryStore } from '$lib/stores/library';
 	import { playerStore } from '$lib/stores/player.svelte';

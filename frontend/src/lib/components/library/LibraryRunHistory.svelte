@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Download, FileClock, LoaderCircle } from 'lucide-svelte';
+	import { Download, FileClock, LoaderCircle } from '@lucide/svelte';
 	import { api } from '$lib/api/client';
 	import { API } from '$lib/constants';
 	import { toastStore } from '$lib/stores/toast';

@@ -5,7 +5,7 @@
 	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 	import { FollowQueryKeyFactory } from '$lib/queries/following/FollowQueryKeyFactory';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { CalendarClock, ExternalLink } from 'lucide-svelte';
+	import { CalendarClock, ExternalLink } from '@lucide/svelte';
 	import { onDestroy, onMount } from 'svelte';
 
 	const form = createSettingsForm<EventsSettings>({

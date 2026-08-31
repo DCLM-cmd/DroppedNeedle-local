@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Copy, Plus, Trash2, TriangleAlert, Waypoints } from 'lucide-svelte';
+	import { Copy, Plus, Trash2, TriangleAlert, Waypoints } from '@lucide/svelte';
 
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';

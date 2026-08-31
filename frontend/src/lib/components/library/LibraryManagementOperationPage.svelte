@@ -13,7 +13,7 @@
 		RotateCcw,
 		ServerCog,
 		ShieldAlert
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import BackButton from '$lib/components/BackButton.svelte';
 	import { API } from '$lib/constants';

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Blocks, CircleAlert, ExternalLink, Github, Trash2 } from 'lucide-svelte';
+	import { Blocks, CircleAlert, ExternalLink, Code as Github, Trash2 } from '@lucide/svelte';
 	import { getPluginsQuery } from '$lib/queries/plugins/PluginQueries.svelte';
 	import {
 		installPluginMutation,

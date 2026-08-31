@@ -352,3 +352,90 @@ async def test_keep_existing_duplicate_is_durable_without_filesystem_publish() -
     assert values["result_json"] == (
         '{"filesystem_writes":0,"resolution":"kept_existing"}'
     )
+
+
+# ---- artwork blurhashes are produced here, not while serving -----------------------
+
+def _worker_with_hashes() -> tuple[LibraryManagementWorker, AsyncMock, AsyncMock]:
+    from services.native.library_image_hash_service import LibraryImageHashService
+
+    store = AsyncMock(spec=NativeLibraryStore)
+    hashes = AsyncMock(spec=LibraryImageHashService)
+    worker = LibraryManagementWorker(
+        store,
+        AsyncMock(spec=LibraryManagementPlanner),
+        AsyncMock(spec=LibraryManagementPublisher),
+        AsyncMock(spec=LibraryManagementUndoService),
+        AsyncMock(spec=LibraryManagementBaselineService),
+        AsyncMock(spec=LibraryManagementDuplicateService),
+        image_hashes=hashes,
+    )
+    store.get_library_management_job_snapshot.return_value = _snapshot()
+    store.checkpoint_operation_control.return_value = None
+    store.claim_operation_work.side_effect = [None]
+    store.finish_library_management_apply.return_value = {
+        "id": "management-1",
+        "state": "succeeded",
+    }
+    return worker, store, hashes
+
+
+@pytest.mark.asyncio
+async def test_a_finished_apply_hashes_the_artwork_it_placed() -> None:
+    """Jellyfin hashes images at the end of a scan and serves the stored value.
+
+    Doing it per request instead made a 100-album listing take 5.1 seconds where
+    Jellyfin needed 0.2 for the same call.
+    """
+    worker, _store, hashes = _worker_with_hashes()
+
+    await worker._run_apply("management-1", "worker-1")
+
+    hashes.backfill.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_apply_still_succeeds_when_hashing_fails() -> None:
+    """A run that moved every file correctly must not be reported as failed because
+    a cover could not be decoded."""
+    worker, _store, hashes = _worker_with_hashes()
+    hashes.backfill.side_effect = OSError("the cover cache is unreadable")
+
+    finished = await worker._run_apply("management-1", "worker-1")
+
+    assert finished["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_hashing_is_optional_so_existing_compositions_still_run() -> None:
+    worker, store, _publisher = _worker()
+    store.claim_operation_work.side_effect = [None]
+
+    finished = await worker._run_apply("management-1", "worker-1")
+
+    assert finished["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_a_finished_apply_gives_back_the_artwork_bytes_it_no_longer_needs():
+    """Runs hold a full copy of every cover in their plan items and import bundle.
+
+    That was 2.67 GB of a 2.90 GB database. The bytes are read only while the run is
+    executing, so a finished run hands them back.
+    """
+    worker, store, _hashes = _worker_with_hashes()
+    store.compact_finished_organization_records.return_value = {"plan_documents": 4}
+
+    await worker._run_apply("management-1", "worker-1")
+
+    store.compact_finished_organization_records.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_apply_still_succeeds_when_compaction_fails() -> None:
+    worker, store, _hashes = _worker_with_hashes()
+    store.compact_finished_organization_records.side_effect = OSError("disk is full")
+
+    finished = await worker._run_apply("management-1", "worker-1")
+
+    assert finished["state"] == "succeeded"

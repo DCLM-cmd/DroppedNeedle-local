@@ -271,12 +271,115 @@ async def test_final_preview_reverifies_a_retained_copy_with_acoustid(
     }
     service._assert_current = AsyncMock()
     service._fingerprinter.fingerprint.return_value = SimpleNamespace(
-        status="no_match", recording_id=None
+        status="skip", recording_id=None, recording_ids=[], error=None
     )
 
-    with pytest.raises(ValidationError, match="could not be verified"):
+    # no audio confirmation AND no release-track tag to fall back on
+    with pytest.raises(ValidationError, match="could not be checked"):
         await service._ensure_final_preview(job, preview_token="preview-token")
 
     service._fingerprinter.fingerprint.assert_awaited_once()
     store.stage_retained_edition_conversion_artifact.assert_not_awaited()
     assert list((tmp_path / "held").iterdir()) == []
+
+
+def _kept_target(*, recording: str, ordinal: int = 0) -> EditionConversionTarget:
+    return EditionConversionTarget(
+        job_id="job-1",
+        ordinal=ordinal,
+        disc_number=1,
+        track_number=ordinal + 1,
+        release_track_mbid=_mbid(400 + ordinal),
+        recording_mbid=recording,
+        title="Ultralight Beam",
+        duration_seconds=1,
+        state="kept",
+        kept_local_track_id=f"local-{ordinal}",
+    )
+
+
+def test_retained_track_verifies_when_its_mbid_is_not_acoustids_first_pick() -> None:
+    """The regression that blocked every Life of Pablo conversion.
+
+    MusicBrainz models one performance as a separate recording per edition and
+    AcoustID returns them in no particular order, so demanding equality with the
+    first entry rejected 12 of 18 correct tracks. Membership is the identity test.
+    """
+    wanted = _mbid(301)
+    fingerprint = SimpleNamespace(
+        status="pass",
+        recording_id=_mbid(999),
+        recording_ids=[_mbid(999), wanted, _mbid(888)],
+        error=None,
+    )
+
+    EditionConversionService._assert_retained_recording(
+        fingerprint, target=_kept_target(recording=wanted), evidence_kind="recording"
+    )
+
+
+def test_retained_track_falls_back_to_its_release_track_tag_when_acoustid_is_down() -> (
+    None
+):
+    """An outage says nothing about the file, so it must not be blamed on the track.
+
+    Without this a missing API key or a dropped lookup made every conversion
+    impossible while reporting it as a bad rip.
+    """
+    fingerprint = SimpleNamespace(
+        status="error",
+        recording_id=None,
+        recording_ids=[],
+        error="invalid AcoustID API key",
+    )
+
+    EditionConversionService._assert_retained_recording(
+        fingerprint,
+        target=_kept_target(recording=_mbid(301)),
+        evidence_kind="release_track",
+    )
+
+
+def test_retained_track_is_refused_when_the_audio_names_another_recording() -> None:
+    fingerprint = SimpleNamespace(
+        status="pass",
+        recording_id=_mbid(777),
+        recording_ids=[_mbid(777)],
+        error=None,
+    )
+
+    with pytest.raises(ValidationError, match="matches a different recording"):
+        EditionConversionService._assert_retained_recording(
+            fingerprint,
+            target=_kept_target(recording=_mbid(301)),
+            evidence_kind="recording_and_position",
+        )
+
+
+def test_refusal_names_the_track_and_the_acoustid_reason() -> None:
+    fingerprint = SimpleNamespace(
+        status="error", recording_id=None, recording_ids=[], error="fpcalc missing"
+    )
+
+    with pytest.raises(ValidationError) as excinfo:
+        EditionConversionService._assert_retained_recording(
+            fingerprint, target=_kept_target(recording=_mbid(301)), evidence_kind=None
+        )
+
+    message = str(excinfo.value)
+    assert "Ultralight Beam" in message and "fpcalc missing" in message
+
+
+def test_weak_tag_evidence_cannot_stand_in_for_a_missing_audio_check() -> None:
+    """A recording-level tag only says "some release uses this recording"; it must
+    not authorise a convert that recycles the files it replaces."""
+    fingerprint = SimpleNamespace(
+        status="skip", recording_id=None, recording_ids=[], error=None
+    )
+
+    with pytest.raises(ValidationError, match="could not be checked"):
+        EditionConversionService._assert_retained_recording(
+            fingerprint,
+            target=_kept_target(recording=_mbid(301)),
+            evidence_kind="recording",
+        )

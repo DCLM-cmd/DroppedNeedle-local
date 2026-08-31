@@ -6,7 +6,7 @@
 	import { createOidcExchangeMutation } from '$lib/queries/auth/AuthMutations.svelte';
 	import { toAuthUser } from '$lib/queries/auth/types';
 	import { onMount } from 'svelte';
-	import { Music } from 'lucide-svelte';
+	import { Music } from '@lucide/svelte';
 
 	let error = $state<string | null>(null);
 

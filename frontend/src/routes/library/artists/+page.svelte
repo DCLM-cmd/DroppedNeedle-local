@@ -7,7 +7,7 @@
 	import { getLibraryArtistsInfiniteQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import type { ArtistSort, LibraryArtistScope, LibraryArtistSummary } from '$lib/types';
 	import { artistHref } from '$lib/utils/entityRoutes';
-	import { ChevronLeft, Disc3, Mic, Search, UsersRound, X } from 'lucide-svelte';
+	import { ChevronLeft, Disc3, Mic, Search, UsersRound, X } from '@lucide/svelte';
 
 	const SEARCH_DEBOUNCE_MS = 300;
 

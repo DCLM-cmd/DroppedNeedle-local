@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Heart, X, ArrowLeft, DownloadCloud } from 'lucide-svelte';
+	import { Heart, X, ArrowLeft, DownloadCloud } from '@lucide/svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import LidarrImportModal from '$lib/components/following/LidarrImportModal.svelte';

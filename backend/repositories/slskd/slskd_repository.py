@@ -17,6 +17,7 @@ stay structurally identical to the protocol for the conformance contract test.
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 from models.common import ServiceStatus
@@ -182,6 +183,107 @@ class SlskdRepository:
     async def discard_client_artifacts(self, handle: TaskHandle) -> bool:
         return await self._remove_transfer_records(handle)
 
+    async def cancel(self, handle: TaskHandle) -> bool:
+        """Drop the transfers and remove whatever they left on the downloads mount.
+
+        A successful import MOVES the file into the library, so anything still
+        locatable here is a failed or abandoned download. Leaving it meant every
+        retry of an album stacked another full copy on the mount - one album grew
+        4.1 GB in two days that way.
+        """
+        ok = await self._remove_transfer_records(handle)
+        await asyncio.to_thread(self._remove_leftover_files, handle)
+        return ok
+
+    def _remove_leftover_files(self, handle: TaskHandle) -> None:
+        """Delete every on-disk copy of the handle's files, then prune emptied dirs.
+
+        All collision variants go, not just the one the locator would pick: a track
+        retried three times leaves three copies, and removing only the newest would
+        strand the rest forever.
+        """
+        emptied: set[Path] = set()
+        mount = self._downloads_mount.resolve()
+        for filename in handle.filenames:
+            located = self._locate_file(handle.username, filename)
+            if located is None:
+                continue
+            basename = located.name
+            parts = [
+                p
+                for p in re.split(r"[\\/]", filename)
+                if p and p not in (".", "..")
+            ]
+            wanted = parts[-1] if parts else basename
+            matches = self._collision_matcher(wanted)
+            for candidate in sorted(located.parent.iterdir()):
+                if not candidate.is_file():
+                    continue
+                if candidate.name != basename and not matches(candidate.name):
+                    continue
+                try:
+                    candidate.unlink()
+                except OSError as exc:
+                    logger.warning("Could not remove leftover %s: %s", candidate, exc)
+            emptied.add(located.parent)
+        for directory in emptied:
+            self._prune_empty_dirs(directory, mount)
+
+    @staticmethod
+    def _prune_empty_dirs(directory: Path, mount: Path) -> None:
+        """Remove ``directory`` and now-empty parents, never the mount root itself."""
+        current = directory.resolve()
+        while current != mount and current.is_relative_to(mount):
+            try:
+                if next(current.iterdir(), None) is not None:
+                    return
+                current.rmdir()
+            except OSError:
+                return
+            current = current.parent
+
+    @staticmethod
+    def _collision_matcher(basename: str) -> Callable[[str], bool]:
+        """Match slskd's collision suffix: ``{stem}_{ticks}{ext}``.
+
+        slskd renames a re-download that would overwrite an existing file by
+        inserting a .NET tick count. Only digits count as a suffix - ``Song_remaster``
+        and ``Song 2`` are different tracks, not variants of ``Song``.
+        """
+        stem, _, extension = basename.rpartition(".")
+        if not stem:
+            stem, extension = basename, ""
+        pattern = re.compile(
+            rf"^{re.escape(stem)}_\d+{re.escape('.' + extension) if extension else ''}$"
+        )
+        return lambda name: bool(pattern.match(name))
+
+    def _pick_in_dir(self, directory: Path, basename: str) -> Path | None:
+        """The exact filename in ``directory``, else its newest collision variant."""
+        exact = directory / basename
+        try:
+            if exact.exists():
+                return exact
+        except OSError:
+            return None
+        matches = self._collision_matcher(basename)
+        newest: Path | None = None
+        newest_mtime = -1.0
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            return None
+        for candidate in entries:
+            if not matches(candidate.name):
+                continue
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest, newest_mtime = candidate, mtime
+        return newest
+
     async def _remove_transfer_records(self, handle: TaskHandle) -> bool:
         transfers = await self._client.get_downloads(handle.username)
         wanted = set(handle.filenames)
@@ -260,14 +362,24 @@ class SlskdRepository:
                 return None
             return resolved
 
+        # Each directory probe accepts slskd's collision-renamed variant
+        # ({stem}_{ticks}{ext}) as well as the exact name, so a retried download is
+        # still found - otherwise it could be neither imported nor cleaned up.
+        def _in_dir(directory: Path) -> Path | None:
+            confined = _within_mount(directory / basename)
+            if confined is None:
+                return None
+            picked = self._pick_in_dir(confined.parent, basename)
+            return picked.resolve() if picked is not None else None
+
         # 1. slskd's common layout: {mount}/{leaf remote folder}/{filename}.
         if len(parts) >= 2:
-            leaf = _within_mount(mount / parts[-2] / basename)
-            if leaf is not None and leaf.exists():
+            leaf = _in_dir(mount / parts[-2])
+            if leaf is not None:
                 return leaf
         # 2. Flat layout: {mount}/{filename}.
-        flat = _within_mount(mount / basename)
-        if flat is not None and flat.exists():
+        flat = _in_dir(mount)
+        if flat is not None:
             return flat
         # 3. Peers that file by username: walk {mount}/{username}/ at any depth
         # (covers {username}/{file} and {username}/{album}/{file}). Scoped to the
@@ -281,8 +393,8 @@ class SlskdRepository:
         try:
             for child in sorted(mount.iterdir()):
                 if child.is_dir():
-                    cand = _within_mount(child / basename)
-                    if cand is not None and cand.exists():
+                    cand = _in_dir(child)
+                    if cand is not None:
                         return cand
         except OSError as exc:
             logger.warning("Could not scan downloads mount %s: %s", mount, exc)

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import CarouselSkeleton from '$lib/components/CarouselSkeleton.svelte';
-	import { ChevronRight } from 'lucide-svelte';
+	import { ChevronRight } from '@lucide/svelte';
 	import type { Snippet } from 'svelte';
 
 	interface Props {

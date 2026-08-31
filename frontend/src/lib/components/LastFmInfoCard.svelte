@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronUp, ChevronDown, ExternalLink, Users, Headphones } from 'lucide-svelte';
+	import { ChevronUp, ChevronDown, ExternalLink, Users, Headphones } from '@lucide/svelte';
 	import { formatListenCount } from '$lib/utils/formatting';
 	import { onMount } from 'svelte';
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Music, Clock, ArrowUp, HardDrive, Layers } from 'lucide-svelte';
+	import { Music, Clock, ArrowUp, HardDrive, Layers } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { fromStore } from 'svelte/store';
 	import { getLibraryStatsQuery } from '$lib/queries/library/LibraryQueries.svelte';

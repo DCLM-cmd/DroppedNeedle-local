@@ -8,7 +8,7 @@
 		RefreshCcw,
 		ScanSearch,
 		Wrench
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import type { LibraryWorkItem } from '$lib/queries/library/LibraryOperationsTypes';
 
 	interface Props {

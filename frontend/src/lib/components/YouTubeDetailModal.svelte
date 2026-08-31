@@ -10,7 +10,7 @@
 		ListStart,
 		ListMusic,
 		Search
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { API, TOAST_DURATION } from '$lib/constants';
 	import { colors } from '$lib/colors';

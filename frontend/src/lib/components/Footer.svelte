@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Github } from 'lucide-svelte';
+	import { Code as Github } from '@lucide/svelte';
 	import { getVersionQuery } from '$lib/queries/VersionQuery.svelte';
 
 	const GITHUB_URL = 'https://github.com/DroppedNeedle/DroppedNeedle';

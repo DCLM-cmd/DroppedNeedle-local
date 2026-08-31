@@ -11,7 +11,7 @@
 		RefreshCw,
 		SearchCheck,
 		ShieldCheck
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import type { ContributionDuplicateCandidate, LibraryContribution } from '$lib/types';
 	import { toastStore } from '$lib/stores/toast';
 	import {

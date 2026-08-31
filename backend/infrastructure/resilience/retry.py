@@ -178,6 +178,16 @@ def _get_retry_after_seconds(exception: Exception) -> Optional[float]:
     return retry_after_value
 
 
+def _describe_exception(exc: BaseException) -> str:
+    """``TypeName: message``, or just ``TypeName`` when there is no message.
+
+    Never returns an empty string, so a log line built from it always identifies the
+    failure.
+    """
+    message = str(exc).strip()
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
 def with_retry(
     max_attempts: int = 3,
     base_delay: float = 1.0,
@@ -234,11 +244,16 @@ def with_retry(
                         break
 
                     if attempt >= max_attempts:
+                        # "%s" on an exception whose str() is empty - every httpx
+                        # timeout, and any exception raised with no args - logged a
+                        # bare "failed after N attempts: " that named neither the
+                        # failure nor its type. An unreadable error line is worse than
+                        # no line: it sent a live investigation after the wrong cause.
                         logger.error(
                             "%s failed after %d attempts: %s",
                             func_name,
                             max_attempts,
-                            e,
+                            _describe_exception(e),
                         )
                         break
 

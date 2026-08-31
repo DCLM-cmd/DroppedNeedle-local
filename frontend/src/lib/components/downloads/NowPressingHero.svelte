@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { X } from 'lucide-svelte';
+	import { X } from '@lucide/svelte';
 
 	import { cancelDownload } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { createDownloadStream } from '$lib/queries/downloads/DownloadSSE.svelte';

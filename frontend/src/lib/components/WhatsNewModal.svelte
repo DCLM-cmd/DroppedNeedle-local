@@ -2,7 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { isWhatsNewDismissed, dismissWhatsNew } from '$lib/stores/version.svelte';
 	import { renderMarkdown } from '$lib/utils/markdown';
-	import { X, Sparkles, ExternalLink } from 'lucide-svelte';
+	import { X, Sparkles, ExternalLink } from '@lucide/svelte';
 	import type { GitHubRelease } from '$lib/queries/VersionQuery.svelte';
 
 	interface Props {

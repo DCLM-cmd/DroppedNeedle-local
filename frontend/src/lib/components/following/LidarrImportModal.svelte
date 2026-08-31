@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { RefreshCw } from 'lucide-svelte';
+	import { RefreshCw } from '@lucide/svelte';
 
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import { getLidarrImportCandidatesQuery } from '$lib/queries/lidarr-import/LidarrImportQueries.svelte';

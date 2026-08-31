@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Music, ArrowLeft } from 'lucide-svelte';
+	import { Music, ArrowLeft } from '@lucide/svelte';
 	import { page } from '$app/state';
 </script>
 

@@ -10,7 +10,7 @@
 		RefreshCw,
 		Sparkles,
 		X
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import type { WantedWatchItem } from '$lib/queries/wanted/types';
 	import { nowSeconds, startSharedClock } from '$lib/stores/clock.svelte';
 

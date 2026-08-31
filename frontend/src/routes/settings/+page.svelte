@@ -10,7 +10,7 @@
 	import {
 		Settings2,
 		Music,
-		Youtube,
+		Play as Youtube,
 		Database,
 		Settings,
 		Radio,
@@ -32,7 +32,7 @@
 		Landmark,
 		Blocks,
 		PanelLeft
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';
 	import PlexIcon from '$lib/components/PlexIcon.svelte';

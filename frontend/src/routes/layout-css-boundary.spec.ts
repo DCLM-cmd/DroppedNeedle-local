@@ -14,7 +14,7 @@ describe('auth-free CSS boundary', () => {
 
 	it('uses one explicitly source-limited stylesheet on every auth-free route', () => {
 		const authCss = source('../auth.css');
-		expect(authCss).toContain("@import 'tailwindcss' source(none)");
+		expect(authCss).toContain("@import 'tailwindcss/index.css' source(none)");
 		for (const route of ['login', 'setup', 'recover-password']) {
 			expect(source(`./${route}/+page.svelte`)).toContain("import '../../auth.css'");
 			expect(authCss).toContain(`@source './routes/${route}/+page.svelte'`);

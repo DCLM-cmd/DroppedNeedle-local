@@ -358,7 +358,12 @@ def test_offline_replacement_entrypoint_is_complete_and_single_worker() -> None:
     )
     from maintenance.automatic_upgrade import _target_command
 
-    assert _target_command(8688)[-2:] == ["--workers", "1"]
+    command = _target_command(8688)
+    # Assert the contract, not the argument order: one worker, and the forwarding
+    # headers the TLS proxy in front of it depends on.
+    assert command[command.index("--workers") + 1] == "1"
+    assert "--proxy-headers" in command
+    assert command[command.index("--forwarded-allow-ips") + 1]
 
 
 def test_production_target_application_always_runs_startup_validation(
@@ -779,7 +784,12 @@ def test_target_cover_provider_has_no_legacy_catalog_inputs(monkeypatch) -> None
     repo_providers.get_target_coverart_repository.cache_clear()
 
     assert repo_providers.get_target_coverart_repository() is built
-    builder.assert_called_once_with()
+    # "Legacy catalog inputs" are library_repo and library_db. native_library_store is
+    # the NATIVE catalog, and is what powers folder/embedded local cover art on the
+    # target app - asserting no inputs at all would silently disable that.
+    builder.assert_called_once()
+    assert set(builder.call_args.kwargs) == {"native_library_store"}
+    assert builder.call_args.args == ()
 
     repo_providers.get_target_coverart_repository.cache_clear()
 

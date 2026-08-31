@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
-	import { Disc3, Users } from 'lucide-svelte';
+	import { Disc3, Users } from '@lucide/svelte';
 	import { lazyImage, resetLazyImage } from '$lib/utils/lazyImage';
 	import { API_SIZES } from '$lib/constants';
 	import { isValidMbid } from '$lib/utils/formatting';

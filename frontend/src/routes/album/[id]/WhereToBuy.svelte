@@ -7,7 +7,7 @@
 		Gift,
 		Search,
 		ShoppingBag
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { getPurchaseOptionsQuery } from '$lib/queries/albums/GetItQueries.svelte';
 	import type { PurchaseLink } from '$lib/types';
 

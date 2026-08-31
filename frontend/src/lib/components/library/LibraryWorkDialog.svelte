@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { AlertTriangle, CirclePause, CirclePlay, FolderTree, OctagonX } from 'lucide-svelte';
+	import { AlertTriangle, CirclePause, CirclePlay, FolderTree, OctagonX } from '@lucide/svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { getLibraryPolicyTreeQuery } from '$lib/queries/library/LibraryPolicyQueries.svelte';
 	import {

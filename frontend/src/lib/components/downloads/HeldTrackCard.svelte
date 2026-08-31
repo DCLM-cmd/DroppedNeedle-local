@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { AlertTriangle } from 'lucide-svelte';
+	import { AlertTriangle } from '@lucide/svelte';
 
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import type { HeldImport } from '$lib/types';

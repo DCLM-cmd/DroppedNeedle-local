@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Loader2, Play, Shuffle } from 'lucide-svelte';
+	import { Loader2, Play, Shuffle } from '@lucide/svelte';
 	import { fromStore } from 'svelte/store';
 	import { launchRadio, type RadioMode } from '$lib/player/launchRadio';
 	import { deckSampler, type SampleEntry } from '$lib/stores/deckSampler.svelte';

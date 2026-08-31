@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { Coffee, ExternalLink, Github, ShoppingBag } from 'lucide-svelte';
+	import { Coffee, ExternalLink, Code as Github, ShoppingBag } from '@lucide/svelte';
 	import { API } from '$lib/constants';
 	import type { GetItSettings } from '$lib/types';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';

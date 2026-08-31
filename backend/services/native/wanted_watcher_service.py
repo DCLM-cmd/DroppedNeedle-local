@@ -61,6 +61,9 @@ _ENROL_PAGE_SIZE = 200
 # Per-cycle ceiling on partial-want track dispatches (D9); the drop is logged
 # (no-silent-caps rule) and the next cycle picks up the remainder.
 _MAX_TRACK_DISPATCH_PER_CYCLE = 5
+# How many albums one sweep may newly enrol from the library. Enrolment downloads
+# nothing, but it governs how fast a large library turns into watches.
+_MAX_LIBRARY_ENROL_PER_SWEEP = 10
 # After an auto-dispatch or an active-work guard, look again soon (~1 day) so
 # the next cycle's satisfaction/guard steps observe the outcome (§5.2.d).
 _SHORT_RESCHEDULE_DAYS = 1.0
@@ -443,6 +446,73 @@ class WantedWatcherService:
                 if page * _ENROL_PAGE_SIZE >= total:
                     break
                 page += 1
+        if settings.watch_partial_albums:
+            enrolled += await self._enrol_from_library()
+        return enrolled
+
+    async def _enrol_from_library(self) -> int:
+        """Enrol albums the LIBRARY says are incomplete, whatever their request says.
+
+        The request-history pass only looks at records in ``failed`` or ``incomplete``
+        state, so completeness was in practice decided by a status field rather than by
+        the files. An album whose request reads ``imported`` - or ``cancelled``, or
+        that was never requested at all - is never re-examined, even when it holds
+        nothing: on the live library, "OK Computer" (0 of 12) and "Birds in the Trap
+        Sing McKnight" (3 of 14) both sat at ``imported``.
+
+        Measured the same way the dispatch is (``match_rows_to_tracks``), so
+        "incomplete" and "which tracks" can never disagree. It only ever CREATES a
+        watch: the watcher's backoff, satisfaction re-check and per-cycle dispatch cap
+        still govern what is actually fetched, and an album that already has a watch -
+        including one the user stopped - is left alone.
+        """
+        enrolled = 0
+        try:
+            mbids = await self._library.get_library_mbids(include_release_ids=False)
+        except Exception:  # noqa: BLE001 - a library read failure skips the pass
+            logger.warning("wanted.library_enrol_unavailable", exc_info=True)
+            return 0
+        for mbid in sorted(mbids):
+            if enrolled >= _MAX_LIBRARY_ENROL_PER_SWEEP:
+                logger.info("wanted.library_enrol_capped", extra={"enrolled": enrolled})
+                break
+            if await self._store.get_watch(mbid) is not None:
+                continue  # watching, stopped or fulfilled: the existing state stands
+            record = await self._requests.async_get_record(mbid)
+            if record is None or not record.user_id:
+                continue  # nobody to act for (D7); never invent a requester
+            tracks = await self._tracklist(mbid)
+            if not tracks:
+                continue  # unmeasurable - never enrol on missing data
+            rows = await self._file_rows(mbid)
+            covered, _orphans, _matched = match_rows_to_tracks(rows, tracks)
+            if covered >= len(tracks):
+                continue
+            now = time.time()
+            if await self._store.create_watch(
+                release_group_mbid=mbid,
+                user_id=record.user_id,
+                artist_name=record.artist_name,
+                album_title=record.album_title,
+                kind="partial",
+                next_check_at=now
+                + self._interval_seconds(None, quiet_streak=0, now=now),
+                artist_mbid=record.artist_mbid,
+                year=record.year,
+                cover_url=record.cover_url,
+                first_release_date=None,
+                created_at=now,
+            ):
+                enrolled += 1
+                logger.info(
+                    "wanted.enrolled_from_library",
+                    extra={
+                        "release_group_mbid": mbid,
+                        "covered": covered,
+                        "expected": len(tracks),
+                        "request_status": record.status,
+                    },
+                )
         return enrolled
 
     async def _maybe_enrol(self, record: "RequestHistoryRecord") -> bool:
@@ -500,6 +570,68 @@ class WantedWatcherService:
         )
         if inserted:
             self._log_enrolled(record, kind, rearmed=False)
+        return inserted
+
+    async def enrol_incomplete_mapping(
+        self,
+        release_group_mbid: str,
+        *,
+        user_id: str | None,
+        artist_name: str,
+        album_title: str,
+        artist_mbid: str | None = None,
+        year: int | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Watch an album whose accepted mapping the library does not fully cover.
+
+        Choosing a track mapping is a statement about what the album SHOULD contain,
+        so anything the mapping names and the library does not hold is missing
+        content the user has implicitly asked for. The watcher already knows how to
+        fetch exactly that - ``uncovered_tracks`` is its per-track dispatch set - with
+        backoff, a satisfaction re-check before every search, and a per-album stop.
+        Acceptance therefore only ENROLS; it never dispatches downloads itself, which
+        is what keeps accepting a mapping from firing a burst at the download client.
+
+        Returns whether a new watch was created. Enrolling twice is a no-op: the
+        store's insert is ON CONFLICT DO NOTHING, so an existing watch (including one
+        the user stopped) is never overwritten.
+        """
+        if not user_id or not release_group_mbid:
+            return False  # no requester to act for (D7)
+        tracks = await self._tracklist(release_group_mbid)
+        if not tracks:
+            # Unmeasurable without a tracklist: fail open rather than enrol a want
+            # that would search on missing data (§5.2.3.a).
+            return False
+        rows = await self._file_rows(release_group_mbid)
+        covered, _orphans, _matched = match_rows_to_tracks(rows, tracks)
+        if covered >= len(tracks):
+            return False  # the mapping is fully covered; nothing is missing
+        timestamp = time.time() if now is None else now
+        first_release_date = None
+        inserted = await self._store.create_watch(
+            release_group_mbid=release_group_mbid,
+            user_id=user_id,
+            artist_name=artist_name,
+            album_title=album_title,
+            kind="partial",
+            next_check_at=timestamp
+            + self._interval_seconds(first_release_date, quiet_streak=0, now=timestamp),
+            artist_mbid=artist_mbid,
+            year=year,
+            first_release_date=first_release_date,
+            created_at=timestamp,
+        )
+        if inserted:
+            logger.info(
+                "wanted.enrolled_from_mapping",
+                extra={
+                    "release_group_mbid": release_group_mbid,
+                    "missing_tracks": len(tracks) - covered,
+                    "total_tracks": len(tracks),
+                },
+            )
         return inserted
 
     @staticmethod

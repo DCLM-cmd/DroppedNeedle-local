@@ -28,7 +28,7 @@ describe('LibraryManagementDiscardPreview', () => {
 			unmount();
 			return {};
 		});
-		const view = render(LibraryManagementDiscardPreview, {
+		const view = await render(LibraryManagementDiscardPreview, {
 			jobId: 'preview-1',
 			expectedRevision: 4,
 			profileName: 'Picard-style Organizer',

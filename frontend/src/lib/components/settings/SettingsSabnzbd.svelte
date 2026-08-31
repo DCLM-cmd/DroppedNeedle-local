@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CircleCheck, CircleX, FolderTree, Rss, TriangleAlert } from 'lucide-svelte';
+	import { CircleCheck, CircleX, FolderTree, Rss, TriangleAlert } from '@lucide/svelte';
 
 	import {
 		getSabnzbdConfigQuery,

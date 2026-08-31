@@ -1836,3 +1836,106 @@ async def test_upgrade_origin_never_fetches_an_unheld_recording():
 
     assert result == ALREADY_IN_LIBRARY
     store.create_task.assert_not_called()
+
+
+# ---- the queue's "Clear all" -------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_clear_history_removes_finished_work_of_every_kind():
+    """The route has always called this by name while the service only offered
+    ``clear_finished``, so every press of "Clear all" raised an AttributeError and the
+    button did nothing. A failed download is History too - the tooltip says so."""
+    service, store, _bus, _client, _scorer, orch = _make_service()
+    store.delete_tasks_by_status.return_value = 2
+    store.list_tasks_by_status.return_value = [
+        SimpleNamespace(id="done-failing"),
+        SimpleNamespace(id="still-hunting"),
+    ]
+    orch.next_retry_at = lambda task: None if task.id == "done-failing" else 999.0
+    store.delete_tasks_by_ids.return_value = 1
+
+    cleared = await service.clear_history("u1", "user")
+
+    assert cleared == 3
+    store.delete_tasks_by_status.assert_awaited_once_with(
+        "u1", "user", ["completed", "cancelled"]
+    )
+    store.delete_tasks_by_ids.assert_awaited_once_with(["done-failing"])
+
+
+@pytest.mark.asyncio
+async def test_clear_history_keeps_anything_still_scheduled_to_try_again():
+    """Removing those would silently abandon an album the user is still waiting for."""
+    service, store, _bus, _client, _scorer, orch = _make_service()
+    store.delete_tasks_by_status.return_value = 0
+    store.list_tasks_by_status.return_value = [SimpleNamespace(id="still-hunting")]
+    orch.next_retry_at = lambda task: 999.0
+
+    assert await service.clear_history("u1", "user") == 0
+    store.delete_tasks_by_ids.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clear_history_on_an_empty_queue_is_not_an_error():
+    service, store, _bus, _client, _scorer, orch = _make_service()
+    store.delete_tasks_by_status.return_value = 0
+    store.list_tasks_by_status.return_value = []
+
+    assert await service.clear_history("u1", "user") == 0
+
+
+def _conversion_held() -> SimpleNamespace:
+    return SimpleNamespace(
+        id=718,
+        reason="edition_conversion",
+        origin="edition_conversion",
+        held_path="/app/cache/held/941b41b5_20-saint_pablo.flac",
+        album_title="The Life of Pablo",
+        track_title="Saint Pablo",
+        source_task_id="task-conv",
+        release_group_mbid="rg",
+    )
+
+
+@pytest.mark.asyncio
+async def test_held_file_reserved_by_a_live_conversion_cannot_be_imported_alone():
+    """The conversion clears the slot it writes into as part of its own apply.
+
+    Importing the file by itself hits that not-yet-cleared file and used to fail as
+    "a planned destination is occupied by different content" - accurate but
+    unactionable, and the user retries it forever.
+    """
+    service, store, *_ = _make_service()
+    store.get_held_import.return_value = _conversion_held()
+    store.find_active_edition_conversion_for_held_path.return_value = "job-1"
+
+    with pytest.raises(ValidationError, match="pending exact-edition conversion"):
+        await service.import_held(718, "u1", "admin")
+
+    store.resolve_held_import.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_held_file_reserved_by_a_live_conversion_cannot_be_discarded_alone():
+    service, store, *_ = _make_service()
+    store.get_held_import.return_value = _conversion_held()
+    store.find_active_edition_conversion_for_held_path.return_value = "job-1"
+
+    with pytest.raises(ValidationError, match="pending exact-edition conversion"):
+        await service.discard_held(718, "u1", "admin")
+
+    store.resolve_held_import.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_held_file_from_a_finished_conversion_stays_disposable():
+    """Only *live* jobs reserve a file. A cancelled or applied conversion must not
+    leave its leftovers permanently unimportable and undiscardable."""
+    service, store, *_ = _make_service()
+    store.get_held_import.return_value = _conversion_held()
+    store.find_active_edition_conversion_for_held_path.return_value = None
+    service._delete_discarded_held_files = AsyncMock()
+
+    await service.discard_held(718, "u1", "admin")
+
+    store.resolve_held_import.assert_awaited_once_with(718, "discarded")

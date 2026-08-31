@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Pencil } from 'lucide-svelte';
+	import { Pencil } from '@lucide/svelte';
 	import AudioQualityBadge from '$lib/components/AudioQualityBadge.svelte';
 	import TagEditor from './TagEditor.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';

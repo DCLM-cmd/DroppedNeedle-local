@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { albumHref } from '$lib/utils/entityRoutes';
-	import { Play, Disc3 } from 'lucide-svelte';
+	import { Play, Disc3 } from '@lucide/svelte';
 	import type { TopSong, ResolvedTrack } from '$lib/types';
 	import AlbumImage from './AlbumImage.svelte';
 	import LastFmPlaceholder from './LastFmPlaceholder.svelte';

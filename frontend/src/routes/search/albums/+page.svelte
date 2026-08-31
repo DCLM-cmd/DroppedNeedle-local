@@ -14,7 +14,7 @@
 	import { createSearchEnrichmentBatcher } from '$lib/utils/searchEnrichmentBatcher';
 	import { isAbortError } from '$lib/utils/errorHandling';
 	import { api } from '$lib/api/client';
-	import { Check } from 'lucide-svelte';
+	import { Check } from '@lucide/svelte';
 
 	interface Props {
 		data: { query: string };

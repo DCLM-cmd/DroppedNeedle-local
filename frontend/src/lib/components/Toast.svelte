@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, X, Info, TriangleAlert } from 'lucide-svelte';
+	import { Check, X, Info, TriangleAlert } from '@lucide/svelte';
 	import { TOAST_DURATION } from '$lib/constants';
 
 	interface Props {

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { Compass, Sparkles } from 'lucide-svelte';
+	import { Compass, Sparkles } from '@lucide/svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import { discoverQueueStatusStore } from '$lib/stores/discoverQueueStatus';
 	import type { DiscoverPreview } from '$lib/types';

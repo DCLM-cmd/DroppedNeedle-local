@@ -7,7 +7,7 @@
 		Sparkles,
 		Library,
 		SlidersHorizontal
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import HomeSection from '$lib/components/HomeSection.svelte';
 	import WeeklyExploration from '$lib/components/WeeklyExploration.svelte';
 	import ServicePromptCard from '$lib/components/ServicePromptCard.svelte';
@@ -355,7 +355,7 @@
 				{/if}
 			</div>
 
-			{#snippet failed(_error, reset)}
+			{#snippet failed(_error: unknown, reset: () => void)}
 				<div class="flex flex-col items-center justify-center py-12 sm:py-16">
 					<CircleAlert class="mb-4 h-12 w-12 sm:mb-6 sm:h-14 sm:w-14 text-base-content/50" />
 					<h2 class="mb-2 text-center text-xl font-bold sm:text-2xl">Something Went Wrong</h2>

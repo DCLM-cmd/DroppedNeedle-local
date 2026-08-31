@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { BadgeCheck, Disc3, Download, Files, Library, Signal } from 'lucide-svelte';
+	import { BadgeCheck, Disc3, Download, Files, Library, Signal } from '@lucide/svelte';
 
 	import type { ScoredCandidate } from '$lib/types';
 

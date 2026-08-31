@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { WrappedSettingsResponse } from '$lib/types';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
-	import { Gift } from 'lucide-svelte';
+	import { Gift } from '@lucide/svelte';
 	import { onMount, onDestroy } from 'svelte';
 
 	const form = createSettingsForm<WrappedSettingsResponse>({

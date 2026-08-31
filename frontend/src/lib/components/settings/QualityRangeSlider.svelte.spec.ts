@@ -30,7 +30,7 @@ function dragThumb(thumb: HTMLElement, rect: DOMRect, fromIdx: number, toIdx: nu
 
 describe('QualityRangeSlider', () => {
 	it('GH #270: overlapped handles at FLAC can be pulled apart leftward', async () => {
-		const { container } = render(QualityRangeSlider, {
+		const { container } = await render(QualityRangeSlider, {
 			minKey: 'lossless',
 			maxKey: 'lossless'
 		});
@@ -47,7 +47,7 @@ describe('QualityRangeSlider', () => {
 	});
 
 	it('crossing the other handle swaps roles mid-drag and keeps the band ordered', async () => {
-		const { container } = render(QualityRangeSlider, {
+		const { container } = await render(QualityRangeSlider, {
 			minKey: 'mp3_192',
 			maxKey: 'mp3_256'
 		});

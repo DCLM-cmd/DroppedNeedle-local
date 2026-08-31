@@ -14,7 +14,7 @@
 		RefreshCw,
 		Disc3,
 		ArrowDownToLine
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	interface Props {
 		tracks: CrateTrack[];

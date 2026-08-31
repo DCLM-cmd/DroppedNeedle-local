@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Search, X, ArrowDown } from 'lucide-svelte';
+	import { Search, X, ArrowDown } from '@lucide/svelte';
 
 	interface Props {
 		searchQuery: string;

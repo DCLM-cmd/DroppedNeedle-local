@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronDown, ChevronUp, GripVertical, HardDriveDownload, Rss } from 'lucide-svelte';
+	import { ChevronDown, ChevronUp, GripVertical, HardDriveDownload, Rss } from '@lucide/svelte';
 
 	import {
 		getSourcePriorityQuery,

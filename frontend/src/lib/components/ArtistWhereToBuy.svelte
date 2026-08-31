@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Search, ShoppingBag } from 'lucide-svelte';
+	import { Search, ShoppingBag } from '@lucide/svelte';
 	import { getArtistPurchaseOptionsQuery } from '$lib/queries/albums/GetItQueries.svelte';
 
 	interface Props {

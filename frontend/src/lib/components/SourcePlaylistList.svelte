@@ -5,7 +5,7 @@
 	import SourcePlaylistCard from '$lib/components/SourcePlaylistCard.svelte';
 	import { getSourcePlaylistsQuery } from '$lib/queries/source-playlists/SourcePlaylistQueries.svelte';
 	import type { SourcePlaylistSource } from '$lib/types';
-	import { CircleAlert, Link2, ListMusic, RefreshCw } from 'lucide-svelte';
+	import { CircleAlert, Link2, ListMusic, RefreshCw } from '@lucide/svelte';
 
 	interface Props {
 		source: SourcePlaylistSource;

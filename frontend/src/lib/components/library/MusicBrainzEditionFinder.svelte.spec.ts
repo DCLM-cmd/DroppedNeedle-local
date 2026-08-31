@@ -192,7 +192,7 @@ describe('MusicBrainzEditionFinder', () => {
 	it('shows empty and provider-unavailable states independently', async () => {
 		h.queryState.data.items = [];
 		h.queryState.data.total = 0;
-		const empty = render(MusicBrainzEditionFinder, {
+		const empty = await render(MusicBrainzEditionFinder, {
 			props: {
 				albumId: 'album-1',
 				artistName: 'Signal Artist',

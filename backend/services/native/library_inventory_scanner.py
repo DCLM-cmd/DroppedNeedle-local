@@ -38,6 +38,18 @@ DirectoryProbe = Callable[[Path], bool]
 logger = logging.getLogger(__name__)
 
 
+def _is_hidden_directory(name: str) -> bool:
+    """Dot-prefixed directories are not library content.
+
+    The recycle bin deliberately lives at ``<library>/.recycle`` so that the scanner
+    skips it - but nothing actually skipped it, so a file the Organizer had recycled
+    was indexed straight back into the catalog and reappeared in the library it had
+    just been removed from. This also keeps the other dot-directories that share a
+    media volume out (.Trash, .stfolder, sync state).
+    """
+    return name.startswith(".")
+
+
 @contextmanager
 def _uncoordinated_read() -> Iterator[None]:
     yield
@@ -341,6 +353,7 @@ class LibraryInventoryScanner:
                             name
                             for name in subdirectories
                             if not is_management_artifact(Path(name))
+                            and not _is_hidden_directory(name)
                         ]
                         inspected: list[
                             tuple[Path, os.stat_result] | BaseException

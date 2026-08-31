@@ -6,7 +6,7 @@
 	import { getCoverUrl } from '$lib/utils/errorHandling';
 	import { api } from '$lib/api/client';
 	import type { YouTubeLink, Album } from '$lib/types';
-	import { X } from 'lucide-svelte';
+	import { X } from '@lucide/svelte';
 
 	interface Props {
 		open: boolean;

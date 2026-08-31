@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { albumHref } from '$lib/utils/entityRoutes';
-	import { ChevronDown, Download } from 'lucide-svelte';
+	import { ChevronDown, Download } from '@lucide/svelte';
 	import { colors } from '$lib/colors';
 	import { libraryStore } from '$lib/stores/library';
 	import AlbumImage from './AlbumImage.svelte';

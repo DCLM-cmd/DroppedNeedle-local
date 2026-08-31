@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Radio, Music, Loader2, ExternalLink, RadioTower, Check, Sparkles } from 'lucide-svelte';
+	import { Radio, Music, Loader2, ExternalLink, RadioTower, Check, Sparkles } from '@lucide/svelte';
 	import { ApiError } from '$lib/api/client';
 	import { getConnectionsQuery } from '$lib/queries/connections/ConnectionsQuery.svelte';
 	import {

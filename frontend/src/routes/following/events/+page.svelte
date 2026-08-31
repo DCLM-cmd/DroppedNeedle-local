@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { ArrowLeft, CalendarClock, ExternalLink, Settings } from 'lucide-svelte';
+	import { ArrowLeft, CalendarClock, ExternalLink, Settings } from '@lucide/svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import CitySearchInput from '$lib/components/following/CitySearchInput.svelte';

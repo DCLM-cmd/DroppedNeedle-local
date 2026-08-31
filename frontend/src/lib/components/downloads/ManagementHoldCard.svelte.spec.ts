@@ -145,7 +145,7 @@ describe('ManagementHoldCard.svelte', () => {
 		h.retry.mockImplementation((_input, options) => {
 			options.onError(new Error('Exact edition proof is incomplete.'));
 		});
-		const view = render(ManagementHoldCard, { props: { items: [held(1)] } } as Parameters<
+		const view = await render(ManagementHoldCard, { props: { items: [held(1)] } } as Parameters<
 			typeof render<typeof ManagementHoldCard>
 		>[1]);
 
@@ -167,7 +167,7 @@ describe('ManagementHoldCard.svelte', () => {
 	});
 
 	it('removes the resolved card as soon as refreshed held data is empty', async () => {
-		const view = render(ManagementHoldCard, { props: { items: [held(1)] } } as Parameters<
+		const view = await render(ManagementHoldCard, { props: { items: [held(1)] } } as Parameters<
 			typeof render<typeof ManagementHoldCard>
 		>[1]);
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CircleCheck, HardDrive, Layers3, Sparkles } from 'lucide-svelte';
+	import { CircleCheck, HardDrive, Layers3, Sparkles } from '@lucide/svelte';
 	import type { AlbumIdentityState, ArtistIdentityState } from '$lib/types';
 
 	interface Props {

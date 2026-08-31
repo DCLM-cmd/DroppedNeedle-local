@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, ChevronDown, CornerDownRight, Layers3 } from 'lucide-svelte';
+	import { Check, ChevronDown, CornerDownRight, Layers3 } from '@lucide/svelte';
 
 	import type { LibraryManagementProfile } from '$lib/queries/library-management/types';
 

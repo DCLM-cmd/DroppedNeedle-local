@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check } from 'lucide-svelte';
+	import { Check } from '@lucide/svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import AlbumCardOverlay from '$lib/components/AlbumCardOverlay.svelte';
 	import type { HomeAlbum } from '$lib/types';

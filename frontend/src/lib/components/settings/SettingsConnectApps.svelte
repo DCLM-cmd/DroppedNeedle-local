@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Trash2, TriangleAlert, Users, Waypoints } from 'lucide-svelte';
+	import { Trash2, TriangleAlert, Users, Waypoints } from '@lucide/svelte';
 
 	import { toastStore } from '$lib/stores/toast';
 	import {

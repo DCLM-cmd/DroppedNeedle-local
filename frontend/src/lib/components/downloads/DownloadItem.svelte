@@ -8,7 +8,7 @@
 		TimerOff,
 		TriangleAlert,
 		X
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import {

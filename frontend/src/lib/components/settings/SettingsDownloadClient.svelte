@@ -6,7 +6,7 @@
 		HardDriveDownload,
 		Info,
 		TriangleAlert
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import {
 		getDownloadClientConfigQuery,

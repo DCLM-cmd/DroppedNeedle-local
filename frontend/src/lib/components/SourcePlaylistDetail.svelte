@@ -5,7 +5,7 @@
 	import { getSourcePlaylistDetailQuery } from '$lib/queries/source-playlists/SourcePlaylistQueries.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import { formatTotalDurationSec } from '$lib/utils/formatting';
-	import { Disc3, Download } from 'lucide-svelte';
+	import { Disc3, Download } from '@lucide/svelte';
 	import type { SourcePlaylistSource } from '$lib/types';
 	import type { Snippet } from 'svelte';
 

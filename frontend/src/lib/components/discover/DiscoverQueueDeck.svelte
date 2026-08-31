@@ -13,7 +13,7 @@
 		RefreshCw,
 		Volume2,
 		X
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { getApiUrl } from '$lib/api/api-utils';
 	import { api } from '$lib/api/client';
 	import { API } from '$lib/constants';

@@ -28,7 +28,7 @@
 		Music2,
 		Check,
 		CircleX
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	interface Props {
 		onDropPlay: (track: CrateTrack) => void;

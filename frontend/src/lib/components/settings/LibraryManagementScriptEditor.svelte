@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ArrowDown, ArrowUp, Copy, FileCode2, Plus } from 'lucide-svelte';
+	import { ArrowDown, ArrowUp, Copy, FileCode2, Plus } from '@lucide/svelte';
 
 	import type { ManagementScriptSettings } from '$lib/queries/library-management/types';
 	import { createUuid } from '$lib/utils/uuid';

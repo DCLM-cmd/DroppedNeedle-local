@@ -12,6 +12,7 @@ means "unknown", and the spec then passes). Later steps add library holdings /
 worst-tier and indexer caps.
 """
 
+import asyncio
 import shutil
 import time
 from pathlib import Path
@@ -54,7 +55,8 @@ async def build_context(
     free_bytes: int | None = None
     if free_path is not None:
         try:
-            free_bytes = shutil.disk_usage(Path(free_path)).free
+            usage = await asyncio.to_thread(shutil.disk_usage, Path(free_path))
+            free_bytes = usage.free
         except OSError:
             free_bytes = None
     return DecisionContext(

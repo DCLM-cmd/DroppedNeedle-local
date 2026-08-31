@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { AlertTriangle, ShieldCheck, Trash2 } from 'lucide-svelte';
+	import { AlertTriangle, ShieldCheck, Trash2 } from '@lucide/svelte';
 
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import {

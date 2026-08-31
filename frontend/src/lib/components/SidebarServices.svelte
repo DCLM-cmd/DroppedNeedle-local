@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { fromStore } from 'svelte/store';
-	import { Headphones, Disc3 } from 'lucide-svelte';
+	import { Headphones, Disc3 } from '@lucide/svelte';
 	import { integrationStore } from '$lib/stores/integration';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { nowPlayingMerged } from '$lib/stores/nowPlayingMerged.svelte';

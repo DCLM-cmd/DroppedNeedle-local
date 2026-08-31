@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { X, Music2, Loader2, AlertCircle } from 'lucide-svelte';
+	import { X, Music2, Loader2, AlertCircle } from '@lucide/svelte';
 	import { slide } from 'svelte/transition';
 	import type { LyricLine } from '$lib/types';
 

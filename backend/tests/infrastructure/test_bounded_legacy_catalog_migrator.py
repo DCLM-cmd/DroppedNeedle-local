@@ -233,7 +233,7 @@ async def test_bounded_migration_keeps_identityless_active_files_local_and_playa
                 "flac",
                 1,
                 1,
-                180,
+                1.0,
                 "c",
                 None,
                 first_id,
@@ -257,7 +257,7 @@ async def test_bounded_migration_keeps_identityless_active_files_local_and_playa
                 "flac",
                 1,
                 1,
-                180,
+                1.0,
                 "d",
                 None,
                 first_id,
@@ -1129,3 +1129,54 @@ async def test_bounded_migration_chunks_tracks_within_one_review_album(
         3,
     )
     assert await store.row_count("local_tracks") == 5
+
+
+# ---- an identity shared by several album rows resolves to the one with music --------
+
+@pytest.mark.asyncio
+async def test_a_shared_identity_resolves_to_the_album_that_has_the_music(tmp_path):
+    """A request that never delivered leaves an album row behind with no tracks, and
+    the live catalog holds 104 release groups in exactly that state - one of its
+    release pins had landed on such a shell. Taking whichever row came first resolved
+    most of them to the empty row rather than to the album that holds the songs.
+    """
+    import sqlite3
+    import threading
+
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
+
+    db_path = tmp_path / "library.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO auth_users(id) VALUES ('admin')")
+    store = NativeLibraryStore(db_path, threading.Lock())
+    rg = "11111111-2222-3333-4444-555555555555"
+    with sqlite3.connect(db_path) as connection:
+        for album_id in ("album-empty", "album-with-music"):
+            connection.execute(
+                "INSERT INTO local_albums(id,root_id,grouping_key,title,title_folded,"
+                "album_artist_id,grouping_source,created_at,updated_at) "
+                "VALUES (?,'root-1',?,?,?,'artist-1','automatic',1.0,1.0)",
+                (album_id, album_id, "Shared Title", "shared title"),
+            )
+            connection.execute(
+                "INSERT INTO local_album_external_identities"
+                "(local_album_id,release_group_mbid,decision_source,selected_at) "
+                "VALUES (?,?,'manual',1.0)",
+                (album_id, rg),
+            )
+        connection.execute(
+            "INSERT INTO local_tracks(id,local_album_id,root_id,file_path,"
+            "relative_path,path_hash,file_size_bytes,file_mtime_ns,stat_revision,"
+            "title,title_folded,album_title,album_title_folded,file_format,"
+            "ingest_source,imported_at,membership_source,availability) "
+            "VALUES ('t-1','album-with-music','root-1','/m/a.flac','a.flac','h',1,1,"
+            "'r','A Song','a song','Shared Title','shared title','flac','scan',1.0,"
+            "'automatic','indexed')"
+        )
+
+    resolved = await store.resolve_bounded_legacy_references(
+        "album_release_pin", [{"release_group_mbid": rg}]
+    )
+
+    assert resolved == [("local_album", "album-with-music")]

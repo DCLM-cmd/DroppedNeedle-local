@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronLeft, ChevronRight, Sparkles, ThumbsDown } from 'lucide-svelte';
+	import { ChevronLeft, ChevronRight, Sparkles, ThumbsDown } from '@lucide/svelte';
 	import { fly } from 'svelte/transition';
 	import type { TopPickItem, TopPicksSection } from '$lib/types';
 	import { SvelteSet } from 'svelte/reactivity';

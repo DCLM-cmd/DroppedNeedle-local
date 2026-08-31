@@ -5,7 +5,7 @@
 	import { ApiError } from '$lib/api/client';
 	import { createSetupMutation } from '$lib/queries/auth/AuthMutations.svelte';
 	import { toAuthUser } from '$lib/queries/auth/types';
-	import { Music, Eye, EyeOff, ShieldCheck } from 'lucide-svelte';
+	import { Music, Eye, EyeOff, ShieldCheck } from '@lucide/svelte';
 
 	let displayName = $state('');
 	let username = $state('');

@@ -15,7 +15,7 @@
 	import AddToPlaylistModal from '$lib/components/AddToPlaylistModal.svelte';
 	import SourceAlbumModal from '$lib/components/SourceAlbumModal.svelte';
 	import LibraryFilterBar from '$lib/components/LibraryFilterBar.svelte';
-	import { ChevronLeft, CircleX, Play, Shuffle } from 'lucide-svelte';
+	import { ChevronLeft, CircleX, Play, Shuffle } from '@lucide/svelte';
 	import { onMount, onDestroy } from 'svelte';
 
 	interface Props {

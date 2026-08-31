@@ -13,7 +13,7 @@
 		RefreshCw,
 		ScanSearch,
 		Sparkles
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { onMount } from 'svelte';
 
 	import { authStore } from '$lib/stores/authStore.svelte';

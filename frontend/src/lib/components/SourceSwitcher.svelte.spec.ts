@@ -36,7 +36,7 @@ describe('SourceSwitcher.svelte', () => {
 
 	it('renders nothing when only ListenBrainz is linked', async () => {
 		mockConnections = [{ service: 'listenbrainz' }];
-		const { container } = render(SourceSwitcher, {
+		const { container } = await render(SourceSwitcher, {
 			props: { pageKey: 'home' }
 		} as Parameters<typeof render<typeof SourceSwitcher>>[1]);
 		await vi.waitFor(() => {
@@ -46,7 +46,7 @@ describe('SourceSwitcher.svelte', () => {
 
 	it('renders nothing when only Last.fm is linked', async () => {
 		mockConnections = [{ service: 'lastfm' }];
-		const { container } = render(SourceSwitcher, {
+		const { container } = await render(SourceSwitcher, {
 			props: { pageKey: 'home' }
 		} as Parameters<typeof render<typeof SourceSwitcher>>[1]);
 		await vi.waitFor(() => {
@@ -56,7 +56,7 @@ describe('SourceSwitcher.svelte', () => {
 
 	it('renders nothing when neither service is linked', async () => {
 		mockConnections = [];
-		const { container } = render(SourceSwitcher, {
+		const { container } = await render(SourceSwitcher, {
 			props: { pageKey: 'home' }
 		} as Parameters<typeof render<typeof SourceSwitcher>>[1]);
 		await vi.waitFor(() => {

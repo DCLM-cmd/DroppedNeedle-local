@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Heart, ArrowRight, CalendarClock, Check, Disc3, ExternalLink } from 'lucide-svelte';
+	import { Heart, ArrowRight, CalendarClock, Check, Disc3, ExternalLink } from '@lucide/svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';

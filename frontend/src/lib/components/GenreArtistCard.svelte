@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check } from 'lucide-svelte';
+	import { Check } from '@lucide/svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import ArtistCardDownloadButton from '$lib/components/ArtistCardDownloadButton.svelte';
 	import type { HomeArtist } from '$lib/types';

@@ -3303,3 +3303,220 @@ async def test_partial_album_and_completed_track_do_not_fulfil_wanted_watch(
     )
 
     wanted_store.mark_fulfilled.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# An upgrade is judged on what it replaced, not on what the library already had
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_upgrade_that_imported_nothing_is_not_complete(tmp_path: Path):
+    """The bug, in one line: an upgrade starts from an album that is ALREADY complete.
+
+    The coverage check therefore passes before the download even begins, so it reported
+    success for a release nothing could be imported from - a single-file album image,
+    whose one long file matches no track on the duration gate. The user pressed
+    upgrade, was told it finished, and the library was untouched. Judging it on what
+    was actually replaced is what lets the failover go looking for a usable copy.
+    """
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="upgrade")
+    # Exactly the state the live run was in: the library covers the whole tracklist.
+    orch._coverage = AsyncMock(return_value=(11, 11, []))
+
+    assert await orch._download_is_complete(task, False) is False
+
+
+@pytest.mark.asyncio
+async def test_an_upgrade_that_replaced_every_file_is_complete(tmp_path: Path):
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="upgrade")
+    orch._coverage = AsyncMock(return_value=(11, 11, []))
+    orch._library.get_file_rows_for_album = AsyncMock(
+        return_value=[{"file_format": "flac", "bit_rate": None} for _ in range(10)]
+    )
+
+    assert await orch._download_is_complete(task, True) is True
+
+
+@pytest.mark.asyncio
+async def test_an_upgrade_that_replaced_only_some_files_is_not_complete(tmp_path: Path):
+    """Straight from a live run: it swapped one track, left nine at the old quality,
+    and reported success. The album sat at 1 FLAC + 9 MP3 and nothing went looking for
+    a release that could deliver the rest."""
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="upgrade")
+    orch._library.get_file_rows_for_album = AsyncMock(
+        return_value=[{"file_format": "flac", "bit_rate": None}]
+        + [{"file_format": "mp3", "bit_rate": 320} for _ in range(9)]
+    )
+
+    assert await orch._download_is_complete(task, True) is False
+
+
+@pytest.mark.asyncio
+async def test_unreadable_library_rows_let_an_upgrade_settle(tmp_path: Path):
+    """Fail-open: a quality check that cannot see the album must not loop forever."""
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="upgrade")
+    orch._library.get_file_rows_for_album = AsyncMock(side_effect=OSError("gone"))
+
+    assert await orch._download_is_complete(task, True) is True
+
+
+@pytest.mark.asyncio
+async def test_an_upgrade_does_not_ask_the_coverage_check_at_all(tmp_path: Path):
+    """Coverage measures the library, not this attempt - for an upgrade it can only
+    give the wrong answer, so it is not consulted."""
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="upgrade")
+    orch._coverage = AsyncMock(return_value=(11, 11, []))
+
+    await orch._download_is_complete(task, False)
+
+    orch._coverage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_normal_album_still_completes_on_coverage(tmp_path: Path):
+    """The rule above must not change ordinary acquisitions: an album that ends up
+    covered is done, however many attempts it took to get there."""
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="user")
+    orch._coverage = AsyncMock(return_value=(11, 11, []))
+
+    assert await orch._download_is_complete(task, False) is True
+
+
+@pytest.mark.asyncio
+async def test_a_normal_album_short_of_coverage_is_incomplete(tmp_path: Path):
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="user")
+    orch._coverage = AsyncMock(return_value=(7, 11, []))
+
+    assert await orch._download_is_complete(task, True) is False
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_upgrade_ends_cancelled_not_failed(tmp_path: Path):
+    """The library is exactly as it was, so this is not a failure to report as one -
+    and 'no source on Soulseek' sent the user looking for a problem that is not there.
+    """
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="upgrade")
+
+    await orch._settle_incomplete(task, False)
+
+    final = await store.get_task(task.id)
+    assert final.status == "cancelled"
+    assert "No better copy could be imported" in (final.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_an_upgrade_that_replaced_some_files_still_settles_as_partial(
+    tmp_path: Path,
+):
+    """Something did improve, so it must not be reported as if nothing happened."""
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="upgrade")
+    orch._imported_track_count = AsyncMock(return_value=4)
+
+    await orch._settle_incomplete(task, True)
+
+    final = await store.get_task(task.id)
+    assert final.status == "partial"
+
+
+# ---------------------------------------------------------------------------
+# A rejection says what was actually wrong
+# ---------------------------------------------------------------------------
+
+def _failed(reason: str):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(succeeded=[], failed=[SimpleNamespace(reason=reason)])
+
+
+def test_a_fingerprint_mismatch_is_not_reported_as_a_disk_problem() -> None:
+    """The regression, verbatim from a live run: a release whose fingerprints named
+    different recordings told the user to "check the library folder is writable and has
+    free space" - sending them to look at disks and permissions for a bad release."""
+    from services.native.download_orchestrator import _rejection_message
+
+    message = _rejection_message(_failed("fingerprint_mismatch"))
+
+    assert "fingerprint" in message.lower()
+    assert "writable" not in message.lower()
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("duration_mismatch", "track lengths"),
+        ("verify_failed", "verified"),
+        ("corrupt", "damaged"),
+        ("wrong_track", "different recording"),
+    ],
+)
+def test_each_rejection_names_itself(reason, expected) -> None:
+    from services.native.download_orchestrator import _rejection_message
+
+    assert expected in _rejection_message(_failed(reason)).lower()
+
+
+def test_a_real_write_failure_still_says_so() -> None:
+    """The disk hint is right when the fault really is local - it must not be lost."""
+    from services.native.download_orchestrator import (
+        IMPORT_FAILED,
+        _rejection_message,
+    )
+
+    assert "writable" in _rejection_message(_failed(IMPORT_FAILED)).lower()
+
+
+def test_a_missing_file_outranks_a_bad_one() -> None:
+    """A local fault is the user's to fix, so it is named first."""
+    from types import SimpleNamespace
+
+    from services.native.download_orchestrator import (
+        SOURCE_FILE_MISSING,
+        _rejection_message,
+    )
+
+    result = SimpleNamespace(
+        succeeded=[],
+        failed=[
+            SimpleNamespace(reason="fingerprint_mismatch"),
+            SimpleNamespace(reason=SOURCE_FILE_MISSING),
+        ],
+    )
+
+    assert "slskd downloads folder" in _rejection_message(result)
+
+
+def test_an_unnamed_reason_falls_through_rather_than_inventing_a_cause() -> None:
+    from services.native.download_orchestrator import _rejection_message
+
+    assert _rejection_message(_failed("something new")) is None
+
+
+def test_nothing_failed_means_nothing_to_say() -> None:
+    from types import SimpleNamespace
+
+    from services.native.download_orchestrator import _rejection_message
+
+    assert _rejection_message(SimpleNamespace(succeeded=[], failed=[])) is None
+    assert _rejection_message(None) is None
+
+
+@pytest.mark.asyncio
+async def test_the_settled_task_carries_the_real_reason(tmp_path: Path):
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store, origin="user")
+
+    await orch._settle_incomplete(
+        task, False, process_result=_failed("fingerprint_mismatch")
+    )
+
+    final = await store.get_task(task.id)
+    assert "fingerprint" in (final.error_message or "").lower()

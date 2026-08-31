@@ -22,7 +22,7 @@
 		Music,
 		Radar,
 		Upload
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	interface Props {
 		item: ActiveRequestItem | RequestHistoryItem;

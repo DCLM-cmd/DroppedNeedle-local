@@ -1,7 +1,7 @@
 <script lang="ts">
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
-	import { ClipboardCheck } from 'lucide-svelte';
+	import { ClipboardCheck } from '@lucide/svelte';
 	import type { ReviewListItem } from '$lib/queries/library/LibraryOperationsTypes';
 	import LibraryReviewCard from './LibraryReviewCard.svelte';
 

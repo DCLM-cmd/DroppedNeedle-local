@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CirclePause, CirclePlay, OctagonX } from 'lucide-svelte';
+	import { CirclePause, CirclePlay, OctagonX } from '@lucide/svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { getLibraryOperationQuery } from '$lib/queries/library/LibraryOperationQueries.svelte';
 	import { controlLibraryOperation } from '$lib/queries/library/LibraryOperationMutations.svelte';

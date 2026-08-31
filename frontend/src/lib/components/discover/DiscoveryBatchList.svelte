@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronDown, Loader2, Sparkles, Trash2 } from 'lucide-svelte';
+	import { ChevronDown, Loader2, Sparkles, Trash2 } from '@lucide/svelte';
 	import { slide } from 'svelte/transition';
 	import { SvelteSet } from 'svelte/reactivity';
 	import {

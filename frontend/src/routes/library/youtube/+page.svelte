@@ -11,7 +11,7 @@
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import type { MenuItem } from '$lib/components/ContextMenu.svelte';
 	import type { YouTubeLink } from '$lib/types';
-	import { Plus, Info, Play, Shuffle, ListPlus, ListStart, ListMusic } from 'lucide-svelte';
+	import { Plus, Info, Play, Shuffle, ListPlus, ListStart, ListMusic } from '@lucide/svelte';
 	import LibraryFilterBar from '$lib/components/LibraryFilterBar.svelte';
 	import {
 		ytCardQuickPlay,

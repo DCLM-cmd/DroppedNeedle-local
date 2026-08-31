@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CirclePause, CirclePlay, OctagonX, ShieldCheck, Wrench } from 'lucide-svelte';
+	import { CirclePause, CirclePlay, OctagonX, ShieldCheck, Wrench } from '@lucide/svelte';
 	import {
 		getLibraryRepairEstimateQuery,
 		getLibraryRepairFindingsQuery,

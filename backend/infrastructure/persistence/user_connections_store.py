@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import sqlite3
@@ -10,6 +9,8 @@ import msgspec
 
 from infrastructure.crypto import decrypt, encrypt
 from infrastructure.serialization import to_jsonable
+
+from infrastructure.persistence._database import PooledSqliteStore
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ class UserConnectionRecord(msgspec.Struct, frozen=True):
     updated_at: str
 
 
-class UserConnectionsStore:
+class UserConnectionsStore(PooledSqliteStore):
     """Per-user external scrobble/discovery accounts (AMU-3).
 
     ``connection_data`` is Fernet-encrypted JSON: lastfm = {session_key, username};
@@ -69,28 +70,6 @@ class UserConnectionsStore:
         finally:
             conn.close()
 
-    def _execute(self, operation, write: bool):
-        if write:
-            with self._write_lock:
-                conn = self._connect()
-                try:
-                    result = operation(conn)
-                    conn.commit()
-                    return result
-                finally:
-                    conn.close()
-
-        conn = self._connect()
-        try:
-            return operation(conn)
-        finally:
-            conn.close()
-
-    async def _read(self, operation):
-        return await asyncio.to_thread(self._execute, operation, False)
-
-    async def _write(self, operation):
-        return await asyncio.to_thread(self._execute, operation, True)
 
     async def upsert(
         self,
@@ -140,6 +119,19 @@ class UserConnectionsStore:
             return json.loads(plaintext)
         except (json.JSONDecodeError, ValueError):
             return None
+
+    async def has_enabled(self, user_id: str, service: str) -> bool:
+        """Whether an enabled row exists, even if its encrypted data is unusable."""
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                "SELECT 1 FROM user_connections "
+                "WHERE user_id = ? AND service = ? AND enabled = 1",
+                (user_id, service),
+            ).fetchone()
+            return row is not None
+
+        return await self._read(operation)
 
     async def list_for_user(self, user_id: str) -> list[UserConnectionRecord]:
         def operation(conn: sqlite3.Connection) -> list[sqlite3.Row]:

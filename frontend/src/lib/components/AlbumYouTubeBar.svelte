@@ -7,7 +7,7 @@
 	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
 	import { getCoverUrl } from '$lib/utils/errorHandling';
 	import { api } from '$lib/api/client';
-	import { Link, Download, Search, Play } from 'lucide-svelte';
+	import { Link, Download, Search, Play } from '@lucide/svelte';
 	import type {
 		Track,
 		YouTubeLink,

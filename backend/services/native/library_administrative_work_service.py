@@ -9,6 +9,8 @@ from models.library_work import LibraryWorkItem
 
 
 _RECENT_FAILURE_SECONDS = 24 * 60 * 60
+# Terminal codes that mean "this run was overtaken", not "this run broke".
+_SUPERSEDED_TERMINAL_CODES = frozenset({"STALE_INPUT"})
 
 
 class LibraryAdministrativeWorkService:
@@ -23,9 +25,11 @@ class LibraryAdministrativeWorkService:
         )
         items = [self._operation_item(row) for row in rows]
         recovery = await self._store.library_management_recovery_diagnostics()
-        attention_count = int(recovery["needs_attention_count"]) + int(
-            recovery["cleanup_pending_count"]
-        )
+        # Only genuine attention counts. A bundle in ``cleanup_pending`` HAS published -
+        # its files are organized - and only the staged-source tidy-up is outstanding,
+        # which the cleanup worker does on its own. Adding it here raised a failure
+        # flag over routine background work.
+        attention_count = int(recovery["needs_attention_count"])
         if attention_count:
             items.append(
                 LibraryWorkItem(
@@ -51,10 +55,31 @@ class LibraryAdministrativeWorkService:
         )
 
     @staticmethod
+    def _is_superseded(row: dict[str, Any]) -> bool:
+        """A run that ended without ATTEMPTING any work because its input moved.
+
+        The organizer plans against a catalog revision and aborts when that revision
+        changes before it executes. Nothing was organized, nothing broke, and the work
+        is simply re-planned on the next pass - but it was recorded as ``failed`` and
+        raised the same "needs attention" flag as a real failure. On the live library
+        that was 57 of 71 "failed" runs, every one of them with zero succeeded, zero
+        failed and zero skipped items.
+
+        Deliberately narrow: a STALE_INPUT run that DID get work done keeps its
+        failure, because then something half-happened and that is worth looking at.
+        """
+        if str(row.get("terminal_code") or "") not in _SUPERSEDED_TERMINAL_CODES:
+            return False
+        return not any(
+            int(row.get(field) or 0)
+            for field in ("succeeded_count", "failed_count", "skipped_count")
+        )
+
+    @staticmethod
     def _operation_item(row: dict[str, Any]) -> LibraryWorkItem:
         kind = str(row["kind"])
         state = str(row["state"])
-        failed = state == "failed"
+        failed = state == "failed" and not LibraryAdministrativeWorkService._is_superseded(row)
         common = {
             "id": str(row["id"]),
             "state": state,

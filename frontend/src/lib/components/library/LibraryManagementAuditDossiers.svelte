@@ -9,7 +9,7 @@
 		Image,
 		Layers3,
 		Tags
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import type { ManagementAuditDossier, ManagementAuditEntry } from './LibraryManagementAuditTypes';

@@ -30,7 +30,7 @@
 	import PlexIcon from '$lib/components/PlexIcon.svelte';
 	import LibraryFormatBadge from '$lib/components/library/LibraryFormatBadge.svelte';
 	import LibraryTrackRow from '$lib/components/library/LibraryTrackRow.svelte';
-	import { ChevronDown, TriangleAlert, TrendingUp, Check } from 'lucide-svelte';
+	import { ChevronDown, TriangleAlert, TrendingUp, Check } from '@lucide/svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import type { LibraryFileMeta, DownloadTask, HeldImport } from '$lib/types';
 	import TrackRequestButton from '$lib/components/downloads/TrackRequestButton.svelte';

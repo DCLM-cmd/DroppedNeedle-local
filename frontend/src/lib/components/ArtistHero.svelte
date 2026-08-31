@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, Mic2, RefreshCw } from 'lucide-svelte';
+	import { Check, Mic2, RefreshCw } from '@lucide/svelte';
 	import type { ArtistInfo } from '$lib/types';
 	import { extractDominantColor, DEFAULT_GRADIENT } from '$lib/utils/colors';
 	import { imageSettingsStore } from '$lib/stores/imageSettings';

@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Optional
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.memory import get_rss_bytes, trim_malloc
+from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.serialization import clone_with_updates
-from infrastructure.validators import is_unknown_mbid
+from infrastructure.validators import is_unknown_mbid, is_valid_mbid
 from services.library_service import LibraryService
+from services.native.title_match import is_placeholder_artist
 from services.preferences_service import PreferencesService
 from core.task_registry import TaskRegistry
 
@@ -19,8 +21,6 @@ if TYPE_CHECKING:
     from services.native.download_orchestrator import DownloadOrchestrator
     from infrastructure.persistence.scan_state_store import ScanStateStore
     from services.audiodb_image_service import AudioDBImageService
-    from services.home_service import HomeService
-    from services.artist_discovery_service import ArtistDiscoveryService
     from services.library_precache_service import LibraryPrecacheService
     from infrastructure.persistence import LibraryDB
     from infrastructure.persistence.request_history import RequestHistoryStore
@@ -29,13 +29,16 @@ if TYPE_CHECKING:
     from infrastructure.persistence.wanted_store import WantedStore
     from services.requests_page_service import RequestsPageService
     from services.native.new_release_service import NewReleaseService
+    from services.native.background_workload_gate import BackgroundWorkloadGate
     from services.personal_mix_service import PersonalMixService
     from repositories.coverart_disk_cache import CoverDiskCache
 
 logger = logging.getLogger(__name__)
 
 
-async def cleanup_cache_periodically(cache: CacheInterface, interval: int = 300) -> None:
+async def cleanup_cache_periodically(
+    cache: CacheInterface, interval: int = 300
+) -> None:
     while True:
         try:
             await asyncio.sleep(interval)
@@ -46,7 +49,9 @@ async def cleanup_cache_periodically(cache: CacheInterface, interval: int = 300)
             logger.error("Cache cleanup task failed: %s", e, exc_info=True)
 
 
-def start_cache_cleanup_task(cache: CacheInterface, interval: int = 300) -> asyncio.Task:
+def start_cache_cleanup_task(
+    cache: CacheInterface, interval: int = 300
+) -> asyncio.Task:
     task = asyncio.create_task(cleanup_cache_periodically(cache, interval=interval))
     TaskRegistry.get_instance().register("cache-cleanup", task)
     return task
@@ -93,7 +98,9 @@ def start_memory_maintenance_task(
     cache: CacheInterface,
     interval: int = _MEMORY_MAINTENANCE_INTERVAL,
 ) -> asyncio.Task:
-    task = asyncio.create_task(memory_maintenance_periodically(cache, interval=interval))
+    task = asyncio.create_task(
+        memory_maintenance_periodically(cache, interval=interval)
+    )
     TaskRegistry.get_instance().register("memory-maintenance", task)
     return task
 
@@ -125,7 +132,9 @@ def start_disk_cache_cleanup_task(
     cover_disk_cache: Optional["CoverDiskCache"] = None,
 ) -> asyncio.Task:
     task = asyncio.create_task(
-        cleanup_disk_cache_periodically(disk_cache, interval=interval, cover_disk_cache=cover_disk_cache)
+        cleanup_disk_cache_periodically(
+            disk_cache, interval=interval, cover_disk_cache=cover_disk_cache
+        )
     )
     TaskRegistry.get_instance().register("disk-cache-cleanup", task)
     return task
@@ -225,7 +234,8 @@ async def auto_scan_library_periodically(
 
             paths = [
                 _Path(p)
-                for p in preferences_service.get_library_settings_raw().library_paths
+                for root in preferences_service.get_typed_library_settings_raw().library_roots
+                for p in [root.path]
             ]
             if not paths:
                 await asyncio.sleep(_SCHEDULER_TICK)
@@ -290,6 +300,75 @@ def start_library_scan_resume_task(
     return task
 
 
+def start_artwork_blurhash_task(get_hash_service) -> asyncio.Task:
+    """Hash any artwork that has none yet, once, shortly after startup.
+
+    Organization runs are what normally fill the store, but a library that has not
+    been organized since this was introduced would otherwise carry no hashes at all,
+    and Finamp tells the user outright when a server returns none. Jellyfin has the
+    same safety net: it scans on startup and its ImageNeedsRefresh picks up every
+    image that is missing a hash.
+
+    Deliberately a background task - it decodes images, and startup must not wait.
+    """
+
+    async def _fill() -> None:
+        try:
+            await get_hash_service().backfill()
+        except Exception as error:  # noqa: BLE001 - decorative work, never fatal
+            logger.warning(
+                "startup.artwork_blurhash_failed", extra={"error": str(error)}
+            )
+
+    task = asyncio.create_task(_fill())
+    TaskRegistry.get_instance().register("artwork-blurhash-backfill", task)
+    task.add_done_callback(
+        lambda t: logger.error("Artwork blurhash task error: %s", t.exception())
+        if not t.cancelled() and t.exception()
+        else None
+    )
+    return task
+
+
+def start_organization_compaction_task(get_store) -> asyncio.Task:
+    """Reclaim the artwork bytes finished organization runs are still holding.
+
+    Runs do this themselves as they finish, but a library organized before this
+    existed carries the whole backlog - 2.67 GB of a 2.90 GB database here. Background,
+    bounded, and never blocking startup.
+    """
+
+    async def _compact() -> None:
+        try:
+            counts = await get_store().compact_finished_organization_records()
+            if any(counts.values()):
+                logger.info("Compacted organization records at startup: %s", counts)
+        except Exception as error:  # noqa: BLE001 - housekeeping, never fatal
+            logger.warning(
+                "startup.organization_compaction_failed", extra={"error": str(error)}
+            )
+        try:
+            repaired = await get_store().repair_target_compat_mappings()
+            if repaired:
+                logger.info(
+                    "Dropped %d compat ids that pointed at the wrong catalog row",
+                    repaired,
+                )
+        except Exception as error:  # noqa: BLE001 - housekeeping, never fatal
+            logger.warning(
+                "startup.compat_id_repair_failed", extra={"error": str(error)}
+            )
+
+    task = asyncio.create_task(_compact())
+    TaskRegistry.get_instance().register("organization-compaction", task)
+    task.add_done_callback(
+        lambda t: logger.error("Organization compaction error: %s", t.exception())
+        if not t.cancelled() and t.exception()
+        else None
+    )
+    return task
+
+
 def start_download_resume_task(orchestrator: "DownloadOrchestrator") -> asyncio.Task:
     """(AUD-3) Resume in-progress / queued downloads on startup without blocking it;
     the orchestrator dispatches each resumed task in the background."""
@@ -310,29 +389,73 @@ def start_download_resume_task(orchestrator: "DownloadOrchestrator") -> asyncio.
     return task
 
 
+async def run_acquisition_cleanup_periodically(
+    get_cleanup_service, interval: float = 30.0
+) -> None:
+    """Drain cleanup debt with freshly resolved clients."""
+
+    worker_id = "acquisition-cleanup-worker"
+    while True:
+        try:
+            service = get_cleanup_service()
+            await service.reconcile_legacy_mount()
+            await service.run_once(worker_id)
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001 - durable cleanup survives one failed sweep
+            logger.exception("Acquisition cleanup sweep failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+def start_acquisition_cleanup_task(get_cleanup_service) -> asyncio.Task:
+    task = asyncio.create_task(
+        run_acquisition_cleanup_periodically(get_cleanup_service)
+    )
+    TaskRegistry.get_instance().register("acquisition-cleanup", task)
+    task.add_done_callback(
+        lambda value: logger.error(
+            "Acquisition cleanup task error: %s", value.exception()
+        )
+        if not value.cancelled() and value.exception()
+        else None
+    )
+    return task
+
+
 async def warm_library_cache(
     library_service: LibraryService,
-    album_service: 'AlbumService',
-    library_db: 'LibraryDB'
+    album_service: "AlbumService",
+    library_db: "LibraryDB",
+    workload_gate: "BackgroundWorkloadGate | None" = None,
 ) -> None:
     try:
         await asyncio.sleep(5)
-        
-        albums_data = await library_db.get_albums()
-        
+
+        if workload_gate is not None:
+            await workload_gate.wait_until_available()
+        albums_data = await library_db.get_recent_albums(limit=30)
+
         if not albums_data:
             return
 
         max_warm = 30
         albums_to_warm = albums_data[:max_warm]
-        
+
         warmed = 0
         for i, album_data in enumerate(albums_to_warm):
-            mbid = album_data.get('mbid')
-            if mbid and not is_unknown_mbid(mbid):
+            if workload_gate is not None:
+                await workload_gate.wait_until_available()
+            mbid = album_data.get("mbid")
+            if is_valid_mbid(mbid):
                 try:
                     if not await album_service.is_album_cached(mbid):
-                        await album_service.get_album_info(mbid)
+                        await album_service.get_album_info(
+                            mbid,
+                            priority=RequestPriority.BACKGROUND_SYNC,
+                        )
                         warmed += 1
 
                     if i % 5 == 0:
@@ -341,66 +464,18 @@ async def warm_library_cache(
                 except Exception as e:
                     logger.error(
                         "Library cache warm item failed album=%s mbid=%s error=%s",
-                        album_data.get('title'),
+                        album_data.get("title"),
                         mbid,
                         e,
                         exc_info=True,
                     )
                     continue
-        
+
     except Exception as e:
         logger.error("Library cache warming failed: %s", e, exc_info=True)
 
 
-async def warm_genre_cache_periodically(
-    home_service: 'HomeService',
-    interval: int = 21600,
-) -> None:
-    # Phase 5: Home/Discover are per-user, so there's no global home cache to read
-    # genre names from; derive top genres account-less from the shared library (D2).
-    RETRY_INTERVAL = 60
-
-    await asyncio.sleep(30)
-
-    while True:
-        warmed = 0
-        try:
-            genre_names = await home_service.get_library_genre_names()
-            if genre_names:
-                for src in ("listenbrainz", "lastfm"):
-                    try:
-                        await home_service._genre.build_and_cache_genre_section(src, genre_names)
-                        warmed += 1
-                    except Exception as e:
-                        logger.error(
-                            "Genre cache warming failed (source=%s): %s",
-                            src,
-                            e,
-                            exc_info=True,
-                        )
-        except asyncio.CancelledError:
-            break
-        except Exception as e:  # noqa: BLE001
-            logger.error("Genre cache warming failed: %s", e, exc_info=True)
-
-        if warmed == 0:
-            await asyncio.sleep(RETRY_INTERVAL)
-        else:
-            try:
-                ttl = home_service._genre._get_genre_section_ttl()
-            except Exception:  # noqa: BLE001
-                ttl = interval
-            await asyncio.sleep(ttl)
-
-
-def start_genre_cache_warming_task(home_service: 'HomeService') -> asyncio.Task:
-    task = asyncio.create_task(warm_genre_cache_periodically(home_service))
-    TaskRegistry.get_instance().register("genre-cache-warming", task)
-    return task
-
-
-async def warm_jellyfin_mbid_index(jellyfin_repo: 'JellyfinRepository') -> None:
-
+async def warm_jellyfin_mbid_index(jellyfin_repo: "JellyfinRepository") -> None:
     await asyncio.sleep(8)
     try:
         await jellyfin_repo.build_mbid_index()
@@ -408,79 +483,115 @@ async def warm_jellyfin_mbid_index(jellyfin_repo: 'JellyfinRepository') -> None:
         logger.error("Jellyfin MBID index warming failed: %s", e, exc_info=True)
 
 
-async def warm_navidrome_mbid_cache() -> None:
-    from core.dependencies import get_navidrome_library_service
+async def warm_navidrome_mbid_cache(service_getter=None) -> None:
+    if service_getter is None:
+        from core.dependencies import get_navidrome_library_service
+
+        service_getter = get_navidrome_library_service
 
     await asyncio.sleep(12)
     while True:
         try:
-            service = get_navidrome_library_service()
+            service = service_getter()
             await service.warm_mbid_cache()
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error("Navidrome MBID cache warming failed: %s", e, exc_info=True)
-        await asyncio.sleep(14400)
+        try:
+            await asyncio.sleep(14400)
+        except asyncio.CancelledError:
+            break
 
 
-async def warm_plex_mbid_cache() -> None:
-    from core.dependencies import get_plex_library_service
+async def warm_plex_mbid_cache(service_getter=None) -> None:
+    if service_getter is None:
+        from core.dependencies import get_plex_library_service
+
+        service_getter = get_plex_library_service
 
     await asyncio.sleep(15)
     while True:
         try:
-            service = get_plex_library_service()
+            service = service_getter()
             await service.warm_mbid_cache()
             await service.persist_if_dirty()
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error("Plex MBID cache warming failed: %s", e, exc_info=True)
-        await asyncio.sleep(14400)
+        try:
+            await asyncio.sleep(14400)
+        except asyncio.CancelledError:
+            break
 
 
 async def warm_artist_discovery_cache_periodically(
-    artist_discovery_service: 'ArtistDiscoveryService',
-    library_db: 'LibraryDB',
+    artist_discovery_service_getter,
+    library_db: "LibraryDB",
     interval: int = 14400,
     delay: float = 0.5,
+    workload_gate: "BackgroundWorkloadGate | None" = None,
 ) -> None:
-    await asyncio.sleep(300)  # Allow initial library sync to complete before warming caches
+    await asyncio.sleep(
+        300
+    )  # Allow initial library sync to complete before warming caches
 
     while True:
         try:
-            artists = await library_db.get_artists()
-            if not artists:
-                await asyncio.sleep(interval)
-                continue
+            artist_cursor = ""
+            while True:
+                if workload_gate is not None:
+                    await workload_gate.wait_until_available()
+                page = await library_db.get_artist_mbid_page(
+                    after_mbid=artist_cursor, limit=500
+                )
+                if not page:
+                    break
 
-            mbids = [
-                a['mbid'] for a in artists
-                if a.get('mbid') and not is_unknown_mbid(a['mbid'])
-            ]
-            if not mbids:
-                await asyncio.sleep(interval)
-                continue
+                artist_cursor = page[-1]
+                mbids = [mbid for mbid in page if is_valid_mbid(mbid)]
+                for mbid in mbids:
+                    if workload_gate is not None:
+                        await workload_gate.run_warmer_unit(
+                            lambda mbid=mbid: artist_discovery_service_getter().precache_artist_discovery(
+                                [mbid], delay=delay
+                            )
+                        )
+                    else:
+                        await (
+                            artist_discovery_service_getter().precache_artist_discovery(
+                                [mbid], delay=delay
+                            )
+                        )
 
-            await artist_discovery_service.precache_artist_discovery(
-                mbids, delay=delay
-            )
+                if len(page) < 500:
+                    break
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error("Artist discovery cache warming failed: %s", e, exc_info=True)
 
-        await asyncio.sleep(interval)
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
 
 
 def start_artist_discovery_cache_warming_task(
-    artist_discovery_service: 'ArtistDiscoveryService',
-    library_db: 'LibraryDB',
+    artist_discovery_service_getter,
+    library_db: "LibraryDB",
     interval: int = 14400,
     delay: float = 0.5,
+    workload_gate: "BackgroundWorkloadGate | None" = None,
 ) -> asyncio.Task:
     task = asyncio.create_task(
         warm_artist_discovery_cache_periodically(
-            artist_discovery_service,
+            artist_discovery_service_getter,
             library_db,
             interval=interval,
             delay=delay,
+            workload_gate=workload_gate,
         )
     )
     TaskRegistry.get_instance().register("artist-discovery-warming", task)
@@ -488,36 +599,30 @@ def start_artist_discovery_cache_warming_task(
 
 
 # Proactive per-user Discover/Home warmer.
-# Keeps each music-source-linked user's Discover/Home caches warm and CONVERGED through the
+# Keeps each user's Discover/Home caches warm and CONVERGED through the
 # day, not just while they're looking at the page. During the ListenBrainz-popularity outage
 # personalisation is reconstructed from Last.fm via MusicBrainz at a hard 1 req/s, which an
 # on-visit build can't finish; a background prewarm (uncancellable) drains those resolutions
 # and banks them to mbid_store so the following normal-budget build finds them cached. One
 # loop, ONE user at a time (the single global MB 1/s queue makes concurrency pointless), and
 # it yields whenever a user is actively browsing.
-DISCOVER_WARMER_STARTUP_DELAY = 180       # let boot + first on-demand traffic settle
-DISCOVER_WARMER_INTERVAL = 90             # floor between per-user warm ticks
-DISCOVER_WARMER_ENUM_TTL = 600            # re-enumerate eligible users at most this often
-DISCOVER_WARMER_REFRESH_INTERVAL = 6 * 3600   # re-warm a converged user this often
-DISCOVER_WARMER_PERSONALIZING_RETRY = 600     # re-warm a still-converging user this often
-DISCOVER_WARMER_MAX_ATTEMPTS = 4          # stop fast-retrying a user that won't converge
-DISCOVER_WARMER_HARD_CAP = 300            # per-user wall-clock ceiling vs a wedged build
+DISCOVER_WARMER_STARTUP_DELAY = 5  # after core startup, before a normal first visit
+DISCOVER_WARMER_INTERVAL = 90  # floor between per-user warm ticks
+DISCOVER_WARMER_ENUM_TTL = 600  # re-enumerate eligible users at most this often
+DISCOVER_WARMER_REFRESH_INTERVAL = 6 * 3600  # re-warm a converged user this often
+DISCOVER_WARMER_PERSONALIZING_RETRY = 600  # re-warm a still-converging user this often
+DISCOVER_WARMER_MAX_ATTEMPTS = 4  # stop fast-retrying a user that won't converge
+DISCOVER_WARMER_HARD_CAP = 300  # per-user wall-clock ceiling vs a wedged build
 
 
-async def _enumerate_warmer_users(auth_store, client_factory) -> list[str]:
-    """User ids with a music source linked - Discover is only meaningful for them."""
+async def _enumerate_warmer_users(auth_store) -> list[str]:
     eligible: list[str] = []
     offset = 0
     while True:
         users = await auth_store.list_users(limit=100, offset=offset)
         if not users:
             break
-        for u in users:
-            if (
-                await client_factory.is_listenbrainz_linked(u.id)
-                or await client_factory.is_lastfm_linked(u.id)
-            ):
-                eligible.append(u.id)
+        eligible.extend(u.id for u in users)
         if len(users) < 100:
             break
         offset += 100
@@ -543,7 +648,9 @@ async def _pick_due_warmer_user(
         has_cache, still_converging = await discover.peek_freshness(uid)
         # A warmed user with NO cached response means the last build was cut at the hard cap
         # (a heavy user mid-outage) - keep them in the fast-retry tier, not the 6h one.
-        if (not has_cache or still_converging) and attempts.get(uid, 0) < DISCOVER_WARMER_MAX_ATTEMPTS:
+        if (not has_cache or still_converging) and attempts.get(
+            uid, 0
+        ) < DISCOVER_WARMER_MAX_ATTEMPTS:
             return uid  # still converging - retry soon
         if stale_fallback is None and age > DISCOVER_WARMER_REFRESH_INTERVAL:
             stale_fallback = uid
@@ -569,7 +676,15 @@ async def _run_registered_warmer_build(name: str, coro) -> None:
         logger.debug("Discover warmer build '%s' failed: %s", name, e)
 
 
-async def _warm_one_user(uid: str, discover, home, last_warmed: dict, attempts: dict) -> None:
+async def _warm_one_user(
+    uid: str,
+    discover,
+    home,
+    last_warmed: dict,
+    attempts: dict,
+    queue_manager=None,
+    workload_gate: "BackgroundWorkloadGate | None" = None,
+) -> None:
     registry = TaskRegistry.get_instance()
     if registry.is_running(f"discover-homepage-warm-{uid}"):
         return  # a live user's build owns it
@@ -578,8 +693,24 @@ async def _warm_one_user(uid: str, discover, home, last_warmed: dict, attempts: 
     # MusicBrainz resolution actually completes and banks), registered under the SAME name the
     # on-visit SWR path uses so the two never double-run; then home (reads the discover cache).
     # _run_registered_warmer_build hard-caps it at DISCOVER_WARMER_HARD_CAP.
-    await _run_registered_warmer_build(f"discover-homepage-warm-{uid}", discover.warm_cache_thorough(uid))
+    if workload_gate is not None:
+        await workload_gate.wait_until_available()
+    await _run_registered_warmer_build(
+        f"discover-homepage-warm-{uid}", discover.warm_cache_thorough(uid)
+    )
+    if workload_gate is not None:
+        await workload_gate.wait_until_available()
     await _run_registered_warmer_build(f"home-warm-{uid}", home.warm_cache(uid))
+    if queue_manager is not None:
+        if workload_gate is not None:
+            await workload_gate.wait_until_available()
+        await queue_manager.start_build(uid)
+        try:
+            await asyncio.wait_for(
+                queue_manager.wait_for_build(uid), timeout=DISCOVER_WARMER_HARD_CAP
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Discover queue warmer for %s exceeded hard cap", uid[:8])
     last_warmed[uid] = monotonic()
     has_cache, still_converging = await discover.peek_freshness(uid)
     # converged only when a real response is cached AND it isn't trending-only; a cut-at-cap
@@ -593,12 +724,15 @@ async def warm_discover_home_periodically(
     get_discover_service,
     get_home_service,
     get_auth_store,
-    get_client_factory,
+    get_queue_manager=None,
     interval: int = DISCOVER_WARMER_INTERVAL,
+    workload_gate: "BackgroundWorkloadGate | None" = None,
 ) -> None:
     from core.config import get_settings
 
-    logger.info("Discover/Home warmer starting (delay %ss)", DISCOVER_WARMER_STARTUP_DELAY)
+    logger.info(
+        "Discover/Home warmer starting (delay %ss)", DISCOVER_WARMER_STARTUP_DELAY
+    )
     await asyncio.sleep(DISCOVER_WARMER_STARTUP_DELAY)
 
     eligible: list[str] = []
@@ -608,14 +742,19 @@ async def warm_discover_home_periodically(
 
     while True:
         try:
+            if workload_gate is not None:
+                await workload_gate.wait_until_available()
             if not get_settings().discover_warmer_enabled:
                 await asyncio.sleep(interval)
                 continue
             now = monotonic()
             if not eligible or (now - enumerated_at) > DISCOVER_WARMER_ENUM_TTL:
-                eligible = await _enumerate_warmer_users(get_auth_store(), get_client_factory())
+                eligible = await _enumerate_warmer_users(get_auth_store())
                 enumerated_at = now
-                logger.info("Discover warmer: %d music-source-linked user(s) eligible", len(eligible))
+                logger.info(
+                    "Discover warmer: %d user(s) eligible",
+                    len(eligible),
+                )
             # We do NOT hard-skip when a user is "active" - the MusicBrainz priority queue
             # already yields background resolution to live USER_INITIATED requests, and the
             # per-user is_running check below avoids fighting a live build. A loop-level skip
@@ -625,9 +764,28 @@ async def warm_discover_home_periodically(
                     eligible, last_warmed, attempts, now, get_discover_service()
                 )
                 if uid is not None:
-                    await _warm_one_user(
-                        uid, get_discover_service(), get_home_service(), last_warmed, attempts
-                    )
+                    if workload_gate is not None:
+                        await workload_gate.run_warmer_unit(
+                            lambda: _warm_one_user(
+                                uid,
+                                get_discover_service(),
+                                get_home_service(),
+                                last_warmed,
+                                attempts,
+                                get_queue_manager() if get_queue_manager else None,
+                                workload_gate,
+                            )
+                        )
+                    else:
+                        await _warm_one_user(
+                            uid,
+                            get_discover_service(),
+                            get_home_service(),
+                            last_warmed,
+                            attempts,
+                            get_queue_manager() if get_queue_manager else None,
+                            workload_gate,
+                        )
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -640,11 +798,16 @@ def start_discover_home_warmer_task(
     get_discover_service,
     get_home_service,
     get_auth_store,
-    get_client_factory,
+    get_queue_manager=None,
+    workload_gate: "BackgroundWorkloadGate | None" = None,
 ) -> asyncio.Task:
     task = asyncio.create_task(
         warm_discover_home_periodically(
-            get_discover_service, get_home_service, get_auth_store, get_client_factory,
+            get_discover_service,
+            get_home_service,
+            get_auth_store,
+            get_queue_manager,
+            workload_gate=workload_gate,
         )
     )
     task.add_done_callback(
@@ -665,136 +828,189 @@ _AUDIODB_SWEEP_LOG_INTERVAL = 100
 
 
 async def warm_audiodb_cache_periodically(
-    audiodb_image_service: 'AudioDBImageService',
-    library_db: 'LibraryDB',
-    preferences_service: 'PreferencesService',
-    precache_service: 'LibraryPrecacheService | None' = None,
+    audiodb_image_service: "AudioDBImageService",
+    library_db: "LibraryDB",
+    preferences_service: "PreferencesService",
+    precache_service: "LibraryPrecacheService | None" = None,
+    workload_gate: "BackgroundWorkloadGate | None" = None,
 ) -> None:
     if precache_service is None:
-        logger.warning("AudioDB sweep: precache_service not available, byte downloads disabled")
+        logger.warning(
+            "AudioDB sweep: precache_service not available, byte downloads disabled"
+        )
     await asyncio.sleep(_AUDIODB_SWEEP_INITIAL_DELAY)
 
     while True:
         try:
-            await asyncio.sleep(_AUDIODB_SWEEP_INTERVAL)
-
-            settings = preferences_service.get_advanced_settings()
-            if not settings.audiodb_enabled:
-                continue
-
-            artists = await library_db.get_artists()
-            albums = await library_db.get_albums()
-            if not artists and not albums:
-                continue
-
-            cursor = preferences_service.get_setting('audiodb_sweep_cursor')
-            all_items: list[tuple[str, str, dict]] = []
-
-            for a in (artists or []):
-                mbid = a.get('mbid')
-                if mbid and not is_unknown_mbid(mbid):
-                    all_items.append(("artist", mbid, a))
-            for a in (albums or []):
-                mbid = a.get('mbid') if isinstance(a, dict) else getattr(a, 'musicbrainz_id', None)
-                if mbid and not is_unknown_mbid(mbid):
-                    all_items.append(("album", mbid, a))
-
-            all_items.sort(key=lambda x: x[1])
-
-            if cursor:
-                start_idx = 0
-                for i, (_, mbid, _) in enumerate(all_items):
-                    if mbid > cursor:
-                        start_idx = i
-                        break
-                else:
-                    start_idx = 0
-                    cursor = None
-                all_items = all_items[start_idx:]
-
-            items_needing_refresh: list[tuple[str, str, dict]] = []
-            for entity_type, mbid, data in all_items:
-                if len(items_needing_refresh) >= _AUDIODB_SWEEP_MAX_ITEMS:
-                    break
-                if entity_type == "artist":
-                    cached = await audiodb_image_service.get_cached_artist_images(mbid)
-                else:
-                    cached = await audiodb_image_service.get_cached_album_images(mbid)
-                if cached is None:
-                    items_needing_refresh.append((entity_type, mbid, data))
-
-            if not items_needing_refresh:
-                preferences_service.save_setting('audiodb_sweep_cursor', None)
-                preferences_service.save_setting('audiodb_sweep_last_completed', time())
-                continue
-
-            processed = 0
-            bytes_ok = 0
-            bytes_fail = 0
-            for entity_type, mbid, data in items_needing_refresh:
-                if not preferences_service.get_advanced_settings().audiodb_enabled:
-                    break
-
-                try:
-                    if entity_type == "artist":
-                        name = data.get('name') if isinstance(data, dict) else None
-                        result = await audiodb_image_service.fetch_and_cache_artist_images(
-                            mbid, name, is_monitored=True,
-                        )
-                        if result and not result.is_negative and result.thumb_url and precache_service:
-                            if await precache_service._download_audiodb_bytes(result.thumb_url, "artist", mbid):
-                                bytes_ok += 1
-                            else:
-                                bytes_fail += 1
-                    else:
-                        artist_name = data.get('artist_name') if isinstance(data, dict) else getattr(data, 'artist_name', None)
-                        album_name = data.get('title') if isinstance(data, dict) else getattr(data, 'title', None)
-                        result = await audiodb_image_service.fetch_and_cache_album_images(
-                            mbid, artist_name=artist_name,
-                            album_name=album_name, is_monitored=True,
-                        )
-                        if result and not result.is_negative and result.album_thumb_url and precache_service:
-                            if await precache_service._download_audiodb_bytes(result.album_thumb_url, "album", mbid):
-                                bytes_ok += 1
-                            else:
-                                bytes_fail += 1
-                except Exception as e:
-                    logger.error(
-                        "audiodb.sweep action=item_error entity_type=%s mbid=%s error=%s",
-                        entity_type,
-                        mbid[:8],
-                        e,
-                        exc_info=True,
-                    )
-
-                processed += 1
-                if processed % _AUDIODB_SWEEP_CURSOR_PERSIST_INTERVAL == 0:
-                    preferences_service.save_setting('audiodb_sweep_cursor', mbid)
-
-                await asyncio.sleep(_AUDIODB_SWEEP_INTER_ITEM_DELAY)
-
-            if processed >= len(items_needing_refresh):
-                preferences_service.save_setting('audiodb_sweep_cursor', None)
-                preferences_service.save_setting('audiodb_sweep_last_completed', time())
-            else:
-                preferences_service.save_setting('audiodb_sweep_cursor', mbid)
-
+            await _run_audiodb_sweep_cycle(
+                audiodb_image_service,
+                library_db,
+                preferences_service,
+                precache_service,
+                workload_gate,
+            )
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error("AudioDB sweep cycle failed: %s", e, exc_info=True)
+        try:
+            await asyncio.sleep(_AUDIODB_SWEEP_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+
+async def _run_audiodb_sweep_cycle(
+    audiodb_image_service: "AudioDBImageService",
+    library_db: "LibraryDB",
+    preferences_service: "PreferencesService",
+    precache_service: "LibraryPrecacheService | None",
+    workload_gate: "BackgroundWorkloadGate | None",
+) -> None:
+    if workload_gate is not None:
+        await workload_gate.wait_until_available()
+
+    settings = preferences_service.get_advanced_settings()
+    if not settings.audiodb_enabled:
+        return
+
+    cursor = preferences_service.get_setting("audiodb_sweep_cursor")
+    all_items = await library_db.get_enrichment_candidates(
+        after_mbid=cursor,
+        limit=_AUDIODB_SWEEP_MAX_ITEMS,
+    )
+    if not all_items:
+        preferences_service.save_setting("audiodb_sweep_cursor", None)
+        preferences_service.save_setting("audiodb_sweep_last_completed", time())
+        return
+
+    items_needing_refresh: list[tuple[str, str, dict]] = []
+    inspected_cursor = cursor
+    inspection_complete = True
+    for entity_type, mbid, data in all_items:
+        if workload_gate is not None and workload_gate.scan_active:
+            inspection_complete = False
+            break
+        inspected_cursor = f"{entity_type}:{mbid}"
+        if len(items_needing_refresh) >= _AUDIODB_SWEEP_MAX_ITEMS:
+            break
+        if entity_type == "artist":
+            cached = await audiodb_image_service.get_cached_artist_images(mbid)
+        else:
+            cached = await audiodb_image_service.get_cached_album_images(mbid)
+        if cached is None:
+            items_needing_refresh.append((entity_type, mbid, data))
+
+    if not items_needing_refresh:
+        page_complete = inspection_complete and (
+            len(all_items) < _AUDIODB_SWEEP_MAX_ITEMS
+        )
+        preferences_service.save_setting(
+            "audiodb_sweep_cursor", None if page_complete else inspected_cursor
+        )
+        if page_complete:
+            preferences_service.save_setting("audiodb_sweep_last_completed", time())
+        return
+
+    processed = 0
+    processed_cursor = cursor
+    bytes_ok = 0
+    bytes_fail = 0
+    for entity_type, mbid, data in items_needing_refresh:
+        if workload_gate is not None and workload_gate.scan_active:
+            break
+        if not preferences_service.get_advanced_settings().audiodb_enabled:
+            break
+
+        try:
+            if entity_type == "artist":
+                name = data.get("name") if isinstance(data, dict) else None
+                result = await audiodb_image_service.fetch_and_cache_artist_images(
+                    mbid,
+                    name,
+                    is_monitored=True,
+                )
+                if (
+                    result
+                    and not result.is_negative
+                    and result.thumb_url
+                    and precache_service
+                ):
+                    if await precache_service._download_audiodb_bytes(
+                        result.thumb_url, "artist", mbid
+                    ):
+                        bytes_ok += 1
+                    else:
+                        bytes_fail += 1
+            else:
+                artist_name = (
+                    data.get("artist_name")
+                    if isinstance(data, dict)
+                    else getattr(data, "artist_name", None)
+                )
+                album_name = (
+                    data.get("title")
+                    if isinstance(data, dict)
+                    else getattr(data, "title", None)
+                )
+                result = await audiodb_image_service.fetch_and_cache_album_images(
+                    mbid,
+                    artist_name=artist_name,
+                    album_name=album_name,
+                    is_monitored=True,
+                )
+                if (
+                    result
+                    and not result.is_negative
+                    and result.album_thumb_url
+                    and precache_service
+                ):
+                    if await precache_service._download_audiodb_bytes(
+                        result.album_thumb_url, "album", mbid
+                    ):
+                        bytes_ok += 1
+                    else:
+                        bytes_fail += 1
+        except Exception as e:
+            logger.error(
+                "audiodb.sweep action=item_error entity_type=%s mbid=%s error=%s",
+                entity_type,
+                mbid[:8],
+                e,
+                exc_info=True,
+            )
+
+        processed += 1
+        processed_cursor = f"{entity_type}:{mbid}"
+        if processed % _AUDIODB_SWEEP_CURSOR_PERSIST_INTERVAL == 0:
+            preferences_service.save_setting("audiodb_sweep_cursor", processed_cursor)
+
+        await asyncio.sleep(_AUDIODB_SWEEP_INTER_ITEM_DELAY)
+
+    if processed >= len(items_needing_refresh) and inspection_complete:
+        page_complete = len(all_items) < _AUDIODB_SWEEP_MAX_ITEMS
+        preferences_service.save_setting(
+            "audiodb_sweep_cursor", None if page_complete else inspected_cursor
+        )
+        if page_complete:
+            preferences_service.save_setting("audiodb_sweep_last_completed", time())
+    else:
+        preferences_service.save_setting("audiodb_sweep_cursor", processed_cursor)
 
 
 def start_audiodb_sweep_task(
-    audiodb_image_service: 'AudioDBImageService',
-    library_db: 'LibraryDB',
-    preferences_service: 'PreferencesService',
-    precache_service: 'LibraryPrecacheService | None' = None,
+    audiodb_image_service: "AudioDBImageService",
+    library_db: "LibraryDB",
+    preferences_service: "PreferencesService",
+    precache_service: "LibraryPrecacheService | None" = None,
+    workload_gate: "BackgroundWorkloadGate | None" = None,
 ) -> asyncio.Task:
     task = asyncio.create_task(
         warm_audiodb_cache_periodically(
-            audiodb_image_service, library_db, preferences_service,
+            audiodb_image_service,
+            library_db,
+            preferences_service,
             precache_service=precache_service,
+            workload_gate=workload_gate,
         )
     )
     TaskRegistry.get_instance().register("audiodb-sweep", task)
@@ -806,7 +1022,7 @@ _REQUEST_SYNC_INITIAL_DELAY = 15
 
 
 async def sync_request_statuses_periodically(
-    requests_page_service: 'RequestsPageService',
+    requests_page_service: "RequestsPageService",
     interval: int = _REQUEST_SYNC_INTERVAL,
 ) -> None:
     await asyncio.sleep(_REQUEST_SYNC_INITIAL_DELAY)
@@ -823,7 +1039,7 @@ async def sync_request_statuses_periodically(
 
 
 def start_request_status_sync_task(
-    requests_page_service: 'RequestsPageService',
+    requests_page_service: "RequestsPageService",
 ) -> asyncio.Task:
     task = asyncio.create_task(
         sync_request_statuses_periodically(requests_page_service)
@@ -892,6 +1108,35 @@ def start_download_auto_retry_task(get_orchestrator) -> asyncio.Task:
     return task
 
 
+_MANAGEMENT_HOLD_AUTO_RETRY_INTERVAL = 60
+_MANAGEMENT_HOLD_AUTO_RETRY_INITIAL_DELAY = 60
+
+
+async def auto_retry_management_holds_periodically(
+    get_download_service, interval: int = _MANAGEMENT_HOLD_AUTO_RETRY_INTERVAL
+) -> None:
+    await asyncio.sleep(_MANAGEMENT_HOLD_AUTO_RETRY_INITIAL_DELAY)
+    while True:
+        try:
+            await get_download_service().retry_due_management_holds()
+        except asyncio.CancelledError:
+            break
+        except Exception as error:  # noqa: BLE001 - durable retry loop survives one sweep
+            logger.error("Organizer auto-retry sweep failed: %s", error, exc_info=True)
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+def start_management_hold_auto_retry_task(get_download_service) -> asyncio.Task:
+    task = asyncio.create_task(
+        auto_retry_management_holds_periodically(get_download_service)
+    )
+    TaskRegistry.get_instance().register("management-hold-auto-retry", task)
+    return task
+
+
 _WANTED_WATCHER_INTERVAL = 900
 _WANTED_WATCHER_INITIAL_DELAY = 240
 
@@ -925,7 +1170,7 @@ _FOLLOW_POLL_INITIAL_DELAY = 300
 
 
 async def poll_followed_artists_new_releases(
-    new_release_service: 'NewReleaseService',
+    new_release_service: "NewReleaseService",
     interval: int = _FOLLOW_POLL_INTERVAL,
 ) -> None:
     """Detect new releases for followed artists and auto-enqueue for approved
@@ -945,11 +1190,9 @@ async def poll_followed_artists_new_releases(
 
 
 def start_poll_new_releases_task(
-    new_release_service: 'NewReleaseService',
+    new_release_service: "NewReleaseService",
 ) -> asyncio.Task:
-    task = asyncio.create_task(
-        poll_followed_artists_new_releases(new_release_service)
-    )
+    task = asyncio.create_task(poll_followed_artists_new_releases(new_release_service))
     TaskRegistry.get_instance().register("follow-new-release-poll", task)
     return task
 
@@ -1022,7 +1265,11 @@ _events_kick_task: asyncio.Task | None = None
 
 def _log_events_kick_error(task: asyncio.Task) -> None:
     if not task.cancelled() and task.exception() is not None:
-        logger.error("Kicked events sweep failed: %s", task.exception(), exc_info=task.exception())
+        logger.error(
+            "Kicked events sweep failed: %s",
+            task.exception(),
+            exc_info=task.exception(),
+        )
 
 
 def kick_events_sweep(get_events_watcher) -> asyncio.Task | None:
@@ -1047,7 +1294,7 @@ _PERSONAL_MIX_INITIAL_DELAY = 300
 
 
 async def refresh_personal_mixes_periodically(
-    personal_mix_service: 'PersonalMixService',
+    personal_mix_service: "PersonalMixService",
     interval: int = _PERSONAL_MIX_REFRESH_INTERVAL,
 ) -> None:
     await asyncio.sleep(_PERSONAL_MIX_INITIAL_DELAY)
@@ -1064,7 +1311,7 @@ async def refresh_personal_mixes_periodically(
 
 
 def start_personal_mix_refresh_task(
-    personal_mix_service: 'PersonalMixService',
+    personal_mix_service: "PersonalMixService",
 ) -> asyncio.Task:
     task = asyncio.create_task(
         refresh_personal_mixes_periodically(personal_mix_service)
@@ -1074,8 +1321,8 @@ def start_personal_mix_refresh_task(
 
 
 async def demote_orphaned_covers_periodically(
-    cover_disk_cache: 'CoverDiskCache',
-    library_db: 'LibraryDB',
+    cover_disk_cache: "CoverDiskCache",
+    library_db: "LibraryDB",
     interval: int = 86400,
 ) -> None:
     from repositories.coverart_disk_cache import get_cache_filename
@@ -1105,25 +1352,27 @@ async def demote_orphaned_covers_periodically(
 
 
 def start_orphan_cover_demotion_task(
-    cover_disk_cache: 'CoverDiskCache',
-    library_db: 'LibraryDB',
+    cover_disk_cache: "CoverDiskCache",
+    library_db: "LibraryDB",
     interval: int = 86400,
 ) -> asyncio.Task:
     task = asyncio.create_task(
-        demote_orphaned_covers_periodically(cover_disk_cache, library_db, interval=interval)
+        demote_orphaned_covers_periodically(
+            cover_disk_cache, library_db, interval=interval
+        )
     )
     TaskRegistry.get_instance().register("orphan-cover-demotion", task)
     return task
 
 
 async def prune_stores_periodically(
-    request_history: 'RequestHistoryStore',
-    mbid_store: 'MBIDStore',
-    youtube_store: 'YouTubeStore',
+    request_history: "RequestHistoryStore",
+    mbid_store: "MBIDStore",
+    youtube_store: "YouTubeStore",
     request_retention_days: int = 180,
     ignored_retention_days: int = 365,
     interval: int = 21600,
-    wanted_store: 'WantedStore | None' = None,
+    wanted_store: "WantedStore | None" = None,
 ) -> None:
     await asyncio.sleep(600)
     while True:
@@ -1144,17 +1393,19 @@ async def prune_stores_periodically(
 
 
 def start_store_prune_task(
-    request_history: 'RequestHistoryStore',
-    mbid_store: 'MBIDStore',
-    youtube_store: 'YouTubeStore',
+    request_history: "RequestHistoryStore",
+    mbid_store: "MBIDStore",
+    youtube_store: "YouTubeStore",
     request_retention_days: int = 180,
     ignored_retention_days: int = 365,
     interval: int = 21600,
-    wanted_store: 'WantedStore | None' = None,
+    wanted_store: "WantedStore | None" = None,
 ) -> asyncio.Task:
     task = asyncio.create_task(
         prune_stores_periodically(
-            request_history, mbid_store, youtube_store,
+            request_history,
+            mbid_store,
+            youtube_store,
             request_retention_days=request_retention_days,
             ignored_retention_days=ignored_retention_days,
             interval=interval,
@@ -1176,15 +1427,19 @@ async def prune_recycle_bin_periodically(
     await asyncio.sleep(600)
     while True:
         try:
-            policy = preferences_service.get_download_policy()
-            library = preferences_service.get_library_settings()
-            bin_path = resolve_bin_path(policy.recycle_bin_path, library.library_paths)
-            if bin_path is not None:
-                removed = await asyncio.to_thread(
-                    prune, bin_path, policy.recycle_retention_days
+            library = preferences_service.get_typed_library_settings()
+            if library.enabled:
+                policy = preferences_service.get_download_policy()
+                bin_path = resolve_bin_path(
+                    policy.recycle_bin_path,
+                    [root.path for root in library.library_roots],
                 )
-                if removed:
-                    logger.info("Recycle bin prune removed %d entries", removed)
+                if bin_path is not None:
+                    removed = await asyncio.to_thread(
+                        prune, bin_path, policy.recycle_retention_days
+                    )
+                    if removed:
+                        logger.info("Recycle bin prune removed %d entries", removed)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1205,7 +1460,9 @@ def start_recycle_bin_prune_task(
 
 
 async def run_background_upgrade_sweep(
-    download_service, auth_store, policy  # noqa: ANN001
+    download_service,
+    auth_store,
+    policy,  # noqa: ANN001
 ) -> int:
     """One background-upgrade pass (CollectionManagement Phase 5): walk the
     cutoff-unmet worklist and enqueue at most ``background_upgrade_max_per_run``
@@ -1220,19 +1477,37 @@ async def run_background_upgrade_sweep(
     owner = admins[0]
     items = await download_service.list_cutoff_unmet()
     enqueued = 0
+    skipped = 0
     for item in items:
         if enqueued >= policy.background_upgrade_max_per_run:
             break
+        artist_name = (item.get("artist_name") or "").strip()
+        album_title = (item.get("album_title") or "").strip()
+        # An untagged album has no identity to search for. Substituting a filler here
+        # used to send "Unknown" to the matchers, where it matched any share holding an
+        # "Unknown" folder and auto-accepted whatever was inside - the grab then landed
+        # untagged too, so the next sweep found one more identity-less album and the
+        # library poisoned itself one pass at a time. Skip instead: an upgrade the
+        # sweep cannot name is not one it may guess at.
+        if not artist_name or not album_title or is_placeholder_artist(artist_name):
+            skipped += 1
+            continue
         task_id = await download_service.request_upgrade_album(
             user_id=owner.id,
             release_group_mbid=item["release_group_mbid"],
-            artist_name=item.get("artist_name") or "Unknown",
-            album_title=item.get("album_title") or "Unknown",
+            artist_name=artist_name,
+            album_title=album_title,
             year=item.get("year"),
             artist_mbid=item.get("artist_mbid"),
         )
         if task_id != "already_in_library":
             enqueued += 1
+    if skipped:
+        logger.info(
+            "Background upgrade sweep skipped %d album(s) with no usable artist/album "
+            "name - they need identification before they can be upgraded",
+            skipped,
+        )
     if enqueued:
         logger.info("Background upgrade sweep enqueued %d upgrade(s)", enqueued)
     return enqueued
@@ -1269,7 +1544,9 @@ def start_background_upgrade_scan_task(
     preferences_service: PreferencesService,
 ) -> asyncio.Task:
     task = asyncio.create_task(
-        scan_for_upgrades_periodically(get_download_service, auth_store, preferences_service)
+        scan_for_upgrades_periodically(
+            get_download_service, auth_store, preferences_service
+        )
     )
     TaskRegistry.get_instance().register("background-upgrade-scan", task)
     return task

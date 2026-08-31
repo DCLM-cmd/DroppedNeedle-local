@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Download } from 'lucide-svelte';
+	import { Download } from '@lucide/svelte';
 	import { requestAlbum } from '$lib/utils/albumRequest';
 	import { colors } from '$lib/colors';
 

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { Check, ChevronDown, ListPlus, RotateCcw, ShieldAlert, Tags, X } from 'lucide-svelte';
+	import { Check, ChevronDown, ListPlus, RotateCcw, ShieldAlert, Tags, X } from '@lucide/svelte';
 
 	import { createLibraryManagementTagEditPreviewMutation } from '$lib/queries/library-management/LibraryManagementMutations.svelte';
 	import { rememberLibraryManagementPreviewToken } from '$lib/queries/library-management/LibraryManagementPreviewTokens';

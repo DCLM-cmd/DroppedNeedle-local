@@ -135,6 +135,8 @@ from .service_providers import (  # noqa: F401
     get_target_library_diagnostics_service,
     get_target_explicit_reidentification_worker,
     get_library_management_planner,
+    get_library_housekeeping_service,
+    get_library_image_hash_service,
     get_library_management_worker,
     get_target_library_operation_supervisor,
     get_target_native_library_service,

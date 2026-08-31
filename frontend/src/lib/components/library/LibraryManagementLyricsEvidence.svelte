@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { FileText } from 'lucide-svelte';
+	import { FileText } from '@lucide/svelte';
 
 	import type { LibraryManagementPlanItem } from '$lib/queries/library-management/types';
 	import { managementFieldDiffs, managementLyricsProjection } from './LibraryManagementDisplay';

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import { formatDurationSec } from '$lib/utils/formatting';
-	import { Play } from 'lucide-svelte';
+	import { Play } from '@lucide/svelte';
 
 	export type DiscoveryTrack = {
 		id: string;

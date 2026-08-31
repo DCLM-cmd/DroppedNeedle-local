@@ -4,7 +4,7 @@
 	import HomeSection from './HomeSection.svelte';
 	import HeroBackdrop from './HeroBackdrop.svelte';
 	import ArtistImage from './ArtistImage.svelte';
-	import { Headphones } from 'lucide-svelte';
+	import { Headphones } from '@lucide/svelte';
 	import { imageSettingsStore } from '$lib/stores/imageSettings';
 
 	interface Props {

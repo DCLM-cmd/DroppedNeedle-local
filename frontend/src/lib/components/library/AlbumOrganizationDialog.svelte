@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronDown, FolderTree } from 'lucide-svelte';
+	import { ChevronDown, FolderTree } from '@lucide/svelte';
 	import type { LibraryAlbumDetail, NativeTrackListItem } from '$lib/types';
 	import type { MembershipPreviewResponse } from '$lib/queries/library/LibraryOperationsTypes';
 	import {

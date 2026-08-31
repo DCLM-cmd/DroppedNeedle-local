@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Download } from 'lucide-svelte';
+	import { Download } from '@lucide/svelte';
 	import DiscoveryBatchModal from '$lib/components/discover/DiscoveryBatchModal.svelte';
 	import RadioPlayButton from '$lib/components/discover/RadioPlayButton.svelte';
 	import { integrationStore } from '$lib/stores/integration';

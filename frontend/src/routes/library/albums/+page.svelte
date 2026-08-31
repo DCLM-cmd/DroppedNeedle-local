@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { ChevronLeft, Disc3, Search, X } from 'lucide-svelte';
+	import { ChevronLeft, Disc3, Search, X } from '@lucide/svelte';
 	import { getLibraryAlbumsQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import LibraryAlbumCard from '$lib/components/library/LibraryAlbumCard.svelte';
 	import Pagination from '$lib/components/Pagination.svelte';

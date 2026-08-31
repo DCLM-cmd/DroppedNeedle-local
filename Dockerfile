@@ -23,7 +23,12 @@ RUN pip install --no-cache-dir --prefix=/install -r /tmp/requirements.txt
 
 FROM python:3.13.5-slim
 
-ARG COMMIT_TAG
+# Defaulted, not bare: a bare ARG makes ``ENV COMMIT_TAG=${COMMIT_TAG}`` below set the
+# variable to an EMPTY STRING, which is not the same as unset - os.environ.get's
+# default never applies to it. That emptied the version out of the User-Agent
+# ("DroppedNeedleApp/ (...)"), and MetaBrainz throttles clients that do not name a
+# version. CI still overrides these with --build-arg.
+ARG COMMIT_TAG=dev
 ARG BUILD_DATE
 ARG DROPPEDNEEDLE_SOURCE_REVISION=unknown
 

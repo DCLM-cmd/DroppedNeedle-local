@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Clock3, ListOrdered, SkipForward } from 'lucide-svelte';
+	import { Clock3, ListOrdered, SkipForward } from '@lucide/svelte';
 
 	import { tryNextSource } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import type { DownloadSourceUpdate, DownloadTask } from '$lib/types';

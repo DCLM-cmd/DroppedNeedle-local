@@ -20,7 +20,7 @@
 		ListPlus,
 		ListStart,
 		Loader2
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import type { JellyfinTrackInfo, JellyfinTrackPage } from '$lib/types';
 
 	const PAGE_SIZE = 48;

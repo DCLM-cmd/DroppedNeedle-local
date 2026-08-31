@@ -98,7 +98,7 @@ describe('LibraryRootPolicyEditor', () => {
 				}
 			]
 		};
-		const view = render(LibraryRootPolicyEditor, {
+		const view = await render(LibraryRootPolicyEditor, {
 			props: { roots: [root], onchange: vi.fn() }
 		} as unknown as Parameters<typeof render>[1]);
 

@@ -17,7 +17,7 @@
 		Trash2,
 		UsersRound,
 		X
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import LibraryManagementScriptEditor from './LibraryManagementScriptEditor.svelte';
 	import { getLibraryManagementPresetDiffQuery } from '$lib/queries/library-management/LibraryManagementQueries.svelte';

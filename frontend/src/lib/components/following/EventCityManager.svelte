@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Plus, X } from 'lucide-svelte';
+	import { Plus, X } from '@lucide/svelte';
 	import CitySearchInput from '$lib/components/following/CitySearchInput.svelte';
 	import { createReplaceEventCitiesMutation } from '$lib/queries/following/FollowMutations.svelte';
 	import type { CitySearchResult, EventCity } from '$lib/queries/following/types';

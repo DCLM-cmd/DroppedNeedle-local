@@ -5,6 +5,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
 from core.exceptions import (
+    AutomaticManagementHoldError,
     ResourceNotFoundError,
     ExternalServiceError,
     SourceResolutionError,
@@ -29,6 +30,7 @@ from models.error import (
     CIRCUIT_BREAKER_OPEN,
     FORBIDDEN,
     CONFLICT,
+    MANAGEMENT_HOLD,
     REVISION_OVERFLOW,
     STALE_REVISION,
     STATUS_TO_CODE,
@@ -116,6 +118,33 @@ async def conflict_error_handler(
         status.HTTP_409_CONFLICT,
         getattr(exc, "error_code", CONFLICT),
         str(exc),
+    )
+
+
+async def automatic_management_hold_handler(
+    request: Request, exc: AutomaticManagementHoldError
+) -> MsgSpecJSONResponse:
+    """A hold is a deliberate refusal to import, not a server fault.
+
+    The Organizer funnels every classified publication failure into this one class
+    so the automatic pipeline can park the file and retry it later. A manual import
+    has no such retry, so the caller has to be told why nothing was imported - and
+    ``reason_code`` is what lets the UI say "that destination is occupied" instead
+    of "failed". Without this handler the exception reached FastAPI and became a
+    500, reporting a safety refusal as an internal error.
+    """
+    logger.warning(
+        "Import held (%s): %s - %s %s",
+        exc.reason_code,
+        exc,
+        request.method,
+        request.url.path,
+    )
+    return error_response(
+        status.HTTP_409_CONFLICT,
+        MANAGEMENT_HOLD,
+        str(exc),
+        details={"reason_code": exc.reason_code},
     )
 
 

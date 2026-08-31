@@ -12,7 +12,7 @@
 		LogIn,
 		Eye,
 		EyeOff
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { api } from '$lib/api/client';
 	import type { OIDCConnectionSettings } from '$lib/types';
 

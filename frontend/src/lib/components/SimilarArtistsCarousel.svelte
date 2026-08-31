@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check } from 'lucide-svelte';
+	import { Check } from '@lucide/svelte';
 	import type { SimilarArtist } from '$lib/types';
 	import HorizontalCarousel from './HorizontalCarousel.svelte';
 	import CarouselSkeleton from './CarouselSkeleton.svelte';

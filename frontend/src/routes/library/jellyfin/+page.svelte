@@ -29,7 +29,7 @@
 	import { reveal } from '$lib/actions/reveal';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { Tv } from 'lucide-svelte';
+	import { Tv } from '@lucide/svelte';
 	import type {
 		JellyfinHubResponse,
 		JellyfinAlbumSummary,

@@ -7,7 +7,7 @@
 	import { requestAlbum } from '$lib/utils/albumRequest';
 	import { formatListenCount } from '$lib/utils/formatting';
 	import { getListenTitle } from '$lib/utils/enrichment';
-	import { Download, Music2 } from 'lucide-svelte';
+	import { Download, Music2 } from '@lucide/svelte';
 	import AlbumImage from './AlbumImage.svelte';
 	import LibraryBadge from './LibraryBadge.svelte';
 	import AlbumCardOverlay from './AlbumCardOverlay.svelte';

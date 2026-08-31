@@ -12,7 +12,7 @@
 		Search,
 		Minus,
 		ChevronUp
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	const phaseIcons: Record<string, typeof Users> = {
 		artists: Users,

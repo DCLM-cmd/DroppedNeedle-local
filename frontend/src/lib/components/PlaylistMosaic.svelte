@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Disc3 } from 'lucide-svelte';
+	import { Disc3 } from '@lucide/svelte';
 
 	interface Props {
 		coverUrls?: string[];

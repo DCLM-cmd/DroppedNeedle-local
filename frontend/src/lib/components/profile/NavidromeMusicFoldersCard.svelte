@@ -3,7 +3,7 @@
 	import { getNavidromeFolderPreferenceQuery } from '$lib/queries/navidrome-folders/NavidromeFolderQueries.svelte';
 	import { createUpdateNavidromeFolderPreferenceMutation } from '$lib/queries/navidrome-folders/NavidromeFolderMutations.svelte';
 	import type { NavidromeFolderPreferenceMode } from '$lib/types';
-	import { CircleAlert, Folder, Save } from 'lucide-svelte';
+	import { CircleAlert, Folder, Save } from '@lucide/svelte';
 
 	interface Props {
 		userId: string;

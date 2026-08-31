@@ -2,7 +2,7 @@
 	import { api } from '$lib/api/client';
 	import type { SpotifySettings } from '$lib/types';
 	import { createSettingsForm } from '$lib/utils/settingsForm.svelte';
-	import { Copy, ExternalLink } from 'lucide-svelte';
+	import { Copy, ExternalLink } from '@lucide/svelte';
 	import { onMount, onDestroy } from 'svelte';
 
 	let redirectUri = $state('');

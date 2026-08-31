@@ -18,7 +18,7 @@
 	import type { MenuItem } from '$lib/components/ContextMenu.svelte';
 	import SourcePickerDropdown from '$lib/components/SourcePickerDropdown.svelte';
 	import NowPlayingIndicator from '$lib/components/NowPlayingIndicator.svelte';
-	import { Music, Trash2, ListPlus, ListStart, GripVertical, Play, X } from 'lucide-svelte';
+	import { Music, Trash2, ListPlus, ListStart, GripVertical, Play, X } from '@lucide/svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 
 	interface Props {

@@ -7,7 +7,7 @@
 		Plus,
 		Rss,
 		Trash2
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import {
 		deleteIndexerMutation,

@@ -14,7 +14,7 @@
 		RotateCcw,
 		Save,
 		Trash2
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import type { PageData } from './$types';
 	import type { ReleaseDraft, ReleaseTextField } from '$lib/types';
 	import ContributionDiscogsSource from '$lib/components/library/ContributionDiscogsSource.svelte';

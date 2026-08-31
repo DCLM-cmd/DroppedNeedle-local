@@ -13,7 +13,7 @@
 		Sparkles,
 		Tags,
 		X
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import BackButton from '$lib/components/BackButton.svelte';
 	import LibraryManagementDiscardPreview from './LibraryManagementDiscardPreview.svelte';

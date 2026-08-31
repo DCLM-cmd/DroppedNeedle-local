@@ -11,7 +11,7 @@
 	import PlaylistMosaic from '$lib/components/PlaylistMosaic.svelte';
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import type { MenuItem } from '$lib/components/ContextMenu.svelte';
-	import { Play, Shuffle, Pencil, Check, X, Tv, Sparkles, Globe, Lock } from 'lucide-svelte';
+	import { Play, Shuffle, Pencil, Check, X, Tv, Sparkles, Globe, Lock } from '@lucide/svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';
 	import PlexIcon from '$lib/components/PlexIcon.svelte';
 	import { getSourceColor, getSourceLabel } from '$lib/utils/sources';
@@ -40,7 +40,7 @@
 		onshare
 	}: Props = $props();
 
-	import { Trash2 } from 'lucide-svelte';
+	import { Trash2 } from '@lucide/svelte';
 
 	let ownerInitials = $derived(
 		(playlist.owner_name ?? '')

@@ -592,7 +592,9 @@ class LocalFilesService:
         if not roots:
             return LocalStorageStats()
         stats = await self._library_repo.get_stats()
-        disk = shutil.disk_usage(roots[0])
+        # /mnt/storage is a spinning/network mount; statvfs on a stalled mount
+        # would freeze the whole loop, not just this request.
+        disk = await asyncio.to_thread(shutil.disk_usage, roots[0])
         return LocalStorageStats(
             total_tracks=stats.total_tracks,
             total_albums=stats.total_albums,

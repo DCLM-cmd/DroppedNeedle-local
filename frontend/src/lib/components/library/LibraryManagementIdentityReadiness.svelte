@@ -9,7 +9,7 @@
 		ShieldCheck,
 		Tags,
 		Trash2
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import IdentityFindingEditionButton from './IdentityFindingEditionButton.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';

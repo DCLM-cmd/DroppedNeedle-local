@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Radio, Headphones } from 'lucide-svelte';
+	import { Radio, Headphones } from '@lucide/svelte';
 
 	interface Props {
 		source?: string;

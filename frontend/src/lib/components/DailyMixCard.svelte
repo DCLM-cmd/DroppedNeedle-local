@@ -3,7 +3,7 @@
 	import HomeSection from '$lib/components/HomeSection.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import DiscoveryShelfActions from '$lib/components/discover/DiscoveryShelfActions.svelte';
-	import { ChevronDown, Disc3 } from 'lucide-svelte';
+	import { ChevronDown, Disc3 } from '@lucide/svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { tilt } from '$lib/actions/tilt';
 	import { slide } from 'svelte/transition';

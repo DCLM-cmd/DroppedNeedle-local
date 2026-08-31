@@ -1,6 +1,6 @@
 <script lang="ts">
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
-	import { ChevronRight } from 'lucide-svelte';
+	import { ChevronRight } from '@lucide/svelte';
 	import { reveal } from '$lib/actions/reveal';
 
 	interface AlbumItem {

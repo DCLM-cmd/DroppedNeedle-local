@@ -51,6 +51,22 @@ _PREFERENCES_OWNED_CONFIG_KEYS = frozenset(
 )
 
 
+# Fallback when the build did not stamp a version. ``os.environ.get(key, default)``
+# only falls back when the key is ABSENT, and the Dockerfile writes
+# ``ENV COMMIT_TAG=${COMMIT_TAG}`` from an ARG nothing passes - so the variable exists
+# and is EMPTY, and the default never applied. The User-Agent then read
+# "DroppedNeedleApp/ (...)" with no version at all, which MetaBrainz (ListenBrainz,
+# MusicBrainz, Cover Art Archive) throttles: they require an application name AND
+# version. Both of those circuit breakers tripping on the live server is what this
+# fixes. Anything that reads a build stamp must go through here.
+_DEFAULT_VERSION = "dev"
+
+
+def build_version() -> str:
+    """The build's version string, never empty."""
+    return (os.environ.get("COMMIT_TAG") or "").strip() or _DEFAULT_VERSION
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -158,10 +174,12 @@ class Settings(BaseSettings):
         return self
     
     def get_user_agent(self) -> str:
-        version = os.environ.get("COMMIT_TAG", "dev")
         id_part = self.instance_id[:8] if self.instance_id else "unknown"
         email = (self.contact_email or "").strip() or "contact@droppedneedle.com"
-        return f"DroppedNeedleApp/{version} ({id_part}; {email}; https://www.droppedneedle.com)"
+        return (
+            f"DroppedNeedleApp/{build_version()} "
+            f"({id_part}; {email}; https://www.droppedneedle.com)"
+        )
 
     def load_from_file(self) -> None:
         if not self.config_file_path.exists():

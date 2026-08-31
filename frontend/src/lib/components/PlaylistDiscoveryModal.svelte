@@ -9,7 +9,7 @@
 		Tags,
 		Check,
 		ExternalLink
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import AlbumRequestButton from '$lib/components/AlbumRequestButton.svelte';
 	import GenreAlbumCard from '$lib/components/GenreAlbumCard.svelte';
 	import SampleButton from '$lib/components/discover/SampleButton.svelte';

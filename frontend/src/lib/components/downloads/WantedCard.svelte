@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { FileDown, RotateCcw, TimerOff } from 'lucide-svelte';
+	import { FileDown, RotateCcw, TimerOff } from '@lucide/svelte';
 
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import {

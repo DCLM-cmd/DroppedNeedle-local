@@ -14,6 +14,7 @@ from core.exceptions import (
     ServiceDisabledUpstreamError,
 )
 from infrastructure.degradation import try_get_degradation_context
+from infrastructure.resilience.retry import CircuitOpenError
 from infrastructure.integration_result import IntegrationResult
 from models.library_management_canonical import CanonicalReleaseDocument
 from models.library_management_genres import GenreCandidate, GenreProjection
@@ -61,7 +62,9 @@ class GenreProjectionService:
         deferred: list[str] = []
         if "listenbrainz" in settings.sources:
             if self._listenbrainz is None:
-                deferred.append("listenbrainz")
+                # Not wired at all. That is the source being OFF, not delayed - see
+                # the ConfigurationError note below.
+                pass
             else:
                 try:
                     values = await self._listenbrainz.get_release_group_genres_batch(
@@ -76,18 +79,31 @@ class GenreProjectionService:
                         or candidate.count >= settings.listenbrainz_minimum_count
                         if not settings.listenbrainz_curated_only or candidate.curated
                     )
+                except ConfigurationError:
+                    # An unconfigured provider (no API key) is a permanent, known
+                    # state: no retry will ever resolve it. Reporting it as
+                    # "deferred" put OPTIONAL_ENRICHMENT_DEFERRED on every single
+                    # track of every run, a warning the operator could never clear
+                    # and that hid the real ones. A source you never set up is off,
+                    # exactly as disabled lyrics are - and those warn about nothing.
+                    pass
                 except (
-                    ConfigurationError,
                     ExternalServiceError,
                     RateLimitedError,
                     ServiceDisabledUpstreamError,
+                    # An open breaker is the same situation as the failures above -
+                    # the provider is unavailable - but it was not caught, so it
+                    # escaped and killed the whole import. Genres are decorative:
+                    # while ListenBrainz was refusing this address, sixteen tracks
+                    # could not be published because their GENRES could not be read.
+                    CircuitOpenError,
                 ):
                     self._record_deferred("listenbrainz")
                     deferred.append("listenbrainz")
 
         if "lastfm" in settings.sources:
             if self._lastfm is None:
-                deferred.append("lastfm")
+                pass  # not wired: the source is off, not delayed
             else:
                 try:
                     artist_name = "".join(
@@ -107,7 +123,9 @@ class GenreProjectionService:
                         if value.weight is None
                         or value.weight >= settings.lastfm_minimum_weight
                     )
-                except (ConfigurationError, ExternalServiceError, RateLimitedError):
+                except ConfigurationError:
+                    pass  # no API key configured: off, not deferred (see above)
+                except (ExternalServiceError, RateLimitedError, CircuitOpenError):
                     self._record_deferred("lastfm")
                     deferred.append("lastfm")
 

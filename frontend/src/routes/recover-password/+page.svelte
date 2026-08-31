@@ -11,7 +11,7 @@
 		EyeOff,
 		KeyRound,
 		ShieldCheck
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	type OwnerTab = 'compose' | 'docker' | 'source';
 

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { albumHref } from '$lib/utils/entityRoutes';
 	import { onMount } from 'svelte';
-	import { Disc3, Download } from 'lucide-svelte';
+	import { Disc3, Download } from '@lucide/svelte';
 	import type { TopAlbum } from '$lib/types';
 	import { colors } from '$lib/colors';
 	import { libraryStore } from '$lib/stores/library';

@@ -72,6 +72,38 @@ async def _schedule_identified_album_work(
     )
 
 
+async def _request_uncovered_mapping_content(
+    local_album_id: str, actor_user_id: str
+) -> bool:
+    """Enrol an accepted mapping whose content the library does not fully hold.
+
+    The wanted watcher owns the fetching: it re-checks coverage before every search,
+    paces by release age, and can be stopped per album. Acceptance only registers the
+    want, so choosing a mapping never fires a burst at the download client.
+    """
+    from .cache_providers import get_native_library_store
+
+    context = await get_native_library_store().get_album_identification_context(
+        local_album_id
+    )
+    if context is None:
+        return False
+    identity = context.get("identity") or {}
+    release_group_mbid = identity.get("release_group_mbid")
+    if not release_group_mbid:
+        return False
+    album = context["album"]
+    artist_identity = context.get("artist_identity") or {}
+    return await get_target_wanted_watcher_service().enrol_incomplete_mapping(
+        str(release_group_mbid),
+        user_id=actor_user_id,
+        artist_name=str(album["album_artist_name"] or ""),
+        album_title=str(album["title"] or ""),
+        artist_mbid=artist_identity.get("artist_mbid"),
+        year=album["year"],
+    )
+
+
 async def _schedule_scanned_album_work(local_album_id: str) -> str | None:
     return await get_automatic_scan_management_service().schedule_scanned_album(
         local_album_id
@@ -581,6 +613,7 @@ def get_target_library_review_service() -> "LibraryReviewService":
         get_native_library_store(),
         resolver_getter=get_library_policy_resolver,
         on_identified=_schedule_identified_album_work,
+        on_mapping_accepted=_request_uncovered_mapping_content,
     )
 
 
@@ -904,6 +937,21 @@ def get_library_management_recovery_service() -> "LibraryManagementRecoveryServi
 
 
 @singleton
+def get_library_image_hash_service() -> "LibraryImageHashService":
+    from services.native.library_image_hash_service import LibraryImageHashService
+
+    from .cache_providers import get_native_library_store
+
+    from .compat_providers import get_target_consumer_composition
+
+    return LibraryImageHashService(
+        get_native_library_store(),
+        get_cached_local_artwork_service(),
+        covers=get_target_consumer_composition().covers,
+    )
+
+
+@singleton
 def get_library_management_worker() -> "LibraryManagementWorker":
     from services.native.library_management_worker import LibraryManagementWorker
 
@@ -916,6 +964,8 @@ def get_library_management_worker() -> "LibraryManagementWorker":
         get_library_management_undo_service(),
         get_library_management_baseline_service(),
         get_library_management_duplicate_service(),
+        filesystem=get_library_filesystem_coordinator(),
+        image_hashes=get_library_image_hash_service(),
     )
 
 
@@ -1012,6 +1062,52 @@ def get_library_manager() -> "LibraryManager":
 
 
 @singleton
+def get_library_housekeeping_service() -> "LibraryHousekeepingService":
+    from pathlib import Path
+
+    from services.native.library_housekeeping_service import (
+        LibraryHousekeepingService,
+    )
+    from services.native.recycle_bin import resolve_bin_path
+
+    from .cache_providers import get_native_library_store
+
+    def _root_paths() -> list[str]:
+        return [
+            root.path
+            for root in get_library_policy_resolver().settings.library_roots
+        ]
+
+    # Both read on every run rather than captured once, so a root or a bin changed in
+    # settings is honoured by the next scan without a restart.
+    def roots() -> list[Path]:
+        return [Path(path) for path in _root_paths()]
+
+    def bin_path() -> Path | None:
+        return resolve_bin_path(
+            get_preferences_service().get_download_policy().recycle_bin_path,
+            _root_paths(),
+        )
+
+    def retention_days() -> int:
+        return int(
+            getattr(
+                get_preferences_service().get_download_policy(),
+                "recycle_retention_days",
+                30,
+            )
+        )
+
+    return LibraryHousekeepingService(
+        get_native_library_store(),
+        hygiene=get_catalog_identity_hygiene_service(),
+        recycle_bin=bin_path,
+        library_roots=roots,
+        recycle_retention_days=retention_days,
+    )
+
+
+@singleton
 def get_library_scanner() -> "LibraryScanner":
     from services.native.library_scanner import LibraryScanner
 
@@ -1027,6 +1123,7 @@ def get_library_scanner() -> "LibraryScanner":
         invalidate_albums=_build_scan_invalidation(
             get_cache(), get_disk_cache(), get_discovery_snapshot_store()
         ),
+        housekeeping=get_library_housekeeping_service(),
     )
 
 
@@ -2511,7 +2608,7 @@ def get_version_service() -> "VersionService":
     from services.version_service import VersionService
 
     github_repo = get_github_repository()
-    return VersionService(github_repo)
+    return VersionService(github_repo, preferences=get_preferences_service())
 
 
 def _build_spec_policy(policy):
@@ -2541,6 +2638,7 @@ def get_album_preflight_scorer() -> "AlbumPreflightScorer":
     return AlbumPreflightScorer(
         get_download_store(),
         flac_mp3_only=policy.flac_mp3_only,
+        lossless_max_kbps=policy.lossless_max_kbps,
         policy=_build_spec_policy(policy),
     )
 
@@ -2557,6 +2655,7 @@ def get_track_matcher() -> "TrackMatcher":
         quality_min=policy.quality_min,
         quality_max=policy.quality_max,
         flac_mp3_only=policy.flac_mp3_only,
+        lossless_max_kbps=policy.lossless_max_kbps,
     )
 
 
@@ -2664,6 +2763,7 @@ def _build_download_orchestrator(
         soulseek_enabled=dc.enabled,
         source_priority=prefs.get_source_priority(),
         album_service=album_service,
+        alias_resolver=_artist_alias_resolver,
         usenet_category=sab.category,
         usenet_priority=sab.priority,
         usenet_post_processing=sab.post_processing,
@@ -2679,6 +2779,13 @@ def _build_download_orchestrator(
 @singleton
 def get_download_orchestrator() -> "DownloadOrchestrator":
     return get_target_download_orchestrator()
+
+
+async def _artist_alias_resolver(artist_mbid: str) -> list[str]:
+    """MusicBrainz aliases for an artist, for the Soulseek alias search fallback."""
+    from .repo_providers import get_musicbrainz_repository
+
+    return await get_musicbrainz_repository().get_artist_aliases(artist_mbid)
 
 
 @singleton

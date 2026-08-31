@@ -4,7 +4,7 @@ import { render } from 'vitest-browser-svelte';
 import ContextMenu from './ContextMenu.svelte';
 import { closeAllMenus } from './ContextMenu.svelte';
 import type { MenuItem } from './ContextMenu.svelte';
-import { ListPlus, ListStart } from 'lucide-svelte';
+import { ListPlus, ListStart } from '@lucide/svelte';
 
 function makeItems(overrides: Partial<MenuItem>[] = []): MenuItem[] {
 	const defaults: MenuItem[] = [

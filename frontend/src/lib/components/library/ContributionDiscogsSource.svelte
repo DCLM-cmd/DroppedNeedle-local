@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ExternalLink, LoaderCircle, RefreshCw, Search, Unlink } from 'lucide-svelte';
+	import { ExternalLink, LoaderCircle, RefreshCw, Search, Unlink } from '@lucide/svelte';
 	import type { LibraryContribution } from '$lib/types';
 	import {
 		removeDiscogsReleaseMutation,

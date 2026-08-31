@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Disc3, Mic2 } from 'lucide-svelte';
+	import { Disc3, Mic2 } from '@lucide/svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import LocalAlbumTrackList from '$lib/components/library/LocalAlbumTrackList.svelte';
 	import ArtistAppearancesSectionSkeleton from './ArtistAppearancesSectionSkeleton.svelte';

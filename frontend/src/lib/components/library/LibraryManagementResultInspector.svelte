@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ArrowRight, CheckCircle2, FileClock, ShieldAlert } from 'lucide-svelte';
+	import { ArrowRight, CheckCircle2, FileClock, ShieldAlert } from '@lucide/svelte';
 
 	import type { LibraryManagementResultItem } from '$lib/queries/library-management/types';
 	import {

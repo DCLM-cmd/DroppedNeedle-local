@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Download, X, Disc3, Check, Loader2, Library } from 'lucide-svelte';
+	import { Download, X, Disc3, Check, Loader2, Library } from '@lucide/svelte';
 	import { discographyDownloadStore } from '$lib/stores/discographyDownload.svelte';
 	import { batchDownloadStore } from '$lib/stores/batchDownloadStatus.svelte';
 	import { requestBatch, type BatchAlbumItem } from '$lib/utils/albumRequest';

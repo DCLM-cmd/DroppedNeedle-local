@@ -4,7 +4,7 @@ import { toastStore } from '$lib/stores/toast';
 import { playerStore } from '$lib/stores/player.svelte';
 import type { QueueItem } from '$lib/player/types';
 import type { MenuItem } from '$lib/components/ContextMenu.svelte';
-import { ListPlus, ListStart, ListMusic, Download } from 'lucide-svelte';
+import { ListPlus, ListStart, ListMusic, Download } from '@lucide/svelte';
 import { downloadFile } from '$lib/utils/downloadHelper';
 import { API } from '$lib/constants';
 import type { LocalAlbumSummary } from '$lib/types';

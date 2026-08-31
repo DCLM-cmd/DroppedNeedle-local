@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { AlertTriangle, ArrowRight, CheckCircle2, FolderCog, ScanSearch } from 'lucide-svelte';
+	import { AlertTriangle, ArrowRight, CheckCircle2, FolderCog, ScanSearch } from '@lucide/svelte';
 	import { ApiError } from '$lib/api/client';
 	import {
 		getLibraryRestorableRootsQuery,

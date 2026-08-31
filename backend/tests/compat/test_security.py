@@ -204,8 +204,16 @@ class _Clock:
 
 @pytest.mark.asyncio
 async def test_principal_browse_buckets_are_isolated():
+    """One user exhausting their budget must not affect anyone else.
+
+    The burst size is read from the module rather than written here: it is tuned for
+    what real clients do (a media client opens a library with a burst of list, image
+    and playback-info requests) and is expected to move, while the isolation this
+    asserts is the actual guarantee."""
+    from api.compat.common.ratelimit import _BROWSE_BURST
+
     state = CompatRateLimitState()
-    for _ in range(120):
+    for _ in range(_BROWSE_BURST):
         assert await state.principal_retry_after("user-a", mutation=False) is None
     assert await state.principal_retry_after("user-a", mutation=False) is not None
     assert await state.principal_retry_after("user-b", mutation=False) is None
@@ -213,8 +221,11 @@ async def test_principal_browse_buckets_are_isolated():
 
 @pytest.mark.asyncio
 async def test_mutation_and_browse_buckets_are_separate():
+    """Exhausting writes must leave reads working, and vice versa."""
+    from api.compat.common.ratelimit import _MUTATION_BURST
+
     state = CompatRateLimitState()
-    for _ in range(20):
+    for _ in range(_MUTATION_BURST):
         assert await state.principal_retry_after("user-a", mutation=True) is None
     assert await state.principal_retry_after("user-a", mutation=True) is not None
     assert await state.principal_retry_after("user-a", mutation=False) is None
@@ -286,3 +297,89 @@ async def test_admin_revoke_audit_names_actor_and_owner(app_password_service, ca
     assert "admin-revoked" in text
     assert "admin=user-admin" in text and "owner=user-alice" in text
     assert secret not in text  # never the secret
+
+
+# ---- artwork is bulk asset traffic, not a discovery endpoint ------------------------
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/jellyfin/Items/abc/Images/Primary",
+        "/jellyfin/Items/abc/Images/Primary/0",
+        "/subsonic/rest/getCoverArt.view",
+        "/subsonic/rest/getcoverart",
+    ],
+)
+def test_image_paths_are_recognised_as_artwork(path) -> None:
+    from api.compat.common.ratelimit import is_artwork_request
+
+    assert is_artwork_request(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/jellyfin/Users/u/Items",
+        "/jellyfin/System/Info/Public",
+        "/subsonic/rest/getAlbumList2.view",
+        "/subsonic/rest/stream.view",
+    ],
+)
+def test_other_paths_are_not_artwork(path) -> None:
+    from api.compat.common.ratelimit import is_artwork_request
+
+    assert not is_artwork_request(path)
+
+
+@pytest.mark.asyncio
+async def test_a_screen_of_covers_is_not_rejected() -> None:
+    """The regression: artwork was charged to the budget that guards login and
+    discovery endpoints, which allows a burst of 80. Opening a library of 129 albums
+    fires one image request per tile, so 94 of 100 covers came back 429 - which is
+    what "most covers do not load" looked like from the client side.
+    """
+    from api.compat.common.ratelimit import CompatRateLimitState
+
+    state = CompatRateLimitState()
+
+    rejected = [
+        r for _ in range(400) if (r := await state.artwork_retry_after("10.0.0.1"))
+    ]
+
+    assert rejected == []
+
+
+@pytest.mark.asyncio
+async def test_the_artwork_budget_is_still_bounded() -> None:
+    """Generous, but not absent: the endpoint needs no token."""
+    from api.compat.common.ratelimit import CompatRateLimitState
+
+    state = CompatRateLimitState()
+
+    for _ in range(1200):
+        await state.artwork_retry_after("10.0.0.1")
+
+    assert await state.artwork_retry_after("10.0.0.1") is not None
+
+
+@pytest.mark.asyncio
+async def test_artwork_does_not_consume_the_browsing_budget() -> None:
+    """A cover grid must not starve the calls that produced the list itself."""
+    from api.compat.common.ratelimit import CompatRateLimitState
+
+    state = CompatRateLimitState()
+    for _ in range(1000):
+        await state.artwork_retry_after("10.0.0.1")
+
+    assert await state.principal_retry_after("user-a", mutation=False) is None
+
+
+@pytest.mark.asyncio
+async def test_one_clients_covers_do_not_block_another_clients_login() -> None:
+    from api.compat.common.ratelimit import CompatRateLimitState
+
+    state = CompatRateLimitState()
+    for _ in range(1200):
+        await state.artwork_retry_after("10.0.0.1")
+
+    assert await state.public_retry_after("10.0.0.2") is None

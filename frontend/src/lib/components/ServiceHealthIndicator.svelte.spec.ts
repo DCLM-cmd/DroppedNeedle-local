@@ -18,7 +18,7 @@ import ServiceHealthIndicator from './ServiceHealthIndicator.svelte';
 describe('ServiceHealthIndicator', () => {
 	it('is invisible when nothing is degraded', async () => {
 		queryState.data = { degraded: [] };
-		const { container } = render(ServiceHealthIndicator);
+		const { container } = await render(ServiceHealthIndicator);
 		expect(container.querySelector('button')).toBeNull();
 	});
 

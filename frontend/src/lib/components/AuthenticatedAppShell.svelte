@@ -67,7 +67,7 @@
 		Heart,
 		LibraryBig,
 		Cog
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import type { Component, Snippet } from 'svelte';
 	import NewReleasesNavBadge from '$lib/components/NewReleasesNavBadge.svelte';
 	import ConcertsNavBadge from '$lib/components/ConcertsNavBadge.svelte';

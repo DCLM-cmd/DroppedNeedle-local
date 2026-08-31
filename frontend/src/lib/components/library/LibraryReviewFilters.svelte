@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Filter, Search, X } from 'lucide-svelte';
+	import { Filter, Search, X } from '@lucide/svelte';
 	import type { LibraryReviewFilters as Filters } from '$lib/queries/library/LibraryReviewQueries.svelte';
 	import type { LibraryPolicyTreeNode } from '$lib/queries/library/LibraryOperationsTypes';
 

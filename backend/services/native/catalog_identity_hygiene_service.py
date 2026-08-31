@@ -14,7 +14,15 @@ from services.native.background_workload_gate import BackgroundWorkloadGate
 
 CATALOG_IDENTITY_HYGIENE_PURPOSE = "catalog_identity_hygiene"
 CATALOG_IDENTITY_HYGIENE_VERSION = "catalog-identity-hygiene-v1"
-_BACKFILL_IDEMPOTENCY_KEY = "catalog-identity-hygiene:v1:backfill"
+# The backfill is keyed by the catalog revision, not by a constant. With a constant it
+# ran exactly once - at first startup, against an empty catalog, enqueuing nothing - and
+# then refused to run again for the rest of the installation's life. Every album shell
+# created afterwards stayed: 111 of them had accumulated, 107 of which this pass would
+# have retired, and one of the user's release pins had landed on such a shell.
+#
+# Keyed this way it re-runs whenever the catalog has changed and is a no-op when it has
+# not, which is what "idempotent" was meant to buy in the first place.
+_BACKFILL_IDEMPOTENCY_PREFIX = "catalog-identity-hygiene:v1:backfill"
 
 
 def _input_revision(context: dict) -> str:
@@ -66,12 +74,15 @@ class CatalogIdentityHygieneService:
 
     async def enqueue_backfill(self) -> dict:
         now = self._clock()
+        job_catalog_revision = await self._store.get_catalog_revision()
         job = OperationJob(
             id=str(uuid.uuid4()),
             kind="repair",
             requested_by_user_id=None,
-            input_catalog_revision=await self._store.get_catalog_revision(),
-            idempotency_key=_BACKFILL_IDEMPOTENCY_KEY,
+            input_catalog_revision=job_catalog_revision,
+            idempotency_key=(
+                f"{_BACKFILL_IDEMPOTENCY_PREFIX}:{job_catalog_revision}"
+            ),
             created_at=now,
         )
         return await self._store.create_repair_operation(

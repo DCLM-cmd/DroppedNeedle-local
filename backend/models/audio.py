@@ -87,6 +87,10 @@ class FingerprintResult(AppStruct):
     - ``fail``     - confident audio match but no recording MBID to act on.
     - ``disabled`` - no AcoustID API key configured; fpcalc never ran.
     - ``error``    - fpcalc missing/errored or the AcoustID call failed.
+
+    ``recording_id`` is the single best pick; ``recording_ids`` carries *every*
+    recording the same audio match resolves to. Callers asking "is this file
+    recording X?" must consult ``recording_ids`` - see its note below.
     """
 
     status: Literal["pass", "fail", "skip", "disabled", "error"]
@@ -101,3 +105,11 @@ class FingerprintResult(AppStruct):
     # download-verify release-group check (D15/B2) compares the requested
     # release group against this set.
     release_group_ids: list[str] = msgspec.field(default_factory=list)
+    # EVERY recording MBID the matched audio resolves to, ``recording_id`` first.
+    # AcoustID routinely returns several: MusicBrainz models one performance as
+    # separate recording entities per release/edition, and the order it returns
+    # them in is not meaningful. Equality against ``recording_id`` alone therefore
+    # rejects a correct file whenever the wanted edition's entity is not the one
+    # AcoustID happened to list first - which is most of the time on an album with
+    # many editions. Membership in this list is the identity test.
+    recording_ids: list[str] = msgspec.field(default_factory=list)

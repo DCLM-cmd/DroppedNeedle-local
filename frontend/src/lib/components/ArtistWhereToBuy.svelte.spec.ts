@@ -59,7 +59,7 @@ describe('ArtistWhereToBuy', () => {
 
 	it('shows a skeleton while loading', async () => {
 		h.isLoading = true;
-		const { container } = render(ArtistWhereToBuy, props);
+		const { container } = await render(ArtistWhereToBuy, props);
 		expect(container.querySelector('.skeleton')).not.toBeNull();
 	});
 });

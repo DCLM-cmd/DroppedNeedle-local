@@ -12,7 +12,7 @@
 		ShieldQuestion,
 		Split,
 		UsersRound
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { SvelteURLSearchParams } from 'svelte/reactivity';
 

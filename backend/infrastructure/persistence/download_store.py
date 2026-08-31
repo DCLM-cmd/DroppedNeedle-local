@@ -432,6 +432,17 @@ def _safe_alter(conn: sqlite3.Connection, sql: str) -> None:
             raise
 
 
+# A task whose files are still waiting in the organizer is the only record of which
+# edition they belong to. Deleting it strands them for good: every later retry rejects
+# with "the original acquisition task is unavailable", so the download can neither be
+# finished nor discarded. Ten secured Melodrama tracks reached exactly that state after
+# their task was cleared from the queue.
+_NO_PENDING_HOLD = (
+    "NOT EXISTS (SELECT 1 FROM held_imports hold "
+    "WHERE hold.source_task_id = download_tasks.id AND hold.status = 'held')"
+)
+
+
 class DownloadStore(PersistenceBase):
     def __init__(self, db_path: Path, write_lock: threading.Lock) -> None:
         super().__init__(db_path, write_lock)
@@ -1754,15 +1765,61 @@ class DownloadStore(PersistenceBase):
 
         await self._write(operation)
 
+    async def find_release_group_identity(
+        self, release_group_mbid: str
+    ) -> tuple[str, str] | None:
+        """The newest real ``(artist_name, album_title)`` recorded for this release
+        group, or None when every row for it carries a filler name.
+
+        A task that was created with a placeholder artist keeps it forever, and a retry
+        copies the task verbatim - so "Unknown" kept being searched for long after the
+        pipeline stopped inventing it. Sibling tasks for the same release group usually
+        hold the real names.
+        """
+
+        def operation(conn: sqlite3.Connection) -> tuple[str, str] | None:
+            row = conn.execute(
+                """SELECT artist_name, album_title FROM download_tasks
+                   WHERE release_group_mbid = ?
+                     AND artist_name IS NOT NULL AND TRIM(artist_name) != ''
+                     AND LOWER(TRIM(artist_name)) NOT IN
+                         ('unknown','unknown artist','various','various artists','va',
+                          'untitled','no artist','none','n/a','null','artist')
+                     AND album_title IS NOT NULL AND TRIM(album_title) != ''
+                   ORDER BY created_at DESC LIMIT 1""",
+                (release_group_mbid,),
+            ).fetchone()
+            return (row["artist_name"], row["album_title"]) if row else None
+
+        return await self._read(operation)
+
+    # A release we JUDGED unsuitable (it arrived but failed verification) may well have
+    # been judged wrongly, so an explicit "try again" should reconsider it. A release we
+    # could not DOWNLOAD at all is a different thing: nothing arrived, and re-offering it
+    # just means the retry picks the same dead release first - it scores highest - and
+    # fails again immediately. Those stay blocked; the search still re-runs by source
+    # priority and simply skips them.
+    _RETRY_CLEARS_QUARANTINE_REASONS = (
+        "verify_failed",
+        "corrupt",
+        "fingerprint_mismatch",
+        "duration_mismatch",
+        "manual",
+    )
+
     async def delete_quarantine_for_album(self, release_group_mbid: str) -> int:
-        """Clear every blocklist entry for an album (all its tried releases). Called on a
-        MANUAL re-request so an explicit 'try again' overrides the blocklist. Returns the
-        number of rows removed."""
+        """Clear an album's blocklist entries that a manual 'try again' should override.
+
+        Entries recorded as ``download_failed`` are KEPT - see
+        ``_RETRY_CLEARS_QUARANTINE_REASONS``. Returns the number of rows removed.
+        """
+        placeholders = ",".join("?" * len(self._RETRY_CLEARS_QUARANTINE_REASONS))
 
         def operation(conn: sqlite3.Connection) -> int:
             cur = conn.execute(
-                "DELETE FROM download_quarantine WHERE release_group_mbid = ?",
-                (release_group_mbid,),
+                f"""DELETE FROM download_quarantine
+                    WHERE release_group_mbid = ? AND reason IN ({placeholders})""",
+                (release_group_mbid, *self._RETRY_CLEARS_QUARANTINE_REASONS),
             )
             return cur.rowcount
 
@@ -2001,6 +2058,47 @@ class DownloadStore(PersistenceBase):
                 params.append(source_task_id)
             sql += " ORDER BY created_at DESC"
             return [_row_to_held(dict(r)) for r in conn.execute(sql, params).fetchall()]
+
+        return await self._read(operation)
+
+    # Live edition-conversion states. A job outside this set has either been
+    # cancelled (which discards its held rows itself) or already applied, and its
+    # leftovers must stay disposable.
+    _LIVE_CONVERSION_STATES = ("preflight", "acquiring", "ready", "needs_recheck")
+
+    async def find_active_edition_conversion_for_held_path(
+        self, held_path: str
+    ) -> str | None:
+        """Job id of a live edition conversion that has reserved this held file.
+
+        A file staged for a conversion is not free to import or discard on its own:
+        the conversion publishes the whole tracklist as one unit and recycles the
+        files it supersedes in that same step. Acting on it alone writes into a slot
+        the conversion has not cleared, which fails as a bare path collision.
+
+        The conversion tables belong to NativeLibraryStore but live in this same
+        database, so the join is local; the sqlite_master check keeps a store opened
+        without them (a bare DownloadStore in a test) from raising instead of
+        answering "not reserved".
+        """
+
+        def operation(conn: sqlite3.Connection) -> str | None:
+            present = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='library_edition_conversion_artifacts'"
+            ).fetchone()
+            if present is None:
+                return None
+            placeholders = ",".join("?" * len(self._LIVE_CONVERSION_STATES))
+            row = conn.execute(
+                "SELECT artifact.job_id AS job_id "
+                "FROM library_edition_conversion_artifacts artifact "
+                "JOIN library_edition_conversion_jobs job ON job.id = artifact.job_id "
+                f"WHERE artifact.held_path = ? AND job.state IN ({placeholders}) "
+                "LIMIT 1",
+                (held_path, *self._LIVE_CONVERSION_STATES),
+            ).fetchone()
+            return str(row["job_id"]) if row is not None else None
 
         return await self._read(operation)
 
@@ -2512,7 +2610,7 @@ class DownloadStore(PersistenceBase):
         responsible for passing only terminal statuses - this does no status guarding."""
         if not statuses:
             return 0
-        clauses = [f"status IN ({_in_placeholders(statuses)})"]
+        clauses = [f"status IN ({_in_placeholders(statuses)})", _NO_PENDING_HOLD]
         params: list[Any] = list(statuses)
         if user_role != "admin":
             if user_id is None:
@@ -2541,7 +2639,8 @@ class DownloadStore(PersistenceBase):
             for start in range(0, len(task_ids), 400):
                 chunk = task_ids[start:start + 400]
                 cur = conn.execute(
-                    f"DELETE FROM download_tasks WHERE id IN ({_in_placeholders(chunk)})",
+                    "DELETE FROM download_tasks WHERE id IN "
+                    f"({_in_placeholders(chunk)}) AND {_NO_PENDING_HOLD}",
                     tuple(chunk),
                 )
                 total += cur.rowcount

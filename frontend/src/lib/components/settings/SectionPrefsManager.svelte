@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
 	import { SvelteMap } from 'svelte/reactivity';
-	import { Check, ExternalLink } from 'lucide-svelte';
+	import { Check, ExternalLink } from '@lucide/svelte';
 	import type { SectionPrefItem } from '$lib/types';
 	import {
 		getSectionPrefsQuery,

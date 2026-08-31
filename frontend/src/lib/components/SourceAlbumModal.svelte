@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Shuffle, Play, X, ListPlus, ListStart, ListMusic, Info, Download } from 'lucide-svelte';
+	import { Shuffle, Play, X, ListPlus, ListStart, ListMusic, Info, Download } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { API } from '$lib/constants';
 	import { downloadFile } from '$lib/utils/downloadHelper';
@@ -30,7 +30,7 @@
 	import { api } from '$lib/api/client';
 	import NowPlayingIndicator from '$lib/components/NowPlayingIndicator.svelte';
 	import AudioQualityBadge from '$lib/components/AudioQualityBadge.svelte';
-	import { Radio } from 'lucide-svelte';
+	import { Radio } from '@lucide/svelte';
 	import type {
 		JellyfinTrackInfo,
 		LocalAlbumMatch,

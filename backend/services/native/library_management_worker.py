@@ -13,6 +13,9 @@ from core.exceptions import (
     ValidationError,
 )
 from infrastructure.persistence.native_library_store import NativeLibraryStore
+from services.native.library_filesystem_coordinator import (
+    LibraryFilesystemCoordinator,
+)
 from services.native.library_management_planner import LibraryManagementPlanner
 from services.native.library_management_publisher import LibraryManagementPublisher
 from services.native.library_management_undo_service import LibraryManagementUndoService
@@ -22,6 +25,7 @@ from services.native.library_management_baseline_service import (
 from services.native.library_management_duplicate_service import (
     LibraryManagementDuplicateService,
 )
+from services.native.library_image_hash_service import LibraryImageHashService
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,8 @@ class LibraryManagementWorker:
         undo: LibraryManagementUndoService,
         baseline: LibraryManagementBaselineService,
         duplicates: LibraryManagementDuplicateService,
+        filesystem: "LibraryFilesystemCoordinator | None" = None,
+        image_hashes: "LibraryImageHashService | None" = None,
     ) -> None:
         self._store = store
         self._planner = planner
@@ -42,6 +48,11 @@ class LibraryManagementWorker:
         self._undo = undo
         self._baseline = baseline
         self._duplicates = duplicates
+        # Used to hold the library still while a settings dry run plans against it.
+        self._filesystem = filesystem
+        # Artwork blurhashes are computed here, once, the way Jellyfin computes them
+        # during a scan - never while a client is waiting for a listing.
+        self._image_hashes = image_hashes
 
     async def run_claimed(self, job: dict, worker_id: str) -> dict:
         job_id = str(job["id"])
@@ -148,7 +159,19 @@ class LibraryManagementWorker:
                 now=time.time(),
             )
         try:
-            planned = await self._planner.run_claimed_preview(job, worker_id)
+            # A dry run for the automation settings (it proposes a new settings
+            # revision) must see a library that is not moving underneath it: an
+            # import or Organizer apply landing mid-plan produces a preview that
+            # describes files that have since moved. Ordinary previews do not pay
+            # this cost - only the one whose whole purpose is to predict what the
+            # new settings would do.
+            if snapshot.proposed_settings_revision is not None and (
+                self._filesystem is not None
+            ):
+                async with self._filesystem.quiesce():
+                    planned = await self._planner.run_claimed_preview(job, worker_id)
+            else:
+                planned = await self._planner.run_claimed_preview(job, worker_id)
         except StaleRevisionError:
             return await self._store.finish_operation_job(
                 job_id,
@@ -188,6 +211,44 @@ class LibraryManagementWorker:
                     return current
         return current
 
+    async def _hash_artwork(self, job_id: str) -> None:
+        """Give the covers this run placed their blurhashes, before anyone asks.
+
+        Jellyfin does the same at the end of a scan (LibraryManager.UpdateImagesAsync
+        via ImageNeedsRefresh): hash what has none yet, store it on the image record,
+        and let serving be a pure lookup. Never fatal - a run that organized files
+        correctly must not be reported as failed because a cover would not decode.
+        """
+        if self._image_hashes is None:
+            return
+        try:
+            await self._image_hashes.backfill()
+        except Exception:  # noqa: BLE001 - decorative work, never fails a run
+            logger.warning(
+                "Could not hash artwork after management job %s", job_id, exc_info=True
+            )
+
+    async def _compact_records(self, job_id: str) -> None:
+        """Drop the artwork bytes this run no longer needs.
+
+        A finished run's documents keep a full copy of every cover, twice per plan item
+        and once per file in the import bundle. That was 2.67 GB of a 2.90 GB database.
+        The bytes are only read while a run is executing, so the moment it reaches a
+        terminal state they can go - see the store method for the full cross-check.
+        """
+        try:
+            counts = await self._store.compact_finished_organization_records()
+            if any(counts.values()):
+                logger.info(
+                    "Compacted organization records after %s: %s", job_id, counts
+                )
+        except Exception:  # noqa: BLE001 - housekeeping never fails a run
+            logger.warning(
+                "Could not compact records after management job %s",
+                job_id,
+                exc_info=True,
+            )
+
     async def _run_apply(self, job_id: str, worker_id: str) -> dict:
         snapshot = await self._store.get_library_management_job_snapshot(job_id)
         if snapshot is None:
@@ -202,9 +263,12 @@ class LibraryManagementWorker:
                 job_id, worker_id, now=time.time()
             )
             if work is None:
-                return await self._store.finish_library_management_apply(
+                finished = await self._store.finish_library_management_apply(
                     job_id, worker_id, now=time.time()
                 )
+                await self._hash_artwork(job_id)
+                await self._compact_records(job_id)
+                return finished
             ordinal = int(work["ordinal"])
             try:
                 items = (

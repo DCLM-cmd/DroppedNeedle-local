@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Play, Shuffle, ListPlus, ListStart, ListMusic, Download } from 'lucide-svelte';
+	import { Play, Shuffle, ListPlus, ListStart, ListMusic, Download } from '@lucide/svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { MenuItem } from './ContextMenu.svelte';
 	import { integrationStore } from '$lib/stores/integration';

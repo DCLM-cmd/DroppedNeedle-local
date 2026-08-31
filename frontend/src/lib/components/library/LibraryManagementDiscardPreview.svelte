@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ShieldAlert, Trash2 } from 'lucide-svelte';
+	import { ShieldAlert, Trash2 } from '@lucide/svelte';
 
 	import { discardLibraryManagementPreviewMutation } from '$lib/queries/library-management/LibraryManagementMutations.svelte';
 	import { forgetLibraryManagementPreviewToken } from '$lib/queries/library-management/LibraryManagementPreviewTokens';

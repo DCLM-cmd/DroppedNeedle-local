@@ -18,7 +18,7 @@
 		Sparkles,
 		TriangleAlert,
 		X
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import MusicBrainzEditionFinder from './MusicBrainzEditionFinder.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';

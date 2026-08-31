@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { run } from 'svelte/legacy';
 
-	import { ChevronUp, ChevronDown } from 'lucide-svelte';
+	import { ChevronUp, ChevronDown } from '@lucide/svelte';
 	import { colors } from '$lib/colors';
 	import { onMount } from 'svelte';
 

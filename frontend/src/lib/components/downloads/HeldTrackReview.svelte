@@ -9,7 +9,7 @@
 </script>
 
 <script lang="ts">
-	import { Check, Pause, Play, X } from 'lucide-svelte';
+	import { Check, Pause, Play, X } from '@lucide/svelte';
 
 	import { API } from '$lib/constants';
 	import {

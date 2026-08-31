@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import { Search, X } from 'lucide-svelte';
+	import { Search, X } from '@lucide/svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import { getAlbumSearchQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import { matchDropItemMutation } from '$lib/queries/import/DropImportMutations.svelte';

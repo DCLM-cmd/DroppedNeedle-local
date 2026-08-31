@@ -4,6 +4,7 @@ import { render } from 'vitest-browser-svelte';
 
 const h = vi.hoisted(() => ({
 	discard: vi.fn(),
+	acknowledge: vi.fn(),
 	goto: vi.fn(),
 	replaceState: vi.fn(),
 	appPage: {
@@ -88,6 +89,7 @@ vi.mock('$lib/queries/library-management/LibraryManagementQueries.svelte', () =>
 	getLibraryManagementRecoveryQuery: () => h.recovery
 }));
 vi.mock('$lib/queries/library-management/LibraryManagementMutations.svelte', () => ({
+	acknowledgeLibraryManagementRecoveryMutation: () => ({ mutate: h.acknowledge, isPending: false }),
 	controlLibraryManagementOperationMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	discardLibraryManagementPreviewMutation: () => ({ mutateAsync: h.discard, isPending: false }),
 	createLibraryManagementPreviewMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),

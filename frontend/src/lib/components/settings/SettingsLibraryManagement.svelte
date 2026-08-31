@@ -19,7 +19,7 @@
 		Sparkles,
 		Tags,
 		Trash2
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import LibraryManagementProfilePicker from './LibraryManagementProfilePicker.svelte';
 	import LibraryManagementProfileEditor from './LibraryManagementProfileEditor.svelte';

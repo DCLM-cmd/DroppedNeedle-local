@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronDown, Download, RotateCcw, TimerOff, Trash2 } from 'lucide-svelte';
+	import { ChevronDown, Download, RotateCcw, TimerOff, Trash2 } from '@lucide/svelte';
 	import { SvelteMap } from 'svelte/reactivity';
 
 	import EmptyState from '$lib/components/EmptyState.svelte';

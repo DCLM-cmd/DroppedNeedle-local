@@ -7,7 +7,7 @@
 	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 	import { DiscoverQueryKeyFactory } from '$lib/queries/discover/DiscoverQueryKeyFactory';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { ChevronDown, Disc3, Radio, RefreshCw } from 'lucide-svelte';
+	import { ChevronDown, Disc3, Radio, RefreshCw } from '@lucide/svelte';
 	import DiscoveryShelfActions from '$lib/components/discover/DiscoveryShelfActions.svelte';
 	import { tilt } from '$lib/actions/tilt';
 	import { slide } from 'svelte/transition';

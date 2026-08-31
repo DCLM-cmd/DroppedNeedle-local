@@ -8,7 +8,7 @@
 		ListMusic,
 		Play,
 		Shuffle
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import LibraryFormatBadge from '$lib/components/library/LibraryFormatBadge.svelte';
 	import LocalIdentityBadge from '$lib/components/library/LocalIdentityBadge.svelte';

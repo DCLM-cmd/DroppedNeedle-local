@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { browser } from '$app/environment';
-	import { Disc3, Search, Plus, Check, CircleCheck, X } from 'lucide-svelte';
+	import { Disc3, Search, Plus, Check, CircleCheck, X } from '@lucide/svelte';
 	import { fly } from 'svelte/transition';
 	import {
 		fetchPlaylists,

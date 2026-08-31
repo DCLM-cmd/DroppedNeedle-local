@@ -21,6 +21,7 @@ from services.native.title_match import artist_evidence
 from services.native.quality_tiers import (
     DEFAULT_QUALITY_MAX,
     DEFAULT_QUALITY_MIN,
+    exceeds_lossless_cap,
     file_tier,
     folder_hires_key,
     in_range,
@@ -38,11 +39,14 @@ class TrackMatcher:
         quality_min: str = DEFAULT_QUALITY_MIN,
         quality_max: str = DEFAULT_QUALITY_MAX,
         flac_mp3_only: bool = True,
+        lossless_max_kbps: int = 0,
     ):
         self._store = download_store
         self._quality_min = quality_min
         self._quality_max = quality_max
         self._flac_mp3_only = flac_mp3_only
+        # 0 = no cap; see AlbumPreflightScorer for why the album path needs the same gate.
+        self._lossless_max_kbps = lossless_max_kbps
 
     async def match(
         self,
@@ -90,6 +94,11 @@ class TrackMatcher:
             r
             for r in filtered
             if in_range(file_tier(r), self._quality_min, self._quality_max)
+        ]
+        filtered = [
+            r
+            for r in filtered
+            if not exceeds_lossless_cap(r, self._lossless_max_kbps)
         ]
         if held_tier is not None:
             filtered = [

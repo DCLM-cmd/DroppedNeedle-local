@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { browser } from '$app/environment';
 	import { onDestroy } from 'svelte';
-	import { List } from 'lucide-svelte';
+	import { List } from '@lucide/svelte';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { SvelteMap } from 'svelte/reactivity';
 

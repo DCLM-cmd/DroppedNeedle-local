@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, X } from 'lucide-svelte';
+	import { Check, X } from '@lucide/svelte';
 	import { getLibraryScanScheduleQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import { saveLibraryScanSchedule } from '$lib/queries/library/LibraryMutations.svelte';
 	import { SCAN_FREQUENCY_OPTIONS } from '$lib/utils/scanFrequency';

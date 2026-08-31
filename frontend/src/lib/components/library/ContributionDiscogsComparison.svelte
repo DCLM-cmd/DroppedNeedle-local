@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { AlertTriangle, Check, ExternalLink, GitCompareArrows } from 'lucide-svelte';
+	import { AlertTriangle, Check, ExternalLink, GitCompareArrows } from '@lucide/svelte';
 	import type { LibraryContribution, ReleaseDraft } from '$lib/types';
 
 	type ComparisonField =

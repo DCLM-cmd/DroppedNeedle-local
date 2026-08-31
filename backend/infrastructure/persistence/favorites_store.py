@@ -6,13 +6,14 @@ shared WAL db (FK to auth_users).
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 import threading
 from pathlib import Path
 
+from infrastructure.persistence._database import PooledSqliteStore
 
-class FavoritesStore:
+
+class FavoritesStore(PooledSqliteStore):
     def __init__(self, db_path: Path, write_lock: threading.Lock | None = None) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -28,27 +29,6 @@ class FavoritesStore:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
-    def _execute(self, operation, write: bool):
-        if write:
-            with self._write_lock:
-                conn = self._connect()
-                try:
-                    result = operation(conn)
-                    conn.commit()
-                    return result
-                finally:
-                    conn.close()
-        conn = self._connect()
-        try:
-            return operation(conn)
-        finally:
-            conn.close()
-
-    async def _read(self, operation):
-        return await asyncio.to_thread(self._execute, operation, False)
-
-    async def _write(self, operation):
-        return await asyncio.to_thread(self._execute, operation, True)
 
     def _ensure_tables(self) -> None:
         conn = self._connect()
@@ -78,6 +58,34 @@ class FavoritesStore:
                 "VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
                 (user_id, item_kind, item_id, created_at),
             )
+
+        await self._write(operation)
+
+    async def apply_many(
+        self,
+        user_id: str,
+        targets: list[tuple[str, str]],
+        *,
+        add: bool,
+        created_at: float,
+    ) -> None:
+        def operation(conn: sqlite3.Connection) -> None:
+            if add:
+                conn.executemany(
+                    "INSERT INTO user_favorites "
+                    "(user_id, item_kind, item_id, created_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT DO NOTHING",
+                    [
+                        (user_id, kind, item_id, created_at)
+                        for kind, item_id in targets
+                    ],
+                )
+            else:
+                conn.executemany(
+                    "DELETE FROM user_favorites "
+                    "WHERE user_id = ? AND item_kind = ? AND item_id = ?",
+                    [(user_id, kind, item_id) for kind, item_id in targets],
+                )
 
         await self._write(operation)
 

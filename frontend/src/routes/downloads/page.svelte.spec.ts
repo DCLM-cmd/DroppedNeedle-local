@@ -77,7 +77,7 @@ describe('/downloads page', () => {
 
 	it('shows a loading skeleton before integration status loads', async () => {
 		h.loaded = false;
-		const { container } = render(DownloadsPage);
+		const { container } = await render(DownloadsPage);
 		expect(container.querySelector('.skeleton')).not.toBeNull();
 	});
 

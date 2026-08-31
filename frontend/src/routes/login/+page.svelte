@@ -18,7 +18,7 @@
 		type PlexPollResponse
 	} from '$lib/queries/auth/types';
 	import { onDestroy } from 'svelte';
-	import { Eye, EyeOff } from 'lucide-svelte';
+	import { Eye, EyeOff } from '@lucide/svelte';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import PlexIcon from '$lib/components/PlexIcon.svelte';
 

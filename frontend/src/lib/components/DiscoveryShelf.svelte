@@ -1,6 +1,6 @@
 <script lang="ts">
 	import CarouselSkeleton from '$lib/components/CarouselSkeleton.svelte';
-	import { RefreshCw, Sparkles } from 'lucide-svelte';
+	import { RefreshCw, Sparkles } from '@lucide/svelte';
 	import type { Snippet } from 'svelte';
 
 	interface Props {

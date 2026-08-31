@@ -7,7 +7,7 @@
 	import { artistHrefOrNull } from '$lib/utils/entityRoutes';
 	import { reveal } from '$lib/actions/reveal';
 	import LibraryFilterBar from '$lib/components/LibraryFilterBar.svelte';
-	import { ChevronLeft, ChevronRight } from 'lucide-svelte';
+	import { ChevronLeft, ChevronRight } from '@lucide/svelte';
 	import type { NavidromeArtistPage } from '$lib/types';
 
 	const PAGE_SIZE = 48;

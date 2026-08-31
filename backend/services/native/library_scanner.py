@@ -41,6 +41,9 @@ if TYPE_CHECKING:
     from infrastructure.sse_publisher import SSEPublisher
     from models.audio import AudioInfo, AudioTag, FingerprintResult
     from services.native.album_matcher import AlbumIdentifier, AlbumMatch
+    from services.native.library_housekeeping_service import (
+        LibraryHousekeepingService,
+    )
     from services.native.library_manager import LibraryManager, LibraryTrack
     from services.native.musicbrainz_matcher import MusicBrainzMatcher
 
@@ -106,6 +109,7 @@ class LibraryScanner:
         event_bus: "SSEPublisher",
         invalidate_albums: "Callable[[set[str]], Awaitable[None]] | None" = None,
         reconcile_downloads: "Callable[[], Awaitable[int]] | None" = None,
+        housekeeping: "LibraryHousekeepingService | None" = None,
     ) -> None:
         self._tagger = audio_tagger
         self._fingerprinter = fingerprinter
@@ -119,6 +123,9 @@ class LibraryScanner:
         # waiting on an auto-retry that would just re-download what's already
         # there. ``None`` in tests = no-op, mirroring ``invalidate_albums``.
         self._reconcile_downloads = reconcile_downloads
+        # Tidying that only makes sense once the catalog knows what is on disk:
+        # duplicates, albums split across rows, and folders with nothing that plays.
+        self._housekeeping = housekeeping
         self._cancel = asyncio.Event()
         self._running = False
         # Release groups a scan/re-identify re-attributed - their cached album pages are
@@ -496,6 +503,14 @@ class LibraryScanner:
                     await self._reconcile_downloads()
                 except Exception:  # noqa: BLE001
                     logger.warning("Download-list reconcile after scan failed", exc_info=True)
+            # After the catalog is current, and never before: deduplication needs to
+            # know which copies exist, merging needs the albums resolved, and a folder
+            # is only empty once the files it lost have been reconciled away.
+            if self._housekeeping is not None:
+                try:
+                    await self._housekeeping.run_after_scan()
+                except Exception:  # noqa: BLE001 - tidying never fails a scan
+                    logger.warning("Post-scan housekeeping failed", exc_info=True)
             await self._state.complete(matched=stats.matched, failed=stats.errored)
             logger.info(
                 "scan.completed",

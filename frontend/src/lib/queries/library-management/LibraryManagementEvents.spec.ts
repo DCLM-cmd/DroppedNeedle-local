@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { closeAllSharedEventSources } from '../sharedEventSource';
+
 const invalidate = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 vi.mock('./LibraryManagementInvalidation', () => ({
@@ -29,6 +31,12 @@ class FakeEventSource {
 		this.listeners.set(type, listeners);
 	}
 
+	// The shared-source cache detaches its fan-out listener when a stream is
+	// replaced, so a double without this throws on every stop().
+	removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+		this.listeners.get(type)?.delete(listener as EventListener);
+	}
+
 	close(): void {
 		this.closed = true;
 	}
@@ -40,6 +48,10 @@ class FakeEventSource {
 }
 
 beforeEach(() => {
+	// One EventSource is shared per URL in a module-level cache, so a connection
+	// opened by an earlier test is REUSED by the next one - which then sees no new
+	// FakeEventSource. Close them so each test starts from no connections.
+	closeAllSharedEventSources();
 	vi.clearAllMocks();
 	FakeEventSource.instances = [];
 	vi.stubGlobal('EventSource', FakeEventSource);

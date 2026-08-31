@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ArrowRight, Eraser, FileClock, Image, RotateCcw, Tags } from 'lucide-svelte';
+	import { ArrowRight, Eraser, FileClock, Image, RotateCcw, Tags } from '@lucide/svelte';
 
 	import { API } from '$lib/constants';
 	import type { LibraryManagementPlanItem } from '$lib/queries/library-management/types';

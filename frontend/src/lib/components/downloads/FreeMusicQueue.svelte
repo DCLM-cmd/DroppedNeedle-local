@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CheckCircle2, CircleAlert, Loader2, RotateCw, Search, Trash2, X } from 'lucide-svelte';
+	import { CheckCircle2, CircleAlert, Loader2, RotateCw, Search, Trash2, X } from '@lucide/svelte';
 	import {
 		cancelFreeMusicMutation,
 		clearFreeMusicHistoryMutation,

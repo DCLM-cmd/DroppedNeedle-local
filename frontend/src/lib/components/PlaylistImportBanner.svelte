@@ -9,7 +9,7 @@
 		Link2,
 		ListMusic,
 		RefreshCw
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { reveal } from '$lib/actions/reveal';
 
 	interface Props {

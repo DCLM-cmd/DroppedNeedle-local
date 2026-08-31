@@ -2141,6 +2141,14 @@ async def test_preview_marks_provider_deferral_as_warning(
         settings, expected_settings_revision=current.settings_revision
     )
     planner = _planner(tmp_path, store, preferences)
+    # A real provider OUTAGE. An unwired provider would now read as "the source is
+    # switched off", which correctly warns about nothing - see
+    # test_genre_source_deferral for that distinction.
+    outage = AsyncMock()
+    outage.get_release_group_genres_batch.side_effect = ExternalServiceError(
+        "ListenBrainz is unreachable"
+    )
+    planner._genres._listenbrainz = outage
     handle = await planner.create_preview(
         selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
         profile_id=PICARD_ORGANIZER_PROFILE_ID,

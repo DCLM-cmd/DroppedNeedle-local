@@ -28,6 +28,18 @@ class RateLimitedError(ExternalServiceError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class RateLimitBlockedError(RateLimitedError):
+    """A 429 that carries no hint of when to come back.
+
+    A rate limit WITH a Retry-After is a throttle: waiting the stated interval and
+    trying again is the co-operative thing to do. A 429 with no headers at all is not
+    a throttle, it is a refusal - typically an edge proxy that has stopped answering
+    for this address - and retrying it sends more of exactly the traffic that earned
+    the refusal. Kept separate so the retry wrapper can honour the first and stop on
+    the second.
+    """
+
+
 class ServiceDisabledUpstreamError(DroppedNeedleException):
     """A provider has deliberately switched a sub-API off (e.g. ListenBrainz's
     "Popularity API currently disabled due to high load"). Deliberately NOT an

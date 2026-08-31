@@ -23,7 +23,7 @@
 		Sparkles,
 		DownloadCloud,
 		TrendingUp
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import WantedWatchCard from '$lib/components/WantedWatchCard.svelte';
 	import WantedRetryingCard from '$lib/components/WantedRetryingCard.svelte';
 	import { getWantedWatchesQuery } from '$lib/queries/wanted/WantedQuery.svelte';

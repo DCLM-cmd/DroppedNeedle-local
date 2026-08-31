@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { WeeklyExplorationTrack } from '$lib/types';
-	import { Music2, Disc3 } from 'lucide-svelte';
+	import { Music2, Disc3 } from '@lucide/svelte';
 	import { albumHrefOrNull, artistHrefOrNull } from '$lib/utils/entityRoutes';
 	import { integrationStore } from '$lib/stores/integration';
 	import { libraryStore } from '$lib/stores/library';

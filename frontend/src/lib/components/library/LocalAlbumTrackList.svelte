@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Play } from 'lucide-svelte';
+	import { Play } from '@lucide/svelte';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { buildDiscoveryQueueFromLocal } from '$lib/player/queueHelpers';
 	import { formatDurationSec } from '$lib/utils/formatting';

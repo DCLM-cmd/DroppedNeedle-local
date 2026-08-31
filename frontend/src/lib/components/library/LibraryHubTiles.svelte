@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Disc3, Users, Music2, ArrowUpRight } from 'lucide-svelte';
+	import { Disc3, Users, Music2, ArrowUpRight } from '@lucide/svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import {

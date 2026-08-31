@@ -1,7 +1,7 @@
 <script lang="ts">
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import PlexIcon from '$lib/components/PlexIcon.svelte';
-	import { UserRound } from 'lucide-svelte';
+	import { UserRound } from '@lucide/svelte';
 	import { getImportCandidatesQuery } from '$lib/queries/auth/ImportCandidatesQuery.svelte';
 	import { createImportUsersMutation } from '$lib/queries/auth/UserImportMutations.svelte';
 

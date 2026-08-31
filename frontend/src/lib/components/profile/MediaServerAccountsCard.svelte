@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Loader2, ServerCog } from 'lucide-svelte';
+	import { Loader2, ServerCog } from '@lucide/svelte';
 	import { ApiError } from '$lib/api/client';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';

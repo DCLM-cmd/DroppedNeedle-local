@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, Clock, Trash2 } from 'lucide-svelte';
+	import { Check, Clock, Trash2 } from '@lucide/svelte';
 	import { colors } from '$lib/colors';
 	import { STATUS_COLORS } from '$lib/constants';
 	import DeleteAlbumModal from './DeleteAlbumModal.svelte';

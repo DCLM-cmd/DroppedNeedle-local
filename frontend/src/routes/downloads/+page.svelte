@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 
-	import { Download, PackageOpen } from 'lucide-svelte';
+	import { Download, PackageOpen } from '@lucide/svelte';
 
 	import DownloadQueue from '$lib/components/downloads/DownloadQueue.svelte';
 	import FreeMusicQueue from '$lib/components/downloads/FreeMusicQueue.svelte';

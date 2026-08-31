@@ -7,7 +7,7 @@
 		ExternalLink,
 		Search,
 		ShieldCheck
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import { API } from '$lib/constants';

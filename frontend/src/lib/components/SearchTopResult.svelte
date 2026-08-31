@@ -5,7 +5,7 @@
 	import ArtistImage from './ArtistImage.svelte';
 	import AlbumImage from './AlbumImage.svelte';
 	import { getApiUrl } from '$lib/api/api-utils';
-	import { ArrowRight } from 'lucide-svelte';
+	import { ArrowRight } from '@lucide/svelte';
 
 	interface Props {
 		artist?: Artist | null;

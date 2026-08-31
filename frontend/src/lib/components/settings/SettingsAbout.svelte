@@ -12,8 +12,8 @@
 		Tag,
 		Calendar,
 		ArrowUpCircle,
-		Github
-	} from 'lucide-svelte';
+		Code as Github
+	} from '@lucide/svelte';
 
 	const versionQuery = getVersionQuery();
 	const updateCheckQuery = getUpdateCheckQuery();

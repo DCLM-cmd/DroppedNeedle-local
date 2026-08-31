@@ -22,7 +22,7 @@
 	import { PlaylistQueryKeyFactory } from '$lib/queries/playlists/PlaylistQueryKeyFactory';
 	import { extractDominantColor, DEFAULT_GRADIENT } from '$lib/utils/colors';
 	import { getApiUrl } from '$lib/api/api-utils';
-	import { Music, Lock, Download, Loader2 } from 'lucide-svelte';
+	import { Music, Lock, Download, Loader2 } from '@lucide/svelte';
 	import BackButton from '$lib/components/BackButton.svelte';
 	import HeroBackdrop from '$lib/components/HeroBackdrop.svelte';
 	import type { PageData } from './$types';

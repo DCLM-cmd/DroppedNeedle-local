@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { MapPin, Search } from 'lucide-svelte';
+	import { MapPin, Search } from '@lucide/svelte';
 	import { getCitySearchQuery } from '$lib/queries/following/FollowQueries.svelte';
 	import type { CitySearchResult } from '$lib/queries/following/types';
 

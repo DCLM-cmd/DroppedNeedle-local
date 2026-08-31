@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { SourcePlaylistSummary } from '$lib/types';
 	import { formatTotalDurationSec } from '$lib/utils/formatting';
-	import { Disc3 } from 'lucide-svelte';
+	import { Disc3 } from '@lucide/svelte';
 
 	interface Props {
 		playlist: SourcePlaylistSummary;

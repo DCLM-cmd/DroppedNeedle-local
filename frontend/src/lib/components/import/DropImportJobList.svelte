@@ -6,7 +6,7 @@
 		Loader2,
 		SkipForward,
 		Trash2
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import DropImportMatchModal from './DropImportMatchModal.svelte';
 	import { getDropImportJobsQuery } from '$lib/queries/import/DropImportQueries.svelte';
 	import { discardDropItemMutation } from '$lib/queries/import/DropImportMutations.svelte';

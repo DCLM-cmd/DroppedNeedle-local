@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { RefreshCw } from 'lucide-svelte';
+	import { RefreshCw } from '@lucide/svelte';
 	import AlbumIdentificationPanel from '$lib/components/library/AlbumIdentificationPanel.svelte';
 	import { getLibraryAlbumDetailQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import type { LibraryAlbumSummary } from '$lib/types';

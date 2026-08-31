@@ -7,6 +7,7 @@ import threading
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 import os
+import uuid
 from pathlib import Path
 from pathlib import PurePosixPath
 import stat
@@ -72,6 +73,54 @@ class LibraryFilesystemCoordinator:
         self._states: dict[str, _RootLeaseState] = {}
         self._states_lock = threading.Lock()
         self._scan_revisions: dict[tuple[str, str], int] = {}
+        # Quiesce support: a settings dry run must plan against a library that is
+        # standing still. See ``quiesced``.
+        self._quiesce_depth = 0
+        self._not_quiesced = asyncio.Event()
+        self._not_quiesced.set()
+        self._active_writes = 0
+        self._writes_drained = asyncio.Event()
+        self._writes_drained.set()
+
+    @property
+    def quiesced(self) -> bool:
+        """Whether filesystem mutation is currently suspended."""
+        return self._quiesce_depth > 0
+
+    @asynccontextmanager
+    async def quiesce(self) -> AsyncIterator[None]:
+        """Suspend every library write for the duration of the block.
+
+        A dry run for the automation settings plans against what is on disk. If a
+        scan import, an Organizer apply or a recovery pass moves files while it is
+        planning, the plan it produces describes a library that no longer exists -
+        which is how "a destination was created after planning" happens. Holding
+        this blocks NEW writes and waits for in-flight ones to finish, so the
+        preview sees a still library.
+
+        Reads stay open: the dry run itself has to inspect the files.
+        """
+        self._quiesce_depth += 1
+        self._not_quiesced.clear()
+        try:
+            # Let whatever was already mid-write finish before planning starts.
+            await self._writes_drained.wait()
+            yield
+        finally:
+            self._quiesce_depth -= 1
+            if self._quiesce_depth <= 0:
+                self._quiesce_depth = 0
+                self._not_quiesced.set()
+
+    def _enter_write(self) -> None:
+        self._active_writes += 1
+        self._writes_drained.clear()
+
+    def _exit_write(self) -> None:
+        self._active_writes -= 1
+        if self._active_writes <= 0:
+            self._active_writes = 0
+            self._writes_drained.set()
 
     def _state(self, root_id: str) -> _RootLeaseState:
         if not root_id:
@@ -133,6 +182,10 @@ class LibraryFilesystemCoordinator:
     async def write_many(self, root_ids: Iterable[str]) -> AsyncIterator[None]:
         states = self._ordered_states(root_ids)
         acquired: list[_RootLeaseState] = []
+        # Wait BEFORE taking any root lease: holding one while blocked on a quiesce
+        # would stall the dry run's own reads behind this writer.
+        await self._not_quiesced.wait()
+        self._enter_write()
         try:
             for _root_id, state in states:
                 state.register_write_waiter()
@@ -144,6 +197,7 @@ class LibraryFilesystemCoordinator:
         finally:
             for state in reversed(acquired):
                 state.release_write()
+            self._exit_write()
 
     @contextmanager
     def read_sync(self, root_id: str) -> Iterator[None]:
@@ -220,12 +274,65 @@ def replace_rooted(
         raise ValueError("A rooted replacement references an unknown root.") from error
     with _rooted_parent(source_root, source_relative_path) as source:
         with _rooted_parent(destination_root, destination_relative_path) as destination:
-            os.replace(
-                source[1],
-                destination[1],
-                src_dir_fd=source[0],
-                dst_dir_fd=destination[0],
-            )
+            _replace_at(source, destination)
+
+
+def _replace_at(source: tuple[int, str], destination: tuple[int, str]) -> None:
+    """``os.replace`` that also lands a case-only rename.
+
+    On a case-insensitive filesystem - an SMB or exFAT share, or a macOS volume,
+    all ordinary places to keep a music library - replacing "01 - ARIA.flac" with
+    "01 - Aria.flac" swaps the file's contents but KEEPS the existing directory
+    entry, so a rename that only changes capitalisation silently does nothing.
+    Vacating the old entry first is what makes the new spelling take.
+
+    Case-sensitive filesystems never enter this path, and the displaced entry is
+    put back if the replacement fails, so a failure is not destructive.
+    """
+    source_fd, source_name = source
+    destination_fd, destination_name = destination
+    occupant = _case_variant(destination_fd, destination_name)
+    if occupant is None:
+        os.replace(
+            source_name,
+            destination_name,
+            src_dir_fd=source_fd,
+            dst_dir_fd=destination_fd,
+        )
+        return
+    displaced = f"{destination_name}.{uuid.uuid4().hex}.case"
+    os.replace(
+        occupant, displaced, src_dir_fd=destination_fd, dst_dir_fd=destination_fd
+    )
+    try:
+        os.replace(
+            source_name,
+            destination_name,
+            src_dir_fd=source_fd,
+            dst_dir_fd=destination_fd,
+        )
+    except OSError:
+        os.replace(
+            displaced, occupant, src_dir_fd=destination_fd, dst_dir_fd=destination_fd
+        )
+        raise
+    # os.replace would have removed the old destination anyway; this is that removal.
+    try:
+        os.unlink(displaced, dir_fd=destination_fd)
+    except OSError:
+        pass
+
+
+def _case_variant(directory_fd: int, name: str) -> str | None:
+    """The existing entry that differs from ``name`` only by case, if any."""
+    try:
+        entries = os.listdir(directory_fd)
+    except OSError:
+        return None
+    if name in entries:
+        return None
+    folded = name.casefold()
+    return next((entry for entry in entries if entry.casefold() == folded), None)
 
 
 def unlink_rooted(

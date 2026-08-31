@@ -7,7 +7,7 @@
 		LayoutDashboard,
 		ScanSearch,
 		Settings2
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { SvelteURL } from 'svelte/reactivity';

@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { Headphones, ArrowRight, Sparkles, AlertTriangle } from 'lucide-svelte';
-	import type { ComponentType } from 'svelte';
+	import { Headphones, ArrowRight, Sparkles, AlertTriangle } from '@lucide/svelte';
+	import type { Component } from 'svelte';
 	import { fromStore } from 'svelte/store';
 	import DropImportZone from '$lib/components/import/DropImportZone.svelte';
 	import { integrationStore } from '$lib/stores/integration';
@@ -17,7 +17,7 @@
 	}
 	interface EntryCard {
 		href: string;
-		icon: ComponentType;
+		icon: Component;
 		title: string;
 		subtitle: string;
 		state: CardState;

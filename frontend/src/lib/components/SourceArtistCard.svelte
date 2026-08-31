@@ -1,7 +1,7 @@
 <script lang="ts">
 	import ArtistImage from './ArtistImage.svelte';
 	import ArtistCardDownloadButton from './ArtistCardDownloadButton.svelte';
-	import { Users } from 'lucide-svelte';
+	import { Users } from '@lucide/svelte';
 
 	interface Props {
 		name: string;

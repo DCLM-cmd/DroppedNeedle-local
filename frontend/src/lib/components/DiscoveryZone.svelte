@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Sparkles } from 'lucide-svelte';
+	import { Sparkles } from '@lucide/svelte';
 	import { reveal } from '$lib/actions/reveal';
 	import type { Snippet } from 'svelte';
 

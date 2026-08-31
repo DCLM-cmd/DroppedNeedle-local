@@ -24,7 +24,7 @@
 		mergeSearchAlbums,
 		mergeSearchArtists
 	} from '$lib/queries/search/SearchQueries.svelte';
-	import { Check, ArrowRight, RefreshCw } from 'lucide-svelte';
+	import { Check, ArrowRight, RefreshCw } from '@lucide/svelte';
 	import SearchTopResult from '$lib/components/SearchTopResult.svelte';
 
 	interface Props {

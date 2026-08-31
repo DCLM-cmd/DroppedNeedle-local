@@ -4,7 +4,7 @@
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { playbackToast } from '$lib/stores/playbackToast.svelte';
 	import { getCoverUrl } from '$lib/utils/errorHandling';
-	import { X, GripVertical, ListMusic, Disc3, Shuffle, Trash2 } from 'lucide-svelte';
+	import { X, GripVertical, ListMusic, Disc3, Shuffle, Trash2 } from '@lucide/svelte';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import LocalFilesIcon from '$lib/components/LocalFilesIcon.svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';

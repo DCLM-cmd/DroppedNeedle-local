@@ -343,8 +343,13 @@ async def test_quarantine_usenet_identity_and_download_failed_reason(store):
 
 @pytest.mark.asyncio
 async def test_delete_quarantine_for_album_clears_all_releases(store):
-    """A manual re-request clears every blocklisted release for that album, but leaves
-    other albums' blocklists untouched."""
+    """A manual re-request reconsiders releases we JUDGED unsuitable, keeps the ones
+    that never downloaded, and leaves other albums' blocklists untouched.
+
+    Clearing everything meant the retry re-offered a release that had delivered zero
+    files - and being the highest-scoring candidate it was picked first and failed
+    again on the spot, which is what "the download starts, fails and is thrown out
+    without trying anything else" looked like."""
     from models.download_identity import soulseek_identity, usenet_identity
 
     await store.record_quarantine(
@@ -367,11 +372,17 @@ async def test_delete_quarantine_for_album_clears_all_releases(store):
         release_group_mbid="rg-keep",
     )
 
+    dead = usenet_identity("Album [FLAC]", 100)
     removed = await store.delete_quarantine_for_album("rg-clear")
-    assert removed == 2
+
+    assert removed == 1  # the verify_failed one only
     quarantine = await store.load_quarantine_set()
-    assert ("soulseek", keep) in quarantine
+    # judged unsuitable -> reconsidered
     assert ("soulseek", soulseek_identity("peerX", "a.flac")) not in quarantine
+    # never downloaded -> still skipped, so the retry searches past it
+    assert ("usenet", dead) in quarantine
+    # another album is untouched either way
+    assert ("soulseek", keep) in quarantine
 
 
 @pytest.mark.asyncio
@@ -1271,3 +1282,147 @@ async def test_held_import_pause_and_resolve(store):
     assert await store.has_unresolved_held_for_task("task-9") is False
     assert await store.task_ids_with_unresolved_held("user-a", "user") == set()
     assert await store.list_held_imports("user-a", "user") == []
+
+
+# ---- a task whose files still wait must survive a queue clear ----------------------
+
+def _hold(db_path: Path, task_id: str, *, status: str = "held") -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO held_imports(user_id, release_group_mbid, track_title,"
+            "artist_name, album_title, held_path, original_filename, file_format,"
+            "reason, source, source_task_id, status, created_at) "
+            "VALUES ('user-a','rg-1','A Song','An Artist','An Album','/held/a.flac',"
+            "'a.flac','flac','fingerprint_mismatch','usenet',?,?,1.0)",
+            (task_id, status),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_a_task_with_files_still_in_the_organizer_is_not_cleared(
+    store, tmp_path: Path
+):
+    """It is the only record of which edition those files belong to. Deleting it
+    strands them: every later retry rejects with "the original acquisition task is
+    unavailable", so the download can neither be finished nor discarded. Ten secured
+    Melodrama tracks reached exactly that state after their task was cleared.
+    """
+    task = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B"
+    )
+    await store.update_status(task.id, "completed")
+    _hold(tmp_path / "library.db", task.id)
+
+    assert await store.delete_tasks_by_status("user-a", "user", ["completed"]) == 0
+    assert await store.get_task(task.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_task_whose_holds_are_settled_is_cleared(store, tmp_path: Path):
+    """Only UNRESOLVED holds protect a task - a discarded or imported one is done."""
+    task = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B"
+    )
+    await store.update_status(task.id, "completed")
+    _hold(tmp_path / "library.db", task.id, status="discarded")
+
+    assert await store.delete_tasks_by_status("user-a", "user", ["completed"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_deleting_by_id_is_guarded_too(store, tmp_path: Path):
+    task = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B"
+    )
+    await store.update_status(task.id, "failed")
+    _hold(tmp_path / "library.db", task.id)
+
+    assert await store.delete_tasks_by_ids([task.id]) == 0
+    assert await store.get_task(task.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_finished_task_still_clears(store):
+    task = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A", album_title="B"
+    )
+    await store.update_status(task.id, "completed")
+
+    assert await store.delete_tasks_by_status("user-a", "user", ["completed"]) == 1
+    assert await store.get_task(task.id) is None
+
+
+def _seed_conversion(db_path: Path, *, state: str, held_path: str) -> None:
+    """Create the NativeLibraryStore-owned conversion tables this query joins to."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS library_edition_conversion_jobs (
+                id TEXT PRIMARY KEY, state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS library_edition_conversion_artifacts (
+                id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+                target_ordinal INTEGER NOT NULL, held_path TEXT NOT NULL UNIQUE);
+            """
+        )
+        conn.execute(
+            "INSERT INTO library_edition_conversion_jobs (id, state) VALUES (?, ?)",
+            ("job-1", state),
+        )
+        conn.execute(
+            "INSERT INTO library_edition_conversion_artifacts "
+            "(id, job_id, target_ordinal, held_path) VALUES (?, ?, ?, ?)",
+            ("artifact-1", "job-1", 19, held_path),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["preflight", "acquiring", "ready", "needs_recheck"])
+async def test_live_conversion_reserves_its_held_file(tmp_path: Path, state: str):
+    db_path = tmp_path / "library.db"
+    store = DownloadStore(db_path=db_path, write_lock=threading.Lock())
+    _seed_conversion(db_path, state=state, held_path="/held/saint_pablo.flac")
+
+    assert (
+        await store.find_active_edition_conversion_for_held_path(
+            "/held/saint_pablo.flac"
+        )
+        == "job-1"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["cancelled", "failed", "applied"])
+async def test_finished_conversion_releases_its_held_file(tmp_path: Path, state: str):
+    """Otherwise a leftover would be neither importable nor discardable forever."""
+    db_path = tmp_path / "library.db"
+    store = DownloadStore(db_path=db_path, write_lock=threading.Lock())
+    _seed_conversion(db_path, state=state, held_path="/held/saint_pablo.flac")
+
+    assert (
+        await store.find_active_edition_conversion_for_held_path(
+            "/held/saint_pablo.flac"
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_unreserved_and_missing_conversion_tables_answer_not_reserved(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "library.db"
+    store = DownloadStore(db_path=db_path, write_lock=threading.Lock())
+
+    # tables absent entirely - must answer, not raise
+    assert await store.find_active_edition_conversion_for_held_path("/held/x.flac") is None
+
+    _seed_conversion(db_path, state="ready", held_path="/held/saint_pablo.flac")
+    assert await store.find_active_edition_conversion_for_held_path("/held/x.flac") is None

@@ -10,7 +10,7 @@
 </script>
 
 <script lang="ts">
-	import { EllipsisVertical } from 'lucide-svelte';
+	import { EllipsisVertical } from '@lucide/svelte';
 	import type { Component, SvelteComponent } from 'svelte';
 
 	const MENU_WIDTH = 208;

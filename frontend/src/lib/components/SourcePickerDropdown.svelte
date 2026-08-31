@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronDown, Check } from 'lucide-svelte';
+	import { ChevronDown, Check } from '@lucide/svelte';
 	import { getSourceLabel, getSourceColor } from '$lib/utils/sources';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import LocalFilesIcon from '$lib/components/LocalFilesIcon.svelte';

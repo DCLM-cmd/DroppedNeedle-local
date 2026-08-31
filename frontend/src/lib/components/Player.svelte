@@ -33,7 +33,7 @@
 		ListMusic,
 		SlidersHorizontal,
 		Music2
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	let coverImgError = $state(false);
 	let lastCoverKey = '';

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Globe, Shuffle } from 'lucide-svelte';
+	import { Globe, Shuffle } from '@lucide/svelte';
 
 	interface Props {
 		title: string;

@@ -90,12 +90,85 @@ class TargetCoverArtService:
         provider_id = self._remember_provider_id(
             self._album_provider_ids, album_id, context
         )
-        local = await self._local.read(context)
-        if local is not None:
-            return local[3]
+        # Identity only: a listing wants the tag, not the picture. Reading the bytes
+        # here loaded 181 MB of covers for one 100-album page.
+        identity = await self._local.read_identity(context)
+        if identity is not None:
+            return identity
         if provider_id:
             return await self._provider.get_release_group_cover_etag(provider_id, size)
         return None
+
+    async def get_release_group_cover_blurhash(
+        self, album_id: str, size: str | None = "500"
+    ) -> str | None:
+        """Mirrors ``get_release_group_cover_etag``: local album id -> provider id.
+
+        Without this the compat builders' ``except Exception`` swallowed an
+        AttributeError and every album reported no blurhash, which Finamp surfaces as
+        "the server is misconfigured" and which costs it image de-duplication.
+        """
+        context = await self._store.get_target_artwork_context("album", album_id)
+        if context is None:
+            return await self._provider.get_release_group_cover_blurhash(album_id, size)
+        provider_id = self._remember_provider_id(
+            self._album_provider_ids, album_id, context
+        )
+        identity = await self._local.read_identity(context)
+        if identity is not None:
+            # Look the hash up, never compute it here. Jellyfin's DTO layer only reads
+            # BaseItemImageInfos.Blurhash; the value is produced while scanning. Ours
+            # is produced by the organization run - see LibraryImageHashService - and
+            # keyed by the artwork's content hash, the same value the etag returns.
+            stored = await self._store.get_image_blurhashes([identity])
+            return stored.get(identity)
+        if provider_id:
+            return await self._provider.get_release_group_cover_blurhash(
+                provider_id, size
+            )
+        return None
+
+    async def get_release_group_cover_image_info(
+        self, album_id: str, size: str | None = "500"
+    ) -> tuple[str | None, str | None]:
+        """The album cover's tag and blurhash, resolving the image record once.
+
+        Asking for the two separately cost every listed album two catalog lookups and
+        two identity reads for one and the same picture - 358 ms of a 378 ms
+        hundred-album page. Jellyfin reads its ItemImageInfo once and takes both the
+        tag and the hash off that single record; this is the same shape.
+        """
+        context = await self._store.get_target_artwork_context("album", album_id)
+        if context is None:
+            return (
+                await self._provider.get_release_group_cover_etag(album_id, size),
+                await self._provider.get_release_group_cover_blurhash(album_id, size),
+            )
+        provider_id = self._remember_provider_id(
+            self._album_provider_ids, album_id, context
+        )
+        identity = await self._local.read_identity(context)
+        if identity is not None:
+            stored = await self._store.get_image_blurhashes([identity])
+            return identity, stored.get(identity)
+        if provider_id:
+            return (
+                await self._provider.get_release_group_cover_etag(provider_id, size),
+                await self._provider.get_release_group_cover_blurhash(
+                    provider_id, size
+                ),
+            )
+        return None, None
+
+    async def get_artist_image_info(
+        self, artist_id: str, size: int | None = None
+    ) -> tuple[str | None, str | None]:
+        """The artist picture's tag and blurhash. See the album variant above."""
+        identity = await self.get_artist_image_etag(artist_id, size)
+        if not identity:
+            return None, None
+        stored = await self._store.get_image_blurhashes([identity])
+        return identity, stored.get(identity)
 
     async def get_release_cover(
         self,
@@ -157,6 +230,22 @@ class TargetCoverArtService:
         if not provider_id:
             return None
         return await self._provider.get_artist_image_etag(provider_id, size)
+
+    async def get_artist_image_blurhash(
+        self, artist_id: str, size: int | None = None
+    ) -> str | None:
+        """Looked up, never computed - see the album variant above.
+
+        Keyed on the picture's etag, which is its content hash, so an artist's hash is
+        stored by the organization run at the same moment the picture itself is
+        materialised. A tag without a hash is what makes Finamp declare the server
+        misconfigured, so the two are produced together or not at all.
+        """
+        identity = await self.get_artist_image_etag(artist_id, size)
+        if not identity:
+            return None
+        stored = await self._store.get_image_blurhashes([identity])
+        return stored.get(identity)
 
     async def debug_artist_image(self, artist_id: str, debug_info: dict) -> dict:
         context = await self._store.get_target_artwork_context("artist", artist_id)

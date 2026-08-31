@@ -84,3 +84,49 @@ async def test_valid_lookup_still_passes(tmp_path):
     assert result.status == FingerprintStatus.PASS
     assert result.recording_id == "rec-1"
     assert result.release_group_ids == ["rg-1"]
+
+
+@pytest.mark.asyncio
+async def test_all_recordings_of_the_match_are_reported(tmp_path):
+    """AcoustID returns every recording entity the audio resolves to, unordered.
+
+    MusicBrainz splits one performance into a separate recording per edition, so a
+    caller asking "is this file recording X?" gets a wrong answer from
+    ``recording_id`` alone whenever X is not the entity listed first. On the real
+    library this rejected 12 of 18 correct Life of Pablo tracks.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "status": "ok",
+            "results": [
+                {
+                    "score": 0.99,
+                    "recordings": [
+                        {"id": "rec-deluxe", "title": "Song", "duration": 184},
+                        {"id": "rec-original", "title": "Song", "duration": 184},
+                        {"id": "rec-deluxe", "title": "Song"},
+                    ],
+                },
+                {"score": 0.72, "recordings": [{"id": "rec-other-audio"}]},
+            ],
+        })
+
+    result = await _fingerprinter(handler).fingerprint(tmp_path / "a.flac")
+
+    assert result.status == FingerprintStatus.PASS
+    assert result.recording_id == "rec-deluxe"
+    # deduped, best pick first, and scoped to the matched cluster: the second
+    # result is different audio and must not be able to verify this file
+    assert result.recording_ids == ["rec-deluxe", "rec-original"]
+
+
+@pytest.mark.asyncio
+async def test_recording_ids_empty_when_nothing_matched(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "ok", "results": []})
+
+    result = await _fingerprinter(handler).fingerprint(tmp_path / "a.flac")
+
+    assert result.status == FingerprintStatus.SKIP
+    assert result.recording_ids == []

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, Search } from 'lucide-svelte';
+	import { Check, Search } from '@lucide/svelte';
 	import type { HomeAlbum, HomeArtist } from '$lib/types';
 	import { formatListenCount } from '$lib/utils/formatting';
 	import AlbumImage from './AlbumImage.svelte';

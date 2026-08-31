@@ -163,7 +163,16 @@ _MUTATION_JOURNAL_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 _IMPORT_JOURNAL_TRANSITIONS: dict[str, frozenset[str]] = {
     "planned": frozenset({"staged", "rollback_pending", "needs_attention"}),
-    "staged": frozenset({"validated", "rollback_pending", "needs_attention"}),
+    # "planned" is a RECOVERY step, not a step backwards through the work: the staged
+    # copy of a run that failed after staging is removed along with its workspace,
+    # while the journal entry survives. Verifying a file that is no longer there can
+    # only fail, so without this every retry of such an import failed identically
+    # forever and a held upgrade could never be published. Re-planning rebuilds that
+    # temporary copy from the same source - nothing already published is touched, and
+    # the fingerprint check on the way back through "staged" is unchanged.
+    "staged": frozenset(
+        {"validated", "planned", "rollback_pending", "needs_attention"}
+    ),
     "validated": frozenset(
         {"replacement_backed_up", "published", "rollback_pending", "needs_attention"}
     ),
@@ -655,6 +664,42 @@ def _bulk_preview_ineligibility(
         ):
             return "IDENTITY_CONFLICT"
     return None
+
+
+# A run in one of these states will never be executed again, so the artwork bytes its
+# records carry can no longer be needed by the tag writer.
+# A track's own satellite data, which has no meaning without it. Play history and
+# playlists are deliberately NOT here: those belong to the user, not to the file.
+_TRACK_OWNED_TABLES = (
+    "local_track_genres",
+    "local_track_artists",
+    "local_track_external_identities",
+    "library_artist_credit_proofs",
+)
+
+
+_TERMINAL_JOB_STATES_SQL = "('succeeded','failed','cancelled','stopped')"
+_TERMINAL_BUNDLE_STATES_SQL = "('completed','rolled_back')"
+# Documents observed in practice carry one artwork entry, a few carry two.
+_MAX_ARTWORK_ENTRIES = 8
+
+
+def _strip_bundle_artwork(document: dict[str, Any]) -> None:
+    """Remove every inline image from a sealed import request, in place."""
+    files = document.get("files")
+    if not isinstance(files, list):
+        return
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        desired = entry.get("desired_document")
+        if isinstance(desired, dict):
+            for image in desired.get("artwork") or ():
+                if isinstance(image, dict):
+                    image.pop("content", None)
+        for artifact in entry.get("artifacts") or ():
+            if isinstance(artifact, dict):
+                artifact.pop("content", None)
 
 
 class NativeLibraryStore(PersistenceBase):
@@ -1160,6 +1205,8 @@ class NativeLibraryStore(PersistenceBase):
             for statement in (
                 "ALTER TABLE library_identification_jobs ADD COLUMN checkpoint_json TEXT",
                 "ALTER TABLE library_operation_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE library_file_mutation_journal ADD COLUMN acknowledged_at REAL",
+                "ALTER TABLE library_management_import_bundles ADD COLUMN acknowledged_at REAL",
                 "ALTER TABLE library_work_control ADD COLUMN high_priority_claim_count INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE local_tracks ADD COLUMN embedded_release_group_mbid TEXT",
                 "ALTER TABLE local_tracks ADD COLUMN embedded_release_mbid TEXT",
@@ -1575,18 +1622,33 @@ class NativeLibraryStore(PersistenceBase):
     def _resolve_target_id(
         connection: sqlite3.Connection, *, kind: str, identifier: str
     ) -> str | None:
+        # An id that names a real row ALWAYS resolves to that row; an alias is only
+        # consulted when it does not. The two branches used to race on the order a
+        # compound SELECT happens to produce, and an album could resolve to itself in
+        # one query and to an alias target in the next. That is how four albums ended
+        # up with a stored compat id pointing at a DIFFERENT, empty catalog row: the
+        # write resolved through the alias, the read did not, and Finamp was handed an
+        # id whose album had no tracks while the same album played fine here.
         if kind == "album":
             row = connection.execute(
-                "SELECT COALESCE(retired_into_album_id, id) AS id FROM local_albums "
-                "WHERE id = ? UNION ALL "
-                "SELECT local_album_id FROM local_album_aliases WHERE alias = ? LIMIT 1",
+                "SELECT id FROM ("
+                "  SELECT COALESCE(retired_into_album_id, id) AS id, 0 AS precedence"
+                "  FROM local_albums WHERE id = ?"
+                "  UNION ALL"
+                "  SELECT local_album_id AS id, 1 AS precedence"
+                "  FROM local_album_aliases WHERE alias = ?"
+                ") ORDER BY precedence LIMIT 1",
                 (identifier, identifier.casefold()),
             ).fetchone()
         elif kind == "artist":
             row = connection.execute(
-                "SELECT COALESCE(retired_into_artist_id, id) AS id FROM local_artists "
-                "WHERE id = ? UNION ALL "
-                "SELECT local_artist_id FROM local_artist_aliases WHERE alias = ? LIMIT 1",
+                "SELECT id FROM ("
+                "  SELECT COALESCE(retired_into_artist_id, id) AS id, 0 AS precedence"
+                "  FROM local_artists WHERE id = ?"
+                "  UNION ALL"
+                "  SELECT local_artist_id AS id, 1 AS precedence"
+                "  FROM local_artist_aliases WHERE alias = ?"
+                ") ORDER BY precedence LIMIT 1",
                 (identifier, identifier.casefold()),
             ).fetchone()
         elif kind == "track":
@@ -1795,11 +1857,27 @@ class NativeLibraryStore(PersistenceBase):
         active_matches = [row for row in matches if row["has_indexed_tracks"]]
         if len(active_matches) == 1:
             return str(active_matches[0]["id"])
-        if len(active_matches) > 1 or len(matches) > 1:
+        if len(active_matches) > 1:
+            # Two albums that BOTH hold playable files really are a choice only the
+            # user can make (a release and its deluxe edition, say).
             raise ConflictError(
                 "This MusicBrainz release group matches multiple local albums; "
                 "select a local edition before changing its release pin."
             )
+        if len(matches) > 1:
+            # Several rows claim the release group but NONE of them holds a present
+            # file: they are leftovers - an album whose files were removed or moved,
+            # a row left behind when a folder was renamed, an empty shell from an
+            # abandoned import. That is not an ambiguity for the user to resolve, it
+            # means the release group is not in the library.
+            #
+            # Reporting a conflict here made an absent album unusable: its track list
+            # answered 404 ("Couldn't load the track list") and requesting it refused
+            # with "the exact MusicBrainz edition could not be verified", so the one
+            # action that would have fixed it - downloading the album - was the action
+            # being blocked. Every caller treats None as "no local album", which is
+            # exactly what this is.
+            return None
         return str(matches[0]["id"]) if matches else None
 
     async def get_target_artists_by_genre(
@@ -2581,12 +2659,19 @@ class NativeLibraryStore(PersistenceBase):
                     parameters,
                 ).fetchone()[0]
             )
+            # The descending twins exist so a client that asks for a sort ORDER can be
+            # answered. Jellyfin clients send SortBy together with SortOrder, and
+            # without a way to express "Z to A" every such request had to fall back to
+            # the default - which is why sorting in Finamp always came back newest-first.
             ordering = {
                 "recent": "MAX(t.imported_at) DESC, a.id",
+                "recent_asc": "MAX(t.imported_at) ASC, a.id",
                 "newest": "COALESCE(a.year, 0) DESC, a.title_folded, a.id",
                 "oldest": "COALESCE(a.year, 0), a.title_folded, a.id",
                 "name": "a.title_folded, a.id",
+                "name_desc": "a.title_folded DESC, a.id",
                 "artist": "a.album_artist_name_folded, a.title_folded, a.id",
+                "artist_desc": "a.album_artist_name_folded DESC, a.title_folded, a.id",
                 "random": "a.id",
             }.get(sort, "MAX(t.imported_at) DESC, a.id")
             rows = connection.execute(
@@ -2978,9 +3063,15 @@ class NativeLibraryStore(PersistenceBase):
             )
             ordering = {
                 "recent": "t.imported_at DESC, t.id",
+                "recent_asc": "t.imported_at ASC, t.id",
                 "title": "t.title_folded, t.id",
+                "title_desc": "t.title_folded DESC, t.id",
                 "artist": "t.artist_name_folded, t.title_folded, t.id",
+                "artist_desc": "t.artist_name_folded DESC, t.title_folded, t.id",
                 "album": "t.album_title_folded, t.disc_number, t.track_number, t.id",
+                "album_desc": (
+                    "t.album_title_folded DESC, t.disc_number, t.track_number, t.id"
+                ),
                 "random": "RANDOM()",
             }.get(sort, "t.imported_at DESC, t.id")
             rows = connection.execute(
@@ -3749,6 +3840,47 @@ class NativeLibraryStore(PersistenceBase):
             return str(row["jf_id"]) if row else None
 
         return await self._read(operation)
+
+    async def repair_target_compat_mappings(self) -> int:
+        """Drop compat ids that disagree with their own derivation.
+
+        The mapping is deterministic by design - ``jf_id`` is the hash of
+        ``kind:internal_id`` - which is what keeps an id stable when a row is rebuilt.
+        A row that no longer satisfies that is not a stable id, it is a wrong one: it
+        sends a client to a different catalog row than the one it asked about. Four
+        albums reached that state, each pointing at an empty twin, so Finamp showed
+        them with no tracks while they played perfectly here.
+
+        Dropping such a row is safe and self-healing: the id is re-derived - to the
+        same value - the next time the item is served, and re-inserted correctly.
+        """
+
+        def operation(connection: sqlite3.Connection) -> int:
+            rows = connection.execute(
+                "SELECT jf_id, kind, internal_id FROM library_compat_id_map"
+            ).fetchall()
+            broken = [
+                str(row["jf_id"])
+                for row in rows
+                if hashlib.sha256(
+                    f"{row['kind']}:{row['internal_id']}".encode()
+                ).hexdigest()[:32]
+                != str(row["jf_id"])
+            ]
+            for offset in range(0, len(broken), 500):
+                batch = broken[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                connection.execute(
+                    "DELETE FROM library_compat_id_map "
+                    f"WHERE jf_id IN ({placeholders})",
+                    batch,
+                )
+            return len(broken)
+
+        repaired = await self._write(operation)
+        if repaired:
+            await self._invalidate()
+        return repaired
 
     async def get_target_compat_mapping(self, jf_id: str) -> tuple[str, str] | None:
         def operation(connection: sqlite3.Connection) -> tuple[str, str] | None:
@@ -5195,11 +5327,29 @@ class NativeLibraryStore(PersistenceBase):
                 normalized = str(item_kind or "").casefold()
                 source_id = str(item_id or "")
                 if normalized in {"album", "music_album"}:
+                    # An identity can be shared by several album rows - a request
+                    # that never delivered leaves one behind with no tracks, and the
+                    # catalog holds 104 release groups in that state. Taking whichever
+                    # came first resolved most of them to the empty shell instead of
+                    # the album that actually has the music, so the row holding
+                    # indexed tracks is preferred explicitly.
                     row = connection.execute(
-                        "SELECT local_album_id FROM local_album_external_identities "
-                        "WHERE release_group_mbid = ? UNION ALL "
-                        "SELECT local_album_id FROM local_album_aliases "
-                        "WHERE alias = ? LIMIT 1",
+                        "SELECT local_album_id FROM ("
+                        "  SELECT identity.local_album_id AS local_album_id,"
+                        "         EXISTS(SELECT 1 FROM local_tracks track"
+                        "                WHERE track.local_album_id ="
+                        "                      identity.local_album_id"
+                        "                  AND track.availability='indexed') AS has_music"
+                        "  FROM local_album_external_identities identity"
+                        "  WHERE identity.release_group_mbid = ?"
+                        "  UNION ALL"
+                        "  SELECT alias.local_album_id AS local_album_id,"
+                        "         EXISTS(SELECT 1 FROM local_tracks track"
+                        "                WHERE track.local_album_id ="
+                        "                      alias.local_album_id"
+                        "                  AND track.availability='indexed') AS has_music"
+                        "  FROM local_album_aliases alias WHERE alias.alias = ?"
+                        ") ORDER BY has_music DESC LIMIT 1",
                         (source_id.casefold(), source_id.casefold()),
                     ).fetchone()
                     return (
@@ -6284,6 +6434,469 @@ class NativeLibraryStore(PersistenceBase):
             return album_revision, self._bump_catalog(connection)
 
         return await self._write(operation)
+
+    async def compact_finished_organization_records(
+        self, *, max_bundles: int = 200
+    ) -> dict[str, int]:
+        """Drop artwork bytes from organization records whose run has finished.
+
+        Inline base64 covers were 2.67 GB of a 2.90 GB database: one cover is embedded
+        in a plan item's desired document AND in its catalog document, and again in
+        every file of the import bundle, so a 14-track album stored the same image
+        around thirty times.
+
+        They are needed only while a run is in flight - the tag writer reads them to
+        stamp artwork into the audio files. Checked against every other consumer:
+
+        * undo and baseline restore read library_management_baselines, a separate
+          table holding its own catalog document, and are untouched by this;
+        * the preview API returns the document to the browser but the UI reads only
+          ``fields``, never ``artwork``;
+        * the two queries that reach into a bundle's JSON look up
+          ``$.conversion_job_id`` and ``$.files[*].download_task_id``;
+        * a completed bundle's outcome is read from ``result_json``, and the sealed
+          request is decoded only while the bundle is still ``publishing``.
+
+        Everything describing the image is kept - dimensions, mime type, byte size and
+        the sha256 that identifies it - so the audit trail still says exactly which
+        artwork a run applied. Only the pixels go.
+        """
+        counts = await self._compact_plan_item_artwork()
+        counts["bundles"] = await self._compact_import_bundle_artwork(max_bundles)
+        return counts
+
+    async def _compact_plan_item_artwork(self) -> dict[str, int]:
+        def operation(connection: sqlite3.Connection) -> dict[str, int]:
+            changed = 0
+            # json_remove takes out the CONTENT KEY, not the array element, so the
+            # remaining images keep their positions and each index has to be visited.
+            # Documents carry one image as a rule and occasionally two; the loop stops
+            # at the first index no document reaches.
+            for column in ("desired_document_json", "catalog_document_json"):
+                for index in range(_MAX_ARTWORK_ENTRIES):
+                    path = f"$.artwork[{index}].content"
+                    cursor = connection.execute(
+                        f"UPDATE library_management_plan_items SET {column} = "
+                        f"json_remove({column}, '{path}') "
+                        "WHERE job_id IN (SELECT id FROM library_operation_jobs "
+                        f"WHERE state IN {_TERMINAL_JOB_STATES_SQL}) "
+                        # json_extract raises on malformed input rather than returning
+                        # null, so one corrupt row would abort the whole pass.
+                        f"AND json_valid({column}) "
+                        f"AND json_extract({column}, '{path}') IS NOT NULL"
+                    )
+                    if not cursor.rowcount:
+                        break
+                    changed += int(cursor.rowcount)
+            return {"plan_documents": changed}
+
+        return await self._write(operation)
+
+    async def _compact_import_bundle_artwork(self, limit: int) -> int:
+        """Strip artwork from finished bundles' sealed requests.
+
+        Done in Python rather than SQL: the bytes sit at
+        ``files[*].desired_document.artwork[*].content`` and
+        ``files[*].artifacts[*].content``, which SQLite's JSON functions cannot walk
+        without a query per element. The rows are few and large, so reading them one
+        at a time is the cheaper shape anyway.
+        """
+
+        def load(connection: sqlite3.Connection) -> list[tuple[str, str]]:
+            rows = connection.execute(
+                "SELECT id, request_json FROM library_management_import_bundles "
+                f"WHERE state IN {_TERMINAL_BUNDLE_STATES_SQL} "
+                # A corrupt row is skipped rather than aborting the pass: json_extract
+                # raises on malformed input instead of returning null.
+                "AND json_valid(request_json) "
+                "AND json_extract(request_json, '$._artwork_compacted') IS NULL "
+                "ORDER BY length(request_json) DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [(str(row["id"]), str(row["request_json"])) for row in rows]
+
+        pending = await self._read(load)
+        compacted = 0
+        for bundle_id, raw in pending:
+            try:
+                document = json.loads(raw)
+            except ValueError:
+                logger.warning(
+                    "Skipping an import bundle with unreadable JSON: %s", bundle_id
+                )
+                continue
+            if not isinstance(document, dict):
+                continue
+            _strip_bundle_artwork(document)
+            # Self-describing, and what keeps this pass from revisiting the row.
+            document["_artwork_compacted"] = True
+            replacement = json.dumps(document, separators=(",", ":"))
+
+            def operation(
+                connection: sqlite3.Connection,
+                bundle_id: str = bundle_id,
+                replacement: str = replacement,
+            ) -> int:
+                # request_hash still describes the ORIGINAL request. It is compared
+                # only against a stored value when re-inserting the same idempotency
+                # key, and verified against the payload only while publishing - never
+                # for a bundle that already reached a terminal state.
+                cursor = connection.execute(
+                    "UPDATE library_management_import_bundles SET request_json=? "
+                    f"WHERE id=? AND state IN {_TERMINAL_BUNDLE_STATES_SQL}",
+                    (replacement, bundle_id),
+                )
+                return int(cursor.rowcount)
+
+            compacted += await self._write(operation)
+        return compacted
+
+    async def list_duplicate_track_positions(
+        self, *, limit: int = 500
+    ) -> list[list[dict[str, Any]]]:
+        """Groups of indexed files that occupy the SAME album/disc/track position.
+
+        Two files at one position are the same song twice - the shape a library ends
+        up in when the same album arrives in two formats. Which one to keep is a
+        quality question, answered by the caller; this only finds them.
+
+        Positions without a track number are skipped: without one there is no position
+        to be duplicated at, and grouping those together would pair unrelated songs.
+
+        Grouping follows a retirement rather than ignoring it. A retired album row can
+        still hold live, indexed tracks - retiring moves the ALBUM, not the files
+        hanging off it - and skipping those rows hid real duplicates: one album sat
+        with eleven flacs and eleven mp3s of the same songs while this reported none.
+        """
+
+        def operation(connection: sqlite3.Connection) -> list[list[dict[str, Any]]]:
+            rows = connection.execute(
+                "SELECT t.id, "
+                "COALESCE(a.retired_into_album_id, t.local_album_id) AS album_key, "
+                "t.disc_number, t.track_number, "
+                "t.title, t.file_format, t.bit_rate, t.file_path, t.relative_path, "
+                "t.root_id, t.file_size_bytes, a.title AS album_title "
+                "FROM local_tracks t "
+                "JOIN local_albums a ON a.id = t.local_album_id "
+                "WHERE t.availability = 'indexed' AND t.track_number IS NOT NULL "
+                "AND (COALESCE(a.retired_into_album_id, t.local_album_id), "
+                "     COALESCE(t.disc_number, 1), t.track_number) IN ("
+                "  SELECT COALESCE(da.retired_into_album_id, d.local_album_id),"
+                "         COALESCE(d.disc_number, 1), d.track_number"
+                "  FROM local_tracks d"
+                "  JOIN local_albums da ON da.id = d.local_album_id"
+                "  WHERE d.availability = 'indexed' AND d.track_number IS NOT NULL"
+                "  GROUP BY COALESCE(da.retired_into_album_id, d.local_album_id),"
+                "           COALESCE(d.disc_number, 1), d.track_number"
+                "  HAVING COUNT(*) > 1"
+                ") "
+                "ORDER BY album_key, COALESCE(t.disc_number, 1), t.track_number, "
+                "t.id LIMIT ?",
+                (max(1, limit) * 8,),
+            ).fetchall()
+            grouped: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+            for row in rows:
+                key = (
+                    str(row["album_key"]),
+                    int(row["disc_number"] or 1),
+                    int(row["track_number"]),
+                )
+                grouped.setdefault(key, []).append(dict(row))
+            return [group for group in grouped.values() if len(group) > 1][:limit]
+
+        return await self._read(operation)
+
+    async def retire_duplicate_track(
+        self, track_id: str, *, recycled_path: str | None = None, now: float
+    ) -> None:
+        """Mark one copy of a duplicated song as gone from the library.
+
+        The row follows its file to wherever it was set aside. Left pointing at the
+        library path it no longer occupies it reads as a second copy that is merely
+        missing, which is what made an album look like it still held both and what
+        blocked a later import from taking the slot.
+        """
+
+        def operation(connection: sqlite3.Connection) -> None:
+            if recycled_path:
+                connection.execute(
+                    "UPDATE local_tracks SET availability='missing', missing_since=?,"
+                    "file_path=?, relative_path=?,"
+                    "row_revision=row_revision+1 WHERE id=? AND availability='indexed'",
+                    (now, recycled_path, recycled_path, track_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE local_tracks SET availability='missing', missing_since=?,"
+                    "row_revision=row_revision+1 WHERE id=? AND availability='indexed'",
+                    (now, track_id),
+                )
+            self._bump_catalog(connection)
+
+        await self._write(operation)
+
+    async def library_management_plan_subjects_changed(self, job_id: str) -> bool:
+        """Whether any file THIS plan covers has changed since it was planned.
+
+        The preview used to be judged stale whenever the global catalog revision
+        moved, and that revision is bumped by every catalog write anywhere - a scan, an
+        import, an artwork hash. On a system that is doing anything at all it changes
+        between building a preview and pressing Confirm, so applying was refused with
+        "the preview is not current" and the button looked dead.
+
+        What actually matters is whether the FILES in this plan moved underneath it,
+        which each item records when it is planned. The apply path re-checks the same
+        expectations per item and fails that item as STALE_INPUT, so this is a
+        courtesy check for the UI, not the safety guarantee.
+        """
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            row = connection.execute(
+                "SELECT 1 FROM library_management_plan_items item "
+                "JOIN local_tracks track ON track.id = item.local_track_id "
+                "WHERE item.job_id = ? AND ("
+                "  track.stat_revision IS NOT item.expected_stat_revision"
+                "  OR track.root_id IS NOT item.expected_root_id"
+                "  OR track.relative_path IS NOT item.expected_relative_path"
+                ") LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if row is not None:
+                return True
+            # A subject that has left the catalog entirely counts as changed: the plan
+            # describes work on a file that is no longer there to do it to.
+            missing = connection.execute(
+                "SELECT 1 FROM library_management_plan_items item "
+                "WHERE item.job_id = ? AND item.local_track_id IS NOT NULL "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM local_tracks track WHERE track.id = item.local_track_id"
+                ") LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            return missing is not None
+
+        return await self._read(operation)
+
+    async def rehome_tracks_from_retired_albums(self) -> int:
+        """Move tracks off retired album rows onto the row that survived the merge.
+
+        Retiring an album moves the ROW; anything still hanging off it becomes
+        invisible, because listings follow the survivor. An album ended up with ten
+        of its eleven tracks on the retired half and showed exactly one - the files
+        were all on disk and all indexed, and the library reported a single song.
+
+        Follows a chain of retirements to its end, so a row retired twice still lands
+        on the album that is actually shown.
+        """
+
+        def operation(connection: sqlite3.Connection) -> int:
+            retirements = {
+                str(row["id"]): str(row["retired_into_album_id"])
+                for row in connection.execute(
+                    "SELECT id, retired_into_album_id FROM local_albums "
+                    "WHERE retired_into_album_id IS NOT NULL"
+                )
+            }
+            if not retirements:
+                return 0
+
+            def survivor(album_id: str) -> str:
+                seen = {album_id}
+                current = album_id
+                # Bounded: a cycle would otherwise spin here forever.
+                while current in retirements:
+                    nxt = retirements[current]
+                    if nxt in seen:
+                        return current
+                    seen.add(nxt)
+                    current = nxt
+                return current
+
+            moved = 0
+            for retired in retirements:
+                target = survivor(retired)
+                if target == retired:
+                    continue
+                cursor = connection.execute(
+                    "UPDATE local_tracks SET local_album_id = ?,"
+                    "row_revision = row_revision + 1 WHERE local_album_id = ?",
+                    (target, retired),
+                )
+                moved += int(cursor.rowcount)
+            if moved:
+                self._bump_catalog(connection)
+            return moved
+
+        return await self._write(operation)
+
+    async def purge_superseded_track_rows(self) -> dict[str, int]:
+        """Remove rows for files a better copy has replaced.
+
+        A scan marks a file that has left the disk as ``missing`` and stops there, so
+        every replaced copy leaves its row behind forever. Those rows are invisible in
+        listings but they are not harmless: one at a destination is what an import
+        trips over, and an album that holds both reads as having the song twice.
+
+        Only rows SUPERSEDED by a live copy at the same position go. A missing row with
+        no such counterpart is the record that an album lost a track, which is
+        information the library is meant to keep - and to show.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, int]:
+            rows = connection.execute(
+                "SELECT gone.id FROM local_tracks gone "
+                "WHERE gone.availability = 'missing' "
+                "AND gone.track_number IS NOT NULL "
+                "AND EXISTS ("
+                "  SELECT 1 FROM local_tracks live"
+                "  WHERE live.local_album_id = gone.local_album_id"
+                "    AND live.track_number = gone.track_number"
+                "    AND COALESCE(live.disc_number, 1) = COALESCE(gone.disc_number, 1)"
+                "    AND live.availability = 'indexed'"
+                ")"
+            ).fetchall()
+            removed = kept = 0
+            for row in rows:
+                track_id = str(row["id"])
+                connection.execute("SAVEPOINT purge_superseded")
+                try:
+                    for table in _TRACK_OWNED_TABLES:
+                        connection.execute(
+                            f"DELETE FROM {table} WHERE local_track_id = ?",
+                            (track_id,),
+                        )
+                    connection.execute(
+                        "DELETE FROM local_tracks WHERE id = ?", (track_id,)
+                    )
+                except sqlite3.IntegrityError:
+                    # Play history or a playlist still names it. Those belong to the
+                    # user, not to the file, so the row stays.
+                    connection.execute("ROLLBACK TO purge_superseded")
+                    kept += 1
+                else:
+                    removed += 1
+                finally:
+                    connection.execute("RELEASE purge_superseded")
+            if removed:
+                self._bump_catalog(connection)
+            return {"removed": removed, "kept": kept}
+
+        return await self._write(operation)
+
+    async def purge_recycled_track_rows(self, bin_path: str) -> dict[str, int]:
+        """Take files that now live in the recycle bin out of the catalog.
+
+        A recycled file is not part of the library any more - it was deliberately set
+        aside - but its row stayed behind still naming the bin as its location. One
+        such row was enough to make an album read as having a track it does not have.
+
+        The row's OWN satellite data goes with it. Anything else still pointing at the
+        track - play history, a playlist - keeps it alive; those rows are kept and
+        merely stop claiming to be somewhere they are not, because silently dropping a
+        track someone has in a playlist would be worse than an untidy row.
+        """
+        prefix = bin_path.rstrip("/")
+        if not prefix:
+            return {"removed": 0, "detached": 0}
+
+        def operation(connection: sqlite3.Connection) -> dict[str, int]:
+            rows = connection.execute(
+                "SELECT id FROM local_tracks WHERE file_path LIKE ? ESCAPE '\\'",
+                (f"{_escape_like(prefix)}/%",),
+            ).fetchall()
+            removed = detached = 0
+            for row in rows:
+                track_id = str(row["id"])
+                connection.execute("SAVEPOINT purge_recycled")
+                try:
+                    for table in _TRACK_OWNED_TABLES:
+                        connection.execute(
+                            f"DELETE FROM {table} WHERE local_track_id = ?",
+                            (track_id,),
+                        )
+                    connection.execute(
+                        "DELETE FROM local_tracks WHERE id = ?", (track_id,)
+                    )
+                except sqlite3.IntegrityError:
+                    connection.execute("ROLLBACK TO purge_recycled")
+                    connection.execute(
+                        "UPDATE local_tracks SET file_path = '', relative_path = ?,"
+                        "availability = 'missing',"
+                        "row_revision = row_revision + 1 WHERE id = ?",
+                        (f"{track_id}.recycled", track_id),
+                    )
+                    detached += 1
+                else:
+                    removed += 1
+                finally:
+                    connection.execute("RELEASE purge_recycled")
+            if removed or detached:
+                self._bump_catalog(connection)
+            return {"removed": removed, "detached": detached}
+
+        return await self._write(operation)
+
+    async def get_image_blurhashes(
+        self, content_hashes: list[str]
+    ) -> dict[str, str]:
+        """The stored blurhashes for these artwork content hashes.
+
+        Batched because a listing asks for a whole page of covers at once, and the
+        point of storing them is that serving must not do per-image work.
+        """
+        wanted = [value for value in dict.fromkeys(content_hashes) if value]
+        if not wanted:
+            return {}
+
+        def operation(connection: sqlite3.Connection) -> dict[str, str]:
+            found: dict[str, str] = {}
+            for offset in range(0, len(wanted), 500):
+                batch = wanted[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    "SELECT content_sha1, blurhash FROM library_image_blurhashes "
+                    f"WHERE content_sha1 IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                found.update({row["content_sha1"]: row["blurhash"] for row in rows})
+            return found
+
+        return await self._read(operation)
+
+    async def put_image_blurhash(
+        self,
+        *,
+        content_sha1: str,
+        blurhash: str,
+        width: int,
+        height: int,
+        computed_at: float,
+    ) -> None:
+        """Record the blurhash for one image, as the organization run computes it."""
+        if not content_sha1 or not blurhash or width <= 0 or height <= 0:
+            return
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "INSERT INTO library_image_blurhashes "
+                "(content_sha1, blurhash, width, height, computed_at) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(content_sha1) DO UPDATE SET "
+                "blurhash = excluded.blurhash, width = excluded.width, "
+                "height = excluded.height, computed_at = excluded.computed_at",
+                (content_sha1, blurhash, width, height, computed_at),
+            )
+
+        await self._write(operation)
+
+    async def count_image_blurhashes(self) -> int:
+        def operation(connection: sqlite3.Connection) -> int:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM library_image_blurhashes"
+                ).fetchone()[0]
+            )
+
+        return await self._read(operation)
 
     async def backfill_identified_provider_artwork(self, *, updated_at: float) -> int:
         """Create reproducible provider artwork associations missed by early imports."""
@@ -9684,6 +10297,25 @@ class NativeLibraryStore(PersistenceBase):
             "WHERE root_id = ? AND relative_path = ?",
             (track.root_id, track.relative_path),
         ).fetchone()
+        if existing is None:
+            # The path is free, but the row may still be here under another one - a
+            # copy that was moved aside, recycled, or renamed by an earlier run. The
+            # id is derived from the track's identity rather than its location, so
+            # inserting then failed on the primary key and took the whole import down
+            # with "the automatic import could not be committed". Finding it by id and
+            # updating it is what an upsert is supposed to do; the write below moves
+            # the row to its new path.
+            existing = connection.execute(
+                "SELECT local_tracks.*, EXISTS(SELECT 1 FROM local_album_external_identities ae "
+                "WHERE ae.local_album_id=local_tracks.local_album_id "
+                "AND ae.provider='musicbrainz' AND ae.release_mbid IS NOT NULL) "
+                "AND EXISTS(SELECT 1 FROM local_track_external_identities te "
+                "WHERE te.local_track_id=local_tracks.id AND te.provider='musicbrainz' "
+                "AND te.release_mbid IS NOT NULL AND te.recording_mbid IS NOT NULL "
+                "AND te.release_track_mbid IS NOT NULL) AS accepted_identity "
+                "FROM local_tracks WHERE id = ?",
+                (track.id,),
+            ).fetchone()
         catalog_locked = bool(
             existing is not None
             and existing["membership_locked"]
@@ -9771,7 +10403,12 @@ class NativeLibraryStore(PersistenceBase):
                 )
             )
             connection.execute(
-                "UPDATE local_tracks SET local_album_id = ?, file_path = ?, path_hash = ?, "
+                # root_id/relative_path are written, not just matched on: a row found
+                # by ID rather than by location still carries wherever it used to be -
+                # a parked or recycled path - and leaving that behind would describe
+                # the file as being somewhere it is not.
+                "UPDATE local_tracks SET local_album_id = ?, root_id = ?, "
+                "relative_path = ?, file_path = ?, path_hash = ?, "
                 "file_size_bytes = ?, file_mtime_ns = ?, stat_revision = ?, "
                 "stat_revision_kind = ?, tag_revision = ?, tags_read_at = ?, "
                 "metadata_incomplete = ?, title = ?, title_folded = ?, "
@@ -9792,6 +10429,8 @@ class NativeLibraryStore(PersistenceBase):
                 "row_revision = row_revision + 1 WHERE id = ?",
                 (
                     local_album_id,
+                    track.root_id,
+                    track.relative_path,
                     track.file_path,
                     track.path_hash,
                     track.file_size_bytes,
@@ -21856,7 +22495,8 @@ class NativeLibraryStore(PersistenceBase):
                 replacement_id = replacement_track_ids.get(ordinal)
                 if replacement_id is not None:
                     destination = connection.execute(
-                        "SELECT id FROM local_tracks WHERE root_id=? AND relative_path=?",
+                        "SELECT id, availability FROM local_tracks "
+                        "WHERE root_id=? AND relative_path=?",
                         (write.track.root_id, write.track.relative_path),
                     ).fetchone()
                     replacement = connection.execute(
@@ -21880,9 +22520,50 @@ class NativeLibraryStore(PersistenceBase):
                             ),
                         )
                     elif str(destination["id"]) != replacement_id:
-                        raise StaleRevisionError(
-                            "An edition-conversion destination changed before commit."
-                        )
+                        if str(destination["availability"]) == "missing":
+                            # Debris from an earlier attempt at THIS very upgrade: a
+                            # row was created for the destination, its file never
+                            # landed, and the row stayed behind pointing at nothing.
+                            # Treating it as a rival occupant blocked the whole bundle
+                            # and did so permanently - every later attempt tripped over
+                            # the wreckage of the one before, which is why an album
+                            # could sit at "1 flac + 9 mp3" through repeated upgrades.
+                            #
+                            # The dead row is moved aside rather than deleted: play
+                            # history and playlists still point at it, and those
+                            # references are RESTRICTed. Parking it on a path nothing
+                            # can collide with frees the slot while leaving every
+                            # reference intact.
+                            parked = (
+                                f"{destination['id']}.superseded"
+                            )
+                            connection.execute(
+                                "UPDATE local_tracks SET relative_path=?,file_path=?,"
+                                "path_hash=?,row_revision=row_revision+1 WHERE id=?",
+                                (
+                                    parked,
+                                    parked,
+                                    hashlib.sha256(parked.encode()).hexdigest(),
+                                    str(destination["id"]),
+                                ),
+                            )
+                            connection.execute(
+                                "UPDATE local_tracks SET root_id=?,file_path=?,"
+                                "relative_path=?,path_hash=?,"
+                                "row_revision=row_revision+1 WHERE id=?",
+                                (
+                                    write.track.root_id,
+                                    write.track.file_path,
+                                    write.track.relative_path,
+                                    write.track.path_hash,
+                                    replacement_id,
+                                ),
+                            )
+                        else:
+                            raise StaleRevisionError(
+                                "An edition-conversion destination changed before "
+                                "commit."
+                            )
                 track_id, changed = self._upsert_scanned_track_tx(
                     connection, write, scan_run_id=None
                 )
@@ -23517,11 +24198,43 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def acknowledge_library_management_recovery_attention(
+        self, *, now: float
+    ) -> int:
+        """Clear the "needs attention" flag on everything recovery has given up on.
+
+        ``needs_attention`` is terminal for automated recovery - it is deliberately
+        excluded from the recoverable scan - but nothing could ever clear it, so the
+        banner and its work item stayed on screen for good and every library-activity
+        poll kept re-counting rows that would never change. Acknowledging keeps the
+        rows (they are the audit trail of what recovery could not finish) and only
+        stops them being reported as outstanding work.
+        """
+
+        def operation(connection: sqlite3.Connection) -> int:
+            journals = connection.execute(
+                "UPDATE library_file_mutation_journal SET acknowledged_at = ? "
+                "WHERE state = 'needs_attention' AND acknowledged_at IS NULL",
+                (now,),
+            ).rowcount
+            bundles = connection.execute(
+                "UPDATE library_management_import_bundles SET acknowledged_at = ? "
+                "WHERE state = 'needs_attention' AND acknowledged_at IS NULL",
+                (now,),
+            ).rowcount
+            acknowledged = int(journals) + int(bundles)
+            if acknowledged:
+                self._bump_stream(connection, "operation")
+            return acknowledged
+
+        return await self._write(operation)
+
     async def library_management_recovery_diagnostics(self) -> dict[str, Any]:
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             rows = connection.execute(
                 "SELECT state,COUNT(*) AS count FROM library_file_mutation_journal "
                 "WHERE state NOT IN ('completed','rolled_back') "
+                "AND acknowledged_at IS NULL "
                 "GROUP BY state ORDER BY state"
             ).fetchall()
             bundle = connection.execute(
@@ -23539,7 +24252,8 @@ class NativeLibraryStore(PersistenceBase):
             import_bundles = connection.execute(
                 "SELECT state,COUNT(*) AS count,MIN(updated_at) AS oldest_updated_at "
                 "FROM library_management_import_bundles "
-                "WHERE state NOT IN ('completed','rolled_back') GROUP BY state "
+                "WHERE state NOT IN ('completed','rolled_back') "
+                "AND acknowledged_at IS NULL GROUP BY state "
                 "ORDER BY state"
             ).fetchall()
             import_journals = connection.execute(
@@ -23615,6 +24329,61 @@ class NativeLibraryStore(PersistenceBase):
             }
 
         return await self._read(operation)
+
+    # A run's own rows go with it; the pointers other records keep to "the run that
+    # last touched me" are NULLed instead, so the catalog audit trail and the per-track
+    # management state survive the history entry being cleared. Written out explicitly
+    # rather than relying on ON DELETE CASCADE: foreign keys are not enforced on this
+    # connection, so a bare DELETE would silently leave dangling references.
+    _OPERATION_OWNED_TABLES = (
+        ("library_operation_work", "job_id"),
+        ("library_operation_control_idempotency", "job_id"),
+        ("library_management_external_refresh_deliveries", "operation_job_id"),
+        ("library_bulk_review_snapshots", "job_id"),
+        ("library_reidentification_snapshots", "job_id"),
+        ("library_repair_snapshots", "job_id"),
+        ("library_identity_repair_findings", "job_id"),
+        ("library_management_job_snapshots", "job_id"),
+    )
+    _OPERATION_SOFT_REFERENCES = (
+        ("library_artist_reconciliation_state", "operation_job_id"),
+        ("library_track_management_state", "last_operation_job_id"),
+        ("library_catalog_actions", "operation_job_id"),
+        ("library_edition_conversion_jobs", "final_preview_job_id"),
+        ("library_management_job_snapshots", "linked_operation_job_id"),
+    )
+    _OPERATION_TERMINAL_STATES = ("succeeded", "failed", "cancelled", "stopped")
+
+    async def delete_library_operation(self, job_id: str) -> str:
+        """Remove one operation from the history.
+
+        Returns ``"deleted"``, ``"not_found"``, or ``"running"`` when the run has not
+        reached a terminal state - a job still in flight is never deleted out from
+        under its worker.
+        """
+
+        def operation(connection: sqlite3.Connection) -> str:
+            row = connection.execute(
+                "SELECT state FROM library_operation_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return "not_found"
+            if str(row["state"]) not in self._OPERATION_TERMINAL_STATES:
+                return "running"
+            for table, column in self._OPERATION_SOFT_REFERENCES:
+                connection.execute(
+                    f"UPDATE {table} SET {column} = NULL WHERE {column} = ?", (job_id,)
+                )
+            for table, column in self._OPERATION_OWNED_TABLES:
+                connection.execute(
+                    f"DELETE FROM {table} WHERE {column} = ?", (job_id,)
+                )
+            connection.execute(
+                "DELETE FROM library_operation_jobs WHERE id = ?", (job_id,)
+            )
+            return "deleted"
+
+        return await self._write(operation)
 
     async def claim_management_bundle_for_recovery(
         self,

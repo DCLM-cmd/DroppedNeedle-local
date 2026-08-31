@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Activity, TriangleAlert } from 'lucide-svelte';
+	import { Activity, TriangleAlert } from '@lucide/svelte';
 	import { getSystemHealthQuery } from '$lib/queries/system/SystemHealthQuery.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import type { ServiceHealthItem } from '$lib/types';

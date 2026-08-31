@@ -3,7 +3,7 @@
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import LibraryDashboard from '$lib/components/library/LibraryDashboard.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
-	import { Headphones, LockKeyhole, SlidersHorizontal, Waypoints, X } from 'lucide-svelte';
+	import { Headphones, LockKeyhole, SlidersHorizontal, Waypoints, X } from '@lucide/svelte';
 
 	const CONNECT_APPS_HREF = '/profile#connect-apps';
 	const BANNER_KEY = 'droppedneedle_connect_apps_banner_dismissed';

@@ -752,6 +752,9 @@ def test_management_route_inventory_is_complete() -> None:
         ("POST", "/library/management/previews/{job_id}/apply"),
         ("GET", "/library/management/operations"),
         ("GET", "/library/management/operations/{job_id}"),
+        # Removing a finished run from the history. Admin-only, and refused while the
+        # run is still in flight.
+        ("DELETE", "/library/management/operations/{job_id}"),
         ("GET", "/library/management/operations/{job_id}/results"),
         ("POST", "/library/management/operations/{job_id}/undo-preview"),
         ("POST", "/library/management/baselines/restore-previews"),
@@ -759,6 +762,7 @@ def test_management_route_inventory_is_complete() -> None:
         ("POST", "/library/management/baselines/purge-impact"),
         ("POST", "/library/management/baselines/purge"),
         ("GET", "/library/management/recovery/diagnostics"),
+        ("POST", "/library/management/recovery/acknowledge"),
     }
 
 

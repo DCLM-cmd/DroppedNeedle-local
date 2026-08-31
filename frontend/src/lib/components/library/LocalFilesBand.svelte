@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Headphones, Play, Shuffle, Sparkles, ArrowRight } from 'lucide-svelte';
+	import { Headphones, Play, Shuffle, Sparkles, ArrowRight } from '@lucide/svelte';
 	import { getLocalStatsQuery, getLocalRecentQuery } from '$lib/queries/local/LocalQueries.svelte';
 	import { createLibraryTrackLoader } from '$lib/utils/libraryTrackLoader.svelte';
 	import { buildDiscoveryQueueFromLocal } from '$lib/player/queueHelpers';

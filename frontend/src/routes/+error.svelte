@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Home, RotateCw } from 'lucide-svelte';
+	import { Home, RotateCw } from '@lucide/svelte';
 	import { page } from '$app/state';
 
 	const status = $derived(page.status);

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ArrowRight, ChevronDown, X } from 'lucide-svelte';
+	import { ArrowRight, ChevronDown, X } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 
 	import { authStore } from '$lib/stores/authStore.svelte';

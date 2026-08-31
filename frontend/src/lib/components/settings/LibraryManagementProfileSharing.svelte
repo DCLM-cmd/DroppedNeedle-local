@@ -9,7 +9,7 @@
 		FileUp,
 		Hash,
 		PackageCheck
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 
 	import {
 		exportLibraryManagementProfileMutation,

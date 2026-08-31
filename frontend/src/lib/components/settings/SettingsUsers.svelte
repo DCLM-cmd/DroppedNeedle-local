@@ -22,7 +22,7 @@
 		Copy,
 		Check,
 		Clock3
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import UserQuotaEditor from '$lib/components/settings/UserQuotaEditor.svelte';
 	import {
 		getDownloadPolicyQuery,

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import SourcePlaylistList from '$lib/components/SourcePlaylistList.svelte';
-	import { Tv } from 'lucide-svelte';
+	import { Tv } from '@lucide/svelte';
 </script>
 
 <SourcePlaylistList

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Loader2, Play, Square } from 'lucide-svelte';
+	import { Loader2, Play, Square } from '@lucide/svelte';
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';
 
 	interface Props {

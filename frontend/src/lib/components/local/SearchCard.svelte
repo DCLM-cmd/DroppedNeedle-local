@@ -3,7 +3,7 @@
 	import { getLocalSearchQuery } from '$lib/queries/local/LocalQueries.svelte';
 	import { getCoverUrl } from '$lib/utils/errorHandling';
 	import { fly } from 'svelte/transition';
-	import { Search, X, Disc3, Music2, Play, ListPlus, GripVertical, Loader } from 'lucide-svelte';
+	import { Search, X, Disc3, Music2, Play, ListPlus, GripVertical, Loader } from '@lucide/svelte';
 
 	interface Props {
 		reducedMotion?: boolean;

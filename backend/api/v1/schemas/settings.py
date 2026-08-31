@@ -71,6 +71,10 @@ class UserPreferences(AppStruct):
         default_factory=lambda: ["album", "ep", "single"]
     )
     secondary_types: list[str] = msgspec.field(default_factory=lambda: ["studio"])
+    # Whether a newer release should be announced in the UI. Turning it off silences
+    # the banner and the what's-new overlay; the About page still reports the real
+    # versions, because "do not interrupt me" is not "lie to me".
+    notify_new_versions: bool = True
 
 
 class DownloadClientConnectionSettings(AppStruct):
@@ -225,8 +229,14 @@ class DownloadPolicySettings(AppStruct):
     background_upgrade_scan_enabled: bool = False
     background_upgrade_scan_interval_hours: int = 12
     background_upgrade_max_per_run: int = 3
+    # Reject LOSSLESS files above this effective bitrate (0 = no cap). slskd reports
+    # no bitRate for lossless, so the quality tiers cannot express "FLAC, but not
+    # 24/192": this derives the rate from size/duration and drops hi-res rips that
+    # cost several times the bytes for no audible gain on most systems.
+    lossless_max_kbps: int = 0
 
     def __post_init__(self) -> None:
+        _validate_range(self.lossless_max_kbps, "lossless_max_kbps", 0, 10_000)
         _validate_range(
             self.download_stall_timeout_minutes,
             "download_stall_timeout_minutes",
@@ -710,7 +720,14 @@ class ConnectAppsSettings(AppStruct):
     transcode_default_format: Literal["mp3", "opus"] = "mp3"
     transcode_max_bitrate_kbps: int = 320
     advertise_server_name: str = "DroppedNeedle"
-    advertise_server_version: str = "10.10.6"
+    # The Jellyfin server version the shim claims. Clients gate on it BEFORE they try
+    # anything else: Finamp reads /System/Info/Public when a server is added and stops
+    # right there if the version is older than the API it was built against - no login
+    # attempt, no item request, nothing in the server log after that one call. The
+    # compat surface already speaks the 12.0 shapes (userId as a query parameter on
+    # /Items, /UserViews, /UserFavoriteItems, /UserPlayedItems), so claiming 10.10.6
+    # only locked out current clients.
+    advertise_server_version: str = "12.0.0"
     discover_mode: Literal["local-only", "lazy-mb", "use-scrobble-targets"] = (
         "local-only"
     )

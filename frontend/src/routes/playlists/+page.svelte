@@ -11,7 +11,7 @@
 	import { getConnectionsQuery } from '$lib/queries/connections/ConnectionsQuery.svelte';
 	import { getPlaylistListQuery } from '$lib/queries/playlists/PlaylistQuery.svelte';
 	import { createCreatePlaylistMutation } from '$lib/queries/playlists/PlaylistMutations.svelte';
-	import { ListMusic, Plus, Lock } from 'lucide-svelte';
+	import { ListMusic, Plus, Lock } from '@lucide/svelte';
 	import SpotifyIcon from '$lib/components/SpotifyIcon.svelte';
 	import PlaylistCard from '$lib/components/PlaylistCard.svelte';
 	import RedactedPlaylistCard from '$lib/components/RedactedPlaylistCard.svelte';

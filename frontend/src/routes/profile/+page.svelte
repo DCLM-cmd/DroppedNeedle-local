@@ -24,7 +24,7 @@
 		AtSign,
 		Mail,
 		KeyRound
-	} from 'lucide-svelte';
+	} from '@lucide/svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { logout } from '$lib/utils/logout';
 	import { getProfileQuery } from '$lib/queries/profile/ProfileQuery.svelte';

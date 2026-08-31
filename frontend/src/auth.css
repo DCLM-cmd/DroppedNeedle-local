@@ -1,4 +1,4 @@
-@import 'tailwindcss' source(none);
+@import 'tailwindcss/index.css' source(none);
 @source './routes/login/+page.svelte';
 @source './routes/setup/+page.svelte';
 @source './routes/recover-password/+page.svelte';

@@ -623,7 +623,7 @@ describe('LibraryManagementPreviewPage', () => {
 			'droppedneedle:library-management:preview-token:resolution-1',
 			'resolution-token'
 		);
-		const view = render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		const view = await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByText('Read-only plan · no files changed')).toBeVisible();
 		await view.rerender({ jobId: 'resolution-1' });

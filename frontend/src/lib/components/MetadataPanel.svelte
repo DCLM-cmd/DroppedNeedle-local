@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { X, Info, ExternalLink } from 'lucide-svelte';
+	import { X, Info, ExternalLink } from '@lucide/svelte';
 	import { slide } from 'svelte/transition';
 
 	interface Props {

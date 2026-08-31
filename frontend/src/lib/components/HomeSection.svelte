@@ -7,7 +7,7 @@
 		HomeGenre
 	} from '$lib/types';
 	import type { Snippet } from 'svelte';
-	import { ArrowRight, X, Check, Disc3, Music2, Tv, Sparkles, Search } from 'lucide-svelte';
+	import { ArrowRight, X, Check, Disc3, Music2, Tv, Sparkles, Search } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import {
 		albumHrefOrNull,

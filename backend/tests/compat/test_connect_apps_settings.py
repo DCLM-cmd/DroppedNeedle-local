@@ -32,7 +32,7 @@ def test_defaults_protocols_off_and_local_only():
     assert s.transcode_default_format == "mp3"
     assert s.transcode_max_bitrate_kbps == 320
     assert s.advertise_server_name == "DroppedNeedle"
-    assert s.advertise_server_version == "10.10.6"
+    assert s.advertise_server_version == "12.0.0"
     assert s.discover_mode == "local-only"
 
 

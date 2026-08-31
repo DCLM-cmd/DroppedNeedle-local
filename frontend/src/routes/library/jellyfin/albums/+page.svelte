@@ -25,7 +25,7 @@
 		JellyfinTrackInfo,
 		JellyfinFilterFacets
 	} from '$lib/types';
-	import { Tv } from 'lucide-svelte';
+	import { Tv } from '@lucide/svelte';
 
 	let filterFacets = $state<JellyfinFilterFacets | null>(null);
 	let yearChips = $derived(filterFacets?.years?.map((y) => String(y)) ?? []);

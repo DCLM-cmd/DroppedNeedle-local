@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { serviceStatusStore } from '$lib/stores/serviceStatus';
 	import { fromStore } from 'svelte/store';
-	import { TriangleAlert, X } from 'lucide-svelte';
+	import { TriangleAlert, X } from '@lucide/svelte';
 
 	const status = fromStore(serviceStatusStore);
 

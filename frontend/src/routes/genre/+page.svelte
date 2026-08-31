@@ -14,7 +14,7 @@
 		getGenreAlbumPagesQuery,
 		getGenreDetailQuery
 	} from '$lib/queries/genre/GenreQueries.svelte';
-	import { ArrowLeft, BookOpen, Music2, CircleAlert, Mic, Disc3, ChevronDown } from 'lucide-svelte';
+	import { ArrowLeft, BookOpen, Music2, CircleAlert, Mic, Disc3, ChevronDown } from '@lucide/svelte';
 	import RadioPlayButton from '$lib/components/discover/RadioPlayButton.svelte';
 	import type { RadioMode } from '$lib/player/launchRadio';
 	import type { SampleEntry } from '$lib/stores/deckSampler.svelte';
