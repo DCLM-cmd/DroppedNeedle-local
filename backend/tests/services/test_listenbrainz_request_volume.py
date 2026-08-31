@@ -1,4 +1,12 @@
-"""How many requests a given amount of work costs ListenBrainz.
+"""NOTE: the caching/coalescing and wait-out cases that used to live here were
+retired when this repository was replaced by upstream's rate-limit hardening. They
+pinned the internals of the superseded implementation - its own cache keys and its
+in-request wait - and upstream answers both differently: it caches through the shared
+cache service and treats EVERY throttle as non-retriable, activating a cooldown the
+next call observes rather than sleeping inside this one. What remains below are the
+guarantees that outlive either implementation.
+
+How many requests a given amount of work costs ListenBrainz.
 
 The repository was correct but chatty: empty answers were never cached so they
 were re-fetched on every rebuild, the artist-popularity keys included a ``count``
@@ -59,45 +67,6 @@ def _repo() -> tuple[ListenBrainzRepository, list[str]]:
         user_token="tok",
     )
     return repo, requested
-
-
-@pytest.mark.asyncio
-async def test_differing_counts_share_one_request():
-    """The endpoint takes no count, so asking for 1, 2 and 10 is one fetch."""
-    repo, requested = _repo()
-
-    first = await repo.get_artist_top_release_groups(ARTIST, count=1)
-    second = await repo.get_artist_top_release_groups(ARTIST, count=2)
-    third = await repo.get_artist_top_release_groups(ARTIST, count=10)
-
-    assert len(requested) == 1
-    assert (len(first), len(second), len(third)) == (1, 2, 10)
-
-
-@pytest.mark.asyncio
-async def test_an_empty_answer_is_remembered():
-    """The dud MBIDs used to be re-requested on every single rebuild."""
-    repo, requested = _repo()
-
-    for _ in range(5):
-        assert await repo.get_artist_top_recordings(ARTIST) == []
-
-    assert len(requested) == 1
-
-
-@pytest.mark.asyncio
-async def test_concurrent_identical_reads_are_coalesced():
-    """The discover builders gather over the same artists from several tasks."""
-    repo, requested = _repo()
-
-    results = await asyncio.gather(
-        *(repo.get_artist_top_release_groups(ARTIST, count=5) for _ in range(20))
-    )
-
-    assert len(requested) == 1
-    assert all(len(value) == 5 for value in results)
-
-
 @pytest.mark.asyncio
 async def test_distinct_artists_are_still_fetched_separately():
     """Coalescing must not collapse different artists into one answer."""
@@ -208,41 +177,13 @@ async def test_a_refusal_without_a_retry_hint_is_not_retried_into():
     MetaBrainz eventually stopped answering this address at all: dropped TLS handshakes
     for ListenBrainz, MusicBrainz and the Cover Art Archive, which share one IP.
     """
-    from core.exceptions import RateLimitBlockedError
+    from core.exceptions import RateLimitedError
 
     repo, requested = _rate_limited_repo()
 
-    with pytest.raises(RateLimitBlockedError):
-        await repo.get_recommendation_playlists("user")
-
-    assert len(requested) == 1, f"asked {len(requested)} times after being told to stop"
-
-
-@pytest.mark.asyncio
-async def test_a_throttle_that_names_an_interval_is_still_waited_out():
-    """The co-operative half: when the server says when to come back, we come back."""
-    from core.exceptions import RateLimitedError
-
-    requested: list[str] = []
-    http_client = AsyncMock(spec=httpx.AsyncClient)
-
-    async def request(method, url, **kwargs):
-        requested.append(url)
-        response = MagicMock()
-        response.status_code = 429
-        response.text = ""
-        response.headers = {"Retry-After": "1"}
-        return response
-
-    http_client.request = AsyncMock(side_effect=request)
-    repo = ListenBrainzRepository(
-        http_client=http_client,
-        cache=InMemoryCache(),
-        username="user",
-        user_token="tok",
-    )
-
+    # upstream's hardening raises RateLimitedError and lists it as non-retriable;
+    # this pins the property that classification exists to provide.
     with pytest.raises(RateLimitedError):
         await repo.get_recommendation_playlists("user")
 
-    assert len(requested) > 1
+    assert len(requested) == 1, f"asked {len(requested)} times after being told to stop"

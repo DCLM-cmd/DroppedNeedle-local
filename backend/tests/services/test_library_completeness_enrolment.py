@@ -17,6 +17,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from services.native.wanted_watcher_service import (
+    _SweepMembershipState,
+)
+from services.native.wanted_watcher_service import (
     _MAX_LIBRARY_ENROL_PER_SWEEP,
     WantedWatcherService,
 )
@@ -67,7 +70,7 @@ async def test_an_imported_request_with_missing_files_is_enrolled() -> None:
         rows=[],
     )
 
-    assert await service._enrol_from_library() == 1
+    assert await service._enrol_from_library(_SweepMembershipState()) == 1
     kwargs = service._store.create_watch.await_args.kwargs
     assert kwargs["kind"] == "partial"
     assert kwargs["release_group_mbid"] == "rg-1"
@@ -83,7 +86,7 @@ async def test_a_cancelled_request_with_missing_files_is_enrolled() -> None:
         record=_record(status="cancelled"),
     )
 
-    assert await service._enrol_from_library() == 1
+    assert await service._enrol_from_library(_SweepMembershipState()) == 1
 
 
 @pytest.mark.asyncio
@@ -94,7 +97,7 @@ async def test_a_complete_album_is_not_enrolled() -> None:
         rows=[_row(1, "A"), _row(2, "B")],
     )
 
-    assert await service._enrol_from_library() == 0
+    assert await service._enrol_from_library(_SweepMembershipState()) == 0
     service._store.create_watch.assert_not_called()
 
 
@@ -106,7 +109,7 @@ async def test_an_album_that_already_has_a_watch_is_left_alone() -> None:
         existing_watch=SimpleNamespace(state="stopped"),
     )
 
-    assert await service._enrol_from_library() == 0
+    assert await service._enrol_from_library(_SweepMembershipState()) == 0
     service._requests.async_get_record.assert_not_called()
 
 
@@ -115,7 +118,7 @@ async def test_an_album_nobody_requested_is_not_enrolled() -> None:
     """A want needs someone to act for; ownership is never invented."""
     service = _watcher(mbids=["rg-1"], tracks=[_track(1, "A")], rows=[], record=None)
 
-    assert await service._enrol_from_library() == 0
+    assert await service._enrol_from_library(_SweepMembershipState()) == 0
 
 
 @pytest.mark.asyncio
@@ -124,7 +127,7 @@ async def test_a_request_without_a_user_is_not_enrolled() -> None:
         mbids=["rg-1"], tracks=[_track(1, "A")], rows=[], record=_record(user_id=None)
     )
 
-    assert await service._enrol_from_library() == 0
+    assert await service._enrol_from_library(_SweepMembershipState()) == 0
 
 
 @pytest.mark.asyncio
@@ -133,7 +136,7 @@ async def test_an_unmeasurable_album_is_never_enrolled() -> None:
     data, the same rule the dispatch follows."""
     service = _watcher(mbids=["rg-1"], tracks=None, rows=[])
 
-    assert await service._enrol_from_library() == 0
+    assert await service._enrol_from_library(_SweepMembershipState()) == 0
 
 
 @pytest.mark.asyncio
@@ -143,7 +146,7 @@ async def test_one_sweep_cannot_enrol_the_whole_library_at_once() -> None:
     many = [f"rg-{i}" for i in range(_MAX_LIBRARY_ENROL_PER_SWEEP * 3)]
     service = _watcher(mbids=many, tracks=[_track(1, "A")], rows=[])
 
-    assert await service._enrol_from_library() == _MAX_LIBRARY_ENROL_PER_SWEEP
+    assert await service._enrol_from_library(_SweepMembershipState()) == _MAX_LIBRARY_ENROL_PER_SWEEP
 
 
 @pytest.mark.asyncio
@@ -151,7 +154,7 @@ async def test_a_library_read_failure_skips_the_pass_quietly() -> None:
     service = _watcher(mbids=[], tracks=[], rows=[])
     service._library.get_library_mbids = AsyncMock(side_effect=RuntimeError("db gone"))
 
-    assert await service._enrol_from_library() == 0
+    assert await service._enrol_from_library(_SweepMembershipState()) == 0
 
 
 @pytest.mark.asyncio
@@ -159,7 +162,7 @@ async def test_enrolment_never_dispatches_a_download() -> None:
     """The whole safety argument: this pass writes a watch and nothing else."""
     service = _watcher(mbids=["rg-1"], tracks=[_track(1, "A")], rows=[])
 
-    await service._enrol_from_library()
+    await service._enrol_from_library(_SweepMembershipState())
 
     assert {name for name, *_ in service._store.mock_calls} == {
         "get_watch", "create_watch",

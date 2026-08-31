@@ -1302,11 +1302,13 @@ class LibraryManagementPublisher:
                     != journal.replacement_fingerprint
                 ):
                     raise LibraryManagementDestinationConflictError(
-                        "An import destination was created after planning."
+                        "An import destination was created after planning.",
+                        destination=str(value.destination),
                     )
             elif cls._has_normalized_destination_sibling(value.destination):
                 raise LibraryManagementDestinationConflictError(
-                    "An import destination collides after normalization."
+                    "An import destination collides after normalization.",
+                    destination=str(value.destination),
                 )
             if value.replacement is not None and not same_path_replacement:
                 if cls._hash_file(value.replacement) != journal.replacement_fingerprint:
@@ -3533,7 +3535,8 @@ class LibraryManagementPublisher:
                     and value.destination not in recycled_sources
                 ):
                     raise LibraryManagementDestinationConflictError(
-                        "A destination was created after preview."
+                        "A destination was created after preview.",
+                        destination=str(value.destination),
                     )
             elif value.source is not None:
                 if self._hash_file(value.source) != value.source_fingerprint:
@@ -3564,7 +3567,8 @@ class LibraryManagementPublisher:
                             if sibling == value.source or sibling in recycled_sources:
                                 continue
                             raise LibraryManagementDestinationConflictError(
-                                "A normalized destination was created after preview."
+                                "A normalized destination was created after preview.",
+                                destination=str(sibling),
                             )
 
     async def _record_late_collisions(self, prepared: list[_PreparedMutation]) -> None:

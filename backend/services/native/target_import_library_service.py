@@ -154,6 +154,7 @@ class TargetImportLibraryService:
             raise AutomaticManagementHoldError(
                 PATH_COLLISION_DIFFERENT,
                 "A planned destination is occupied by different content. Nothing was overwritten.",
+                destination=getattr(error, "destination", None),
             ) from error
         except StaleRevisionError as error:
             if not automatic:

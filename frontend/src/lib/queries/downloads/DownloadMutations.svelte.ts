@@ -1,6 +1,6 @@
 import { createMutation } from '@tanstack/svelte-query';
 
-import { api } from '$lib/api/client';
+import { api, ApiError } from '$lib/api/client';
 import { API } from '$lib/constants';
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { LibraryQueryKeyFactory } from '$lib/queries/library/LibraryQueryKeyFactory';
@@ -413,6 +413,9 @@ export function retryAllFailed() {
 interface HeldActionInput {
 	id: number;
 	release_group_mbid?: string | null;
+	/** Destroy whatever occupies the destination. Only ever set after the user has
+	 *  been shown which file that is and confirmed. */
+	replaceExisting?: boolean;
 }
 
 function invalidateAlbum(releaseGroupMbid?: string | null) {
@@ -423,20 +426,51 @@ function invalidateAlbum(releaseGroupMbid?: string | null) {
 	}
 }
 
+export interface OccupiedDestination {
+	destination: string | null;
+	occupant: {
+		path?: string;
+		name?: string;
+		title?: string | null;
+		file_format?: string | null;
+		file_size_bytes?: number | null;
+		in_catalog?: boolean;
+	};
+}
+
+/** The import path is taken. Carries what is in the way so the user can be asked. */
+export function isDestinationOccupied(err: unknown): boolean {
+	return err instanceof ApiError && err.code === 'IMPORT_DESTINATION_OCCUPIED';
+}
+
+export function occupiedDestination(err: unknown): OccupiedDestination | null {
+	if (!isDestinationOccupied(err)) return null;
+	const details = (err as ApiError).details as OccupiedDestination | null;
+	return details && typeof details === 'object' ? details : null;
+}
+
 export function importHeldTrack() {
 	return createMutation(() => ({
 		mutationFn: (input: HeldActionInput) =>
 			api.global.post<{ status: string; final_path: string | null }>(
 				API.downloads.heldImport(input.id),
-				{}
+				{ replace_existing: input.replaceExisting ?? false }
 			),
 		onSuccess: (_data: { status: string }, input: HeldActionInput) => {
-			toastStore.show({ message: 'Imported', type: 'success' });
+			toastStore.show({
+				message: input.replaceExisting ? 'Imported, replacing the old file' : 'Imported',
+				type: 'success'
+			});
 			void invalidateTasks();
 			invalidateAlbum(input.release_group_mbid);
 		},
-		onError: (err: unknown) =>
-			toastStore.show({ message: errorMessage(err, 'Failed to import track'), type: 'error' })
+		onError: (err: unknown) => {
+			// An occupied destination is a question, not a failure: the caller opens the
+			// replace dialog for it. Toasting an error here would bury the one thing the
+			// user can actually act on.
+			if (isDestinationOccupied(err)) return;
+			toastStore.show({ message: errorMessage(err, 'Failed to import track'), type: 'error' });
+		}
 	}));
 }
 

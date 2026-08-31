@@ -116,8 +116,18 @@ class MsgSpecRoute(APIRoute):
         return custom_route_handler
 
 
-def MsgSpecBody(model: type[T]) -> Any:
-    async def dependency(payload: Any = Body(...)) -> T:
+def MsgSpecBody(model: type[T], *, optional: bool = False) -> Any:
+    """Decode the request body into ``model``.
+
+    ``optional`` accepts a request with no body at all and decodes the model's own
+    defaults instead. For an endpoint that gains a body it never had, this is what
+    keeps every existing caller working: without it they answer 422 for omitting a
+    field whose default is exactly what they meant.
+    """
+
+    async def dependency(payload: Any = Body(None if optional else ...)) -> T:
+        if optional and payload is None:
+            payload = {}
         try:
             return msgspec.convert(payload, type=model, strict=False)
         except (msgspec.ValidationError, ValueError) as exc:

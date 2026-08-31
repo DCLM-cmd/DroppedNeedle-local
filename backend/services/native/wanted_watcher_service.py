@@ -165,10 +165,14 @@ class WantedWatcherService:
         if not settings.enabled:
             return WantedSweepSummary()
 
-        enrolled = await self._enrol(settings)
+        # F-PERF-09: ONE membership snapshot serves the whole sweep. Created before
+        # enrolment, not inside the want loop, because the library-completeness pass
+        # reads the same membership - giving it its own read would double the load
+        # and break the guarantee that snapshot exists to make.
+        membership_state = _SweepMembershipState()
+        enrolled = await self._enrol(settings, membership_state)
 
         due = await self._store.list_due(time.time(), settings.max_checks_per_sweep)
-        membership_state = _SweepMembershipState()
         checked = dispatched = fulfilled = errors = 0
         for index, want in enumerate(due):
             try:
@@ -482,7 +486,7 @@ class WantedWatcherService:
 
     # -- enrolment (§5.2.1) --
 
-    async def _enrol(self, settings) -> int:  # noqa: ANN001 - WantedWatcherSettings
+    async def _enrol(self, settings, membership_state) -> int:  # noqa: ANN001
         enrolled = 0
         statuses = ["failed"]
         if settings.watch_partial_albums:
@@ -519,10 +523,10 @@ class WantedWatcherService:
                     break
                 cursor = next_cursor
         if settings.watch_partial_albums:
-            enrolled += await self._enrol_from_library()
+            enrolled += await self._enrol_from_library(membership_state)
         return enrolled
 
-    async def _enrol_from_library(self) -> int:
+    async def _enrol_from_library(self, membership_state) -> int:  # noqa: ANN001
         """Enrol albums the LIBRARY says are incomplete, whatever their request says.
 
         The request-history pass only looks at records in ``failed`` or ``incomplete``
@@ -540,7 +544,7 @@ class WantedWatcherService:
         """
         enrolled = 0
         try:
-            mbids = await self._library.get_library_mbids(include_release_ids=False)
+            mbids = await self._library_membership_snapshot(membership_state)
         except Exception:  # noqa: BLE001 - a library read failure skips the pass
             logger.warning("wanted.library_enrol_unavailable", exc_info=True)
             return 0

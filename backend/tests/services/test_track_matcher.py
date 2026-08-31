@@ -316,8 +316,10 @@ async def test_lossless_cap_drops_hires_file():
         parent_directory="Radiohead - OK Computer", size=120_000_000,
         extension="flac", bitrate=None, duration=284.0,
     )
-    assert await TrackMatcher(_store(), lossless_max_kbps=1500).match(_TARGET, [hires]) is None
-    assert await TrackMatcher(_store()).match(_TARGET, [hires]) is not None  # 0 = no cap
+    capped = TrackMatcher(_store(), lossless_max_kbps=1500)
+    assert await capped.match(_TARGET, [hires], snapshot=policy_snapshot()) is None
+    uncapped = TrackMatcher(_store())  # 0 = no cap
+    assert await uncapped.match(_TARGET, [hires], snapshot=policy_snapshot()) is not None
 
 
 @pytest.mark.asyncio
@@ -332,6 +334,8 @@ async def test_equal_band_prefers_faster_peer():
 
     # identical file from two peers = same identity band -> the faster peer wins
     ranked = await TrackMatcher(_store()).rank(
-        _TARGET, [_peer("slowpoke", 20_000), _peer("speedy", 8_000_000)]
+        _TARGET,
+        [_peer("slowpoke", 20_000), _peer("speedy", 8_000_000)],
+        snapshot=policy_snapshot(),
     )
     assert [c.username for c in ranked[:2]] == ["speedy", "slowpoke"]

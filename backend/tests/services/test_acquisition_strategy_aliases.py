@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from services.native.acquisition.quality import build_snapshot
+from api.v1.schemas.settings import DownloadPolicySettings
 from models.download import DownloadTask, ScoredCandidate
 from models.download_identity import soulseek_identity
 from models.download_manifest import DownloadManifest, ExpectedFile, ManifestCodec
@@ -79,6 +81,15 @@ def _strategy(tmp_path: Path, *, aliases=None, alias_error=False):
 # --- alias search fallback --------------------------------------------------------
 
 
+
+def _snapshot():
+    """Quality now travels on a per-call snapshot; these tests care about the alias
+    search, so any in-range policy will do."""
+    return build_snapshot(
+        DownloadPolicySettings(quality_min="mp3_320", quality_max="lossless")
+    )
+
+
 @pytest.mark.asyncio
 async def test_alias_fallback_finds_candidates_under_alias(tmp_path: Path):
     strategy, indexer, scorer, _store, resolver = _strategy(
@@ -87,7 +98,9 @@ async def test_alias_fallback_finds_candidates_under_alias(tmp_path: Path):
     # primary name scores nothing; the alias pass finds an auto candidate
     scorer.rank = AsyncMock(side_effect=[[], [_candidate("auto")]])
 
-    ranked = await strategy.search_and_score(_album_task(), timeout=30, auto=0.7, manual=0.5)
+    ranked = await strategy.search_and_score(
+        _album_task(), timeout=30, auto=0.7, manual=0.5, snapshot=_snapshot()
+    )
 
     assert [c.tier for c in ranked] == ["auto"]
     resolver.assert_awaited_once_with("mbid-artist-1")
@@ -105,7 +118,9 @@ async def test_alias_fallback_skipped_when_primary_is_pickable(tmp_path: Path):
     )
     scorer.rank = AsyncMock(return_value=[_candidate("manual")])
 
-    ranked = await strategy.search_and_score(_album_task(), timeout=30, auto=0.7, manual=0.5)
+    ranked = await strategy.search_and_score(
+        _album_task(), timeout=30, auto=0.7, manual=0.5, snapshot=_snapshot()
+    )
 
     assert [c.tier for c in ranked] == ["manual"]
     resolver.assert_not_awaited()
@@ -119,7 +134,11 @@ async def test_alias_fallback_skipped_without_artist_mbid(tmp_path: Path):
     scorer.rank = AsyncMock(return_value=[])
 
     await strategy.search_and_score(
-        _album_task(artist_mbid=None), timeout=30, auto=0.7, manual=0.5
+        _album_task(artist_mbid=None),
+        timeout=30,
+        auto=0.7,
+        manual=0.5,
+        snapshot=_snapshot(),
     )
 
     resolver.assert_not_awaited()
@@ -132,7 +151,9 @@ async def test_alias_identical_to_primary_name_is_not_researched(tmp_path: Path)
     )
     scorer.rank = AsyncMock(return_value=[])
 
-    ranked = await strategy.search_and_score(_album_task(), timeout=30, auto=0.7, manual=0.5)
+    ranked = await strategy.search_and_score(
+        _album_task(), timeout=30, auto=0.7, manual=0.5, snapshot=_snapshot()
+    )
 
     assert ranked == []
     assert indexer.search_album.await_count == 1  # only the primary pass
@@ -144,7 +165,9 @@ async def test_alias_resolver_failure_returns_primary_result(tmp_path: Path):
     rejected = [_candidate("rejected", 0.3)]
     scorer.rank = AsyncMock(return_value=rejected)
 
-    ranked = await strategy.search_and_score(_album_task(), timeout=30, auto=0.7, manual=0.5)
+    ranked = await strategy.search_and_score(
+        _album_task(), timeout=30, auto=0.7, manual=0.5, snapshot=_snapshot()
+    )
 
     assert ranked == rejected  # degraded, never raises
 
@@ -157,7 +180,9 @@ async def test_alias_fallback_keeps_primary_result_when_aliases_also_fail(tmp_pa
     rejected = [_candidate("rejected", 0.3)]
     scorer.rank = AsyncMock(side_effect=[rejected, [], []])
 
-    ranked = await strategy.search_and_score(_album_task(), timeout=30, auto=0.7, manual=0.5)
+    ranked = await strategy.search_and_score(
+        _album_task(), timeout=30, auto=0.7, manual=0.5, snapshot=_snapshot()
+    )
 
     assert ranked == rejected
     assert indexer.search_album.await_count == 3  # primary + both aliases

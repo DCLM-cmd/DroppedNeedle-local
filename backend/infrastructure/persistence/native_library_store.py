@@ -703,6 +703,34 @@ def _bulk_preview_ineligibility(
 # records carry can no longer be needed by the tag writer.
 # A track's own satellite data, which has no meaning without it. Play history and
 # playlists are deliberately NOT here: those belong to the user, not to the file.
+def _tables_referencing_local_tracks(conn: sqlite3.Connection) -> list[str]:
+    """Every table with a foreign key onto ``local_tracks``, read from the schema."""
+    tables = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' AND name <> 'local_tracks'"
+        )
+    ]
+    return [
+        table
+        for table in tables
+        if any(
+            str(fk[2]) == "local_tracks"
+            for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")')
+        )
+    ]
+
+
+def _local_track_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """The columns of ``table`` that point at ``local_tracks``."""
+    return [
+        str(fk[3])
+        for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")')
+        if str(fk[2]) == "local_tracks"
+    ]
+
+
 _TRACK_OWNED_TABLES = (
     "local_track_genres",
     "local_track_artists",
@@ -7427,6 +7455,69 @@ class NativeLibraryStore(PersistenceBase):
             if removed:
                 self._bump_catalog(connection)
             return {"removed": removed, "kept": kept}
+
+        return await self._write(operation)
+
+    async def find_track_by_file_path(self, file_path: str) -> dict[str, Any] | None:
+        """The catalog row occupying an absolute path, if any."""
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            row = connection.execute(
+                "SELECT id, title, file_format, file_size_bytes, availability, "
+                "local_album_id FROM local_tracks WHERE file_path=?",
+                (file_path,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+        return await self._read(operation)
+
+    async def delete_track_by_file_path(
+        self, file_path: str
+    ) -> dict[str, Any] | None:
+        """Remove the catalog row occupying a destination, references and all.
+
+        Used when the user confirms replacing an occupied import path. Unlike the
+        recycle path - which sets a file aside and keeps its row usable - this is a
+        deliberate destruction: the row goes, and so does everything that points at
+        it, because a reference to a track whose file is about to be unlinked names
+        nothing.
+
+        The referencing tables are read from the schema rather than listed here: a
+        dozen of them carry ON DELETE RESTRICT, so a hand-kept list that fell one
+        table behind would not degrade - it would abort the delete outright and leave
+        the user stuck exactly where they asked to be unstuck.
+
+        Returns what was removed (path and per-table reference counts) so the caller
+        can report it, or None when nothing occupied the destination.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            row = connection.execute(
+                "SELECT id, file_path, file_format, file_size_bytes, title "
+                "FROM local_tracks WHERE file_path=?",
+                (file_path,),
+            ).fetchone()
+            if row is None:
+                return None
+            track_id = str(row["id"])
+            removed: dict[str, int] = {}
+            for table in _tables_referencing_local_tracks(connection):
+                for column in _local_track_columns(connection, table):
+                    cursor = connection.execute(
+                        f'DELETE FROM "{table}" WHERE "{column}" = ?', (track_id,)
+                    )
+                    if cursor.rowcount:
+                        removed[table] = removed.get(table, 0) + cursor.rowcount
+            connection.execute("DELETE FROM local_tracks WHERE id=?", (track_id,))
+            self._bump_catalog(connection)
+            return {
+                "track_id": track_id,
+                "file_path": str(row["file_path"]),
+                "file_format": row["file_format"],
+                "file_size_bytes": row["file_size_bytes"],
+                "title": row["title"],
+                "removed_references": removed,
+            }
 
         return await self._write(operation)
 
@@ -23934,6 +24025,15 @@ class NativeLibraryStore(PersistenceBase):
             if request.download_task_id == task_id and request.source_path is not None
         }
         held_paths = {str(row["held_path"]) for row in rows}
+        if not (held_paths & requested_paths):
+            # This settlement covers a management RETRY, which republishes the whole
+            # secured unit. A bundle that touches none of the held paths is not that:
+            # it is a single file being force-imported from a task that happens to
+            # also carry management holds. Comparing the two as if they were the same
+            # operation made "one file" look like "the unit changed", and every
+            # confirm of a held file on such a task failed with a message about a
+            # publication contract the user had not asked for.
+            return
         if len(rows) != len(requests) or held_paths != requested_paths:
             raise ValidationError(
                 "The secured acquisition changed before its catalog commit."

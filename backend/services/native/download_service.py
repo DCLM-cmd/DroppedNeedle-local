@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from core.exceptions import (
+    ImportDestinationOccupiedError,
     AutomaticManagementHoldError,
     ConfigurationError,
     PermissionDeniedError,
@@ -189,6 +190,7 @@ class DownloadService:
         ownership_service: "LibraryOwnershipService | None" = None,
         library_reconciler=None,
         snapshot_factory=None,  # Callable[[], AcquisitionQualitySnapshot] (post-cutover)
+        native_library_store=None,  # NativeLibraryStore | None
     ):
         self._client = download_client
         self._indexer = indexer
@@ -220,6 +222,9 @@ class DownloadService:
         self._pins = release_pin_store
         self._ownership = ownership_service
         self._library_reconciler = library_reconciler or library_manager
+        # Only for replacing an occupied import destination, which has to delete
+        # the catalog row as well as the file on disk.
+        self._native_library_store = native_library_store
         self._management_hold_locks_guard = asyncio.Lock()
         self._management_hold_locks: dict[str, asyncio.Lock] = {}
         self._management_hold_lock_users: dict[str, int] = {}
@@ -1409,9 +1414,99 @@ class DownloadService:
                 "replaces."
             )
 
-    async def import_held(self, held_id: int, user_id: str, user_role: str) -> str:
+    async def _place_held_resolving_collisions(
+        self, held, *, replace_existing: bool
+    ) -> "Path":  # noqa: ANN001
+        """Place a held file, turning an occupied destination into a decision.
+
+        The destination is not predicted here. Automatic management computes the final
+        path from the active profile, so the only authority on where a file lands - and
+        on what is already there - is the publication itself. We let it run, and treat
+        the collision it reports as the question to put to the user.
+        """
+        try:
+            return await self._file_processor.place_held_file(held)
+        except AutomaticManagementHoldError as error:
+            if error.reason_code != PATH_COLLISION_DIFFERENT:
+                raise
+            destination = getattr(error, "destination", None)
+            if not destination:
+                # Nothing to name and nothing to delete: replacing blind would be a
+                # guess at which file to destroy.
+                raise
+            if not replace_existing:
+                raise ImportDestinationOccupiedError(
+                    "This track's place in the library already holds a different file.",
+                    destination=destination,
+                    occupant=await self._describe_occupant(destination),
+                ) from error
+            await self._destroy_occupant(destination)
+            # The path is free now, so the same publication can proceed. Attempted
+            # once: a second collision means something else is writing there, and
+            # deleting again on a moving target is how the wrong file gets destroyed.
+            return await self._file_processor.place_held_file(held)
+
+    async def _describe_occupant(self, destination: str) -> dict:
+        """What is in the way, in the terms the user will be shown."""
+        path = Path(destination)
+        occupant: dict = {"path": destination, "name": path.name}
+        row = await self._resolve_destination_row(destination)
+        if row is not None:
+            occupant.update(
+                title=row.get("title"),
+                file_format=row.get("file_format"),
+                file_size_bytes=row.get("file_size_bytes"),
+            )
+        elif path.exists():
+            occupant["file_size_bytes"] = path.stat().st_size
+        occupant["in_catalog"] = row is not None
+        return occupant
+
+    async def _resolve_destination_row(self, destination: str) -> dict | None:
+        if self._native_library_store is None:
+            return None
+        return await self._native_library_store.find_track_by_file_path(destination)
+
+    async def _destroy_occupant(self, destination: str) -> None:
+        """Delete the occupying file AND its catalog row - the user asked for gone.
+
+        Ordered row-first: if the unlink fails the row is already gone and a rescan
+        re-adds it, whereas deleting the file first and then failing on the row leaves
+        the catalog naming a file that no longer exists.
+        """
+        removed = None
+        if self._native_library_store is not None:
+            removed = await self._native_library_store.delete_track_by_file_path(
+                destination
+            )
+        await asyncio.to_thread(Path(destination).unlink, True)
+        logger.info(
+            "download.import_replaced_destination",
+            extra={
+                "destination": destination,
+                "catalog_row_removed": removed is not None,
+                "references_removed": (removed or {}).get("removed_references", {}),
+            },
+        )
+
+    async def import_held(
+        self,
+        held_id: int,
+        user_id: str,
+        user_role: str,
+        *,
+        replace_existing: bool = False,
+    ) -> str:
         """Force-import a held track, bypassing the AcoustID identity check (a human has
-        judged it correct), and mark it resolved. Returns the library path it landed at."""
+        judged it correct), and mark it resolved. Returns the library path it landed at.
+
+        ``replace_existing`` answers the one question the user is asked when the path
+        is taken. It DESTROYS what is there - the file is unlinked and its catalog row
+        deleted, not set aside - because the user has just been shown exactly which
+        file that is and said to replace it. Without the flag an occupied path raises
+        ``ImportDestinationOccupiedError`` carrying the occupant, so the caller can
+        put that choice to them instead of failing with nowhere to go.
+        """
         held = await self._store.get_held_import(held_id, user_id, user_role)
         if held is None:
             raise ResourceNotFoundError("Held track not found")
@@ -1423,7 +1518,9 @@ class DownloadService:
         if self._file_processor is None:
             raise ConfigurationError("Import is unavailable right now")
         try:
-            target = await self._file_processor.place_held_file(held)
+            target = await self._place_held_resolving_collisions(
+                held, replace_existing=replace_existing
+            )
         except FileNotFoundError as exc:
             # its copy is gone (shouldn't happen - it lives in our held area); tidy the row
             await self._store.resolve_held_import(held_id, "discarded")

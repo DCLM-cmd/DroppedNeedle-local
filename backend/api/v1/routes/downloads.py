@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from core.exceptions import ResourceNotFoundError
 
 from api.v1.schemas.download import (
+    ImportHeldRequestBody,
     BlacklistSourceRequestBody,
     BlacklistSourceResponse,
     CancelDownloadResponse,
@@ -591,10 +592,26 @@ async def discard_management_hold(
 
 @router.post("/held/{held_id}/import", response_model=HeldActionResponse)
 async def import_held(
-    held_id: int, current_user: CurrentUserDep, service=Depends(get_download_service)
+    held_id: int,
+    current_user: CurrentUserDep,
+    body: ImportHeldRequestBody = MsgSpecBody(
+        ImportHeldRequestBody, optional=True
+    ),
+    service=Depends(get_download_service),
 ):
-    """Import a held track as-is, overriding the AcoustID identity check (admin/owner)."""
-    final_path = await service.import_held(held_id, current_user.id, current_user.role)
+    """Import a held track as-is, overriding the AcoustID identity check (admin/owner).
+
+    An occupied destination answers 409 IMPORT_DESTINATION_OCCUPIED naming the file in
+    the way, rather than failing flat: the collision is not something the user can
+    resolve anywhere else, so the only useful response is to let them decide. Sending
+    ``replace_existing`` deletes that file and its catalog row and imports over it.
+    """
+    final_path = await service.import_held(
+        held_id,
+        current_user.id,
+        current_user.role,
+        replace_existing=body.replace_existing,
+    )
     return HeldActionResponse(status="imported", final_path=final_path)
 
 

@@ -398,6 +398,10 @@ async def test_transient_failures_retry_then_succeed_without_breaker_failure(mon
 
 
 @pytest.mark.asyncio
+# Waits out the breaker's real backoff, so it legitimately runs past the suite-wide
+# 30s cap. Raised here rather than globally: everything else stays under a bound that
+# still catches a deadlock quickly.
+@pytest.mark.timeout(120)
 async def test_open_breaker_short_circuits_http_and_returns_error(monkeypatch):
     _patch_fpcalc(monkeypatch)
     from infrastructure.audio.fingerprinter import _acoustid_circuit_breaker

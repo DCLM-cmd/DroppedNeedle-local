@@ -15,7 +15,9 @@
 	import { API } from '$lib/constants';
 	import {
 		discardHeldTrack,
-		importHeldTrack
+		importHeldTrack,
+		occupiedDestination,
+		type OccupiedDestination
 	} from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { formatCountdown } from '$lib/queries/downloads/downloadStatus';
 	import type { HeldImport } from '$lib/types';
@@ -28,6 +30,31 @@
 	// without this a fast second click re-POSTs an already-consumed held id
 	let done = $state(false);
 	const busy = $derived(importMut.isPending || discardMut.isPending || done);
+
+	// Set when the import came back "that path is taken". Holding the details here is
+	// what lets the card ask about a NAMED file instead of a generic collision.
+	let occupied = $state<OccupiedDestination | null>(null);
+
+	async function runImport(replaceExisting: boolean) {
+		try {
+			await importMut.mutateAsync({
+				id: held.id,
+				release_group_mbid: held.release_group_mbid,
+				replaceExisting
+			});
+			occupied = null;
+			done = true;
+		} catch (err) {
+			// Anything else has already been reported by the mutation.
+			occupied = occupiedDestination(err);
+		}
+	}
+
+	function formatSize(bytes?: number | null): string {
+		if (!bytes) return '';
+		const mb = bytes / (1024 * 1024);
+		return mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
+	}
 	// server-side failure reason (e.g. no library root configured) shown inline so the
 	// review card itself says what to fix - the toast alone disappears too fast
 	const actionError = $derived.by(() => {
@@ -150,14 +177,45 @@
 		</p>
 	{/if}
 
+	{#if occupied}
+		<div class="mt-2 rounded-box border border-warning/40 bg-warning/10 p-3 text-xs">
+			<p class="font-semibold">That place in your library is already taken.</p>
+			<p class="mt-1 text-base-content/75">
+				{#if occupied.occupant.title}
+					It holds <span class="font-medium">{occupied.occupant.title}</span>
+				{:else}
+					It holds <span class="font-medium">{occupied.occupant.name ?? 'another file'}</span>
+				{/if}
+				{#if occupied.occupant.file_format}
+					({occupied.occupant.file_format.toUpperCase()}{formatSize(
+						occupied.occupant.file_size_bytes
+					)
+						? `, ${formatSize(occupied.occupant.file_size_bytes)}`
+						: ''})
+				{/if}.
+			</p>
+			<p class="mt-1 break-all font-mono text-[0.68rem] text-base-content/50">
+				{occupied.destination}
+			</p>
+			<p class="mt-2 text-base-content/75">
+				Replacing <span class="font-semibold">deletes</span> that file and removes it from your library.
+				This cannot be undone.
+			</p>
+			<div class="mt-2 flex flex-wrap gap-1.5">
+				<button class="btn btn-warning btn-xs" onclick={() => runImport(true)} disabled={busy}>
+					Replace it
+				</button>
+				<button class="btn btn-ghost btn-xs" onclick={() => (occupied = null)} disabled={busy}>
+					Keep what I have
+				</button>
+			</div>
+		</div>
+	{/if}
+
 	<div class="flex flex-wrap items-center gap-1.5">
 		<button
 			class="btn btn-primary btn-xs"
-			onclick={() =>
-				importMut.mutate(
-					{ id: held.id, release_group_mbid: held.release_group_mbid },
-					{ onSuccess: () => (done = true) }
-				)}
+			onclick={() => runImport(false)}
 			disabled={busy}
 			title="Add this file to your library anyway"
 		>

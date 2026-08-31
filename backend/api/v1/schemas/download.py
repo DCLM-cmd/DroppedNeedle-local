@@ -103,6 +103,12 @@ class DismissReviewResponse(AppStruct):
     state: str
 
 
+class ImportHeldRequestBody(AppStruct):
+    # False asks; True destroys what is in the way. Never defaulted to True: the
+    # replacement is irreversible, so it may only ever follow an explicit answer.
+    replace_existing: bool = False
+
+
 class BlacklistSourceRequestBody(AppStruct):
     release_group_mbid: str
     redownload: bool = False

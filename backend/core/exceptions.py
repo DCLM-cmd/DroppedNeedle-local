@@ -144,9 +144,16 @@ class ConflictError(DroppedNeedleException):
 
 
 class LibraryManagementDestinationConflictError(ConflictError):
-    """A staged Library Management destination is occupied or aliases another path."""
+    """A staged Library Management destination is occupied or aliases another path.
 
-    pass
+    Carries the path when one is known: the user is offered the choice of replacing
+    what is there, and an offer to replace "something, somewhere" is not one anybody
+    can answer.
+    """
+
+    def __init__(self, message: str, *, destination: str | None = None) -> None:
+        super().__init__(message)
+        self.destination = destination
 
 
 class MediaAccountRelinkRequiredError(ConflictError):
@@ -184,9 +191,36 @@ class LibraryManagementPolicyChangedError(StaleRevisionError):
 class AutomaticManagementHoldError(DroppedNeedleException):
     """A verified import unit must remain intact until management can be retried."""
 
-    def __init__(self, reason_code: str, message: str) -> None:
+    def __init__(
+        self, reason_code: str, message: str, *, destination: str | None = None
+    ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
+        # Set for a path collision, so the caller can name what is in the way.
+        self.destination = destination
+
+
+class ImportDestinationOccupiedError(ConflictError):
+    """The import path already holds a different file; the user must choose.
+
+    Raised INSTEAD of failing the import outright, so the caller can present what is
+    in the way and offer to replace it. Blocking with nothing but a message left the
+    user with no move at all - the collision is not something they can resolve
+    anywhere else in the app.
+    """
+
+    error_code = "IMPORT_DESTINATION_OCCUPIED"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        destination: str | None = None,
+        occupant: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.destination = destination
+        self.occupant = occupant or {}
 
 
 class ContributionStateError(ConflictError):

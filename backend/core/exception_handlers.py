@@ -114,10 +114,20 @@ async def conflict_error_handler(
     request: Request, exc: ConflictError
 ) -> MsgSpecJSONResponse:
     logger.warning("Conflict: %s - %s %s", exc, request.method, request.url.path)
+    # An occupied import destination carries WHICH file is in the way. The client is
+    # about to ask the user whether to destroy it, and that question cannot be put
+    # without naming the file, so the details ride along with the refusal.
+    occupant = getattr(exc, "occupant", None)
+    details = (
+        {"destination": getattr(exc, "destination", None), "occupant": occupant}
+        if occupant is not None
+        else None
+    )
     return error_response(
         status.HTTP_409_CONFLICT,
         getattr(exc, "error_code", CONFLICT),
         str(exc),
+        details,
     )
 
 

@@ -1392,4 +1392,8 @@ async def test_failed_membership_read_stays_fail_open_per_want(env):
     assert summary.checked == 3
     assert summary.fulfilled == 0
     assert summary.errors == 0
-    assert attempts["n"] == 3
+    # Three wants, each retrying its own presence check because a failed load leaves
+    # the snapshot unloaded - plus the library-completeness enrolment pass, which
+    # shares that same snapshot and so makes the first of the attempts. Sharing is
+    # the point: on a SUCCESSFUL read the whole sweep still costs exactly one load.
+    assert attempts["n"] == 4

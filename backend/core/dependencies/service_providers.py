@@ -1523,7 +1523,6 @@ def _build_artist_service(
         browse_queue,
         library_db,
         ownership_service,
-        native_library_store=get_native_library_store(),
     )
 
 
@@ -1772,7 +1771,6 @@ def _build_album_service(
         browse_queue,
         release_pin_store=release_pin_store or get_album_release_pin_store(),
         ownership_service=ownership_service,
-        native_library_store=get_native_library_store(),
     )
 
 
@@ -2968,6 +2966,7 @@ def _build_download_service(
         quota_service=quota_service or get_quota_service(),
         release_pin_store=release_pin_store or get_album_release_pin_store(),
         ownership_service=ownership_service,
+        native_library_store=get_native_library_store(),
         library_reconciler=library_reconciler,
     )
 
@@ -2986,6 +2985,7 @@ def get_target_download_service() -> "DownloadService":
         file_processor=get_target_file_processor(),
         album_service=get_target_album_service(),
         library_reconciler=get_target_import_library_service(),
+        native_library_store=get_native_library_store(),
         quota_service=get_target_quota_service(),
         release_pin_store=get_target_album_release_pin_store(),
     )
