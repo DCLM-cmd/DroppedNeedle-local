@@ -7,7 +7,8 @@
 		FileUp,
 		ListMusic,
 		Play,
-		Shuffle
+		Shuffle,
+		Ban
 	} from 'lucide-svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import LibraryFormatBadge from '$lib/components/library/LibraryFormatBadge.svelte';
@@ -24,6 +25,7 @@
 	} from '$lib/queries/library/LibraryQueries.svelte';
 	import { getAlbumEditionsQuery } from '$lib/queries/albums/EditionQueries.svelte';
 	import { createLibraryContributionMutation } from '$lib/queries/libraryContributions/LibraryContributionMutations.svelte';
+	import { blacklistSource } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
 	import { artistHref } from '$lib/utils/entityRoutes';
 
@@ -32,6 +34,16 @@
 	}
 
 	let { albumId }: Props = $props();
+	const blacklistMutation = blacklistSource();
+	let blacklistDialog = $state<HTMLDialogElement | null>(null);
+
+	function confirmBlacklist(redownload: boolean) {
+		const releaseGroupMbid = album?.musicbrainz_release_group_id;
+		if (!releaseGroupMbid) return;
+		blacklistDialog?.close();
+		blacklistMutation.mutate({ releaseGroupMbid, redownload });
+	}
+
 	const albumQuery = getLibraryAlbumDetailQuery(() => albumId);
 	const tracksQuery = getLibraryAlbumTracksQuery(() => albumId);
 	const album = $derived(albumQuery.data);
@@ -168,7 +180,17 @@
 					{#if authStore.isAdmin}<AlbumIdentificationPanel
 							{album}
 							attentionLabel={managementIdentityAttention}
-						/><AlbumOrganizationDialog {album} {tracks} />{/if}
+						/><AlbumOrganizationDialog {album} {tracks} />
+						{#if album.musicbrainz_release_group_id}
+							<button
+								class="btn btn-ghost gap-2"
+								disabled={blacklistMutation.isPending}
+								onclick={() => blacklistDialog?.showModal()}
+							>
+								<Ban class="h-4 w-4" />
+								Blacklist source
+							</button>
+						{/if}{/if}
 				</div>
 				{#if album.review_id && authStore.isAdmin}
 					<a
@@ -179,6 +201,28 @@
 				{/if}
 			</div>
 		</header>
+
+		<dialog bind:this={blacklistDialog} class="modal">
+			<div class="modal-box">
+				<h3 class="text-lg font-bold">Blacklist this source?</h3>
+				<p class="mt-2 text-sm text-base-content/70">
+					The source that delivered <span class="font-medium">{album.title}</span> will be skipped by
+					every future download of this album. Use this when the files are fine but the version is not
+					- a clean edit instead of the explicit one, say.
+				</p>
+				<p class="mt-2 text-sm text-base-content/55">
+					Nothing already in your library is deleted. The block does not expire.
+				</p>
+				<div class="modal-action">
+					<button class="btn btn-ghost" onclick={() => blacklistDialog?.close()}>Cancel</button>
+					<button class="btn" onclick={() => confirmBlacklist(false)}>Blacklist only</button>
+					<button class="btn btn-primary" onclick={() => confirmBlacklist(true)}>
+						Blacklist and find another copy
+					</button>
+				</div>
+			</div>
+			<form method="dialog" class="modal-backdrop"><button>close</button></form>
+		</dialog>
 
 		<section class="mt-8" aria-labelledby="local-tracks-title">
 			<div class="flex items-center gap-2">

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import math
+import struct
 from functools import lru_cache
 from pathlib import Path
 
@@ -76,6 +77,11 @@ def _encode_ac(rgb: tuple[float, float, float], maximum: float) -> int:
     return quantised[0] * 19 * 19 + quantised[1] * 19 + quantised[2]
 
 
+def _as_float32(value: float) -> float:
+    """Round to IEEE single precision, the width Jellyfin's MathF calls work in."""
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
 def components_for_dimensions(width: int, height: int) -> tuple[int, int]:
     """The component counts Jellyfin would pick for an image of this size.
 
@@ -91,8 +97,12 @@ def components_for_dimensions(width: int, height: int) -> tuple[int, int]:
     """
     if width <= 0 or height <= 0:
         return _COMPONENTS_X, _COMPONENTS_Y
-    components_x = math.sqrt(_TARGET_TILES * width / height)
-    components_y = components_x * height / width
+    # Jellyfin computes both in SINGLE precision (MathF.Sqrt on floats). Doing it in
+    # double here would disagree with it whenever the true value sits within a float32
+    # ulp of an integer: the cast truncates, so 3.9999998 and 4.0000001 pick different
+    # component counts, and the count is encoded in the hash itself.
+    components_x = _as_float32(math.sqrt(_as_float32(_TARGET_TILES * width / height)))
+    components_y = _as_float32(components_x * height / width)
     return min(int(components_x) + 1, 9), min(int(components_y) + 1, 9)
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import ipaddress
 import logging
 from functools import lru_cache
 from datetime import datetime, timezone
@@ -169,6 +170,33 @@ async def system_info(
     request: Request, services: CompatServices = Depends(get_compat_services)
 ) -> Response:
     return await _handle(request, services, _system_info)
+
+
+@router.get("/System/Endpoint")
+async def system_endpoint(
+    request: Request, services: CompatServices = Depends(get_compat_services)
+) -> Response:
+    """Whether the caller reached us over the local network.
+
+    Finamp asks on every connect. Both flags describe the CLIENT's vantage point, so
+    they are derived from its address rather than reported as constants: a client on
+    the LAN must not be told it is remote, or it will assume it needs transcoding.
+    """
+    return await _handle(request, services, _system_endpoint, auth=False)
+
+
+async def _system_endpoint(request, services, _user) -> dict[str, bool]:
+    local = _is_private_client(trusted_client_ip(request))
+    return {"IsLocal": local, "IsInNetwork": local}
+
+
+def _is_private_client(client_ip: str | None) -> bool:
+    if not client_ip:
+        return False
+    try:
+        return ipaddress.ip_address(client_ip).is_private
+    except ValueError:
+        return False
 
 
 async def _system_info(request, services, _user) -> jm.SystemInfo:
@@ -759,6 +787,63 @@ async def items_filters_legacy(
     services: CompatServices = Depends(get_compat_services),
 ) -> Response:
     return await _handle(request, services, _items_filters)
+
+
+async def _latest(request, services, user, **_) -> list[jm.BaseItemDto]:
+    """``/Users/{id}/Items/Latest`` - newest first, as a BARE ARRAY.
+
+    Jellyfin answers this one with a plain array rather than the BaseItemDtoQueryResult
+    every other browse endpoint returns, and Finamp decodes it as such. Wrapping it
+    would fail to parse on the client, which is the whole reason this endpoint has to
+    exist separately instead of being folded into ``_browse``.
+
+    Jellyfin's default limit here is 20, and it groups into albums unless the caller
+    asks for Audio explicitly.
+    """
+    q = _params(request)
+    b = _builder(services, request)
+    limit = max(_qint(request, "Limit", 20), 0) or 20
+    types = set(_csv_param(request, "IncludeItemTypes"))
+
+    parent = q.get("ParentId")
+    parent_kind = parent_internal = None
+    if parent:
+        try:
+            parent_kind, parent_internal = await services.id_map.from_jf(parent)
+        except JellyfinError:
+            return []
+
+    if parent_kind == "album":
+        tracks = await services.view.get_album_tracks(parent_internal, user=user)
+        page = await _build_page(b.audio, tracks[:limit], 0, limit)
+        return list(page.Items)
+
+    if _primary_type(types, parent_kind) == "Audio":
+        tracks, _total = await services.view.get_tracks_page(
+            limit=limit, offset=0, user=user, sort="recent"
+        )
+        return [await b.audio(t) for t in tracks]
+
+    albums, _total = await services.view.get_albums(
+        page=1, page_size=limit, user=user, sort="recent"
+    )
+    return [await b.album(a) for a in albums]
+
+
+@router.get("/Users/{user_id}/Items/Latest")
+async def items_latest(
+    user_id: str,
+    request: Request,
+    services: CompatServices = Depends(get_compat_services),
+) -> Response:
+    return await _handle(request, services, _latest)
+
+
+@router.get("/Items/Latest")
+async def items_latest_modern(
+    request: Request, services: CompatServices = Depends(get_compat_services)
+) -> Response:
+    return await _handle(request, services, _latest)
 
 
 async def _single_item_handler(request, services, user, *, item_id) -> jm.BaseItemDto:
@@ -1743,6 +1828,59 @@ async def items_similar(
     request: Request,
     services: CompatServices = Depends(get_compat_services),
 ) -> Response:
+    return await _handle(request, services, _similar, item_id=item_id)
+
+
+@router.get("/Playlists/{playlist_id}/Users")
+async def playlist_users(
+    playlist_id: str,
+    request: Request,
+    services: CompatServices = Depends(get_compat_services),
+) -> Response:
+    """Per-user playlist permissions. Playlists here are not shared between users, so
+    the list is empty - which is what Jellyfin returns for an unshared playlist too."""
+    return await _handle(request, services, lambda r, s, u: [])
+
+
+@router.get("/Playlists/{playlist_id}/Users/{target_user_id}")
+async def playlist_user(
+    playlist_id: str,
+    target_user_id: str,
+    request: Request,
+    services: CompatServices = Depends(get_compat_services),
+) -> Response:
+    return await _handle(request, services, lambda r, s, u: None)
+
+
+@router.get("/Audio/{item_id}/Lyrics")
+async def audio_lyrics(
+    item_id: str,
+    request: Request,
+    services: CompatServices = Depends(get_compat_services),
+) -> Response:
+    """Jellyfin returns 404 for a track it holds no lyrics for, and Finamp treats that
+    as "none" rather than as an error. We store none, so every track answers 404 -
+    but it must be a REAL 404: an unknown path used to fall through to the frontend
+    and return an HTML page with status 200, which the client then failed to parse."""
+    return await _handle(request, services, _lyrics, item_id=item_id)
+
+
+async def _lyrics(request, services, _user, *, item_id):
+    try:
+        await services.id_map.from_jf(item_id)
+    except JellyfinError:
+        raise JellyfinError(404, "Item not found")
+    raise JellyfinError(404, "No lyrics available")
+
+
+@router.get("/Albums/{item_id}/Similar")
+async def albums_similar(
+    item_id: str,
+    request: Request,
+    services: CompatServices = Depends(get_compat_services),
+) -> Response:
+    """Finamp asks for album recommendations under /Albums, Jellify under /Items.
+    Jellyfin serves both; the answer is the same."""
     return await _handle(request, services, _similar, item_id=item_id)
 
 

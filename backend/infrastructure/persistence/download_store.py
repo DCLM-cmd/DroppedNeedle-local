@@ -52,6 +52,13 @@ _RETRYABLE_STATUSES = ("failed", "partial")
 # album's entries immediately, regardless of TTL.)
 _QUARANTINE_TTL_SECONDS = 7 * 24 * 3600.0
 
+# The TTL is a self-heal for entries this server decided on its own: a peer that
+# failed a verification once should get another chance a week later. A ``manual``
+# row is not a guess - it is the user saying they do not want this release - so it
+# never lapses. Silently un-blocking it would re-download the very version they
+# rejected, and they would have no reason to suspect the block had expired.
+_QUARANTINE_EXPIRES = "reason <> 'manual'"
+
 # Quarantine is the cross-source blocklist, keyed (source, identity, release_group_mbid)
 # (D8). ``identity`` is a single opaque string whose encoding is source-specific
 # (see ``models.download_identity``): soulseek = username+filename, usenet = title+size.
@@ -2030,7 +2037,8 @@ class DownloadStore(PersistenceBase):
             # Prune expired blocklist entries on write (cheap, indexed) so the table stays
             # small and the TTL self-heal is reflected on disk, not just filtered on read.
             conn.execute(
-                "DELETE FROM download_quarantine WHERE quarantined_at < ?",
+                "DELETE FROM download_quarantine WHERE quarantined_at < ? "
+                f"AND {_QUARANTINE_EXPIRES}",
                 (now - _QUARANTINE_TTL_SECONDS,),
             )
             conn.execute(
@@ -2051,7 +2059,8 @@ class DownloadStore(PersistenceBase):
 
         def operation(conn: sqlite3.Connection) -> set[tuple[str, str]]:
             rows = conn.execute(
-                "SELECT source, identity FROM download_quarantine WHERE quarantined_at >= ?",
+                "SELECT source, identity FROM download_quarantine "
+                f"WHERE quarantined_at >= ? OR NOT ({_QUARANTINE_EXPIRES})",
                 (cutoff,),
             ).fetchall()
             return {

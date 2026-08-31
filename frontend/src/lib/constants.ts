@@ -821,6 +821,7 @@ export const API = {
 		clear: () => '/api/v1/downloads/clear',
 		stopAllRetries: () => '/api/v1/downloads/stop-all-retries',
 		retryAllFailed: () => '/api/v1/downloads/retry-all-failed',
+		blacklistSource: () => '/api/v1/downloads/blacklist-source',
 		held: (releaseGroupMbid?: string) => {
 			const params = new URLSearchParams();
 			if (releaseGroupMbid) params.set('release_group_mbid', releaseGroupMbid);

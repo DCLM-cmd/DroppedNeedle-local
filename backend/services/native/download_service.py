@@ -12,7 +12,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from core.exceptions import (
     AutomaticManagementHoldError,
@@ -26,6 +26,12 @@ from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.filesystem_mounts import check_move_boundary
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.sse_publisher import SSEPublisher
+from models.download_identity import (
+    SOURCE_SOULSEEK,
+    SOURCE_USENET,
+    soulseek_identity,
+    usenet_identity,
+)
 from models.download import (
     DownloadsMountStatus,
     ScoredCandidate,
@@ -90,6 +96,11 @@ _CLIENT_FOR_SOURCE = {"soulseek": "slskd", "usenet": "sabnzbd"}
 
 ALREADY_IN_LIBRARY = "already_in_library"
 
+# A re-request placed straight after the user blacklisted the delivering source.
+# Distinct from ``upgrade`` because it is not a quality judgement: the wanted copy
+# may well be the same tier as the one being replaced.
+ORIGIN_REPLACEMENT = "replacement"
+
 _LOSSLESS = {"flac", "alac", "wav", "ape", "wv"}
 
 
@@ -140,6 +151,12 @@ def check_downloads_mount(
     return DownloadsMountStatus(
         ok=True, move_supported=False, reason="ok", path=path_str
     )
+
+
+# A completed album normally has one delivering task; a failover chain adds a few
+# more. Bounded so a pathological history cannot turn one button press into an
+# unbounded scan.
+_BLACKLIST_TASK_SCAN_LIMIT = 50
 
 
 class DownloadService:
@@ -243,7 +260,14 @@ class DownloadService:
         improve on. Origin-aware (D18): only an ``origin='upgrade'`` request may treat a
         below-cutoff held album as not-satisfied - replace-on-import fires only for
         upgrades, so re-fetching for any other origin would download bytes that are then
-        skipped at placement. Every non-upgrade origin sees any held copy as satisfied."""
+        skipped at placement. Every non-upgrade origin sees any held copy as satisfied.
+
+        ``replacement`` is the exception: the user has just blacklisted the source that
+        delivered the held copy, so "we already have it" is precisely the thing they
+        rejected. Quality is not the question - a clean edit and the explicit cut sit
+        at the same tier - so the gate cannot answer this one and must stand aside."""
+        if origin == ORIGIN_REPLACEMENT:
+            return False
         held = await self._library.album_quality_tier(release_group_mbid)
         if origin != "upgrade":
             return held is not None
@@ -990,9 +1014,10 @@ class DownloadService:
                     held, self._quality_cutoff, self._upgrade_allowed
                 ):
                     return ALREADY_IN_LIBRARY
-            elif origin != "edition_conversion" and await self._library.has_track(
-                recording_mbid
-            ):
+            elif origin not in (
+                "edition_conversion",
+                ORIGIN_REPLACEMENT,
+            ) and await self._library.has_track(recording_mbid):
                 return ALREADY_IN_LIBRARY
 
         if not release_group_mbid:
@@ -1916,6 +1941,120 @@ class DownloadService:
                 extra={"user_id": user_id, "count": cleared},
             )
         return cleared
+
+    async def blacklist_album_source(
+        self,
+        release_group_mbid: str,
+        user_id: str,
+        user_role: str,
+        *,
+        redownload: bool = False,
+    ) -> dict[str, Any]:
+        """Block the source that delivered this album, so a re-request skips it.
+
+        The case this exists for: the album imported cleanly and the files are fine,
+        but it is the wrong VERSION - a clean edit where the explicit one was wanted.
+        Nothing here is a fault the server could detect, so nothing else will ever
+        stop that release being picked again; only the user can say "not this one".
+
+        Recorded per delivered FILE for Soulseek and per release for Usenet, because
+        that is the granularity the scorers match at (see the quarantine spec). The
+        reason is ``manual``, which is exempt from the blocklist TTL: a deliberate
+        rejection must not silently lapse after a week and re-deliver the same files.
+
+        The album's own rows are left alone - blacklisting a source is not a request
+        to delete what is already in the library.
+        """
+        tasks = await self._store.list_tasks(
+            user_id=user_id,
+            user_role=user_role,
+            status="completed",
+            release_group_mbid=release_group_mbid,
+            page=1,
+            page_size=_BLACKLIST_TASK_SCAN_LIMIT,
+        )
+        if not tasks:
+            raise ValidationError(
+                "No completed download is on record for this album, so there is no "
+                "source to blacklist."
+            )
+
+        blocked: set[tuple[str, str]] = set()
+        for task in tasks:
+            for source, identity in await self._delivered_identities(task):
+                if (source, identity) in blocked:
+                    continue
+                blocked.add((source, identity))
+                await self._store.record_quarantine(
+                    source=source,
+                    identity=identity,
+                    reason="manual",
+                    release_group_mbid=release_group_mbid,
+                )
+        if not blocked:
+            raise ValidationError(
+                "The delivering source could not be identified - its search results "
+                "have already been pruned, so there is nothing left to match on."
+            )
+        sources = sorted({source for source, _ in blocked})
+        logger.info(
+            "download.source_blacklisted",
+            extra={
+                "release_group_mbid": release_group_mbid,
+                "entries": len(blocked),
+                "sources": sources,
+            },
+        )
+        task_id = None
+        if redownload:
+            # Re-requested from the delivering task's own metadata: the album is in
+            # the library, so there is no need to go back to MusicBrainz for a title
+            # and artist this record already carries.
+            reference = tasks[0]
+            task_id = await self.request_album(
+                user_id=user_id,
+                release_group_mbid=release_group_mbid,
+                artist_name=reference.artist_name or "",
+                album_title=reference.album_title or "",
+                year=reference.year,
+                artist_mbid=reference.artist_mbid,
+                origin=ORIGIN_REPLACEMENT,
+            )
+            if task_id == ALREADY_IN_LIBRARY:
+                task_id = None
+        return {"blocked": len(blocked), "sources": sources, "task_id": task_id}
+
+    async def _delivered_identities(self, task) -> list[tuple[str, str]]:  # noqa: ANN001
+        """The blocklist identities of whatever this task actually downloaded.
+
+        Rebuilt from the stored candidate rather than from the task row: the task
+        keeps only the peer name, and Soulseek is blocked per file. A task whose
+        search job has since been pruned yields nothing, which the caller reports
+        rather than papering over with a peer-wide block that would not match.
+        """
+        if not task.search_job_id or task.candidate_index is None:
+            return []
+        try:
+            candidates = await self._store.get_search_job_candidates(
+                task.search_job_id
+            )
+        except Exception:  # noqa: BLE001 - a pruned job is not an error here
+            return []
+        if not 0 <= task.candidate_index < len(candidates):
+            return []
+        candidate = candidates[task.candidate_index]
+        if candidate.source == SOURCE_USENET:
+            release = candidate.usenet_release
+            if release is None:
+                return []
+            return [
+                (SOURCE_USENET, usenet_identity(release.title, release.size_bytes))
+            ]
+        return [
+            (SOURCE_SOULSEEK, soulseek_identity(candidate.username, file.filename))
+            for file in candidate.files
+            if file.filename
+        ]
 
     async def clear_history(self, user_id: str, user_role: str) -> int:
         """Empty the queue's History: completed, cancelled, and finished failures.

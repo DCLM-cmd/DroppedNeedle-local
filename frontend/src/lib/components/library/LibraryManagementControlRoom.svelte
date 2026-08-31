@@ -22,7 +22,6 @@
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { createLibraryManagementEvents } from '$lib/queries/library-management/LibraryManagementEvents';
 	import { withBasePath } from '$lib/utils/basePath';
-	import { controlLibraryManagementOperationMutation } from '$lib/queries/library-management/LibraryManagementMutations.svelte';
 	import {
 		acknowledgeLibraryManagementRecoveryMutation,
 		controlLibraryManagementOperationMutation

@@ -475,20 +475,32 @@ class SoulseekStrategy:
                 held_tier=held_tier,
             )
         ranked = await self._score_album_under(
-            task, task.artist_name, timeout=timeout, auto=auto, manual=manual,
+            task,
+            task.artist_name,
+            timeout=timeout,
+            auto=auto,
+            manual=manual,
             held_tier=held_tier,
+            snapshot=snapshot,
+            extras=extras,
         )
         if _has_pickable(ranked):
             return ranked
         alias_ranked = await self._search_under_aliases(
-            task, timeout=timeout, auto=auto, manual=manual, held_tier=held_tier
+            task,
+            timeout=timeout,
+            auto=auto,
+            manual=manual,
+            held_tier=held_tier,
+            snapshot=snapshot,
+            extras=extras,
         )
         # The primary pass may have produced rejected-tier rows worth showing in Review;
         # only replace them when the alias pass actually found something pickable.
         return alias_ranked if _has_pickable(alias_ranked) else ranked
 
     async def _score_album_under(
-        self, task, artist_name, *, timeout, auto, manual, held_tier
+        self, task, artist_name, *, timeout, auto, manual, held_tier, snapshot, extras
     ):  # noqa: ANN001, ANN201
         """One album search+score pass under ``artist_name``.
 
@@ -520,7 +532,7 @@ class SoulseekStrategy:
         )
 
     async def _search_under_aliases(
-        self, task, *, timeout, auto, manual, held_tier
+        self, task, *, timeout, auto, manual, held_tier, snapshot, extras
     ):  # noqa: ANN001, ANN201
         """Re-search under the artist's MusicBrainz aliases, best pass wins.
 
@@ -545,8 +557,14 @@ class SoulseekStrategy:
                 continue
             seen.add(folded)
             ranked = await self._score_album_under(
-                task, name, timeout=timeout, auto=auto, manual=manual,
+                task,
+                name,
+                timeout=timeout,
+                auto=auto,
+                manual=manual,
                 held_tier=held_tier,
+                snapshot=snapshot,
+                extras=extras,
             )
             if _has_pickable(ranked):
                 logger.info(

@@ -1463,3 +1463,56 @@ async def test_unreserved_and_missing_conversion_tables_answer_not_reserved(
 
     _seed_conversion(db_path, state="ready", held_path="/held/saint_pablo.flac")
     assert await store.find_active_edition_conversion_for_held_path("/held/x.flac") is None
+
+
+@pytest.mark.asyncio
+async def test_a_manual_blocklist_entry_never_expires(store):
+    """The TTL is a self-heal for the server's own guesses - a peer that failed one
+    verification deserves another chance a week later. A manual entry is the user
+    saying they do not want this release; letting it lapse would quietly re-deliver
+    the exact version they rejected, with nothing to suggest the block had gone."""
+    import time as _time
+
+    await store.record_quarantine(
+        source="soulseek", identity="peer\x1fold.flac", reason="verify_failed"
+    )
+    await store.record_quarantine(
+        source="soulseek", identity="peer\x1fkeep.flac", reason="manual"
+    )
+    # age both past the TTL
+    conn = sqlite3.connect(store.db_path)
+    conn.execute(
+        "UPDATE download_quarantine SET quarantined_at = ?", (_time.time() - 30 * 86400,)
+    )
+    conn.commit()
+    conn.close()
+
+    live = await store.load_quarantine_set()
+
+    assert ("soulseek", "peer\x1fkeep.flac") in live
+    assert ("soulseek", "peer\x1fold.flac") not in live
+
+
+@pytest.mark.asyncio
+async def test_pruning_on_write_leaves_manual_entries_alone(store):
+    import time as _time
+
+    await store.record_quarantine(
+        source="soulseek", identity="peer\x1fkeep.flac", reason="manual"
+    )
+    conn = sqlite3.connect(store.db_path)
+    conn.execute(
+        "UPDATE download_quarantine SET quarantined_at = ?", (_time.time() - 30 * 86400,)
+    )
+    conn.commit()
+    conn.close()
+
+    # any later write triggers the prune
+    await store.record_quarantine(
+        source="usenet", identity="something-else", reason="corrupt"
+    )
+
+    conn = sqlite3.connect(store.db_path)
+    remaining = {r[0] for r in conn.execute("SELECT identity FROM download_quarantine")}
+    conn.close()
+    assert "peer\x1fkeep.flac" in remaining

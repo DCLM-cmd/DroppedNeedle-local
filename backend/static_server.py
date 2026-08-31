@@ -73,6 +73,11 @@ def _precompressed_variant(
     return path, candidate_stat, encoding, True
 
 
+# Path prefixes owned by machine APIs. Anything under them that no route claims is
+# a 404, not the single-page app: these are consumed by clients that parse the body.
+_NON_SPA_PREFIXES = ("api", "jellyfin", "subsonic")
+
+
 class FrontendStaticFiles(StaticFiles):
     def file_response(
         self,
@@ -257,7 +262,14 @@ def mount_frontend(app: FastAPI) -> None:
 
     @app.get("/{full_path:path}")
     async def serve_spa_routes(full_path: str):
-        if full_path.startswith("api"):
+        if full_path.startswith(_NON_SPA_PREFIXES):
+            # A machine API must answer 404, never the SPA shell. An unknown
+            # /jellyfin path used to fall through to here and return index.html with
+            # status 200, so a Jellyfin client asking for an endpoint this server does
+            # not implement was handed an HTML page where it expected JSON - it then
+            # failed while parsing rather than on the status, which is how a missing
+            # endpoint surfaced as an unexplained client-side breakage instead of a
+            # plain "not found".
             raise HTTPException(status_code=404, detail="API route not found")
         if index_html.exists():
             return FileResponse(index_html, headers=_NO_CACHE_HEADERS)

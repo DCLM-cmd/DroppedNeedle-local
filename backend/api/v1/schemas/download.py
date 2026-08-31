@@ -103,6 +103,18 @@ class DismissReviewResponse(AppStruct):
     state: str
 
 
+class BlacklistSourceRequestBody(AppStruct):
+    release_group_mbid: str
+    redownload: bool = False
+
+
+class BlacklistSourceResponse(AppStruct):
+    status: str
+    blocked: int = 0
+    sources: list[str] = []
+    task_id: str | None = None
+
+
 class OperationResult(AppStruct):
     success: bool
 

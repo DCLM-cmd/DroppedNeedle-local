@@ -25,6 +25,13 @@ interface NextSourceResponse {
 	started?: boolean;
 }
 
+interface BlacklistSourceResponse {
+	status: string;
+	blocked: number;
+	sources: string[];
+	task_id: string | null;
+}
+
 interface ReimportDownloadResponse {
 	status: string;
 	error_message?: string | null;
@@ -268,6 +275,34 @@ export function cancelDownload() {
 interface NextSourceInput {
 	id: string;
 	candidateIndex: number;
+}
+
+// Never take this album from the source that delivered it again. For the case no
+// automatic check can catch: the files are fine and the import was clean, but it is
+// the wrong version - a clean edit where the explicit one was wanted.
+export function blacklistSource() {
+	return createMutation(() => ({
+		mutationFn: (input: { releaseGroupMbid: string; redownload?: boolean }) =>
+			api.global.post<BlacklistSourceResponse>(API.downloads.blacklistSource(), {
+				release_group_mbid: input.releaseGroupMbid,
+				redownload: input.redownload ?? false
+			}),
+		onSuccess: (result: BlacklistSourceResponse) => {
+			toastStore.show({
+				message: result.task_id
+					? 'Source blacklisted - looking for another copy'
+					: `Source blacklisted (${result.sources.join(', ')})`,
+				type: 'success'
+			});
+			void invalidateTasks();
+		},
+		onError: (err: unknown) => {
+			toastStore.show({
+				message: errorMessage(err, 'Could not blacklist the source'),
+				type: 'error'
+			});
+		}
+	}));
 }
 
 export function tryNextSource() {

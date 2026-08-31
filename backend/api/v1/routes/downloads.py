@@ -22,6 +22,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from core.exceptions import ResourceNotFoundError
 
 from api.v1.schemas.download import (
+    BlacklistSourceRequestBody,
+    BlacklistSourceResponse,
     CancelDownloadResponse,
     ClearDownloadsResponse,
     CutoffUnmetItem,
@@ -467,6 +469,33 @@ async def list_cutoff_unmet(
         ],
         cutoff=service.quality_cutoff,
         upgrade_allowed=service.upgrade_allowed,
+    )
+
+
+@router.post("/blacklist-source", response_model=BlacklistSourceResponse)
+async def blacklist_source(
+    current_user: CurrentCuratorDep,
+    body: BlacklistSourceRequestBody = MsgSpecBody(BlacklistSourceRequestBody),
+    service=Depends(get_download_service),
+):
+    """Never accept this album from the source that delivered it again.
+
+    For the case no automatic check can catch: the files are fine, the import was
+    clean, but it is the wrong version - a clean edit where the explicit one was
+    wanted. ``redownload`` immediately re-requests the album, which now skips the
+    blocked source and picks the next-best candidate.
+    """
+    result = await service.blacklist_album_source(
+        body.release_group_mbid,
+        current_user.id,
+        current_user.role,
+        redownload=body.redownload,
+    )
+    return BlacklistSourceResponse(
+        status="blacklisted",
+        blocked=result["blocked"],
+        sources=result["sources"],
+        task_id=result["task_id"],
     )
 
 
