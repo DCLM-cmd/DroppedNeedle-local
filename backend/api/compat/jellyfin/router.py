@@ -491,6 +491,10 @@ _ALBUM_SORTS = {
     "datecreated": ("recent_asc", "recent"),
     "premieredate": ("oldest", "newest"),
     "productionyear": ("oldest", "newest"),
+    "runtime": ("runtime", "runtime_desc"),
+    # Jellyfin's "newest content in this container first"; for an album that is the
+    # most recently imported track, which is what ``recent`` already orders by.
+    "datelastcontentadded": ("recent_asc", "recent"),
     "random": ("random", "random"),
 }
 _TRACK_SORTS = {
@@ -500,6 +504,12 @@ _TRACK_SORTS = {
     "albumartist": ("artist", "artist_desc"),
     "artist": ("artist", "artist_desc"),
     "datecreated": ("recent_asc", "recent"),
+    # Jellyfin's track and disc numbers. A client laying out a multi-disc album
+    # asks for ParentIndexNumber then IndexNumber; unmapped, both fell through to
+    # the default and the discs came back interleaved by import date.
+    "indexnumber": ("track_number", "track_number_desc"),
+    "parentindexnumber": ("disc_number", "disc_number_desc"),
+    "runtime": ("runtime", "runtime_desc"),
     "random": ("random", "random"),
 }
 # The artist listing takes a key and a direction separately, so it needs no twins.

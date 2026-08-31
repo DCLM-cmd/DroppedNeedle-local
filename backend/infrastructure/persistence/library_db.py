@@ -122,6 +122,20 @@ _TRACK_LIST_SORTS = {
     "lf.disc_number, lf.track_number, lf.id",
     "album": "lf.album_artist_name COLLATE NOCASE ASC, lf.album_title COLLATE NOCASE, "
     "lf.disc_number, lf.track_number, lf.id",
+    # Kept in step with the target runtime's own table: a compat client asking for
+    # Jellyfin's IndexNumber / ParentIndexNumber must get the same order from either
+    # implementation, or the answer depends on which one happens to be wired.
+    "title_desc": "lf.track_title COLLATE NOCASE DESC, lf.id",
+    "artist_desc": "lf.artist_name COLLATE NOCASE DESC, lf.id",
+    "album_desc": "lf.album_title COLLATE NOCASE DESC, lf.disc_number, "
+    "lf.track_number, lf.id",
+    "recent_asc": "lf.imported_at ASC, lf.id",
+    "track_number": "lf.track_number, lf.id",
+    "track_number_desc": "lf.track_number DESC, lf.id",
+    "disc_number": "lf.disc_number, lf.track_number, lf.id",
+    "disc_number_desc": "lf.disc_number DESC, lf.track_number DESC, lf.id",
+    "runtime": "COALESCE(lf.duration_seconds, 0), lf.id",
+    "runtime_desc": "COALESCE(lf.duration_seconds, 0) DESC, lf.id",
 }
 
 _ARTIST_AGG_SORT_COLUMNS = {

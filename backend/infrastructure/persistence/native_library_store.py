@@ -2965,6 +2965,10 @@ class NativeLibraryStore(PersistenceBase):
                     "artist_desc": (
                         "a.album_artist_name_folded DESC, a.title_folded, a.id"
                     ),
+                    "runtime": "SUM(COALESCE(t.duration_seconds, 0)), a.id",
+                    "runtime_desc": (
+                        "SUM(COALESCE(t.duration_seconds, 0)) DESC, a.id"
+                    ),
                     "random": "a.id",
                 }.get(sort, "MAX(t.imported_at) DESC, a.id")
                 rows = connection.execute(
@@ -3547,6 +3551,18 @@ class NativeLibraryStore(PersistenceBase):
                     "album_desc": (
                         "t.album_title_folded DESC, t.disc_number, t.track_number, t.id"
                     ),
+                    # Jellyfin's IndexNumber / ParentIndexNumber: track and disc.
+                    # A client laying out a multi-disc album asks for exactly this
+                    # pair, and an unmapped sort silently became "newest first" -
+                    # so the discs interleaved in import order.
+                    "track_number": "t.track_number, t.id",
+                    "track_number_desc": "t.track_number DESC, t.id",
+                    "disc_number": "t.disc_number, t.track_number, t.id",
+                    "disc_number_desc": (
+                        "t.disc_number DESC, t.track_number DESC, t.id"
+                    ),
+                    "runtime": "COALESCE(t.duration_seconds, 0), t.id",
+                    "runtime_desc": "COALESCE(t.duration_seconds, 0) DESC, t.id",
                     "random": "RANDOM()",
                 }.get(sort, "t.imported_at DESC, t.id")
                 rows = connection.execute(
