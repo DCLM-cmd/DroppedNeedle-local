@@ -56,7 +56,10 @@ def _ok_response(json_data=None, headers=None):
 
 
 def test_baseline_limiter_is_evenly_paced_without_cold_burst():
-    assert _listenbrainz_rate_limiter.rate == pytest.approx(2.5)
+    # Lowered from the documented 2.5/s ceiling: treating a ceiling as a target is
+    # what made a background warmer look like a scraper. The property this test
+    # protects - even pacing with no cold-start burst - is unchanged.
+    assert _listenbrainz_rate_limiter.rate == pytest.approx(0.5)
     assert _listenbrainz_rate_limiter.capacity == 1
 
 

@@ -155,7 +155,11 @@ _generic_cover_circuit_breaker = CircuitBreaker(
 # IMAGE_FETCH semaphore (10) + circuit breaker + 429/Retry-After are the real
 # governors. A generous bucket stays polite while removing the head-of-line stall
 # that made cold cover grids load ~1 image/second.
-_coverart_rate_limiter = TokenBucketRateLimiter(rate=10.0, capacity=20)
+# Cover Art Archive is MetaBrainz infrastructure and shares their fair-use
+# expectations. 10/s with a burst of 20 was set for a local cache miss storm; a
+# hundred-album page hitting that is a scrape from their side. Covers are cached
+# locally after the first fetch, so a slower fill costs one page, once.
+_coverart_rate_limiter = TokenBucketRateLimiter(rate=2.0, capacity=4)
 
 _deduplicator = RequestDeduplicator()
 

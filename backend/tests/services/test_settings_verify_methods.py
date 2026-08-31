@@ -31,8 +31,10 @@ async def test_verify_listenbrainz_does_not_reset_circuit_breaker():
     service = _make_service()
     settings = ListenBrainzConnectionSettings(username="alice")
     mock_repo_instance = MagicMock()
+    # (valid, message, reachable) - the third value distinguishes a credential the
+    # provider REJECTED from one it never got to see.
     mock_repo_instance.validate_username = AsyncMock(
-        return_value=(True, "User found with 12 listens")
+        return_value=(True, "User found with 12 listens", True)
     )
 
     with (

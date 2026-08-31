@@ -426,7 +426,12 @@ _listenbrainz_circuit_breaker = CircuitBreaker(
 # Live edge evidence (2026-08-26): 30 requests/10 seconds. LB's API docs
 # (https://listenbrainz.readthedocs.io/en/latest/users/api/#rate-limiting) make
 # X-RateLimit-* dynamic, so keep the local baseline evenly paced with no burst.
-_listenbrainz_rate_limiter = TokenBucketRateLimiter(rate=2.5, capacity=1)
+# 2.5/s was the documented ceiling, and treating a ceiling as a target is what makes
+# a background pass look like abuse: an artist warmer issuing three calls per artist
+# sustains ~9000 requests an hour from one address, indistinguishable from a scraper.
+# 0.5/s leaves the interactive paths responsive - they are a handful of calls - while
+# a warmer spreads over minutes instead of saturating the allowance.
+_listenbrainz_rate_limiter = TokenBucketRateLimiter(rate=0.5, capacity=1)
 _metadata_deduplicator = RequestDeduplicator()
 
 LISTENBRAINZ_API_URL = "https://api.listenbrainz.org"
@@ -459,6 +464,9 @@ class ListenBrainzRepository:
         # read.  ``require_auth`` must only ever accept this repository's own token.
         self._user_token = user_token
         self._base_url = LISTENBRAINZ_API_URL
+        # Kept at 2: throughput is bounded by the token bucket above, not by this,
+        # and the shared-window reservation exists precisely because two requests can
+        # be in flight - narrowing it to one would retire that guard untested.
         self._request_semaphore = asyncio.Semaphore(2)
         # borrowed token for PUBLIC reads when this (usually global/enrichment) repo
         # has none of its own; LB now anti-scraper-gates anonymous popularity calls.

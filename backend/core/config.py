@@ -81,6 +81,22 @@ class Settings(BaseSettings):
         default="contact@droppedneedle.com",
         description="Contact email for MusicBrainz API User-Agent. Override with your own if desired."
     )
+    # MetaBrainz identify their callers by this name and hold it responsible for the
+    # traffic, so an installation that has been separated from the upstream project -
+    # its own build, its own pacing, its own operator - should say so rather than
+    # answer for a name it no longer shares. Set it together with contact_email: a
+    # name without a reachable operator behind it is worth nothing to them.
+    app_name: str = Field(
+        default="DroppedNeedleApp",
+        description=(
+            "Application name sent in the outbound User-Agent. Change it only "
+            "together with contact_email, which must reach whoever runs this install."
+        ),
+    )
+    app_url: str = Field(
+        default="https://www.droppedneedle.com",
+        description="URL sent in the outbound User-Agent alongside app_name.",
+    )
     discover_warmer_enabled: bool = Field(
         default=True,
         description="Proactively warm per-user Discover/Home in the background through the day (kill switch)."
@@ -189,10 +205,9 @@ class Settings(BaseSettings):
     def get_user_agent(self) -> str:
         id_part = self.instance_id[:8] if self.instance_id else "unknown"
         email = (self.contact_email or "").strip() or "contact@droppedneedle.com"
-        return (
-            f"DroppedNeedleApp/{build_version()} "
-            f"({id_part}; {email}; https://www.droppedneedle.com)"
-        )
+        name = (self.app_name or "").strip() or "DroppedNeedleApp"
+        url = (self.app_url or "").strip() or "https://www.droppedneedle.com"
+        return f"{name}/{build_version()} ({id_part}; {email}; {url})"
 
     def load_from_file(self) -> None:
         if not self.config_file_path.exists():

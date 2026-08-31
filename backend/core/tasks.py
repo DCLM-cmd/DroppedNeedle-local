@@ -13,6 +13,8 @@ from services.library_service import LibraryService
 from services.native.title_match import is_placeholder_artist
 from services.preferences_service import PreferencesService
 from core.task_registry import TaskRegistry
+from core.exceptions import RateLimitedError
+from infrastructure.resilience.retry import CircuitOpenError
 from repositories.listenbrainz_repository import listenbrainz_rate_limit_cooldown_active
 
 if TYPE_CHECKING:
@@ -356,7 +358,8 @@ async def warm_artist_discovery_cache_periodically(
     while True:
         try:
             artist_cursor = ""
-            while True:
+            throttled = False
+            while not throttled:
                 if workload_gate is not None:
                     await workload_gate.wait_until_available()
                 page = await library_db.get_artist_mbid_page(
@@ -368,18 +371,30 @@ async def warm_artist_discovery_cache_periodically(
                 artist_cursor = page[-1]
                 mbids = [mbid for mbid in page if is_valid_mbid(mbid)]
                 for mbid in mbids:
-                    if workload_gate is not None:
-                        await workload_gate.run_warmer_unit(
-                            lambda mbid=mbid: artist_discovery_service_getter().precache_artist_discovery(
-                                [mbid], delay=delay
+                    try:
+                        if workload_gate is not None:
+                            await workload_gate.run_warmer_unit(
+                                lambda mbid=mbid: artist_discovery_service_getter().precache_artist_discovery(
+                                    [mbid], delay=delay
+                                )
                             )
-                        )
-                    else:
-                        await (
-                            artist_discovery_service_getter().precache_artist_discovery(
-                                [mbid], delay=delay
+                        else:
+                            await (
+                                artist_discovery_service_getter().precache_artist_discovery(
+                                    [mbid], delay=delay
+                                )
                             )
+                    except (RateLimitedError, CircuitOpenError) as limit:
+                        # Abandon the whole pass, not just this artist. The provider
+                        # has said stop; walking the remaining artists asks it again
+                        # once per artist - hundreds of refusals a minute on a large
+                        # library - which is the shape that gets a caller blocked in
+                        # the first place. The next cycle starts fresh.
+                        logger.info(
+                            "Artist discovery warming stopped early: %s", limit
                         )
+                        throttled = True
+                        break
 
                 if len(page) < 500:
                     break
