@@ -289,6 +289,15 @@ class HeldManagementActionResponse(AppStruct):
     files: int
 
 
+class HeldReevaluateResponse(AppStruct):
+    """Outcome of re-running the AcoustID identity check over held tracks."""
+
+    checked: int
+    imported: int
+    still_held: int
+    failed: int
+
+
 class DownloadListResponse(AppStruct):
     items: list[DownloadTaskResponse]
     page: int

@@ -59,6 +59,12 @@
 			<div class="skeleton h-32 w-32 rounded-full"></div>
 			<div class="skeleton h-12 w-64"></div>
 		</div>
+	{:else if !artistQuery.isError && artist === null}
+		<!-- A definitive "not in your library" (404), not a failure: offering a Retry
+		     here sent the user round a loop that could never succeed. -->
+		<div class="alert">
+			<span>This artist isn't in your library.</span>
+		</div>
 	{:else if artistQuery.isError || !artist}
 		<div class="alert alert-error">
 			<span>Couldn't load this artist.</span><button

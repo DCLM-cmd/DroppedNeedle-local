@@ -765,12 +765,26 @@ def create_production_target_application() -> FastAPI:
     app.add_middleware(AuthMiddleware)
     app.add_middleware(
         RateLimitMiddleware,
-        default_rate=30.0,
-        default_capacity=60,
+        # Per CLIENT, not per process. Browsing is bursty by nature - one page
+        # render fans out ~10 calls and a library grid fires one cover request
+        # per tile - and it is served from SQLite, so a tight ceiling costs far
+        # more than it protects. These sit well above what real use produces and
+        # exist only to stop one runaway client hurting itself.
+        default_rate=120.0,
+        default_capacity=240,
         overrides={
-            "/api/v1/search": (10.0, 20),
-            "/api/v1/discover": (10.0, 20),
-            "/api/v1/covers": (15.0, 30),
+            # MUST precede '/api/v1/auth/setup': prefix matching takes the first
+            # hit, and this is the bootstrap call EVERY cold page load makes. Under
+            # the setup budget below, a couple of tabs opening at once 429s it and
+            # the root layout turns that into a fatal error for the whole app.
+            "/api/v1/auth/setup/status": (20.0, 60),
+            # These fan out to rate-limited third parties, so they stay tighter
+            # than browse - but per-client, one user's search cannot block another's.
+            "/api/v1/search": (20.0, 60),
+            "/api/v1/discover": (20.0, 60),
+            # One request per tile; a full grid must fit inside the burst.
+            "/api/v1/covers": (120.0, 300),
+            # Genuine abuse controls. Unauthenticated, so these key by IP.
             "/api/v1/auth/login": (2.0, 5),
             "/api/v1/auth/setup": (1.0, 3),
             "/api/v1/auth/plex/poll": (5.0, 10),

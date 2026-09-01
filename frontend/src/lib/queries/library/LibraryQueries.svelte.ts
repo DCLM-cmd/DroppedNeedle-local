@@ -224,8 +224,23 @@ export const getLibraryArtistDetailQueryOptions = (artistId: string) =>
 	queryOptions({
 		staleTime: CACHE_TTL.LIBRARY_NATIVE,
 		queryKey: LibraryQueryKeyFactory.artistDetail(artistId),
-		queryFn: ({ signal }) =>
-			api.global.get<LibraryArtistSummary>(API.library.artistDetail(artistId), { signal })
+		// An artist you don't own is a normal answer, not a failure: this endpoint is
+		// asked about every artist the user opens, including ones reached from search
+		// or discover. Resolving 404 to null keeps the provider page as the clean
+		// branch and lets the result CACHE - as an error it was neither cached nor
+		// retried-with-backoff, so every remount re-asked and one such page put 514
+		// requests for a single artist onto the server.
+		queryFn: async ({ signal }) => {
+			try {
+				return await api.global.get<LibraryArtistSummary>(
+					API.library.artistDetail(artistId),
+					{ signal }
+				);
+			} catch (err) {
+				if (err instanceof ApiError && err.status === 404) return null;
+				throw err;
+			}
+		}
 	});
 
 export const getLibraryArtistDetailQuery = (getArtistId: Getter<string>) =>

@@ -1570,6 +1570,59 @@ class DownloadService:
             extra={"held_id": held_id, "release_group_mbid": held.release_group_mbid},
         )
 
+    async def reevaluate_fingerprint_holds(
+        self, user_id: str, user_role: str
+    ) -> dict[str, int]:
+        """Re-run the AcoustID identity check over ``fingerprint_mismatch`` holds and
+        import the ones that only ever failed the old single-MBID comparison.
+
+        The check used to compare AcoustID's FIRST recording id against the wanted one.
+        MusicBrainz splits one performance across editions and AcoustID returns those
+        entities in no meaningful order, so a correct file was rejected whenever the
+        wanted edition was not listed first - on this library that held tracks whose
+        title and artist AcoustID had named EXACTLY right. The comparison now tests
+        membership, and this clears the backlog that bug produced.
+
+        Only holds that PASS the corrected check are imported: a genuine mismatch (the
+        audio really is another song) stays held for the human. Returns per-outcome
+        counts; one file's failure never aborts the sweep."""
+        if self._file_processor is None:
+            raise ConfigurationError("Import is unavailable right now")
+        fingerprinter = getattr(self._file_processor, "_fingerprinter", None)
+        if fingerprinter is None:
+            raise ConfigurationError("Audio fingerprinting is not configured")
+
+        from models.download_manifest import ExpectedTrack
+        from services.native.file_processor import _fingerprint_disagrees
+
+        counts = {"checked": 0, "imported": 0, "still_held": 0, "failed": 0}
+        for held in await self._store.list_held_imports(user_id, user_role):
+            if held.reason != "fingerprint_mismatch" or held.status != "held":
+                continue
+            counts["checked"] += 1
+            try:
+                fp = await fingerprinter.fingerprint(Path(held.held_path))
+                expected = ExpectedTrack(
+                    track_number=held.track_number or 0,
+                    disc_number=held.disc_number or 1,
+                    duration_seconds=held.duration_seconds,
+                    recording_mbid=held.recording_mbid,
+                    title=held.track_title,
+                )
+                if _fingerprint_disagrees(fp, expected, held.artist_name):
+                    counts["still_held"] += 1
+                    continue
+                await self.import_held(held.id, user_id, user_role)
+                counts["imported"] += 1
+            except Exception:  # noqa: BLE001 - one bad file must not stop the sweep
+                counts["failed"] += 1
+                logger.warning(
+                    "download.held_reevaluate_failed",
+                    extra={"held_id": held.id, "track": held.track_title},
+                )
+        logger.info("download.held_reevaluated", extra=counts)
+        return counts
+
     async def retry_management_hold(
         self, source_task_id: str, user_id: str, user_role: str
     ) -> list[str]:

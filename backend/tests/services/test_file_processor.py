@@ -962,7 +962,14 @@ def test_recording_mbid_overrides_a_title_conflict(tmp_path):
 # --- fingerprint recording-identity check (release-group is NOT gated) ------------
 
 
-def _fp(status="pass", title=None, artist=None, rgs=None, recording_id=None):
+def _fp(
+    status="pass",
+    title=None,
+    artist=None,
+    rgs=None,
+    recording_id=None,
+    recording_ids=None,
+):
     from models.audio import FingerprintResult
 
     return FingerprintResult(
@@ -972,6 +979,7 @@ def _fp(status="pass", title=None, artist=None, rgs=None, recording_id=None):
         title=title,
         artist=artist,
         release_group_ids=rgs or [],
+        recording_ids=recording_ids or [],
     )
 
 
@@ -1069,6 +1077,81 @@ def test_fingerprint_recording_mismatch_rejects_before_various_artist_allowance(
         recording_id="recording-other",
     )
     assert _fingerprint_disagrees(fp, track, "Various Artists")
+
+
+def test_fingerprint_accepts_wanted_recording_listed_after_the_first():
+    # The Björk hold: AcoustID named the track EXACTLY right, but MusicBrainz splits
+    # one performance across editions and the wanted entity was not listed first.
+    # Membership in recording_ids is the identity test - equality against the first
+    # id alone held 108 correct files as fingerprint_mismatch.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=4, title="My Juvenile", recording_mbid="recording-wanted"
+    )
+    fp = _fp(
+        title="My Juvenile",
+        artist="Björk",
+        recording_id="recording-other-edition",
+        recording_ids=["recording-other-edition", "recording-wanted"],
+    )
+    assert _fingerprint_disagrees(fp, track, "Björk") is False
+
+
+def test_fingerprint_still_rejects_when_wanted_recording_is_absent_entirely():
+    # The 100 gecs hold: a remix album whose track ordering differs, so the audio is
+    # genuinely a different song. Widening to membership must NOT let this through.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=1, title="money machine", recording_mbid="recording-wanted"
+    )
+    fp = _fp(
+        title="800db cloud (Ricco Harver remix)",
+        artist="100 gecs",
+        recording_id="recording-remix-a",
+        recording_ids=["recording-remix-a", "recording-remix-b"],
+    )
+    assert _fingerprint_disagrees(fp, track, "100 gecs") is True
+
+
+def test_import_confidence_trusts_wanted_recording_listed_after_the_first():
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _import_confidence
+
+    track = ExpectedTrack(
+        track_number=4, title="My Juvenile", recording_mbid="recording-wanted"
+    )
+    fp = _fp(
+        title="My Juvenile",
+        artist="Björk",
+        recording_id="recording-other-edition",
+        recording_ids=["recording-other-edition", "recording-wanted"],
+    )
+    tag = AudioTag(
+        title="My Juvenile",
+        artist="Björk",
+        album="Volta",
+        track_number=4,
+        disc_number=1,
+    )
+    info = AudioInfo(
+        duration_seconds=None,
+        bitrate=900,
+        sample_rate=44100,
+        channels=2,
+        file_format="flac",
+        file_size_bytes=1,
+        bit_depth=16,
+    )
+    assert (
+        _import_confidence(
+            tag=tag, info=info, expected_track=track, canonical_duration=None, fp=fp
+        )
+        == 1.0
+    )
 
 
 def test_fingerprint_recording_mismatch_rejects_base_audio_for_requested_remix():

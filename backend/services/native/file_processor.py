@@ -334,8 +334,7 @@ def _import_confidence(*, tag, info, expected_track, canonical_duration, fp) -> 
         tag_rec = (tag.musicbrainz_recording_id or "").strip().lower()
         if tag_rec and tag_rec == expected_rec:
             return 1.0
-        fp_rec = (getattr(fp, "recording_id", None) or "").strip().lower() if fp else ""
-        if fp_rec and getattr(fp, "status", None) == "pass" and fp_rec == expected_rec:
+        if fp is not None and _fingerprint_proves_recording(fp, expected_rec):
             return 1.0
     if (
         canonical_duration
@@ -466,6 +465,33 @@ def _tag_conflict_reason(tag, info, manifest, expected_track) -> str | None:  # 
 _WRONG_SONG_TITLE_FLOOR = 60
 
 
+def _fingerprint_recording_ids(fp) -> set[str]:  # noqa: ANN001 - FingerprintResult
+    """EVERY recording MBID the fingerprint resolves to, case-folded.
+
+    AcoustID answers with every recording entity the audio resolves to, in no
+    meaningful order, and MusicBrainz splits one performance across editions - so
+    membership in this set is the identity test, never equality against
+    ``recording_id`` alone (see ``models.audio.FingerprintResult.recording_ids``).
+    Comparing the first id only held correct files as ``fingerprint_mismatch``:
+    on this library every Björk track AcoustID named EXACTLY right was rejected
+    because the wanted edition's entity was not the one listed first."""
+    return {
+        str(value).strip().casefold()
+        for value in (
+            *(getattr(fp, "recording_ids", None) or ()),
+            getattr(fp, "recording_id", None),
+        )
+        if value
+    }
+
+
+def _fingerprint_proves_recording(fp, recording_mbid: str | None) -> bool:  # noqa: ANN001
+    """Whether a PASS fingerprint positively identifies ``recording_mbid``."""
+    if not recording_mbid or getattr(fp, "status", None) != "pass":
+        return False
+    return recording_mbid.strip().casefold() in _fingerprint_recording_ids(fp)
+
+
 def _fingerprint_disagrees(
     fp,
     expected_track,
@@ -488,8 +514,11 @@ def _fingerprint_disagrees(
     verifies recording identity, not edition, and fails OPEN - a non-pass result never
     rejects, leaving the tag/duration match to stand. ``expected_track`` may be None (the
     slskd path has no per-file title), in which case only the artist is checked. When both
-    sides provide a recording ID, a PASS fingerprint mismatch rejects before artist
-    allowances and an exact match permits display-credit differences after the title veto.
+    sides provide a recording ID, a PASS fingerprint that names NONE of the expected
+    recording's entities rejects before artist allowances, and one that names it permits
+    display-credit differences after the title veto. Identity is MEMBERSHIP in the
+    fingerprint's whole ``recording_ids`` set, not equality with the first entry -
+    AcoustID orders them arbitrarily, so comparing the first alone held correct files.
     Without both IDs, the existing conservative artist gate remains in force."""
     if getattr(fp, "status", None) != "pass":
         return False
@@ -507,16 +536,14 @@ def _fingerprint_disagrees(
     ):
         return True  # clearly the wrong song
 
-    fp_recording_id = (getattr(fp, "recording_id", None) or "").strip().casefold()
+    fp_recording_ids = _fingerprint_recording_ids(fp)
     expected_recording_id = (
         (getattr(expected_track, "recording_mbid", None) or "").strip().casefold()
         if expected_track is not None
         else ""
     )
-    if fp_recording_id and expected_recording_id:
-        if fp_recording_id != expected_recording_id:
-            return True
-        return False
+    if fp_recording_ids and expected_recording_id:
+        return expected_recording_id not in fp_recording_ids
 
     # Wrong artist - but skip for various-artists compilations, where the album artist
     # legitimately differs from a track's performing artist.
@@ -1453,11 +1480,8 @@ class FileProcessor:
                     reason="fingerprint_mismatch",
                     filename=source.name,
                 )
-            if conversion_verification and (
-                not track.recording_mbid
-                or getattr(fp, "status", None) != "pass"
-                or (getattr(fp, "recording_id", None) or "").casefold()
-                != track.recording_mbid.casefold()
+            if conversion_verification and not _fingerprint_proves_recording(
+                fp, track.recording_mbid
             ):
                 raise VerificationFailed(
                     "AcoustID could not prove the requested recording",
@@ -2198,25 +2222,16 @@ class FileProcessor:
                     reason="fingerprint_mismatch",
                     filename=expected.filename,
                 )
-            if conversion_verification and (
-                expected_track is None
-                or not expected_track.recording_mbid
-                or getattr(fp, "status", None) != "pass"
-                or (getattr(fp, "recording_id", None) or "").casefold()
-                != expected_track.recording_mbid.casefold()
-            ):
+            proves_recording = expected_track is not None and (
+                _fingerprint_proves_recording(fp, expected_track.recording_mbid)
+            )
+            if conversion_verification and not proves_recording:
                 raise VerificationFailed(
                     "AcoustID could not prove the requested recording",
                     reason="fingerprint_unverified",
                     filename=expected.filename,
                 )
-            if (
-                expected_track is not None
-                and expected_track.recording_mbid
-                and getattr(fp, "status", None) == "pass"
-                and (getattr(fp, "recording_id", None) or "").casefold()
-                == expected_track.recording_mbid.casefold()
-            ):
+            if proves_recording:
                 authoritative_mapping = bool(
                     manifest.release_mbid and expected_track.release_track_mbid
                 )

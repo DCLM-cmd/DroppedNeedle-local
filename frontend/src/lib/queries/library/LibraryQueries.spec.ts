@@ -7,8 +7,20 @@ vi.mock('@tanstack/svelte-query', () => ({
 	keepPreviousData: vi.fn((data: unknown) => data)
 }));
 
+const MockApiError = vi.hoisted(
+	() =>
+		class MockApiError extends Error {
+			status: number;
+			constructor(status: number) {
+				super(`status ${status}`);
+				this.status = status;
+			}
+		}
+);
+
 vi.mock('$lib/api/client', () => ({
-	api: { global: { get: vi.fn(), post: vi.fn() } }
+	api: { global: { get: vi.fn(), post: vi.fn() } },
+	ApiError: MockApiError
 }));
 
 vi.mock('../QueryClient', () => ({
@@ -22,7 +34,8 @@ import {
 	getLibraryAlbumStatusQueryOptions,
 	getLibraryAlbumCopiesQuery,
 	getLibraryScanScheduleQuery,
-	getLibraryMembershipQueryOptions
+	getLibraryMembershipQueryOptions,
+	getLibraryArtistDetailQueryOptions
 } from './LibraryQueries.svelte';
 
 const mockGet = vi.mocked(api.global.get);
@@ -143,5 +156,19 @@ describe('library query endpoints', () => {
 		expect((mockPost.mock.calls[0][1] as { album_ids: string[] }).album_ids).toHaveLength(500);
 		expect((mockPost.mock.calls[1][1] as { album_ids: string[] }).album_ids).toEqual(['album-500']);
 		expect(result).toEqual({ owned_ids: ['album-000'], requested_ids: ['album-500'] });
+	});
+});
+
+describe('library artist detail: "not in my library" is an answer, not a failure', () => {
+	it('resolves a 404 to null so the provider page is the clean branch', async () => {
+		mockGet.mockRejectedValueOnce(new MockApiError(404));
+
+		await expect(callQueryFn(getLibraryArtistDetailQueryOptions('artist-1'))).resolves.toBeNull();
+	});
+
+	it('still surfaces a real failure', async () => {
+		mockGet.mockRejectedValueOnce(new MockApiError(500));
+
+		await expect(callQueryFn(getLibraryArtistDetailQueryOptions('artist-1'))).rejects.toThrow();
 	});
 });

@@ -112,6 +112,72 @@ async def test_middleware_skips_non_api_paths():
 
 
 @pytest.mark.asyncio
+async def test_one_clients_burst_does_not_starve_another():
+    """The reported bug: a runaway tab 429'd every OTHER page in the app.
+
+    With one shared bucket, whoever spent the tokens first took them from
+    everyone. The budget is per client now, so exhausting one caller's
+    allowance must leave a different caller untouched.
+    """
+    app = _build_app(default_rate=1.0, default_capacity=1)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        greedy = {"Authorization": "Bearer runaway-tab"}
+        await client.get("/api/v1/test", headers=greedy)
+        exhausted = await client.get("/api/v1/test", headers=greedy)
+
+        bystander = await client.get(
+            "/api/v1/test", headers={"Authorization": "Bearer someone-else"}
+        )
+
+    assert exhausted.status_code == 429
+    assert bystander.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_same_client_credential_shares_one_budget():
+    app = _build_app(default_rate=1.0, default_capacity=1)
+    transport = httpx.ASGITransport(app=app)
+    headers = {"Authorization": "Bearer one-client"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.get("/api/v1/test", headers=headers)
+        second = await client.get("/api/v1/test", headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_setup_status_is_not_captured_by_the_setup_budget():
+    """'/api/v1/auth/setup' is a PREFIX, so it also matches the bootstrap call
+    every cold page load makes. Registered ahead of it, the status path keeps
+    its own budget instead of inheriting the deliberately tiny setup one."""
+    app = FastAPI()
+
+    @app.get("/api/v1/auth/setup/status")
+    async def setup_status():
+        return PlainTextResponse("ok")
+
+    app.add_middleware(
+        RateLimitMiddleware,
+        default_rate=100.0,
+        default_capacity=200,
+        overrides={
+            "/api/v1/auth/setup/status": (20.0, 60),
+            "/api/v1/auth/setup": (1.0, 3),
+        },
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        statuses = [
+            (await client.get("/api/v1/auth/setup/status")).status_code
+            for _ in range(6)
+        ]
+
+    assert statuses == [200] * 6
+
+
+@pytest.mark.asyncio
 async def test_middleware_per_route_override():
     overrides = {"/api/v1/special": (100.0, 500)}
     app = _build_app(default_rate=1.0, default_capacity=1, overrides=overrides)

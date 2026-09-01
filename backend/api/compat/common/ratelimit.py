@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import time
-from collections import OrderedDict, deque
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Generic, TypeVar
+from typing import Callable
 
 from starlette.responses import Response
 
 from api.compat.subsonic.serialization import render_error
-from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
+from infrastructure.resilience.rate_limiter import (
+    BoundedTTLMap as _BoundedTTLMap,
+    TokenBucketRateLimiter,
+)
 
 _MAX_PRINCIPALS = 10_000
 _MAX_IPS = 10_000
@@ -19,8 +22,6 @@ _AUTH_FAILURE_WINDOW_SECONDS = 60.0
 _AUTH_FAILURE_LIMIT = 5
 _AUTH_INITIAL_COOLDOWN_SECONDS = 10.0
 _AUTH_MAX_COOLDOWN_SECONDS = 5 * 60.0
-
-_T = TypeVar("_T")
 
 # Per-signed-in-user budgets. These are NOT an abuse control - a signed-in client is
 # already trusted - they only stop one runaway client from starving the others, so they
@@ -56,54 +57,6 @@ _ARTWORK_BURST = 1200
 def trusted_client_ip(request) -> str:
     """Use only the address established by Uvicorn's trusted-proxy middleware."""
     return request.client.host if request.client else "unknown"
-
-
-class _BoundedTTLMap(Generic[_T]):
-    def __init__(
-        self,
-        *,
-        max_entries: int,
-        ttl_seconds: float,
-        factory: Callable[[], _T],
-        clock: Callable[[], float],
-    ) -> None:
-        self._max_entries = max_entries
-        self._ttl_seconds = ttl_seconds
-        self._factory = factory
-        self._clock = clock
-        self._items: OrderedDict[str, tuple[float, _T]] = OrderedDict()
-
-    def get(self, key: str) -> _T:
-        now = self._clock()
-        self._evict_expired(now)
-        current = self._items.pop(key, None)
-        value = current[1] if current else self._factory()
-        self._items[key] = (now, value)
-        if len(self._items) > self._max_entries:
-            self._items.popitem(last=False)
-        return value
-
-    def discard(self, key: str) -> None:
-        self._items.pop(key, None)
-
-    def clear(self) -> None:
-        self._items.clear()
-
-    def _evict_expired(self, now: float) -> None:
-        cutoff = now - self._ttl_seconds
-        while self._items:
-            _, (last_seen, _) = next(iter(self._items.items()))
-            if last_seen > cutoff:
-                break
-            self._items.popitem(last=False)
-
-    def __len__(self) -> int:
-        self._evict_expired(self._clock())
-        return len(self._items)
-
-    def keys(self) -> tuple[str, ...]:
-        self._evict_expired(self._clock())
-        return tuple(self._items)
 
 
 @dataclass

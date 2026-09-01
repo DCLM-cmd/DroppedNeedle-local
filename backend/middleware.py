@@ -1,6 +1,7 @@
 import logging
 import time
-from typing import Annotated
+from hashlib import sha256
+from typing import Annotated, Callable
 
 from fastapi import Depends, HTTPException, Request, status
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -13,7 +14,10 @@ from infrastructure.degradation import (
     clear_degradation_context,
 )
 from infrastructure.persistence.auth_store import TokenRecord, UserRecord
-from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
+from infrastructure.resilience.rate_limiter import (
+    BoundedTTLMap,
+    TokenBucketRateLimiter,
+)
 from infrastructure.msgspec_fastapi import MsgSpecJSONResponse
 
 logger = logging.getLogger(__name__)
@@ -64,33 +68,85 @@ _NON_INTERACTIVE_API_PATHS: frozenset[str] = frozenset({
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Per-process token-bucket rate limiter with per-path overrides."""
+    """Token-bucket rate limiter with per-path overrides, keyed PER CLIENT.
+
+    The budget is per caller, not per process. A single shared bucket makes every
+    client compete for one allowance: one browser tab looping on a failing page
+    exhausted the whole instance's 30/s and the OTHER pages started answering
+    "Too many requests" - a 92 req/s burst from one tab produced 908 rejections
+    across the library, artist and connection endpoints at once. Keying by client
+    contains a runaway to the client that caused it.
+
+    The key is the caller's credential when it carries one (so two users behind
+    one NAT, or a browser and a media client on one machine, get separate
+    budgets), else the connecting IP. Credentials are hashed - this map outlives
+    the request, and it should not hold raw session tokens. This runs BEFORE
+    ``AuthMiddleware``, so the credential is read from the request rather than
+    from ``request.state``; an invalid token still gets a stable key and is
+    rejected on its own merits a moment later.
+
+    Buckets live in a ``BoundedTTLMap``: idle clients expire and the map is
+    count-capped, so a stream of fresh identities cannot grow it without bound.
+    Losing a bucket only refills that client's allowance - the failure mode is
+    leniency, never a wrongly-rejected request.
+    """
 
     def __init__(
         self,
         app: ASGIApp,
-        default_rate: float = 30.0,
-        default_capacity: int = 60,
+        default_rate: float = 120.0,
+        default_capacity: int = 240,
         overrides: dict[str, tuple[float, int]] | None = None,
+        *,
+        max_clients: int = 10_000,
+        entry_ttl_seconds: float = 15 * 60.0,
+        clock: "Callable[[], float]" = time.monotonic,
     ):
         super().__init__(app)
-        self._default = TokenBucketRateLimiter(rate=default_rate, capacity=default_capacity)
-        self._overrides: list[tuple[str, TokenBucketRateLimiter]] = []
-        for prefix, (rate, capacity) in (overrides or {}).items():
-            self._overrides.append((prefix, TokenBucketRateLimiter(rate=rate, capacity=capacity)))
+        self._clock = clock
+        self._default = self._make_map(
+            default_rate, default_capacity, max_clients, entry_ttl_seconds
+        )
+        # First match wins, so a more specific path registered ahead of a broader
+        # one keeps its own budget: '/api/v1/auth/setup/status' MUST precede
+        # '/api/v1/auth/setup', or the bootstrap call every cold page load makes
+        # inherits the deliberately tiny setup budget and the whole app fails to
+        # render.
+        self._overrides: list[tuple[str, BoundedTTLMap]] = [
+            (prefix, self._make_map(rate, capacity, max_clients, entry_ttl_seconds))
+            for prefix, (rate, capacity) in (overrides or {}).items()
+        ]
 
-    def _get_limiter(self, path: str) -> TokenBucketRateLimiter:
-        for prefix, limiter in self._overrides:
+    def _make_map(
+        self, rate: float, capacity: int, max_clients: int, ttl_seconds: float
+    ) -> "BoundedTTLMap":
+        return BoundedTTLMap(
+            max_entries=max_clients,
+            ttl_seconds=ttl_seconds,
+            factory=lambda: TokenBucketRateLimiter(rate=rate, capacity=capacity),
+            clock=self._clock,
+        )
+
+    def _get_bucket_map(self, path: str) -> "BoundedTTLMap":
+        for prefix, buckets in self._overrides:
             if path.startswith(prefix):
-                return limiter
+                return buckets
         return self._default
+
+    @staticmethod
+    def _client_key(request: Request) -> str:
+        credential = AuthMiddleware._extract_bearer(request)
+        if credential:
+            return "tok:" + sha256(credential.encode("utf-8")).hexdigest()[:32]
+        client = request.client
+        return "ip:" + (client.host if client else "unknown")
 
     async def dispatch(self, request: Request, call_next):
         path = application_path(request.scope)
         if not path.startswith("/api/"):
             return await call_next(request)
 
-        limiter = self._get_limiter(path)
+        limiter = self._get_bucket_map(path).get(self._client_key(request))
         acquired = await limiter.try_acquire()
 
         if acquired:

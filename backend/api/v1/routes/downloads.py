@@ -38,6 +38,7 @@ from api.v1.schemas.download import (
     HeldImportResponse,
     HeldListResponse,
     HeldManagementActionResponse,
+    HeldReevaluateResponse,
     NextSourceRequest,
     NextSourceResponse,
     ReimportDownloadResponse,
@@ -554,6 +555,23 @@ async def list_held(
         current_user.id, current_user.role, release_group_mbid
     )
     return HeldListResponse(items=[_held_to_response(h) for h in held])
+
+
+@router.post("/held/reevaluate", response_model=HeldReevaluateResponse)
+async def reevaluate_fingerprint_holds(
+    current_user: CurrentAdminDep,
+    service=Depends(get_download_service),
+):
+    """Re-check ``fingerprint_mismatch`` holds and import the ones that now pass.
+
+    Clears the backlog left by the old single-MBID AcoustID comparison, which held
+    correct files whenever the wanted recording entity was not the first one AcoustID
+    listed. Genuine mismatches stay held.
+    """
+    counts = await service.reevaluate_fingerprint_holds(
+        current_user.id, current_user.role
+    )
+    return HeldReevaluateResponse(**counts)
 
 
 @router.post(

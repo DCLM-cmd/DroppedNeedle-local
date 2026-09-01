@@ -3,9 +3,69 @@ import heapq
 import itertools
 import math
 import time
-from typing import Optional
+from collections import OrderedDict
+from typing import Callable, Generic, Optional, TypeVar
 
 EPSILON = 1e-9
+
+_T = TypeVar("_T")
+
+
+class BoundedTTLMap(Generic[_T]):
+    """Per-client state keyed by identity, bounded in both age and count.
+
+    A rate limiter that keys by client needs somewhere to keep one bucket per
+    client, and that map is itself an attack surface - unbounded, a stream of
+    fresh identities grows it forever. Entries expire after ``ttl_seconds`` idle
+    and the oldest is evicted past ``max_entries``; evicting a bucket only
+    refills that client's allowance, so the failure mode is leniency, never a
+    wrongly-rejected request."""
+
+    def __init__(
+        self,
+        *,
+        max_entries: int,
+        ttl_seconds: float,
+        factory: Callable[[], _T],
+        clock: Callable[[], float],
+    ) -> None:
+        self._max_entries = max_entries
+        self._ttl_seconds = ttl_seconds
+        self._factory = factory
+        self._clock = clock
+        self._items: OrderedDict[str, tuple[float, _T]] = OrderedDict()
+
+    def get(self, key: str) -> _T:
+        now = self._clock()
+        self._evict_expired(now)
+        current = self._items.pop(key, None)
+        value = current[1] if current else self._factory()
+        self._items[key] = (now, value)
+        if len(self._items) > self._max_entries:
+            self._items.popitem(last=False)
+        return value
+
+    def discard(self, key: str) -> None:
+        self._items.pop(key, None)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def _evict_expired(self, now: float) -> None:
+        cutoff = now - self._ttl_seconds
+        while self._items:
+            _, (last_seen, _) = next(iter(self._items.items()))
+            if last_seen > cutoff:
+                break
+            self._items.popitem(last=False)
+
+    def __len__(self) -> int:
+        self._evict_expired(self._clock())
+        return len(self._items)
+
+    def keys(self) -> tuple[str, ...]:
+        self._evict_expired(self._clock())
+        return tuple(self._items)
 
 
 class TokenBucketRateLimiter:
