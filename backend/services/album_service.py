@@ -1088,6 +1088,13 @@ class AlbumService:
         Precedence is a valid manual pin, explicit stored album identity, the closest
         media count for one active local album, then the existing release ranking.
         Inferred choices never become owned identification evidence.
+
+        A stored identity naming a CENSORED release is the one thing that does not
+        carry: owning the clean cut is how the library ends up asking for the clean
+        cut forever, which is the loop that put "Long Term Effects of SUFFERING" in
+        as its clean edition and kept it there. That identity was written by the
+        automatic importer, not chosen, so it loses to the ranking - while a manual
+        PIN still wins, because asking for the clean cut on purpose is legitimate.
         """
         releases = release_group.get("releases") or release_group.get(
             "release-list", []
@@ -1113,13 +1120,34 @@ class AlbumService:
 
         if pinned in release_ids:
             return pinned, owned, pinned
-        if owned in release_ids:
+        if owned in release_ids and not self._is_superseded_clean_edition(
+            owned, releases, ranked_releases
+        ):
             return owned, owned, pinned
         if file_count is not None:
             inferred = self._closest_release_id(ranked_releases, file_count)
             if inferred:
                 return inferred, owned, pinned
         return (ranked_ids[0] if ranked_ids else None), owned, pinned
+
+    @staticmethod
+    def _is_superseded_clean_edition(
+        release_id: str | None, releases: list[dict], ranked_releases: list[dict]
+    ) -> bool:
+        """Whether this release is a censored cut that an uncensored one replaces.
+
+        Only true when an alternative actually exists: a release group whose ONLY
+        release is the clean one still resolves to it, because refusing to name
+        any edition would leave the album unidentifiable rather than uncensored.
+        """
+        if not release_id:
+            return False
+        match = next(
+            (r for r in releases if str(r.get("id") or "") == str(release_id)), None
+        )
+        if match is None or not is_clean_release(match):
+            return False
+        return any(not is_clean_release(r) for r in ranked_releases)
 
     async def _pinned_release_id(self, release_group_id: str) -> str | None:
         if self._release_pins is None:

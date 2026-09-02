@@ -72,3 +72,58 @@ def test_prose_is_not_an_edition_marker():
     assert edition_rating("uncleaned tape source") == RATING_UNMARKED
     assert edition_rating("remastered") == RATING_UNMARKED
     assert is_clean_release({"disambiguation": "remastered"}) is False
+
+
+# --- an owned clean edition must not pin itself forever ----------------------
+
+from services.album_service import AlbumService
+
+_CLEAN = {
+    "id": "020fc885-d505-4ee6-9bd0-dbe0c0b1cf82",
+    "title": "Long Term Effects of SUFFERING",
+    "status": "Official",
+    "disambiguation": "clean",
+    "country": "XW",
+}
+_EXPLICIT = {
+    "id": "4c5084cc-2302-4f0d-93e5-875f343b4219",
+    "title": "Long Term Effects of SUFFERING",
+    "status": "Official",
+    "disambiguation": "explicit",
+    "country": "XW",
+}
+
+
+def test_an_owned_clean_edition_yields_to_the_explicit_one():
+    """Owning the clean cut is how the library asks for it forever."""
+    releases = [_CLEAN, _EXPLICIT]
+
+    assert AlbumService._is_superseded_clean_edition(
+        _CLEAN["id"], releases, get_ranked_releases({"releases": releases})
+    )
+
+
+def test_an_owned_explicit_edition_is_never_superseded():
+    releases = [_CLEAN, _EXPLICIT]
+
+    assert not AlbumService._is_superseded_clean_edition(
+        _EXPLICIT["id"], releases, get_ranked_releases({"releases": releases})
+    )
+
+
+def test_a_clean_only_release_group_still_resolves_to_its_clean_release():
+    """Refusing to name any edition leaves the album unidentifiable, not clean."""
+    releases = [_CLEAN]
+
+    assert not AlbumService._is_superseded_clean_edition(
+        _CLEAN["id"], releases, get_ranked_releases({"releases": releases})
+    )
+
+
+def test_an_unknown_release_id_is_not_treated_as_clean():
+    releases = [_CLEAN, _EXPLICIT]
+
+    assert not AlbumService._is_superseded_clean_edition(
+        "ffffffff-0000-0000-0000-000000000000", releases, releases
+    )
+    assert not AlbumService._is_superseded_clean_edition(None, releases, releases)
