@@ -1,5 +1,47 @@
 from typing import Optional
 from api.v1.schemas.album import Track
+from services.native.edition_suffix import (
+    RATING_CLEAN,
+    RATING_EXPLICIT,
+    edition_rating,
+)
+
+EXPLICIT_RANK_EXPLICIT = 0
+EXPLICIT_RANK_UNMARKED = 1
+EXPLICIT_RANK_CLEAN = 2
+
+_RANK_BY_RATING = {
+    RATING_EXPLICIT: EXPLICIT_RANK_EXPLICIT,
+    RATING_CLEAN: EXPLICIT_RANK_CLEAN,
+}
+
+
+def release_edition_rating(release: dict) -> str:
+    """MusicBrainz marks a censored cut on the RELEASE, by convention in the
+    disambiguation comment ("clean" / "explicit"); some editors put it in the
+    title instead. Both are checked."""
+    return edition_rating(release.get("disambiguation"), release.get("title"))
+
+
+def explicit_rank(release: dict) -> int:
+    """Sort rank for a release's edition: explicit first, censored last.
+
+    A release group routinely holds a clean and an explicit cut of the same
+    record, identical in title, country and format. Nothing else in the sort key
+    separated them, so the choice fell to the lexicographic MBID tiebreak - which
+    handed "Long Term Effects of SUFFERING" its CLEAN edition purely because
+    020fc885 sorts before 4c5084cc. Ranking the edition makes that deterministic
+    and right instead of alphabetical.
+
+    An unmarked release sits between the two: it is usually the original, and
+    demoting it below a known-clean cut would be worse than leaving it alone.
+    """
+    return _RANK_BY_RATING.get(release_edition_rating(release), EXPLICIT_RANK_UNMARKED)
+
+
+def is_clean_release(release: dict) -> bool:
+    """Whether this release is a censored cut, by MusicBrainz's own marking."""
+    return release_edition_rating(release) == RATING_CLEAN
 
 
 def parse_year(date_str: Optional[str]) -> Optional[int]:
@@ -24,6 +66,12 @@ def get_ranked_releases(release_group: dict) -> list[dict]:
     separately under one EP. Ranking on format/country alone leaves those tied,
     falling back to comparing MBIDs lexicographically - arbitrary, and just as
     likely to land on the partial release as the complete one.
+
+    The EDITION is ranked next (``explicit_rank``): a clean and an explicit cut
+    of the same record agree on title, country and format, so without this the
+    lexicographic tiebreak decided which one the library got. Edition outranks
+    format deliberately - a censored tracklist is the wrong music, whereas a
+    physical pressing is merely a less convenient source of the right music.
     """
     releases = release_group.get("releases") or release_group.get("release-list", [])
     official = [r for r in releases if r.get("status") == "Official"]
@@ -32,7 +80,7 @@ def get_ranked_releases(release_group: dict) -> list[dict]:
 
     group_title = (release_group.get("title") or "").strip().casefold()
 
-    def _release_sort_key(r: dict) -> tuple[int, int, str]:
+    def _release_sort_key(r: dict) -> tuple[int, int, int, str]:
         title_rank = 0 if (r.get("title") or "").strip().casefold() == group_title else 1
         country = (r.get("country") or "").upper()
         packaging = (r.get("packaging") or "").lower()
@@ -43,7 +91,7 @@ def get_ranked_releases(release_group: dict) -> list[dict]:
             rank = 2
         else:
             rank = 1
-        return (title_rank, rank, r.get("id", ""))
+        return (title_rank, explicit_rank(r), rank, r.get("id", ""))
 
     official.sort(key=_release_sort_key)
     return official

@@ -37,6 +37,11 @@ from models.acquisition_quality import (
     QualityReason,
 )
 from services.native.acquisition import quality as acq_quality
+from services.native.edition_suffix import (
+    RATING_CLEAN,
+    RATING_EXPLICIT,
+    edition_rating,
+)
 from services.native.quality_tiers import tier_rank
 from services.native.title_match import fold
 
@@ -80,6 +85,25 @@ _AVG_TRACK_SECONDS = 240.0  # fallback when MB gave no album duration
 
 # (The edition / wrong-product reject moved to the shared ``wrong_edition`` spec - M3 -
 # so the Soulseek path gets the identical hard reject.)
+
+
+def _edition_rank(title: str) -> int:
+    """Edition rank for the sort tie-breaker: 2 = explicit, 1 = unmarked, 0 = clean.
+
+    Sorted descending, so an uncensored cut wins a tie against the censored one
+    of the same record. Placed ABOVE ``final_score`` deliberately: sibling cuts
+    of one album score identically (all three candidates for "Long Term Effects
+    of SUFFERING" scored 0.7662), so a tie-breaker below the score would decide
+    nothing in exactly the case it exists for. It still sits below the quality
+    terms - the user's configured quality preference outranks edition, and this
+    can only reorder releases the quality gate already considers equivalent.
+    """
+    rating = edition_rating(title)
+    if rating == RATING_EXPLICIT:
+        return 2
+    if rating == RATING_CLEAN:
+        return 0
+    return 1
 
 
 def _hires_rank(title: str) -> int:
@@ -258,14 +282,14 @@ class NewznabReleaseScorer:
             certainty = acq_quality.CERTAINTY_RANK[
                 evidence_.certainty if evidence_ else EvidenceCertainty.PARTIAL
             ]
+            title_ = cand.usenet_release.title if cand.usenet_release else ""
             return (
                 band_rank.get(cand.tier, 0),
                 -(step if step is not None else worst_step),
                 -certainty,
+                _edition_rank(title_),
                 cand.final_score,
-                _hires_rank(
-                    cand.usenet_release.title if cand.usenet_release else ""
-                ),
+                _hires_rank(title_),
             )
 
         scored.sort(key=_sort_key, reverse=True)

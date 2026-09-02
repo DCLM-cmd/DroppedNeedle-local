@@ -13,6 +13,7 @@ from services.preferences_service import PreferencesService
 from services.album_utils import (
     find_primary_release,
     get_ranked_releases,
+    is_clean_release,
     extract_artist_info,
     extract_tracks,
     extract_label,
@@ -718,7 +719,15 @@ class AlbumService:
         selected_release_id, _owned, _pinned = await self._effective_release_id(
             canonical_rg_id, release_group
         )
-        ranked_ids = [r.get("id") for r in ranked_releases[:3] if r.get("id")]
+        # A censored cut is excluded from the FALLBACK chain, not merely ranked
+        # last: the fallbacks exist for when the preferred release cannot be
+        # fetched, and quietly answering with the clean edition there is the same
+        # wrong record arriving by a slower route. An explicitly pinned or
+        # already-owned release still stands - that is a decision, not a guess.
+        fallback = [r for r in ranked_releases[:3] if not is_clean_release(r)]
+        if not fallback:
+            fallback = ranked_releases[:1]
+        ranked_ids = [r.get("id") for r in fallback if r.get("id")]
         candidate_ids = list(
             dict.fromkeys(rid for rid in (selected_release_id, *ranked_ids) if rid)
         )

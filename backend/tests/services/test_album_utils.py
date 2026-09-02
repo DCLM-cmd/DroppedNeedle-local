@@ -1,4 +1,12 @@
-from services.album_utils import extract_tracks
+from services.album_utils import (
+    EXPLICIT_RANK_CLEAN,
+    EXPLICIT_RANK_EXPLICIT,
+    EXPLICIT_RANK_UNMARKED,
+    explicit_rank,
+    extract_tracks,
+    get_ranked_releases,
+    is_clean_release,
+)
 
 
 def test_extract_tracks_preserves_disc_numbers_and_track_positions():
@@ -73,3 +81,93 @@ def test_extract_tracks_prefers_exact_release_track_title():
     tracks, _total_length = extract_tracks(release_data)
 
     assert tracks[0].title == "The Fisherman Will Be Bewildered"
+
+
+# --- edition ranking: explicit over clean -----------------------------------
+# Real case: $uicideboy$ "Long Term Effects of SUFFERING" holds a clean and an
+# explicit cut, identical in title, status and country. Nothing but the
+# lexicographic MBID tiebreak separated them, and 020fc885 (clean) sorts before
+# 4c5084cc (explicit) - so the library was handed the censored record.
+
+_LTEOS = {
+    "title": "Long Term Effects of SUFFERING",
+    "releases": [
+        {
+            "id": "4c5084cc-2302-4f0d-93e5-875f343b4219",
+            "title": "Long Term Effects of SUFFERING",
+            "status": "Official",
+            "disambiguation": "explicit",
+            "country": "XW",
+        },
+        {
+            "id": "020fc885-d505-4ee6-9bd0-dbe0c0b1cf82",
+            "title": "Long Term Effects of SUFFERING",
+            "status": "Official",
+            "disambiguation": "clean",
+            "country": "XW",
+        },
+        {
+            "id": "da707ecd-764a-4082-af00-a0f4b603030f",
+            "title": "Long Term Effects of SUFFERING",
+            "status": "Official",
+            "disambiguation": "",
+            "country": "US",
+        },
+    ],
+}
+
+
+def test_explicit_release_outranks_the_clean_cut_of_the_same_record():
+    ranked = get_ranked_releases(_LTEOS)
+
+    assert ranked[0]["disambiguation"] == "explicit"
+    assert ranked[-1]["disambiguation"] == "clean"
+
+
+def test_an_unmarked_release_sits_between_explicit_and_clean():
+    """Usually the original cut; demoting it below a known-clean one is worse."""
+    ranked = [r["disambiguation"] for r in get_ranked_releases(_LTEOS)]
+
+    assert ranked == ["explicit", "", "clean"]
+
+
+def test_edition_outranks_format_so_a_censored_digital_cut_never_wins():
+    group = {
+        "title": "Record",
+        "releases": [
+            {
+                "id": "aaaa1111-0000-0000-0000-000000000000",
+                "title": "Record",
+                "status": "Official",
+                "disambiguation": "clean",
+                "country": "XW",
+            },
+            {
+                "id": "bbbb2222-0000-0000-0000-000000000000",
+                "title": "Record",
+                "status": "Official",
+                "disambiguation": "explicit",
+                "packaging": "Gatefold Cover",
+                "country": "DE",
+            },
+        ],
+    }
+
+    assert get_ranked_releases(group)[0]["disambiguation"] == "explicit"
+
+
+def test_markers_match_whole_words_only():
+    """'explicit' inside prose, or a 'cleaned-up' comment, is not an edition."""
+    assert explicit_rank({"disambiguation": "remastered"}) == EXPLICIT_RANK_UNMARKED
+    assert explicit_rank({"disambiguation": "uncleaned tape source"}) == (
+        EXPLICIT_RANK_UNMARKED
+    )
+    assert explicit_rank({"disambiguation": "clean"}) == EXPLICIT_RANK_CLEAN
+    assert explicit_rank({"title": "Album (Clean Version)"}) == EXPLICIT_RANK_CLEAN
+    assert explicit_rank({"disambiguation": "uncensored"}) == EXPLICIT_RANK_EXPLICIT
+
+
+def test_is_clean_release_names_only_the_censored_cut():
+    assert is_clean_release({"disambiguation": "clean"}) is True
+    assert is_clean_release({"disambiguation": "explicit"}) is False
+    assert is_clean_release({"disambiguation": ""}) is False

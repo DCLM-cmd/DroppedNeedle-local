@@ -55,6 +55,11 @@ from services.native.acquisition.decision import (
     SpecPolicy,
 )
 from services.native.acquisition.specs.quarantine import quarantine
+from services.native.edition_suffix import (
+    RATING_CLEAN,
+    RATING_EXPLICIT,
+    edition_rating,
+)
 from services.native.title_match import (
     artist_evidence,
     names_different_album,
@@ -81,6 +86,18 @@ _VERSION_MARKERS = re.compile(
     r"\b(remix|live|acoustic|instrumental|demo|radio edit|karaoke|cover|commentary)\b",
     re.IGNORECASE,
 )
+
+
+def _edition_rank(text: str) -> int:
+    """Edition rank for the sort tie-breaker: 2 = explicit, 1 = unmarked,
+    0 = clean. Same scale and same vocabulary as the Usenet lane, so a folder
+    named "...(Clean)" loses to the uncensored cut on either source."""
+    rating = edition_rating(text)
+    if rating == RATING_EXPLICIT:
+        return 2
+    if rating == RATING_CLEAN:
+        return 0
+    return 1
 _CJK_RANGES = (
     (0x4E00, 0x9FFF),  # CJK Unified Ideographs
     (0x3040, 0x309F),  # Hiragana
@@ -586,6 +603,11 @@ class AlbumPreflightScorer:
                 -(step if step is not None else worst_step),
                 -acq_quality.CERTAINTY_RANK[certainty],
                 -(dist if dist is not None else -1),
+                # Explicit over censored, at the same rung as the Usenet lane so
+                # the two sources cannot disagree about which cut is wanted. A
+                # clean folder is different music, not lesser music, so this
+                # outranks availability and score; quality still outranks it.
+                _edition_rank(candidate.parent_directory or ""),
                 # Availability tuple and identity score are already
                 # bigger-is-better for the descending comparison.
                 *_availability_key(candidate),
