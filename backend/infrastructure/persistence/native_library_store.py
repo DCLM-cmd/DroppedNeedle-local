@@ -740,32 +740,82 @@ def _local_album_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     ]
 
 
-def _tables_referencing_local_tracks(conn: sqlite3.Connection) -> list[str]:
-    """Every table with a foreign key onto ``local_tracks``, read from the schema."""
+def _foreign_keys_onto(
+    conn: sqlite3.Connection, parent: str
+) -> list[tuple[str, list[tuple[str, str]]]]:
+    """``(child_table, [(child_column, parent_column), ...])`` per foreign key onto
+    ``parent``. Grouped by the constraint's own id so a COMPOSITE key stays one
+    edge - the management journal reaches its parents through (job, ordinal)
+    pairs, and matching those columns independently would name the wrong rows."""
+    edges: list[tuple[str, list[tuple[str, str]]]] = []
     tables = [
         str(row[0])
         for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' AND name <> 'local_tracks'"
+            "AND name NOT LIKE 'sqlite_%'"
         )
     ]
-    return [
-        table
-        for table in tables
-        if any(
-            str(fk[2]) == "local_tracks"
-            for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")')
+    default_parent_key = _primary_key_columns(conn, parent)
+    for table in tables:
+        grouped: dict[int, list[tuple[str, str]]] = {}
+        for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")'):
+            if str(fk[2]) != parent:
+                continue
+            # fk[4] is NULL when the key points at the parent's primary key.
+            parent_column = str(fk[4]) if fk[4] is not None else default_parent_key
+            grouped.setdefault(int(fk[0]), []).append((str(fk[3]), parent_column))
+        for pairs in grouped.values():
+            edges.append((table, pairs))
+    return edges
+
+
+def _primary_key_columns(conn: sqlite3.Connection, table: str) -> str:
+    """The table's first primary-key column, or ``rowid`` when it declares none."""
+    keyed = [row for row in conn.execute(f'PRAGMA table_info("{table}")') if row[5]]
+    if not keyed:
+        return "rowid"
+    return str(sorted(keyed, key=lambda row: row[5])[0][1])
+
+
+def _rows_to_destroy(
+    conn: sqlite3.Connection,
+    table: str,
+    rowids: list[int],
+    seen: set[tuple[str, tuple[int, ...]]],
+    order: list[tuple[str, list[int]]],
+) -> None:
+    """Append ``(table, rowids)`` groups in deletion order, DEEPEST FIRST.
+
+    A referencing row can itself be referenced - an identification attempt carries
+    evidence, a management plan item carries journal entries, an edition-conversion
+    target carries its local files - and a dozen of those links are ON DELETE
+    RESTRICT. Deleting only the tables that point AT ``local_tracks``, in whatever
+    order the schema happens to list them, therefore aborts on the first row some
+    OTHER table still holds. That is the "Internal Server Error" a user got when
+    they confirmed replacing an occupied import path. Walking the graph and
+    emitting children before their parents removes the whole derived subtree in an
+    order SQLite accepts, with no pragma and no hand-kept table list."""
+    key = (table, tuple(sorted(rowids)))
+    if not rowids or key in seen:
+        return
+    seen.add(key)
+    for child, pairs in _foreign_keys_onto(conn, table):
+        placeholders = ",".join("?" for _ in rowids)
+        match = " AND ".join(
+            f'child."{child_column}" = parent."{parent_column}"'
+            for child_column, parent_column in pairs
         )
-    ]
-
-
-def _local_track_columns(conn: sqlite3.Connection, table: str) -> list[str]:
-    """The columns of ``table`` that point at ``local_tracks``."""
-    return [
-        str(fk[3])
-        for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")')
-        if str(fk[2]) == "local_tracks"
-    ]
+        child_rowids = [
+            int(row[0])
+            for row in conn.execute(
+                f'SELECT DISTINCT child.rowid FROM "{child}" child '
+                f'JOIN "{table}" parent ON {match} '
+                f"WHERE parent.rowid IN ({placeholders})",
+                rowids,
+            )
+        ]
+        _rows_to_destroy(conn, child, child_rowids, seen, order)
+    order.append((table, rowids))
 
 
 # Rows that belong to the person using the library, not to the file. A recycled
@@ -7745,28 +7795,35 @@ class NativeLibraryStore(PersistenceBase):
         table behind would not degrade - it would abort the delete outright and leave
         the user stuck exactly where they asked to be unstuck.
 
+        The walk is RECURSIVE for the same reason. Several of those tables are
+        themselves referenced under RESTRICT, so clearing only the ones that name
+        ``local_tracks`` fails on whichever the schema happens to list first.
+
         Returns what was removed (path and per-table reference counts) so the caller
         can report it, or None when nothing occupied the destination.
         """
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
             row = connection.execute(
-                "SELECT id, file_path, file_format, file_size_bytes, title "
+                "SELECT rowid, id, file_path, file_format, file_size_bytes, title "
                 "FROM local_tracks WHERE file_path=?",
                 (file_path,),
             ).fetchone()
             if row is None:
                 return None
             track_id = str(row["id"])
+            order: list[tuple[str, list[int]]] = []
+            _rows_to_destroy(
+                connection, "local_tracks", [int(row["rowid"])], set(), order
+            )
             removed: dict[str, int] = {}
-            for table in _tables_referencing_local_tracks(connection):
-                for column in _local_track_columns(connection, table):
-                    cursor = connection.execute(
-                        f'DELETE FROM "{table}" WHERE "{column}" = ?', (track_id,)
-                    )
-                    if cursor.rowcount:
-                        removed[table] = removed.get(table, 0) + cursor.rowcount
-            connection.execute("DELETE FROM local_tracks WHERE id=?", (track_id,))
+            for table, rowids in order:
+                placeholders = ",".join("?" for _ in rowids)
+                cursor = connection.execute(
+                    f'DELETE FROM "{table}" WHERE rowid IN ({placeholders})', rowids
+                )
+                if cursor.rowcount and table != "local_tracks":
+                    removed[table] = removed.get(table, 0) + cursor.rowcount
             self._bump_catalog(connection)
             return {
                 "track_id": track_id,

@@ -107,5 +107,71 @@ async def test_restricting_references_go_too_rather_than_blocking_the_delete(
 
 
 @pytest.mark.asyncio
+async def test_a_reference_that_is_itself_referenced_goes_too(store, db_path):
+    """The reference chain is deeper than one hop, and every link RESTRICTs.
+
+    An identification attempt names the track; its evidence names the attempt.
+    Clearing only the tables that point AT ``local_tracks`` leaves the evidence
+    holding the attempt, and SQLite refuses the delete - which reached the user
+    as an Internal Server Error on "replace file".
+    """
+    with sqlite3.connect(db_path) as connection:
+        _seed(connection)
+        connection.execute(
+            "INSERT INTO library_identification_attempts(id,local_track_id,trigger,"
+            "input_tag_revision,input_policy_revision,input_file_revision,"
+            "input_identity_revision,matcher_version,state,terminal_reason_code,"
+            "candidate_count,degradation_flags_json,started_at,completed_at) "
+            "VALUES ('att-1','t-old','scan','r','r','r','r','v1','completed','OK',"
+            "0,'[]',1.0,1.0)"
+        )
+        connection.execute(
+            "INSERT INTO library_identification_evidence(id,attempt_id,candidate_key,"
+            "evidence_json,evidence_size_bytes,compacted,created_at) "
+            "VALUES ('ev-1','att-1','cand-1',X'7B7D',2,0,1.0)"
+        )
+
+    removed = await store.delete_track_by_file_path(_PATH)
+
+    assert removed["removed_references"]["library_identification_attempts"] == 1
+    assert removed["removed_references"]["library_identification_evidence"] == 1
+    with sqlite3.connect(db_path) as connection:
+        for table in (
+            "local_tracks",
+            "library_identification_attempts",
+            "library_identification_evidence",
+        ):
+            assert (
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            ), table
+
+
+@pytest.mark.asyncio
+async def test_other_tracks_references_survive_the_delete(store, db_path):
+    """The walk must follow the graph from THIS track, not empty the tables."""
+    with sqlite3.connect(db_path) as connection:
+        _seed(connection)
+        _seed(connection, track_id="t-keep", file_path="/music/Artist/other.mp3")
+        for attempt, track in (("att-1", "t-old"), ("att-2", "t-keep")):
+            connection.execute(
+                "INSERT INTO library_identification_attempts(id,local_track_id,trigger,"
+                "input_tag_revision,input_policy_revision,input_file_revision,"
+                "input_identity_revision,matcher_version,state,terminal_reason_code,"
+                "candidate_count,degradation_flags_json,started_at,completed_at) "
+                "VALUES (?,?,'scan','r','r','r','r','v1','completed','OK',0,'[]',1.0,1.0)",
+                (attempt, track),
+            )
+
+    await store.delete_track_by_file_path(_PATH)
+
+    with sqlite3.connect(db_path) as connection:
+        surviving = connection.execute(
+            "SELECT id FROM library_identification_attempts"
+        ).fetchall()
+        assert [row[0] for row in surviving] == ["att-2"]
+        assert connection.execute("SELECT COUNT(*) FROM local_tracks").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
 async def test_nothing_there_reports_nothing_removed(store):
     assert await store.delete_track_by_file_path("/music/absent.flac") is None
