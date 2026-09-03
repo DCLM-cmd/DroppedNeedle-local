@@ -15,6 +15,7 @@
 	let removing = $state(false);
 	let error = $state<string | null>(null);
 	let stopWanted = $state(true);
+	let blacklist = $state(false);
 	const removal = removeLibraryAlbum();
 
 	$effect(() => {
@@ -33,7 +34,7 @@
 		error = null;
 
 		try {
-			await removal.mutateAsync({ mbid: musicbrainzId, stopWanted });
+			await removal.mutateAsync({ mbid: musicbrainzId, stopWanted, blacklist });
 			await ondeleted();
 		} catch (e) {
 			error = e instanceof Error ? e.message : "Couldn't remove this album";
@@ -62,6 +63,22 @@
 				<span class="font-semibold">Stop the Wanted watcher</span>
 				<span class="mt-1 block text-base-content/65">
 					Uncheck this to keep looking for a replacement after the album is removed.
+				</span>
+			</span>
+		</label>
+
+		<label class="mt-2 flex cursor-pointer items-start gap-3 rounded-box bg-base-200 p-3 text-sm">
+			<input
+				type="checkbox"
+				class="checkbox checkbox-sm mt-0.5"
+				bind:checked={blacklist}
+				disabled={removing}
+			/>
+			<span>
+				<span class="font-semibold">Never accept this release again</span>
+				<span class="mt-1 block text-base-content/65">
+					Blocks whatever delivered this copy, so a later request picks a different source
+					instead of handing you the same files back.
 				</span>
 			</span>
 		</label>

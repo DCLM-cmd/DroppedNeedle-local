@@ -57,7 +57,7 @@ describe('album removal mutation', () => {
 		await mutation.onSuccess(data, input);
 
 		expect(mockDelete).toHaveBeenCalledWith(
-			'/api/v1/library/album/release-1?delete_files=true&stop_wanted=true'
+			'/api/v1/library/album/release-1?delete_files=true&stop_wanted=true&blacklist=false'
 		);
 		expect(mockRemoveMbid).toHaveBeenCalledWith('release-1');
 		expect(mockRemoveMbid).toHaveBeenCalledWith('rg-1');
@@ -67,6 +67,23 @@ describe('album removal mutation', () => {
 		);
 		expect(invalidateQueriesWithPersister).toHaveBeenCalledTimes(6);
 		expect(invalidateQueriesWithPersister).toHaveBeenCalledWith({ queryKey: ['wanted'] });
+	});
+
+	it('asks the server to blocklist the delivering source when opted in', async () => {
+		mockDelete.mockResolvedValueOnce({ success: true, id: 'release-1', removed_track_ids: [] });
+		const mutation = removeLibraryAlbum() as unknown as {
+			mutationFn: (input: {
+				mbid: string;
+				stopWanted: boolean;
+				blacklist: boolean;
+			}) => Promise<unknown>;
+		};
+
+		await mutation.mutationFn({ mbid: 'release-1', stopWanted: true, blacklist: true });
+
+		expect(mockDelete).toHaveBeenCalledWith(
+			'/api/v1/library/album/release-1?delete_files=true&stop_wanted=true&blacklist=true'
+		);
 	});
 
 	it('does not report cache housekeeping failures as removal failures', async () => {

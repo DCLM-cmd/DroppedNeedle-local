@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import FastAPI, HTTPException
 
+from core.exceptions import ValidationError
+
 from api.v1.routes.library_target import router
 from api.v1.schemas.edition_conversion import (
     EditionConversionPreviewResponse,
@@ -272,7 +274,7 @@ def test_admin_can_search_exact_releases_with_canonical_metadata(app: FastAPI) -
     from models.identification import ReleaseEdition, ReleaseEditionSearchPage
 
     override_user_auth(app, role="admin")
-    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1")
+    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1", role="admin")
     service = app.dependency_overrides[get_target_album_edition_finder_service]()
     service.search.return_value = (
         "Album",
@@ -314,7 +316,7 @@ def test_admin_can_search_exact_releases_with_canonical_metadata(app: FastAPI) -
 
 def test_target_album_removal_stops_watch_by_default(app: FastAPI) -> None:
     override_user_auth(app, role="admin")
-    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1")
+    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1", role="admin")
     writer = app.dependency_overrides[get_target_catalog_writer_service]()
     writer.provider_release_group_id.return_value = "rg-1"
     writer.remove_album.return_value = ["track-1"]
@@ -330,7 +332,7 @@ def test_target_album_removal_stops_watch_by_default(app: FastAPI) -> None:
 
 def test_target_album_removal_can_keep_watch(app: FastAPI) -> None:
     override_user_auth(app, role="admin")
-    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1")
+    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1", role="admin")
     writer = app.dependency_overrides[get_target_catalog_writer_service]()
     writer.provider_release_group_id.return_value = "rg-1"
     writer.remove_album.return_value = ["track-1"]
@@ -581,3 +583,91 @@ def test_target_library_route_inventory_is_complete() -> None:
         ("GET", "/library/tracks/{track_id}/tags"),
         ("POST", "/library/albums/{album_id}/rescan"),
     }
+
+
+def test_album_removal_does_not_blacklist_unless_asked(app: FastAPI) -> None:
+    override_user_auth(app, role="admin")
+    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1", role="admin")
+    writer = app.dependency_overrides[get_target_catalog_writer_service]()
+    writer.provider_release_group_id.return_value = "rg-1"
+    writer.remove_album.return_value = ["track-1"]
+    download_service = app.dependency_overrides[get_download_service]()
+
+    response = build_test_client(app).delete("/library/album/local-1")
+
+    assert response.status_code == 200
+    assert response.json()["blacklisted"] == 0
+    download_service.blacklist_album_source.assert_not_awaited()
+
+
+def test_album_removal_blacklists_the_delivering_source_on_request(
+    app: FastAPI,
+) -> None:
+    override_user_auth(app, role="admin")
+    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1", role="admin")
+    writer = app.dependency_overrides[get_target_catalog_writer_service]()
+    writer.provider_release_group_id.return_value = "rg-1"
+    writer.remove_album.return_value = ["track-1"]
+    download_service = app.dependency_overrides[get_download_service]()
+    download_service.blacklist_album_source.return_value = {
+        "blocked": 13,
+        "sources": ["usenet"],
+        "task_id": None,
+    }
+
+    response = build_test_client(app).delete("/library/album/local-1?blacklist=true")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["blacklisted"] == 13
+    assert body["blacklisted_sources"] == ["usenet"]
+    assert body["blacklist_skipped"] is None
+    download_service.blacklist_album_source.assert_awaited_once_with(
+        "rg-1", "admin-1", "admin", redownload=False
+    )
+
+
+def test_the_blacklist_is_written_after_the_purge_that_would_erase_it(
+    app: FastAPI,
+) -> None:
+    """purge_album_artifacts drops this album's blocklist rows, so blacklisting
+    first would delete exactly what the user asked to keep."""
+    override_user_auth(app, role="admin")
+    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1", role="admin")
+    writer = app.dependency_overrides[get_target_catalog_writer_service]()
+    writer.provider_release_group_id.return_value = "rg-1"
+    writer.remove_album.return_value = []
+    download_service = app.dependency_overrides[get_download_service]()
+    order: list[str] = []
+    download_service.purge_album_downloads.side_effect = lambda *_: order.append(
+        "purge"
+    )
+    download_service.blacklist_album_source.side_effect = lambda *_a, **_k: (
+        order.append("blacklist") or {"blocked": 1, "sources": ["usenet"]}
+    )
+
+    build_test_client(app).delete("/library/album/local-1?blacklist=true")
+
+    assert order == ["purge", "blacklist"]
+
+
+def test_a_removal_still_succeeds_when_no_source_can_be_named(app: FastAPI) -> None:
+    """A scanned-in album was never downloaded; the files are already gone, so
+    reporting a removal that happened as one that failed would be a lie."""
+    override_user_auth(app, role="admin")
+    app.dependency_overrides[_get_current_admin] = lambda: SimpleNamespace(id="admin-1", role="admin")
+    writer = app.dependency_overrides[get_target_catalog_writer_service]()
+    writer.provider_release_group_id.return_value = "rg-1"
+    writer.remove_album.return_value = ["track-1"]
+    download_service = app.dependency_overrides[get_download_service]()
+    download_service.blacklist_album_source.side_effect = ValidationError(
+        "No completed download is on record for this album."
+    )
+
+    response = build_test_client(app).delete("/library/album/local-1?blacklist=true")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["blacklisted"] == 0
+    assert "No completed download" in body["blacklist_skipped"]

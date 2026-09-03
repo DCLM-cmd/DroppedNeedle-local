@@ -218,3 +218,9 @@ class TargetCatalogRemovalResponse(AppStruct):
     success: bool
     id: str
     removed_track_ids: list[str] = []
+    # Blocklist entries written because the removal asked for it. ``blacklisted=0``
+    # with a ``blacklist_skipped`` reason means the sources could not be named -
+    # the removal itself still succeeded, so this reports rather than raises.
+    blacklisted: int = 0
+    blacklisted_sources: list[str] = []
+    blacklist_skipped: str | None = None

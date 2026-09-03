@@ -600,6 +600,7 @@ async def remove_target_album(
     wanted: WantedWatcherServiceDep,
     delete_files: bool = False,
     stop_wanted: bool = True,
+    blacklist: bool = False,
     download_service=Depends(get_download_service),
 ) -> TargetCatalogRemovalResponse:
     release_group_mbid = await writer.provider_release_group_id(album_id)
@@ -611,6 +612,28 @@ async def remove_target_album(
         await download_service.purge_album_downloads(cleanup_id)
     except Exception:  # noqa: BLE001 - removal already succeeded
         logger.warning("Target album removal download cleanup failed")
+    blacklisted = 0
+    blacklisted_sources: list[str] = []
+    blacklist_skipped: str | None = None
+    if blacklist:
+        # AFTER the purge on purpose: purge_album_artifacts drops this album's
+        # blocklist rows, so blacklisting first would delete what we just wrote.
+        # Best-effort like every other post-removal step - the files are already
+        # gone, and failing the response now would report a removal that happened
+        # as one that didn't.
+        try:
+            outcome = await download_service.blacklist_album_source(
+                cleanup_id, admin.id, admin.role, redownload=False
+            )
+            blacklisted = int(outcome.get("blocked", 0))
+            blacklisted_sources = list(outcome.get("sources", []))
+        except ValidationError as exc:
+            # Nothing on record to blacklist: scanned-in album, or the search
+            # results that named the source have already been pruned.
+            blacklist_skipped = str(exc)
+        except Exception:  # noqa: BLE001 - removal already succeeded
+            blacklist_skipped = "The blocklist could not be updated."
+            logger.warning("Target album removal blacklist failed")
     if release_group_mbid:
         try:
             if stop_wanted:
@@ -620,7 +643,12 @@ async def remove_target_album(
         except Exception:  # noqa: BLE001 - removal already succeeded
             logger.warning("Target album removal wanted-state cleanup failed")
     return TargetCatalogRemovalResponse(
-        success=True, id=album_id, removed_track_ids=removed
+        success=True,
+        id=album_id,
+        removed_track_ids=removed,
+        blacklisted=blacklisted,
+        blacklisted_sources=blacklisted_sources,
+        blacklist_skipped=blacklist_skipped,
     )
 
 

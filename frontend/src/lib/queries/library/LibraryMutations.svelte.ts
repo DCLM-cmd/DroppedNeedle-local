@@ -20,9 +20,18 @@ import type {
 
 export function removeLibraryAlbum() {
 	return createMutation(() => ({
-		mutationFn: ({ mbid, stopWanted }: { mbid: string; stopWanted: boolean }) =>
+		mutationFn: ({
+			mbid,
+			stopWanted,
+			blacklist = false
+		}: {
+			mbid: string;
+			stopWanted: boolean;
+			blacklist?: boolean;
+		}) =>
 			api.global.delete<AlbumRemoveResponse | TargetCatalogRemovalResponse>(
-				`${API.library.removeAlbum(mbid)}?delete_files=true&stop_wanted=${stopWanted}`
+				`${API.library.removeAlbum(mbid)}?delete_files=true&stop_wanted=${stopWanted}` +
+					`&blacklist=${blacklist}`
 			),
 		onSuccess: async (result, { mbid: requestedMbid }) => {
 			const responseMbids =

@@ -1996,6 +1996,9 @@ export interface TargetCatalogRemovalResponse {
 	success: boolean;
 	id: string;
 	removed_track_ids: string[];
+	blacklisted?: number;
+	blacklisted_sources?: string[];
+	blacklist_skipped?: string | null;
 }
 
 export interface AlbumEditionItem {
