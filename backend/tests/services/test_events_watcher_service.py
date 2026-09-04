@@ -8,6 +8,7 @@ caching + 7-day TTL, stale-row deletion, supersede-delete, disabled-source row
 retention, error cursors, and the badge-only SSE fan-out."""
 
 import threading
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -48,6 +49,14 @@ ARTIST = DistinctFollowedArtist(
 )
 
 
+# Every sweep prunes events older than _PRUNE_GRACE_DAYS, so a HARDCODED sample date
+# turns this suite red the moment the calendar passes it - which is what happened
+# once 2026-08-28 fell out of the two-day grace window. Anchor the samples ahead of
+# today instead; the assertions care that the date round-trips, never what it is.
+_EVENT_DAY = (date.today() + timedelta(days=30)).isoformat()
+_NEXT_DAY = (date.today() + timedelta(days=31)).isoformat()
+
+
 def _attraction(id: str, name: str, mbids: list[str] | None = None) -> TmAttraction:
     links = {"musicbrainz": [TmExternalId(id=m) for m in mbids]} if mbids else None
     return TmAttraction(id=id, name=name, external_links=links)
@@ -55,7 +64,7 @@ def _attraction(id: str, name: str, mbids: list[str] | None = None) -> TmAttract
 
 def _tm_event(
     event_id: str = "tm-1",
-    local_date: str | None = "2026-08-28",
+    local_date: str | None = _EVENT_DAY,
     status: str = "onsale",
     venue_name: str = "Little John's Farm",
     lat: str | None = "51.456062",
@@ -66,7 +75,7 @@ def _tm_event(
         name="Reading Festival",
         url="https://www.ticketmaster.co.uk/x",
         dates=TmDates(
-            start=TmDateStart(local_date=local_date, date_time="2026-08-28T08:30:00Z"),
+            start=TmDateStart(local_date=local_date, date_time=f"{_EVENT_DAY}T08:30:00Z"),
             status=TmDateStatus(code=status),
         ),
         embedded=TmEventEmbedded(
@@ -84,7 +93,7 @@ def _tm_event(
 
 def _sk_event(
     event_id: str = "sk-1",
-    date: str | None = "2026-08-28",
+    date: str | None = _EVENT_DAY,
     cancelled: str = "0",
     venue_name: str = "Little Johns Farm",
     lat: float | None = 51.4561,
@@ -95,7 +104,7 @@ def _sk_event(
         id=event_id,
         eventname="Reading Festival",
         date=date,
-        startdate="2026-08-28T11:00:00+00:00",
+        startdate=f"{_EVENT_DAY}T11:00:00+00:00",
         cancelled=cancelled,
         link="https://www.skiddle.com/festivals/Reading/",
         ticket_url=ticket_url,
@@ -164,7 +173,7 @@ def test_pick_skiddle_ids_collects_duplicates_and_rejects_tribute():
 def test_map_tm_event_full_row():
     row = map_tm_event(_tm_event(), ARTIST, "mbid")
     assert row.source == "ticketmaster"
-    assert row.local_date == "2026-08-28"
+    assert row.local_date == _EVENT_DAY
     assert row.status == "scheduled"  # onsale normalizes to scheduled
     assert row.match_confidence == "mbid"
     assert row.city == "Reading"
@@ -205,7 +214,7 @@ def _row(source: str, event_id: str, **overrides) -> LiveEventInput:
         "artist_mbid_lower": MBID,
         "artist_name": ARTIST.artist_name,
         "event_name": "Reading Festival",
-        "local_date": "2026-08-28",
+        "local_date": _EVENT_DAY,
         "status": "scheduled",
         "match_confidence": "mbid" if source == "ticketmaster" else "name",
         "venue_name": "Little John's Farm",
@@ -253,7 +262,7 @@ def test_dedupe_keeps_distinct_gigs():
     kept = dedupe_across_sources(
         [
             _row("ticketmaster", "tm-1"),
-            _row("skiddle", "sk-1", local_date="2026-08-29"),  # different day
+            _row("skiddle", "sk-1", local_date=_NEXT_DAY),  # different day
             _row(
                 "skiddle",
                 "sk-2",

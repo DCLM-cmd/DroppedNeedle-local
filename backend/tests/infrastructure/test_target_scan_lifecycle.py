@@ -4,6 +4,7 @@ import asyncio
 import errno
 import logging
 import os
+import sys
 import sqlite3
 import threading
 import time
@@ -1970,6 +1971,7 @@ async def test_recover_stopping_is_idempotent_and_sets_cleanup(
 
 
 
+@pytest.mark.asyncio
 async def test_scheduler_anchor_is_not_hidden_by_many_policy_reconciliations(
     target_store: NativeLibraryStore, tmp_path: Path
 ) -> None:
@@ -3101,6 +3103,15 @@ async def test_control_exit_scope_diagnostic_is_not_permission_denied(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason=(
+        "APFS/HFS+ reject a filename that is not valid UTF-8, so the poisoned name "
+        "cannot be written at all - open() fails with EILSEQ before the scanner is "
+        "ever reached. There is no macOS behaviour to assert here; the surrogate "
+        "path this guards is a Linux filesystem concern and still runs there."
+    ),
+)
 async def test_non_utf8_filename_is_skipped_reported_and_never_poisons(
     target_store: NativeLibraryStore, tmp_path: Path
 ) -> None:
