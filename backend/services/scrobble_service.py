@@ -41,6 +41,33 @@ class ScrobbleService:
         self._plugin_host = plugin_host
         self._dedup_cache: dict[str, float] = {}
         self._plugin_tasks: set[asyncio.Task] = set()
+        self._forward_tasks: set[asyncio.Task] = set()
+
+    def _forward_in_background(
+        self, tasks: dict[str, Any], failure_msg: str
+    ) -> None:
+        """Run external now-playing/scrobble forwarding off the caller's request.
+
+        A compat client (Jellyfin/Subsonic) POSTs a play event and waits on a bare
+        204 - it never reads the per-service outcome. Awaiting Last.fm/ListenBrainz
+        inline therefore spent the client's whole request on a call whose result was
+        discarded, and one slow or DNS-stalled endpoint turned every Sessions/Playing
+        into a multi-second hang. The native REST route still awaits (it returns the
+        results), so this is reached only when a caller opts in.
+
+        Referenced in a set and cleared on completion so the loop keeps the task
+        alive; a failure is logged, never surfaced to the client that has gone.
+        """
+
+        async def _run() -> None:
+            try:
+                await self._gather_results(tasks, failure_msg)
+            except Exception:  # noqa: BLE001 - fire-and-forget must not raise onto the loop
+                logger.warning("Background %s", failure_msg, exc_info=True)
+
+        task = asyncio.create_task(_run())
+        self._forward_tasks.add(task)
+        task.add_done_callback(self._forward_tasks.discard)
 
     def _dispatch_to_plugins(self, request: ScrobbleRequest) -> None:
         """Fan the accepted play out to scrobbler plugins, fire-and-forget so a
@@ -87,7 +114,11 @@ class ScrobbleService:
                     del self._dedup_cache[k]
 
     async def report_now_playing(
-        self, request: NowPlayingRequest, *, user_id: str
+        self,
+        request: NowPlayingRequest,
+        *,
+        user_id: str,
+        forward_in_background: bool = False,
     ) -> ScrobbleResponse:
         prefs = await self._listening_prefs_store.get(user_id)
         if request.source == "navidrome" and prefs.navidrome_handles_external_scrobbles:
@@ -120,11 +151,19 @@ class ScrobbleService:
         if not tasks:
             return ScrobbleResponse(accepted=False, services={})
 
+        if forward_in_background:
+            self._forward_in_background(tasks, "Now playing report failed")
+            return ScrobbleResponse(accepted=True, services={})
+
         services, any_success = await self._gather_results(tasks, "Now playing report failed")
         return ScrobbleResponse(accepted=any_success, services=services)
 
     async def submit_scrobble(
-        self, request: ScrobbleRequest, *, user_id: str
+        self,
+        request: ScrobbleRequest,
+        *,
+        user_id: str,
+        forward_in_background: bool = False,
     ) -> ScrobbleResponse:
         dedup = self._dedup_key(
             user_id, request.artist_name, request.track_name, request.timestamp
@@ -192,6 +231,13 @@ class ScrobbleService:
 
         if not tasks:
             # no linked/enabled external account - the play is still recorded
+            return ScrobbleResponse(accepted=True, services={})
+
+        # The play is recorded locally ABOVE, synchronously, so a compat caller's
+        # recently-played still updates before the 204 - only the external
+        # forwarding, whose result the caller discards, moves off the request.
+        if forward_in_background:
+            self._forward_in_background(tasks, "Scrobble submission failed")
             return ScrobbleResponse(accepted=True, services={})
 
         # play is already recorded locally, so accepted=True regardless of the external

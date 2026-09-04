@@ -68,7 +68,9 @@ class CompatScrobbleAdapter:
             source=_norm_client(client),
             release_group_mbid=track.rg_mbid,
         )
-        result = await self._scrobble.report_now_playing(req, user_id=user_id)
+        result = await self._scrobble.report_now_playing(
+            req, user_id=user_id, forward_in_background=True
+        )
         await self._write_presence(
             track,
             user_id=user_id,
@@ -131,7 +133,9 @@ class CompatScrobbleAdapter:
             source=source,
             release_group_mbid=track.rg_mbid,
         )
-        result = await self._scrobble.submit_scrobble(req, user_id=user_id)
+        result = await self._scrobble.submit_scrobble(
+            req, user_id=user_id, forward_in_background=True
+        )
         if played_at is None:
             self._recent_submissions[dedup_key] = now
             while len(self._recent_submissions) > _MIXED_REPORT_DEDUP_MAX:

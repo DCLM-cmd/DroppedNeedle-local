@@ -174,3 +174,50 @@ async def test_progress_updates_presence_position(
     presence.update.assert_awaited_once()
     kw = presence.update.await_args.kwargs
     assert kw["progress_ms"] == 12345 and kw["is_paused"] is True
+
+
+async def test_compat_scrobble_does_not_block_on_slow_external_forwarding(
+    play_history_store, library_view_service, seeded_library, db_path
+):
+    """A Jellyfin/Subsonic play POST waits on a bare 204 and never reads the
+    per-service outcome, so a slow or DNS-stalled Last.fm/ListenBrainz must not be
+    spent on the client's request - while the local play is still recorded before
+    the call returns (recently-played updates immediately)."""
+    import asyncio
+
+    release = asyncio.Event()
+
+    class _SlowListenBrainz:
+        async def submit_single_listen(self, **_):
+            await release.wait()  # stands in for a multi-second external call
+
+    factory = AsyncMock()
+    factory.resolve_listenbrainz = AsyncMock(return_value=_SlowListenBrainz())
+    factory.resolve_lastfm = AsyncMock(return_value=None)
+    prefs = AsyncMock()
+    prefs.get = AsyncMock(
+        return_value=SimpleNamespace(
+            scrobble_to_lastfm=False,
+            scrobble_to_listenbrainz=True,
+            navidrome_handles_external_scrobbles=False,
+        )
+    )
+    service = ScrobbleService(
+        client_factory=factory,
+        listening_prefs_store=prefs,
+        play_history_store=play_history_store,
+    )
+    adapter = CompatScrobbleAdapter(service, library_view_service)
+    _db, _lm, ids = seeded_library
+
+    # Returns without waiting on the still-blocked external call...
+    resp = await asyncio.wait_for(
+        adapter.scrobble(ids["tracks"][0], user_id="user-alice", client="Finamp"),
+        timeout=1.0,
+    )
+    assert resp.accepted is True
+    # ...and the play is already on record.
+    assert len(_play_rows(db_path)) == 1
+
+    release.set()
+    await asyncio.gather(*service._forward_tasks)  # let the background task finish
