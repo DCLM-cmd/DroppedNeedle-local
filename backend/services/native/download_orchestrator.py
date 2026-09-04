@@ -1217,12 +1217,6 @@ class DownloadOrchestrator:
                     and not local_fault
                     and not attempt_import_fault
                 ):
-                    await strategy.maybe_blocklist_on_failure(
-                        task,
-                        status,
-                        completed=outcome == _OUT_COMPLETED,
-                        enumerated_any=enumerated > 0,
-                    )
                     # Peer-folder exhaustion (#255 defect 2): a CLEAN import (zero file
                     # failures of any kind) that still under-delivers means the shared
                     # folder simply LACKS tracks - per-file quarantine never fired, so
@@ -1230,12 +1224,24 @@ class DownloadOrchestrator:
                     # forever, re-downloading it each cycle. Block the PEER identity for
                     # this release-group; a manual re-request/retry still clears
                     # album-scoped rows (retry_task / request path semantics).
-                    if (
+                    folder_exhausted = (
                         task.source == "soulseek"
                         and not attempt_result.failed
                         and task.search_job_id is not None
                         and task.candidate_index is not None
-                    ):
+                    )
+                    # The two blocklists are alternatives, as that comment says in as
+                    # many words. Running both would ALSO pin a permanent per-file row
+                    # on a track the folder never held - blaming a file for not
+                    # existing, and keeping it blocked everywhere that peer appears.
+                    if not folder_exhausted:
+                        await strategy.maybe_blocklist_on_failure(
+                            task,
+                            status,
+                            completed=outcome == _OUT_COMPLETED,
+                            enumerated_any=enumerated > 0,
+                        )
+                    if folder_exhausted:
                         pool = await self._store.get_search_job_candidates(
                             task.search_job_id
                         )
