@@ -696,6 +696,14 @@ class LibraryInventoryScanner:
         )
         stopped = threading.Event()
         heartbeat = _WalkHeartbeat()
+        # The escape-out audit below compares a FULLY RESOLVED file path against the
+        # root, so the root has to be resolved the same way or the comparison is
+        # between two different spellings of the same directory. A library root
+        # reached through a symlink - /var/... on macOS, /home behind a bind mount,
+        # any operator-made shortcut - then makes EVERY file under it look like it
+        # escapes, and the whole scan reports SYMLINK_ESCAPE_OUT and indexes nothing.
+        # Reporting still uses the unresolved root: the walk yields paths under it.
+        resolved_root = root.resolve(strict=False)
 
         def producer() -> None:
             # F-022: unreadable directories are collected and reported instead
@@ -759,7 +767,7 @@ class LibraryInventoryScanner:
                         # path by design; escape-out links are audited below
                         # (E11: symlinks are never followed into the library).
                         resolved = path.resolve(strict=False)
-                        if not resolved.is_relative_to(root):
+                        if not resolved.is_relative_to(resolved_root):
                             skips.append(
                                 (
                                     LibraryInventoryScanner._text_safe_posix(
@@ -932,8 +940,11 @@ class LibraryInventoryScanner:
                 # discovery generation so discovered_count counts distinct
                 # files even when an alias batch lands after its target's.
                 resolved_path, stat_result = item
+                # Resolved path, resolved root: the producer yields fully resolved
+                # paths, so measuring them against the raw root fails outright wherever
+                # the root is reached through a symlink.
                 relative_key = PurePosixPath(
-                    *resolved_path.relative_to(root).parts
+                    *resolved_path.relative_to(resolved_root).parts
                 ).as_posix()
                 if relative_key in seen_relative_paths:
                     continue
@@ -1048,8 +1059,11 @@ class LibraryInventoryScanner:
         discovery_generation: int,
     ) -> ScanRun:
         raw: list[tuple[Path, str, os.stat_result, str]] = []
+        # The batch holds FULLY RESOLVED paths (the walk resolves in-root aliases onto
+        # their target), so the root it is measured against has to be resolved too.
+        resolved_root = root.resolve(strict=False)
         for path, stat in batch:
-            relative = PurePosixPath(*path.relative_to(root).parts).as_posix()
+            relative = PurePosixPath(*path.relative_to(resolved_root).parts).as_posix()
             raw.append((path, relative, stat, revision_from_stat(stat)))
         comparisons = await self._store.classify_scan_paths(
             scope.root_id,
