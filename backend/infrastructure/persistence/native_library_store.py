@@ -12090,6 +12090,81 @@ class NativeLibraryStore(PersistenceBase):
 
         return await super()._background_write(operation)
 
+    async def get_tag_read_failures(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], str]:
+        """The stat revision each of these files last failed a tag read at.
+
+        Absent from the mapping means "never failed, or failed at a revision that has
+        since been superseded" - either way, worth reading.
+        """
+        if not pairs:
+            return {}
+
+        def operation(connection: sqlite3.Connection) -> dict[tuple[str, str], str]:
+            found: dict[tuple[str, str], str] = {}
+            # Grouped by root so the lookup rides the primary key instead of a
+            # row-value IN, which SQLite cannot use an index for.
+            by_root: dict[str, list[str]] = {}
+            for root_id, relative_path in pairs:
+                by_root.setdefault(root_id, []).append(relative_path)
+            for root_id, relatives in by_root.items():
+                for start in range(0, len(relatives), 400):
+                    chunk = relatives[start : start + 400]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = connection.execute(
+                        "SELECT relative_path, stat_revision "
+                        "FROM library_tag_read_failures "
+                        f"WHERE root_id = ? AND relative_path IN ({placeholders})",
+                        [root_id, *chunk],
+                    ).fetchall()
+                    for row in rows:
+                        found[(root_id, str(row["relative_path"]))] = str(
+                            row["stat_revision"]
+                        )
+            return found
+
+        return await self._read(operation)
+
+    async def record_tag_read_failures(
+        self, rows: list[tuple[str, str, str, str]], *, now: float
+    ) -> None:
+        """Remember that these files failed a tag read at this stat revision.
+
+        Upsert, not INSERT OR IGNORE: a file that failed, changed, and failed again
+        must carry the NEW revision, or the retry it just earned is skipped forever.
+        """
+        if not rows:
+            return
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.executemany(
+                "INSERT INTO library_tag_read_failures "
+                "(root_id, relative_path, stat_revision, failure_code, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(root_id, relative_path) DO UPDATE SET "
+                "stat_revision = excluded.stat_revision, "
+                "failure_code = excluded.failure_code, "
+                "recorded_at = excluded.recorded_at",
+                [(*row, now) for row in rows],
+            )
+
+        return await super()._background_write(operation)
+
+    async def clear_tag_read_failures(self, pairs: list[tuple[str, str]]) -> None:
+        """Forget failures for files that have just been read successfully."""
+        if not pairs:
+            return
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.executemany(
+                "DELETE FROM library_tag_read_failures "
+                "WHERE root_id = ? AND relative_path = ?",
+                pairs,
+            )
+
+        return await super()._background_write(operation)
+
     async def list_scan_run_failures(
         self,
         run_id: str,

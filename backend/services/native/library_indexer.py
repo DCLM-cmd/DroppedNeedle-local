@@ -167,6 +167,18 @@ class LibraryIndexer:
                 "excluded": [],
             }
             last_checkpoint = time.monotonic()
+            # A file whose tags could not be read is re-read by every later scan
+            # unless we remember that it failed AND at which revision. Loaded per
+            # batch so an unchanged failure costs one lookup instead of a full,
+            # certain-to-fail read of the file.
+            remembered_failures = await self._store.get_tag_read_failures(
+                [
+                    (str(entry["root_id"]), str(entry["relative_path"]))
+                    for entry in batch
+                ]
+            )
+            tag_failures: list[tuple[str, str, str, str]] = []
+            tag_successes: list[tuple[str, str]] = []
             for item in batch:
                 if len(writes) >= TAG_BATCH_SIZE:
                     break
@@ -191,6 +203,27 @@ class LibraryIndexer:
                         item["comparison_result"] == "unchanged"
                     )
                     batch_counts["excluded"] += item["comparison_result"] == "excluded"
+                    continue
+                if (
+                    remembered_failures.get(key[0])
+                    == str(item["stat_revision"])
+                ):
+                    # Same bytes, same failure. Reading again cannot produce a
+                    # different answer, and on a library holding a few thousand
+                    # unreadable files that is the entire cost of every scan.
+                    # Still REPORTED as a failure: the row is what marks the item
+                    # processed, and without it the item stays pending and the
+                    # batch loop fetches it again forever.
+                    failures.append(
+                        self._failure_record(
+                            run.id, key[0], "TAG_READ_FAILED",
+                            detail=(
+                                "The tag read failed at this revision before; the "
+                                "file has not changed since."
+                            ),
+                        )
+                    )
+                    batch_counts["errored"] += 1
                     continue
                 try:
                     stable = await self._read_stable_tags(
@@ -231,6 +264,8 @@ class LibraryIndexer:
                     ):
                         return counts
                     batch_counts["indexed"] += 1
+                    if key[0] in remembered_failures:
+                        tag_successes.append(key[0])
                     if item["comparison_result"] == "new":
                         batch_counts["new"] += 1
                     elif item["comparison_result"] == "changed":
@@ -268,6 +303,14 @@ class LibraryIndexer:
                             error=error,
                         )
                     )
+                    # Deterministic: the bytes cannot be parsed, and will not start
+                    # parsing on their own. Remembered so the next scan skips it -
+                    # unlike a timeout or an exhausted read budget, which say nothing
+                    # about the file and must stay retryable.
+                    tag_failures.append(
+                        (key[0][0], key[0][1], str(item["stat_revision"]),
+                         "TAG_READ_FAILED")
+                    )
                     batch_counts["errored"] += 1
                 except OSError as error:
                     failures.append(
@@ -286,11 +329,23 @@ class LibraryIndexer:
                             error=error,
                         )
                     )
+                    # Deterministic: the bytes cannot be parsed, and will not start
+                    # parsing on their own. Remembered so the next scan skips it -
+                    # unlike a timeout or an exhausted read budget, which say nothing
+                    # about the file and must stay retryable.
+                    tag_failures.append(
+                        (key[0][0], key[0][1], str(item["stat_revision"]),
+                         "TAG_READ_FAILED")
+                    )
                     batch_counts["errored"] += 1
             if checkpoint is not None and not await checkpoint(
                 run.id, frozen_policy_revision
             ):
                 return counts
+            await self._store.record_tag_read_failures(
+                tag_failures, now=self._clock()
+            )
+            await self._store.clear_tag_read_failures(tag_successes)
             increments = {
                 "inspected_count": sum(
                     batch_counts[name]

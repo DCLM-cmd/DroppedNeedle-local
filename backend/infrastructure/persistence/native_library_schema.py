@@ -1359,6 +1359,21 @@ CREATE TABLE IF NOT EXISTS library_scan_failures (
     PRIMARY KEY(run_id, root_id, relative_path, phase, failure_code)
 );
 
+-- A tag read that failed, remembered ACROSS runs. Every other scan table hangs off
+-- library_scan_runs and dies with the run, so a file whose tags cannot be read was
+-- re-read from scratch by every later scan - forever, for as long as it sat there.
+-- Keyed by the file, holding the stat revision it failed AT: the moment the file
+-- changes the revision differs and the read is retried, which is the only thing that
+-- could make it succeed.
+CREATE TABLE IF NOT EXISTS library_tag_read_failures (
+    root_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    stat_revision TEXT NOT NULL,
+    failure_code TEXT NOT NULL,
+    recorded_at REAL NOT NULL,
+    PRIMARY KEY(root_id, relative_path)
+);
+
 CREATE TABLE IF NOT EXISTS library_scan_management_candidates (
     run_id TEXT NOT NULL REFERENCES library_scan_runs(id) ON DELETE CASCADE,
     local_album_id TEXT NOT NULL REFERENCES local_albums(id) ON DELETE CASCADE,
