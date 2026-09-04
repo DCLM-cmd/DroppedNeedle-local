@@ -127,8 +127,14 @@ class LibraryPrecacheService:
         max_timeout_s: float,
     ) -> None:
         start = time.time()
+        # Poll proportionally to what was CONFIGURED, not on a fixed 30s cadence. A
+        # stall timeout shorter than the poll interval could never be honoured inside
+        # it - the smallest configurable timeout still took 30s to notice, and one
+        # below that was undetectable in principle. Capped at 30s so a
+        # production-sized timeout (hours) keeps the same cheap cadence it had.
+        interval = min(30.0, max(0.05, min(stall_timeout_s, max_timeout_s) / 4))
         while not task.done():
-            await asyncio.sleep(30)
+            await asyncio.sleep(interval)
             elapsed = time.time() - start
             if elapsed > max_timeout_s:
                 msg = f"Sync exceeded maximum timeout ({max_timeout_s / 3600:.1f}h)"
