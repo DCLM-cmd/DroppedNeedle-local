@@ -17,11 +17,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from services.native import recycle_bin
+from services.native.library_filesystem_coordinator import remove_contained_directory
 from services.native.quality_tiers import tier_for, tier_rank
 
 if TYPE_CHECKING:
@@ -192,18 +193,10 @@ class LibraryHousekeepingService:
         def move() -> Path | None:
             if not path.is_file():
                 return None
-            stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(self._clock()))
-            destination = bin_path / f"{stamp}-duplicates" / path.name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            target = destination
-            suffix = 1
-            while target.exists():
-                target = destination.with_name(
-                    f"{destination.stem}-{suffix}{destination.suffix}"
-                )
-                suffix += 1
-            shutil.move(str(path), str(target))
-            return target
+            # Through the recycle bin's own mover (E44: it is the sanctioned writer
+            # for this, and its per-entry "<stamp>-<uuid>" directory already gives
+            # two files of the same name somewhere separate to land).
+            return recycle_bin.recycle(path, bin_path)
 
         try:
             return await asyncio.to_thread(move)
@@ -320,9 +313,9 @@ class LibraryHousekeepingService:
                     if self._holds_audio(current):
                         continue
                     try:
-                        shutil.rmtree(current)
+                        remove_contained_directory(resolved, current)
                         removed += 1
-                    except OSError:
+                    except (OSError, ValueError):
                         logger.warning(
                             "Could not remove the empty folder %s", current,
                             exc_info=True,
