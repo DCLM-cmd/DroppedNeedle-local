@@ -16,7 +16,9 @@ stay structurally identical to the protocol for the conformance contract test.
 
 import asyncio
 import logging
+import os
 import re
+import sys
 from collections.abc import Callable
 import unicodedata
 from datetime import datetime, timezone
@@ -46,6 +48,28 @@ _MAX_WALK_ENTRIES = 10_000
 def _normalised_filename(value: str) -> str:
     """Return the NFC form used for filename comparisons only."""
     return unicodedata.normalize("NFC", value)
+
+
+# APFS and HFS+ resolve a path THROUGH Unicode normalization: probing for the NFC
+# spelling opens a file stored as NFD. That silently turns the exact-spelling
+# phases into normalized lookups, so a differently-normalized file is answered
+# there instead of falling through to the alias phase - skipping the peer scoping
+# and the fail-closed ambiguity refusal that phase exists to provide. ext4 and its
+# peers compare bytes, so the check below is theirs for free.
+_FS_RESOLVES_UNICODE_ALIASES = sys.platform == "darwin"
+
+
+def _spelled_exactly_on_disk(path: Path) -> bool:
+    """Whether ``path``'s final component is the name the filesystem really stores.
+
+    Only pays for a directory read where the filesystem can lie about it.
+    """
+    if not _FS_RESOLVES_UNICODE_ALIASES:
+        return True
+    try:
+        return path.name in os.listdir(path.parent)
+    except OSError:
+        return False
 
 
 def _exact_transfer_path(value: str) -> str:
@@ -299,7 +323,7 @@ class SlskdRepository:
         """The exact filename in ``directory``, else its newest collision variant."""
         exact = directory / basename
         try:
-            if exact.exists():
+            if exact.exists() and _spelled_exactly_on_disk(exact):
                 return exact
         except OSError:
             return None
@@ -410,7 +434,7 @@ class SlskdRepository:
             candidate = _within_mount(directory / basename)
             if candidate is None:
                 return None
-            if candidate.is_file():
+            if candidate.is_file() and _spelled_exactly_on_disk(candidate):
                 return candidate
             picked = self._pick_in_dir(candidate.parent, basename)
             return picked.resolve() if picked is not None else None
