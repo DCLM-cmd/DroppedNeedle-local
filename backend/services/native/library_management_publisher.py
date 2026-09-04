@@ -3527,6 +3527,31 @@ class LibraryManagementPublisher:
             if value.source is not None and value.source != value.destination:
                 if self._hash_file(value.source) != value.source_fingerprint:
                     raise StaleRevisionError("A source changed before publication.")
+            # The normalized-sibling scan runs FIRST: it only ever fires for an
+            # entry whose name DIFFERS from the wanted one, so it cannot shadow a
+            # genuine occupant - but on a Unicode-folding filesystem that sibling IS
+            # the destination, and the generic check below would then answer the
+            # precise "a normalized destination" case with a vague one.
+            if value.destination != value.source and value.destination.parent.is_dir():
+                wanted = unicodedata.normalize("NFC", value.destination.name).casefold()
+                with os.scandir(value.destination.parent) as entries:
+                    for index, entry in enumerate(entries, start=1):
+                        if index > _MAX_DIRECTORY_COLLISION_ENTRIES:
+                            raise LibraryManagementDestinationConflictError(
+                                "A destination directory exceeds the collision limit."
+                            )
+                        if entry.name != value.destination.name and (
+                            unicodedata.normalize("NFC", entry.name).casefold()
+                            == wanted
+                        ):
+                            sibling = value.destination.parent / entry.name
+                            if sibling == value.source or sibling in recycled_sources:
+                                continue
+                            raise LibraryManagementDestinationConflictError(
+                                "A normalized destination was created after preview.",
+                                destination=str(sibling),
+                            )
+
             if value.journal.subject_kind in {"audio", "sidecar"}:
                 if (
                     value.destination != value.source
@@ -3551,26 +3576,6 @@ class LibraryManagementPublisher:
                 raise LibraryManagementDestinationConflictError(
                     "An artwork destination was created after preview."
                 )
-            if value.destination != value.source and value.destination.parent.is_dir():
-                wanted = unicodedata.normalize("NFC", value.destination.name).casefold()
-                with os.scandir(value.destination.parent) as entries:
-                    for index, entry in enumerate(entries, start=1):
-                        if index > _MAX_DIRECTORY_COLLISION_ENTRIES:
-                            raise LibraryManagementDestinationConflictError(
-                                "A destination directory exceeds the collision limit."
-                            )
-                        if entry.name != value.destination.name and (
-                            unicodedata.normalize("NFC", entry.name).casefold()
-                            == wanted
-                        ):
-                            sibling = value.destination.parent / entry.name
-                            if sibling == value.source or sibling in recycled_sources:
-                                continue
-                            raise LibraryManagementDestinationConflictError(
-                                "A normalized destination was created after preview.",
-                                destination=str(sibling),
-                            )
-
     async def _record_late_collisions(self, prepared: list[_PreparedMutation]) -> None:
         collisions = []
         now = self._clock()
@@ -3726,6 +3731,10 @@ class LibraryManagementPublisher:
             journal.temporary_relative_path,
             journal.destination_root_id,
             journal.destination_relative_path,
+            # A spelling-only rename finds its OWN source at the destination on a
+            # case-insensitive or Unicode-folding filesystem; that one occupant is
+            # expected, anything else is the external writer F-112 guards against.
+            permitted_occupant=value.source,
         )
         # F-179: durable directory entry before the published journal row.
         await asyncio.to_thread(self._fsync_directory, value.destination)

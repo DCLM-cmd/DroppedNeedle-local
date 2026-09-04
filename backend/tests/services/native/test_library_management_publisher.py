@@ -1,11 +1,13 @@
 import asyncio
 import errno
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import shutil
 import sqlite3
+import sys
 import unicodedata
 import stat
 from pathlib import Path, PurePosixPath
@@ -99,6 +101,21 @@ from tests.services.native.test_library_management_planner import (
     FIXTURES,
     _ArtworkRepository,
 )
+
+
+def _path_of_fd(fd: int) -> str:
+    """The path an open descriptor points at, on Linux AND on macOS.
+
+    ``/proc`` is Linux-only; macOS answers the same question through fcntl's
+    F_GETPATH. Without this the recording hooks below raise on a Mac, so the real
+    unlink/fsync they wrap never runs and the test reports a publisher defect that
+    is not there. The assertions stay identical on both platforms.
+    """
+    if sys.platform == "darwin":
+        return os.fsdecode(
+            fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b"\x00")
+        )
+    return os.readlink(f"/proc/self/fd/{fd}")
 
 
 def _update_profile(preferences, update: Callable) -> None:
@@ -3159,7 +3176,13 @@ async def test_publisher_fails_closed_on_nfd_normalized_sibling_directory(
 
     del caught
     assert source.is_file()
-    assert not (root / str(planned_relative)).exists()
+    # Compare directory ENTRIES, not Path.exists(): on a Unicode-folding filesystem
+    # the NFD twin this test planted answers .exists() for the NFC spelling, so the
+    # check could not tell it apart from a destination the publisher created. The
+    # entry name is the thing under test, exactly as in the case-only rename above.
+    assert planned_relative.name not in {
+        entry.name for entry in destination_parent.iterdir()
+    }
 
 
 @pytest.mark.asyncio
@@ -3176,7 +3199,7 @@ async def test_publish_logs_directory_fsync_failures_but_still_commits(
     def failing_directory_fsync(fd):
         if stat.S_ISDIR(os.fstat(fd).st_mode):
             try:
-                directory = os.readlink(f"/proc/self/fd/{fd}")
+                directory = _path_of_fd(fd)
             except OSError:
                 directory = ""
             if os.path.normpath(directory).startswith(music_root):
@@ -3219,7 +3242,7 @@ async def test_cleanup_fsyncs_source_parent_after_unlink(
         dir_fd = kwargs.get("dir_fd")
         if dir_fd is not None:
             target = os.path.join(
-                os.readlink(f"/proc/self/fd/{dir_fd}"), os.fspath(name)
+                _path_of_fd(dir_fd), os.fspath(name)
             )
         else:
             target = os.fspath(name)
@@ -3228,7 +3251,7 @@ async def test_cleanup_fsyncs_source_parent_after_unlink(
 
     def recording_fsync(fd):
         try:
-            path = os.readlink(f"/proc/self/fd/{fd}")
+            path = _path_of_fd(fd)
         except OSError:
             path = "<unknown>"
         events.append(("fsync", os.path.normpath(path)))

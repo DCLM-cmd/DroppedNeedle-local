@@ -12,6 +12,7 @@ import os
 import uuid
 from pathlib import Path
 from pathlib import PurePosixPath
+import shutil
 import stat
 
 from core.exceptions import LibraryManagementDestinationConflictError
@@ -33,6 +34,16 @@ try:
     _RENAMEAT2 = _LIBC.renameat2
 except AttributeError:
     _RENAMEAT2 = None
+# macOS exports no renameat2, but renameatx_np carries the same guarantee under a
+# different name: RENAME_EXCL fails with EEXIST rather than overwriting, and it
+# takes the same (fd, name, fd, name, flags) shape. Without it every publication on
+# a Mac fell through to plain os.replace - precisely the recheck-then-replace window
+# F-112 exists to close, left open on the one platform that had an answer for it.
+_RENAME_EXCL = 0x00000004
+try:
+    _RENAMEATX_NP = _LIBC.renameatx_np
+except AttributeError:
+    _RENAMEATX_NP = None
 
 
 class _RootLeaseState:
@@ -305,20 +316,42 @@ def _renameat2_noreplace(
 ) -> None:
     """renameat2(RENAME_NOREPLACE): fail with EEXIST instead of overwriting."""
 
-    if _RENAMEAT2 is None:
+    if _RENAMEAT2 is not None:
+        syscall, flag = _RENAMEAT2, _RENAME_NOREPLACE
+    elif _RENAMEATX_NP is not None:
+        syscall, flag = _RENAMEATX_NP, _RENAME_EXCL
+    else:
         raise OSError(
             errno.ENOSYS, os.strerror(errno.ENOSYS), os.fspath(new_name)
         )
-    result = _RENAMEAT2(
+    result = syscall(
         ctypes.c_int(old_dir_fd),
         ctypes.c_char_p(os.fsencode(old_name)),
         ctypes.c_int(new_dir_fd),
         ctypes.c_char_p(os.fsencode(new_name)),
-        ctypes.c_uint(_RENAME_NOREPLACE),
+        ctypes.c_uint(flag),
     )
     if result != 0:
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number), os.fspath(new_name))
+
+
+def _occupant_is_permitted(
+    destination: tuple[int, str], permitted: Path | None
+) -> bool:
+    """Whether whatever occupies ``destination`` is the file the caller expected.
+
+    Compared by inode, not by name: the whole reason EEXIST showed up is that the
+    filesystem folds two spellings onto one file, so names cannot answer this.
+    """
+    if permitted is None:
+        return False
+    try:
+        occupant = os.stat(destination[1], dir_fd=destination[0], follow_symlinks=False)
+        expected = os.stat(permitted, follow_symlinks=False)
+    except OSError:
+        return False
+    return (occupant.st_dev, occupant.st_ino) == (expected.st_dev, expected.st_ino)
 
 
 def replace_rooted_publication(
@@ -327,6 +360,8 @@ def replace_rooted_publication(
     source_relative_path: str,
     destination_root_id: str,
     destination_relative_path: str,
+    *,
+    permitted_occupant: Path | None = None,
 ) -> None:
     """Publish one staged temp onto its destination with a NOREPLACE backstop.
 
@@ -334,6 +369,13 @@ def replace_rooted_publication(
     out-of-model external writer's file. Unsupported platforms/filesystems
     fall back to plain os.replace (previous behavior); an existing destination
     becomes LibraryManagementDestinationConflictError.
+
+    ``permitted_occupant`` names the ONE file allowed to be sitting there already:
+    the mutation's own source. A case-insensitive or Unicode-folding filesystem
+    reports the destination as occupied by the very file being renamed, so without
+    this a rename that only changes spelling is indistinguishable from an external
+    writer - and refusing it makes "01 - ARIA.flac" -> "01 - Aria.flac" impossible
+    on exactly the filesystems that need it spelled out.
     """
 
     try:
@@ -351,9 +393,26 @@ def replace_rooted_publication(
                 )
             except OSError as error:
                 if error.errno == errno.EEXIST:
-                    raise LibraryManagementDestinationConflictError(
-                        "A management destination was created after preview."
-                    ) from error
+                    if not _occupant_is_permitted(destination, permitted_occupant):
+                        raise LibraryManagementDestinationConflictError(
+                            "A management destination was created after preview."
+                        ) from error
+                    # Unlink before renaming, rather than os.replace onto the
+                    # occupant: replacing keeps the EXISTING directory entry, so on a
+                    # case-folding filesystem "01 - ARIA.flac" stays ARIA no matter
+                    # what spelling was asked for - the rename reports success and
+                    # changes nothing. Removing the entry first makes the new name the
+                    # only one there is. Safe here and only here: the occupant has
+                    # just been proven to be this mutation's own source, which is
+                    # already staged and backed up.
+                    os.unlink(destination[1], dir_fd=destination[0])
+                    os.rename(
+                        source[1],
+                        destination[1],
+                        src_dir_fd=source[0],
+                        dst_dir_fd=destination[0],
+                    )
+                    return
                 if error.errno not in _NOREPLACE_UNSUPPORTED_ERRNOS:
                     raise
                 # renameat2 unsupported here: previous recheck-then-replace
@@ -515,3 +574,24 @@ def copy_rooted(
                         os.close(destination_fd)
             finally:
                 os.close(source_fd)
+
+
+def remove_contained_directory(root: Path, target: Path) -> None:
+    """Remove ``target`` and its remaining contents, refusing anything outside ``root``.
+
+    The organizer's empty-folder sweep decides WHICH folders no longer hold music;
+    the removal itself belongs here, with every other filesystem mutation, so the
+    E44 boundary keeps naming one place per primitive. Containment is re-checked
+    against the resolved paths rather than trusted from the caller, and the root
+    itself is never removable - a sweep that walked up out of the library would
+    otherwise take the library with it.
+    """
+    resolved_root = root.resolve()
+    resolved_target = target.resolve()
+    if resolved_target == resolved_root:
+        raise ValueError("A library root is not removable.")
+    if not resolved_target.is_relative_to(resolved_root):
+        raise ValueError("A directory removal escapes its library root.")
+    if resolved_target.is_symlink() or not resolved_target.is_dir():
+        raise ValueError("A directory removal target is not a directory.")
+    shutil.rmtree(resolved_target)
