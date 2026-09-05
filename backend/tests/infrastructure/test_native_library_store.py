@@ -3263,3 +3263,78 @@ async def test_begin_apply_rejects_settings_drift_in_transaction(
             current_settings_revision="settings-v1",
             current_policy_revision="pol-drifted",
         )
+
+
+def _album_at(album_id: str, title: str, imported_at: float) -> CatalogMembership:
+    """One album+track with an explicit id, title and import time, so a test can
+    make the id order and the title order DISAGREE within one imported_at tie."""
+    artist = _artist(f"artist-{album_id}", f"Artist {album_id}")
+    album = LocalAlbum(
+        id=album_id,
+        root_id="root-1",
+        grouping_key=f"group-{album_id}",
+        title=title,
+        album_artist_id=artist.id,
+        album_artist_name=artist.display_name,
+        created_at=1,
+        updated_at=1,
+    )
+    track = LocalTrack(
+        id=f"track-{album_id}",
+        local_album_id=album_id,
+        root_id="root-1",
+        file_path=f"/music/{album_id}.flac",
+        relative_path=f"{album_id}.flac",
+        path_hash=f"hash-{album_id}",
+        file_size_bytes=100,
+        file_mtime_ns=200,
+        stat_revision=f"stat-{album_id}",
+        title="t",
+        artist_name=artist.display_name,
+        album_title=title,
+        album_artist_name=artist.display_name,
+        file_format="flac",
+        imported_at=imported_at,
+    )
+    return CatalogMembership(
+        album=album,
+        artists=[artist],
+        tracks=[track],
+        track_credits={track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_recent_sort_breaks_imported_at_ties_by_title(store) -> None:
+    """A bulk import stamps many albums with the same whole-second imported_at.
+    A client asking for DateCreated,SortName re-sorts those ties by name, so the
+    server must break them by title too - breaking them by UUID put an album on
+    two pages of an offset scroll (the recently-added duplicates report)."""
+    # Same import second; id order (album-a, album-z) is the REVERSE of title order.
+    await store.create_catalog_membership(_album_at("album-a", "Zebra", imported_at=1000))
+    await store.create_catalog_membership(_album_at("album-z", "Apple", imported_at=1000))
+
+    rows, _ = await store.list_target_albums(sort="recent")
+    titles = [r["album_title"] for r in rows]
+
+    # Title tie-break, not id tie-break: Apple before Zebra despite album-z's id.
+    assert titles == ["Apple", "Zebra"]
+
+
+@pytest.mark.asyncio
+async def test_recent_sort_paging_never_repeats_an_album_across_a_tie(store) -> None:
+    """The concrete failure: offset paging over a tie group returned an album on
+    both pages. With a stable total order, page 1 and page 2 are disjoint."""
+    for i in range(6):
+        # all one import second, titles in an order unrelated to their ids
+        await store.create_catalog_membership(
+            _album_at(f"album-{i}", f"Title {5 - i}", imported_at=2000)
+        )
+
+    page1, _ = await store.list_target_albums(sort="recent", limit=3, offset=0)
+    page2, _ = await store.list_target_albums(sort="recent", limit=3, offset=3)
+    ids1 = {r["release_group_mbid"] for r in page1}
+    ids2 = {r["release_group_mbid"] for r in page2}
+
+    assert ids1.isdisjoint(ids2)
+    assert len(ids1) == 3 and len(ids2) == 3

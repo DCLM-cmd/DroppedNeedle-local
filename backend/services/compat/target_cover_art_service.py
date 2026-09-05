@@ -152,12 +152,18 @@ class TargetCoverArtService:
             stored = await self._store.get_image_blurhashes([identity])
             return identity, stored.get(identity)
         if provider_id:
-            return (
-                await self._provider.get_release_group_cover_etag(provider_id, size),
-                await self._provider.get_release_group_cover_blurhash(
-                    provider_id, size
-                ),
+            etag = await self._provider.get_release_group_cover_etag(provider_id, size)
+            blurhash = await self._provider.get_release_group_cover_blurhash(
+                provider_id, size
             )
+            # Advertise a STABLE tag even before the cover is cached. The etag is the
+            # cached content hash, so an un-warmed provider cover returned None here -
+            # the album DTO then carried no ImageTags, the client never requested
+            # /Images/Primary, and the cover that image endpoint would have fetched
+            # on demand stayed blank forever. A provider-backed album HAS a primary
+            # image; the placeholder tag (stable per release group) makes the client
+            # ask for it, and the real hash replaces it once warmed.
+            return etag or f"rg:{provider_id}", blurhash
         return None, None
 
     async def get_image_aspect_ratio(self, content_hash: str | None) -> float | None:

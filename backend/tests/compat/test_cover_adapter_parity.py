@@ -262,6 +262,55 @@ async def test_an_album_without_local_art_still_falls_back_to_the_provider() -> 
 
 
 @pytest.mark.asyncio
+async def test_an_uncached_provider_cover_still_advertises_a_stable_tag() -> None:
+    """A provider-backed album HAS a primary image, but its content hash exists
+    only once the cover has been fetched. Returning no tag until then left the
+    client never requesting /Images/Primary - which is what would have fetched it -
+    so the cover stayed blank forever. A stable placeholder tag breaks that loop;
+    the real hash replaces it once warmed."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    store = AsyncMock()
+    store.get_target_artwork_context = AsyncMock(return_value={"provider_id": "rg-42"})
+    local = AsyncMock()
+    local.read_identity = AsyncMock(return_value=None)
+    provider = SimpleNamespace(
+        get_release_group_cover_etag=AsyncMock(return_value=None),  # not warmed yet
+        get_release_group_cover_blurhash=AsyncMock(return_value=None),
+    )
+
+    adapter = TargetCoverArtService(store, provider, local)
+    tag, blurhash = await adapter.get_release_group_cover_image_info("album-1")
+
+    assert tag == "rg:rg-42"  # non-empty -> client will request the image
+    assert blurhash is None
+
+
+@pytest.mark.asyncio
+async def test_a_warmed_provider_cover_prefers_its_real_hash() -> None:
+    """Once warmed, the real content hash wins over the placeholder."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    store = AsyncMock()
+    store.get_target_artwork_context = AsyncMock(return_value={"provider_id": "rg-42"})
+    local = AsyncMock()
+    local.read_identity = AsyncMock(return_value=None)
+    provider = SimpleNamespace(
+        get_release_group_cover_etag=AsyncMock(return_value="real-hash"),
+        get_release_group_cover_blurhash=AsyncMock(return_value="blur"),
+    )
+
+    adapter = TargetCoverArtService(store, provider, local)
+
+    assert await adapter.get_release_group_cover_image_info("album-1") == (
+        "real-hash",
+        "blur",
+    )
+
+
+@pytest.mark.asyncio
 async def test_an_artist_without_a_picture_reports_neither_half() -> None:
     """A tag without its hash is what makes Finamp call the server misconfigured."""
     from types import SimpleNamespace

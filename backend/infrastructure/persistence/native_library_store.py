@@ -3187,8 +3187,17 @@ class NativeLibraryStore(PersistenceBase):
                 # fell back to the default - which is why sorting in Finamp always
                 # came back newest-first.
                 ordering = {
-                    "recent": "MAX(t.imported_at) DESC, a.id",
-                    "recent_asc": "MAX(t.imported_at) ASC, a.id",
+                    # Tie-break by title, not by id. A bulk import stamps many
+                    # albums with the SAME whole-second imported_at (139 of them sat
+                    # in one-second groups on the live library), and a client that
+                    # asked for "DateCreated,SortName" re-sorts those ties by name.
+                    # Breaking them by UUID here disagreed with that, so offset
+                    # paging over two requests put an album on both pages - the
+                    # "recently added shows duplicates" report. title_folded matches
+                    # the client's SortName tie-break; a.id stays as the final
+                    # deterministic backstop for identical titles.
+                    "recent": "MAX(t.imported_at) DESC, a.title_folded, a.id",
+                    "recent_asc": "MAX(t.imported_at) ASC, a.title_folded, a.id",
                     "newest": "COALESCE(a.year, 0) DESC, a.title_folded, a.id",
                     "oldest": "COALESCE(a.year, 0), a.title_folded, a.id",
                     "name": "a.title_folded, a.id",
