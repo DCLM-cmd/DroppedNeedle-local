@@ -403,3 +403,40 @@ async def test_reconcile_walks_once_and_scopes_literal_wildcard_paths(
         "availability"
     ] == "missing"
     assert (await store.get_target_track(sibling_id))["availability"] == "indexed"
+
+
+@pytest.mark.asyncio
+async def test_imported_at_is_the_import_time_not_the_file_mtime(target) -> None:
+    """A downloaded rip carries its original release/rip date in the file mtime.
+    "Recently added" orders by MAX(imported_at), so importing a 2011-mtime file
+    must record NOW as imported_at (or the album sinks to 2011 and never shows) -
+    while file_mtime_ns still reflects the file's own 2011 time for change
+    detection.
+    """
+    import time as _time
+
+    db_path, root, store, service = target
+    audio = root / "Rammstein" / "Sehnsucht" / "01 Sehnsucht.flac"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"old-rip")
+    old_mtime = _time.mktime((2011, 9, 25, 3, 26, 0, 0, 0, -1))
+    before = _time.time()
+
+    track_id = await service.upsert_file(
+        audio,
+        _tag(),
+        _info(audio.stat().st_size),
+        release_group_mbid="rg-ramm",
+        release_mbid="rel-ramm",
+        recording_mbid="rec-ramm",
+        source="download",
+        download_task_id="ramm-1",
+        source_path="peer/01 Sehnsucht.flac",
+        file_mtime=old_mtime,
+    )
+
+    row = await store.get_local_track(track_id)
+    assert row is not None
+    # imported_at is the wall clock at import, not the 2011 file_mtime handed in
+    assert row["imported_at"] >= before
+    assert row["imported_at"] > old_mtime + 3600

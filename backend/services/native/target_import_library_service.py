@@ -297,7 +297,15 @@ class TargetImportLibraryService:
         if resolution is None:
             raise ValueError("Imported file is outside every configured library root.")
         policy = resolution.policy
-        now = file_mtime if file_mtime is not None else stat.st_mtime
+        # The organizer reads and rewrites each release sequentially before it
+        # commits, so the ingest wall clock is the honest "added to the library"
+        # time for every membership timestamp below (album/track created + updated,
+        # tags_read_at, imported_at). The file's OWN mtime is a rip/release date -
+        # a downloaded rip carries e.g. 2011 - and only ever informs file_mtime_ns
+        # for change detection, never when the library gained the track. Using it
+        # here sorted yesterday's imports into 2011 and hid them from recently-added.
+        del file_mtime  # kept in the signature for callers; superseded by stat below
+        now = time.time()
         album_title = tag.album.strip() or audio_path.parent.name or "Unknown Album"
         album_artist = (tag.album_artist or tag.artist or "Unknown Artist").strip()
         artist_id = await self._store.find_target_artist_by_name(album_artist)
@@ -581,7 +589,10 @@ class TargetImportLibraryService:
         if resolution is None:
             raise ValueError("Imported file is outside every configured library root.")
         policy = resolution.policy
-        now = file_mtime if file_mtime is not None else stat_result.st_mtime
+        # Ingest wall clock for every membership timestamp; the file's own mtime
+        # stays in file_mtime_ns only. See _upsert_file_once for the full reasoning.
+        del file_mtime  # kept in the signature for callers; superseded by stat below
+        now = time.time()
         album_title = tag.album.strip() or audio_path.parent.name or "Unknown Album"
         album_artist = (tag.album_artist or tag.artist or "Unknown Artist").strip()
         artist_id = await self._store.find_target_artist_by_name(album_artist)
