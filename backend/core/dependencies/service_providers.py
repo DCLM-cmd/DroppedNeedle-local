@@ -1945,6 +1945,28 @@ def _build_target_import_invalidation(memory_cache, disk_cache):
                     exc,
                 )
 
+        # Warm the cover the moment the album is added, the way a real Jellyfin
+        # server fetches art at library scan. The invalidation just above dropped
+        # any stale cached cover, so without this the home screen's first look at a
+        # freshly imported album finds no cached image, advertises no resolvable
+        # ImageTag, and shows a blank tile until an on-demand fetch catches up.
+        # Fetching here caches it under the release group, so the tag is a real
+        # content hash by the time the client asks. Best-effort: the import is
+        # already done and art must never fail or delay it.
+        if record.musicbrainz_id:
+            try:
+                from .repo_providers import get_target_coverart_repository
+
+                await get_target_coverart_repository().get_release_group_cover(
+                    record.musicbrainz_id, "250"
+                )
+            except Exception as exc:  # noqa: BLE001 - art is best-effort
+                logger.debug(
+                    "Cover prewarm after import failed for %s: %s",
+                    record.musicbrainz_id,
+                    exc,
+                )
+
     return on_import
 
 
