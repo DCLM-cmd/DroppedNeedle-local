@@ -122,6 +122,7 @@ def _coordinator(
     max_detached_tag_reads: int = 4,
     walk_deadline_seconds: float = 30.0,
     on_indexed_album: Callable[[str], Awaitable[object]] | None = None,
+    cover_prewarm: Callable[[], Awaitable[None]] | None = None,
     clock: Callable[[], float] = lambda: 1_800_000_000.0,
 ) -> LibraryScanCoordinator:
     reader = tag_reader or _TagReader()
@@ -144,6 +145,7 @@ def _coordinator(
         lambda: resolver,
         clock=clock,
         on_indexed_album=on_indexed_album,
+        cover_prewarm=cover_prewarm,
     )
 
 
@@ -3292,3 +3294,47 @@ async def test_cjk_and_nfd_twin_filenames_survive_walk_index_identity(
             for row in connection.execute("SELECT id FROM local_tracks").fetchall()
         }
     assert ids_after == ids_before and len(ids_after) == 2
+
+
+@pytest.mark.asyncio
+async def test_scan_prewarms_covers_after_completion(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """A real Jellyfin fetches art at scan; the coordinator fires the cover
+    prewarm once a run reaches completed, so the home finds cached images."""
+    root = tmp_path / "music"
+    (root / "Artist" / "Album").mkdir(parents=True)
+    (root / "Artist" / "Album" / "track-1.flac").write_bytes(b"one")
+    resolver = _resolver(root)
+    called = 0
+
+    async def prewarm() -> None:
+        nonlocal called
+        called += 1
+
+    coordinator = _coordinator(target_store, resolver, cover_prewarm=prewarm)
+    await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+
+    assert completed is not None and completed.state == "completed"
+    assert called == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failing_cover_prewarm_never_fails_the_scan(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """Art is best-effort: a prewarm that raises must not turn a good scan bad."""
+    root = tmp_path / "music"
+    (root / "Artist" / "Album").mkdir(parents=True)
+    (root / "Artist" / "Album" / "track-1.flac").write_bytes(b"one")
+    resolver = _resolver(root)
+
+    async def prewarm() -> None:
+        raise RuntimeError("provider down")
+
+    coordinator = _coordinator(target_store, resolver, cover_prewarm=prewarm)
+    await coordinator.request_run(_request(resolver))
+    completed = await coordinator.run_once({"root-a": root})
+
+    assert completed is not None and completed.state == "completed"

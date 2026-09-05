@@ -50,6 +50,7 @@ class LibraryScanCoordinator:
         filesystem_coordinator: LibraryFilesystemCoordinator | None = None,
         on_indexed_album: IndexedAlbumCallback | None = None,
         housekeeping: LibraryHousekeepingService | None = None,
+        cover_prewarm: "Callable[[], Awaitable[None]] | None" = None,
     ) -> None:
         self._store = store
         self._inventory = inventory
@@ -66,6 +67,12 @@ class LibraryScanCoordinator:
         # resolved, and a folder is only empty once the files it lost have been
         # reconciled away. Runs after the run reaches ``completed``, never before.
         self._housekeeping = housekeeping
+        # Fetch cover art for the freshly-settled catalog the way a real Jellyfin
+        # server fetches it at scan, so the home shows real ImageTags instead of
+        # warming on the client's first look. Runs after housekeeping, once the
+        # albums are deduplicated and merged, so it never warms a row about to be
+        # retired. Best-effort.
+        self._cover_prewarm = cover_prewarm
         self._last_progress_log: dict[str, float] = {}
         self._pending_control_run_ids: set[str] = set()
 
@@ -467,6 +474,7 @@ class LibraryScanCoordinator:
         if self._filesystem is not None:
             self._filesystem.forget_scan(run.id)
         await self._run_housekeeping(run.id)
+        await self._run_cover_prewarm(run.id)
         return run
 
     async def _run_housekeeping(self, run_id: str) -> None:
@@ -487,6 +495,18 @@ class LibraryScanCoordinator:
             return
         if any(counts.values()):
             logger.info("scan.housekeeping", extra={"run_id": run_id, **counts})
+
+    async def _run_cover_prewarm(self, run_id: str) -> None:
+        """Warm covers for the settled catalog. Best-effort: the scan has already
+        succeeded, and art must never turn a good scan into a failed one."""
+        if self._cover_prewarm is None:
+            return
+        try:
+            await self._cover_prewarm()
+        except Exception:  # noqa: BLE001 - art is best-effort
+            logger.warning(
+                "scan.cover_prewarm_failed", extra={"run_id": run_id}, exc_info=True
+            )
 
     async def _schedule_pending_indexed_albums(self) -> None:
         if self._on_indexed_album is None:

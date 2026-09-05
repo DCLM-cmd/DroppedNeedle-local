@@ -539,7 +539,29 @@ def get_target_library_scan_coordinator() -> "LibraryScanCoordinator":
         filesystem_coordinator=filesystem,
         on_indexed_album=_schedule_scanned_album_work,
         housekeeping=get_library_housekeeping_service(),
+        cover_prewarm=_prewarm_recent_album_covers,
     )
+
+
+async def _prewarm_recent_album_covers() -> None:
+    """Fetch covers for the most-recently-added albums after a scan.
+
+    Bounded to what the home screen actually shows first, so a full library scan
+    does not turn into a full art re-download; the batch resolver dedupes by
+    release group and paces provider calls. Warming here means the home's first
+    look finds cached images and real ImageTags, matching Jellyfin's scan-time art
+    fetch instead of warming lazily on the client's request.
+    """
+    from .cache_providers import get_native_library_store
+    from .compat_providers import get_target_compat_services
+
+    store = get_native_library_store()
+    rows, _ = await store.list_target_albums(limit=100, offset=0, sort="recent")
+    album_ids = [r["release_group_mbid"] for r in rows if r.get("release_group_mbid")]
+    if album_ids:
+        await get_target_compat_services().coverart.batch_prefetch_covers(
+            album_ids, "250"
+        )
 
 
 @singleton
