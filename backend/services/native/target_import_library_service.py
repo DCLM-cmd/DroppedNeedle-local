@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
+from models.audio import album_artists_payload
 from models.local_catalog import (
     LocalAlbum,
     LocalArtist,
@@ -371,6 +372,7 @@ class TargetImportLibraryService:
             album_artist_name=album_artist,
             tag_album_title=tag.album,
             tag_album_artist_name=tag.album_artist,
+            tag_album_artists_json=album_artists_payload(tag.album_artists),
             disc_number=tag.disc_number,
             track_number=tag.track_number,
             year=tag.year,
@@ -658,6 +660,7 @@ class TargetImportLibraryService:
             album_artist_name=album_artist,
             tag_album_title=tag.album,
             tag_album_artist_name=tag.album_artist,
+            tag_album_artists_json=album_artists_payload(tag.album_artists),
             disc_number=tag.disc_number,
             track_number=tag.track_number,
             year=tag.year,

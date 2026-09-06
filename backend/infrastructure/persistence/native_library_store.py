@@ -1631,6 +1631,11 @@ class NativeLibraryStore(PersistenceBase):
                 "ALTER TABLE library_operation_jobs "
                 "ADD COLUMN reidentification_attempt_count INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE library_identification_jobs ADD COLUMN attention_cause TEXT",
+                # The format-native multi-value album-artist list (JSON array of
+                # names), preserved so grouping can split "A; B" into separate
+                # album-artists instead of one combined artist. NULL/'' means the
+                # single tag_album_artist_name is authoritative.
+                "ALTER TABLE local_tracks ADD COLUMN tag_album_artists_json TEXT",
             ):
                 try:
                     connection.execute(statement)
@@ -6718,7 +6723,7 @@ class NativeLibraryStore(PersistenceBase):
             "stat_revision_kind, "
             "metadata_incomplete, title, title_folded, artist_name, artist_name_folded, "
             "album_title, album_title_folded, album_artist_name, album_artist_name_folded, "
-            "tag_album_title, tag_album_artist_name, "
+            "tag_album_title, tag_album_artist_name, tag_album_artists_json, "
             "disc_number, track_number, year, genre, genre_folded, title_sort, artist_sort, album_sort, "
             "album_artist_sort, disc_subtitle, is_compilation, embedded_release_group_mbid, "
             "embedded_release_mbid, embedded_recording_mbid, embedded_release_track_mbid, "
@@ -6729,7 +6734,7 @@ class NativeLibraryStore(PersistenceBase):
             "missing_since, excluded_at, ingest_source, download_task_id, source_path, "
             "imported_at, membership_source, membership_locked, manual_excluded, desired_policy_revision, "
             "applied_policy_revision, applied_policy, row_revision) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 track.id,
                 track.local_album_id,
@@ -6754,6 +6759,7 @@ class NativeLibraryStore(PersistenceBase):
                 _fold(track.album_artist_name),
                 track.tag_album_title,
                 track.tag_album_artist_name,
+                track.tag_album_artists_json,
                 track.disc_number,
                 track.track_number,
                 track.year,
@@ -11832,7 +11838,7 @@ class NativeLibraryStore(PersistenceBase):
                 "metadata_incomplete = ?, title = ?, title_folded = ?, "
                 "artist_name = ?, artist_name_folded = ?, album_title = ?, "
                 "album_title_folded = ?, album_artist_name = ?, album_artist_name_folded = ?, "
-                "tag_album_title = ?, tag_album_artist_name = ?, "
+                "tag_album_title = ?, tag_album_artist_name = ?, tag_album_artists_json = ?, "
                 "disc_number = ?, track_number = ?, year = ?, genre = ?, genre_folded = ?, title_sort = ?, "
                 "artist_sort = ?, album_sort = ?, album_artist_sort = ?, disc_subtitle = ?, "
                 "is_compilation = ?, embedded_release_group_mbid = ?, embedded_release_mbid = ?, "
@@ -11887,6 +11893,7 @@ class NativeLibraryStore(PersistenceBase):
                     ),
                     track.tag_album_title,
                     track.tag_album_artist_name,
+                    track.tag_album_artists_json,
                     existing["disc_number"] if catalog_locked else track.disc_number,
                     existing["track_number"] if catalog_locked else track.track_number,
                     existing["year"] if catalog_locked else track.year,

@@ -234,6 +234,7 @@ CREATE TABLE IF NOT EXISTS local_albums (
     album_artist_name_folded TEXT,
     tag_album_title TEXT,
     tag_album_artist_name TEXT,
+    tag_album_artists_json TEXT,
     album_artist_id TEXT NOT NULL REFERENCES local_artists(id) ON DELETE RESTRICT,
     album_artist_sort_name TEXT,
     year INTEGER,

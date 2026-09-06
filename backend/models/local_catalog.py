@@ -86,6 +86,10 @@ class LocalTrack(AppStruct):
     album_artist_name: str | None = None
     tag_album_title: str | None = None
     tag_album_artist_name: str | None = None
+    # Format-native multi-value album artists as a JSON array of names, preserved
+    # so grouping can split "A; B" into separate album-artists. None means the
+    # single tag_album_artist_name is authoritative (one artist).
+    tag_album_artists_json: str | None = None
     year: int | None = None
     genre: str | None = None
     title_sort: str | None = None

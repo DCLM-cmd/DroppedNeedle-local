@@ -6,6 +6,7 @@ Tier-3 AcoustID lookup. All are msgspec structs so they (de)serialise through th
 house codec without dataclass/dict ad-hoc handling.
 """
 
+import json
 from typing import Literal
 
 import msgspec
@@ -21,6 +22,18 @@ class AudioArtistCredit(AppStruct):
     sort_name: str | None = None
     musicbrainz_artist_id: str | None = None
     join_phrase: str = ""
+
+
+def album_artists_payload(credits: "list[AudioArtistCredit]") -> str | None:
+    """Serialize a MULTI-value album-artist list to JSON, or None for one/zero.
+
+    Only a genuine multi-value tag ("A; B" stored as two format-native values)
+    yields a payload; a single value - including a real name that merely contains
+    "&" or "," like "Earth, Wind & Fire" - returns None, so grouping keeps it as
+    one artist. The distinction is the tag's own value count, never string
+    splitting."""
+    names = [credit.name for credit in credits if credit.name]
+    return json.dumps(names) if len(names) > 1 else None
 
 
 class AudioTag(AppStruct):

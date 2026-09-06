@@ -17,7 +17,7 @@ import msgspec
 from core.exceptions import AudioFormatError
 from infrastructure.audio.metadata_engine import legacy_audio_projection
 from infrastructure.persistence.native_library_store import NativeLibraryStore
-from models.audio import AudioArtistCredit, AudioInfo, AudioTag
+from models.audio import AudioArtistCredit, AudioInfo, AudioTag, album_artists_payload
 from models.library_work import ScanFailureRecord, ScanRun, ScannedTrackWrite
 from models.local_catalog import (
     LocalAlbum,
@@ -590,6 +590,7 @@ class LibraryIndexer:
             album_artist_name=album_artist,
             tag_album_title=tag.album.strip(),
             tag_album_artist_name=(tag.album_artist or "").strip(),
+            tag_album_artists_json=album_artists_payload(album_audio_credits),
             disc_number=tag.disc_number,
             track_number=tag.track_number,
             year=tag.year,
