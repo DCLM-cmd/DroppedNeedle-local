@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import PurePosixPath
@@ -12,6 +13,7 @@ from models.identification import (
     ExistingAlbumMembership,
     GroupingApplication,
     GroupingTrack,
+    ProposedLocalAlbum,
 )
 from services.native.identification_queue_service import IdentificationQueueService
 from services.native.identification_revisions import album_input_revisions
@@ -30,6 +32,18 @@ STAGED_GROUPING_THRESHOLD = 512
 CONTINUITY_COMPONENT_EDGE_LIMIT = 512
 
 
+def _album_artists_from_row(row: dict) -> list[str]:
+    """Decode the persisted multi-value album-artist names, or [] for one/none."""
+    raw = row["tag_album_artists_json"] if "tag_album_artists_json" in row.keys() else None
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(name) for name in names if name] if isinstance(names, list) else []
+
+
 def grouping_track_from_row(row: dict) -> GroupingTrack:
     return GroupingTrack(
         local_track_id=str(row["id"]),
@@ -39,6 +53,7 @@ def grouping_track_from_row(row: dict) -> GroupingTrack:
         artist_name=str(row["artist_name"] or ""),
         album_title=str(row["tag_album_title"] or ""),
         album_artist_name=str(row["tag_album_artist_name"] or ""),
+        album_artists=_album_artists_from_row(row),
         artist_sort_name=row["artist_sort"],
         album_artist_sort_name=row["album_artist_sort"],
         track_number=int(row["track_number"] or 0),
@@ -56,6 +71,16 @@ def grouping_track_from_row(row: dict) -> GroupingTrack:
 
 def grouping_artist_candidate_id(display_name: str) -> str:
     return str(uuid.uuid5(_GROUPING_NAMESPACE, f"artist:{display_name}:group"))
+
+
+def grouping_album_artist_names(group: ProposedLocalAlbum) -> list[str]:
+    """The album-artist names to credit, in order: the split list, else the one.
+
+    A genuine multi-value tag yields one credit per artist; anything else keeps the
+    single combined ``album_artist_name`` as the sole album artist."""
+    if len(group.album_artists) > 1:
+        return list(group.album_artists)
+    return [group.album_artist_name]
 
 
 def grouping_album_id(grouping_key: str) -> str:
@@ -131,7 +156,11 @@ class LocalAlbumGroupingService:
                     existing=list(memberships.values()),
                 )
                 artist_names = list(
-                    dict.fromkeys(group.album_artist_name for group in groups)
+                    dict.fromkeys(
+                        name
+                        for group in groups
+                        for name in grouping_album_artist_names(group)
+                    )
                 )
                 artist_ids: dict[str, str] = {}
                 for offset in range(0, len(artist_names), ARTIST_RESOLUTION_BATCH_SIZE):
@@ -155,7 +184,10 @@ class LocalAlbumGroupingService:
                     )
                 applications: list[GroupingApplication] = []
                 for group in groups:
-                    artist_id = artist_ids[group.album_artist_name]
+                    credit_ids = [
+                        artist_ids[name]
+                        for name in grouping_album_artist_names(group)
+                    ]
                     album_id = group.retained_album_id or grouping_album_id(
                         group.grouping_key
                     )
@@ -163,7 +195,8 @@ class LocalAlbumGroupingService:
                         GroupingApplication(
                             group=group,
                             local_album_id=album_id,
-                            local_artist_id=artist_id,
+                            local_artist_id=credit_ids[0],
+                            local_artist_ids=credit_ids,
                         )
                     )
                 album_ids, _ = await self._store.apply_grouping_context(

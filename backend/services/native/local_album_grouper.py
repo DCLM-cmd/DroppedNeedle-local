@@ -45,6 +45,21 @@ def _display_consensus(values: list[str], fallback: str) -> str:
     return min(value for value in usable if normalize_group_value(value) == selected)
 
 
+def _album_artists_consensus(members: list[GroupingTrack]) -> list[str]:
+    """The members' agreed multi-value album-artist list, or [] for a single one.
+
+    An album-level tag; every track of the album should carry the same list. Pick
+    the most common non-empty list so one mistagged track cannot split the credit,
+    and keep [] when the tag was single-valued so the joined name stays one artist.
+    """
+    lists = [tuple(member.album_artists) for member in members if member.album_artists]
+    if not lists:
+        return []
+    counts = Counter(lists)
+    selected = min(counts, key=lambda value: (-counts[value], value))
+    return list(selected)
+
+
 def _directory_context(track: GroupingTrack) -> tuple[str, str | None]:
     parent = PurePosixPath(track.relative_path).parent
     match = _DISC_DIRECTORY.match(parent.name)
@@ -216,6 +231,7 @@ def assign_album_continuity(
             grouping_key=album.grouping_key,
             title=album.title,
             album_artist_name=album.album_artist_name,
+            album_artists=album.album_artists,
             track_ids=album.track_ids,
             reason_code=album.reason_code,
             retained_album_id=(retained.get(album.grouping_key) or (None, None))[0],
@@ -312,6 +328,7 @@ class LocalAlbumGrouper:
                     grouping_key=grouping_key,
                     title=title,
                     album_artist_name=artist,
+                    album_artists=_album_artists_consensus(members),
                     track_ids=sorted(member.local_track_id for member in members),
                     reason_code=reason,
                 )

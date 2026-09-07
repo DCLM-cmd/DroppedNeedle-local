@@ -14011,17 +14011,23 @@ class NativeLibraryStore(PersistenceBase):
             album_ids = [application.local_album_id for application in applications]
             placeholders = ",".join("?" for _ in album_ids)
             rows = connection.execute(
-                "SELECT a.*, aa.local_artist_id AS credit_artist_id, "
-                "aa.credited_name AS credit_name FROM local_albums a "
-                "LEFT JOIN local_album_artists aa ON aa.local_album_id = a.id "
-                "AND aa.position = 0 "
-                f"WHERE a.id IN ({placeholders})",
+                f"SELECT a.* FROM local_albums a WHERE a.id IN ({placeholders})",
                 tuple(album_ids),
             ).fetchall()
             existing_albums = {str(row["id"]): dict(row) for row in rows}
+            existing_credits: dict[str, list[tuple[str, str]]] = {}
+            for row in connection.execute(
+                "SELECT local_album_id, position, local_artist_id, credited_name "
+                f"FROM local_album_artists WHERE local_album_id IN ({placeholders}) "
+                "ORDER BY local_album_id, position",
+                tuple(album_ids),
+            ).fetchall():
+                existing_credits.setdefault(str(row["local_album_id"]), []).append(
+                    (str(row["local_artist_id"]), str(row["credited_name"] or ""))
+                )
             new_albums: list[tuple[Any, ...]] = []
             updated_albums: list[tuple[Any, ...]] = []
-            artist_credits: list[tuple[str, str, str]] = []
+            credit_rewrites: list[tuple[str, list[tuple[str, str]]]] = []
             track_memberships: list[tuple[str, str]] = []
             for application in applications:
                 group = application.group
@@ -14068,14 +14074,23 @@ class NativeLibraryStore(PersistenceBase):
                             album_id,
                         )
                     )
-                if group.reason_code != "MANUAL_MEMBERSHIP_RESTORED" and (
-                    existing is None
-                    or existing["credit_artist_id"] != application.local_artist_id
-                    or existing["credit_name"] != group.album_artist_name
-                ):
-                    artist_credits.append(
-                        (album_id, application.local_artist_id, group.album_artist_name)
+                if group.reason_code != "MANUAL_MEMBERSHIP_RESTORED":
+                    credit_names = (
+                        list(group.album_artists)
+                        if len(group.album_artists) > 1
+                        else [group.album_artist_name]
                     )
+                    credit_ids = application.local_artist_ids or [
+                        application.local_artist_id
+                    ]
+                    desired = [
+                        (artist_id, name)
+                        for artist_id, name in zip(
+                            credit_ids, credit_names, strict=True
+                        )
+                    ]
+                    if existing_credits.get(album_id, []) != desired:
+                        credit_rewrites.append((album_id, desired))
                 for track_id in group.track_ids:
                     state = old_track_state.get(track_id)
                     if state is None or (
@@ -14108,16 +14123,20 @@ class NativeLibraryStore(PersistenceBase):
                     "FROM batch WHERE target.id=batch.id",
                     tuple(value for row in updated_albums for value in row),
                 )
-            if artist_credits:
-                values = ",".join("(?,0,?,'primary',?)" for _ in artist_credits)
-                connection.execute(
+            if credit_rewrites:
+                connection.executemany(
+                    "DELETE FROM local_album_artists WHERE local_album_id = ?",
+                    [(album_id,) for album_id, _ in credit_rewrites],
+                )
+                connection.executemany(
                     "INSERT INTO local_album_artists "
                     "(local_album_id,position,local_artist_id,role,credited_name) "
-                    f"VALUES {values} ON CONFLICT(local_album_id,position) DO UPDATE SET "
-                    "local_artist_id=excluded.local_artist_id,"
-                    "credited_name=excluded.credited_name,"
-                    "row_revision=local_album_artists.row_revision+1",
-                    tuple(value for row in artist_credits for value in row),
+                    "VALUES (?,?,?,'primary',?)",
+                    [
+                        (album_id, position, artist_id, name)
+                        for album_id, desired in credit_rewrites
+                        for position, (artist_id, name) in enumerate(desired)
+                    ],
                 )
             for offset in range(0, len(track_memberships), 500):
                 rows = track_memberships[offset : offset + 500]

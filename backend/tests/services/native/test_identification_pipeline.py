@@ -2360,6 +2360,143 @@ async def test_post_index_grouping_rolls_disc_directories_together_and_aliases_u
     assert after == before
 
 
+async def _seed_multi_artist_album(
+    store: NativeLibraryStore,
+    db_path: Path,
+    suffix: str,
+    *,
+    directory: str,
+    joined_name: str,
+    album_artists_json: str | None,
+) -> str:
+    """Seed one track in ``directory`` and open a pending grouping context for it."""
+    await _seed_album(store, suffix)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET relative_path = ?, tag_album_title = 'Album', "
+            "tag_album_artist_name = ?, album_title = 'Album', album_title_folded = 'album', "
+            "tag_album_artists_json = ? WHERE id = ?",
+            (f"{directory}/01.flac", joined_name, album_artists_json, f"track-{suffix}"),
+        )
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id, root_id, relative_directory) VALUES (?, 'root', ?)",
+            (f"grouping-{suffix}", directory),
+        )
+    await store.create_scan_run(
+        ScanRun(
+            id=f"grouping-{suffix}",
+            kind="incremental",
+            trigger="manual",
+            queued_at=1,
+            updated_at=2,
+        )
+    )
+    await LocalAlbumGroupingService(
+        store, IdentificationQueueService(store)
+    ).regroup_run(f"grouping-{suffix}", now=3)
+    with sqlite3.connect(db_path) as connection:
+        return connection.execute(
+            "SELECT local_album_id FROM local_tracks WHERE id = ?", (f"track-{suffix}",)
+        ).fetchone()[0]
+
+
+@pytest.mark.asyncio
+async def test_grouping_splits_a_multi_value_album_artist_into_separate_credits(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A genuine two-value tag becomes two album-artist credits, first is primary.
+
+    The joined display name is kept on the album, so nothing that reads
+    ``album_artist_name`` changes; the split lives only in the credits, which is
+    what puts the album on both artists' pages.
+    """
+    album_id = await _seed_multi_artist_album(
+        store,
+        db_path,
+        "jayz",
+        directory="JAY-Z/Watch the Throne",
+        joined_name="JAY-Z & Kanye West",
+        album_artists_json='["JAY-Z", "Kanye West"]',
+    )
+    with sqlite3.connect(db_path) as connection:
+        credits = connection.execute(
+            "SELECT laa.position, la.display_name, laa.role FROM local_album_artists laa "
+            "JOIN local_artists la ON la.id = laa.local_artist_id "
+            "WHERE laa.local_album_id = ? ORDER BY laa.position",
+            (album_id,),
+        ).fetchall()
+        album = connection.execute(
+            "SELECT album_artist_name, la.display_name FROM local_albums a "
+            "JOIN local_artists la ON la.id = a.album_artist_id WHERE a.id = ?",
+            (album_id,),
+        ).fetchone()
+
+    assert credits == [(0, "JAY-Z", "primary"), (1, "Kanye West", "primary")]
+    assert album == ("JAY-Z & Kanye West", "JAY-Z")
+
+
+@pytest.mark.asyncio
+async def test_grouping_re_run_leaves_split_credits_untouched(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Re-grouping an already-split album must not churn its credits (no ping-pong)."""
+    album_id = await _seed_multi_artist_album(
+        store,
+        db_path,
+        "jayz",
+        directory="JAY-Z/Watch the Throne",
+        joined_name="JAY-Z & Kanye West",
+        album_artists_json='["JAY-Z", "Kanye West"]',
+    )
+    with sqlite3.connect(db_path) as connection:
+        before = connection.execute(
+            "SELECT position, local_artist_id, row_revision FROM local_album_artists "
+            "WHERE local_album_id = ? ORDER BY position",
+            (album_id,),
+        ).fetchall()
+        connection.execute(
+            "UPDATE library_scan_grouping_contexts SET state = 'pending' "
+            "WHERE run_id = 'grouping-jayz'"
+        )
+    await LocalAlbumGroupingService(
+        store, IdentificationQueueService(store)
+    ).regroup_run("grouping-jayz", now=4)
+    with sqlite3.connect(db_path) as connection:
+        after = connection.execute(
+            "SELECT position, local_artist_id, row_revision FROM local_album_artists "
+            "WHERE local_album_id = ? ORDER BY position",
+            (album_id,),
+        ).fetchall()
+
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_grouping_keeps_a_single_valued_name_with_an_ampersand_as_one_artist(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A real name that merely contains "&" carries no multi-value tag, so it stays
+    one album artist - never string-split."""
+    album_id = await _seed_multi_artist_album(
+        store,
+        db_path,
+        "celo",
+        directory="Ćelo & Abdï/Mietwagentape",
+        joined_name="Ćelo & Abdï",
+        album_artists_json=None,
+    )
+    with sqlite3.connect(db_path) as connection:
+        credits = connection.execute(
+            "SELECT laa.position, la.display_name FROM local_album_artists laa "
+            "JOIN local_artists la ON la.id = laa.local_artist_id "
+            "WHERE laa.local_album_id = ? ORDER BY laa.position",
+            (album_id,),
+        ).fetchall()
+
+    assert credits == [(0, "Ćelo & Abdï")]
+
+
 @pytest.mark.asyncio
 async def test_grouping_context_track_read_excludes_deeper_descendants(
     store: NativeLibraryStore, db_path: Path

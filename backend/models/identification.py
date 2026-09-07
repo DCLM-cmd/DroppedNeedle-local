@@ -118,6 +118,10 @@ class GroupingTrack(AppStruct):
     artist_name: str = ""
     album_title: str = ""
     album_artist_name: str = ""
+    # Format-native multi-value album artists (names only), when the tag carried
+    # more than one. Empty means the single ``album_artist_name`` is authoritative
+    # - a real name that merely contains "&"/"," stays one artist.
+    album_artists: list[str] = msgspec.field(default_factory=list)
     artist_sort_name: str | None = None
     album_artist_sort_name: str | None = None
     track_number: int = 0
@@ -139,6 +143,10 @@ class ProposedLocalAlbum(AppStruct):
     album_artist_name: str
     track_ids: list[str]
     reason_code: str
+    # The album's format-native multi-value album artists (names, in order), when
+    # the members agreed on more than one. Empty keeps the single combined
+    # ``album_artist_name`` as the one album artist.
+    album_artists: list[str] = msgspec.field(default_factory=list)
     retained_album_id: str | None = None
     continuity_reason_code: str | None = None
 
@@ -153,6 +161,10 @@ class GroupingApplication(AppStruct):
     group: ProposedLocalAlbum
     local_album_id: str
     local_artist_id: str
+    # Resolved album-artist ids, position-ordered, one per credit to write.
+    # ``local_artist_id`` is the first of these (the album's primary artist).
+    # Empty falls back to the single ``local_artist_id``.
+    local_artist_ids: list[str] = msgspec.field(default_factory=list)
 
 
 class IdentificationAttempt(AppStruct):
