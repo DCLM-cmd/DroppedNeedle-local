@@ -278,6 +278,11 @@ class DownloadPolicySettings(AppStruct):
         "allow_as_fallback"  # reject|review|allow_as_fallback
     )
     source_selection_mode: str = "source_first"  # source_first|quality_first
+    # Prefer the explicit/uncensored cut of a release over a "(Clean)" one when
+    # ranking download candidates the quality gate already treats as equivalent.
+    # ON (default): "explicit" in the title/folder scores higher, "clean" lower.
+    # OFF: edition markers are ignored and no longer reorder candidates.
+    prefer_explicit: bool = True
 
     def __post_init__(self) -> None:
         _validate_range(self.lossless_max_kbps, "lossless_max_kbps", 0, 10_000)

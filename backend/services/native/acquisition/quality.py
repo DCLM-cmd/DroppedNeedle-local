@@ -357,6 +357,7 @@ _SNAPSHOT_BASE_FIELDS: tuple[str, ...] = (
     "flac_mp3_only",
     "unknown_quality_behavior",
     "source_selection_mode",
+    "prefer_explicit",
     "summary",
     "origin",
 )
@@ -553,7 +554,10 @@ def decode_snapshot(
             raise SnapshotValidationError(
                 f"unsupported quality snapshot schema {schema!r}"
             )
-        if set(value) != expected:
+        # ``prefer_explicit`` was added after the initial schema; snapshots persisted
+        # before it simply lack the key and decode with the default. Accept its
+        # presence or absence without widening the check to any other field.
+        if set(value) - {"prefer_explicit"} != expected - {"prefer_explicit"}:
             raise SnapshotValidationError("quality snapshot has an invalid field set")
         snapshot = msgspec.convert(value, type=AcquisitionQualitySnapshot, strict=True)
         return validate_snapshot(snapshot)
@@ -599,6 +603,7 @@ def build_snapshot(policy: "DownloadPolicySettings") -> AcquisitionQualitySnapsh
         flac_mp3_only=policy.flac_mp3_only,
         unknown_quality_behavior=policy.unknown_quality_behavior,
         source_selection_mode=policy.source_selection_mode,
+        prefer_explicit=getattr(policy, "prefer_explicit", True),
     )
     snapshot.snapshot_hash = snapshot_policy_hash(snapshot)
     snapshot.summary = compose_summary(snapshot)

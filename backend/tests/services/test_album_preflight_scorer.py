@@ -128,6 +128,34 @@ async def test_numbered_sequel_folder_rejected_for_self_titled_debut():
 
 
 @pytest.mark.asyncio
+async def test_prefer_explicit_on_ranks_the_explicit_folder_first():
+    # Two full, quality-equal cuts of one album: the edition tie-breaker picks the
+    # uncensored folder with prefer_explicit ON, even though clean is listed first.
+    clean = [_mk(_PARENT + " (Clean)", f"OK Computer {n:02d}.flac") for n in range(1, 13)]
+    explicit = [
+        _mk(_PARENT + " (Explicit)", f"OK Computer {n:02d}.flac") for n in range(1, 13)
+    ]
+    scorer = AlbumPreflightScorer(_store())
+    ranked = await scorer.rank(_TARGET, clean + explicit, snapshot=policy_snapshot())
+    assert ranked[0].parent_directory.endswith("(Explicit)")
+
+
+@pytest.mark.asyncio
+async def test_prefer_explicit_off_ignores_edition_folders():
+    # With the option OFF the edition marker no longer decides; the clean folder
+    # listed first stays first (quality/availability are identical).
+    clean = [_mk(_PARENT + " (Clean)", f"OK Computer {n:02d}.flac") for n in range(1, 13)]
+    explicit = [
+        _mk(_PARENT + " (Explicit)", f"OK Computer {n:02d}.flac") for n in range(1, 13)
+    ]
+    scorer = AlbumPreflightScorer(_store())
+    ranked = await scorer.rank(
+        _TARGET, clean + explicit, snapshot=policy_snapshot(prefer_explicit=False)
+    )
+    assert ranked[0].parent_directory.endswith("(Clean)")
+
+
+@pytest.mark.asyncio
 async def test_junk_folder_is_rejected():
     files = [
         _mk(

@@ -284,3 +284,26 @@ async def test_year_in_title_outranks_edition_without_it():
     scored = await _scorer().rank(target, [remaster, original], snapshot=policy_snapshot())
     assert scored[0].usenet_release.guid == "a"
     assert scored[0].final_score > scored[1].final_score
+
+
+@pytest.mark.asyncio
+async def test_prefer_explicit_on_ranks_the_explicit_cut_first():
+    # Sibling cuts of one album score identically on quality, so the edition
+    # tie-breaker decides. With prefer_explicit ON (default) the uncensored cut wins
+    # even when the clean one is offered first.
+    clean = _release("Radiohead - In Rainbows (Clean) [FLAC]", [3040], guid="clean")
+    explicit = _release("Radiohead - In Rainbows (Explicit) [FLAC]", [3040], guid="dirty")
+    scored = await _scorer().rank(_TARGET, [clean, explicit], snapshot=policy_snapshot())
+    assert [c.usenet_release.guid for c in scored][0] == "dirty"
+
+
+@pytest.mark.asyncio
+async def test_prefer_explicit_off_ignores_edition_markers():
+    # With the option OFF the edition marker no longer reorders: the two quality-equal
+    # cuts tie on every ranking term, so the clean cut offered first is not demoted.
+    clean = _release("Radiohead - In Rainbows (Clean) [FLAC]", [3040], guid="clean")
+    explicit = _release("Radiohead - In Rainbows (Explicit) [FLAC]", [3040], guid="dirty")
+    scored = await _scorer().rank(
+        _TARGET, [clean, explicit], snapshot=policy_snapshot(prefer_explicit=False)
+    )
+    assert scored[0].usenet_release.guid == "clean"

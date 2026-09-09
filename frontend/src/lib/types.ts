@@ -2310,6 +2310,9 @@ export interface DownloadPolicySettings {
 	quality_min: string;
 	quality_max: string;
 	flac_mp3_only: boolean;
+	/** Prefer the explicit/uncensored cut over a "(Clean)" one when ranking
+	 * download candidates the quality gate already treats as equivalent. */
+	prefer_explicit?: boolean;
 	verify_downloads: boolean;
 	preflight_score_auto_accept: number;
 	preflight_score_manual_min: number;

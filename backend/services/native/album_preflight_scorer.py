@@ -712,7 +712,12 @@ class AlbumPreflightScorer:
                 # the two sources cannot disagree about which cut is wanted. A
                 # clean folder is different music, not lesser music, so this
                 # outranks availability and score; quality still outranks it.
-                _edition_rank(candidate.parent_directory or ""),
+                # Gated on prefer_explicit: off means edition never reorders.
+                (
+                    _edition_rank(candidate.parent_directory or "")
+                    if snapshot.prefer_explicit
+                    else 0
+                ),
                 # Availability tuple and identity score are already
                 # bigger-is-better for the descending comparison.
                 *_availability_key(candidate),

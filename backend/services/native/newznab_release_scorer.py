@@ -382,6 +382,11 @@ class NewznabReleaseScorer:
             decision_ = cand.quality_decision
             evidence_ = cand.quality_evidence
             step = decision_.preference_step if decision_ else None
+            title_ = cand.usenet_release.title if cand.usenet_release else ""
+            # Explicit-over-clean, but only when the operator asked for it. When
+            # prefer_explicit is off every candidate scores the same rung here, so
+            # edition markers no longer reorder the results.
+            edition_term = _edition_rank(title_) if snapshot.prefer_explicit else 0
             if recipe_mode:
                 step = step if step is not None else len(snapshot.quality_recipe) + 1
                 refinement = acq_quality.recipe_refinement_key(
@@ -391,20 +396,18 @@ class NewznabReleaseScorer:
                     band_rank.get(cand.tier, 0),
                     -step,
                     *(-value for value in refinement),
+                    edition_term,
                     cand.final_score,
-                    _hires_rank(
-                        cand.usenet_release.title if cand.usenet_release else ""
-                    ),
+                    _hires_rank(title_),
                 )
             certainty = acq_quality.CERTAINTY_RANK[
                 evidence_.certainty if evidence_ else EvidenceCertainty.PARTIAL
             ]
-            title_ = cand.usenet_release.title if cand.usenet_release else ""
             return (
                 band_rank.get(cand.tier, 0),
                 -(step if step is not None else worst_step),
                 -certainty,
-                _edition_rank(title_),
+                edition_term,
                 cand.final_score,
                 _hires_rank(title_),
             )

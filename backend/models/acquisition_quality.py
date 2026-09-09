@@ -427,6 +427,10 @@ class AcquisitionQualitySnapshot(AppStruct, forbid_unknown_fields=True):
     flac_mp3_only: bool = True
     unknown_quality_behavior: str = UnknownQualityBehavior.ALLOW_AS_FALLBACK.value
     source_selection_mode: str = SourceSelectionMode.SOURCE_FIRST.value
+    # Prefer the explicit cut over a clean one when ranking equivalent candidates.
+    # Not part of the policy identity hash (see _SNAPSHOT_BASE_FIELDS) - it only
+    # reorders candidates the quality gate already considers interchangeable.
+    prefer_explicit: bool = True
     summary: str = ""
     origin: str = SnapshotOrigin.GLOBAL_POLICY.value
 

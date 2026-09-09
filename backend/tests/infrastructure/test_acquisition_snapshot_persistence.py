@@ -31,7 +31,11 @@ from models.acquisition_quality import (
     EvidenceProvenance,
     QualityRecipeEntry,
 )
-from services.native.acquisition.quality import build_snapshot
+from services.native.acquisition.quality import (
+    build_snapshot,
+    decode_snapshot,
+    encode_snapshot,
+)
 
 _NEW_TASK_COLUMNS = (
     "quality_snapshot_json",
@@ -809,3 +813,30 @@ async def test_recipe_search_job_and_selected_quality_fields_round_trip(tmp_path
         )
         == snapshot
     )
+
+
+@pytest.mark.parametrize("prefer", [True, False])
+def test_prefer_explicit_roundtrips_through_encode_decode(prefer: bool):
+    """prefer_explicit is part of the persisted snapshot, so a task requested with
+    the option off keeps it off when its snapshot is reloaded for re-scoring."""
+    snapshot = build_snapshot(
+        DownloadPolicySettings(
+            quality_min="mp3_320", quality_max="lossless", prefer_explicit=prefer
+        )
+    )
+    assert snapshot.prefer_explicit is prefer
+    restored = decode_snapshot(encode_snapshot(snapshot))
+    assert restored.prefer_explicit is prefer
+
+
+def test_legacy_snapshot_without_prefer_explicit_decodes_as_default():
+    """Snapshots persisted before prefer_explicit existed simply lack the key; they
+    must still decode (backward-compatible field set) and default to preferring the
+    explicit cut."""
+    snapshot = build_snapshot(
+        DownloadPolicySettings(quality_min="mp3_320", quality_max="lossless")
+    )
+    payload = json.loads(encode_snapshot(snapshot))
+    payload.pop("prefer_explicit", None)  # older on-disk shape
+    restored = decode_snapshot(json.dumps(payload))
+    assert restored.prefer_explicit is True
