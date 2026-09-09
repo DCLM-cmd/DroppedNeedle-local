@@ -13,6 +13,7 @@ from core.exceptions import (
     NavidromeApiError,
     NavidromeAuthError,
     NavidromeSubsonicError,
+    NonRetriableExternalServiceError,
 )
 from repositories.navidrome_repository import _navidrome_circuit_breaker
 from repositories.navidrome_models import (
@@ -480,9 +481,34 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_not_configured_raises(self):
         _navidrome_circuit_breaker.reset()
-        repo, _, _ = _make_repo(configured=False)
-        with pytest.raises(ExternalServiceError, match="not configured"):
-            await repo._request("/rest/ping")
+        repo, client, _ = _make_repo(configured=False)
+        with patch(
+            "infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock
+        ) as mock_sleep:
+            with pytest.raises(ExternalServiceError, match="not configured"):
+                await repo._request("/rest/ping")
+        client.get.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
+        from infrastructure.resilience.retry import CircuitState
+
+        assert _navidrome_circuit_breaker.state == CircuitState.CLOSED
+        assert _navidrome_circuit_breaker.failure_count == 0
+
+    @pytest.mark.asyncio
+    async def test_not_configured_is_non_retriable_subtype(self):
+        _navidrome_circuit_breaker.reset()
+        repo, client, _ = _make_repo(configured=False)
+        with patch(
+            "infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock
+        ) as mock_sleep:
+            with pytest.raises(NonRetriableExternalServiceError, match="not configured"):
+                await repo._request("/rest/ping")
+        client.get.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
+        from infrastructure.resilience.retry import CircuitState
+
+        assert _navidrome_circuit_breaker.state == CircuitState.CLOSED
+        assert _navidrome_circuit_breaker.failure_count == 0
 
 
 class TestCircuitBreakerNonBreaking:
@@ -634,3 +660,48 @@ class TestPlaylistCacheScope:
         cache.get.assert_awaited_once_with(
             "navidrome:songs_browse:user:alice:scope:all::500:0"
         )
+
+
+class TestCacheCopySemantics:
+    @pytest.mark.asyncio
+    async def test_album_list_mutation_does_not_corrupt_cache(self):
+        # Regression test for issue #371: callers must not be able to mutate
+        # the cached list in place.
+        client = AsyncMock(spec=httpx.AsyncClient)
+        repo = NavidromeRepository(http_client=client, cache=InMemoryCache())
+        repo.configure("http://navidrome:4533", "admin", "secret")
+        album = {
+            "id": "a1", "name": "Album", "artist": "Artist",
+            "artistId": "ar-1", "songCount": 10, "duration": 180,
+        }
+        client.get = AsyncMock(
+            return_value=_mock_response(
+                _ok_envelope({"albumList2": {"album": [album]}})
+            )
+        )
+        first = await repo.get_album_list(
+            type="alphabeticalByName", size=500, offset=0
+        )
+        first.extend([SubsonicAlbum(id="bogus", name="Bogus")])
+        second = await repo.get_album_list(
+            type="alphabeticalByName", size=500, offset=0
+        )
+        assert [a.id for a in second] == ["a1"]
+        client.get.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_artists_mutation_does_not_corrupt_cache(self):
+        client = AsyncMock(spec=httpx.AsyncClient)
+        repo = NavidromeRepository(http_client=client, cache=InMemoryCache())
+        repo.configure("http://navidrome:4533", "admin", "secret")
+        artist = {"id": "ar-1", "name": "Artist", "albumCount": 1}
+        client.get = AsyncMock(
+            return_value=_mock_response(
+                _ok_envelope({"artists": {"index": [{"name": "A", "artist": [artist]}]}})
+            )
+        )
+        first = await repo.get_artists()
+        first.append(SubsonicArtist(id="bogus", name="Bogus"))
+        second = await repo.get_artists()
+        assert [a.id for a in second] == ["ar-1"]
+        client.get.assert_awaited_once()

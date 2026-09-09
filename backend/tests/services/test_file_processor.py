@@ -107,6 +107,16 @@ def _place(downloads: Path, rel: str) -> None:
     shutil.copy(_FLAC, dest)
 
 
+def _sized(downloads: Path, rel: str, **kwargs) -> ExpectedFile:
+    """ExpectedFile with the real on-disk size of an already-placed stub.
+
+    The importer's size gate rejects anything else, so place (and retag) first,
+    then build the manifest with this helper. Files that are never placed keep a
+    dummy size - the gate never runs for a missing source.
+    """
+    return ExpectedFile(filename=rel, size=(downloads / rel).stat().st_size, **kwargs)
+
+
 def _write_fixture_tag(path: Path, tag: AudioTag) -> None:
     """Seed FLAC tags with raw mutagen, independent of DroppedNeedle's writer."""
     from mutagen.flac import FLAC
@@ -214,7 +224,7 @@ async def test_edition_conversion_requires_recording_fingerprint_proof(
     )
     _place(downloads, "A/track.flac")
     manifest = _manifest(
-        ExpectedFile(filename="A/track.flac", size=1),
+        _sized(downloads, "A/track.flac"),
         release_mbid="release-1",
         is_track=True,
         expected_tracks=[
@@ -267,6 +277,133 @@ def _make_processor(
     return fp, manager, client, library, downloads
 
 
+def _conversion_manifest(
+    filename: str = "A/track.flac", *, size: int = 1
+) -> DownloadManifest:
+    return _manifest(
+        ExpectedFile(filename=filename, size=size),
+        release_mbid="release-1",
+        is_track=True,
+        expected_tracks=[
+            ExpectedTrack(
+                track_number=1,
+                title="Airbag",
+                recording_mbid="recording-1",
+                release_track_mbid="release-track-1",
+            )
+        ],
+        origin="edition_conversion",
+    )
+
+
+def _later_recording_fingerprint() -> FingerprintResult:
+    return FingerprintResult(
+        status="pass",
+        score=0.95,
+        recording_id="recording-other",
+        recording_ids=["recording-other", "recording-1"],
+        title="Airbag",
+        artist="Radiohead",
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_one_conversion_accepts_later_recording_candidate(
+    tmp_path: Path,
+) -> None:
+    fingerprinter = MagicMock()
+    fingerprinter.fingerprint = AsyncMock(return_value=_later_recording_fingerprint())
+    fp, _manager, _client, _library, downloads = _make_processor(
+        tmp_path, fingerprinter=fingerprinter, verify=False
+    )
+    _place(downloads, "A/track.flac")
+    manifest = _conversion_manifest(
+        size=(downloads / "A/track.flac").stat().st_size
+    )
+
+    planned = await fp._process_one(manifest.target_files[0], manifest, set())
+
+    assert planned.authoritative_mapping is True
+    assert planned.recording_mbid == "recording-1"
+    assert planned.confidence == 1.0
+
+
+@pytest.mark.asyncio
+async def test_place_matched_file_conversion_accepts_later_recording_candidate(
+    tmp_path: Path,
+) -> None:
+    fingerprinter = MagicMock()
+    fingerprinter.fingerprint = AsyncMock(return_value=_later_recording_fingerprint())
+    fp, _manager, _client, _library, downloads = _make_processor(
+        tmp_path, fingerprinter=fingerprinter, verify=False
+    )
+    _place(downloads, "A/track.flac")
+    source = downloads / "A/track.flac"
+    tag, info = AudioTagger().read_tags(source)
+    candidate = _FolderCandidate(path=source, tag=tag, info=info)
+    manifest = _conversion_manifest(
+        size=(downloads / "A/track.flac").stat().st_size
+    )
+
+    planned = await fp._place_matched_file(
+        manifest, candidate, manifest.expected_tracks[0]
+    )
+
+    assert planned.authoritative_mapping is True
+    assert planned.recording_mbid == "recording-1"
+    assert planned.confidence == 1.0
+
+
+@pytest.mark.parametrize(
+    ("fingerprint", "reason"),
+    [
+        pytest.param(
+            FingerprintResult(
+                status="pass",
+                score=0.95,
+                recording_id="recording-other",
+                recording_ids=["recording-other"],
+                title="Airbag",
+                artist="Radiohead",
+            ),
+            "fingerprint_mismatch",
+            id="absent-expected-recording",
+        ),
+        pytest.param(
+            FingerprintResult(
+                status="pass",
+                score=0.95,
+                title="Airbag",
+                artist="Radiohead",
+            ),
+            "fingerprint_unverified",
+            id="no-recording-proof",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_process_one_conversion_rejects_without_positive_recording_proof(
+    tmp_path: Path,
+    fingerprint: FingerprintResult,
+    reason: str,
+) -> None:
+    fingerprinter = MagicMock()
+    fingerprinter.fingerprint = AsyncMock(return_value=fingerprint)
+    fp, _manager, _client, _library, downloads = _make_processor(
+        tmp_path, fingerprinter=fingerprinter, verify=False
+    )
+    _place(downloads, "A/track.flac")
+    manifest = _conversion_manifest(
+        size=(downloads / "A/track.flac").stat().st_size
+    )
+
+    from services.native.file_processor import VerificationFailed
+
+    with pytest.raises(VerificationFailed) as raised:
+        await fp._process_one(manifest.target_files[0], manifest, set())
+    assert raised.value.reason == reason
+
+
 @pytest.mark.asyncio
 async def test_shared_publisher_receives_complete_slskd_album_bundle(tmp_path: Path):
     async def publish(bundle):
@@ -300,8 +437,8 @@ async def test_shared_publisher_receives_complete_slskd_album_bundle(tmp_path: P
             ),
         )
     manifest = _manifest(
-        ExpectedFile(filename="A/one.flac", size=1),
-        ExpectedFile(filename="A/two.flac", size=1),
+        _sized(downloads, "A/one.flac"),
+        _sized(downloads, "A/two.flac"),
         release_mbid="release-1",
         expected_tracks=(
             ExpectedTrack(
@@ -401,7 +538,7 @@ async def test_process_downloaded_imports_and_moves(tmp_path: Path):
     fp, manager, client, library, downloads = _make_processor(tmp_path)
     _place(downloads, "Radiohead - OK Computer/01 Airbag.flac")
     manifest = _manifest(
-        ExpectedFile(filename="Radiohead - OK Computer/01 Airbag.flac", size=1)
+        _sized(downloads, "Radiohead - OK Computer/01 Airbag.flac")
     )
 
     result = await fp.process_downloaded(manifest)
@@ -426,7 +563,7 @@ async def test_process_downloaded_duration_mismatch_quarantines(tmp_path: Path):
     fp, _manager, _client, _library, downloads = _make_processor(tmp_path, verify=False)
     _place(downloads, "A/track.flac")
     # expected 500s but the fixture is a few seconds -> mismatch
-    manifest = _manifest(ExpectedFile(filename="A/track.flac", size=1, duration=500.0))
+    manifest = _manifest(_sized(downloads, "A/track.flac", duration=500.0))
 
     result = await fp.process_downloaded(manifest)
 
@@ -445,7 +582,7 @@ async def test_process_downloaded_track_duration_mismatch_is_wrong_track_not_qua
     fp, _manager, _client, _library, downloads = _make_processor(tmp_path, verify=False)
     _place(downloads, "A/track.flac")
     manifest = _manifest(
-        ExpectedFile(filename="A/track.flac", size=1, duration=500.0), is_track=True
+        _sized(downloads, "A/track.flac", duration=500.0), is_track=True
     )
 
     result = await fp.process_downloaded(manifest)
@@ -463,8 +600,8 @@ async def test_process_downloaded_only_filenames_imports_subset(tmp_path: Path):
     _place(downloads, "A/one.flac")
     _place(downloads, "A/two.flac")
     manifest = _manifest(
-        ExpectedFile(filename="A/one.flac", size=1),
-        ExpectedFile(filename="A/two.flac", size=1),
+        _sized(downloads, "A/one.flac"),
+        _sized(downloads, "A/two.flac"),
     )
 
     result = await fp.process_downloaded(manifest, only_filenames={"A/one.flac"})
@@ -479,7 +616,7 @@ async def test_process_downloaded_continue_on_failure(tmp_path: Path):
     fp, _manager, _client, library, downloads = _make_processor(tmp_path, verify=False)
     _place(downloads, "A/good.flac")
     manifest = _manifest(
-        ExpectedFile(filename="A/good.flac", size=1),
+        _sized(downloads, "A/good.flac"),
         ExpectedFile(filename="A/missing.flac", size=1),  # never placed
     )
 
@@ -513,8 +650,8 @@ async def test_process_downloaded_publication_error_fails_the_whole_unit(
     fp._publish_import_bundle = AsyncMock(side_effect=OSError("disk full"))
 
     manifest = _manifest(
-        ExpectedFile(filename="A/good.flac", size=1),
-        ExpectedFile(filename="A/bad.flac", size=1),
+        _sized(downloads, "A/good.flac"),
+        _sized(downloads, "A/bad.flac"),
     )
 
     result = await fp.process_downloaded(manifest)
@@ -559,7 +696,7 @@ async def test_process_downloaded_cross_mount_copies(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(_os, "replace", fake_replace)
 
-    manifest = _manifest(ExpectedFile(filename="A/track.flac", size=1))
+    manifest = _manifest(_sized(downloads, "A/track.flac"))
     result = await fp.process_downloaded(manifest)
 
     assert len(result.succeeded) == 1
@@ -600,7 +737,7 @@ async def test_process_downloaded_cross_mount_survives_metadata_rejection(
 
     monkeypatch.setattr(shutil, "copystat", reject_metadata)
 
-    manifest = _manifest(ExpectedFile(filename="A/track.flac", size=1))
+    manifest = _manifest(_sized(downloads, "A/track.flac"))
     result = await fp.process_downloaded(manifest)
 
     assert len(result.succeeded) == 1
@@ -615,7 +752,7 @@ async def test_process_downloaded_prunes_empty_leftover_dirs(tmp_path: Path):
     walking up nested dirs - but never the downloads mount root itself."""
     fp, _manager, _client, _library, downloads = _make_processor(tmp_path, verify=False)
     _place(downloads, "Artist - Album/CD1/track.flac")
-    manifest = _manifest(ExpectedFile(filename="Artist - Album/CD1/track.flac", size=1))
+    manifest = _manifest(_sized(downloads, "Artist - Album/CD1/track.flac"))
 
     result = await fp.process_downloaded(manifest)
 
@@ -632,7 +769,7 @@ async def test_process_downloaded_keeps_dir_with_remaining_sibling(tmp_path: Pat
     fp, _manager, _client, _library, downloads = _make_processor(tmp_path, verify=False)
     _place(downloads, "A/good.flac")
     (downloads / "A" / "cover.jpg").write_bytes(b"jpg")  # keeps the dir non-empty
-    manifest = _manifest(ExpectedFile(filename="A/good.flac", size=1))
+    manifest = _manifest(_sized(downloads, "A/good.flac"))
 
     result = await fp.process_downloaded(manifest)
 
@@ -670,7 +807,7 @@ async def test_process_downloaded_fingerprint_mismatch_on_wrong_artist(tmp_path:
         tmp_path, fingerprinter=fingerprinter, verify=True
     )
     _place(downloads, "A/track.flac")
-    manifest = _manifest(ExpectedFile(filename="A/track.flac", size=1), rg="rg-1")
+    manifest = _manifest(_sized(downloads, "A/track.flac"), rg="rg-1")
 
     result = await fp.process_downloaded(manifest)
 
@@ -697,7 +834,7 @@ async def test_process_downloaded_fingerprint_title_check_armed_for_single(
     )
     _place(downloads, "A/track.flac")
     manifest = _manifest(
-        ExpectedFile(filename="A/track.flac", size=1),
+        _sized(downloads, "A/track.flac"),
         expected_tracks=[ExpectedTrack(track_number=1, title="Airbag")],
     )
 
@@ -723,7 +860,7 @@ async def test_process_downloaded_fingerprint_title_check_skipped_without_expect
         tmp_path, fingerprinter=fingerprinter, verify=True
     )
     _place(downloads, "A/track.flac")
-    manifest = _manifest(ExpectedFile(filename="A/track.flac", size=1))
+    manifest = _manifest(_sized(downloads, "A/track.flac"))
 
     result = await fp.process_downloaded(manifest)
 
@@ -751,7 +888,7 @@ async def test_process_downloaded_fingerprint_accepts_right_artist_other_release
         tmp_path, fingerprinter=fingerprinter, verify=True
     )
     _place(downloads, "A/track.flac")
-    manifest = _manifest(ExpectedFile(filename="A/track.flac", size=1), rg="rg-1")
+    manifest = _manifest(_sized(downloads, "A/track.flac"), rg="rg-1")
 
     result = await fp.process_downloaded(manifest)
 
@@ -771,7 +908,7 @@ async def test_process_downloaded_fingerprint_failopen_when_disabled(tmp_path: P
         tmp_path, fingerprinter=fingerprinter, verify=True
     )
     _place(downloads, "A/track.flac")
-    manifest = _manifest(ExpectedFile(filename="A/track.flac", size=1))
+    manifest = _manifest(_sized(downloads, "A/track.flac"))
 
     result = await fp.process_downloaded(manifest)
 
@@ -818,12 +955,12 @@ async def test_process_downloaded_skips_duplicate_track_position(tmp_path: Path)
         )
 
     r1 = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="A/first.flac", size=1))
+        _manifest(_sized(downloads, "A/first.flac"))
     )
     assert len(r1.succeeded) == 1
 
     r2 = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="B/second.flac", size=1), task_id="t2")
+        _manifest(_sized(downloads, "B/second.flac"), task_id="t2")
     )
 
     # the duplicate position counts a success (already present) but isn't re-written
@@ -976,10 +1113,10 @@ def _fp(
         status=status,
         score=0.95,
         recording_id=recording_id,
+        recording_ids=recording_ids or [],
         title=title,
         artist=artist,
         release_group_ids=rgs or [],
-        recording_ids=recording_ids or [],
     )
 
 
@@ -1079,79 +1216,42 @@ def test_fingerprint_recording_mismatch_rejects_before_various_artist_allowance(
     assert _fingerprint_disagrees(fp, track, "Various Artists")
 
 
-def test_fingerprint_accepts_wanted_recording_listed_after_the_first():
-    # The Björk hold: AcoustID named the track EXACTLY right, but MusicBrainz splits
-    # one performance across editions and the wanted entity was not listed first.
-    # Membership in recording_ids is the identity test - equality against the first
-    # id alone held 108 correct files as fingerprint_mismatch.
+def test_fingerprint_accepts_expected_recording_candidate_after_selected_match():
     from models.download_manifest import ExpectedTrack
     from services.native.file_processor import _fingerprint_disagrees
 
     track = ExpectedTrack(
-        track_number=4, title="My Juvenile", recording_mbid="recording-wanted"
+        track_number=1,
+        title="Compilation Song",
+        recording_mbid="recording-wanted",
     )
     fp = _fp(
-        title="My Juvenile",
-        artist="Björk",
-        recording_id="recording-other-edition",
-        recording_ids=["recording-other-edition", "recording-wanted"],
+        title="Compilation Song",
+        artist="Different Display Artist",
+        recording_id="recording-other",
+        recording_ids=["recording-other", "recording-wanted"],
     )
-    assert _fingerprint_disagrees(fp, track, "Björk") is False
+
+    assert _fingerprint_disagrees(fp, track, "Requested Artist") is False
 
 
-def test_fingerprint_still_rejects_when_wanted_recording_is_absent_entirely():
-    # The 100 gecs hold: a remix album whose track ordering differs, so the audio is
-    # genuinely a different song. Widening to membership must NOT let this through.
+def test_fingerprint_recording_candidates_reject_absent_expected_before_artist_allowance():
     from models.download_manifest import ExpectedTrack
     from services.native.file_processor import _fingerprint_disagrees
 
     track = ExpectedTrack(
-        track_number=1, title="money machine", recording_mbid="recording-wanted"
+        track_number=1,
+        title="Compilation Song",
+        recording_mbid="recording-wanted",
     )
     fp = _fp(
-        title="800db cloud (Ricco Harver remix)",
-        artist="100 gecs",
-        recording_id="recording-remix-a",
-        recording_ids=["recording-remix-a", "recording-remix-b"],
+        title="Compilation Song",
+        artist="Specific Band",
+        recording_id="recording-other",
+        recording_ids=["recording-other"],
     )
-    assert _fingerprint_disagrees(fp, track, "100 gecs") is True
 
-
-def test_import_confidence_trusts_wanted_recording_listed_after_the_first():
-    from models.download_manifest import ExpectedTrack
-    from services.native.file_processor import _import_confidence
-
-    track = ExpectedTrack(
-        track_number=4, title="My Juvenile", recording_mbid="recording-wanted"
-    )
-    fp = _fp(
-        title="My Juvenile",
-        artist="Björk",
-        recording_id="recording-other-edition",
-        recording_ids=["recording-other-edition", "recording-wanted"],
-    )
-    tag = AudioTag(
-        title="My Juvenile",
-        artist="Björk",
-        album="Volta",
-        track_number=4,
-        disc_number=1,
-    )
-    info = AudioInfo(
-        duration_seconds=None,
-        bitrate=900,
-        sample_rate=44100,
-        channels=2,
-        file_format="flac",
-        file_size_bytes=1,
-        bit_depth=16,
-    )
-    assert (
-        _import_confidence(
-            tag=tag, info=info, expected_track=track, canonical_duration=None, fp=fp
-        )
-        == 1.0
-    )
+    assert _fingerprint_disagrees(fp, track, "Various Artists") is True
 
 
 def test_fingerprint_recording_mismatch_rejects_base_audio_for_requested_remix():
@@ -1184,8 +1284,320 @@ def test_fingerprint_title_veto_precedes_exact_recording_match():
         title="Clearly Different Song",
         artist="Unrelated Artist",
         recording_id="recording-wanted",
+        recording_ids=["recording-wanted"],
     )
     assert _fingerprint_disagrees(fp, track, "Requested Artist")
+
+
+def test_fingerprint_conflict_passes_when_lengths_agree():
+    # Slice 2: a length-consistent file (the max(15s, 10%) gate) with a
+    # conflicting AcoustID mapping is NOT held on the fingerprint alone.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=9, title="How Many More Times", duration_seconds=508.0
+    )
+    fp = _fp(title="Kashmir", artist="Led Zeppelin")
+    assert (
+        _fingerprint_disagrees(
+            fp,
+            track,
+            "Led Zeppelin",
+            file_duration_seconds=510.0,
+            expected_duration_seconds=508.0,
+        )
+        is False
+    )
+
+
+def test_fingerprint_conflict_holds_when_lengths_diverge():
+    # Slice 2: length-divergent + fingerprint-conflicting still holds.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=9, title="How Many More Times", duration_seconds=508.0
+    )
+    fp = _fp(title="Kashmir", artist="Led Zeppelin")
+    assert (
+        _fingerprint_disagrees(
+            fp,
+            track,
+            "Led Zeppelin",
+            file_duration_seconds=200.0,
+            expected_duration_seconds=508.0,
+        )
+        is True
+    )
+
+
+def test_fingerprint_non_pass_stays_fail_open_with_divergent_lengths():
+    # Slice 2: a non-pass result never rejects, even when the lengths disagree.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(track_number=1, title="Anything", duration_seconds=300.0)
+    assert (
+        _fingerprint_disagrees(
+            _fp(status="error"),
+            track,
+            "Artist",
+            file_duration_seconds=60.0,
+            expected_duration_seconds=300.0,
+        )
+        is False
+    )
+
+
+def test_fingerprint_candidate_accept_survives_divergent_lengths():
+    # Slice 2: candidate-set accept is preserved regardless of the lengths.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=1,
+        title="Compilation Song",
+        recording_mbid="recording-wanted",
+        duration_seconds=300.0,
+    )
+    fp = _fp(
+        title="Compilation Song",
+        artist="Different Display Artist",
+        recording_id="recording-other",
+        recording_ids=["recording-other", "recording-wanted"],
+    )
+    assert (
+        _fingerprint_disagrees(
+            fp,
+            track,
+            "Requested Artist",
+            file_duration_seconds=60.0,
+            expected_duration_seconds=300.0,
+        )
+        is False
+    )
+
+
+def test_fingerprint_recording_mismatch_weighed_by_length():
+    # Slice 2: an absent expected recording rejects only when the lengths diverge.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(
+        track_number=1,
+        title="Compilation Song",
+        recording_mbid="recording-wanted",
+        duration_seconds=300.0,
+    )
+    fp = _fp(
+        title="Compilation Song",
+        artist="Specific Band",
+        recording_id="recording-other",
+        recording_ids=["recording-other"],
+    )
+    assert (
+        _fingerprint_disagrees(
+            fp,
+            track,
+            "Various Artists",
+            file_duration_seconds=60.0,
+            expected_duration_seconds=300.0,
+        )
+        is True
+    )
+    assert (
+        _fingerprint_disagrees(
+            fp,
+            track,
+            "Various Artists",
+            file_duration_seconds=298.0,
+            expected_duration_seconds=300.0,
+        )
+        is False
+    )
+
+
+def test_fingerprint_unknown_lengths_keep_legacy_rule():
+    # Slice 2: without lengths on both sides the pre-existing rule stands.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(track_number=9, title="How Many More Times")
+    assert _fingerprint_disagrees(
+        _fp(title="Kashmir", artist="Led Zeppelin"), track, "Led Zeppelin"
+    )
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("KASHMIR", "Kashmir"),  # case fold
+        ("Don't Stop!", "dont stop"),  # punctuation fold
+        ("[Explicit] Song", "Song"),  # bracketed prefix
+        ("(Bonus) Song", "Song"),  # bracketed prefix
+        ("Song (feat. Guest)", "Song"),  # featuring credit
+        ("Mötley Crüe", "Motley Crue"),  # accent fold
+    ],
+)
+def test_recording_title_normaliser_folds_same_recording(first, second):
+    from services.native.title_match import normalize_recording_title
+
+    assert normalize_recording_title(first) == normalize_recording_title(second)
+
+
+def test_recording_title_normaliser_keeps_remix_marker():
+    from services.native.title_match import normalize_recording_title
+
+    assert "remix" in normalize_recording_title("Higher Love (Kygo Remix)")
+
+
+def test_fingerprint_passes_censored_spelling_variant():
+    # Slice 3: a censored AcoustID spelling of the same recording never vetoes.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(track_number=1, title="Fuck You")
+    fp = _fp(title="F**k You", artist="CeeLo Green")
+    assert _fingerprint_disagrees(fp, track, "CeeLo Green") is False
+
+
+def test_fingerprint_passes_bracketed_prefix_variant():
+    # Slice 3: a leading bracketed marker on the AcoustID side never vetoes.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(track_number=1, title="Song Title")
+    fp = _fp(title="[Explicit] Song Title", artist="Some Artist")
+    assert _fingerprint_disagrees(fp, track, "Some Artist") is False
+
+
+def test_fingerprint_artist_check_is_case_insensitive():
+    # Slice 3: the artist gate compares the normalized form.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(track_number=1, title="Kashmir")
+    fp = _fp(title="Kashmir", artist="LED ZEPPELIN")
+    assert _fingerprint_disagrees(fp, track, "Led Zeppelin") is False
+
+
+def test_fingerprint_still_holds_wrong_song_and_artist():
+    # Slice 3: no regression - a genuinely different song/artist still holds.
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+
+    track = ExpectedTrack(track_number=9, title="How Many More Times")
+    assert _fingerprint_disagrees(
+        _fp(title="Kashmir", artist="Led Zeppelin"), track, "Led Zeppelin"
+    )
+    assert _fingerprint_disagrees(
+        _fp(title="How Many More Times", artist="Someone Else"),
+        track,
+        "Led Zeppelin",
+    )
+
+
+def test_title_vetoes_pin_boundary_score_50(tmp_path):
+    # The <= 50 re-pin is load-bearing: normalisation lands "Clearly Different
+    # Song" vs "Requested Song" on exactly 50.0 (raw scored 44.4), and all three
+    # title vetoes must still fire there.
+    from types import SimpleNamespace
+
+    from rapidfuzz import fuzz
+
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import (
+        _fingerprint_disagrees,
+        _tag_conflict_reason,
+        _title_conflicts,
+    )
+    from services.native.title_match import normalize_recording_title
+
+    assert (
+        fuzz.token_set_ratio(
+            normalize_recording_title("Clearly Different Song"),
+            normalize_recording_title("Requested Song"),
+        )
+        == 50.0
+    )
+    track = ExpectedTrack(track_number=1, title="Requested Song")
+    assert (
+        _fingerprint_disagrees(
+            _fp(title="Clearly Different Song", artist="Requested Artist"),
+            track,
+            "Requested Artist",
+        )
+        is True
+    )
+    cand = _cand(
+        tmp_path, filename="01.flac", title="Clearly Different Song", dur=200.0
+    )
+    assert _title_conflicts(cand, track) is True
+    manifest = SimpleNamespace(artist_name="Led Zeppelin", album_title="Led Zeppelin")
+    assert (
+        _tag_conflict_reason(
+            cand.tag,
+            cand.info,
+            manifest,
+            ExpectedTrack(
+                track_number=1, title="Requested Song", duration_seconds=200.0
+            ),
+        )
+        == "tag_mismatch"
+    )
+
+
+def test_artist_gate_pins_boundary_score_55():
+    # The artist gate stays strict-< 55: a pair scoring exactly 55.0 (constructed
+    # boundary pair - token_set_ratio lands on 55.0) does NOT veto, while a
+    # below-55 pair still does. Titles agree throughout to isolate the gate.
+    from rapidfuzz import fuzz
+
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _fingerprint_disagrees
+    from services.native.title_match import normalize_recording_title
+
+    assert (
+        fuzz.token_set_ratio(
+            normalize_recording_title("abcdefghijklmnopqrst"),
+            normalize_recording_title("abcdefghijkzzzzzzzzz"),
+        )
+        == 55.0
+    )
+    track = ExpectedTrack(track_number=1, title="Same Song")
+    assert (
+        _fingerprint_disagrees(
+            _fp(title="Same Song", artist="abcdefghijklmnopqrst"),
+            track,
+            "abcdefghijkzzzzzzzzz",
+        )
+        is False
+    )
+    assert (
+        _fingerprint_disagrees(
+            _fp(title="Same Song", artist="zepp"),
+            ExpectedTrack(track_number=1, title="Same Song"),
+            "Led Zeppelin",
+        )
+        is True
+    )
+
+
+def test_tag_veto_ignores_bracket_only_title(tmp_path):
+    # A TITLE tag holding only a content marker ("[Explicit]") names nothing -
+    # it must not veto, mirroring the folder path's untagged bail-out.
+    from types import SimpleNamespace
+
+    from models.download_manifest import ExpectedTrack
+    from services.native.file_processor import _tag_conflict_reason
+
+    cand = _cand(tmp_path, filename="01.flac", title="[Explicit]", dur=200.0)
+    manifest = SimpleNamespace(artist_name="Led Zeppelin", album_title="Led Zeppelin")
+    track = ExpectedTrack(
+        track_number=1, title="Requested Song", duration_seconds=200.0
+    )
+    assert _tag_conflict_reason(cand.tag, cand.info, manifest, track) is None
 
 
 @pytest.mark.parametrize(
@@ -1270,6 +1682,20 @@ def test_import_guard_keeps_album_when_only_a_minority_mis_tagged():
     assert _folder_names_wrong_album(cands, "Led Zeppelin", "Led Zeppelin") is False
 
 
+def test_import_guard_accepts_rip_tag_without_the_canonical_apostrophe():
+    # GH #259 (import leg): the MB target carries "Man's Best Friend" but rips are
+    # routinely tagged without the apostrophe - that must NOT read as a wrong album.
+    cands = [_fc("Mans Best Friend", artist="Sabrina Carpenter") for _ in range(5)]
+    assert _folder_names_wrong_album(cands, "Sabrina Carpenter", "Man's Best Friend") is False
+
+
+def test_import_guard_still_quarantines_a_different_album_with_apostrophes():
+    # ...while "Emails I Can't Send" is a genuinely different Sabrina Carpenter album:
+    # the quarantine decision (process.folder_wrong_album) must still fire.
+    cands = [_fc("Emails I Can’t Send", artist="Sabrina Carpenter") for _ in range(5)]
+    assert _folder_names_wrong_album(cands, "Sabrina Carpenter", "Man's Best Friend") is True
+
+
 # -- held imports (capture on verify-fail + force-import) --
 
 
@@ -1322,7 +1748,7 @@ async def test_fingerprint_mismatch_holds_file_for_review(tmp_path: Path):
     )
     _place(downloads, "A/track.flac")
     manifest = _manifest(
-        ExpectedFile(filename="A/track.flac", size=1), task_id=task.id, rg="rg-1"
+        _sized(downloads, "A/track.flac"), task_id=task.id, rg="rg-1"
     )
 
     result = await fp.process_downloaded(manifest)
@@ -1493,6 +1919,7 @@ def _held_wired_processor(
 def _single_manifest(
     task_id,
     *,
+    file_size: int = 1,
     expected_duration=None,
     hold_on_wrong_track=False,
     canonical=None,
@@ -1510,7 +1937,7 @@ def _single_manifest(
         album_title="the arrival",
         naming_template=_TEMPLATE,
         target_files=[
-            ExpectedFile(filename="A/track.flac", size=1, duration=expected_duration)
+            ExpectedFile(filename="A/track.flac", size=file_size, duration=expected_duration)
         ],
         year=2026,
         is_track=expected_duration is not None,
@@ -1548,7 +1975,11 @@ async def test_tagged_wrong_file_held_without_acoustid(tmp_path: Path):
         album="A Knight of the Seven Kingdoms (Season 1)",
     )
 
-    result = await fp.process_downloaded(_single_manifest(task.id))
+    result = await fp.process_downloaded(
+        _single_manifest(
+            task.id, file_size=(downloads / "A/track.flac").stat().st_size
+        )
+    )
 
     assert result.succeeded == []
     assert result.failed[0].reason == "tag_mismatch"
@@ -1585,7 +2016,11 @@ async def test_automatic_management_failure_holds_acquisition_source_for_retry(
     _place(downloads, "A/track.flac")
     source = downloads / "A/track.flac"
 
-    result = await fp.process_downloaded(_single_manifest(task.id))
+    result = await fp.process_downloaded(
+        _single_manifest(
+            task.id, file_size=(downloads / "A/track.flac").stat().st_size
+        )
+    )
 
     held = await store.list_held_imports("user-a", "user")
     assert result.succeeded == []
@@ -1633,7 +2068,11 @@ async def test_management_hold_storage_failure_preserves_source_and_stops_failov
         AsyncMock(side_effect=OSError("database unavailable")),
     )
 
-    result = await fp.process_downloaded(_single_manifest(task.id))
+    result = await fp.process_downloaded(
+        _single_manifest(
+            task.id, file_size=(downloads / "A/track.flac").stat().st_size
+        )
+    )
 
     assert result.succeeded == []
     assert result.failed[0].reason == IMPORT_FAILED
@@ -1675,6 +2114,7 @@ async def test_management_hold_retry_republishes_the_secured_unit_once(
     await fp.process_downloaded(
         _single_manifest(
             task.id,
+            file_size=(downloads / "A/track.flac").stat().st_size,
             release_mbid="release-1",
             release_track_mbid="release-track-1",
         )
@@ -1715,7 +2155,7 @@ async def test_feat_credit_artist_tag_imports(tmp_path: Path):
     )
     _place(downloads, "A/track.flac")
     _retag(downloads, "A/track.flac", artist="Radiohead feat. Someone Else")
-    manifest = _manifest(ExpectedFile(filename="A/track.flac", size=1))
+    manifest = _manifest(_sized(downloads, "A/track.flac"))
 
     result = await fp.process_downloaded(manifest)
 
@@ -1748,7 +2188,7 @@ async def test_classical_composer_tag_imports(tmp_path: Path):
         artist_name="Berliner Philharmoniker",
         album_title="Beethoven: Symphony No. 9",
         naming_template=_TEMPLATE,
-        target_files=[ExpectedFile(filename="A/track.flac", size=1)],
+        target_files=[_sized(downloads, "A/track.flac")],
         expected_tracks=[
             ExpectedTrack(track_number=1, title="Symphony No. 9 in D minor, Op. 125")
         ],
@@ -1778,7 +2218,11 @@ async def test_untagged_file_never_tag_held(tmp_path: Path):
     audio.delete()
     audio.save()
 
-    result = await fp.process_downloaded(_single_manifest(task.id))
+    result = await fp.process_downloaded(
+        _single_manifest(
+            task.id, file_size=(downloads / "A/track.flac").stat().st_size
+        )
+    )
 
     assert len(result.succeeded) == 1
 
@@ -1810,7 +2254,7 @@ async def test_degraded_manifest_album_tag_conflict_held(tmp_path: Path):
         artist_name="Yan Qing",
         album_title="the arrival",
         naming_template=_TEMPLATE,
-        target_files=[ExpectedFile(filename="A/track.flac", size=1)],
+        target_files=[_sized(downloads, "A/track.flac")],
     )
 
     result = await fp.process_downloaded(manifest)
@@ -1832,7 +2276,11 @@ async def test_verify_off_skips_tag_check(tmp_path: Path):
     _place(downloads, "A/track.flac")
     _retag(downloads, "A/track.flac", title="Arrival in Ashford", artist="Dan Romer")
 
-    result = await fp.process_downloaded(_single_manifest(task.id))
+    result = await fp.process_downloaded(
+        _single_manifest(
+            task.id, file_size=(downloads / "A/track.flac").stat().st_size
+        )
+    )
 
     assert len(result.succeeded) == 1  # verification is the owner's existing toggle
 
@@ -1854,6 +2302,7 @@ async def test_repull_duration_mismatch_holds_for_review(tmp_path: Path):
     result = await fp.process_downloaded(
         _single_manifest(
             task.id,
+            file_size=(downloads / "A/track.flac").stat().st_size,
             expected_duration=155.556,
             canonical=155.556,
             hold_on_wrong_track=True,
@@ -1867,6 +2316,94 @@ async def test_repull_duration_mismatch_holds_for_review(tmp_path: Path):
     assert held[0].reason == WRONG_TRACK
     assert held[0].track_title == "the arrival"
     assert held[0].recording_mbid == "rec-180ceef5"
+    assert held[0].expected_duration_seconds == 155.556
+
+
+def _held_row(held_path: Path, **overrides):
+    from models.held_import import HeldImport
+
+    base = dict(
+        id=1,
+        user_id="user-a",
+        held_path=str(held_path),
+        reason="fingerprint_mismatch",
+        source="usenet",
+        status="held",
+        created_at=0.0,
+        track_title="Airbag",
+        artist_name="Radiohead",
+        track_number=1,
+        disc_number=1,
+    )
+    base.update(overrides)
+    return HeldImport(**base)
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_file_confirms_agreeing_result(tmp_path: Path):
+    from models.audio import FingerprintResult
+
+    fingerprinter = MagicMock()
+    fingerprinter.fingerprint = AsyncMock(
+        return_value=FingerprintResult(
+            status="pass", score=0.95, artist="Radiohead", title="Airbag"
+        )
+    )
+    fp, _store, _manager, _downloads = _held_wired_processor(
+        tmp_path, fingerprinter=fingerprinter
+    )
+    held_path = tmp_path / "held" / "x.flac"
+    held_path.parent.mkdir()
+    shutil.copy(_FLAC, held_path)
+
+    assert await fp.reverify_held_file(_held_row(held_path)) == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_file_holds_disagreeing_result(tmp_path: Path):
+    from models.audio import FingerprintResult
+
+    fingerprinter = MagicMock()
+    fingerprinter.fingerprint = AsyncMock(
+        return_value=FingerprintResult(
+            status="pass", score=0.99, artist="Coldplay", title="Yellow"
+        )
+    )
+    fp, _store, _manager, _downloads = _held_wired_processor(
+        tmp_path, fingerprinter=fingerprinter
+    )
+    held_path = tmp_path / "held" / "x.flac"
+    held_path.parent.mkdir()
+    shutil.copy(_FLAC, held_path)
+
+    assert await fp.reverify_held_file(_held_row(held_path)) == "still_held"
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_file_stays_held_without_verdict(tmp_path: Path):
+    from models.audio import FingerprintResult
+
+    fingerprinter = MagicMock()
+    fingerprinter.fingerprint = AsyncMock(return_value=FingerprintResult(status="error"))
+    fp, _store, _manager, _downloads = _held_wired_processor(
+        tmp_path, fingerprinter=fingerprinter
+    )
+    held_path = tmp_path / "held" / "x.flac"
+    held_path.parent.mkdir()
+    shutil.copy(_FLAC, held_path)
+    # an inconclusive result is not a confirmation - the file stays in review
+    assert await fp.reverify_held_file(_held_row(held_path)) == "still_held"
+    # without a fingerprinter wired there is no verdict either
+    fp._fingerprinter = None
+    assert await fp.reverify_held_file(_held_row(held_path)) == "still_held"
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_file_missing_copy_raises(tmp_path: Path):
+    fp, _store, _manager, _downloads = _held_wired_processor(tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        await fp.reverify_held_file(_held_row(tmp_path / "held" / "gone.flac"))
 
 
 @pytest.mark.asyncio
@@ -1883,7 +2420,12 @@ async def test_ordinary_wrong_track_failover_does_not_hold(tmp_path: Path):
     _place(downloads, "A/track.flac")
 
     result = await fp.process_downloaded(
-        _single_manifest(task.id, expected_duration=155.556, canonical=155.556)
+        _single_manifest(
+            task.id,
+            file_size=(downloads / "A/track.flac").stat().st_size,
+            expected_duration=155.556,
+            canonical=155.556,
+        )
     )
 
     assert result.failed and result.failed[0].reason == WRONG_TRACK
@@ -2015,7 +2557,7 @@ async def test_wrong_squatter_does_not_swallow_correct_import(tmp_path: Path):
         artist_name="Radiohead",
         album_title="the arrival",
         naming_template=_TEMPLATE,
-        target_files=[ExpectedFile(filename="A/track.flac", size=1)],
+        target_files=[_sized(downloads, "A/track.flac")],
         expected_tracks=[ExpectedTrack(track_number=1, title="Airbag")],
     )
 
@@ -2060,7 +2602,7 @@ async def test_covering_occupant_still_dedupes(tmp_path: Path):
         artist_name="Radiohead",
         album_title="the arrival",
         naming_template=_TEMPLATE,
-        target_files=[ExpectedFile(filename="A/track.flac", size=1)],
+        target_files=[_sized(downloads, "A/track.flac")],
         expected_tracks=[
             ExpectedTrack(track_number=1, title="Airbag", duration_seconds=0.3)
         ],
@@ -2106,7 +2648,7 @@ async def test_confidence_1_0_when_recording_tag_confirms(tmp_path: Path):
         artist_name="Radiohead",
         album_title="OK Computer",
         naming_template=_TEMPLATE,
-        target_files=[ExpectedFile(filename="A/track.flac", size=1)],
+        target_files=[_sized(downloads, "A/track.flac")],
         expected_tracks=[
             ExpectedTrack(
                 track_number=1, title="Airbag", recording_mbid="rec-airbag-0001"
@@ -2138,7 +2680,7 @@ async def test_confidence_0_9_when_canonical_duration_validated(tmp_path: Path):
         album_title="the arrival",
         naming_template=_TEMPLATE,
         is_track=True,  # strict gate armed: duration IS the canonical length
-        target_files=[ExpectedFile(filename="A/track.flac", size=1, duration=0.3)],
+        target_files=[_sized(downloads, "A/track.flac", duration=0.3)],
         expected_tracks=[
             # no title (unknown) and a NON-matching recording MBID, so neither the
             # 1.0 nor the 0.8 tier can fire - the canonical duration is the evidence
@@ -2174,9 +2716,7 @@ async def test_confidence_0_8_when_title_only_agrees(tmp_path: Path):
         artist_name="Radiohead",
         album_title="OK Computer",
         naming_template=_TEMPLATE,
-        target_files=[
-            ExpectedFile(filename="A/track.flac", size=1)
-        ],  # no canonical duration
+        target_files=[_sized(downloads, "A/track.flac")],  # no canonical duration
         expected_tracks=[
             ExpectedTrack(
                 track_number=1, title="Airbag", recording_mbid="rec-a-different-one"
@@ -2209,7 +2749,7 @@ async def test_confidence_0_6_when_uncorroborated(tmp_path: Path):
         artist_name="Radiohead",
         album_title="OK Computer",
         naming_template=_TEMPLATE,
-        target_files=[ExpectedFile(filename="A/track.flac", size=1)],
+        target_files=[_sized(downloads, "A/track.flac")],
     )
 
     result = await fp.process_downloaded(manifest)
@@ -2250,3 +2790,395 @@ async def test_import_anyway_stays_full_confidence(tmp_path: Path):
     await fp.place_held_file(held)
 
     assert _row_confidence(tmp_path / "library.db", "rg-c5") == pytest.approx(1.0)
+
+
+# -- #122: truncated-import size gate + downloads-subpath prune root --
+
+
+def _place_bytes(downloads: Path, rel: str, data: bytes) -> Path:
+    dest = downloads / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return dest
+
+
+@pytest.mark.asyncio
+async def test_truncated_file_rejected_by_size_gate(tmp_path: Path):
+    """#122: a 25%-truncated file must not import. The duration metadata lives in
+    the file header (truncation-invariant for MP3's Xing header and FLAC's
+    streaminfo) and the cheap locate paths ignore size, so the byte-size gate is
+    the backstop: correct expected.size + short file rejects with SIZE_MISMATCH,
+    which quarantines nothing and preserves the workspace."""
+    from services.native.file_processor import SIZE_MISMATCH
+
+    fp, _manager, _client, _library, downloads = _make_processor(tmp_path, verify=False)
+    full = _FLAC.read_bytes()
+    _place_bytes(downloads, "A/song.flac", full[: len(full) // 4])
+    manifest = _manifest(ExpectedFile(filename="A/song.flac", size=len(full)))
+
+    result = await fp.process_downloaded(manifest)
+
+    assert result.succeeded == []
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == SIZE_MISMATCH
+    assert SIZE_MISMATCH not in QUARANTINE_REASONS  # never blacklist the peer
+    assert result.workspace_disposition == "preserve"
+    assert (downloads / "A/song.flac").exists()  # failed imports keep the source
+
+
+@pytest.mark.asyncio
+async def test_full_size_file_passes_size_gate(tmp_path: Path):
+    fp, manager, _client, _library, downloads = _make_processor(tmp_path, verify=False)
+    full = _FLAC.read_bytes()
+    _place_bytes(downloads, "A/song.flac", full)
+    manifest = _manifest(ExpectedFile(filename="A/song.flac", size=len(full)))
+
+    result = await fp.process_downloaded(manifest)
+
+    assert len(result.succeeded) == 1
+    assert result.failed == []
+    assert await manager.has_album("rg-1") is True
+
+
+@pytest.mark.asyncio
+async def test_size_gate_fails_open_on_unknown_size(tmp_path: Path):
+    """size<=0 means 'unknown' (older manifests): the gate is skipped, import proceeds."""
+    fp, manager, _client, _library, downloads = _make_processor(tmp_path, verify=False)
+    full = _FLAC.read_bytes()
+    _place_bytes(downloads, "A/song.flac", full)
+    manifest = _manifest(ExpectedFile(filename="A/song.flac", size=0))
+
+    result = await fp.process_downloaded(manifest)
+
+    assert len(result.succeeded) == 1
+    assert result.failed == []
+
+
+@pytest.mark.asyncio
+async def test_size_gate_fails_open_when_stat_fails(tmp_path: Path, monkeypatch):
+    """A transient stat error must not fail the import - log and carry on."""
+    fp, manager, _client, _library, downloads = _make_processor(tmp_path, verify=False)
+    full = _FLAC.read_bytes()
+    target = _place_bytes(downloads, "A/song.flac", full)
+    manifest = _manifest(ExpectedFile(filename="A/song.flac", size=len(full)))
+
+    real_stat = Path.stat
+    calls = {"n": 0}
+
+    def _flaky_stat(self, *args, **kwargs):
+        # only the gate's bare source.stat() fails, once: exists()/is_dir() probe
+        # via stat(follow_symlinks=...) and the tagger's own bare stat() (for
+        # file_size_bytes) must keep working, as in production. The gate runs
+        # before the tag read, so the first bare stat is always the gate's.
+        if self == target and "follow_symlinks" not in kwargs and calls["n"] == 0:
+            calls["n"] += 1
+            raise OSError("transient IO error")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _flaky_stat)
+
+    result = await fp.process_downloaded(manifest)
+
+    assert len(result.succeeded) == 1
+    assert result.failed == []
+
+
+@pytest.mark.asyncio
+async def test_prune_preserves_downloads_subpath_root(tmp_path: Path):
+    """#122 Unraid layout: mount=media/, slskd writes into media/completed/. Once the
+    album folder empties, the empty album dirs still prune but completed/ itself -
+    the effective downloads root - must survive."""
+    effective = tmp_path / "media" / "completed"
+    fp, _manager, _client, _library, downloads = _make_processor(
+        tmp_path, downloads=effective, verify=False
+    )
+    assert downloads == effective
+    _place(downloads, "Album/track.flac")
+    manifest = _manifest(_sized(downloads, "Album/track.flac"))
+
+    result = await fp.process_downloaded(manifest)
+
+    assert len(result.succeeded) == 1
+    assert not (effective / "Album").exists()  # empty album dir still prunes
+    assert effective.exists()  # ...but the subpath root itself survives
+    assert (tmp_path / "media").exists()
+
+
+def test_build_file_processor_resolves_downloads_subpath(tmp_path, monkeypatch):
+    """#122: the importer must prune under the same effective root the repository
+    uses (mount + downloads_subpath), not the raw mount - otherwise an emptied
+    completed/ dir is itself removed. Empty subpath keeps the raw mount."""
+    import core.config as _config
+    import core.dependencies.repo_providers as _repos
+    import core.dependencies.service_providers as _providers
+    from types import SimpleNamespace
+
+    from api.v1.schemas.settings import (
+        DownloadClientConnectionSettings,
+        DownloadPolicySettings,
+    )
+
+    mount = tmp_path / "media"
+    mount.mkdir()
+    prefs = MagicMock()
+    prefs.get_download_policy.return_value = DownloadPolicySettings()
+    prefs.get_download_client_settings_raw.return_value = (
+        DownloadClientConnectionSettings(downloads_subpath="completed")
+    )
+    settings = SimpleNamespace(
+        slskd_downloads_path=mount, cache_dir=tmp_path / "cache"
+    )
+    monkeypatch.setattr(_providers, "get_audio_tagger", lambda: MagicMock())
+    monkeypatch.setattr(_providers, "get_audio_fingerprinter", lambda: MagicMock())
+    monkeypatch.setattr(_repos, "get_download_client_repository", lambda: MagicMock())
+    monkeypatch.setattr(_repos, "get_download_store", lambda: MagicMock())
+    monkeypatch.setattr(_providers, "get_preferences_service", lambda: prefs)
+    monkeypatch.setattr(_config, "get_settings", lambda: settings)
+
+    fp = _providers._build_file_processor(MagicMock(), [tmp_path / "lib"])
+
+    assert fp._slskd_downloads_path == mount / "completed"
+
+    prefs.get_download_client_settings_raw.return_value = (
+        DownloadClientConnectionSettings(downloads_subpath="")
+    )
+
+    fp = _providers._build_file_processor(MagicMock(), [tmp_path / "lib"])
+
+    assert fp._slskd_downloads_path == mount
+
+    # defence in depth: ".." components can never escape the mount
+    prefs.get_download_client_settings_raw.return_value = (
+        DownloadClientConnectionSettings(downloads_subpath="../../etc")
+    )
+
+    fp = _providers._build_file_processor(MagicMock(), [tmp_path / "lib"])
+
+    assert fp._slskd_downloads_path == mount / "etc"
+
+
+@pytest.mark.asyncio
+async def test_shared_publication_enospc_logs_errno_and_keeps_generic_reason(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#185 part A: an ENOSPC publisher failure must log errno/exc-type context to
+    the server log only, while the user-facing reason stays the fixed generic
+    string."""
+    import errno
+    import logging
+
+    from services.native.file_processor import IMPORT_FAILED
+
+    fp, _manager, _client, _library, downloads = _make_processor(
+        tmp_path, verify=False
+    )
+    _place(downloads, "A/good.flac")
+    fp._publish_import_bundle = AsyncMock(
+        side_effect=OSError(errno.ENOSPC, "No space left on device")
+    )
+    manifest = _manifest(_sized(downloads, "A/good.flac"))
+
+    with caplog.at_level(logging.DEBUG, logger="services.native.file_processor"):
+        result = await fp.process_downloaded(manifest)
+
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == IMPORT_FAILED
+    assert (
+        result.failed[0].reason
+        == "import failed - could not write the file into the library"
+    )
+    errno_records = [
+        record for record in caplog.records if getattr(record, "errno", None) == errno.ENOSPC
+    ]
+    assert errno_records, "expected a log record carrying errno=ENOSPC (28)"
+    assert any(getattr(record, "exc_type", None) == "OSError" for record in errno_records)
+    assert any("good.flac" in record.getMessage() for record in errno_records)
+    assert any("acquisition:t1:files" in record.getMessage() for record in errno_records)
+
+
+def test_target_location_zero_matches_logs_count_and_keeps_message(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#185 part A: a 0-root resolution logs count/roots/basename and raises with
+    the unchanged message."""
+    import logging
+
+    fp = FileProcessor(
+        AudioTagger(),
+        library_paths=[tmp_path / "lib"],
+        library_root_ids=["root-a"],
+    )
+    outside = tmp_path / "elsewhere" / "track.flac"
+
+    with caplog.at_level(logging.DEBUG, logger="services.native.file_processor"):
+        with pytest.raises(RuntimeError) as excinfo:
+            fp._target_location(outside)
+
+    assert str(excinfo.value) == "Import target does not resolve to one library root."
+    resolution = [
+        record for record in caplog.records if getattr(record, "match_count", None) == 0
+    ]
+    assert resolution, "expected a log record with match_count=0"
+    assert resolution[0].root_count == 1
+    assert resolution[0].target == "track.flac"
+    assert str(tmp_path) not in resolution[0].getMessage()
+
+
+def test_target_location_two_matches_logs_count_and_keeps_message(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#185 part A: a 2-root resolution (nested roots) logs count/roots/basename
+    and raises with the unchanged message."""
+    import logging
+
+    outer = tmp_path / "lib"
+    inner = outer / "sub"
+    fp = FileProcessor(
+        AudioTagger(),
+        library_paths=[outer, inner],
+        library_root_ids=["root-a", "root-b"],
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="services.native.file_processor"):
+        with pytest.raises(RuntimeError) as excinfo:
+            fp._target_location(inner / "track.flac")
+
+    assert str(excinfo.value) == "Import target does not resolve to one library root."
+    resolution = [
+        record for record in caplog.records if getattr(record, "match_count", None) == 2
+    ]
+    assert resolution, "expected a log record with match_count=2"
+    assert resolution[0].root_count == 2
+    assert resolution[0].target == "track.flac"
+    assert str(tmp_path) not in resolution[0].getMessage()
+
+
+class _RepoClient:
+    """Stub client delegating location to a real SlskdRepository, counting
+    partial consults so the tests prove which import mode consults them."""
+
+    def __init__(self, repo) -> None:  # noqa: ANN001
+        self._repo = repo
+        self.partial_calls = 0
+
+    async def get_file_path(
+        self, handle, remote_filename: str, size: int | None = None
+    ):
+        return await self._repo.get_file_path(handle, remote_filename, size)
+
+    async def locate_partial(
+        self, handle, remote_filename: str, size: int | None = None
+    ):
+        self.partial_calls += 1
+        return await self._repo.locate_partial(handle, remote_filename, size)
+
+
+def _partial_processor(tmp_path: Path, *, incomplete: Path | None):
+    """FileProcessor wired to a real SlskdRepository over split tmp mounts."""
+    from repositories.slskd.slskd_repository import SlskdRepository
+
+    complete = tmp_path / "complete"
+    complete.mkdir(parents=True, exist_ok=True)
+    library = tmp_path / "library"
+    library.mkdir(parents=True, exist_ok=True)
+    manager = LibraryManager(
+        LibraryDB(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    )
+    repo = SlskdRepository(
+        client=None,
+        url="",
+        api_key="",
+        downloads_mount=complete,
+        incomplete_mount=incomplete,
+    )
+    client = _RepoClient(repo)
+    fp = FileProcessor(
+        AudioTagger(),
+        naming_engine=NamingTemplateEngine(),
+        library_manager=manager,
+        library_paths=[library],
+        client=client,
+        slskd_downloads_path=complete,
+        verify_downloads=False,
+        library_root_ids=["root-a"],
+        publish_import_bundle=_test_publisher(manager, library),
+        policy_revision_getter=lambda: "policy-1",
+    )
+    return fp, client, complete
+
+
+@pytest.mark.asyncio
+async def test_subset_import_partial_hit_emits_retry_signal_without_import(
+    tmp_path: Path,
+) -> None:
+    """An Errored file's stranded bytes resolve via locate_partial while
+    get_file_path stays None: the subset import must emit the per-file retry
+    signal (SOURCE_FILE_MISSING, non-quarantine, workspace preserved) WITHOUT
+    a tag read or import. The staged bytes are deliberately not valid audio,
+    so any tag-read attempt would fail "corrupt" instead."""
+    from services.native.file_processor import SOURCE_FILE_MISSING
+
+    incomplete = tmp_path / "incomplete"
+    album = incomplete / "Album"
+    album.mkdir(parents=True)
+    (album / "01 - Track.flac").write_bytes(b"not audio, just stranded bytes")
+    fp, client, _complete = _partial_processor(tmp_path, incomplete=incomplete)
+    manifest = _manifest(ExpectedFile(filename="Album/01 - Track.flac", size=50000))
+
+    result = await fp.process_downloaded(
+        manifest, only_filenames={"Album/01 - Track.flac"}
+    )
+
+    assert client.partial_calls == 1
+    assert result.succeeded == []
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == SOURCE_FILE_MISSING
+    assert SOURCE_FILE_MISSING not in QUARANTINE_REASONS
+    assert result.workspace_disposition == "preserve"
+
+
+@pytest.mark.asyncio
+async def test_full_manifest_import_never_consults_partial(tmp_path: Path) -> None:
+    """Full-manifest import (only=None, the completed-status shape) must never
+    consult the partial path: a synthetic completed-status import with a short
+    staged file still fails closed with SOURCE_FILE_MISSING."""
+    from services.native.file_processor import SOURCE_FILE_MISSING
+
+    incomplete = tmp_path / "incomplete"
+    album = incomplete / "Album"
+    album.mkdir(parents=True)
+    (album / "01 - Track.flac").write_bytes(b"not audio, just stranded bytes")
+    fp, client, _complete = _partial_processor(tmp_path, incomplete=incomplete)
+    manifest = _manifest(ExpectedFile(filename="Album/01 - Track.flac", size=50000))
+
+    result = await fp.process_downloaded(manifest)
+
+    assert client.partial_calls == 0
+    assert result.succeeded == []
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == SOURCE_FILE_MISSING
+
+
+@pytest.mark.asyncio
+async def test_subset_import_empty_setting_emits_no_partial_signal(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Empty setting = byte-identical behaviour: the repo declines silently, so
+    no partial_retry signal fires and the missing file fails exactly as before."""
+    from services.native.file_processor import SOURCE_FILE_MISSING
+
+    fp, _client, _complete = _partial_processor(tmp_path, incomplete=None)
+    manifest = _manifest(ExpectedFile(filename="Album/01 - Track.flac", size=50000))
+
+    with caplog.at_level("INFO", logger="services.native.file_processor"):
+        result = await fp.process_downloaded(
+            manifest, only_filenames={"Album/01 - Track.flac"}
+        )
+
+    assert result.succeeded == []
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == SOURCE_FILE_MISSING
+    assert not [
+        r for r in caplog.records if r.getMessage() == "process.partial_retry"
+    ]

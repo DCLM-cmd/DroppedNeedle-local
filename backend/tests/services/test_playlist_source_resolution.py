@@ -547,3 +547,178 @@ class TestGuidAlbumIdFallback:
 
         jf.resolve_album_mbid.assert_not_called()
         local.match_album_by_mbid.assert_called_once_with("mbid-abc")
+
+
+class TestSkippedBackendsNotCalled:
+    """Unconfigured backends are gated on is_configured() before any call."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_album_sources_skips_unconfigured_backends(self, tmp_path):
+        service, _ = _make_service(tmp_path)
+        jf = AsyncMock()
+        jf.is_configured = MagicMock(return_value=False)
+        local = AsyncMock()
+        local.is_configured = MagicMock(return_value=False)
+        nd = AsyncMock()
+        nd.is_configured = MagicMock(return_value=False)
+        plex = AsyncMock()
+        plex.is_configured = MagicMock(return_value=False)
+
+        jf_out, local_out, nd_out, plex_out = await service._resolve_album_sources(
+            "mbid-abc", jf, local, nd, plex,
+            album_name="Sheet Music", artist_name="10cc",
+        )
+
+        assert (jf_out, local_out, nd_out, plex_out) == ({}, {}, {}, {})
+        jf.match_album_by_mbid.assert_not_called()
+        local.match_album_by_mbid.assert_not_called()
+        nd.get_album_match.assert_not_called()
+        plex.get_album_match.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_configured_backend_still_called_when_others_skipped(self, tmp_path):
+        service, _ = _make_service(tmp_path)
+        jf = AsyncMock()
+        jf.is_configured = MagicMock(return_value=False)
+        local = _make_local_service()
+        local.is_configured = MagicMock(return_value=True)
+        nd = AsyncMock()
+        nd.is_configured = MagicMock(return_value=False)
+
+        _, local_out, nd_out, _ = await service._resolve_album_sources(
+            "mbid-abc", jf, local, nd,
+            album_name="Sheet Music", artist_name="10cc",
+        )
+
+        jf.match_album_by_mbid.assert_not_called()
+        nd.get_album_match.assert_not_called()
+        local.match_album_by_mbid.assert_called_once_with("mbid-abc")
+        assert local_out != {}
+        assert nd_out == {}
+
+    @pytest.mark.asyncio
+    async def test_skipped_backends_record_degradation(self, tmp_path):
+        from infrastructure.degradation import (
+            clear_degradation_context,
+            init_degradation_context,
+            try_get_degradation_context,
+        )
+
+        service, _ = _make_service(tmp_path)
+        jf = AsyncMock()
+        jf.is_configured = MagicMock(return_value=False)
+        nd = AsyncMock()
+        nd.is_configured = MagicMock(return_value=False)
+
+        init_degradation_context()
+        try:
+            await service._resolve_album_sources("mbid-abc", jf, None, nd)
+            ctx = try_get_degradation_context()
+            assert ctx is not None
+            summary = ctx.degraded_summary()
+            assert "jellyfin" in summary
+            assert "navidrome" in summary
+        finally:
+            clear_degradation_context()
+
+
+def _make_unknown_track(id="t-1") -> PlaylistTrackRecord:
+    """A Spotify-imported row still waiting on its album (#381)."""
+    track = _make_track(id=id, source_type="", available_sources=[])
+    track.track_source_id = None
+    return track
+
+
+class TestResolvePromotesUnknownRows:
+    """Empty source_type rows heal to the best resolved source (#381)."""
+
+    @pytest.mark.asyncio
+    async def test_promotes_empty_row_to_local(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        repo.get_tracks = MagicMock(return_value=[_make_unknown_track()])
+
+        result = await service.resolve_track_sources(
+            "p-1", local_service=_make_local_service(),
+        )
+
+        assert result["t-1"] == ["local"]
+        repo.update_track_source.assert_called_once()
+        # AsyncPlaylistRepository forwards positionally:
+        # (playlist_id, track_id, source_type, available_sources,
+        #  track_source_id, plex_rating_key, library_file_id).
+        args, _kwargs = repo.update_track_source.call_args
+        assert args[:4] == ("p-1", "t-1", "local", ["local"])
+        assert args[4] == "789"
+        assert args[6] == "789"
+        # The promotion already stores available_sources; the batch path skips it.
+        repo.batch_update_available_sources.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_clobber_existing_source(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        repo.get_tracks = MagicMock(
+            return_value=[_make_track(available_sources=["navidrome"])]
+        )
+
+        result = await service.resolve_track_sources(
+            "p-1",
+            local_service=_make_local_service(),
+            nd_service=_make_nd_service(),
+        )
+
+        assert sorted(result["t-1"]) == ["local", "navidrome"]
+        repo.update_track_source.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_cache_does_not_block_local_healing(self, tmp_path):
+        repo = MagicMock()
+        repo.get_playlist = MagicMock(return_value=_make_playlist())
+        repo.get_tracks = MagicMock(return_value=[_make_unknown_track()])
+        repo.batch_update_available_sources = MagicMock(return_value=0)
+        repo.batch_link_library_files = MagicMock(return_value=0)
+        cache = AsyncMock()
+        # Entry cached before the download: navidrome only, no local tracks.
+        cache.get = AsyncMock(
+            return_value=({}, {}, {(1, 1): ("Wall Street Shuffle", "nd-456")}, {})
+        )
+        cache.set = AsyncMock()
+        service = PlaylistService(repo=repo, cache_dir=tmp_path, cache=cache)
+
+        result = await service.resolve_track_sources(
+            "p-1",
+            local_service=_make_local_service(),
+            nd_service=_make_nd_service(),
+        )
+
+        assert "local" in result["t-1"]
+        repo.update_track_source.assert_called_once()
+        args, _kwargs = repo.update_track_source.call_args
+        assert args[:4] == ("p-1", "t-1", "local", result["t-1"])
+        assert args[4] == "789"
+        assert args[6] == "789"
+
+    @pytest.mark.asyncio
+    async def test_scoped_promotion_to_local_strips_navidrome(self, tmp_path):
+        """A scoped resolve healing to local must not persist navidrome globally."""
+        service, repo = _make_service(tmp_path)
+        repo.get_tracks = MagicMock(return_value=[_make_unknown_track()])
+
+        result = await service.resolve_track_sources(
+            "p-1",
+            local_service=_make_local_service(),
+            nd_service=_make_nd_service(),
+            navidrome_folder_ids=("folder-a",),
+        )
+
+        assert "local" in result["t-1"]
+        repo.update_track_source.assert_called_once()
+        args, _kwargs = repo.update_track_source.call_args
+        assert args[0] == "p-1"
+        assert args[1] == "t-1"
+        assert args[2] == "local"
+        persisted = args[3]
+        assert "navidrome" not in persisted
+        assert "local" in persisted
+        assert args[4] == "789"
+        assert args[6] == "789"
+        repo.batch_update_available_sources.assert_not_called()

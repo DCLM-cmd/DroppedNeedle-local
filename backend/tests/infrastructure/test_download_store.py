@@ -79,6 +79,7 @@ def test_migration_is_idempotent(tmp_path: Path):
         "management_retry_count",
         "management_next_retry_at",
         "file_cleanup_completed_at",
+        "expected_duration_seconds",
     } <= held_columns
     assert activity_tables == {
         "download_activity_global_revision",
@@ -114,6 +115,22 @@ async def test_create_task_returns_uuid(store):
     fetched = await store.get_task(task.id)
     assert fetched is not None
     assert fetched.release_group_mbid == "rg-1"
+
+
+@pytest.mark.asyncio
+async def test_create_task_persists_manual_quality_override(store):
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-override",
+        artist_name="A",
+        album_title="B",
+        manual_quality_override=True,
+    )
+
+    assert task.manual_quality_override is True
+    fetched = await store.get_task(task.id)
+    assert fetched is not None
+    assert fetched.manual_quality_override is True
 
 
 @pytest.mark.asyncio
@@ -322,6 +339,7 @@ async def test_quarantine_set_roundtrip(store):
     quarantine = await store.load_quarantine_set()
     assert ("soulseek", soulseek_identity("peerX", "bad.flac")) in quarantine
     assert isinstance(quarantine, set)
+
 
 @pytest.mark.asyncio
 async def test_quarantine_soulseek_identity_canonicalizes_writer_and_reader(store):
@@ -929,6 +947,8 @@ async def test_held_import_record_list_get_ownership(store):
     # the album-artist MBID round-trips so "import anyway" can stamp the real artist
     assert got.artist_mbid == "678d88b2-87b0-403b-b63d-5da7465aecc3"
     assert await store.get_held_import(hid, "user-b", "user") is None  # not the owner
+    admin_got = await store.get_held_import(hid, "admin-1", "admin")
+    assert admin_got is not None and admin_got.track_title == "You Shook Me"
     # album scoping (the album page)
     assert (
         len(await store.list_held_imports("user-a", "user", release_group_mbid="rg-1"))
@@ -937,6 +957,24 @@ async def test_held_import_record_list_get_ownership(store):
     assert (
         await store.list_held_imports("user-a", "user", release_group_mbid="rg-x") == []
     )
+
+
+@pytest.mark.asyncio
+async def test_held_import_expected_duration_round_trips(store):
+    hid = await store.record_held_import(
+        **_held_kwargs(expected_duration_seconds=390.0)
+    )
+    got = await store.get_held_import(hid, "user-a", "user")
+    assert got is not None and got.expected_duration_seconds == 390.0
+    listed = await store.list_held_imports("user-a", "user")
+    assert listed[0].expected_duration_seconds == 390.0
+
+
+@pytest.mark.asyncio
+async def test_held_import_expected_duration_defaults_null_for_legacy(store):
+    hid = await store.record_held_import(**_held_kwargs())
+    got = await store.get_held_import(hid, "user-a", "user")
+    assert got is not None and got.expected_duration_seconds is None
 
 
 @pytest.mark.asyncio
@@ -1021,6 +1059,49 @@ async def test_discarded_file_cleanup_debt_is_durable_and_clears_once(store):
     await store.complete_held_file_cleanup([held_id])
 
     assert await store.list_pending_discard_file_cleanups() == []
+
+
+@pytest.mark.asyncio
+async def test_held_import_lookup_and_resolve_ignore_terminal_rows(store):
+    imported_id = await store.record_held_import(
+        **_held_kwargs(track_number=4, held_path="/held/imported.flac")
+    )
+    discarded_id = await store.record_held_import(
+        **_held_kwargs(track_number=5, held_path="/held/discarded.flac")
+    )
+    assert isinstance(imported_id, int)
+    assert isinstance(discarded_id, int)
+
+    await store.resolve_held_import(imported_id, "imported")
+    await store.resolve_held_import(discarded_id, "discarded")
+
+    assert await store.get_held_import(imported_id, "user-a", "user") is None
+    assert await store.get_held_import(imported_id, "admin-1", "admin") is None
+    assert await store.get_held_import(discarded_id, "user-a", "user") is None
+    assert await store.get_held_import(discarded_id, "admin-1", "admin") is None
+    assert await store.list_held_imports("user-a", "user") == []
+    assert await store.list_held_imports("admin-1", "admin") == []
+
+    with sqlite3.connect(store.db_path) as conn:
+        terminal_state = conn.execute(
+            "SELECT id, status, resolved_at FROM held_imports "
+            "WHERE id IN (?, ?) ORDER BY id",
+            (imported_id, discarded_id),
+        ).fetchall()
+
+    # Stale/repeated actions must not overwrite a terminal state.
+    await store.resolve_held_import(imported_id, "discarded")
+    await store.resolve_held_import(discarded_id, "imported")
+
+    with sqlite3.connect(store.db_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT id, status, resolved_at FROM held_imports "
+                "WHERE id IN (?, ?) ORDER BY id",
+                (imported_id, discarded_id),
+            ).fetchall()
+            == terminal_state
+        )
 
 
 @pytest.mark.asyncio

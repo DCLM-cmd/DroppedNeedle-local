@@ -1,12 +1,12 @@
 import { browser } from '$app/environment';
 import { ApiError, api } from '$lib/api/client';
+import { queryClient } from '$lib/queries/QueryClient';
 import { API, AUTH_FREE_PATHS } from '$lib/constants';
-import { queryClient, resetQueryCacheForUserSwitch } from '$lib/queries/QueryClient';
+import { toAuthUser, type AuthSessionUser } from '$lib/queries/auth/types';
 import { getScrobblePreferencesQueryOptions } from '$lib/queries/scrobble-preferences/ScrobblePreferencesQuery.svelte';
 import { DEFAULT_SOURCE, isMusicSource, musicSourceStore } from '$lib/stores/musicSource';
-import { scrobbleManager } from '$lib/stores/scrobble.svelte';
 import { authStore, LAST_USER_ID_KEY } from '$lib/stores/authStore.svelte';
-import { clearUserScopedLocalCaches } from '$lib/utils/userScopedCaches';
+import { clearUserSessionState } from '$lib/utils/userSessionCleanup';
 import { withBasePath, withoutBasePath } from '$lib/utils/basePath';
 import { error, redirect } from '@sveltejs/kit';
 import type { LayoutLoad } from './$types';
@@ -34,36 +34,13 @@ export const load: LayoutLoad = async ({ url }) => {
 		}
 
 		try {
-			const user = await api.global.get<{
-				id: string;
-				display_name: string;
-				role: string;
-				email: string | null;
-				avatar_url: string | null;
-				username: string | null;
-				username_display: string | null;
-				providers: string[];
-			}>(API.auth.me(), { timeoutMs: BOOTSTRAP_TIMEOUT_MS });
-			authStore.setUser({
-				id: user.id,
-				display_name: user.display_name,
-				role: user.role as 'admin' | 'trusted' | 'user',
-				email: user.email,
-				avatar_url: user.avatar_url,
-				username: user.username,
-				username_display: user.username_display,
-				providers: user.providers ?? []
+			const user = await api.global.get<AuthSessionUser>(API.auth.me(), {
+				timeoutMs: BOOTSTRAP_TIMEOUT_MS
 			});
+			authStore.setUser(toAuthUser(user));
 		} catch (cause) {
 			if (cause instanceof ApiError && cause.status === 401) {
-				if (browser && localStorage.getItem(LAST_USER_ID_KEY)) {
-					await resetQueryCacheForUserSwitch();
-					clearUserScopedLocalCaches();
-					musicSourceStore.reset();
-					scrobbleManager.reset();
-					localStorage.removeItem(LAST_USER_ID_KEY);
-				}
-				authStore.clear();
+				await clearUserSessionState().catch(() => undefined);
 			} else {
 				throw error(503, BUSY_MESSAGE);
 			}
@@ -82,10 +59,7 @@ export const load: LayoutLoad = async ({ url }) => {
 	if (browser && authStore.user) {
 		const lastId = localStorage.getItem(LAST_USER_ID_KEY);
 		if (lastId && lastId !== authStore.user.id) {
-			await resetQueryCacheForUserSwitch();
-			clearUserScopedLocalCaches();
-			musicSourceStore.reset();
-			scrobbleManager.reset();
+			await clearUserSessionState({ clearAuth: false }).catch(() => undefined);
 		}
 		localStorage.setItem(LAST_USER_ID_KEY, authStore.user.id);
 	}

@@ -1364,8 +1364,8 @@ async def test_recover_import_bundle_skips_while_publication_lock_held(
     class SimulatedProcessStop(BaseException):
         pass
 
-    async def gated_commit(bundle_id: str, published):
-        del bundle_id, published
+    async def gated_commit(bundle_id: str, published, source_context=None):
+        del bundle_id, published, source_context
         commit_started.set()
         await release.wait()
         raise SimulatedProcessStop

@@ -2,9 +2,11 @@ import asyncio
 import logging
 import time
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
+from starlette.datastructures import URL
 
+from api.v1.schemas.album import EditionPinBody, EditionPinResponse
 from api.v1.schemas.library_target import (
     TargetNativeAlbumDetail,
     TargetNativeAlbumsResponse,
@@ -41,6 +43,7 @@ from api.v1.schemas.library import (
 from api.v1.schemas.library_scan_target import ScanRunRequestedResponse
 from core.exceptions import ResourceNotFoundError, ValidationError
 from core.dependencies.type_aliases import (
+    AlbumServiceDep,
     LibraryPolicyResolverDep,
     PreferencesServiceDep,
     RequestHistoryStoreDep,
@@ -67,6 +70,16 @@ router = APIRouter(
     prefix="/library",
     tags=["library-target"],
 )
+
+
+def _path_relative_location(target: URL) -> str:
+    """Keep redirects same-origin without trusting request URL metadata.
+
+    ``request.url_for`` includes the ASGI root path; retain only its path and
+    query to preserve deployment prefixes without reflecting Host or scheme.
+    """
+    path = "/" + target.path.lstrip("/")
+    return f"{path}?{target.query}" if target.query else path
 
 
 @router.get("/albums/{album_id}/artwork/cached")
@@ -251,7 +264,9 @@ async def get_target_artist(
     canonical = await service.canonical_id("artist", artist_id)
     if canonical is not None and canonical != artist_id:
         return RedirectResponse(
-            request.url_for("target_artist_detail", artist_id=canonical),
+            _path_relative_location(
+                request.url_for("target_artist_detail", artist_id=canonical)
+            ),
             status_code=308,
         )
     artist = await service.artist(artist_id)
@@ -274,7 +289,9 @@ async def get_target_artist_albums(
     canonical = await service.canonical_id("artist", artist_id)
     if canonical is not None and canonical != artist_id:
         return RedirectResponse(
-            request.url_for("target_artist_albums", artist_id=canonical),
+            _path_relative_location(
+                request.url_for("target_artist_albums", artist_id=canonical)
+            ),
             status_code=308,
         )
     items = await service.artist_albums(artist_id)
@@ -300,7 +317,7 @@ async def get_target_artist_appearances(
             "target_artist_appearances", artist_id=canonical
         ).include_query_params(limit=limit, offset=offset)
         return RedirectResponse(
-            target,
+            _path_relative_location(target),
             status_code=308,
         )
     items, total, total_tracks = await service.artist_appearances(
@@ -329,7 +346,9 @@ async def get_target_album(
     canonical = await service.canonical_id("album", album_id)
     if canonical is not None and canonical != album_id:
         return RedirectResponse(
-            request.url_for("target_album_detail", album_id=canonical),
+            _path_relative_location(
+                request.url_for("target_album_detail", album_id=canonical)
+            ),
             status_code=308,
         )
     album = await service.album_detail(album_id)
@@ -534,6 +553,57 @@ async def get_target_album_copies(
     return TargetNativeAlbumsResponse(items=items, total=len(items))
 
 
+@router.get("/albums/{local_album_id}/edition", response_model=EditionPinResponse)
+async def get_local_album_edition_pin(
+    local_album_id: str,
+    _user: CurrentUserDep,
+    album_service: AlbumServiceDep,
+) -> EditionPinResponse:
+    """Read one local copy's edition pin (viewer-open, direct local-id path)."""
+    try:
+        pinned = await album_service.get_edition_pin_for_local_album(local_album_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
+        )
+    return EditionPinResponse(pinned_release_mbid=pinned)
+
+
+@router.put("/albums/{local_album_id}/edition", response_model=EditionPinResponse)
+async def set_local_album_edition_pin(
+    local_album_id: str,
+    curator: CurrentCuratorDep,
+    album_service: AlbumServiceDep,
+    body: EditionPinBody = MsgSpecBody(EditionPinBody),
+) -> EditionPinResponse:
+    """Pin one local copy's edition (curator-only, direct local-id path)."""
+    try:
+        await album_service.set_edition_pin_for_local_album(
+            local_album_id, body.release_mbid, curator.id
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
+        )
+    return EditionPinResponse(pinned_release_mbid=body.release_mbid)
+
+
+@router.delete("/albums/{local_album_id}/edition", response_model=EditionPinResponse)
+async def clear_local_album_edition_pin(
+    local_album_id: str,
+    _curator: CurrentCuratorDep,
+    album_service: AlbumServiceDep,
+) -> EditionPinResponse:
+    """Clear one local copy's pin back to Automatic (curator-only)."""
+    try:
+        await album_service.clear_edition_pin_for_local_album(local_album_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
+        )
+    return EditionPinResponse(pinned_release_mbid=None)
+
+
 @router.post("/resolve-tracks", response_model=TrackResolveResponse)
 async def resolve_target_tracks(
     _user: CurrentUserDep,
@@ -557,7 +627,9 @@ async def get_target_album_tracks(
     canonical = await service.canonical_id("album", album_id)
     if canonical is not None and canonical != album_id:
         return RedirectResponse(
-            request.url_for("target_album_tracks", album_id=canonical),
+            _path_relative_location(
+                request.url_for("target_album_tracks", album_id=canonical)
+            ),
             status_code=308,
         )
     items = await service.album_tracks(album_id)
@@ -581,7 +653,9 @@ async def get_target_album_status(
     canonical = await service.canonical_id("album", album_id)
     if canonical is not None and canonical != album_id:
         return RedirectResponse(
-            request.url_for("target_album_status", album_id=canonical),
+            _path_relative_location(
+                request.url_for("target_album_status", album_id=canonical)
+            ),
             status_code=308,
         )
     policy = preferences.get_download_policy()

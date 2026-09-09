@@ -9,13 +9,27 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from rapidfuzz.fuzz import token_set_ratio
+
 from infrastructure.degradation import try_get_degradation_context
 from infrastructure.http.client import get_spotify_cover_http_client
 from infrastructure.integration_result import IntegrationResult
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.validators import validate_spotify_cover_url
-from repositories.musicbrainz_album import _pick_best_release_group
-from repositories.musicbrainz_base import mb_api_get
+from repositories.musicbrainz_album import (
+    _artist_name_matches,
+    _artist_preference_active,
+    _pick_best_release_group,
+)
+from repositories.musicbrainz_base import (
+    capture_mb_source_context,
+    clear_mb_response_context,
+    extract_artist_name,
+    get_mb_response_context,
+    is_mb_source_current,
+    mb_api_get,
+)
+from services.native.musicbrainz_matcher import MusicBrainzMatcher
 from repositories.async_playlist_repository import AsyncPlaylistRepository
 
 if TYPE_CHECKING:
@@ -45,6 +59,24 @@ def _best_image_url(images: list[dict], min_size: int = 250) -> str | None:
         if (img.get("width") or 0) >= min_size:
             return img.get("url")
     return sorted_imgs[-1].get("url")
+
+def _playlist_track_count(playlist: dict) -> int:
+    """Track count from a GET /me/playlists playlist item.
+
+    Spotify simplified-playlist shape (served early Sept 2026, DroppedNeedle
+    v2.9.0, issue #353 over 221 playlists): the count lives under ``items``
+    as a dict ``{"href": ..., "total": N}`` with ``tracks`` null/absent. The
+    older shape used ``tracks: {"total": N}``. ``items`` is also the
+    pagination key elsewhere and may arrive as a list, which carries no
+    total, so only dict shapes are read and anything else yields 0.
+    """
+    for key in ("items", "tracks"):
+        val = playlist.get(key)
+        if isinstance(val, dict):
+            total = val.get("total")
+            if isinstance(total, int):
+                return total
+    return 0
 
 
 _SOURCE = "spotify"
@@ -109,6 +141,68 @@ def cover_fetcher_for(http_client: httpx.AsyncClient) -> CoverFetcher:
     return _fetch
 
 
+def _prefer_artist_matching_recordings(
+    recordings: list[dict], artist: str
+) -> list[dict]:
+    """Stable artist-first ordering for the ISRC per-recording loop (#385).
+
+    Recordings whose in-hand artist credit fuzzy-matches the expected artist
+    resolve first, so a Various Artists compilation recording sharing the ISRC
+    no longer wins by MusicBrainz response order. Blank/Various Artists
+    requests keep wire order.
+    """
+    if not _artist_preference_active(artist):
+        return recordings
+    return sorted(
+        recordings,
+        key=lambda rec: not _artist_name_matches(
+            artist, extract_artist_name(rec)
+        ),
+    )
+
+
+def _import_artist_floor_ok(target_artist: str, candidate_artist: str | None) -> bool:
+    """Artist-floor gate mirroring MusicBrainzMatcher._artist_floor_ok.
+
+    Local (rather than a Matcher instance) because the import service owns no
+    matcher; the floor constant and normalization are the matcher's own.
+    """
+    if not candidate_artist:
+        return True
+    result_artist = MusicBrainzMatcher._normalize(candidate_artist)
+    if not result_artist:
+        return True
+    return (
+        token_set_ratio(MusicBrainzMatcher._normalize(target_artist), result_artist)
+        / 100.0
+        >= MusicBrainzMatcher.ARTIST_MATCH_FLOOR
+    )
+
+
+def _select_import_search_result(
+    results: list[Any], artist: str, album_name: str
+) -> Any:
+    """Title-search fallback pick (#385): most title-similar result among
+    artist-floor passers instead of blind results[0]; falls back to results[0]
+    when the artist is blank/Various Artists or nothing passes.
+    """
+    if not _artist_preference_active(artist):
+        return results[0]
+    passing = [
+        result
+        for result in results
+        if _import_artist_floor_ok(artist, getattr(result, "artist", None))
+    ]
+    if not passing:
+        return results[0]
+    return max(
+        passing,
+        key=lambda result: MusicBrainzMatcher.title_similarity(
+            album_name, getattr(result, "title", "") or ""
+        ),
+    )
+
+
 class SpotifyImportService:
     def __init__(
         self,
@@ -167,7 +261,7 @@ class SpotifyImportService:
                     "id": pid,
                     "name": p.get("name") or "",
                     "description": p.get("description") or "",
-                    "track_count": (p.get("tracks") or {}).get("total", 0),
+                    "track_count": _playlist_track_count(p),
                     "cover_url": cover_url,
                     "owner": owner.get("display_name") or "",
                     "imported_playlist_id": imported_mapping.get(pid),
@@ -324,37 +418,86 @@ class SpotifyImportService:
     async def _resolve_mbid(
         self, isrc: str | None, artist: str, album_name: str
     ) -> str | None:
+        clear_mb_response_context()
+        operation_context = capture_mb_source_context()
         if isrc:
+            canonical_store = getattr(self._mb_repo, "mb_canonical_store", None)
+            if canonical_store is not None:
+                try:
+                    existing = await canonical_store.get_recordings_by_isrc(
+                        isrc,
+                        source_context=operation_context,
+                    )
+                    if not is_mb_source_current(operation_context):
+                        existing = []
+                except Exception:  # noqa: BLE001 - durable miss falls through to wire
+                    existing = []
+                if not isinstance(existing, (list, tuple, set)):
+                    existing = []
+
+                # Only inspect the repository memory tier before paying for /isrc.
+                # A durable ISRC row is an index, not permission to issue another
+                # recording wire for every candidate.
+                cache_lookup = getattr(
+                    self._mb_repo, "get_cached_recording_to_release_group", None
+                )
+                if callable(cache_lookup):
+                    for rec_id in sorted(
+                        {str(value).casefold() for value in existing if value}
+                    ):
+                        try:
+                            mbid = await cache_lookup(rec_id)
+                        except Exception:  # noqa: BLE001 - try the next known row
+                            continue
+                        if mbid:
+                            return mbid
+
+            operation_context = capture_mb_source_context()
             try:
                 data = await mb_api_get(
                     f"/isrc/{isrc}",
                     priority=RequestPriority.BACKGROUND_SYNC,
+                    source_context=operation_context,
                 )
+                response_context = get_mb_response_context() or operation_context
+                if response_context != operation_context or not is_mb_source_current(
+                    operation_context
+                ):
+                    raise RuntimeError("MusicBrainz source changed during ISRC lookup")
                 recordings: list[dict] = data.get("recordings") or []
                 if isinstance(recordings, dict):
                     recordings = [recordings]
-                # ST2 P1: bank ISRC -> recording ids durably (write-through).
-                canonical_store = getattr(self._mb_repo, "mb_canonical_store", None)
-                if canonical_store is not None:
+                # ST2 P1: bank ISRC -> recording ids durably (write-through)
+                # only for the source generation that answered.
+                if canonical_store is not None and operation_context is not None:
                     try:
                         await canonical_store.save_isrc_recordings(
-                            [(isrc, rec["id"]) for rec in recordings if rec.get("id")]
+                            [(isrc, rec["id"]) for rec in recordings if rec.get("id")],
+                            source_context=operation_context,
                         )
                     except Exception:  # noqa: BLE001
                         pass  # write-through must never break the import
-                for rec in recordings:
+                for rec in _prefer_artist_matching_recordings(recordings, artist):
+                    if not is_mb_source_current(operation_context):
+                        raise RuntimeError(
+                            "MusicBrainz source changed during recording resolution"
+                        )
                     rec_id = rec.get("id")
                     if not rec_id:
                         continue
                     mbid = await self._mb_repo.resolve_recording_to_release_group(
-                        rec_id
+                        rec_id, expected_artist=artist
                     )
                     if mbid:
                         return mbid
+                if not is_mb_source_current(operation_context):
+                    raise RuntimeError(
+                        "MusicBrainz source changed during ISRC release selection"
+                    )
                 all_releases: list[dict] = []
                 for rec in recordings:
                     all_releases.extend(rec.get("releases") or [])
-                best = _pick_best_release_group(all_releases)
+                best = _pick_best_release_group(all_releases, expected_artist=artist)
                 if best:
                     return best[0]
             except Exception:  # noqa: BLE001
@@ -369,7 +512,9 @@ class SpotifyImportService:
                     include_all_types=False,
                 )
                 if results:
-                    return results[0].musicbrainz_id
+                    return _select_import_search_result(
+                        results, artist, album_name
+                    ).musicbrainz_id
             except Exception:  # noqa: BLE001
                 pass
 

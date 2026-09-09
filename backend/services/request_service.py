@@ -10,7 +10,7 @@ from api.v1.schemas.request import (
     BatchRequestResponse,
     RequestAcceptedResponse,
 )
-from core.exceptions import ExternalServiceError, ValidationError
+from core.exceptions import ExternalServiceError, ResourceNotFoundError, ValidationError
 from infrastructure.persistence.request_history import RequestHistoryStore
 from infrastructure.queue.priority_queue import RequestPriority
 from services.native.download_service import ALREADY_IN_LIBRARY
@@ -33,15 +33,31 @@ _CANCELLING_STATUS = "cancelling"
 
 def _generation_of(value: object | None) -> int | None:
     generation = getattr(value, "generation", None)
-    return generation if isinstance(generation, int) and not isinstance(generation, bool) else None
+    return (
+        generation
+        if isinstance(generation, int) and not isinstance(generation, bool)
+        else None
+    )
 
 
 def _mutation_won(value: object) -> bool:
     return value is not False
 
 
+def _meaningful_name(value: str | None) -> str | None:
+    """None for absent, blank, or literal-"Unknown" names; else the stripped value."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.casefold() == "unknown":
+        return None
+    return stripped
+
+
 def _request_begin_won(value: object | None) -> bool:
     return value is not None and value is not False
+
+
 _RETRYABLE_BEGIN_ATTEMPTS = 2
 
 
@@ -126,6 +142,41 @@ class RequestService:
             normalized.append(value)
         return normalized
 
+    async def _resolve_request_names(
+        self,
+        musicbrainz_id: str,
+        artist: str | None,
+        album: str | None,
+    ) -> tuple[str | None, str | None]:
+        # Literal placeholders from older callers (e.g. the playlist
+        # missing-tracks flow) are missing values, not real names.
+        artist = _meaningful_name(artist)
+        album = _meaningful_name(album)
+        if artist and album:
+            return artist, album
+        if self._album_service is not None:
+            try:
+                info = await self._album_service.get_album_basic_info(musicbrainz_id)
+            except (ResourceNotFoundError, ValueError) as error:
+                # Lookup miss only: unknown MBID or degraded MusicBrainz with no
+                # local fallback. Anything else (bugs, outages surfacing as
+                # unexpected errors) propagates instead of becoming a 400.
+                logger.warning(
+                    "Could not resolve names for %s: %s", musicbrainz_id, error
+                )
+                info = None
+            if info is not None:
+                if not artist:
+                    artist = _meaningful_name(getattr(info, "artist_name", None))
+                if not album:
+                    album = _meaningful_name(getattr(info, "title", None))
+        if not artist or not album:
+            raise ValidationError(
+                f"Could not resolve artist and album for MBID {musicbrainz_id}: "
+                "artist and album are required when MusicBrainz resolution fails"
+            )
+        return artist, album
+
     async def _begin_request(
         self,
         *,
@@ -191,6 +242,23 @@ class RequestService:
         except Exception:  # noqa: BLE001 - the request row remains generation-safe
             logger.warning("Failed to cancel orphan download task %s", task_id)
 
+    async def _quality_snapshot_summary(
+        self, task_id: str | None, user_id: str | None, user_role: str | None
+    ) -> str | None:
+        """Read the summary pinned by the acquisition backend, not live policy."""
+        if not task_id:
+            return None
+        method = getattr(type(self._acquisition), "get_quality_snapshot_summary", None)
+        if method is None:
+            return None
+        try:
+            summary = await self._acquisition.get_quality_snapshot_summary(
+                task_id, user_id or "", user_role or "user"
+            )
+            return summary if isinstance(summary, str) else None
+        except Exception:  # noqa: BLE001 - response feedback cannot undo acceptance
+            logger.warning("Unable to read quality summary for task %s", task_id)
+            return None
 
     async def request_album(
         self,
@@ -210,12 +278,15 @@ class RequestService:
         musicbrainz_id, release_mbid = await self._resolve_album_identity(
             musicbrainz_id
         )
+        artist_name, album_title = await self._resolve_request_names(
+            musicbrainz_id, artist, album
+        )
         needs_approval = user_role not in ("trusted", "admin")
         initial_status = "awaiting_approval" if needs_approval else "pending"
         request_kwargs: dict[str, object] = {
             "musicbrainz_id": musicbrainz_id,
-            "artist_name": artist or "Unknown",
-            "album_title": album or "Unknown",
+            "artist_name": artist_name,
+            "album_title": album_title,
             "year": year,
             "artist_mbid": artist_mbid,
             "monitor_artist": monitor_artist,
@@ -255,6 +326,11 @@ class RequestService:
                     ),
                     musicbrainz_id=musicbrainz_id,
                     status=existing.status,
+                    quality_snapshot_summary=await self._quality_snapshot_summary(
+                        getattr(existing, "download_task_id", None),
+                        user_id,
+                        user_role,
+                    ),
                 )
             if existing and existing.status == _CANCELLING_STATUS:
                 return RequestAcceptedResponse(
@@ -262,6 +338,11 @@ class RequestService:
                     message="Request is being cancelled",
                     musicbrainz_id=musicbrainz_id,
                     status=existing.status,
+                    quality_snapshot_summary=await self._quality_snapshot_summary(
+                        getattr(existing, "download_task_id", None),
+                        user_id,
+                        user_role,
+                    ),
                 )
 
             if self._quota is not None:
@@ -291,6 +372,11 @@ class RequestService:
                         ),
                         musicbrainz_id=musicbrainz_id,
                         status=status,
+                        quality_snapshot_summary=await self._quality_snapshot_summary(
+                            getattr(winner, "download_task_id", None),
+                            user_id,
+                            user_role,
+                        ),
                     )
                 if status == _CANCELLING_STATUS:
                     return RequestAcceptedResponse(
@@ -298,6 +384,11 @@ class RequestService:
                         message="Request is being cancelled",
                         musicbrainz_id=musicbrainz_id,
                         status=status,
+                        quality_snapshot_summary=await self._quality_snapshot_summary(
+                            getattr(winner, "download_task_id", None),
+                            user_id,
+                            user_role,
+                        ),
                     )
                 return RequestAcceptedResponse(
                     success=False,
@@ -325,8 +416,8 @@ class RequestService:
             task_id = await self._acquisition.request_album(
                 user_id=user_id or "",
                 release_group_mbid=musicbrainz_id,
-                artist_name=artist or "Unknown",
-                album_title=album or "Unknown",
+                artist_name=artist_name,
+                album_title=album_title,
                 year=year,
                 artist_mbid=artist_mbid,
                 origin="user",
@@ -363,7 +454,9 @@ class RequestService:
                     **kwargs,
                 )
             except Exception as error:  # noqa: BLE001
-                logger.exception("Failed to mark album request %s imported", musicbrainz_id)
+                logger.exception(
+                    "Failed to mark album request %s imported", musicbrainz_id
+                )
                 raise ExternalServiceError("Failed to complete request") from error
             return RequestAcceptedResponse(
                 success=True,
@@ -382,7 +475,9 @@ class RequestService:
             )
             if not _mutation_won(linked):
                 await self._cancel_orphan_task(task_id, user_id or "")
-                raise ExternalServiceError("Request generation changed while starting download")
+                raise ExternalServiceError(
+                    "Request generation changed while starting download"
+                )
         except ExternalServiceError:
             raise
         except Exception as error:  # noqa: BLE001
@@ -399,6 +494,9 @@ class RequestService:
             message="Request accepted",
             musicbrainz_id=musicbrainz_id,
             status="pending",
+            quality_snapshot_summary=await self._quality_snapshot_summary(
+                task_id, user_id, user_role
+            ),
         )
 
     async def request_track(
@@ -566,7 +664,9 @@ class RequestService:
             )
             if not _mutation_won(linked):
                 await self._cancel_orphan_task(task_id, user_id)
-                raise ExternalServiceError("Request generation changed while starting download")
+                raise ExternalServiceError(
+                    "Request generation changed while starting download"
+                )
         except ExternalServiceError:
             raise
         except Exception as error:  # noqa: BLE001
@@ -653,6 +753,32 @@ class RequestService:
                     user_id, user_role, len(new_items)
                 )
                 await self._quota.check_storage_admission(user_id or "", "user")
+
+            resolvable: list[dict] = []
+            for item in new_items:
+                mbid = str(item["musicbrainz_id"])
+                try:
+                    artist_name, album_title = await self._resolve_request_names(
+                        mbid,
+                        item.get("artist_name") or None,
+                        item.get("album_title") or None,
+                    )
+                except ValidationError as error:
+                    logger.warning("Skipping batch item %s: %s", mbid, error)
+                    skipped += 1
+                    continue
+                item["artist_name"] = artist_name
+                item["album_title"] = album_title
+                resolvable.append(item)
+            new_items = resolvable
+            if not new_items:
+                return BatchRequestResponse(
+                    success=False,
+                    message="Batch request could not be recorded",
+                    requested=0,
+                    skipped=skipped,
+                    status="failed",
+                )
 
             bulk_result = await self._request_history.async_bulk_record_requests(
                 new_items,
@@ -762,8 +888,8 @@ class RequestService:
                     task_id = await self._acquisition.request_album(
                         user_id=user_id or "",
                         release_group_mbid=mbid,
-                        artist_name=item.get("artist_name") or "Unknown",
-                        album_title=item.get("album_title") or "Unknown",
+                        artist_name=item["artist_name"],
+                        album_title=item["album_title"],
                         year=item.get("year"),
                         artist_mbid=item.get("artist_mbid"),
                         origin="user",
@@ -786,10 +912,12 @@ class RequestService:
                         kwargs = {"request_kind": "album"}
                         if generation is not None:
                             kwargs["expected_generation"] = generation
-                        linked = await self._request_history.async_update_download_task_id(
-                            mbid,
-                            task_id,
-                            **kwargs,
+                        linked = (
+                            await self._request_history.async_update_download_task_id(
+                                mbid,
+                                task_id,
+                                **kwargs,
+                            )
                         )
                         if not _mutation_won(linked):
                             await self._cancel_orphan_task(task_id, user_id or "")
@@ -827,6 +955,7 @@ class RequestService:
         except Exception as error:  # noqa: BLE001
             logger.exception("Batch request failed")
             raise ExternalServiceError("Batch request failed") from error
+
     async def cancel_batch(
         self,
         musicbrainz_ids: list[str],
@@ -901,12 +1030,14 @@ class RequestService:
                         logger.exception("Batch cancel failed for %s", mbid)
                         try:
                             if decision.prior_status is not None:
-                                await self._request_history.async_restore_request_status(
-                                    mbid,
-                                    decision.prior_status,
-                                    expected_status=_CANCELLING_STATUS,
-                                    expected_generation=generation,
-                                    request_kind=request_kind,
+                                await (
+                                    self._request_history.async_restore_request_status(
+                                        mbid,
+                                        decision.prior_status,
+                                        expected_status=_CANCELLING_STATUS,
+                                        expected_generation=generation,
+                                        request_kind=request_kind,
+                                    )
                                 )
                         except Exception:  # noqa: BLE001
                             logger.exception("Failed to restore batch request %s", mbid)
@@ -967,11 +1098,16 @@ class RequestService:
                             await self._request_history.async_update_status(
                                 mbid, status, **restore_kwargs
                             )
-                        if status == "awaiting_approval" and prior_authorized is not None:
-                            await self._request_history.async_update_dispatch_authorized(
-                                mbid,
-                                bool(prior_authorized),
-                                request_kind=request_kind,
+                        if (
+                            status == "awaiting_approval"
+                            and prior_authorized is not None
+                        ):
+                            await (
+                                self._request_history.async_update_dispatch_authorized(
+                                    mbid,
+                                    bool(prior_authorized),
+                                    request_kind=request_kind,
+                                )
                             )
                     except Exception:  # noqa: BLE001
                         logger.exception("Failed to restore batch request %s", mbid)

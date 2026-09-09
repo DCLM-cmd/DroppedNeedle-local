@@ -1,10 +1,18 @@
 """Integration tests - SettingsService invalidation methods clear the right cache keys."""
 
+from types import SimpleNamespace
+
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from infrastructure.cache.cache_keys import (
     ALBUM_INFO_PREFIX,
+    ARTIST_DISCOVERY_PREFIX,
+    ARTIST_DISCOVERY_TOP_ALBUMS_PREFIX,
+    ARTIST_DISCOVERY_TOP_SONGS_PREFIX,
     ARTIST_INFO_PREFIX,
+    DISCOVER_QUEUE_ENRICH_PREFIX,
     DISCOVER_RESPONSE_PREFIX,
     GENRE_ARTIST_PREFIX,
     HOME_RESPONSE_PREFIX,
@@ -20,9 +28,13 @@ from infrastructure.cache.memory_cache import InMemoryCache
 from services.settings_service import SettingsService
 
 
-async def _build_service() -> tuple[SettingsService, InMemoryCache]:
+async def _build_service(disk_cache=None) -> tuple[SettingsService, InMemoryCache]:
     cache = InMemoryCache(max_entries=500)
-    service = SettingsService(preferences_service=None, cache=cache)
+    service = SettingsService(
+        preferences_service=None,
+        cache=cache,
+        disk_cache=disk_cache,
+    )
     return service, cache
 
 
@@ -52,8 +64,12 @@ async def test_identical_preference_change_is_a_no_op():
     ]
     await _populate(cache, keys)
 
-    same = _prefs(["album", "ep", "single"], ["studio"])
-    cleared = await service.apply_preference_change(same, same)
+    previous = _prefs(
+        [" Album ", "ep", "single", "album"],
+        [" Studio ", "studio"],
+    )
+    incoming = _prefs(["single", "album", "ep"], ["studio"])
+    cleared = await service.apply_preference_change(previous, incoming)
 
     assert cleared == 0
     for key in keys:
@@ -366,16 +382,26 @@ async def test_youtube_settings_change_clears_home_cache():
 def mb_live_state():
     """Snapshot and restore the live MusicBrainz module state around a test."""
     from repositories.musicbrainz_base import (
-        get_mb_api_base,
+        brainzmash_runtime_enabled,
+        capture_mb_source_context,
+        get_mb_source_id,
         set_mb_api_base,
         mb_rate_limiter,
     )
 
-    base = get_mb_api_base()
+    source = capture_mb_source_context()
+    source_id = get_mb_source_id()
+    runtime = brainzmash_runtime_enabled()
     rate = mb_rate_limiter.rate
     capacity = mb_rate_limiter.capacity
     yield
-    set_mb_api_base(base)
+    set_mb_api_base(
+        source.source_url,
+        source_mode=source.source_mode,
+        source_id=source_id,
+        generation=source.generation,
+        brainzmash_binding_valid=runtime,
+    )
     mb_rate_limiter.update_rate(rate)
     mb_rate_limiter.update_capacity(capacity)
 
@@ -384,6 +410,7 @@ def _mb_settings(api_url: str, rate_limit: float, concurrent_searches: int):
     from api.v1.schemas.settings import MusicBrainzConnectionSettings
 
     return MusicBrainzConnectionSettings(
+        source_mode="mirror",
         api_url=api_url,
         rate_limit=rate_limit,
         concurrent_searches=concurrent_searches,
@@ -393,7 +420,12 @@ def _mb_settings(api_url: str, rate_limit: float, concurrent_searches: int):
 def _seed_mb_live_state(settings) -> None:
     from repositories.musicbrainz_base import set_mb_api_base, mb_rate_limiter
 
-    set_mb_api_base(settings.api_url)
+    set_mb_api_base(
+        settings.api_url,
+        source_mode=settings.source_mode,
+        source_id=settings.source_id,
+        generation=settings.generation,
+    )
     mb_rate_limiter.update_rate(settings.rate_limit)
     mb_rate_limiter.update_capacity(settings.concurrent_searches)
 
@@ -438,37 +470,112 @@ async def test_musicbrainz_settings_endpoint_change_resets_and_clears(
 ):
     """An endpoint change resets the breaker, clears the deduplicator, and
     clears the MusicBrainz cache prefixes."""
-    service, cache = await _build_service()
+    disk_cache = SimpleNamespace(clear_musicbrainz=AsyncMock())
+    service, cache = await _build_service(disk_cache)
     _seed_mb_live_state(_mb_settings("https://mb-a.example/ws/2", 2.0, 4))
     reset, clear = _spy_mb_side_effects(monkeypatch)
+    from services.search_service import SearchService
 
+    search_clear = MagicMock()
+    monkeypatch.setattr(SearchService, "clear_cached_results", search_clear)
     mb_keys = [f"{p}endpoint" for p in musicbrainz_prefixes()]
-    # QW10/C2 regression guard: ALBUM_INFO must be part of the bulk sweep.
+    assert len(mb_keys) == 28
+    # Source switches clear only MusicBrainz-backed discovery categories.
+    assert ARTIST_DISCOVERY_TOP_SONGS_PREFIX in musicbrainz_prefixes()
+    assert ARTIST_DISCOVERY_TOP_ALBUMS_PREFIX in musicbrainz_prefixes()
+    assert ARTIST_DISCOVERY_PREFIX not in musicbrainz_prefixes()
     assert ALBUM_INFO_PREFIX in musicbrainz_prefixes()
+    assert DISCOVER_QUEUE_ENRICH_PREFIX in musicbrainz_prefixes()
     album_info_key = f"{ALBUM_INFO_PREFIX}rg-endpoint"
-    await _populate(cache, mb_keys + [album_info_key])
+    similar_key = f"{ARTIST_DISCOVERY_PREFIX}similar:artist:10:listenbrainz"
+    await _populate(cache, mb_keys + [album_info_key, similar_key])
 
     await service.on_musicbrainz_settings_changed(
         _mb_settings("https://mb-b.example/ws/2", 2.0, 4)
     )
     assert await cache.get(album_info_key) is None
+    assert await cache.get(similar_key) == "v"
 
     from repositories.musicbrainz_base import get_mb_api_base
 
     reset.assert_called_once()
     clear.assert_called_once()
+    search_clear.assert_called_once()
     assert get_mb_api_base() == "https://mb-b.example/ws/2"
     for key in mb_keys:
         assert await cache.get(key) is None
+    disk_cache.clear_musicbrainz.assert_awaited_once()
 
 
 @pytest.mark.asyncio(loop_scope="function")
-async def test_musicbrainz_settings_rate_only_change_resets_and_clears(
+async def test_musicbrainz_source_change_clears_durable_discover_snapshots(
+    tmp_path, mb_live_state, monkeypatch
+):
+    import threading
+
+    from infrastructure.persistence.discovery_snapshot_store import (
+        DiscoverySnapshotStore,
+    )
+    from repositories import musicbrainz_base as mb_base
+
+    snapshot_store = DiscoverySnapshotStore(tmp_path / "library.db", threading.Lock())
+    await snapshot_store.save("discover_response:u1", "u1", b"old-response", 123.0)
+    await snapshot_store.save("discover_queue:u1", "u1", b"old-queue", 124.0)
+    await snapshot_store.save("discover:u1", "u1", b"unrelated", 125.0)
+    disk_cache = SimpleNamespace(clear_musicbrainz=AsyncMock())
+    service, _cache = await _build_service(disk_cache)
+    service._discovery_snapshot_store = snapshot_store
+
+    old_settings = _mb_settings("https://mb-old.example/ws/2", 2.0, 4)
+    new_settings = _mb_settings("https://mb-new.example/ws/2", 2.0, 4)
+    _seed_mb_live_state(old_settings)
+    old_context = mb_base.capture_mb_source_context()
+    real_delete = snapshot_store.delete_source_dependent_snapshots
+    delete_calls = 0
+
+    async def fail_once() -> int:
+        nonlocal delete_calls
+        delete_calls += 1
+        if delete_calls == 1:
+            raise RuntimeError("synthetic snapshot clear failure")
+        return await real_delete()
+
+    monkeypatch.setattr(snapshot_store, "delete_source_dependent_snapshots", fail_once)
+
+    with pytest.raises(RuntimeError, match="synthetic snapshot clear failure"):
+        await service.on_musicbrainz_settings_changed(new_settings)
+    assert mb_base.get_mb_api_base() == old_settings.api_url
+    assert await snapshot_store.get("discover_response:u1") == b"old-response"
+    assert await snapshot_store.get("discover_queue:u1") == b"old-queue"
+
+    await service.on_musicbrainz_settings_changed(new_settings)
+
+    assert delete_calls == 2
+    assert disk_cache.clear_musicbrainz.await_count == 2
+    assert mb_base.get_mb_api_base() == new_settings.api_url
+    assert await snapshot_store.get("discover_response:u1") is None
+    assert await snapshot_store.get("discover_queue:u1") is None
+    assert await snapshot_store.get("discover:u1") == b"unrelated"
+
+    republished = await mb_base.mb_publish_if_current(
+        old_context,
+        lambda: snapshot_store.save(
+            "discover_response:u1", "u1", b"stale-republish", 126.0
+        ),
+    )
+    assert republished is False
+    assert await snapshot_store.get("discover_response:u1") is None
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_musicbrainz_settings_rate_only_change_resets_without_cache_clear(
     mb_live_state, monkeypatch
 ):
-    """A rate-only change re-arms the limiter, so it is behavior-changing and
-    must reset the breaker and clear caches too."""
+    """A control-only change re-arms transport behavior but retains provider
+    results because the endpoint identity did not change."""
     service, cache = await _build_service()
+    snapshot_store = SimpleNamespace(delete_source_dependent_snapshots=AsyncMock())
+    service._discovery_snapshot_store = snapshot_store
     _seed_mb_live_state(_mb_settings("https://mb-a.example/ws/2", 2.0, 4))
     reset, clear = _spy_mb_side_effects(monkeypatch)
 
@@ -482,7 +589,74 @@ async def test_musicbrainz_settings_rate_only_change_resets_and_clears(
     from repositories.musicbrainz_base import mb_rate_limiter
 
     reset.assert_called_once()
+
     clear.assert_called_once()
+    snapshot_store.delete_source_dependent_snapshots.assert_not_awaited()
     assert mb_rate_limiter.rate == 3.0
     for key in mb_keys:
-        assert await cache.get(key) is None
+        assert await cache.get(key) == "v"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_musicbrainz_settings_concurrency_only_skips_durable_snapshot_clear(
+    mb_live_state, monkeypatch
+):
+    service, _cache = await _build_service()
+    snapshot_store = SimpleNamespace(delete_source_dependent_snapshots=AsyncMock())
+    service._discovery_snapshot_store = snapshot_store
+    _seed_mb_live_state(_mb_settings("https://mb-a.example/ws/2", 2.0, 4))
+    _spy_mb_side_effects(monkeypatch)
+
+    await service.on_musicbrainz_settings_changed(
+        _mb_settings("https://mb-a.example/ws/2", 2.0, 8)
+    )
+
+    snapshot_store.delete_source_dependent_snapshots.assert_not_awaited()
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_musicbrainz_settings_clear_failure_leaves_live_state_for_retry(
+    mb_live_state, monkeypatch
+):
+    service, cache = await _build_service()
+    from repositories.musicbrainz_base import (
+        get_mb_api_base,
+        mb_circuit_breaker,
+        mb_rate_limiter,
+        mb_rate_limiter_bypassed,
+        set_mb_rate_limiter_bypass,
+    )
+
+    old_settings = _mb_settings("https://mb-old.example/ws/2", 2.0, 4)
+    new_settings = _mb_settings("https://mb-new.example/ws/2", 3.0, 8)
+    _seed_mb_live_state(old_settings)
+    set_mb_rate_limiter_bypass(False)
+    mb_circuit_breaker.reset()
+    before_breaker = mb_circuit_breaker.get_state()
+    calls = 0
+    original_clear = cache.clear_prefix
+
+    async def fail_once(prefix: str) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic cache clear failure")
+        return await original_clear(prefix)
+
+    monkeypatch.setattr(cache, "clear_prefix", fail_once)
+
+    with pytest.raises(RuntimeError, match="synthetic cache clear failure"):
+        await service.on_musicbrainz_settings_changed(new_settings)
+
+    assert get_mb_api_base() == old_settings.api_url
+    assert mb_rate_limiter.rate == old_settings.rate_limit
+    assert mb_rate_limiter.capacity == old_settings.concurrent_searches
+    assert mb_rate_limiter_bypassed() is False
+    assert mb_circuit_breaker.get_state() == before_breaker
+
+    await service.on_musicbrainz_settings_changed(new_settings)
+
+    assert calls == 29
+    assert get_mb_api_base() == new_settings.api_url
+    assert mb_rate_limiter.rate == new_settings.rate_limit
+    assert mb_rate_limiter.capacity == new_settings.concurrent_searches

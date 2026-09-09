@@ -13,9 +13,10 @@ from api.v1.schemas.settings import (
     WantedWatcherSettings,
 )
 from core.dependencies import get_preferences_service
-from middleware import _get_current_admin
+from middleware import _get_current_admin, _get_current_user
+from models.acquisition_quality import QualityRecipeEntry
 from models.common import ServiceStatus
-from tests.helpers import build_test_client, mock_admin_user
+from tests.helpers import build_test_client, mock_admin_user, mock_user
 
 
 def _prefs():
@@ -141,14 +142,26 @@ def test_put_wanted_settings_rejects_out_of_range():
 
 
 def test_test_sabnzbd_reports_version_and_categories(monkeypatch):
+    from repositories.protocols.download_client import MountDiagnosis
+
     fake_client = MagicMock()
     fake_client.health_check = AsyncMock(
         return_value=ServiceStatus(status="ok", version="5.0.4")
     )
     fake_client.get_categories = AsyncMock(return_value=["*", "audio"])
     fake_client.get_complete_dir = AsyncMock(return_value="/data/Downloads/complete")
+    fake_client.diagnose_downloads_mount = AsyncMock(
+        return_value=MountDiagnosis(
+            supported=True,
+            completed_downloads=2,
+            mount_has_files=True,
+            resolvable_downloads=2,
+            sampled_downloads=2,
+            client_downloads_dir="/data/Downloads/complete",
+        )
+    )
     monkeypatch.setattr(
-        download_clients, "build_sabnzbd_download_client", lambda url, key: fake_client
+        download_clients, "build_sabnzbd_download_client", lambda url, key, mount="/tmp": fake_client
     )
 
     app = _app()
@@ -163,6 +176,119 @@ def test_test_sabnzbd_reports_version_and_categories(monkeypatch):
     assert body["version"] == "5.0.4"
     assert "audio" in body["categories"]
     assert body["complete_dir"] == "/data/Downloads/complete"
+    assert body["resolvable_downloads"] == 2
+    assert body["sampled_downloads"] == 2
+    assert body["mount_message"] is None  # healthy mount -> no advisory
+
+
+def test_test_sabnzbd_flags_unresolvable_mount(monkeypatch):
+    from repositories.protocols.download_client import MountDiagnosis
+
+    fake_client = MagicMock()
+    fake_client.health_check = AsyncMock(
+        return_value=ServiceStatus(status="ok", version="5.0.4")
+    )
+    fake_client.get_categories = AsyncMock(return_value=["*", "audio"])
+    fake_client.get_complete_dir = AsyncMock(return_value="/data/Downloads/complete")
+    fake_client.diagnose_downloads_mount = AsyncMock(
+        return_value=MountDiagnosis(
+            supported=True,
+            completed_downloads=3,
+            mount_has_files=True,
+            resolvable_downloads=0,
+            sampled_downloads=3,
+            client_downloads_dir="/data/Downloads/complete",
+        )
+    )
+    monkeypatch.setattr(
+        download_clients, "build_sabnzbd_download_client", lambda url, key, mount="/tmp": fake_client
+    )
+
+    app = _app()
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    resp = build_test_client(app).post(
+        "/download-clients/sabnzbd/test",
+        json={
+            "url": "http://sab:8080",
+            "api_key": "k",
+            "downloads_mount": "/wrong/mount",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is True
+    assert body["resolvable_downloads"] == 0
+    assert body["sampled_downloads"] == 3
+    assert "0/3" in (body["mount_message"] or "")
+    assert "/wrong/mount" in (body["mount_message"] or "")
+
+
+def test_get_sabnzbd_status_reports_version_and_categories(monkeypatch):
+    fake_client = MagicMock()
+    fake_client.health_check = AsyncMock(
+        return_value=ServiceStatus(status="ok", version="5.0.4")
+    )
+    fake_client.get_categories = AsyncMock(return_value=["*", "audio"])
+    fake_client.get_complete_dir = AsyncMock(return_value="/data/Downloads/complete")
+    monkeypatch.setattr(
+        download_clients,
+        "build_sabnzbd_download_client",
+        lambda url, key, mount="/tmp": fake_client,
+    )
+
+    app = _app()
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    resp = build_test_client(app).get("/download-clients/sabnzbd/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is True
+    assert body["version"] == "5.0.4"
+    assert "audio" in body["categories"]
+    assert body["complete_dir"] == "/data/Downloads/complete"
+
+
+def test_get_sabnzbd_status_unreachable_is_valid_false(monkeypatch):
+    from core.exceptions import ExternalServiceError
+
+    fake_client = MagicMock()
+    fake_client.health_check = AsyncMock(
+        side_effect=ExternalServiceError("connection refused")
+    )
+    monkeypatch.setattr(
+        download_clients,
+        "build_sabnzbd_download_client",
+        lambda url, key, mount="/tmp": fake_client,
+    )
+
+    app = _app()
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    resp = build_test_client(app).get("/download-clients/sabnzbd/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert body["message"] == "connection refused"
+
+
+def test_get_sabnzbd_status_unconfigured_makes_no_network_call(monkeypatch):
+    prefs = _prefs()
+    prefs.get_sabnzbd_connection_raw.return_value = SabnzbdConnectionSettings(
+        enabled=False, url="", api_key=""
+    )
+
+    def _fail_on_call(url, key, mount="/tmp"):
+        raise AssertionError("factory must not be called when unconfigured")
+
+    monkeypatch.setattr(
+        download_clients, "build_sabnzbd_download_client", _fail_on_call
+    )
+
+    app = _app(prefs)
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    resp = build_test_client(app).get("/download-clients/sabnzbd/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert body["message"] == "Not configured"
 
 
 # --- Acquisition-quality policy routes
@@ -200,3 +326,70 @@ def test_policy_impact_maps_invalid_submission_to_domain_error():
         raise AssertionError(f"unmapped ValueError leaked to routing: {exc}")
     raise AssertionError("expected ValidationError")
 
+
+def test_put_policy_recipe_returns_v2_status_and_recipe(monkeypatch):
+    prefs = _prefs()
+    returned = DownloadPolicySettings(
+        quality_recipe=[
+            QualityRecipeEntry(format="flac", quality="cd"),
+            QualityRecipeEntry(format="mp3", quality="320_plus"),
+        ],
+        quality_recipe_status="v2",
+    )
+    prefs.get_download_policy.return_value = returned
+    monkeypatch.setattr(download_clients, "_clear_download_client_cache", lambda: None)
+    app = _app(prefs)
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    response = build_test_client(app).put(
+        "/download-clients/policy",
+        json={
+            "flac_mp3_only": True,
+            "quality_recipe": [
+                {"format": "flac", "quality": "cd"},
+                {"format": "mp3", "quality": "320_plus"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["quality_recipe_status"] == "v2"
+    assert body["quality_recipe_error"] is None
+    assert [entry["quality"] for entry in body["quality_recipe"]] == ["cd", "320_plus"]
+    prefs.save_download_policy.assert_called_once()
+
+
+def test_put_policy_recipe_rejects_invalid_entry_before_save(monkeypatch):
+    prefs = _prefs()
+    monkeypatch.setattr(download_clients, "_clear_download_client_cache", lambda: None)
+    app = _app(prefs)
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+
+    response = build_test_client(app).put(
+        "/download-clients/policy",
+        json={
+            "flac_mp3_only": True,
+            "quality_recipe": [{"format": "mp3", "quality": "not-valid"}],
+        },
+    )
+
+    assert response.status_code in (400, 422)
+    prefs.save_download_policy.assert_not_called()
+
+
+def test_policy_summary_exposes_recipe_status_and_error():
+    prefs = _prefs()
+    prefs.get_download_policy.return_value = DownloadPolicySettings(
+        quality_recipe_status="non_convertible",
+        quality_recipe_error="v2 recipes require FLAC/MP3-only mode",
+        flac_mp3_only=False,
+    )
+    app = _app(prefs)
+    app.dependency_overrides[_get_current_user] = lambda: mock_user(role="user")
+
+    response = build_test_client(app).get("/download-clients/policy-summary")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["quality_recipe_status"] == "non_convertible"
+    assert body["quality_recipe_error"] == "v2 recipes require FLAC/MP3-only mode"

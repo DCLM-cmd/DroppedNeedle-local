@@ -34,10 +34,12 @@
 		setEditionPin
 	} from '$lib/queries/albums/EditionQueries.svelte';
 	import type { AlbumEditionItem } from '$lib/types';
+	import { ApiError } from '$lib/api/client';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';
 	import LocalAlbumIdentificationControl from './LocalAlbumIdentificationControl.svelte';
+	import EditionPinConflictDialog from './EditionPinConflictDialog.svelte';
 
 	interface Props {
 		album: AlbumBasicInfo;
@@ -164,10 +166,11 @@
 	// MB release the album page + acquisition follow (D16), and acquire it (D13).
 	// ST7 W2: the query warms as soon as the album identity is known - the old
 	// !loadingTracks term serialized a depth-3 chain for no data dependency
-	// (editions key off the RG mbid alone). The picker section below still waits
-	// on !loadingTracks so the visible behavior is unchanged.
+	// (editions key off the authenticated user and RG mbid). The picker section
+	// below still waits on !loadingTracks so the visible behavior is unchanged.
 	const editionsMbid = $derived(releaseGroupMbid || album.musicbrainz_id);
 	const editionsQuery = getAlbumEditionsQuery(
+		() => authStore.user?.id,
 		() => editionsMbid,
 		() => authStore.isTrusted && downloadClientConfigured && Boolean(editionsMbid)
 	);
@@ -219,20 +222,41 @@
 		return bits.join(' · ') || e.release_mbid.slice(0, 8);
 	}
 
+	// 409 means this release group matches several local albums: the RG-keyed
+	// pin cannot address one copy, so the pending intent moves to the picker
+	let conflictDialog = $state<{ showModal: () => void } | null>(null);
+	let pendingIntent = $state<string | null | undefined>(undefined);
+
 	async function handlePickEdition(releaseMbid: string | null) {
 		// the DaisyUI dropdown is focus-driven: blur the trigger so the menu
 		// closes on selection instead of hanging over the refreshed page
 		(document.activeElement as HTMLElement | null)?.blur();
 		try {
 			if (releaseMbid === null) {
-				await clearPinMutation.mutateAsync({ mbid: editionsMbid });
+				await clearPinMutation.mutateAsync({
+					mbid: editionsMbid,
+					userId: authStore.user?.id
+				});
 				toastStore.show({ message: 'Edition back to automatic.', type: 'success' });
 			} else {
-				await pinMutation.mutateAsync({ mbid: editionsMbid, releaseMbid });
+				await pinMutation.mutateAsync({
+					mbid: editionsMbid,
+					releaseMbid,
+					userId: authStore.user?.id
+				});
 				toastStore.show({ message: 'Edition pinned.', type: 'success' });
 			}
 			onrefresh(); // the pin changes the served tracklist - refetch the page
 		} catch (e) {
+			// Per-album pins need a known library-local id: with no addressable
+			// copies (unowned RG) the RG route stays authoritative and the
+			// failure surfaces as a toast, never a per-album call.
+			const actionableCopies = localCopies.filter((copy) => Boolean(copy.id));
+			if (e instanceof ApiError && e.status === 409 && actionableCopies.length > 0) {
+				pendingIntent = releaseMbid;
+				conflictDialog?.showModal();
+				return;
+			}
 			toastStore.show({
 				message: e instanceof Error ? e.message : 'Could not change the edition',
 				type: 'error'
@@ -608,6 +632,13 @@
 		</div>
 	</div>
 </div>
+	<EditionPinConflictDialog
+		bind:this={conflictDialog}
+		releaseMbid={pendingIntent ?? null}
+		{localCopies}
+		{onrefresh}
+		onclose={() => (pendingIntent = undefined)}
+	/>
 
 <style>
 	.album-hero {

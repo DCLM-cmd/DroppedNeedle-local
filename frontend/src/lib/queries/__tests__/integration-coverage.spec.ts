@@ -10,6 +10,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { API } from '$lib/constants';
+import { localAlbumEditionPinUrl } from '$lib/queries/albums/EditionQueries.svelte';
 
 // [description, actual path produced by the API builder, expected backend route]
 const COVERAGE: Array<[string, string, string]> = [
@@ -52,6 +53,11 @@ const COVERAGE: Array<[string, string, string]> = [
 		API.downloadClients.policyImpact(),
 		'/api/v1/download-clients/policy/impact'
 	],
+	[
+		'download-clients sabnzbd status',
+		API.downloadClients.sabnzbdStatus(),
+		'/api/v1/download-clients/sabnzbd/status'
+	],
 
 	[
 		'management hold retry',
@@ -63,6 +69,8 @@ const COVERAGE: Array<[string, string, string]> = [
 		API.downloads.heldManagementDiscard('T1'),
 		'/api/v1/downloads/held/management/T1/discard'
 	],
+	['held single reverify', API.downloads.heldReverify(7), '/api/v1/downloads/held/7/reverify'],
+	['held bulk reverify', API.downloads.heldReverifyBulk(), '/api/v1/downloads/held/reverify'],
 	// search (user-scoped)
 	['search album', API.downloads.searchAlbum(), '/api/v1/downloads/search/album'],
 	['search job', API.downloads.searchJob('J1'), '/api/v1/downloads/search/J1'],
@@ -147,6 +155,9 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/covers/release/R1?size=250'
 	],
 	['local album copies', API.library.albumCopies('A1'), '/api/v1/library/albums/A1/copies'],
+	['get local album edition pin', localAlbumEditionPinUrl('A1'), '/api/v1/library/albums/A1/edition'],
+	['set local album edition pin', localAlbumEditionPinUrl('A1'), '/api/v1/library/albums/A1/edition'],
+	['clear local album edition pin', localAlbumEditionPinUrl('A1'), '/api/v1/library/albums/A1/edition'],
 	['local artist detail', API.library.artistDetail('R1'), '/api/v1/library/artists/R1'],
 	['local artist albums', API.library.artistAlbums('R1'), '/api/v1/library/artists/R1/albums'],
 	[
@@ -378,6 +389,11 @@ const COVERAGE: Array<[string, string, string]> = [
 		'discard library management preview',
 		API.libraryManagement.discardPreview('J1'),
 		'/api/v1/library/management/previews/J1/discard'
+	],
+	[
+		'reissue library management preview token',
+		API.libraryManagement.reissuePreview('J1'),
+		'/api/v1/library/management/previews/J1/reissue'
 	],
 	[
 		'library management operation history',
@@ -798,6 +814,33 @@ const COVERAGE: Array<[string, string, string]> = [
 	],
 	['get-it settings', API.settingsGetIt(), '/api/v1/settings/get-it'],
 	['free-music settings', API.settingsFreeMusic(), '/api/v1/settings/free-music'],
+	[
+		'navidrome playlist sync',
+		API.settingsNavidromePlaylistSync(),
+		'/api/v1/settings/navidrome/playlist-sync'
+	],
+	// MusicBrainz settings: staged source selection, consent, verification, and activation
+	['MusicBrainz settings', API.settingsMusicbrainz(), '/api/v1/settings/musicbrainz'],
+	[
+		'BrainzMash stage',
+		API.settingsMusicbrainzBrainzMashStage(),
+		'/api/v1/settings/musicbrainz/brainzmash/stage'
+	],
+	[
+		'BrainzMash consent',
+		API.settingsMusicbrainzBrainzMashConsent(),
+		'/api/v1/settings/musicbrainz/brainzmash/consent'
+	],
+	[
+		'MusicBrainz verification',
+		API.settingsMusicbrainzVerify(),
+		'/api/v1/settings/musicbrainz/verify'
+	],
+	[
+		'BrainzMash activation',
+		API.settingsMusicbrainzActivate(),
+		'/api/v1/settings/musicbrainz/activate'
+	],
 	// Plugin API (phase 01b): admin roster + curator source surfaces
 	['plugins list', API.plugins.list(), '/api/v1/plugins'],
 	['plugin install', API.plugins.install(), '/api/v1/plugins/install'],

@@ -143,6 +143,9 @@ class LocalAlbumExternalIdentity(AppStruct):
     selected_by_user_id: str | None = None
     selected_at: float = 0.0
     row_revision: int = 1
+    provider_source_mode: str | None = None
+    provider_source_id: str | None = None
+    provider_source_generation: int | None = None
 
 
 class LocalArtistExternalIdentity(AppStruct):
@@ -153,6 +156,9 @@ class LocalArtistExternalIdentity(AppStruct):
     selected_by_user_id: str | None = None
     selected_at: float = 0.0
     row_revision: int = 1
+    provider_source_mode: str | None = None
+    provider_source_id: str | None = None
+    provider_source_generation: int | None = None
 
 
 class LocalTrackExternalIdentity(AppStruct):
@@ -166,6 +172,9 @@ class LocalTrackExternalIdentity(AppStruct):
     attempt_id: str | None = None
     selected_at: float = 0.0
     row_revision: int = 1
+    provider_source_mode: str | None = None
+    provider_source_id: str | None = None
+    provider_source_generation: int | None = None
 
 
 class LocalArtistAlias(AppStruct):

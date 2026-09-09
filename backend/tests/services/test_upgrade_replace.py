@@ -167,7 +167,13 @@ async def test_upgrade_replaces_worse_file_at_different_path(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="upgrade",
+        )
     )
 
     assert result.failed == []
@@ -205,7 +211,13 @@ async def test_upgrade_never_replaces_equal_or_better(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="upgrade",
+        )
     )
 
     assert result.succeeded == []
@@ -224,7 +236,13 @@ async def test_user_origin_import_never_replaces(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="user")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="user",
+        )
     )
 
     assert result.succeeded == [str(old)]
@@ -240,7 +258,13 @@ async def test_same_path_upgrade_recycles_before_publish(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="upgrade",
+        )
     )
 
     assert result.succeeded == [str(old)]
@@ -266,7 +290,13 @@ async def test_no_recycle_bin_disables_replacement(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="upgrade",
+        )
     )
 
     from services.native.file_processor import UPGRADE_NEEDS_RECYCLE_BIN
@@ -492,7 +522,7 @@ async def test_a_non_upgrade_import_still_counts_an_existing_track_as_done(
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="user")
+        _manifest(ExpectedFile(filename="01 Airbag.flac", size=0), origin="user")
     )
 
     assert result.failed == []

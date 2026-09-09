@@ -12,7 +12,7 @@ from core.exception_handlers import (
     revision_overflow_error_handler,
     stale_revision_error_handler,
 )
-from core.exceptions import ConflictError, RevisionOverflowError, StaleRevisionError
+from core.exceptions import ConflictError, ResourceNotFoundError, RevisionOverflowError, StaleRevisionError
 from api.v1.schemas.library_policies import LibraryRootSettings, TypedLibrarySettings
 from infrastructure.persistence.native_library_store import (
     MAX_REVISION,
@@ -1089,6 +1089,28 @@ async def test_target_release_pins_reject_ambiguous_provider_album_identity(
         await store.clear_target_album_release_pin("shared-rg")
 
     assert await store.get_target_album_release_pin("album-pin-a") == "release-a"
+
+@pytest.mark.asyncio
+async def test_target_release_pins_ignore_fileless_provider_ghosts(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await store.create_catalog_membership(_membership("ghost-a", with_track=False))
+    await store.create_catalog_membership(_membership("ghost-b", with_track=False))
+    with sqlite3.connect(db_path) as connection:
+        connection.executemany(
+            "INSERT INTO local_album_external_identities "
+            "(local_album_id, provider, release_group_mbid, decision_source, selected_at) "
+            "VALUES (?, 'musicbrainz', 'ghost-rg', 'manual', 2)",
+            [("album-ghost-a",), ("album-ghost-b",)],
+        )
+
+    assert await store.get_target_album_release_pin("ghost-rg") is None
+    with pytest.raises(ResourceNotFoundError, match="not in the local library"):
+        await store.set_target_album_release_pin(
+            "ghost-rg", "ghost-release", "admin", "target-time"
+        )
+    assert await store.clear_target_album_release_pin("ghost-rg") is False
+
 
 
 @pytest.mark.asyncio
@@ -3338,3 +3360,60 @@ async def test_recent_sort_paging_never_repeats_an_album_across_a_tie(store) -> 
 
     assert ids1.isdisjoint(ids2)
     assert len(ids1) == 3 and len(ids2) == 3
+@pytest.mark.asyncio
+async def test_album_catalog_scope_ids_resolves_rg_and_credited_artists(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Issue #369: scope ids must resolve without touching the track identity
+    table (which has no provider_artist_id column). Album-level and
+    track-level credited artists both contribute; uncredited identities do
+    not; unknown albums return empty sets instead of raising."""
+    await store.create_catalog_membership(_membership())
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_artists "
+            "(id, display_name, folded_name, kind, created_at, updated_at) "
+            "VALUES ('artist-guest', 'Guest', 'guest', 'person', 1, 1)"
+        )
+        connection.execute(
+            "INSERT INTO local_artists "
+            "(id, display_name, folded_name, kind, created_at, updated_at) "
+            "VALUES ('artist-unrelated', 'Unrelated', 'unrelated', 'person', 1, 1)"
+        )
+        connection.execute(
+            "INSERT INTO local_track_artists "
+            "(local_track_id, position, local_artist_id, role, credited_name, "
+            "join_phrase) VALUES ('track-1', 1, 'artist-guest', 'guest', "
+            "'Guest', '')"
+        )
+        connection.execute(
+            "INSERT INTO local_album_external_identities "
+            "(local_album_id, provider, release_group_mbid, decision_source, "
+            "selected_at) VALUES ('album-1', 'musicbrainz', 'rg-scope-1', "
+            "'manual', 2)"
+        )
+        connection.executemany(
+            "INSERT INTO local_artist_external_identities "
+            "(local_artist_id, provider, provider_artist_id, decision_source, "
+            "selected_at) VALUES (?, 'musicbrainz', ?, 'manual', 2)",
+            [
+                ("artist-1", "artist-scope-1"),
+                ("artist-guest", "artist-scope-guest"),
+                ("artist-unrelated", "artist-scope-unrelated"),
+            ],
+        )
+
+    rg_ids, artist_ids = await store.album_catalog_scope_ids("album-1")
+
+    assert rg_ids == {"rg-scope-1"}
+    assert artist_ids == {"artist-scope-1", "artist-scope-guest"}
+
+
+@pytest.mark.asyncio
+async def test_album_catalog_scope_ids_missing_album_returns_empty_sets(
+    store: NativeLibraryStore,
+) -> None:
+    """Issue #369: requesting an edition for a missing album must yield
+    valid empty scope sets (lists still sweep; no entity keys to delete),
+    not raise sqlite3.OperationalError."""
+    assert await store.album_catalog_scope_ids("album-missing") == (set(), set())

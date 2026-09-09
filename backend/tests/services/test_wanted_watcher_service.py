@@ -7,6 +7,7 @@ request relink writes, capped per-track partial dispatch with per-recording
 dedup, satisfaction-first (no search on a covered want), the active-work
 guards, cadence math with jitter bounds, and dormancy."""
 
+import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -17,9 +18,12 @@ import pytest
 
 from api.v1.schemas.settings import WantedWatcherSettings
 from core.exceptions import ResourceNotFoundError
+from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.persistence.request_history import RequestHistoryRecord
 from infrastructure.persistence.wanted_store import WantedStore
+from infrastructure.sse_publisher import SSEPublisher
 from models.download import ScoredCandidate
+from models.download_manifest import ManifestCodec
 from services.native.download_orchestrator import (
     _FILES_NOT_FOUND_MSG,
     _IMPORT_FAILED_MSG,
@@ -574,6 +578,37 @@ async def test_auto_tier_dispatches_album_and_relinks_the_request(env):
 
 
 @pytest.mark.asyncio
+async def test_auto_dispatch_carries_the_scout_snapshot_across_policy_changes(env):
+    await _add_watch(env)
+    snapshot_a = SimpleNamespace(snapshot_hash="hash-a", summary="A")
+    snapshot_b = SimpleNamespace(snapshot_hash="hash-b", summary="B")
+    live_snapshot = snapshot_a
+    dispatched_snapshot = None
+
+    env.ds.capture_quality_snapshot = Mock(return_value=snapshot_a)
+
+    async def scout(**kwargs):
+        nonlocal live_snapshot
+        assert kwargs["quality_snapshot"] is snapshot_a
+        live_snapshot = snapshot_b
+        return [_cand(tier="auto")]
+
+    async def request_album(**kwargs):
+        nonlocal dispatched_snapshot
+        dispatched_snapshot = kwargs["quality_snapshot"]
+        return "task-a"
+
+    env.ds.scout_album = AsyncMock(side_effect=scout)
+    env.ds.request_album = AsyncMock(side_effect=request_album)
+
+    summary = await env.watcher.run_sweep()
+
+    assert summary.dispatched == 1
+    assert live_snapshot is snapshot_b
+    assert dispatched_snapshot is snapshot_a
+
+
+@pytest.mark.asyncio
 async def test_auto_download_toggle_off_badges_instead_of_dispatching(env):
     env.prefs.get_wanted_settings.return_value = WantedWatcherSettings(
         auto_download_on_find=False
@@ -1016,17 +1051,24 @@ async def test_scout_configuration_error_reschedules_quietly(env):
     assert watch.last_outcome is None
     assert watch.next_check_at > time.time()
 
+
 @pytest.mark.asyncio
-async def test_enrol_open_breaker_skips_provider_calls_and_uses_year_fallback_with_one_signal(env, caplog):
+async def test_enrol_open_breaker_skips_provider_calls_and_uses_year_fallback_with_one_signal(
+    env, caplog
+):
     caplog.set_level("WARNING")
     env.watcher._provider_available = lambda: False  # type: ignore[attr-defined]
     avail_calls: list[int] = []
     orig_avail = env.watcher._provider_available
+
     def counting():
         avail_calls.append(1)
         return orig_avail()
+
     env.watcher._provider_available = counting  # type: ignore
-    records = [_record(mbid=f"rg-{i}", year=2000+i, status="failed") for i in range(3)]
+    records = [
+        _record(mbid=f"rg-{i}", year=2000 + i, status="failed") for i in range(3)
+    ]
     _serve_history(env, failed=records)
     for rec in records:
         env.download_store.get_task.return_value = _task(error=_NO_MATCH_MSG)
@@ -1040,7 +1082,9 @@ async def test_enrol_open_breaker_skips_provider_calls_and_uses_year_fallback_wi
         w = await env.store.get_watch(f"rg-{i}")
         assert w is not None
         assert w.first_release_date == str(2000 + i)
-    outage_logs = [r for r in caplog.records if "wanted.enrol_provider_outage" in r.message]
+    outage_logs = [
+        r for r in caplog.records if "wanted.enrol_provider_outage" in r.message
+    ]
     assert len(outage_logs) == 1
     assert outage_logs[0].exc_info is None
     assert "rg-" not in caplog.text
@@ -1090,10 +1134,15 @@ async def test_enrol_caches_none_and_fallback_year(env):
 async def test_enrol_preserves_existing_exclusions_under_open(env, caplog):
     env.watcher._provider_available = lambda: False  # type: ignore
     caplog.set_level("WARNING")
-    eligible = _record(mbid="rg-eligible", year=2020, status="failed", task_id="task-eligible")
+    eligible = _record(
+        mbid="rg-eligible", year=2020, status="failed", task_id="task-eligible"
+    )
     taskless = _record(mbid="rg-taskless", year=2020, status="failed", task_id=None)
-    local_fault = _record(mbid="rg-fault", year=2020, status="failed", task_id="task-fault")
+    local_fault = _record(
+        mbid="rg-fault", year=2020, status="failed", task_id="task-fault"
+    )
     _serve_history(env, failed=[eligible, taskless, local_fault])
+
     # task for eligible: terminal availability prefix -> enrols
     # taskless: no task -> should not enrol
     # local_fault: mount error -> should not enrol
@@ -1103,6 +1152,7 @@ async def test_enrol_preserves_existing_exclusions_under_open(env, caplog):
         if task_id == local_fault.download_task_id:
             return _task(error="mount error: /music missing")
         return None
+
     env.download_store.get_task.side_effect = get_task
     env.mb.get_release_group_by_id.return_value = {"first-release-date": "1999-01-01"}
     summary = await env.watcher.run_sweep()
@@ -1112,7 +1162,10 @@ async def test_enrol_preserves_existing_exclusions_under_open(env, caplog):
     assert await env.store.get_watch("rg-fault") is None
     assert env.mb.get_release_group_by_id.call_count == 0
     # Still exactly one outage signal, no MBID leak
-    assert len([r for r in caplog.records if "wanted.enrol_provider_outage" in r.message]) == 1
+    assert (
+        len([r for r in caplog.records if "wanted.enrol_provider_outage" in r.message])
+        == 1
+    )
     assert "rg-" not in caplog.text
 
 
@@ -1123,10 +1176,12 @@ async def test_enrol_isolates_per_record_error_under_open(env, caplog):
     rec_good = _record(mbid="rg-good", year=2020, task_id="task-good")
     rec_bad = _record(mbid="rg-bad", year=2020, task_id="task-bad")
     _serve_history(env, failed=[rec_bad, rec_good])
+
     async def get_task(task_id):
         if task_id == rec_bad.download_task_id:
             raise RuntimeError("boom task store")
         return _task(error=_NO_MATCH_MSG)
+
     env.download_store.get_task.side_effect = get_task
     summary = await env.watcher.run_sweep()
     # Bad record isolated, good still enrolled via year fallback despite OPEN
@@ -1164,21 +1219,28 @@ async def test_outer_cadence_and_due_delay_preserved(env):
     env.download_store.get_task.return_value = _task(error=_NO_MATCH_MSG)
     calls: list[int] = []
     orig = env.watcher._provider_available
+
     def counting():
         calls.append(1)
         return orig()
+
     env.watcher._provider_available = counting  # type: ignore
     await env.watcher.run_sweep()
     assert len(calls) == 1
 
+
 @pytest.mark.asyncio
-async def test_duplicate_mbid_differing_years_under_open_uses_per_record_year_and_zero_calls(env, caplog):
+async def test_duplicate_mbid_differing_years_under_open_uses_per_record_year_and_zero_calls(
+    env, caplog
+):
     caplog.set_level("WARNING")
     env.watcher._provider_available = lambda: False  # type: ignore
     rec1 = _record(mbid="rg-dup", year=2000, task_id="task-1")
     rec2 = _record(mbid="rg-dup", year=2010, task_id="task-2")
     _serve_history(env, failed=[rec1, rec2])
-    env.download_store.get_task.side_effect = lambda tid: _task(task_id=tid, error=_NO_MATCH_MSG)
+    env.download_store.get_task.side_effect = lambda tid: _task(
+        task_id=tid, error=_NO_MATCH_MSG
+    )
     summary = await env.watcher.run_sweep()
     assert summary.enrolled == 1
     assert env.mb.get_release_group_by_id.call_count == 0
@@ -1193,8 +1255,11 @@ async def test_duplicate_mbid_differing_years_under_open_uses_per_record_year_an
     outage = [r for r in caplog.records if "wanted.enrol_provider_outage" in r.message]
     assert len(outage) == 1
 
+
 @pytest.mark.asyncio
-async def test_duplicate_mbid_differing_years_healthy_provider_returns_none_uses_per_record_year_and_one_call(env):
+async def test_duplicate_mbid_differing_years_healthy_provider_returns_none_uses_per_record_year_and_one_call(
+    env,
+):
     env.watcher._provider_available = lambda: True  # type: ignore
     cache: dict[str, str | None] = {}
     env.mb.get_release_group_by_id.return_value = {}
@@ -1204,7 +1269,9 @@ async def test_duplicate_mbid_differing_years_healthy_provider_returns_none_uses
     assert cache["rg-dup2"] is None
     d2 = await env.watcher._first_release_date_for_mbid("rg-dup2", 2010, True, cache)
     assert d2 == "2010"  # per-record year, not cached 2000
-    assert env.mb.get_release_group_by_id.call_count == 1  # still one call, second hit cache None
+    assert (
+        env.mb.get_release_group_by_id.call_count == 1
+    )  # still one call, second hit cache None
     cache2: dict[str, str | None] = {}
     env.mb.get_release_group_by_id.return_value = {"first-release-date": "1995-01-01"}
     d3 = await env.watcher._first_release_date_for_mbid("rg-dup3", 2000, True, cache2)
@@ -1223,7 +1290,10 @@ async def test_list_retrying_uses_one_task_batch_per_page_never_per_row(env):
     """250 linked rows across two pages per status: exactly one get_tasks()
     call per page and ZERO per-row get_task() round trips."""
     page_one = [
-        _record(mbid=f"rg-{i:03d}", requested_at=f"2026-01-{(i % 28) + 1:02d}T00:00:00+00:00")
+        _record(
+            mbid=f"rg-{i:03d}",
+            requested_at=f"2026-01-{(i % 28) + 1:02d}T00:00:00+00:00",
+        )
         for i in range(200)
     ]
     page_two = [
@@ -1392,8 +1462,115 @@ async def test_failed_membership_read_stays_fail_open_per_want(env):
     assert summary.checked == 3
     assert summary.fulfilled == 0
     assert summary.errors == 0
-    # Three wants, each retrying its own presence check because a failed load leaves
-    # the snapshot unloaded - plus the library-completeness enrolment pass, which
-    # shares that same snapshot and so makes the first of the attempts. Sharing is
-    # the point: on a SUCCESSFUL read the whole sweep still costs exactly one load.
+    # A failed membership read leaves the snapshot unloaded, so each want retries its
+    # own presence check - three wants - plus the library-completeness enrolment pass
+    # that shares the same snapshot and makes the first attempt: four in all. (The
+    # merged wanted-watcher keeps this local retry shape; on a SUCCESSFUL read the whole
+    # sweep still costs exactly one load.)
     assert attempts["n"] == 4
+
+
+# cancel stops the wanted watch (#255 residual, "cancel doesn't stick")
+
+
+def _cancel_orchestrator(tmp_path, download_store, wanted_store) -> DownloadOrchestrator:
+    """A real orchestrator over real stores, for the cancel→watch path only."""
+    return DownloadOrchestrator(
+        client=Mock(),
+        indexer=Mock(),
+        download_store=download_store,
+        file_processor=Mock(),
+        library_manager=Mock(),
+        scorer=Mock(),
+        track_matcher=Mock(),
+        manifest_codec=ManifestCodec(),
+        event_bus=SSEPublisher(),
+        staging_path=tmp_path / "staging",
+        naming_template="{artist}/{album}",
+        wanted_store=wanted_store,
+    )
+
+
+async def _task_with_live_watch(tmp_path, env, **watch_overrides):
+    db_path = tmp_path / "downloads.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS auth_users (id TEXT PRIMARY KEY, username TEXT, role TEXT)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO auth_users (id, username, role) VALUES (?, ?, ?)",
+            ("user-a", "alice", "admin"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    download_store = DownloadStore(db_path=db_path, write_lock=threading.Lock())
+    orch = _cancel_orchestrator(tmp_path, download_store, env.store)
+    task = await download_store.create_task(
+        user_id="user-a",
+        download_type="album",
+        release_group_mbid="rg-1",
+        artist_name="Yan Qing",
+        album_title="the arrival",
+        year=2026,
+        track_count=12,
+    )
+    await _add_watch(env, **watch_overrides)
+    return download_store, orch, task
+
+
+@pytest.mark.asyncio
+async def test_cancel_stops_the_linked_wanted_watch(env, tmp_path):
+    download_store, orch, task = await _task_with_live_watch(tmp_path, env)
+    assert (await env.store.get_watch("rg-1")).state == "watching"
+
+    await orch.cancel_task(task.id, "user-a", "user")
+
+    assert (await download_store.get_task(task.id)).status == "cancelled"
+    assert (await env.store.get_watch("rg-1")).state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_cancel_leaves_another_users_watch_alone(env, tmp_path):
+    download_store, orch, task = await _task_with_live_watch(
+        tmp_path, env, user_id="user-b"
+    )
+
+    await orch.cancel_task(task.id, "user-a", "user")
+
+    assert (await download_store.get_task(task.id)).status == "cancelled"
+    assert (await env.store.get_watch("rg-1")).state == "watching"
+
+
+@pytest.mark.asyncio
+async def test_cancel_leaves_a_dormant_watch_alone(env, tmp_path):
+    download_store, orch, task = await _task_with_live_watch(tmp_path, env)
+    await env.store.record_cycle(
+        "rg-1",
+        outcome="no_results",
+        next_check_at=time.time() + 3600,
+        quiet=True,
+        go_dormant=True,
+    )
+    assert (await env.store.get_watch("rg-1")).state == "dormant"
+
+    await orch.cancel_task(task.id, "user-a", "user")
+
+    assert (await env.store.get_watch("rg-1")).state == "dormant"
+
+
+@pytest.mark.asyncio
+async def test_stopped_watch_rearms_and_redispatches_after_cancel(env, tmp_path):
+    _download_store, orch, task = await _task_with_live_watch(tmp_path, env)
+    await orch.cancel_task(task.id, "user-a", "user")
+    assert (await env.store.get_watch("rg-1")).state == "stopped"
+
+    # stopping is not destructive: a deliberate re-arm works normally.
+    watch = await env.watcher.resume("rg-1", "user-a", "user")
+    assert watch.state == "watching"
+
+    env.ds.scout_album.return_value = [_cand(tier="auto")]
+    summary = await env.watcher.run_sweep()
+    assert summary.dispatched == 1
+    env.ds.request_album.assert_awaited_once()

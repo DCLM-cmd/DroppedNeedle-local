@@ -897,3 +897,56 @@ async def test_an_unchanged_catalog_does_not_queue_the_work_twice(db_path: Path)
     second = await service.enqueue_backfill()
 
     assert first["id"] == second["id"]
+@pytest.mark.asyncio
+async def test_album_reenqueue_with_moved_revision_joins_queued_job(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    source_id, _target_id = await _seed_split(store)
+    service = CatalogIdentityHygieneService(store, clock=lambda: 3)
+
+    first = await service.enqueue_album(source_id)
+    assert first is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET row_revision = row_revision + 1 "
+            "WHERE local_album_id = ?",
+            (source_id,),
+        )
+    second = await service.enqueue_album(source_id)
+    assert second is not None
+    assert second["id"] == first["id"]
+    with sqlite3.connect(db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM library_operation_jobs WHERE kind = 'repair'"
+        ).fetchone()[0]
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_album_reenqueue_after_terminal_state_creates_fresh_job(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    source_id, _target_id = await _seed_split(store)
+    service = CatalogIdentityHygieneService(store, clock=lambda: 3)
+
+    first = await service.enqueue_album(source_id)
+    assert first is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_operation_jobs SET state = 'succeeded', "
+            "terminal_code = 'HYGIENE_COMPLETED', terminal_at = 4 WHERE id = ?",
+            (first["id"],),
+        )
+        connection.execute(
+            "UPDATE local_tracks SET row_revision = row_revision + 1 "
+            "WHERE local_album_id = ?",
+            (source_id,),
+        )
+    second = await service.enqueue_album(source_id)
+    assert second is not None
+    assert second["id"] != first["id"]
+    with sqlite3.connect(db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM library_operation_jobs WHERE kind = 'repair'"
+        ).fetchone()[0]
+    assert count == 2

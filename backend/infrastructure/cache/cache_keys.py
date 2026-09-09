@@ -72,6 +72,8 @@ ALBUM_INFO_PREFIX = "album_info:"
 ALBUM_TRACKS_INFO_PREFIX = "album_tracks_info:"
 
 ARTIST_DISCOVERY_PREFIX = "artist_discovery:"
+ARTIST_DISCOVERY_TOP_SONGS_PREFIX = f"{ARTIST_DISCOVERY_PREFIX}top_songs:"
+ARTIST_DISCOVERY_TOP_ALBUMS_PREFIX = f"{ARTIST_DISCOVERY_PREFIX}top_albums:"
 DISCOVER_QUEUE_ENRICH_PREFIX = "discover_queue_enrich:"
 
 ARTIST_WIKIDATA_PREFIX = "artist_wikidata:"
@@ -90,6 +92,11 @@ DISCOGS_SEARCH_PREFIX = "discogs:search:"
 
 GETIT_OPTIONS_PREFIX = "getit:v2:options:"
 GETIT_ARTIST_OPTIONS_PREFIX = "getit:v2:artist_options:"
+
+
+def _mbid_key(value: str) -> str:
+    """Canonicalize a MusicBrainz entity ID for cache identity only."""
+    return str(value).strip().casefold()
 
 
 def library_policy_prefixes() -> list[str]:
@@ -170,7 +177,7 @@ def getit_artist_options_key(artist_mbid: str) -> str:
 
 
 def musicbrainz_prefixes() -> list[str]:
-    """All MusicBrainz cache key prefixes for bulk invalidation."""
+    """MusicBrainz source-dependent cache prefixes for bulk invalidation."""
     return [
         MB_ARTIST_SEARCH_PREFIX,
         MB_ARTIST_DETAIL_PREFIX,
@@ -192,11 +199,16 @@ def musicbrainz_prefixes() -> list[str]:
         MB_DUPLICATE_SEARCH_PREFIX,
         MB_RELEASE_EDITION_SEARCH_PREFIX,
         MB_MANAGEMENT_RELEASE_PREFIX,
-        # QW10/C2: ALBUM_INFO is an MB-derived composite (RG lookup + release
-        # enrichments) exactly like ALBUM_TRACKS_INFO - a mirror/endpoint
-        # switch must re-cold both together or pages mix pre/post-switch data.
+        # Provider-bearing composite responses must cold-clear with the
+        # endpoint-specific MusicBrainz entries on a source change.
+        ARTIST_INFO_PREFIX,
+        HOME_RESPONSE_PREFIX,
+        DISCOVER_RESPONSE_PREFIX,
         ALBUM_INFO_PREFIX,
         ALBUM_TRACKS_INFO_PREFIX,
+        DISCOVER_QUEUE_ENRICH_PREFIX,
+        ARTIST_DISCOVERY_TOP_SONGS_PREFIX,
+        ARTIST_DISCOVERY_TOP_ALBUMS_PREFIX,
     ]
 
 
@@ -211,7 +223,7 @@ def mb_release_edition_search_key(
 
 
 def mb_recording_canonical_id_key(recording_mbid: str) -> str:
-    return f"{MB_RECORDING_PREFIX}{recording_mbid.casefold()}:canonical-id"
+    return f"{MB_RECORDING_PREFIX}{_mbid_key(recording_mbid)}:canonical-id"
 
 
 def listenbrainz_prefixes() -> list[str]:
@@ -321,12 +333,13 @@ def mb_album_search_key(
     return f"{MB_ALBUM_SEARCH_PREFIX}{query}:{limit}:{offset}:{types_str}:{primary_str}"
 
 
-def mb_artist_detail_key(mbid: str) -> str:
-    return f"{MB_ARTIST_DETAIL_PREFIX}{mbid}"
+def mb_artist_detail_key(mbid: str, *, include_releases: bool = True) -> str:
+    suffix = "" if include_releases else ":basic"
+    return f"{MB_ARTIST_DETAIL_PREFIX}{_mbid_key(mbid)}{suffix}"
 
 
 def mb_artist_release_groups_key(artist_mbid: str) -> str:
-    return f"{MB_ARTIST_RGS_PREFIX}{artist_mbid.casefold()}"
+    return f"{MB_ARTIST_RGS_PREFIX}{_mbid_key(artist_mbid)}"
 
 
 def mb_artist_rgs_browse_key(artist_mbid: str, limit: int) -> str:
@@ -337,17 +350,17 @@ def mb_artist_rgs_browse_key(artist_mbid: str, limit: int) -> str:
     sibling builder above stores bare casefolded MBIDs and MBIDs never
     contain ':', so the ':browse:' segment cannot collide.
     """
-    return f"{MB_ARTIST_RGS_PREFIX}{artist_mbid.casefold()}:browse:{limit}"
+    return f"{MB_ARTIST_RGS_PREFIX}{_mbid_key(artist_mbid)}:browse:{limit}"
 
 
 def mb_release_group_key(mbid: str, includes: Optional[list[str]] = None) -> str:
     includes_str = ",".join(sorted(includes)) if includes else "default"
-    return f"{MB_RG_DETAIL_PREFIX}{mbid}:{includes_str}"
+    return f"{MB_RG_DETAIL_PREFIX}{_mbid_key(mbid)}:{includes_str}"
 
 
 def mb_release_key(release_id: str, includes: Optional[list[str]] = None) -> str:
     includes_str = ",".join(sorted(includes)) if includes else "default"
-    return f"{MB_RELEASE_DETAIL_PREFIX}{release_id}:{includes_str}"
+    return f"{MB_RELEASE_DETAIL_PREFIX}{_mbid_key(release_id)}:{includes_str}"
 
 
 def mb_management_release_key(
@@ -360,7 +373,7 @@ def mb_management_release_key(
     locales_part = ",".join(locale.strip().casefold() for locale in preferred_locales)
     standardization_part = artist_standardization.strip().casefold()
     return (
-        f"{MB_MANAGEMENT_RELEASE_PREFIX}{release_id}:"
+        f"{MB_MANAGEMENT_RELEASE_PREFIX}{_mbid_key(release_id)}:"
         f"inc={includes_part}:locales={locales_part}:artists={standardization_part}"
     )
 

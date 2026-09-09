@@ -1,5 +1,7 @@
 """Request/response DTOs for the download-client + search + quarantine routes (Phase 6)."""
 
+from typing import Literal
+
 import msgspec
 
 from infrastructure.msgspec_fastapi import AppStruct
@@ -33,13 +35,19 @@ class IndexerSavedResponse(AppStruct):
 
 class SabnzbdTestResponse(AppStruct):
     """Result of testing SABnzbd: version + the category list (for the picker) + the
-    SABnzbd-side completed dir (the mount hint)."""
+    SABnzbd-side completed dir (the mount hint) + the mount diagnosis (how many
+    sampled SABnzbd downloads resolve under the submitted mount, with an
+    actionable message when they don't)."""
 
     valid: bool
     version: str | None = None
     message: str = ""
     categories: list[str] = msgspec.field(default_factory=list)
     complete_dir: str | None = None
+    mount_has_files: bool | None = None
+    resolvable_downloads: int | None = None
+    sampled_downloads: int | None = None
+    mount_message: str | None = None
 
 
 class IndexerReorderRequest(AppStruct):
@@ -77,6 +85,13 @@ class SearchAlbumResponse(AppStruct):
     job_id: str | None = None
 
 
+class QualityRejectionSummary(AppStruct):
+    outside_policy: int = 0
+    unknown_rejected: int = 0
+    not_importable: int = 0
+    needs_review: int = 0
+
+
 class SearchJobResponse(AppStruct):
     job_id: str
     status: str
@@ -84,6 +99,10 @@ class SearchJobResponse(AppStruct):
     album_title: str
     candidate_count: int
     top_score: float | None = None
+    quality_snapshot_summary: str | None = None
+    quality_rejections: QualityRejectionSummary = msgspec.field(
+        default_factory=QualityRejectionSummary
+    )
     candidates: list[ScoredCandidate] = msgspec.field(default_factory=list)
 
 
@@ -214,6 +233,8 @@ class PolicySummaryResponse(AppStruct):
     summary: str
     source_mode: str
     legacy_rollback_compatible: bool
+    quality_recipe_status: Literal["v1", "v2", "non_convertible", "invalid"] = "v1"
+    quality_recipe_error: str | None = None
 
 
 class PolicyImpactResponse(AppStruct):
@@ -230,7 +251,6 @@ class PolicyImpactResponse(AppStruct):
     legacy_representable: bool = True
 
 
-
 class RestartWithPolicyRequest(AppStruct):
     """Guard against acting on a stale view: the caller echoes the stored
     hash it saw; a mismatch aborts the atomic restart."""
@@ -242,6 +262,7 @@ class RestartWithPolicyResponse(AppStruct):
     accepted: bool
     snapshot_summary: str | None = None
     message: str | None = None
+
 
 class HeldImportResponse(AppStruct):
     """A downloaded track held for an "import anyway" review: the audio matched the track by
@@ -273,6 +294,7 @@ class HeldImportResponse(AppStruct):
     evidence_score: float | None = None
     management_retry_count: int = 0
     management_next_retry_at: float | None = None
+    expected_duration_seconds: float | None = None
 
 
 class HeldListResponse(AppStruct):
@@ -296,6 +318,37 @@ class HeldReevaluateResponse(AppStruct):
     imported: int
     still_held: int
     failed: int
+
+
+class HeldReverifyResponse(AppStruct):
+    """Result of re-running the fingerprint identity check on one held file: a
+    confident result that no longer disagrees imports through the same
+    settle/reconcile path as "import anyway", anything else stays held."""
+
+    status: Literal["imported", "still_held"]
+    final_path: str | None = None
+
+
+class HeldBulkReverifyRequest(AppStruct):
+    """Re-check held tracks in bulk. ``held_ids`` scopes the run (in request
+    order); omitted means every held track the caller may see, newest first.
+    Either way at most 25 ids run per request."""
+
+    held_ids: list[int] | None = None
+
+
+class HeldBulkReverifyItem(AppStruct):
+    """Per-id bulk outcome: "imported" | "still_held" | "skipped" | "error"."""
+
+    held_id: int
+    status: Literal["imported", "still_held", "skipped", "error"]
+    final_path: str | None = None
+    release_group_mbid: str | None = None
+    message: str | None = None
+
+
+class HeldBulkReverifyResponse(AppStruct):
+    results: list[HeldBulkReverifyItem]
 
 
 class DownloadListResponse(AppStruct):

@@ -10,13 +10,11 @@ import { toastStore } from '$lib/stores/toast';
 // Request-surface copy lives beside the other acquisition label mappings.
 import { batchRequestCopy, requestStatusCopy } from '$lib/utils/acquisitionLabels';
 import { albumRequestOutcome } from '$lib/utils/requestOutcome';
-
+import type { RequestAccepted } from '$lib/types';
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
 
-// Response mirrors for the consolidated request paths. $lib/types intentionally has
-// no hand-mirror for these shapes yet and this module may not extend it, so they are
-// declared narrowly here instead. `RequestAccepted.task` stays optional: current
-// /requests/new payloads omit it, but a snapshot-carrying backend can fill it.
+// Response mirrors for the consolidated request paths that are not shared with
+// the application-wide type contract.
 interface CancelDownloadResponse {
 	status?: string;
 }
@@ -35,14 +33,6 @@ interface BlacklistSourceResponse {
 interface ReimportDownloadResponse {
 	status: string;
 	error_message?: string | null;
-}
-
-interface RequestAccepted {
-	success: boolean;
-	message: string;
-	musicbrainz_id: string;
-	status: string;
-	task?: { quality_snapshot_summary?: string | null } | null;
 }
 
 interface RetryDownloadResponse {
@@ -145,7 +135,7 @@ export function requestAlbum() {
 				return data;
 			}
 			const outcome = albumRequestOutcome(data);
-			const summary = data.task?.quality_snapshot_summary ?? undefined;
+			const summary = data.quality_snapshot_summary ?? undefined;
 			toastStore.show({
 				message: requestStatusCopy(outcome ?? 'dispatched', summary),
 				type: outcome === 'duplicate_active' || outcome === 'in_library' ? 'info' : 'success'
@@ -484,6 +474,92 @@ export function discardHeldTrack() {
 		},
 		onError: (err: unknown) =>
 			toastStore.show({ message: errorMessage(err, 'Failed to discard track'), type: 'error' })
+	}));
+}
+
+// Re-run the fingerprint identity check on one held file. A confident result that no
+// longer disagrees imports through the same settle path as "import anyway"; anything
+// else stays held. invalidateTasks covers the held prefix nested under tasks; only an
+// import places a track, so the album key refreshes solely on 'imported'.
+export interface HeldReverifyResponse {
+	status: 'imported' | 'still_held';
+	final_path: string | null;
+}
+
+export function reverifyHeldTrack() {
+	return createMutation(() => ({
+		mutationFn: (input: HeldActionInput) =>
+			api.global.post<HeldReverifyResponse>(API.downloads.heldReverify(input.id), {}),
+		onSuccess: (data: HeldReverifyResponse, input: HeldActionInput) => {
+			if (data.status === 'imported') {
+				toastStore.show({ message: 'Re-check confirmed it: imported', type: 'success' });
+				invalidateAlbum(input.release_group_mbid);
+			} else {
+				toastStore.show({ message: 'Still held after re-check', type: 'info' });
+			}
+			void invalidateTasks();
+			void invalidateQueriesWithPersister({
+				queryKey: DownloadQueryKeyFactory.heldPrefix(authStore.user?.id)
+			});
+		},
+		onError: (err: unknown) =>
+			toastStore.show({ message: errorMessage(err, 'Failed to re-check track'), type: 'error' })
+	}));
+}
+
+export interface HeldBulkReverifyItem {
+	held_id: number;
+	status: 'imported' | 'still_held' | 'skipped' | 'error';
+	final_path: string | null;
+	release_group_mbid: string | null;
+	message: string | null;
+}
+
+export interface HeldBulkReverifyResponse {
+	results: HeldBulkReverifyItem[];
+}
+
+export interface HeldBulkReverifyInput {
+	held_ids?: number[] | null;
+}
+
+// Re-check held tracks in bulk. held_ids scopes the run (omitted sweeps everything the
+// caller may see); the 25-id cap is enforced server-side, so ids pass through untouched.
+export function reverifyHeldBulk() {
+	return createMutation(() => ({
+		mutationFn: (input: HeldBulkReverifyInput) =>
+			api.global.post<HeldBulkReverifyResponse>(API.downloads.heldReverifyBulk(), {
+				held_ids: input.held_ids ?? null
+			}),
+		onSuccess: (data: HeldBulkReverifyResponse) => {
+			const imported = data.results.filter((r) => r.status === 'imported');
+			const stillHeld = data.results.filter((r) => r.status === 'still_held').length;
+			const skipped = data.results.filter((r) => r.status === 'skipped').length;
+			const failed = data.results.length - imported.length - stillHeld - skipped;
+			if (data.results.length === 0) {
+				toastStore.show({ message: 'Nothing to re-check', type: 'info' });
+			} else {
+				const parts = [
+					imported.length > 0 ? `${imported.length} imported` : null,
+					stillHeld > 0 ? `${stillHeld} still held` : null,
+					skipped > 0 ? `${skipped} skipped` : null,
+					failed > 0 ? `${failed} failed` : null
+				].filter((p): p is string => p !== null);
+				toastStore.show({
+					message: `Re-checked ${data.results.length}: ${parts.join(', ')}`,
+					type: imported.length > 0 ? 'success' : 'info'
+				});
+			}
+			void invalidateTasks();
+			void invalidateQueriesWithPersister({
+				queryKey: DownloadQueryKeyFactory.heldPrefix(authStore.user?.id)
+			});
+			for (const item of imported) {
+				invalidateAlbum(item.release_group_mbid);
+			}
+		},
+		onError: (err: unknown) =>
+			toastStore.show({ message: errorMessage(err, 'Failed to re-check tracks'), type: 'error' })
 	}));
 }
 

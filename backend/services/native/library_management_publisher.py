@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 import msgspec
 
 from api.v1.schemas.library_management import (
+    LibraryManagementRootAssignment,
     picard_style_organizer_profile,
     settings_revision,
 )
@@ -66,10 +67,14 @@ from models.library_management_planning import (
     naming_policy_revision,
     pin_library_management_profile,
 )
-from api.v1.schemas.library_management import LibraryManagementRootAssignment
 from services.native.artwork_projection_service import merge_embedded_artwork
 from services.native.audio_write_planning_service import AudioWritePlanningService
 from services.native.file_revision import revision_from_stat
+from services.native.library_management_profile_service import (
+    LibraryManagementProfileService,
+)
+from services.native.library_policy_resolver import LibraryPolicyResolver
+from services.native.recycle_bin import recycle
 from services.native.library_filesystem_coordinator import (
     MANAGEMENT_ARTIFACT_PREFIX,
     LibraryFilesystemCoordinator,
@@ -77,12 +82,8 @@ from services.native.library_filesystem_coordinator import (
     replace_rooted_publication,
     unlink_rooted,
 )
-from services.native.library_policy_resolver import LibraryPolicyResolver
-from services.native.library_management_profile_service import (
-    LibraryManagementProfileService,
-)
-from services.native.recycle_bin import recycle
 from services.preferences_service import PreferencesService
+from repositories.musicbrainz_base import MbSourceContext
 
 logger = logging.getLogger(__name__)
 
@@ -105,10 +106,9 @@ _SNAPSHOT_NAMESPACE = uuid.UUID("77d7be20-4ff2-475a-941f-e0a575806d78")
 _BASELINE_NAMESPACE = uuid.UUID("bf48a4f8-5968-41f6-9c82-f95a976a8f21")
 _IMPORT_BUNDLE_NAMESPACE = uuid.UUID("4ac147e4-7371-4eb4-89d3-5cc30f394277")
 _MAX_DIRECTORY_COLLISION_ENTRIES = 10_000
-
 CommitCallback = Callable[[set[str], set[str]], Awaitable[None]]
 ImportCommitCallback = Callable[
-    [str, tuple[LibraryManagementPublishedImportFile, ...]],
+    [str, tuple[LibraryManagementPublishedImportFile, ...], MbSourceContext | None],
     Awaitable[tuple[str, ...]],
 ]
 
@@ -352,13 +352,14 @@ class LibraryManagementPublisher:
         self,
         bundle: LibraryManagementImportBundle,
         catalog_commit: ImportCommitCallback,
+        *,
+        source_context: MbSourceContext | None = None,
     ) -> LibraryManagementImportResult:
         """Publish one verified acquisition/drop unit through a durable journal.
 
-        Incoming files do not exist in the catalog yet, so they cannot use the
-        foreign-keyed manual-management plan table. This import lane shares the
-        staged writer, root leases, safe path checks, publish/rollback rules, and
-        NativeLibraryStore transaction owner without inventing another work queue.
+        The provider source context is an internal admission stamp. It is
+        intentionally not serialized into the import request or any HTTP/domain
+        model.
         """
 
         self._validate_import_bundle(bundle)
@@ -369,12 +370,12 @@ class LibraryManagementPublisher:
         # F-175: serialize duplicate publications of one bundle id so a second
         # caller cannot interleave staging/rollback under the winner's critical
         # section; it awaits the lock and re-runs the state machine instead.
-        lock = self._import_publication_locks.setdefault(
-            bundle_id, asyncio.Lock()
-        )
+        lock = self._import_publication_locks.setdefault(bundle_id, asyncio.Lock())
         try:
             async with lock:
-                return await self._publish_import_bundle(bundle, catalog_commit)
+                return await self._publish_import_bundle(
+                    bundle, catalog_commit, source_context
+                )
         finally:
             remaining = self._active_import_bundles[bundle_id] - 1
             if remaining:
@@ -389,6 +390,7 @@ class LibraryManagementPublisher:
         self,
         bundle: LibraryManagementImportBundle,
         catalog_commit: ImportCommitCallback,
+        source_context: MbSourceContext | None,
     ) -> LibraryManagementImportResult:
         request_json = msgspec.json.encode(bundle).decode()
         request_hash = hashlib.sha256(request_json.encode()).hexdigest()
@@ -497,7 +499,9 @@ class LibraryManagementPublisher:
                         [await self._published_import_file(value) for value in prepared]
                     )
                     self._validate_automatic_import_configuration(bundle)
-                    committed = await catalog_commit(bundle_id, published)
+                    committed = await catalog_commit(
+                        bundle_id, published, source_context
+                    )
                     if len(committed) != len(prepared):
                         raise ValidationError(
                             "The import catalog commit returned an incomplete result."
@@ -619,6 +623,60 @@ class LibraryManagementPublisher:
             return "needs_attention"
 
     @staticmethod
+    def _validate_reviewed_recording_identity(
+        bundle: LibraryManagementImportBundle,
+        request: LibraryManagementImportFile,
+    ) -> None:
+        if not request.reviewed_recording_identity:
+            return
+        conversion_values = (
+            bundle.conversion_job_id,
+            bundle.conversion_expected_row_revision,
+            bundle.conversion_local_album_id,
+            bundle.conversion_preview_job_id,
+            bundle.conversion_recycle_bin_path,
+        )
+        projection_values = (
+            request.desired_document,
+            request.pinned_profile,
+            request.metadata_snapshot_id,
+            request.projection_hash,
+            request.settings_revision,
+            request.naming_policy_revision,
+            request.undo_retention_days,
+            request.baseline_relative_path,
+        )
+        request_recording = (request.recording_mbid or "").strip()
+        tag_recording = (request.tag.musicbrainz_recording_id or "").strip()
+        if (
+            len(bundle.files) != 1
+            or bundle.origin != "acquisition"
+            or request.source != "download"
+            or any(value is not None for value in conversion_values)
+            or request.conversion_recycle_only
+            or request.authoritative_mapping
+            or any(
+                value is not None
+                for value in (
+                    request.release_track_mbid,
+                    request.medium_position,
+                    request.release_track_position,
+                )
+            )
+            or (request.tag.musicbrainz_release_track_id or "").strip()
+            or any(value is not None for value in projection_values)
+            or request.management_warnings
+            or request.artifacts
+            or not request_recording
+            or not tag_recording
+            or request_recording.casefold() != tag_recording.casefold()
+        ):
+            raise ValidationError(
+                "A reviewed recording identity must be an unmanaged acquisition "
+                "request with matching recording IDs."
+            )
+
+    @staticmethod
     def _validate_import_bundle(bundle: LibraryManagementImportBundle) -> None:
         if not bundle.idempotency_key.strip():
             raise ValidationError("An import publication idempotency key is required.")
@@ -680,6 +738,9 @@ class LibraryManagementPublisher:
         for value in bundle.files:
             if not Path(value.input_path).is_absolute():
                 raise ValidationError("An import source path must be absolute.")
+            LibraryManagementPublisher._validate_reviewed_recording_identity(
+                bundle, value
+            )
             replacement_values = (
                 value.replacement_local_track_id,
                 value.replacement_root_id,
@@ -790,7 +851,9 @@ class LibraryManagementPublisher:
         return profile
 
     @staticmethod
-    def _minimal_import_document(tag) -> DesiredAudioDocument:  # noqa: ANN001
+    def _minimal_import_document(
+        tag, *, reviewed_recording_identity: bool = False
+    ) -> DesiredAudioDocument:  # noqa: ANN001
         fields = [DesiredAudioField(name="album", action="set", value=tag.album)]
         if tag.album_artist is not None:
             fields.append(
@@ -808,6 +871,14 @@ class LibraryManagementPublisher:
         ):
             if value:
                 fields.append(DesiredAudioField(name=name, action="set", value=value))
+        if reviewed_recording_identity and tag.musicbrainz_recording_id:
+            fields.append(
+                DesiredAudioField(
+                    name="musicbrainz_recording_id",
+                    action="set",
+                    value=tag.musicbrainz_recording_id,
+                )
+            )
         album_artist_ids = tuple(
             tag.musicbrainz_album_artist_ids
             or (
@@ -947,12 +1018,15 @@ class LibraryManagementPublisher:
                 if request.pinned_profile is not None
                 else self._minimal_import_profile()
             )
-            desired = (
-                self._minimal_import_document(request.tag)
-                if request.conversion_recycle_only
-                else request.desired_document
-                or self._minimal_import_document(request.tag)
-            )
+            if request.conversion_recycle_only:
+                desired = self._minimal_import_document(request.tag)
+            elif request.desired_document is not None:
+                desired = request.desired_document
+            else:
+                desired = self._minimal_import_document(
+                    request.tag,
+                    reviewed_recording_identity=request.reviewed_recording_identity,
+                )
             plan = self._write_planner.plan(
                 current=read,
                 desired=desired,
@@ -1472,9 +1546,7 @@ class LibraryManagementPublisher:
                     artifact.destination_relative_path,
                 )
                 # F-179: durable directory entry before its journal advances.
-                await asyncio.to_thread(
-                    self._fsync_directory, artifact.destination
-                )
+                await asyncio.to_thread(self._fsync_directory, artifact.destination)
             elif (
                 not artifact.destination.exists()
                 or await asyncio.to_thread(self._hash_file, artifact.destination)
@@ -1906,8 +1978,7 @@ class LibraryManagementPublisher:
                 # F-178: startup drains these cleanups, so a persistent failure
                 # must be observable instead of landing as a silent ordinal.
                 logger.warning(
-                    "Library Management import cleanup failed for bundle %s "
-                    "ordinal %s",
+                    "Library Management import cleanup failed for bundle %s ordinal %s",
                     record.id,
                     request.ordinal,
                     exc_info=True,
@@ -2062,9 +2133,7 @@ class LibraryManagementPublisher:
             }
             album_ids: set[str] = set()
             if track_ids:
-                tracks = await self._store.get_target_tracks_by_ids(
-                    sorted(track_ids)
-                )
+                tracks = await self._store.get_target_tracks_by_ids(sorted(track_ids))
                 album_ids = {
                     str(track["local_album_id"])
                     for track in tracks.values()
@@ -3798,6 +3867,7 @@ class LibraryManagementPublisher:
                         )
                     except (StaleRevisionError, ValidationError):
                         pass
+
     async def _cleanup_committed(
         self,
         prepared: list[_PreparedMutation],
@@ -3869,9 +3939,7 @@ class LibraryManagementPublisher:
         journals = await self._store.list_file_mutation_journals_for_bundle(
             job_id, bundle_ordinal
         )
-        current = next(
-            (value for value in journals if value.id == journal_id), None
-        )
+        current = next((value for value in journals if value.id == journal_id), None)
         if current is None or current.state != "catalog_committed":
             return None
         try:
@@ -3923,8 +3991,7 @@ class LibraryManagementPublisher:
                 value.destination.is_symlink()
                 or not value.destination.is_file()
                 or value.journal.staged_fingerprint is None
-                or cls._hash_file(value.destination)
-                != value.journal.staged_fingerprint
+                or cls._hash_file(value.destination) != value.journal.staged_fingerprint
             ):
                 raise ConflictError(
                     "A published management destination changed during rollback."
@@ -4048,6 +4115,11 @@ class LibraryManagementPublisher:
             raise ValidationError("A management path is not a safe relative path.")
         current = root
         if stat.S_ISLNK(current.lstat().st_mode):
+            logger.warning(
+                "Library Management rejected symlink library root (code=%s): %s",
+                "SYMLINK_ROOT",
+                root.name,
+            )
             raise ValidationError("A library root cannot be a symlink.")
         for part in pure.parts[:-1]:
             current = current / part
@@ -4059,6 +4131,13 @@ class LibraryManagementPublisher:
                 current.mkdir()
                 metadata = current.lstat()
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                logger.warning(
+                    "Library Management rejected unsafe management path (code=%s): %s",
+                    "SYMLINK_COMPONENT"
+                    if stat.S_ISLNK(metadata.st_mode)
+                    else "NOT_A_DIRECTORY",
+                    current.name,
+                )
                 raise ValidationError("A management path contains a symlink.")
         return root.joinpath(*pure.parts)
 
@@ -4080,6 +4159,13 @@ class LibraryManagementPublisher:
                 current.mkdir()
                 metadata = current.lstat()
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                logger.warning(
+                    "Library Management rejected unsafe sidecar path (code=%s): %s",
+                    "SYMLINK_COMPONENT"
+                    if stat.S_ISLNK(metadata.st_mode)
+                    else "NOT_A_DIRECTORY",
+                    current.name,
+                )
                 raise ValidationError("A sidecar path contains a symlink.")
         return parent.joinpath(*pure.parts)
 
@@ -4101,8 +4187,7 @@ class LibraryManagementPublisher:
                 return
             except OSError:
                 logger.warning(
-                    "Library Management staging fell back to the system "
-                    "temp for %s",
+                    "Library Management staging fell back to the system temp for %s",
                     temporary,
                     exc_info=True,
                 )
@@ -4130,8 +4215,7 @@ class LibraryManagementPublisher:
             except OSError as error:
                 # F-146: observability without a new failure mode.
                 logger.warning(
-                    "Library Management cleanup directory fsync failed "
-                    "(errno=%s): %s",
+                    "Library Management cleanup directory fsync failed (errno=%s): %s",
                     error.errno,
                     directory,
                 )
@@ -4147,7 +4231,23 @@ class LibraryManagementPublisher:
         temporary.parent.mkdir(parents=True, exist_ok=True)
         temporary.unlink(missing_ok=True)
         shutil.copyfile(source, temporary)
-        shutil.copystat(source, temporary)
+        try:
+            shutil.copystat(source, temporary)
+        except OSError as error:
+            # Issue #185: Docker/Unraid/TrueNAS mounts (ACLs, noexec, user
+            # mapping) commonly reject copystat's ownership/timestamp
+            # preservation with EPERM/EACCES/ENOTSUP while copyfile succeeds;
+            # plain `cp` (no copystat) succeeds there too, so keep the staged
+            # bytes (copyfile parity) instead of failing the whole import.
+            # copyfile stays strict and the fsync below stays strict (durability).
+            logger.warning(
+                "Library Management staging copystat fell back to copyfile bytes "
+                "(errno=%s): %s -> %s",
+                error.errno,
+                source.name,
+                temporary.name,
+                exc_info=True,
+            )
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
 

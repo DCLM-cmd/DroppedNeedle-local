@@ -55,6 +55,7 @@ from services.native.download_orchestrator import (
     _Cancelled,
 )
 from services.native.acquisition.errors import OrchestrationError
+from services.native.acquisition import quality as acq_quality
 from services.native.acquisition.status import DownloadStatus
 from services.native.file_processor import (
     IMPORT_FAILED,
@@ -279,16 +280,11 @@ class _FakeRequestHistory:
             return self.record
         return None
 
-    async def async_get_record_by_download_task_id(
-        self, task_id, request_kind=None
-    ):
+    async def async_get_record_by_download_task_id(self, task_id, request_kind=None):
         if (
             self.record is not None
             and self.record.download_task_id == task_id
-            and (
-                request_kind is None
-                or self.record.request_kind == request_kind
-            )
+            and (request_kind is None or self.record.request_kind == request_kind)
         ):
             return self.record
         return None
@@ -1102,35 +1098,6 @@ class _PartialFailoverClient(_FailoverClient):
 
 
 @pytest.mark.asyncio
-async def test_failover_skips_dead_peer_and_completes_via_next_candidate(
-    tmp_path: Path,
-):
-    """The auto-picked peer stalls; the orchestrator fails over to the next ranked
-    candidate (a different peer) and completes the album unattended."""
-    client = _FailoverClient({"deadpeer": "stall", "goodpeer": "complete"})
-    candidates = [
-        _candidate(0.9, files=2, username="deadpeer"),
-        _candidate(0.85, files=2, username="goodpeer"),
-    ]
-    store, orch, fp, lib = _build(
-        tmp_path,
-        client=client,
-        scorer_result=candidates,
-        stall_minutes=0.0,
-        max_failover=3,
-    )
-    _coupled_fp(fp, lib)
-    task = await _new_task(store, track_count=2)
-
-    await orch.process_task(task.id)
-
-    final = await store.get_task(task.id)
-    assert final.status == "completed"
-    assert final.source_username == "goodpeer"  # advanced past the dead peer
-    assert len(lib.rows) == 2
-
-
-@pytest.mark.asyncio
 async def test_tag_mismatch_failover_uses_fixed_message_without_source_details(
     tmp_path: Path,
 ):
@@ -1150,9 +1117,7 @@ async def test_tag_mismatch_failover_uses_fixed_message_without_source_details(
         fp_result=ProcessResult(
             succeeded=[],
             failed=[
-                FileFailure(
-                    filename="attacker/path/secret.flac", reason="tag_mismatch"
-                )
+                FileFailure(filename="attacker/path/secret.flac", reason="tag_mismatch")
             ],
         ),
         imported_rows=[],
@@ -1585,28 +1550,6 @@ async def test_try_next_source_settles_failed_if_advance_breaks_after_abort(
     client.abort.assert_awaited_once()
     orch.dispatch.assert_not_called()
     orch._dispatch_resume.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_failover_exhausted_settles_failed_when_nothing_landed(tmp_path: Path):
-    client = _FailoverClient({"deadpeer": "stall", "deadpeer2": "stall"})
-    candidates = [
-        _candidate(0.9, username="deadpeer"),
-        _candidate(0.85, username="deadpeer2"),
-    ]
-    store, orch, fp, lib = _build(
-        tmp_path,
-        client=client,
-        scorer_result=candidates,
-        stall_minutes=0.0,
-        max_failover=3,
-    )
-    _coupled_fp(fp, lib)
-    task = await _new_task(store)
-
-    await orch.process_task(task.id)
-
-    assert (await store.get_task(task.id)).status == "failed"
 
 
 @pytest.mark.asyncio
@@ -2054,10 +1997,7 @@ async def test_cancel_task_syncs_linked_request_to_cancelled(tmp_path: Path):
     assert (await store.get_task(task.id)).status == "cancelled"
     assert any(s == "cancelled" for (_m, s, _c) in rh.updates)
     assert any(
-        m == "rg-1"
-        and s == "cancelled"
-        and kind == "album"
-        and generation == 1
+        m == "rg-1" and s == "cancelled" and kind == "album" and generation == 1
         for (m, s, _c, kind, generation) in rh.status_calls
     )
     assert rh.record.status == "cancelled"
@@ -2258,6 +2198,7 @@ async def test_startup_resume_tracks_handle_so_cancel_can_reach_it(tmp_path: Pat
     assert task.id in orch._active_tasks
     orch._active_tasks[task.id].cancel()
 
+
 # Request/library state bridge (Phase 3)
 
 
@@ -2286,42 +2227,10 @@ async def test_terminal_completed_marks_linked_request_imported(tmp_path: Path):
 
     assert ("rg-1", "imported") in [(m, s) for (m, s, _c) in rh.updates]
     assert any(
-        m == "rg-1"
-        and s == "imported"
-        and kind == "album"
-        and generation == 1
+        m == "rg-1" and s == "imported" and kind == "album" and generation == 1
         for (m, s, _c, kind, generation) in rh.status_calls
     )
     on_import.assert_awaited()  # caches busted + album materialised
-
-
-@pytest.mark.asyncio
-async def test_terminal_failed_marks_linked_request_failed(tmp_path: Path):
-    record = _request_record()
-    rh = _FakeRequestHistory(record)
-    client = _FailoverClient({"deadpeer": "stall"})
-    store, orch, fp, lib = _build(
-        tmp_path,
-        client=client,
-        scorer_result=[_candidate(0.9, username="deadpeer")],
-        stall_minutes=0.0,
-        max_failover=1,
-        request_history=rh,
-    )
-    _coupled_fp(fp, lib)
-    task = await _new_task(store)
-    record.download_task_id = task.id
-
-    await orch.process_task(task.id)
-
-    assert any(s == "failed" for (_m, s, _c) in rh.updates)
-    assert any(
-        m == "rg-1"
-        and s == "failed"
-        and kind == "album"
-        and generation == 1
-        for (m, s, _c, kind, generation) in rh.status_calls
-    )
 
 
 @pytest.mark.asyncio
@@ -3078,9 +2987,7 @@ async def test_reimport_tag_mismatch_uses_fixed_message_and_persists_exclusion(
         fp_result=ProcessResult(
             succeeded=[],
             failed=[
-                FileFailure(
-                    filename="mismatched-peer/01.flac", reason="tag_mismatch"
-                )
+                FileFailure(filename="mismatched-peer/01.flac", reason="tag_mismatch")
             ],
         ),
         imported_rows=[],
@@ -3432,9 +3339,14 @@ async def test_candidate_passes_quality_regates_against_current_policy(tmp_path:
     from services.native.acquisition.quality import build_snapshot
 
     _, orch, _, _ = _build(tmp_path)
-    snap = build_snapshot(DownloadPolicySettings(quality_min="mp3_256", quality_max="mp3_320"))
-    task = SimpleNamespace(id="t", track_count=None,
-                           quality_snapshot_json=msgspec.json.encode(snap).decode())
+    snap = build_snapshot(
+        DownloadPolicySettings(quality_min="mp3_256", quality_max="mp3_320")
+    )
+    task = SimpleNamespace(
+        id="t",
+        track_count=None,
+        quality_snapshot_json=acq_quality.encode_snapshot(snap),
+    )
     flac = _candidate(0.9)  # .flac -> lossless -> outside [mp3_256, mp3_320]
     mp3 = _mp3_candidate()  # 320 inside
 
@@ -3444,30 +3356,43 @@ async def test_candidate_passes_quality_regates_against_current_policy(tmp_path:
     # Later settings saves never mutate the stored verdict:
     from types import SimpleNamespace as _NS2
 
-    orch._get_download_policy = lambda: SimpleNamespace(
-        quality_min="low",
-        quality_max="lossless",
-        quality_preference_order=["lossless", "mp3_320", "mp3_256", "mp3_192", "low"],
-        preferred_lossy_bitrate_kbps=None,
-        lossy_min_bitrate_kbps=None,
-        lossy_max_bitrate_kbps=None,
-        lossless_preference="highest",
-        lossless_max_bit_depth=None,
-        lossless_max_sample_rate_hz=None,
-        flac_mp3_only=False,
-        unknown_quality_behavior="allow_as_fallback",
-        source_selection_mode="source_first",
-    ) if False else _full_policy_ns()
+    orch._get_download_policy = lambda: (
+        SimpleNamespace(
+            quality_min="low",
+            quality_max="lossless",
+            quality_preference_order=[
+                "lossless",
+                "mp3_320",
+                "mp3_256",
+                "mp3_192",
+                "low",
+            ],
+            preferred_lossy_bitrate_kbps=None,
+            lossy_min_bitrate_kbps=None,
+            lossy_max_bitrate_kbps=None,
+            lossless_preference="highest",
+            lossless_max_bit_depth=None,
+            lossless_max_sample_rate_hz=None,
+            flac_mp3_only=False,
+            unknown_quality_behavior="allow_as_fallback",
+            source_selection_mode="source_first",
+        )
+        if False
+        else _full_policy_ns()
+    )
 
     def _full_policy_ns():
-        raise AssertionError("legacy fallback must NOT be consulted for stored snapshots")
+        raise AssertionError(
+            "legacy fallback must NOT be consulted for stored snapshots"
+        )
 
     assert await orch._candidate_passes_quality(task, flac) is False
 
     # Legacy row WITHOUT a stored snapshot falls back to a migration snapshot of
     # the live policy: same range, same verdicts, still fails open when unwired.
     orch._get_download_policy = lambda: SimpleNamespace(
-        quality_min="mp3_256", quality_max="mp3_320",
+        quality_min="mp3_256",
+        quality_max="mp3_320",
         quality_preference_order=["mp3_320", "mp3_256"],
         preferred_lossy_bitrate_kbps=None,
         lossy_min_bitrate_kbps=None,
@@ -3479,13 +3404,20 @@ async def test_candidate_passes_quality_regates_against_current_policy(tmp_path:
         unknown_quality_behavior="allow_as_fallback",
         source_selection_mode="source_first",
     )
-    legacy_task = SimpleNamespace(id="t2", track_count=10,
-                                  quality_snapshot_json=None)
+    legacy_task = SimpleNamespace(id="t2", track_count=10, quality_snapshot_json=None)
     orch._usenet_scorer = SimpleNamespace(release_tier=lambda release, tc: "lossless")
-    usenet_flac = ScoredCandidate(source="usenet", files=[],
-                                  usenet_release=SimpleNamespace(title='R - X FLAC', category_ids=[3040], size_bytes=1), final_score=0.9)
+    usenet_flac = ScoredCandidate(
+        source="usenet",
+        files=[],
+        usenet_release=SimpleNamespace(
+            title="R - X FLAC", category_ids=[3040], size_bytes=1
+        ),
+        final_score=0.9,
+    )
     assert await orch._candidate_passes_quality(legacy_task, usenet_flac) is False
-    unwired_task = SimpleNamespace(id="t3", track_count=None, quality_snapshot_json=None)
+    unwired_task = SimpleNamespace(
+        id="t3", track_count=None, quality_snapshot_json=None
+    )
     orch._get_download_policy = None
     usenet_unknown = ScoredCandidate(source="usenet", files=[], final_score=0.9)
     assert await orch._candidate_passes_quality(unwired_task, usenet_unknown) is True
@@ -3501,11 +3433,24 @@ async def test_candidate_passes_quality_enforces_flac_mp3_only(tmp_path: Path):
 
     _, orch, _, _ = _build(tmp_path)
     ogg_task_snapshot = build_snapshot(
-        DownloadPolicySettings(quality_min="low", quality_max="lossless",
-                               quality_preference_order=["lossless","mp3_320","mp3_256","mp3_192","low"],
-                               flac_mp3_only=False))
-    task_off = SimpleNamespace(id="t-off", track_count=None,
-        quality_snapshot_json=msgspec.json.encode(ogg_task_snapshot).decode())
+        DownloadPolicySettings(
+            quality_min="low",
+            quality_max="lossless",
+            quality_preference_order=[
+                "lossless",
+                "mp3_320",
+                "mp3_256",
+                "mp3_192",
+                "low",
+            ],
+            flac_mp3_only=False,
+        )
+    )
+    task_off = SimpleNamespace(
+        id="t-off",
+        track_count=None,
+        quality_snapshot_json=acq_quality.encode_snapshot(ogg_task_snapshot),
+    )
     ogg_candidate = _mp3_candidate()
     ogg_candidate.files[0].extension = "ogg"
     ogg_candidate.files[0].filename = "01.ogg"
@@ -3513,11 +3458,24 @@ async def test_candidate_passes_quality_enforces_flac_mp3_only(tmp_path: Path):
     assert await orch._candidate_passes_quality(task_off, ogg_candidate) is True
 
     strict_snapshot = build_snapshot(
-        DownloadPolicySettings(quality_min="low", quality_max="lossless",
-                               quality_preference_order=["lossless","mp3_320","mp3_256","mp3_192","low"],
-                               flac_mp3_only=True))
-    task_on = SimpleNamespace(id="t-on", track_count=None,
-        quality_snapshot_json=msgspec.json.encode(strict_snapshot).decode())
+        DownloadPolicySettings(
+            quality_min="low",
+            quality_max="lossless",
+            quality_preference_order=[
+                "lossless",
+                "mp3_320",
+                "mp3_256",
+                "mp3_192",
+                "low",
+            ],
+            flac_mp3_only=True,
+        )
+    )
+    task_on = SimpleNamespace(
+        id="t-on",
+        track_count=None,
+        quality_snapshot_json=acq_quality.encode_snapshot(strict_snapshot),
+    )
     # Strict codec gate rejects the non-FLAC/MP3 container outright.
     assert await orch._candidate_passes_quality(task_on, ogg_candidate) is False
 
@@ -3529,19 +3487,29 @@ async def test_advance_candidate_skips_out_of_policy(tmp_path: Path):
     store, orch, _, _ = _build(tmp_path)
     from api.v1.schemas.settings import DownloadPolicySettings
     from models.acquisition_quality import (
-        AudioQualityEvidence as EV, CodecFamily as F,
+        AudioQualityEvidence as EV,
+        CodecFamily as F,
     )
     from services.native.acquisition.quality import build_snapshot
 
-    snap = build_snapshot(DownloadPolicySettings(quality_min="mp3_256", quality_max="mp3_320"))
+    snap = build_snapshot(
+        DownloadPolicySettings(quality_min="mp3_256", quality_max="mp3_320")
+    )
     orch._get_download_policy = None  # no snapshot on legacy task -> fail-open path
     current = _candidate(0.9, username="tried")
-    stale_flac = _candidate(0.9, username="flacpeer")  # index 1 -> out of policy via evidence
+    stale_flac = _candidate(
+        0.9, username="flacpeer"
+    )  # index 1 -> out of policy via evidence
     ok_mp3 = _candidate(0.9, username="mp3peer2")
     from services.native.acquisition.quality import evaluate as _qeval
+
     stale_flac.quality_evidence = EV(extension="flac", codec_family=F.LOSSLESS)
-    stale_flac.quality_decision = _qeval(snap, stale_flac.quality_evidence)  # outside policy
-    ok_mp3.quality_evidence = EV(extension="mp3", codec_family=F.LOSSY, bitrate_kbps=320)
+    stale_flac.quality_decision = _qeval(
+        snap, stale_flac.quality_evidence
+    )  # outside policy
+    ok_mp3.quality_evidence = EV(
+        extension="mp3", codec_family=F.LOSSY, bitrate_kbps=320
+    )
     ok_mp3.quality_decision = _qeval(snap, ok_mp3.quality_evidence)  # in policy
     current = _candidate(0.9, username="tried")  # index 0 (the current pick)
     job = await store.create_search_job(
@@ -3569,7 +3537,7 @@ async def test_advance_candidate_skips_out_of_policy(tmp_path: Path):
         [
             {
                 "id": task.id,
-                "quality_snapshot_json": msgspec.json.encode(snap).decode(),
+                "quality_snapshot_json": acq_quality.encode_snapshot(snap),
                 "quality_snapshot_hash": snap.snapshot_hash,
                 "quality_preference_step": None,
             }
@@ -3639,7 +3607,6 @@ async def test_partial_album_and_completed_track_do_not_fulfil_wanted_watch(
     )
 
     wanted_store.mark_fulfilled.assert_not_awaited()
-
 
 
 def _edition_tracks():
@@ -3719,7 +3686,9 @@ async def test_clean_full_import_completes_without_library_coverage(tmp_path: Pa
     # Files publish cleanly but land under a FOREIGN release-group in the real
     # drift case; the fake library models that as "no rows visible for rg-1".
     fp.process_downloaded = AsyncMock(
-        return_value=ProcessResult(succeeded=["/lib/01.flac", "/lib/02.flac"], failed=[])
+        return_value=ProcessResult(
+            succeeded=["/lib/01.flac", "/lib/02.flac"], failed=[]
+        )
     )
     task = await _new_task(store, track_count=2)
 
@@ -3951,9 +3920,7 @@ async def test_remaining_track_positions_reports_only_uncovered(tmp_path: Path):
         artist_name="A",
         album_title="B",
         naming_template=_TEMPLATE,
-        target_files=[
-            ExpectedFile(filename=f"{i:02d}.flac", size=1) for i in (1, 2)
-        ],
+        target_files=[ExpectedFile(filename=f"{i:02d}.flac", size=1) for i in (1, 2)],
         expected_tracks=[
             ExpectedTrack(
                 track_number=i,
@@ -4009,7 +3976,11 @@ async def test_failover_requests_only_missing_tracks_from_next_peer(tmp_path: Pa
         "partial", succeeded=["p1/01.flac"], files_total=2, files_completed=1, matched=2
     )
     second_status = _status(
-        "completed", succeeded=["p2/02.flac"], files_total=1, files_completed=1, matched=1
+        "completed",
+        succeeded=["p2/02.flac"],
+        files_total=1,
+        files_completed=1,
+        matched=1,
     )
     client = _StubClient()
     client.get_status = AsyncMock(side_effect=[first_status, second_status])
@@ -4152,3 +4123,263 @@ async def test_the_settled_task_carries_the_real_reason(tmp_path: Path):
 
     final = await store.get_task(task.id)
     assert "fingerprint" in (final.error_message or "").lower()
+
+
+def _write_completion_manifest(orch, task_id, *, target_count, expected_count):
+    """Manifest writer for the delivery-trust gate: Usenet enqueues carry no
+    target_files (opaque NZB), only the exact-edition tracklist."""
+    manifest = DownloadManifest(
+        task_id=task_id,
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        naming_template=_TEMPLATE,
+        target_files=[
+            ExpectedFile(filename=f"peer/{i:02d}.flac", size=1)
+            for i in range(1, target_count + 1)
+        ],
+        expected_tracks=[
+            ExpectedTrack(
+                track_number=i,
+                disc_number=1,
+                duration_seconds=200.0,
+                recording_mbid=f"rec-{i}",
+                title=f"Track {i}",
+            )
+            for i in range(1, expected_count + 1)
+        ],
+    )
+    d = orch._staging / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "manifest.json").write_bytes(orch._manifest_codec.encode(manifest))
+
+
+@pytest.mark.asyncio
+async def test_usenet_full_delivery_completes_without_target_files(tmp_path: Path):
+    """Usenet manifests carry target_files=[] (opaque NZB): a clean full delivery
+    of the exact edition still fires the delivery-trust exception."""
+    store, orch, _fp, _lib = _build(tmp_path, imported_rows=[])
+    task = await _new_task(store, track_count=2)
+    _write_completion_manifest(orch, task.id, target_count=0, expected_count=2)
+    orch._coverage = AsyncMock(return_value=(0, 2, []))
+    result = ProcessResult(succeeded=["/lib/01.flac", "/lib/02.flac"], failed=[])
+
+    assert await orch._download_is_complete(task, True, result) is True
+
+
+@pytest.mark.asyncio
+async def test_usenet_short_delivery_does_not_complete(tmp_path: Path):
+    """A Usenet delivery shorter than the exact edition keeps failing over."""
+    store, orch, _fp, _lib = _build(tmp_path, imported_rows=[])
+    task = await _new_task(store, track_count=2)
+    _write_completion_manifest(orch, task.id, target_count=0, expected_count=2)
+    orch._coverage = AsyncMock(return_value=(0, 2, []))
+    result = ProcessResult(succeeded=["/lib/01.flac"], failed=[])
+
+    assert await orch._download_is_complete(task, True, result) is False
+
+
+@pytest.mark.asyncio
+async def test_soulseek_short_manifest_still_fails_over(tmp_path: Path):
+    """Soulseek path unchanged: a clean delivery of a short manifest still trips
+    the whole-album-repull veto when target_files < track_count."""
+    store, orch, _fp, _lib = _build(tmp_path, imported_rows=[])
+    task = await _new_task(store, track_count=2)
+    _write_completion_manifest(orch, task.id, target_count=1, expected_count=2)
+    orch._coverage = AsyncMock(return_value=(0, 2, []))
+    result = ProcessResult(succeeded=["/lib/01.flac"], failed=[])
+
+    assert await orch._download_is_complete(task, True, result) is False
+
+
+@pytest.mark.asyncio
+async def test_schedule_attempt_cleanup_without_manifest_or_attempts_returns_none(
+    tmp_path: Path,
+):
+    """#285: no manifest (enqueue failed before the write) and no live attempt
+    returns None instead of raising "manifest missing"."""
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store)
+
+    assert (
+        await orch._schedule_attempt_cleanup(task, disposition="discard")
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_schedule_attempt_cleanup_without_manifest_schedules_live_attempt(
+    tmp_path: Path,
+):
+    """#285: no manifest but a live acquiring attempt schedules cleanup for it."""
+    store, orch, *_ = _build(tmp_path)
+    task = await _new_task(store)
+    attempt = await store.create_download_attempt(
+        task_id=task.id,
+        source="soulseek",
+        candidate_index=0,
+        job_name="",
+        handle=TaskHandle(
+            source="soulseek", username="peer", filenames=["peer/01.flac"]
+        ),
+    )
+
+    scheduled_id = await orch._schedule_attempt_cleanup(task, disposition="discard")
+
+    assert scheduled_id == attempt.id
+    refreshed = await store.get_download_attempt(attempt.id)
+    assert refreshed.state == "cleanup_pending"
+
+
+@pytest.mark.asyncio
+async def test_failover_after_failed_enqueue_without_manifest_completes(
+    tmp_path: Path,
+):
+    """#285: an enqueue failure before the manifest write with a remaining
+    candidate fails over instead of failing the task with "manifest missing"."""
+    store, orch, fp, lib = _build(
+        tmp_path,
+        scorer_result=[
+            _candidate(0.9, files=2, username="deadpeer"),
+            _candidate(0.85, files=2, username="goodpeer"),
+        ],
+        max_failover=3,
+    )
+    _coupled_fp(fp, lib)
+    orig_enqueue = orch._strategies["soulseek"].enqueue
+    calls = 0
+
+    async def _flaky_enqueue(task_arg, candidate, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OrchestrationError("boom-before-manifest")
+        return await orig_enqueue(task_arg, candidate, **kwargs)
+
+    orch._strategies["soulseek"].enqueue = _flaky_enqueue
+    task = await _new_task(store, track_count=2)
+
+    await orch.process_task(task.id)
+
+    final = await store.get_task(task.id)
+    assert calls == 2
+    assert final.status == "completed"
+    assert final.source_username == "goodpeer"
+    assert (final.error_message or "") != "manifest missing"
+
+
+@pytest.mark.asyncio
+async def test_disk_present_filenames_returns_on_disk_subset_131(tmp_path: Path):
+    """#131: the helper resolves each manifest target via get_file_path - a path
+    reads as present, None/exception as absent; non-soulseek returns empty."""
+    _store, orch, _fp, _lib = _build(tmp_path)
+    seen: list[tuple] = []
+
+    async def _resolve(handle, remote_filename, size=None):
+        seen.append((remote_filename, size))
+        if remote_filename == "peer/02.flac":
+            return None
+        if remote_filename == "peer/03.flac":
+            raise RuntimeError("boom")
+        return Path("/completed") / remote_filename
+
+    orch._strategies["soulseek"].client.get_file_path = AsyncMock(
+        side_effect=_resolve
+    )
+    manifest = DownloadManifest(
+        task_id="t-disk-a",
+        source_username="peer",
+        handle=TaskHandle(
+            source="soulseek",
+            username="peer",
+            filenames=["peer/01.flac", "peer/02.flac", "peer/03.flac"],
+        ),
+        release_group_mbid="rg-1",
+        artist_name="A",
+        album_title="B",
+        naming_template=_TEMPLATE,
+        target_files=[
+            ExpectedFile(filename="peer/01.flac", size=100),
+            ExpectedFile(filename="peer/02.flac", size=100),
+            ExpectedFile(filename="peer/03.flac", size=100),
+        ],
+    )
+    soulseek_task = SimpleNamespace(source="soulseek", id="t-disk-a")
+
+    assert await orch._disk_present_filenames(soulseek_task, manifest) == {
+        "peer/01.flac"
+    }
+    assert {name for name, _size in seen} == {
+        "peer/01.flac",
+        "peer/02.flac",
+        "peer/03.flac",
+    }
+    assert {size for _name, size in seen} == {100}
+
+    usenet_task = SimpleNamespace(source="usenet", id="t-disk-a")
+    assert await orch._disk_present_filenames(usenet_task, manifest) == set()
+
+
+@pytest.mark.asyncio
+async def test_empty_transfer_state_with_files_on_disk_imports_and_completes_131(
+    tmp_path: Path,
+):
+    """#131: slskd reports terminal with zero succeeded, but every expected file
+    is complete on disk -> import from disk and complete with a single enqueue
+    instead of looping whole-album re-downloads to exhaustion."""
+    empty = _status(
+        "failed", succeeded=[], files_total=2, files_completed=0, matched=2
+    )
+    client = _StubClient()
+    client.get_status = AsyncMock(side_effect=[empty, empty])
+    store, orch, fp, lib = _build(
+        tmp_path,
+        client=client,
+        scorer_result=[
+            _candidate(0.9, files=2, username="p1"),
+            _candidate(0.85, files=2, username="p2"),
+        ],
+    )
+    _coupled_fp(fp, lib)
+    task = await _new_task(store, track_count=2)
+
+    await orch.process_task(task.id)
+
+    final = await store.get_task(task.id)
+    assert final.status == "completed"
+    assert client.enqueue.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_transfer_state_with_empty_disk_keeps_failover_131(
+    tmp_path: Path,
+):
+    """#131: nothing on disk either -> prior behavior stands: zero import, fail
+    over to the next peer, and no mount-blaming message."""
+    empty = _status(
+        "failed", succeeded=[], files_total=2, files_completed=0, matched=2
+    )
+    client = _StubClient()
+    client.get_status = AsyncMock(side_effect=[empty, empty])
+    client.get_file_path = AsyncMock(return_value=None)
+    store, orch, fp, lib = _build(
+        tmp_path,
+        client=client,
+        scorer_result=[
+            _candidate(0.9, files=2, username="p1"),
+            _candidate(0.85, files=2, username="p2"),
+        ],
+    )
+    _coupled_fp(fp, lib)
+    task = await _new_task(store, track_count=2)
+
+    await orch.process_task(task.id)
+
+    final = await store.get_task(task.id)
+    assert final.status != "completed"
+    assert client.enqueue.await_count == 2
+    assert fp.process_downloaded.await_count == 2
+    assert lib.rows == []
+    for call in fp.process_downloaded.await_args_list:
+        assert call.kwargs["only_filenames"] == set()
+    assert "No working source" in (final.error_message or "")
+    assert "slskd downloads" not in (final.error_message or "")

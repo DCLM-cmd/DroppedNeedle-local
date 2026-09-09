@@ -327,6 +327,8 @@ export const API = {
 				policy?: string;
 				search?: string;
 				sort?: string;
+				candidateAvailable?: boolean;
+				exclude_active_jobs?: boolean;
 			} = {}
 		) => {
 			const query = new URLSearchParams();
@@ -338,6 +340,8 @@ export const API = {
 			if (params.policy) query.set('policy', params.policy);
 			if (params.search) query.set('search', params.search);
 			if (params.sort) query.set('sort', params.sort);
+			if (params.candidateAvailable) query.set('candidate_available', 'true');
+			if (params.exclude_active_jobs) query.set('exclude_active_jobs', 'true');
 			return `/api/v1/library/reviews${query.size ? `?${query.toString()}` : ''}`;
 		},
 		review: (reviewId: string) => `/api/v1/library/reviews/${reviewId}`,
@@ -501,6 +505,8 @@ export const API = {
 		preview: (jobId: string) => `/api/v1/library/management/previews/${encodeURIComponent(jobId)}`,
 		applyPreview: (jobId: string) =>
 			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/apply`,
+		reissuePreview: (jobId: string) =>
+			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/reissue`,
 		discardPreview: (jobId: string) =>
 			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/discard`,
 		operations: (
@@ -646,6 +652,7 @@ export const API = {
 	settingsPrimarySource: () => '/api/v1/settings/primary-source',
 	settingsNavidrome: () => '/api/v1/settings/navidrome',
 	settingsNavidromeVerify: () => '/api/v1/settings/navidrome/verify',
+	settingsNavidromePlaylistSync: () => '/api/v1/settings/navidrome/playlist-sync',
 	settingsPlex: () => '/api/v1/settings/plex',
 	settingsPlexVerify: () => '/api/v1/settings/plex/verify',
 	settingsPlexLibraries: () => '/api/v1/settings/plex/libraries',
@@ -654,7 +661,10 @@ export const API = {
 	settingsLocalFiles: () => '/api/v1/settings/local-files',
 	settingsLocalFilesVerify: () => '/api/v1/settings/local-files/verify',
 	settingsMusicbrainz: () => '/api/v1/settings/musicbrainz',
+	settingsMusicbrainzBrainzMashStage: () => '/api/v1/settings/musicbrainz/brainzmash/stage',
+	settingsMusicbrainzBrainzMashConsent: () => '/api/v1/settings/musicbrainz/brainzmash/consent',
 	settingsMusicbrainzVerify: () => '/api/v1/settings/musicbrainz/verify',
+	settingsMusicbrainzActivate: () => '/api/v1/settings/musicbrainz/activate',
 	settingsSpotify: () => '/api/v1/settings/spotify',
 	settingsSpotifyRedirectUri: () => '/api/v1/settings/spotify/redirect-uri',
 	settingsGetIt: () => '/api/v1/settings/get-it',
@@ -778,6 +788,7 @@ export const API = {
 	downloadClients: {
 		sabnzbd: () => '/api/v1/download-clients/sabnzbd',
 		sabnzbdTest: () => '/api/v1/download-clients/sabnzbd/test',
+		sabnzbdStatus: () => '/api/v1/download-clients/sabnzbd/status',
 		policy: () => '/api/v1/download-clients/policy',
 		policySave: () => '/api/v1/download-clients/policy',
 		policySummary: () => '/api/v1/download-clients/policy-summary',
@@ -830,6 +841,8 @@ export const API = {
 		},
 		heldImport: (id: number) => `/api/v1/downloads/held/${id}/import`,
 		heldDiscard: (id: number) => `/api/v1/downloads/held/${id}/discard`,
+		heldReverify: (id: number) => `/api/v1/downloads/held/${id}/reverify`,
+		heldReverifyBulk: () => '/api/v1/downloads/held/reverify',
 		heldManagementRetry: (taskId: string) => `/api/v1/downloads/held/management/${taskId}/retry`,
 		heldManagementDiscard: (taskId: string) =>
 			`/api/v1/downloads/held/management/${taskId}/discard`,

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { ApiError } from '$lib/api/client';
 	import { colors } from '$lib/colors';
 	import ArtistHeaderSkeleton from '$lib/components/ArtistHeaderSkeleton.svelte';
 	import AlbumGridSkeleton from '$lib/components/AlbumGridSkeleton.svelte';
@@ -14,7 +15,7 @@
 	import LibraryAlbumsCarousel from '$lib/components/LibraryAlbumsCarousel.svelte';
 	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
 	import LocalArtistPage from './LocalArtistPage.svelte';
-	import { getLibraryArtistDetailQuery } from '$lib/queries/library/LibraryQueries.svelte';
+	import type { LibraryArtistSummary } from '$lib/types';
 	import PageSectionToc from '$lib/components/PageSectionToc.svelte';
 	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { withBasePath } from '$lib/utils/basePath';
@@ -30,6 +31,7 @@
 		getSimilarArtistsQuery,
 		updateArtistReleaseInCache
 	} from '$lib/queries/artist/ArtistQueries.svelte';
+	import { getConnectionsQuery } from '$lib/queries/connections/ConnectionsQuery.svelte';
 	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 	import { ArtistQueryKeyFactory } from '$lib/queries/artist/ArtistQueryKeyFactory';
 	import { PAGE_SOURCE_KEYS } from '$lib/constants';
@@ -46,19 +48,50 @@
 
 	interface Props {
 		data: { artistId: string; primarySource: MusicSource };
+		localArtist?: LibraryArtistSummary;
 	}
 
-	let { data }: Props = $props();
+	let { data, localArtist }: Props = $props();
 
 	// svelte-ignore state_referenced_locally
 	let activeSource = new PersistedState<MusicSource>(
 		PAGE_SOURCE_KEYS['artist'],
 		data.primarySource
 	);
-
-	let validSource = $derived(
+	let selectedSource = $derived(
 		isMusicSource(activeSource.current) ? activeSource.current : data.primarySource
 	);
+
+	const connectionsQuery = getConnectionsQuery();
+	const connectionsSettled = $derived(connectionsQuery.isPending !== true);
+	const connectionsUsable = $derived(
+		connectionsSettled &&
+			connectionsQuery.data !== undefined &&
+			connectionsQuery.isError !== true &&
+			connectionsQuery.isSuccess !== false
+	);
+	const linkedSources = $derived.by<MusicSource[]>(() => {
+		if (!connectionsUsable) return [];
+
+		const services = connectionsQuery.data?.connections ?? [];
+		return (['listenbrainz', 'lastfm'] as const).filter((source) =>
+			services.some((connection) => connection.service === source)
+		);
+	});
+	const resolvedSource = $derived.by<MusicSource>(() => {
+		if (!connectionsUsable || linkedSources.length === 0) return selectedSource;
+		if (linkedSources.includes(selectedSource)) return selectedSource;
+		if (linkedSources.includes(data.primarySource)) return data.primarySource;
+		return linkedSources.includes('listenbrainz') ? 'listenbrainz' : 'lastfm';
+	});
+	const discoveryEnabled = $derived(connectionsSettled);
+
+	$effect(() => {
+		if (!connectionsUsable || linkedSources.length === 0) return;
+		if (linkedSources.includes(selectedSource)) return;
+
+		activeSource.current = resolvedSource;
+	});
 
 	let showToast = $state(false);
 	let toastMessage = 'Added to Library';
@@ -75,6 +108,14 @@
 	const artistBasicQuery = getBasicArtistQuery(() => data.artistId);
 	const artistBasic = $derived(artistBasicQuery.data);
 	const loadingBasic = $derived(artistBasicQuery.isLoading);
+	const artistBasicApiError = $derived(
+		artistBasicQuery.error instanceof ApiError ? artistBasicQuery.error : null
+	);
+	const artistNotFound = $derived(artistBasicApiError?.status === 404);
+	const providerUnavailable = $derived.by(() => {
+		const status = artistBasicApiError?.status;
+		return status === 0 || status === 429 || (status !== undefined && status >= 500);
+	});
 
 	const artistExtendedQuery = getExtendedArtistQuery(() => data.artistId);
 	const artistExtended = $derived(artistExtendedQuery.data);
@@ -82,24 +123,27 @@
 
 	const similarArtistsQuery = getSimilarArtistsQuery(() => ({
 		artistId: data.artistId,
-		source: validSource
+		source: resolvedSource,
+		enabled: discoveryEnabled
 	}));
-	const similarArtists = $derived(similarArtistsQuery.data);
-	const loadingSimilar = $derived(similarArtistsQuery.isLoading);
+	const similarArtists = $derived(discoveryEnabled ? similarArtistsQuery.data : undefined);
+	const loadingSimilar = $derived(!discoveryEnabled || similarArtistsQuery.isLoading);
 
 	const topSongsQuery = getArtistTopSongsQuery(() => ({
 		artistId: data.artistId,
-		source: validSource
+		source: resolvedSource,
+		enabled: discoveryEnabled
 	}));
-	const topSongs = $derived(topSongsQuery.data);
-	const loadingTopSongs = $derived(topSongsQuery.isLoading);
+	const topSongs = $derived(discoveryEnabled ? topSongsQuery.data : undefined);
+	const loadingTopSongs = $derived(!discoveryEnabled || topSongsQuery.isLoading);
 
 	const topAlbumsQuery = getArtistTopAlbumsQuery(() => ({
 		artistId: data.artistId,
-		source: validSource
+		source: resolvedSource,
+		enabled: discoveryEnabled
 	}));
-	const topAlbums = $derived(topAlbumsQuery.data);
-	const loadingTopAlbums = $derived(topAlbumsQuery.isLoading);
+	const topAlbums = $derived(discoveryEnabled ? topAlbumsQuery.data : undefined);
+	const loadingTopAlbums = $derived(!discoveryEnabled || topAlbumsQuery.isLoading);
 
 	const lastFmEnrichmentQuery = getArtistLastFmEnrichmentQuery(() => ({
 		artistId: data.artistId,
@@ -109,7 +153,8 @@
 	const loadingLastfm = $derived(lastFmEnrichmentQuery.isLoading);
 
 	let error: string | null = $derived.by(() => {
-		if (artistBasicQuery.error) {
+		if (artistNotFound) return 'Artist not found.';
+		if (artistBasicQuery.error && !providerUnavailable) {
 			return 'Failed to load artist information.';
 		}
 		if (artistExtendedQuery.error) {
@@ -117,12 +162,6 @@
 		}
 		return null;
 	});
-	// MusicBrainz-down fallback: the library artist endpoint is MB-free, so a
-	// locally known artist still renders (and plays) when the provider fetch
-	// fails. The service_status stamp on the degraded payload drives the
-	// global banner; this branch covers cold caches and restarts.
-	const localArtistDetailQuery = getLibraryArtistDetailQuery(() => data.artistId);
-	const degradedLocalArtist = $derived(localArtistDetailQuery.data ?? null);
 	const artist = $derived.by(() => {
 		if (!artistBasic) return null;
 		return {
@@ -244,7 +283,13 @@
 </script>
 
 <div class="w-full px-2 sm:px-4 lg:px-8 py-4 sm:py-8 max-w-7xl mx-auto">
-	{#if artistBasicQuery.error && degradedLocalArtist}
+	{#if artistNotFound}
+		<div class="flex items-center justify-center min-h-[50vh]">
+			<div class="alert alert-error">
+				<span>Artist not found.</span>
+			</div>
+		</div>
+	{:else if providerUnavailable && localArtist}
 		<div class="mb-4 flex justify-center">
 			<div class="alert alert-info text-sm">
 				<span
@@ -253,7 +298,16 @@
 				>
 			</div>
 		</div>
-		<LocalArtistPage artistId={degradedLocalArtist.id} />
+		<LocalArtistPage artistId={localArtist.id} />
+	{:else if providerUnavailable}
+		<div class="flex items-center justify-center min-h-[50vh]">
+			<div class="alert alert-error">
+				<span>MusicBrainz is temporarily unavailable.</span>
+				<button class="btn btn-sm btn-ghost" onclick={() => void artistBasicQuery.refetch()}>
+					Retry
+				</button>
+			</div>
+		</div>
 	{:else if error}
 		<div class="flex items-center justify-center min-h-[50vh]">
 			<div class="alert alert-error">
@@ -357,14 +411,16 @@
 					loading={loadingBasic}
 				/>
 
-				<div class="flex items-center justify-end mt-8 mb-4">
-					<SimpleSourceSwitcher
-						currentSource={validSource}
-						onSourceChange={(newSource) => {
-							activeSource.current = newSource;
-						}}
-					/>
-				</div>
+				{#if linkedSources.length === 2}
+					<div class="flex items-center justify-end mt-8 mb-4">
+						<SimpleSourceSwitcher
+							currentSource={resolvedSource}
+							onSourceChange={(newSource) => {
+								activeSource.current = newSource;
+							}}
+						/>
+					</div>
+				{/if}
 
 				<div class="flex flex-col md:flex-row gap-6 md:items-stretch">
 					<div class="flex-1 min-w-0">

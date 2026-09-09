@@ -16,6 +16,7 @@ from core.exceptions import (
     ConflictError,
     RevisionOverflowError,
     StaleRevisionError,
+    AutomaticManagementHoldError,
 )
 from infrastructure.msgspec_fastapi import MsgSpecJSONResponse
 from infrastructure.resilience.retry import CircuitOpenError
@@ -33,6 +34,7 @@ from models.error import (
     MANAGEMENT_HOLD,
     REVISION_OVERFLOW,
     STALE_REVISION,
+    AUTOMATIC_MANAGEMENT_HOLD,
     STATUS_TO_CODE,
 )
 
@@ -154,6 +156,23 @@ async def automatic_management_hold_handler(
         status.HTTP_409_CONFLICT,
         MANAGEMENT_HOLD,
         str(exc),
+        details={"reason_code": exc.reason_code},
+    )
+
+
+async def automatic_management_hold_handler(
+    request: Request, exc: AutomaticManagementHoldError
+) -> MsgSpecJSONResponse:
+    logger.warning(
+        "Automatic management hold (%s) - %s %s",
+        exc.reason_code,
+        request.method,
+        request.url.path,
+    )
+    return error_response(
+        status.HTTP_409_CONFLICT,
+        AUTOMATIC_MANAGEMENT_HOLD,
+        "Import blocked by a Library Management safety check.",
         details={"reason_code": exc.reason_code},
     )
 

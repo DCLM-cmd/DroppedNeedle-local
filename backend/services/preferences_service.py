@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import uuid
 from pathlib import Path
@@ -27,6 +28,13 @@ from api.v1.schemas.settings import (
     PlexConnectionSettings,
     PLEX_TOKEN_MASK,
     MusicBrainzConnectionSettings,
+    MusicBrainzSettingsUpdate,
+    MusicBrainzBindingRequest,
+    BrainzMashPendingProposal,
+    BrainzMashActiveBinding,
+    BRAINZMASH_ENDPOINT,
+    BRAINZMASH_DISCLOSURE_VERSION,
+    _BRAINZMASH_RATE_LIMIT,
     SecuritySettings,
     LibrarySettings,
     ConnectAppsSettings,
@@ -39,7 +47,9 @@ from api.v1.schemas.settings import (
     LidarrImportConnectionSettings,
     NewznabIndexerSettings,
     SabnzbdConnectionSettings,
+    QualityRecipeEntry,
     SpotifySettings,
+    validate_quality_recipe,
     SPOTIFY_SECRET_MASK,
     EventsSettings,
     FreeMusicSettings,
@@ -73,11 +83,14 @@ from core.exceptions import (
 from infrastructure.crypto import decrypt, encrypt
 from infrastructure.file_utils import atomic_write_json, read_json
 from infrastructure.serialization import to_jsonable
+from models.release_type_policy import normalize_release_type_filters
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=msgspec.Struct)
 SPOTIFY_CALLBACK_PATH = "/api/v1/me/connections/spotify/auth/callback"
+
+_RELEASE_TYPE_POLICY_REVISION_KEY = "release_type_policy_revision"
 
 
 class PreferencesService:
@@ -86,9 +99,13 @@ class PreferencesService:
         self._config_path = settings.config_file_path
         self._config_cache: Optional[dict] = None
         self._cache_lock = threading.RLock()
-        # Owner decision #1/#2 (Acquisition plan): a FRESH config seeds the
-        # Balanced preset before any normalization reads it. Existing
-        # installs (config file present) never receive these values.
+        # Section saves are synchronous, so use a dedicated non-reentrant
+        # cross-thread transaction lock rather than treating the cache RLock
+        # as an asyncio boundary.
+        self._section_save_lock = threading.Lock()
+        # Fresh configuration gets the normal acquisition defaults above. MusicBrainz
+        # normalization below separately makes the built-in BrainzMash source effective
+        # for absent and legacy non-custom source settings.
         self._seed_initial_acquisition_defaults()
         self._normalize_get_it_settings()
         self._migrate_musicbrainz_settings()
@@ -154,9 +171,10 @@ class PreferencesService:
             return default_factory() if default_factory else model()
 
     def _save_section(self, key: str, value: Any) -> None:
-        config = self._load_config().copy()
-        config[key] = to_jsonable(value)
-        self._save_config(config)
+        with self._section_save_lock:
+            config = self._load_config().copy()
+            config[key] = to_jsonable(value)
+            self._save_config(config)
 
     def _read_secret(self, path: tuple[str, ...], stored_value: str) -> str:
         if not stored_value:
@@ -171,12 +189,57 @@ class PreferencesService:
             self._save_config(config)
         return plaintext
 
+    @staticmethod
+    def _release_type_filters(
+        preferences: UserPreferences,
+    ) -> tuple[frozenset[str], frozenset[str]]:
+        return normalize_release_type_filters(
+            preferences.primary_types, preferences.secondary_types
+        )
+
+    @staticmethod
+    def _release_type_policy_revision_from_config(config: dict) -> int:
+        internal = config.get("_internal", {})
+        if not isinstance(internal, dict):
+            return 0
+        try:
+            return max(0, int(internal.get(_RELEASE_TYPE_POLICY_REVISION_KEY, 0)))
+        except (TypeError, ValueError):
+            return 0
+
     def get_preferences(self) -> UserPreferences:
         return self._get_section("user_preferences", UserPreferences)
 
+    def get_preferences_with_revision(self) -> tuple[UserPreferences, int]:
+        """Read the release-type policy and its persisted revision together."""
+        with self._section_save_lock:
+            config = self._load_config()
+            return (
+                self._get_section("user_preferences", UserPreferences),
+                self._release_type_policy_revision_from_config(config),
+            )
+
     def save_preferences(self, preferences: UserPreferences) -> None:
         try:
-            self._save_section("user_preferences", preferences)
+            with self._section_save_lock:
+                config = self._load_config().copy()
+                try:
+                    previous = msgspec.convert(
+                        config.get("user_preferences", {}), type=UserPreferences
+                    )
+                except (msgspec.ValidationError, TypeError, ValueError):
+                    previous = UserPreferences()
+
+                if self._release_type_filters(previous) != self._release_type_filters(
+                    preferences
+                ):
+                    internal = config.get("_internal", {})
+                    internal = internal.copy() if isinstance(internal, dict) else {}
+                    revision = self._release_type_policy_revision_from_config(config)
+                    internal[_RELEASE_TYPE_POLICY_REVISION_KEY] = revision + 1
+                    config["_internal"] = internal
+                config["user_preferences"] = to_jsonable(preferences)
+                self._save_config(config)
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to save preferences: {e}")
             raise ConfigurationError(f"Failed to save preferences: {e}")
@@ -239,6 +302,10 @@ class PreferencesService:
         settings.api_key = self._read_secret(
             ("download_client", "api_key"), data.get("api_key", "")
         )
+        # Strip paste whitespace post-decrypt so a key saved before the fix
+        # still authenticates (SABnzbd raw-getter precedent).
+        if settings.api_key:
+            settings.api_key = settings.api_key.strip()
         return settings
 
     def save_download_client_settings(
@@ -247,7 +314,7 @@ class PreferencesService:
         try:
             config = self._load_config().copy()
             current = config.get("download_client", {})
-            api_key = settings.api_key
+            api_key = settings.api_key.strip() if settings.api_key else ""
             if api_key == DOWNLOAD_CLIENT_API_KEY_MASK:
                 api_key = current.get(
                     "api_key", ""
@@ -265,6 +332,7 @@ class PreferencesService:
                 "quality_max": settings.quality_max,
                 "flac_mp3_only": settings.flac_mp3_only,
                 "downloads_subpath": settings.downloads_subpath,
+                "slskd_incomplete_mount": settings.slskd_incomplete_mount,
                 "preflight_score_auto_accept": settings.preflight_score_auto_accept,
                 "preflight_score_manual_min": settings.preflight_score_manual_min,
                 "download_stall_timeout_minutes": settings.download_stall_timeout_minutes,
@@ -279,17 +347,81 @@ class PreferencesService:
             logger.error("Failed to save download client settings: %s", e)
             raise ConfigurationError(f"Failed to save download client settings: {e}")
 
+    def get_slskd_incomplete_mount(self) -> Path | None:
+        """Resolved slskd incomplete-downloads dir, or None when unset/unusable.
+
+        Fail-closed: empty, unresolvable, non-dir, or unreadable all yield None,
+        and the repository then skips the incomplete fallback entirely
+        (byte-identical behaviour to before the knob existed).
+        """
+        raw = self.get_download_client_settings_raw().slskd_incomplete_mount
+        if not raw:
+            return None
+        try:
+            resolved = Path(raw).resolve()
+        except (OSError, RuntimeError):
+            return None
+        if not resolved.is_dir() or not os.access(resolved, os.R_OK):
+            return None
+        return resolved
+
+    def _decode_download_policy(self, data: object) -> DownloadPolicySettings:
+        """Decode policy while preserving invalid recipe status.
+
+        Legacy fields remain usable when a hand-edited/stale v2 recipe cannot
+        decode. The raw invalid blob is never rewritten by this read path.
+        """
+        if not isinstance(data, dict):
+            return DownloadPolicySettings(
+                quality_recipe_status="invalid",
+                quality_recipe_error="download_policy must be an object",
+            )
+        try:
+            policy = msgspec.convert(data, type=DownloadPolicySettings, strict=True)
+            if policy.quality_recipe:
+                validate_quality_recipe(policy.quality_recipe)
+                if not policy.flac_mp3_only:
+                    policy.quality_recipe_status = "non_convertible"
+                    policy.quality_recipe_error = (
+                        "v2 recipes require FLAC/MP3-only mode"
+                    )
+                else:
+                    policy.quality_recipe_status = "v2"
+                    policy.quality_recipe_error = None
+            else:
+                policy.quality_recipe_status = (
+                    "v1" if policy.flac_mp3_only else "non_convertible"
+                )
+                policy.quality_recipe_error = (
+                    None
+                    if policy.flac_mp3_only
+                    else "legacy policy allows codecs outside FLAC/MP3"
+                )
+            return policy
+        except (msgspec.ValidationError, TypeError, ValueError) as exc:
+            # Strip only the malformed v2 field; all legacy policy controls
+            # still decode and the caller can show an actionable status.
+            legacy = dict(data)
+            legacy.pop("quality_recipe", None)
+            try:
+                policy = msgspec.convert(
+                    legacy, type=DownloadPolicySettings, strict=True
+                )
+            except (msgspec.ValidationError, TypeError, ValueError):
+                policy = DownloadPolicySettings()
+            policy.quality_recipe = []
+            policy.quality_recipe_status = "invalid"
+            policy.quality_recipe_error = str(exc)
+            return policy
+
     def get_download_policy(self) -> DownloadPolicySettings:
-        """The source-agnostic acquisition policy. Reads ``download_policy`` if present;
-        otherwise derives it (migration-on-read, COPY-not-delete) from the legacy
-        ``download_client`` (slskd) policy fields so existing installs are unchanged and
-        a Usenet-only install still gets working thresholds."""
+        """Read the shared policy without healing away invalid v2 data."""
         config = self._load_config()
         if "download_policy" in config:
-            return self._get_section("download_policy", DownloadPolicySettings)
+            return self._decode_download_policy(config.get("download_policy"))
         dc = config.get("download_client", {})
         if dc:
-            return DownloadPolicySettings(
+            policy = DownloadPolicySettings(
                 quality_min=dc.get("quality_min", "mp3_320"),
                 quality_max=dc.get("quality_max", "lossless"),
                 flac_mp3_only=dc.get("flac_mp3_only", True),
@@ -313,20 +445,57 @@ class PreferencesService:
                     "auto_retry_base_interval_minutes", 15
                 ),
             )
+            policy.quality_recipe_status = (
+                "v1" if policy.flac_mp3_only else "non_convertible"
+            )
+            policy.quality_recipe_error = (
+                None
+                if policy.flac_mp3_only
+                else "legacy policy allows codecs outside FLAC/MP3"
+            )
+            return policy
         return DownloadPolicySettings()
 
     def save_download_policy(self, policy: DownloadPolicySettings) -> None:
         try:
             config = self._load_config().copy()
             section = to_jsonable(policy)
+            section.pop("quality_recipe_status", None)
+            section.pop("quality_recipe_error", None)
+            if policy.quality_recipe:
+                if not policy.flac_mp3_only:
+                    raise ConfigurationError(
+                        "A v2 recipe cannot be saved while non-FLAC/MP3 formats are enabled"
+                    )
+                from services.native.acquisition.quality import (
+                    legacy_range_from_recipe,
+                    legacy_recipe_order,
+                )
+
+                canonical = validate_quality_recipe(policy.quality_recipe)
+                quality_min, quality_max = legacy_range_from_recipe(canonical)
+                section["quality_recipe"] = to_jsonable(canonical)
+                section["quality_min"] = quality_min
+                section["quality_max"] = quality_max
+                section["quality_preference_order"] = legacy_recipe_order(canonical)
+                section["flac_mp3_only"] = True
+            else:
+                section["quality_min"] = policy.quality_min
+                section["quality_max"] = policy.quality_max
+                section["flac_mp3_only"] = policy.flac_mp3_only
+
+            # Keep the legacy upgrade cutoff inside the canonical range projected
+            # above, including after a recipe narrows that range.
+            from services.native.quality_tiers import TIER_KEYS, tier_rank
+
+            cutoff_rank = tier_rank(policy.quality_cutoff)
+            minimum_rank = tier_rank(section["quality_min"])
+            maximum_rank = tier_rank(section["quality_max"])
+            cutoff_rank = min(max(cutoff_rank, minimum_rank), maximum_rank)
+            section["quality_cutoff"] = TIER_KEYS[len(TIER_KEYS) - 1 - cutoff_rank]
+
             # Legacy rollback mirrors (Acquisition plan): after every new-policy
-            # save, keep the closest legacy-representable values populated so a
-            # down-level image still loads a sane policy. Range/codec/wait keys
-            # are identity; Free Music's preferred_format tracks whether the
-            # accepted range includes lossless.
-            section["quality_min"] = policy.quality_min
-            section["quality_max"] = policy.quality_max
-            section["flac_mp3_only"] = policy.flac_mp3_only
+            # save, keep the closest legacy-representable values populated.
             section["preferred_quality_wait_minutes"] = (
                 policy.preferred_quality_wait_minutes
             )
@@ -335,11 +504,20 @@ class PreferencesService:
             if not isinstance(free_music, dict):
                 free_music = {}
             free_music["preferred_format"] = (
-                "flac" if "lossless" in policy.quality_preference_order else "mp3"
+                policy.quality_recipe[0].format
+                if policy.quality_recipe
+                else (
+                    "flac"
+                    if policy.quality_preference_order
+                    and policy.quality_preference_order[0] == "lossless"
+                    else "mp3"
+                )
             )
             config["free_music"] = free_music
             self._save_config(config)
             logger.info("Saved download policy to %s", self._config_path)
+        except ConfigurationError:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error("Failed to save download policy: %s", e)
             raise ConfigurationError(f"Failed to save download policy: {e}")
@@ -373,9 +551,7 @@ class PreferencesService:
                     }
                 }
             )
-            logger.info(
-                "Seeded new-install acquisition defaults (Balanced preset)"
-            )
+            logger.info("Seeded new-install acquisition defaults (Balanced preset)")
         except Exception as exc:  # noqa: BLE001 - seeding must not block startup
             logger.error("Failed to seed acquisition defaults: %s", exc)
 
@@ -703,6 +879,12 @@ class PreferencesService:
             username=nd_data.get("username", ""),
             password=NAVIDROME_PASSWORD_MASK if password else "",
             enabled=nd_data.get("enabled", False),
+            playlist_sync_enabled=nd_data.get("playlist_sync_enabled", False),
+            playlist_sync_path=nd_data.get("playlist_sync_path", ""),
+            playlist_sync_scope=nd_data.get("playlist_sync_scope", "public"),
+            playlist_sync_remove_deleted=nd_data.get(
+                "playlist_sync_remove_deleted", True
+            ),
         )
 
     def get_navidrome_connection_raw(self) -> NavidromeConnectionSettings:
@@ -716,6 +898,12 @@ class PreferencesService:
             username=nd_data.get("username", ""),
             password=password,
             enabled=nd_data.get("enabled", False),
+            playlist_sync_enabled=nd_data.get("playlist_sync_enabled", False),
+            playlist_sync_path=nd_data.get("playlist_sync_path", ""),
+            playlist_sync_scope=nd_data.get("playlist_sync_scope", "public"),
+            playlist_sync_remove_deleted=nd_data.get(
+                "playlist_sync_remove_deleted", True
+            ),
         )
 
     def save_navidrome_connection(self, settings: NavidromeConnectionSettings) -> None:
@@ -734,6 +922,10 @@ class PreferencesService:
                 "username": settings.username,
                 "password": password,
                 "enabled": settings.enabled,
+                "playlist_sync_enabled": settings.playlist_sync_enabled,
+                "playlist_sync_path": settings.playlist_sync_path,
+                "playlist_sync_scope": settings.playlist_sync_scope,
+                "playlist_sync_remove_deleted": settings.playlist_sync_remove_deleted,
             }
             self._save_config(config)
         except Exception as e:  # noqa: BLE001
@@ -1593,41 +1785,659 @@ class PreferencesService:
             self._save_config(config)
             return value
 
+    def _new_brainzmash_pending(self, generation: int = 1) -> BrainzMashPendingProposal:
+        return BrainzMashPendingProposal(
+            endpoint=BRAINZMASH_ENDPOINT,
+            access_revision=str(uuid.uuid4()),
+            source_id=str(uuid.uuid4()),
+            generation=max(1, generation),
+            disclosure_version=BRAINZMASH_DISCLOSURE_VERSION,
+        )
+
+    @staticmethod
+    def _binding_matches(
+        pending: BrainzMashPendingProposal | None,
+        binding: MusicBrainzBindingRequest,
+    ) -> bool:
+        return bool(
+            PreferencesService._pending_brainzmash_policy_is_current(pending)
+            and pending is not None
+            and pending.access_revision == binding.access_revision
+            and pending.source_id == binding.source_id
+            and pending.generation == binding.generation
+            and pending.disclosure_version == binding.disclosure_version
+        )
+
+    @staticmethod
+    def _pending_brainzmash_policy_is_current(
+        pending: BrainzMashPendingProposal | None,
+    ) -> bool:
+        if pending is None:
+            return False
+
+        def exact_nonblank(value: str) -> bool:
+            return bool(value) and value == value.strip()
+
+        return bool(
+            pending.endpoint == BRAINZMASH_ENDPOINT
+            and exact_nonblank(pending.access_revision)
+            and exact_nonblank(pending.source_id)
+            and pending.generation > 0
+            and exact_nonblank(pending.disclosure_version)
+            and pending.disclosure_version == BRAINZMASH_DISCLOSURE_VERSION
+        )
+
+    @staticmethod
+    def _custom_musicbrainz_mode(raw_existing: object) -> str | None:
+        """Return the explicitly configured custom mode, if it is genuine."""
+        if not isinstance(raw_existing, dict):
+            return None
+        mode = raw_existing.get("source_mode")
+        if mode not in {"mirror", "community", None, ""}:
+            return None
+        api_url = raw_existing.get("api_url")
+        if not isinstance(api_url, str) or not api_url.strip():
+            return None
+        try:
+            parsed = urlsplit(api_url.strip())
+            hostname = parsed.hostname
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not hostname
+            or hostname.casefold() == "api.brainzmash.cc"
+        ):
+            return None
+        from repositories.musicbrainz_base import is_mb_rate_policy_public_host
+
+        if is_mb_rate_policy_public_host(api_url):
+            return None
+        return mode or "mirror"
+
+    def _default_musicbrainz_settings(
+        self, raw_existing: object | None = None
+    ) -> MusicBrainzConnectionSettings:
+        """Build the one effective default for absent or non-custom sources."""
+        source_id = ""
+        generation = 1
+        if (
+            isinstance(raw_existing, dict)
+            and raw_existing.get("source_mode") == "brainzmash"
+        ):
+            candidate_id = raw_existing.get("source_id")
+            if (
+                isinstance(candidate_id, str)
+                and candidate_id
+                and candidate_id == candidate_id.strip()
+            ):
+                source_id = candidate_id
+            try:
+                generation = max(1, int(raw_existing.get("generation", 1)))
+            except (TypeError, ValueError):
+                generation = 1
+        return MusicBrainzConnectionSettings(
+            source_mode="brainzmash",
+            api_url=BRAINZMASH_ENDPOINT,
+            rate_limit=_BRAINZMASH_RATE_LIMIT,
+            concurrent_searches=1,
+            selected_source_mode="brainzmash",
+            source_id=source_id or str(uuid.uuid4()),
+            generation=generation,
+            pending_brainzmash=None,
+            active_brainzmash=None,
+            source_quarantined=False,
+            quarantine_reason="",
+        )
+
     def get_musicbrainz_connection(self) -> MusicBrainzConnectionSettings:
-        return self._get_section("musicbrainz_settings", MusicBrainzConnectionSettings)
+        settings = self._get_section(
+            "musicbrainz_settings",
+            MusicBrainzConnectionSettings,
+            default_factory=self._default_musicbrainz_settings,
+        )
+        if settings.pending_brainzmash is None:
+            settings.selected_source_mode = settings.source_mode
+        return settings
+
+    def _save_musicbrainz_connection_unlocked(
+        self, settings: MusicBrainzConnectionSettings
+    ) -> None:
+        settings.api_url = settings.api_url.rstrip("/")
+        config = self._load_config().copy()
+        config["musicbrainz_settings"] = to_jsonable(settings)
+        internal = config.get("_internal", {}).copy()
+        if settings.source_mode == "official":
+            internal["official_source_selected"] = True
+        else:
+            internal.pop("official_source_selected", None)
+        try:
+            revision = int(internal.get("musicbrainz_settings_revision", 0))
+        except (TypeError, ValueError):
+            revision = 0
+        internal["musicbrainz_settings_revision"] = revision + 1
+        config["_internal"] = internal
+        self._save_config(config)
 
     def save_musicbrainz_connection(
         self, settings: MusicBrainzConnectionSettings
     ) -> None:
         try:
-            settings.api_url = settings.api_url.rstrip("/")
-            self._save_section("musicbrainz_settings", settings)
+            with self._section_save_lock:
+                if settings.source_mode == "official":
+                    from api.v1.schemas.settings import (
+                        _OFFICIAL_MB_CONCURRENT_SEARCHES,
+                        _OFFICIAL_MB_RATE_LIMIT,
+                    )
+                    from repositories.musicbrainz_base import OFFICIAL_MB_API_BASE
+
+                    settings.api_url = OFFICIAL_MB_API_BASE
+                    settings.rate_limit = _OFFICIAL_MB_RATE_LIMIT
+                    settings.concurrent_searches = _OFFICIAL_MB_CONCURRENT_SEARCHES
+                    settings.selected_source_mode = "official"
+                    settings.pending_brainzmash = None
+                    settings.active_brainzmash = None
+                    settings.source_quarantined = False
+                    settings.quarantine_reason = ""
+                    settings.community_acknowledged = False
+                    settings.clamped_to_official_limits = False
+                    if (
+                        not settings.source_id
+                        or settings.source_id != settings.source_id.strip()
+                    ):
+                        settings.source_id = str(uuid.uuid4())
+                    settings.generation = max(1, settings.generation)
+                elif settings.source_mode == "brainzmash":
+                    if (
+                        not settings.source_id
+                        or settings.source_id != settings.source_id.strip()
+                    ):
+                        settings.source_id = str(uuid.uuid4())
+                    settings.generation = max(1, settings.generation)
+                    settings.selected_source_mode = "brainzmash"
+                    settings.source_quarantined = False
+                    settings.quarantine_reason = ""
+                elif (
+                    self._custom_musicbrainz_mode(
+                        {
+                            "source_mode": settings.source_mode,
+                            "api_url": settings.api_url,
+                        }
+                    )
+                    != settings.source_mode
+                ):
+                    settings = self._default_musicbrainz_settings()
+                self._save_musicbrainz_connection_unlocked(settings)
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to save MusicBrainz settings: {e}")
             raise ConfigurationError(f"Failed to save MusicBrainz settings: {e}")
 
+    @staticmethod
+    def _musicbrainz_settings_equal(
+        left: MusicBrainzConnectionSettings,
+        right: MusicBrainzConnectionSettings,
+    ) -> bool:
+        return to_jsonable(left) == to_jsonable(right)
+
+    def musicbrainz_settings_revision(self) -> int:
+        """Return the persisted source revision under the section lock."""
+        with self._section_save_lock:
+            internal = self._load_config().get("_internal", {})
+            try:
+                return int(internal.get("musicbrainz_settings_revision", 0))
+            except (TypeError, ValueError):
+                return 0
+
+    def get_musicbrainz_settings_revision(self) -> int:
+        return self.musicbrainz_settings_revision()
+
+    def musicbrainz_settings_match(
+        self, expected: MusicBrainzConnectionSettings
+    ) -> bool:
+        """Compare the current source section under the section transaction lock."""
+        with self._section_save_lock:
+            return self._musicbrainz_settings_equal(
+                self._get_section(
+                    "musicbrainz_settings",
+                    MusicBrainzConnectionSettings,
+                    default_factory=self._default_musicbrainz_settings,
+                ),
+                expected,
+            )
+
+    def restore_musicbrainz_connection_if_current(
+        self,
+        expected: MusicBrainzConnectionSettings,
+        replacement: MusicBrainzConnectionSettings,
+        *,
+        expected_revision: int | None = None,
+    ) -> bool:
+        """CAS-restore a failed runtime commit without clobbering newer settings."""
+        with self._section_save_lock:
+            if expected_revision is not None:
+                internal = self._load_config().get("_internal", {})
+                try:
+                    revision = int(internal.get("musicbrainz_settings_revision", 0))
+                except (TypeError, ValueError):
+                    revision = 0
+                if revision != expected_revision:
+                    return False
+            current = self._get_section(
+                "musicbrainz_settings",
+                MusicBrainzConnectionSettings,
+                default_factory=self._default_musicbrainz_settings,
+            )
+            if not self._musicbrainz_settings_equal(current, expected):
+                return False
+            self._save_musicbrainz_connection_unlocked(replacement)
+            return True
+
+    def save_musicbrainz_update(
+        self, update: MusicBrainzSettingsUpdate
+    ) -> MusicBrainzConnectionSettings:
+        if update.source_mode == "official":
+            return self._save_deliberate_official_update()
+        brainzmash_update = update.source_mode == "brainzmash"
+        if not brainzmash_update:
+            api_url = (update.api_url or "").strip().rstrip("/")
+            brainzmash_update = (
+                self._custom_musicbrainz_mode(
+                    {"source_mode": update.source_mode, "api_url": api_url}
+                )
+                != update.source_mode
+            )
+
+        if (
+            not brainzmash_update
+            and update.source_mode == "community"
+            and not update.community_acknowledged
+        ):
+            raise ConfigurationError("Community source acknowledgement is required")
+
+        with self._section_save_lock:
+            previous = self.get_musicbrainz_connection()
+            if brainzmash_update:
+                source_changed = previous.source_mode != "brainzmash"
+                source_id = (
+                    str(uuid.uuid4())
+                    if source_changed or not previous.source_id.strip()
+                    else previous.source_id
+                )
+                generation = (
+                    max(1, previous.generation) + 1
+                    if source_changed
+                    else max(1, previous.generation)
+                )
+                settings = MusicBrainzConnectionSettings(
+                    source_mode="brainzmash",
+                    api_url=BRAINZMASH_ENDPOINT,
+                    rate_limit=_BRAINZMASH_RATE_LIMIT,
+                    concurrent_searches=1,
+                    selected_source_mode="brainzmash",
+                    source_id=source_id,
+                    generation=generation,
+                    active_brainzmash=(
+                        previous.active_brainzmash if not source_changed else None
+                    ),
+                    pending_brainzmash=None,
+                    source_quarantined=False,
+                    quarantine_reason="",
+                )
+                self._save_musicbrainz_connection_unlocked(settings)
+                return settings
+
+            api_url = (update.api_url or "").strip().rstrip("/")
+            source_changed = (
+                previous.source_mode != update.source_mode
+                or previous.api_url.rstrip("/") != api_url
+            )
+            if source_changed:
+                source_id = str(uuid.uuid4())
+                generation = max(1, previous.generation) + 1
+            else:
+                source_id = previous.source_id
+                generation = max(1, previous.generation)
+            settings = MusicBrainzConnectionSettings(
+                source_mode=update.source_mode,
+                api_url=api_url,
+                rate_limit=update.rate_limit,
+                concurrent_searches=update.concurrent_searches,
+                community_acknowledged=bool(update.community_acknowledged),
+                selected_source_mode=update.source_mode,
+                source_id=source_id,
+                generation=generation,
+            )
+            self._save_musicbrainz_connection_unlocked(settings)
+            return settings
+
+    def _save_deliberate_official_update(self) -> MusicBrainzConnectionSettings:
+        """Persist an admin-chosen Official source as a genuine override.
+
+        The startup migration still converts upgrade-time Official sections to
+        BrainzMash; this path records the internal marker that distinguishes a
+        later deliberate Official save from migrated state, so the choice
+        survives restarts.
+        """
+        from api.v1.schemas.settings import (
+            _OFFICIAL_MB_CONCURRENT_SEARCHES,
+            _OFFICIAL_MB_RATE_LIMIT,
+        )
+        from repositories.musicbrainz_base import OFFICIAL_MB_API_BASE
+
+        with self._section_save_lock:
+            previous = self.get_musicbrainz_connection()
+            source_changed = previous.source_mode != "official"
+            source_id = (
+                str(uuid.uuid4())
+                if source_changed or not previous.source_id.strip()
+                else previous.source_id
+            )
+            generation = (
+                max(1, previous.generation) + 1
+                if source_changed
+                else max(1, previous.generation)
+            )
+            settings = MusicBrainzConnectionSettings(
+                source_mode="official",
+                api_url=OFFICIAL_MB_API_BASE,
+                rate_limit=_OFFICIAL_MB_RATE_LIMIT,
+                concurrent_searches=_OFFICIAL_MB_CONCURRENT_SEARCHES,
+                selected_source_mode="official",
+                source_id=source_id,
+                generation=generation,
+            )
+            self._save_musicbrainz_connection_unlocked(settings)
+            return settings
+
+    def _clear_official_source_marker(self) -> None:
+        config = self._load_config().copy()
+        internal = config.get("_internal", {})
+        if not isinstance(internal, dict) or "official_source_selected" not in internal:
+            return
+        internal = internal.copy()
+        internal.pop("official_source_selected", None)
+        config["_internal"] = internal
+        self._save_config(config)
+
+    def stage_brainzmash(self) -> MusicBrainzConnectionSettings:
+        """Select BrainzMash immediately; disclosure handling remains optional."""
+        with self._section_save_lock:
+            previous = self.get_musicbrainz_connection()
+            source_changed = previous.source_mode != "brainzmash"
+            source_id = (
+                str(uuid.uuid4())
+                if source_changed or not previous.source_id.strip()
+                else previous.source_id
+            )
+            generation = (
+                max(1, previous.generation) + 1
+                if source_changed
+                else max(1, previous.generation)
+            )
+            settings = MusicBrainzConnectionSettings(
+                source_mode="brainzmash",
+                api_url=BRAINZMASH_ENDPOINT,
+                rate_limit=_BRAINZMASH_RATE_LIMIT,
+                concurrent_searches=1,
+                selected_source_mode="brainzmash",
+                source_id=source_id,
+                generation=generation,
+                active_brainzmash=(
+                    previous.active_brainzmash if not source_changed else None
+                ),
+                pending_brainzmash=self._new_brainzmash_pending(generation + 1),
+                source_quarantined=False,
+                quarantine_reason="",
+            )
+            self._save_musicbrainz_connection_unlocked(settings)
+            return settings
+
+    def accept_brainzmash_consent(
+        self, binding: MusicBrainzBindingRequest, admin_id: str
+    ) -> MusicBrainzConnectionSettings:
+        with self._section_save_lock:
+            current = self.get_musicbrainz_connection()
+            if not self._binding_matches(current.pending_brainzmash, binding):
+                raise ValidationError("BrainzMash proposal is stale")
+            assert current.pending_brainzmash is not None
+            if (
+                current.pending_brainzmash.disclosure_version
+                != BRAINZMASH_DISCLOSURE_VERSION
+            ):
+                raise ValidationError("BrainzMash disclosure is outdated")
+            current.pending_brainzmash.consented = True
+            self._save_musicbrainz_connection_unlocked(current)
+            config = self._load_config().copy()
+            config["_internal"] = {
+                **config.get("_internal", {}),
+                "brainzmash_consent_admin": admin_id,
+            }
+            self._save_config(config)
+            return current
+
+    def record_brainzmash_verification(
+        self, binding: MusicBrainzBindingRequest
+    ) -> MusicBrainzConnectionSettings:
+        with self._section_save_lock:
+            current = self.get_musicbrainz_connection()
+            if not self._binding_matches(current.pending_brainzmash, binding):
+                raise ValidationError("BrainzMash proposal is stale")
+            assert current.pending_brainzmash is not None
+            if not current.pending_brainzmash.consented:
+                raise ValidationError("BrainzMash consent is required")
+            current.pending_brainzmash.verified = True
+            self._save_musicbrainz_connection_unlocked(current)
+            return current
+
+    def promote_brainzmash(
+        self, binding: MusicBrainzBindingRequest
+    ) -> tuple[MusicBrainzConnectionSettings, MusicBrainzConnectionSettings]:
+        """Promote an exact verified proposal and return (previous, promoted)."""
+        with self._section_save_lock:
+            current = self.get_musicbrainz_connection()
+            if not self._binding_matches(current.pending_brainzmash, binding):
+                raise ValidationError("BrainzMash proposal is stale")
+            pending = current.pending_brainzmash
+            assert pending is not None
+            if not pending.consented:
+                raise ValidationError("BrainzMash consent is required")
+            if not pending.verified:
+                raise ValidationError("BrainzMash verification is required")
+            previous = msgspec.convert(
+                msgspec.to_builtins(current), type=MusicBrainzConnectionSettings
+            )
+            promoted = MusicBrainzConnectionSettings(
+                source_mode="brainzmash",
+                api_url=pending.endpoint.rstrip("/"),
+                rate_limit=_BRAINZMASH_RATE_LIMIT,
+                concurrent_searches=1,
+                selected_source_mode="brainzmash",
+                source_id=pending.source_id,
+                generation=pending.generation,
+                pending_brainzmash=None,
+                active_brainzmash=BrainzMashActiveBinding(
+                    endpoint=pending.endpoint,
+                    access_revision=pending.access_revision,
+                    source_id=pending.source_id,
+                    generation=pending.generation,
+                    disclosure_version=pending.disclosure_version,
+                    consented=True,
+                    verified=True,
+                ),
+            )
+            self._save_musicbrainz_connection_unlocked(promoted)
+            return previous, promoted
+
+    def _legacy_custom_musicbrainz_settings(
+        self, raw_existing: object, mode: str
+    ) -> MusicBrainzConnectionSettings | None:
+        if not isinstance(raw_existing, dict):
+            return None
+        api_url = raw_existing.get("api_url")
+        if not isinstance(api_url, str):
+            return None
+        try:
+            rate_limit = float(raw_existing.get("rate_limit", 1.0))
+            concurrent_searches = int(raw_existing.get("concurrent_searches", 6))
+            return MusicBrainzConnectionSettings(
+                source_mode=mode,
+                api_url=api_url,
+                rate_limit=rate_limit,
+                concurrent_searches=concurrent_searches,
+                community_acknowledged=bool(
+                    raw_existing.get("community_acknowledged", False)
+                ),
+                selected_source_mode=mode,
+                source_id=str(raw_existing.get("source_id") or uuid.uuid4()),
+                generation=max(1, int(raw_existing.get("generation", 1))),
+            )
+        except (TypeError, ValueError, msgspec.ValidationError):
+            return None
+
     def _migrate_musicbrainz_settings(self) -> None:
-        """One-time migration of musicbrainz_concurrent_searches from advanced_settings."""
+        """Normalize every non-custom source to the built-in BrainzMash default.
+
+        A deliberate Official re-selection recorded by
+        `_save_deliberate_official_update` is preserved instead of migrated.
+        """
+        from api.v1.schemas.settings import (
+            _OFFICIAL_MB_CONCURRENT_SEARCHES,
+            _OFFICIAL_MB_RATE_LIMIT,
+        )
+        from repositories.musicbrainz_base import OFFICIAL_MB_API_BASE
+
         try:
             config = self._load_config()
-            if config.get("musicbrainz_settings") is not None:
+            existing = config.get("musicbrainz_settings")
+            internal = config.get("_internal", {})
+            deliberate_official = bool(
+                isinstance(internal, dict)
+                and internal.get("official_source_selected") is True
+            )
+            custom_mode = self._custom_musicbrainz_mode(existing)
+            if custom_mode is not None:
+                if deliberate_official:
+                    self._clear_official_source_marker()
+                if isinstance(existing, dict) and existing.get("source_mode") in {
+                    "mirror",
+                    "community",
+                }:
+                    try:
+                        custom = msgspec.convert(
+                            existing, type=MusicBrainzConnectionSettings
+                        )
+                    except (msgspec.ValidationError, TypeError, ValueError):
+                        self._save_section(
+                            "musicbrainz_settings",
+                            self._default_musicbrainz_settings(existing),
+                        )
+                        return
+                    if (
+                        custom.source_mode != custom_mode
+                        or custom.selected_source_mode != custom_mode
+                        or not custom.source_id
+                        or custom.source_id != custom.source_id.strip()
+                        or custom.generation < 1
+                    ):
+                        self._save_section(
+                            "musicbrainz_settings",
+                            self._default_musicbrainz_settings(existing),
+                        )
+                        return
+                    # A complete valid custom section is preserved byte-for-byte.
+                    return
+                # A pre-source-mode custom URL is the one legacy case worth
+                # preserving; its active endpoint remains the user's choice.
+                migrated = self._legacy_custom_musicbrainz_settings(
+                    existing, custom_mode
+                )
+                if migrated is not None:
+                    self._save_section("musicbrainz_settings", migrated)
+                else:
+                    self._save_section(
+                        "musicbrainz_settings",
+                        self._default_musicbrainz_settings(existing),
+                    )
                 return
 
-            advanced_data = config.get("advanced_settings", {})
-            old_value = advanced_data.get("musicbrainz_concurrent_searches")
-            if old_value is not None:
-                settings = MusicBrainzConnectionSettings(
-                    concurrent_searches=int(old_value)
-                )
-                self._save_section("musicbrainz_settings", settings)
-                logger.info(
-                    f"Migrated musicbrainz_concurrent_searches={old_value} to musicbrainz_settings"
-                )
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "Failed to migrate musicbrainz_concurrent_searches, using defaults"
+            if (
+                isinstance(existing, dict)
+                and existing.get("source_mode") == "brainzmash"
+            ):
+                try:
+                    current = msgspec.convert(
+                        existing, type=MusicBrainzConnectionSettings
+                    )
+                except (msgspec.ValidationError, TypeError, ValueError):
+                    current = None
+                if deliberate_official:
+                    self._clear_official_source_marker()
+                if current is not None:
+                    changed = to_jsonable(current) != existing
+                    if (
+                        not current.source_id
+                        or current.source_id != current.source_id.strip()
+                    ):
+                        current.source_id = str(uuid.uuid4())
+                        changed = True
+                    if current.generation < 1:
+                        current.generation = 1
+                        changed = True
+                    if current.selected_source_mode != "brainzmash":
+                        current.selected_source_mode = "brainzmash"
+                        changed = True
+                    if current.source_quarantined or current.quarantine_reason:
+                        current.source_quarantined = False
+                        current.quarantine_reason = ""
+                        changed = True
+                    if changed:
+                        self._save_section("musicbrainz_settings", current)
+                    return
+
+            if (
+                deliberate_official
+                and isinstance(existing, dict)
+                and existing.get("source_mode") == "official"
+            ):
+                # An admin re-selected Official after the upgrade migration.
+                # Canonicalize the section but never convert it to BrainzMash.
+                current = msgspec.convert(existing, type=MusicBrainzConnectionSettings)
+                current.source_mode = "official"
+                current.api_url = OFFICIAL_MB_API_BASE
+                current.rate_limit = _OFFICIAL_MB_RATE_LIMIT
+                current.concurrent_searches = _OFFICIAL_MB_CONCURRENT_SEARCHES
+                current.selected_source_mode = "official"
+                current.pending_brainzmash = None
+                current.active_brainzmash = None
+                current.source_quarantined = False
+                current.quarantine_reason = ""
+                current.community_acknowledged = False
+                current.clamped_to_official_limits = False
+                if (
+                    not current.source_id
+                    or current.source_id != current.source_id.strip()
+                ):
+                    current.source_id = str(uuid.uuid4())
+                if current.generation < 1:
+                    current.generation = 1
+                if to_jsonable(current) != existing:
+                    self._save_section("musicbrainz_settings", current)
+                return
+
+            if deliberate_official:
+                self._clear_official_source_marker()
+            # Missing, legacy official, explicit official, malformed, and
+            # ambiguous states all take the same active BrainzMash path.
+            self._save_section(
+                "musicbrainz_settings",
+                self._default_musicbrainz_settings(existing),
             )
-            self._save_section("musicbrainz_settings", MusicBrainzConnectionSettings())
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to normalize MusicBrainz settings; using BrainzMash")
+            self._clear_official_source_marker()
+            self._save_section(
+                "musicbrainz_settings", self._default_musicbrainz_settings()
+            )
 
     def get_oidc_connection(self) -> OIDCConnectionSettings:
         config = self._load_config()

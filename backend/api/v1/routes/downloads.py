@@ -35,10 +35,14 @@ from api.v1.schemas.download import (
     DownloadListResponse,
     DownloadTaskResponse,
     HeldActionResponse,
+    HeldBulkReverifyItem,
+    HeldBulkReverifyRequest,
+    HeldBulkReverifyResponse,
     HeldImportResponse,
     HeldListResponse,
     HeldManagementActionResponse,
     HeldReevaluateResponse,
+    HeldReverifyResponse,
     NextSourceRequest,
     NextSourceResponse,
     ReimportDownloadResponse,
@@ -290,12 +294,9 @@ async def restart_with_current_policy(
     guidance (their dedicated abort path is cancel/re-request). Storage
     admission re-runs before reset; the whole swap is one atomic transaction
     that retains the old snapshot on any failure."""
-    import json
-
     from core.dependencies import get_download_orchestrator, get_quota_service
     from core.exceptions import ConflictError, ResourceNotFoundError, ValidationError
-    from infrastructure.serialization import to_jsonable
-    from services.native.acquisition.quality import build_snapshot
+    from services.native.acquisition.quality import build_snapshot, encode_snapshot
 
     store = get_download_store()
     prefs = get_preferences_service()
@@ -314,7 +315,9 @@ async def restart_with_current_policy(
             "request again so the new policy applies"
         )
     if task.status not in ("queued", "downloading", "processing"):
-        raise ValidationError("Only an active search or queued download can be restarted")
+        raise ValidationError(
+            "Only an active search or queued download can be restarted"
+        )
 
     quota = get_quota_service()
     await quota.check_storage_admission(task.user_id, task.origin or "user")
@@ -324,7 +327,7 @@ async def restart_with_current_policy(
     ok = await store.apply_quality_policy_restart(
         task.id,
         expected_snapshot_hash=expected,
-        new_snapshot_json=json.dumps(to_jsonable(snapshot)),
+        new_snapshot_json=encode_snapshot(snapshot),
         new_snapshot_hash=snapshot.snapshot_hash,
         new_snapshot_summary=snapshot.summary,
     )
@@ -432,6 +435,7 @@ def _held_to_response(held) -> HeldImportResponse:  # noqa: ANN001 - HeldImport
         original_filename=held.original_filename,
         file_format=held.file_format,
         duration_seconds=held.duration_seconds,
+        expected_duration_seconds=held.expected_duration_seconds,
         reason=held.reason,
         reason_detail=held.reason_detail,
         source=held.source,
@@ -640,6 +644,34 @@ async def discard_held(
     """Delete a held track's file and let the album's auto-retry resume."""
     await service.discard_held(held_id, current_user.id, current_user.role)
     return HeldActionResponse(status="discarded")
+
+
+@router.post("/held/reverify", response_model=HeldBulkReverifyResponse)
+async def reverify_held_bulk(
+    current_user: CurrentUserDep,
+    body: HeldBulkReverifyRequest = MsgSpecBody(HeldBulkReverifyRequest),
+    service=Depends(get_download_service),
+):
+    """Re-run the fingerprint identity check over held tracks (admin/owner-scoped,
+    capped): confirmed tracks import through the same path as "import anyway",
+    the rest stay held. One id's failure never stops the sweep."""
+    results = await service.reverify_held_bulk(
+        current_user.id, current_user.role, body.held_ids
+    )
+    return HeldBulkReverifyResponse(
+        results=[HeldBulkReverifyItem(**item) for item in results]
+    )
+
+
+@router.post("/held/{held_id}/reverify", response_model=HeldReverifyResponse)
+async def reverify_held(
+    held_id: int, current_user: CurrentUserDep, service=Depends(get_download_service)
+):
+    """Re-run the fingerprint identity check on one held file (admin/owner)."""
+    status, final_path = await service.reverify_held(
+        held_id, current_user.id, current_user.role
+    )
+    return HeldReverifyResponse(status=status, final_path=final_path)
 
 
 _AUDIO_MEDIA_TYPES = {

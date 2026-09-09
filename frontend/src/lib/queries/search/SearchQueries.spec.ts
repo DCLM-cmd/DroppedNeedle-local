@@ -4,30 +4,50 @@ vi.mock('@tanstack/svelte-query', () => ({
 	createQuery: vi.fn((factory: () => Record<string, unknown>) => factory()),
 	queryOptions: vi.fn((opts: Record<string, unknown>) => opts)
 }));
+vi.mock('$lib/api/client', () => ({
+	api: { global: { get: vi.fn() } }
+}));
 
 vi.mock('$lib/stores/authStore.svelte', () => ({
 	authStore: { user: { id: 'user-1' } }
 }));
 
-import { CACHE_TTL } from '$lib/constants';
+import { CACHE_TTL, API } from '$lib/constants';
+import { api } from '$lib/api/client';
 import type { Album, Artist, LibraryAlbumSummary, LibraryArtistSummary } from '$lib/types';
 
 import { SearchQueryKeyFactory } from './SearchQueryKeyFactory';
 import {
 	getLocalAlbumSearchQueryOptions,
 	getLocalArtistSearchQueryOptions,
+	getRemoteArtistSearchQueryOptions,
 	mergeSearchAlbums,
 	mergeSearchArtists,
+	REMOTE_ARTIST_PAGE_SIZE,
 	successfulSearchStaleTime,
 	successfulSuggestStaleTime,
 	SEARCH_FAILURE_STALE_TIME_MS
 } from './SearchQueries.svelte';
 
 describe('Search queries', () => {
-	it('dimensions every persisted key by user id', () => {
+	it('uses the bucket-width remote artist profile', async () => {
+		expect(REMOTE_ARTIST_PAGE_SIZE).toBe(24);
+
+		const remote = getRemoteArtistSearchQueryOptions(' Muse ');
+		const options = remote as unknown as {
+			queryKey: unknown;
+			queryFn: (context: { signal: AbortSignal }) => Promise<unknown>;
+		};
+		expect(options.queryKey).toEqual(SearchQueryKeyFactory.artists('user-1', 'muse', 24));
+		const signal = new AbortController().signal;
+		await options.queryFn({ signal });
+		expect(api.global.get).toHaveBeenCalledWith(API.search.artists('Muse', 24), { signal });
+	});
+	it('dimensions every provider key by user and MusicBrainz source identity', () => {
 		expect(SearchQueryKeyFactory.artists('user-a', 'Muse', 6)).toEqual([
 			'search',
 			'user-a',
+			{ user_id: 'user-a', source_mode: 'brainzmash', source_id: '', generation: 0 },
 			'artists',
 			'muse',
 			6
@@ -38,6 +58,7 @@ describe('Search queries', () => {
 		expect(SearchQueryKeyFactory.suggestions('user-a', ' Muse ', 5)).toEqual([
 			'search',
 			'user-a',
+			{ user_id: 'user-a', source_mode: 'brainzmash', source_id: '', generation: 0 },
 			'suggestions',
 			'muse',
 			5

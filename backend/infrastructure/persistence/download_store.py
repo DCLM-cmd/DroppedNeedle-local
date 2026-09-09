@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS held_imports (
     original_filename TEXT,
     file_format TEXT,
     duration_seconds REAL,
+    expected_duration_seconds REAL,
     reason TEXT NOT NULL,
     reason_detail TEXT,
     evidence_title TEXT,
@@ -676,6 +677,10 @@ class DownloadStore(PersistenceBase):
                 "ALTER TABLE download_attempts ADD COLUMN materialized_fingerprints_json "
                 "TEXT NOT NULL DEFAULT '{}'",
             )
+            _safe_alter(
+                conn,
+                "ALTER TABLE held_imports ADD COLUMN expected_duration_seconds REAL",
+            )
             for column, ddl in (
                 ("artist_mbid", "TEXT"),
                 ("origin", "TEXT NOT NULL DEFAULT 'user'"),
@@ -779,6 +784,7 @@ class DownloadStore(PersistenceBase):
         quality_preference_step: int | None = None,
         quality_certainty: str | None = None,
         quality_provenance: str | None = None,
+        manual_quality_override: bool = False,
     ) -> DownloadTask:
         now = time.time()
         task = DownloadTask(
@@ -817,6 +823,7 @@ class DownloadStore(PersistenceBase):
             quality_preference_step=quality_preference_step,
             quality_certainty=quality_certainty,
             quality_provenance=quality_provenance,
+            manual_quality_override=manual_quality_override,
         )
         values = tuple(getattr(task, col) for col in _TASK_COLUMNS)
         placeholders = ", ".join("?" for _ in _TASK_COLUMNS)
@@ -914,6 +921,10 @@ class DownloadStore(PersistenceBase):
         return await self._read(operation)
 
     async def get_reimportable_task_ids(self, task_ids: list[str]) -> set[str]:
+        # NOTE (#245): Usenet tasks persist source_username="" (never NULL) - the
+        # empty string is the Usenet-linked marker, and the reimport guard keys
+        # those tasks off the journaled SABnzbd handle instead of a username.
+        # NULL still means never-linked (either source) and stays excluded.
         if not task_ids:
             return set()
 
@@ -1194,6 +1205,49 @@ class DownloadStore(PersistenceBase):
 
         return await self._write(operation)
 
+    async def backfill_task_quality_fields(self, updates: list[dict]) -> int:
+        """Stamp only rows still missing a snapshot during startup migration.
+
+        The feed is read before this write, so a live task may pin its own
+        snapshot in the meantime. The SQL guard makes the migration idempotent
+        and prevents it from overwriting that live snapshot.
+        """
+        if not updates:
+            return 0
+        now = time.time()
+        statements: list[tuple[str, tuple[Any, ...]]] = []
+        for change in updates:
+            task_id = change.get("id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError("each quality-field update needs a task id")
+            sets = ["updated_at = ?"]
+            params: list[Any] = [now]
+            for key, value in change.items():
+                if key == "id":
+                    continue
+                if key not in _TASK_QUALITY_UPDATABLE:
+                    raise ValueError(f"download_tasks column not updatable: {key}")
+                if key == "manual_quality_override":
+                    value = int(bool(value))
+                sets.append(f"{key} = ?")
+                params.append(value)
+            params.append(task_id)
+            statements.append(
+                (
+                    "UPDATE download_tasks SET "
+                    f"{', '.join(sets)} WHERE id = ? AND quality_snapshot_json IS NULL",
+                    tuple(params),
+                )
+            )
+
+        def operation(conn: sqlite3.Connection) -> int:
+            changed = 0
+            for sql, sql_params in statements:
+                changed += conn.execute(sql, sql_params).rowcount
+            return changed
+
+        return await self._write(operation)
+
     async def set_source_username(self, task_id: str, username: str) -> None:
         def operation(conn: sqlite3.Connection) -> None:
             conn.execute(
@@ -1226,6 +1280,10 @@ class DownloadStore(PersistenceBase):
         *,
         source: str = "soulseek",
         download_client: str = "slskd",
+        quality_preference_step: int | None = None,
+        quality_certainty: str | None = None,
+        quality_provenance: str | None = None,
+        manual_quality_override: bool = False,
     ) -> None:
         """(AUD-8) Link task<->candidate AND move the search job to 'matched' in
         ONE transaction (single commit). ``source``/``download_client`` route a picked
@@ -1237,7 +1295,9 @@ class DownloadStore(PersistenceBase):
                 """UPDATE download_tasks
                    SET search_job_id = ?, candidate_index = ?, source_username = ?,
                        source_directory = ?, preflight_score = ?, source = ?,
-                       download_client = ?, updated_at = ?
+                       download_client = ?, quality_preference_step = ?,
+                       quality_certainty = ?, quality_provenance = ?,
+                       manual_quality_override = ?, updated_at = ?
                    WHERE id = ?""",
                 (
                     search_job_id,
@@ -1247,6 +1307,10 @@ class DownloadStore(PersistenceBase):
                     preflight_score,
                     source,
                     download_client,
+                    quality_preference_step,
+                    quality_certainty,
+                    quality_provenance,
+                    int(manual_quality_override),
                     now,
                     task_id,
                 ),
@@ -1380,6 +1444,7 @@ class DownloadStore(PersistenceBase):
     async def acquisition_policy_impact(self) -> dict:
         """Persisted-state bucket counts for the admin impact preview (spec).
         All derived from existing rows - never a new status."""
+
         def operation(conn: sqlite3.Connection) -> dict:
             one = lambda q, p=(): conn.execute(q, p).fetchone()[0]  # noqa: E731
             return {
@@ -2047,6 +2112,7 @@ class DownloadStore(PersistenceBase):
                    VALUES (?, ?, ?, ?, ?)""",
                 (source, identity, release_group_mbid, reason, now),
             )
+
         await self._write(operation)
 
     async def load_quarantine_set(self) -> set[tuple[str, str]]:
@@ -2189,6 +2255,7 @@ class DownloadStore(PersistenceBase):
         origin: str = "user",
         management_retry_count: int = 0,
         management_next_retry_at: float | None = None,
+        expected_duration_seconds: float | None = None,
     ) -> int | None:
         """Hold a verify-rejected file for review. De-duped on (album, disc, track): if that
         track is already held, returns None so the caller can drop its extra copy instead of
@@ -2222,12 +2289,12 @@ class DownloadStore(PersistenceBase):
                    (user_id, release_group_mbid, release_mbid, release_track_mbid,
                     recording_mbid, track_number,
                     disc_number, track_title, artist_name, artist_mbid, album_title, year,
-                    held_path, original_filename, file_format, duration_seconds, reason,
-                    reason_detail,
+                    held_path, original_filename, file_format, duration_seconds,
+                    expected_duration_seconds, reason, reason_detail,
                     evidence_title, evidence_artist, evidence_score, source, source_task_id,
                     origin, naming_template, management_retry_count,
                     management_next_retry_at, status, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'held',?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'held',?)""",
                 (
                     user_id,
                     release_group_mbid,
@@ -2245,6 +2312,7 @@ class DownloadStore(PersistenceBase):
                     original_filename,
                     file_format,
                     duration_seconds,
+                    expected_duration_seconds,
                     reason,
                     reason_detail,
                     evidence_title,
@@ -2314,11 +2382,12 @@ class DownloadStore(PersistenceBase):
                         recording_mbid,
                         track_number, disc_number, track_title, artist_name, artist_mbid,
                         album_title, year, held_path, original_filename, file_format,
-                        duration_seconds, reason, reason_detail, evidence_title,
-                        evidence_artist, evidence_score, source, source_task_id, origin,
+                        duration_seconds, expected_duration_seconds, reason, reason_detail,
+                        evidence_title, evidence_artist, evidence_score, source,
+                        source_task_id, origin,
                         naming_template, management_retry_count,
                         management_next_retry_at, status, created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'held',?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'held',?)""",
                     (
                         value.user_id,
                         value.release_group_mbid,
@@ -2336,6 +2405,7 @@ class DownloadStore(PersistenceBase):
                         value.original_filename,
                         value.file_format,
                         value.duration_seconds,
+                        value.expected_duration_seconds,
                         value.reason,
                         value.reason_detail,
                         value.evidence_title,
@@ -2425,7 +2495,8 @@ class DownloadStore(PersistenceBase):
     ) -> HeldImport | None:
         def operation(conn: sqlite3.Connection) -> HeldImport | None:
             row = conn.execute(
-                "SELECT * FROM held_imports WHERE id = ?", (held_id,)
+                "SELECT * FROM held_imports WHERE id = ? AND status = 'held'",
+                (held_id,),
             ).fetchone()
             if row is None:
                 return None
@@ -2472,7 +2543,8 @@ class DownloadStore(PersistenceBase):
 
         def operation(conn: sqlite3.Connection) -> None:
             conn.execute(
-                "UPDATE held_imports SET status = ?, resolved_at = ? WHERE id = ?",
+                "UPDATE held_imports SET status = ?, resolved_at = ? "
+                "WHERE id = ? AND status = 'held'",
                 (status, now, held_id),
             )
 
@@ -2834,6 +2906,42 @@ class DownloadStore(PersistenceBase):
         def operation(conn: sqlite3.Connection) -> None:
             for sql, sql_params in statements:
                 conn.execute(sql, sql_params)
+
+        return await self._write(operation)
+
+    async def backfill_search_job_quality_snapshots(self, updates: list[dict]) -> int:
+        """Stamp only snapshot-less search jobs during startup migration."""
+        if not updates:
+            return 0
+        now = time.time()
+        statements: list[tuple[str, tuple[Any, ...]]] = []
+        for change in updates:
+            job_id = change.get("id")
+            if not isinstance(job_id, str) or not job_id:
+                raise ValueError("each snapshot update needs a search job id")
+            sets = ["updated_at = ?"]
+            params: list[Any] = [now]
+            for key, value in change.items():
+                if key == "id":
+                    continue
+                if key not in _SEARCH_JOB_QUALITY_UPDATABLE:
+                    raise ValueError(f"search_jobs column not updatable: {key}")
+                sets.append(f"{key} = ?")
+                params.append(value)
+            params.append(job_id)
+            statements.append(
+                (
+                    "UPDATE search_jobs SET "
+                    f"{', '.join(sets)} WHERE id = ? AND quality_snapshot_json IS NULL",
+                    tuple(params),
+                )
+            )
+
+        def operation(conn: sqlite3.Connection) -> int:
+            changed = 0
+            for sql, sql_params in statements:
+                changed += conn.execute(sql, sql_params).rowcount
+            return changed
 
         return await self._write(operation)
 

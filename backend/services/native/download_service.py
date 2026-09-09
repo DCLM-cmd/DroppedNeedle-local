@@ -8,6 +8,7 @@ dispatches the orchestrator.
 import asyncio
 import logging
 import os
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -69,6 +70,7 @@ MANAGEMENT_ABANDONABLE_CODES = frozenset(
 MANAGEMENT_ABANDON_AFTER_ATTEMPTS = 4
 from repositories.protocols.download_client import DownloadClientProtocol
 from repositories.protocols.indexer import IndexerProtocol
+from services.native.acquisition import quality as acq_quality
 from services.native.acquisition.status import DownloadStatus
 from services.native.album_preflight_scorer import (
     AlbumPreflightScorer,
@@ -79,7 +81,8 @@ from services.native.download_orchestrator import (
     _DefaultPolicyShim,
 )
 from services.native.library_manager import LibraryManager
-from services.native.quality_tiers import should_acquire, tier_for, tier_rank
+from services.native.quality_tiers import is_audio, should_acquire, tier_for, tier_rank
+
 
 if TYPE_CHECKING:
     from models.held_import import HeldImport
@@ -96,6 +99,13 @@ logger = logging.getLogger(__name__)
 _CLIENT_FOR_SOURCE = {"soulseek": "slskd", "usenet": "sabnzbd"}
 
 ALREADY_IN_LIBRARY = "already_in_library"
+_EDITION_CONVERSION_HELD_ACTION_MESSAGE = (
+    "Edition conversion holds must be handled through the "
+    "dedicated edition conversion workflow."
+)
+
+# A bulk held re-check never sweeps more than this many ids in one request.
+HELD_REVERIFY_BULK_LIMIT = 25
 
 # A re-request placed straight after the user blacklisted the delivering source.
 # Distinct from ``upgrade`` because it is not a quality judgement: the wanted copy
@@ -103,6 +113,12 @@ ALREADY_IN_LIBRARY = "already_in_library"
 ORIGIN_REPLACEMENT = "replacement"
 
 _LOSSLESS = {"flac", "alac", "wav", "ape", "wv"}
+
+# Provider rebuilds create new DownloadService instances, so ordinary held actions
+# share this process-local registry (the single-worker serialization boundary).
+_ordinary_held_action_registry_lock = threading.Lock()
+_ordinary_held_action_locks: dict[int, asyncio.Lock] = {}
+_ordinary_held_action_lock_users: dict[int, int] = {}
 
 
 def check_downloads_mount(
@@ -249,6 +265,25 @@ class DownloadService:
                     self._management_hold_locks.pop(source_task_id, None)
                 else:
                     self._management_hold_lock_users[source_task_id] = users
+
+    @asynccontextmanager
+    async def _held_action(self, held_id: int) -> AsyncIterator[None]:
+        with _ordinary_held_action_registry_lock:
+            lock = _ordinary_held_action_locks.setdefault(held_id, asyncio.Lock())
+            _ordinary_held_action_lock_users[held_id] = (
+                _ordinary_held_action_lock_users.get(held_id, 0) + 1
+            )
+        try:
+            async with lock:
+                yield
+        finally:
+            with _ordinary_held_action_registry_lock:
+                users = _ordinary_held_action_lock_users[held_id] - 1
+                if users == 0:
+                    _ordinary_held_action_lock_users.pop(held_id, None)
+                    _ordinary_held_action_locks.pop(held_id, None)
+                else:
+                    _ordinary_held_action_lock_users[held_id] = users
 
     def _ensure_enabled(self) -> None:
         # flag captured at construction; the config-save PUT clears the
@@ -481,6 +516,8 @@ class DownloadService:
             if track_count == 1
             else None
         )
+        snapshot = self._search_snapshot()
+        snapshot_values = self._snapshot_values(snapshot)
         job = await self._store.create_search_job(
             user_id=user_id,
             artist_name=artist_name,
@@ -489,10 +526,17 @@ class DownloadService:
             track_count=track_count,
             release_group_mbid=release_group_mbid,
             search_query=f"{artist_name} - {album_title}",
+            **snapshot_values,
         )
         task = asyncio.create_task(
             self._run_search(
-                job.id, artist_name, album_title, year, track_count, single_identity
+                job.id,
+                artist_name,
+                album_title,
+                year,
+                track_count,
+                single_identity,
+                snapshot=snapshot,
             )
         )
         task.add_done_callback(self._log_task_exception)
@@ -507,7 +551,28 @@ class DownloadService:
         year: int | None,
         track_count: int | None,
         single_identity: "tuple[str | None, str | None, float | None] | None" = None,
+        *,
+        snapshot=None,
     ) -> None:
+        if snapshot is None:
+            job = await self._store.get_search_job(job_id)
+            if job is None:
+                snapshot = self._search_snapshot()
+            else:
+                raw_snapshot = getattr(job, "quality_snapshot_json", None)
+                if raw_snapshot is None:
+                    snapshot = self._search_snapshot()
+                else:
+                    try:
+                        snapshot = self._decode_snapshot(raw_snapshot)
+                    except ValidationError:
+                        logger.exception("search.snapshot_decode_failed job=%s", job_id)
+                        await self._store.update_search_job_status(
+                            job_id,
+                            "failed",
+                            error="Stored quality policy snapshot is invalid",
+                        )
+                        return
         await self._bus.publish(f"search:{job_id}", "status", {"status": "searching"})
         target = TargetAlbum(
             artist_name=artist, album_title=album, year=year, track_count=track_count
@@ -520,13 +585,17 @@ class DownloadService:
         soulseek_ok = True
         if self._soulseek_enabled:
             try:
-                candidates.extend(await self._search_soulseek(target, single_identity))
+                candidates.extend(
+                    await self._search_soulseek(
+                        target, single_identity, snapshot=snapshot
+                    )
+                )
             except Exception:
                 logger.exception("soulseek album search failed for job %s", job_id)
                 soulseek_ok = False
         if self._usenet_enabled:
             try:
-                candidates.extend(await self._search_usenet(target))
+                candidates.extend(await self._search_usenet(target, snapshot=snapshot))
             except Exception:
                 logger.exception("usenet album search failed for job %s", job_id)
 
@@ -535,7 +604,12 @@ class DownloadService:
                 job_id, "failed", error="search failed"
             )
             await self._bus.publish(
-                f"search:{job_id}", "complete", {"status": "failed"}
+                f"search:{job_id}",
+                "complete",
+                {
+                    "status": "failed",
+                    "quality_snapshot_summary": snapshot.summary,
+                },
             )
             return
         await self._store.set_search_job_candidates(job_id, candidates)
@@ -547,6 +621,7 @@ class DownloadService:
                 "status": "completed",
                 "candidate_count": len(candidates),
                 "top_score": candidates[0].final_score if candidates else 0.0,
+                "quality_snapshot_summary": snapshot.summary,
             },
         )
 
@@ -554,7 +629,10 @@ class DownloadService:
         self,
         target: TargetAlbum,
         single_identity: "tuple[str | None, str | None, float | None] | None" = None,
+        *,
+        snapshot=None,
     ) -> list[ScoredCandidate]:
+        snapshot = snapshot or self._search_snapshot()
         indexer_results = await self._indexer.search_album(
             target.artist_name, target.album_title, target.year, target.track_count
         )
@@ -577,19 +655,22 @@ class DownloadService:
                 return await self._track_matcher.rank(
                     track_target,
                     results,
-                    snapshot=self._search_snapshot(),
+                    snapshot=snapshot,
                     auto_accept_threshold=self._auto,
                     manual_threshold=self._manual,
                 )
         return await self._scorer.rank(
             target,
             results,
-            snapshot=self._search_snapshot(),
+            snapshot=snapshot,
             auto_accept_threshold=self._auto,
             manual_threshold=self._manual,
         )
 
-    async def _search_usenet(self, target: TargetAlbum) -> list[ScoredCandidate]:
+    async def _search_usenet(
+        self, target: TargetAlbum, *, snapshot=None
+    ) -> list[ScoredCandidate]:
+        snapshot = snapshot or self._search_snapshot()
         indexer_results = await self._usenet_indexer.search_album(
             target.artist_name, target.album_title, target.year, target.track_count
         )
@@ -597,7 +678,7 @@ class DownloadService:
         return await self._usenet_scorer.rank(
             target,
             releases,
-            snapshot=self._search_snapshot(),
+            snapshot=snapshot,
             auto_accept_threshold=self._auto,
             manual_threshold=self._manual,
             track_count=target.track_count,
@@ -610,6 +691,8 @@ class DownloadService:
         year: int | None = None,
         track_count: int | None = None,
         release_group_mbid: str | None = None,
+        *,
+        quality_snapshot=None,
     ) -> list[ScoredCandidate]:
         """The wanted watcher's re-search (Wanted D10): run the manual lane's
         search + scoring verbatim across all enabled sources and return the
@@ -629,6 +712,11 @@ class DownloadService:
             if track_count == 1
             else None
         )
+        snapshot = (
+            quality_snapshot
+            if quality_snapshot is not None
+            else self._search_snapshot()
+        )
         target = TargetAlbum(
             artist_name=artist_name,
             album_title=album_title,
@@ -638,14 +726,18 @@ class DownloadService:
         candidates: list[ScoredCandidate] = []
         if self._soulseek_enabled:
             try:
-                candidates.extend(await self._search_soulseek(target, single_identity))
+                candidates.extend(
+                    await self._search_soulseek(
+                        target, single_identity, snapshot=snapshot
+                    )
+                )
             except Exception:
                 logger.exception(
                     "soulseek scout search failed for %s", release_group_mbid
                 )
         if self._usenet_enabled:
             try:
-                candidates.extend(await self._search_usenet(target))
+                candidates.extend(await self._search_usenet(target, snapshot=snapshot))
             except Exception:
                 logger.exception(
                     "usenet scout search failed for %s", release_group_mbid
@@ -667,7 +759,60 @@ class DownloadService:
             year=job.year,
             track_count=job.track_count,
         )
-        return job, rank_stored_candidates(target, candidates)
+        snapshot = self._decode_snapshot(job.quality_snapshot_json)
+        if snapshot is None:
+            snapshot = self._search_snapshot()
+        return job, rank_stored_candidates(target, candidates, snapshot)
+
+    @staticmethod
+    def _manual_quality_override(snapshot, candidate, decision=None) -> bool:  # noqa: ANN001
+        """Return whether an explicit pick bypasses only a soft quality rule."""
+        if not acq_quality.is_recipe_snapshot(snapshot):
+            return False
+        decision = decision or getattr(candidate, "quality_decision", None)
+        if decision is None or decision.eligible:
+            return False
+        if acq_quality.is_hard_quality_rejection(decision):
+            raise ValidationError(
+                "Selected candidate violates an importability or quality cap"
+            )
+        return True
+
+    def _quality_decision_for_pick(
+        self,
+        snapshot,
+        candidate: ScoredCandidate,
+        job: SearchJob,
+    ):  # noqa: ANN001
+        """Recover a v2 decision for an old candidate blob before a manual pick.
+
+        Current scorer rows already carry the decision. Older search jobs do not,
+        so the pick endpoint must not treat missing evidence as permission to
+        bypass the quality/importability gate.
+        """
+        decision = getattr(candidate, "quality_decision", None)
+        if decision is not None or not acq_quality.is_recipe_snapshot(snapshot):
+            return decision
+        evidence = getattr(candidate, "quality_evidence", None)
+        if candidate.source == "soulseek":
+            audio = [file for file in candidate.files if is_audio(file)]
+            if not audio:
+                raise ValidationError("Selected candidate has no downloadable audio")
+            from services.native.album_preflight_scorer import _file_evidence
+
+            return acq_quality.evaluate_worst(
+                snapshot, [_file_evidence(file) for file in audio]
+            )
+        if candidate.source == "usenet" and candidate.usenet_release is not None:
+            scorer = self._usenet_scorer
+            if scorer is not None and hasattr(scorer, "release_tier"):
+                from services.native.newznab_release_scorer import _release_evidence
+
+                tier = scorer.release_tier(candidate.usenet_release, job.track_count)
+                evidence = _release_evidence(candidate.usenet_release, tier, snapshot)
+        if evidence is None:
+            raise ValidationError("Selected candidate has no quality evidence")
+        return acq_quality.evaluate(snapshot, evidence)
 
     async def pick_candidate(
         self, user_id: str, job_id: str, candidate_index: int
@@ -684,6 +829,20 @@ class DownloadService:
         if candidate_index < 0 or candidate_index >= len(candidates):
             raise ValidationError("Invalid candidate index")
         candidate = candidates[candidate_index]
+        if candidate.tier == "rejected":
+            raise ValidationError("Selected candidate failed identity safety checks")
+        snapshot = self._decode_snapshot(job.quality_snapshot_json)
+        if snapshot is None:
+            snapshot = self._search_snapshot()
+        selected_decision = self._quality_decision_for_pick(snapshot, candidate, job)
+        selected_evidence = (
+            selected_decision.evidence
+            if selected_decision is not None
+            else getattr(candidate, "quality_evidence", None)
+        )
+        manual_quality_override = self._manual_quality_override(
+            snapshot, candidate, selected_decision
+        )
 
         # Byte-cap admission (Feature C layer 2): the manual-pick path creates or
         # resumes a task outside request_album, so it needs its own gate.
@@ -707,6 +866,22 @@ class DownloadService:
                 preflight_score=candidate.final_score,
                 source=candidate.source,
                 download_client=_CLIENT_FOR_SOURCE.get(candidate.source, "slskd"),
+                quality_preference_step=(
+                    selected_decision.preference_step
+                    if selected_decision is not None
+                    else None
+                ),
+                quality_certainty=(
+                    selected_evidence.certainty.value
+                    if selected_evidence is not None
+                    else None
+                ),
+                quality_provenance=(
+                    selected_evidence.provenance.value
+                    if selected_evidence is not None
+                    else None
+                ),
+                manual_quality_override=manual_quality_override,
             )
             self._orchestrator.dispatch(parked.id)
             return parked.id
@@ -768,6 +943,23 @@ class DownloadService:
             search_job_id=job_id,
             candidate_index=candidate_index,
             status="queued",
+            **self._snapshot_values(snapshot),
+            quality_preference_step=(
+                selected_decision.preference_step
+                if selected_decision is not None
+                else None
+            ),
+            quality_certainty=(
+                selected_evidence.certainty.value
+                if selected_evidence is not None
+                else None
+            ),
+            quality_provenance=(
+                selected_evidence.provenance.value
+                if selected_evidence is not None
+                else None
+            ),
+            manual_quality_override=manual_quality_override,
         )
         await self._store.update_search_job_status(job_id, "matched")
         # orchestrator skips search (candidate already linked) and goes straight to
@@ -791,6 +983,7 @@ class DownloadService:
         origin: str = "user",
         release_mbid: str | None = None,
         release_track_mbid: str | None = None,
+        quality_snapshot=None,
     ) -> str:
         """Create a download task and dispatch the orchestrator. Returns the new
         task id, the existing active task id (dedup), or the ``already_in_library``
@@ -953,36 +1146,45 @@ class DownloadService:
             track_count=track_count,
             track_duration_seconds=track_duration_seconds,
             origin=origin,
-            **self._pinned_snapshot(),
+            **self._pinned_snapshot(quality_snapshot),
         )
         self._orchestrator.dispatch(task.id)
         return task.id
 
+    def capture_quality_snapshot(self):
+        """Capture one validated quality policy for a scout/dispatch pair."""
+        return self._search_snapshot()
+
     def _search_snapshot(self):
-        """The manual-search lane scores under the CURRENT global policy (the
-        auto path pins each task's creation-time snapshot instead). Legacy
-        constructions without a factory keep the pre-cutover default range."""
+        """Capture the current policy once for a manual search or legacy fallback."""
         if self._snapshot_factory is not None:
             return self._snapshot_factory()
         from services.native.acquisition.quality import build_snapshot
 
         return build_snapshot(_DefaultPolicyShim())
 
-    def _pinned_snapshot(self):
-        """Creation-time immutable policy snapshot; tests/legacy constructions
-        without a factory produce untagged rows the startup backfill covers."""
-        if self._snapshot_factory is None:
-            return {}
-        import json as _json
-
-        from infrastructure.serialization import to_jsonable as _to
-
-        snapshot = self._snapshot_factory()
+    @staticmethod
+    def _snapshot_values(snapshot) -> dict[str, str | None]:
         return {
-            "quality_snapshot_json": _json.dumps(_to(snapshot)),
+            "quality_snapshot_json": acq_quality.encode_snapshot(snapshot),
             "quality_snapshot_hash": snapshot.snapshot_hash,
             "quality_snapshot_summary": snapshot.summary,
         }
+
+    @staticmethod
+    def _decode_snapshot(raw):
+        if raw is None:
+            return None
+        try:
+            return acq_quality.decode_snapshot(raw)
+        except acq_quality.SnapshotValidationError as exc:
+            raise ValidationError("Stored quality policy snapshot is invalid") from exc
+
+    def _pinned_snapshot(self, snapshot=None):
+        """Creation-time immutable policy snapshot for every new task."""
+        return self._snapshot_values(
+            snapshot if snapshot is not None else self._search_snapshot()
+        )
 
     async def request_track(
         self,
@@ -997,6 +1199,7 @@ class DownloadService:
         origin: str = "user",
         release_mbid: str | None = None,
         release_track_mbid: str | None = None,
+        quality_snapshot=None,
     ) -> str:
         """Request a single track. Orphan tracks (album not in the library) resolve
         the release group via MusicBrainz, auto-create the album folder, and download
@@ -1065,6 +1268,7 @@ class DownloadService:
             origin=origin,
             release_mbid=release_mbid,
             release_track_mbid=release_track_mbid,
+            quality_snapshot=quality_snapshot,
         )
 
     @property
@@ -1507,9 +1711,24 @@ class DownloadService:
         ``ImportDestinationOccupiedError`` carrying the occupant, so the caller can
         put that choice to them instead of failing with nowhere to go.
         """
+        async with self._held_action(held_id):
+            return await self._import_held_locked(
+                held_id, user_id, user_role, replace_existing=replace_existing
+            )
+
+    async def _import_held_locked(
+        self,
+        held_id: int,
+        user_id: str,
+        user_role: str,
+        *,
+        replace_existing: bool = False,
+    ) -> str:
         held = await self._store.get_held_import(held_id, user_id, user_role)
         if held is None:
             raise ResourceNotFoundError("Held track not found")
+        if held.origin == "edition_conversion":
+            raise ValidationError(_EDITION_CONVERSION_HELD_ACTION_MESSAGE)
         if held.reason.startswith("management:"):
             raise ValidationError(
                 "Library Management holds must be retried as one complete acquisition unit"
@@ -1553,11 +1772,18 @@ class DownloadService:
         return str(target)
 
     async def discard_held(self, held_id: int, user_id: str, user_role: str) -> None:
-        """Delete a held track's file and mark it discarded, re-enabling the album's
-        auto-retry. The file is always removed - a rejected candidate never lingers on disk."""
+        """Discard one held track under its per-id action lock."""
+        async with self._held_action(held_id):
+            await self._discard_held_locked(held_id, user_id, user_role)
+
+    async def _discard_held_locked(
+        self, held_id: int, user_id: str, user_role: str
+    ) -> None:
         held = await self._store.get_held_import(held_id, user_id, user_role)
         if held is None:
             raise ResourceNotFoundError("Held track not found")
+        if held.origin == "edition_conversion":
+            raise ValidationError(_EDITION_CONVERSION_HELD_ACTION_MESSAGE)
         if held.reason.startswith("management:"):
             raise ValidationError(
                 "Library Management holds must be discarded as one complete acquisition unit"
@@ -1622,6 +1848,123 @@ class DownloadService:
                 )
         logger.info("download.held_reevaluated", extra=counts)
         return counts
+
+    async def reverify_held(
+        self, held_id: int, user_id: str, user_role: str
+    ) -> tuple[str, str | None]:
+        """Re-run the fingerprint identity check on one fingerprint-held file, under
+        its per-id action lock. Returns ``(status, final_path)``: ``"imported"``
+        (with the placed path) when a confident result no longer disagrees -
+        through the same settle/reconcile path as "import anyway" - else
+        ``"still_held"``. Non-fingerprint holds are rejected outright: only a
+        ``fingerprint_mismatch`` hold can be fingerprint-verified."""
+        async with self._held_action(held_id):
+            return await self._reverify_held_locked(held_id, user_id, user_role)
+
+    async def _reverify_held_locked(
+        self, held_id: int, user_id: str, user_role: str
+    ) -> tuple[str, str | None]:
+        held = await self._store.get_held_import(held_id, user_id, user_role)
+        if held is None:
+            raise ResourceNotFoundError("Held track not found")
+        if held.origin == "edition_conversion":
+            raise ValidationError(_EDITION_CONVERSION_HELD_ACTION_MESSAGE)
+        if held.reason != "fingerprint_mismatch":
+            raise ValidationError("Only fingerprint-held tracks can be re-checked")
+        if self._file_processor is None:
+            raise ConfigurationError("Import is unavailable right now")
+        try:
+            verdict = await self._file_processor.reverify_held_file(held)
+        except FileNotFoundError as exc:
+            # its copy is gone (shouldn't happen - it lives in our held area); tidy the row
+            await self._store.resolve_held_import(held_id, "discarded")
+            raise ValidationError(
+                "The held file is no longer available - discard it and re-download the album"
+            ) from exc
+        if verdict != "confirmed":
+            return ("still_held", None)
+        final_path = await self._import_held_locked(held_id, user_id, user_role)
+        return ("imported", final_path)
+
+    async def reverify_held_bulk(
+        self, user_id: str, user_role: str, held_ids: list[int] | None = None
+    ) -> list[dict]:
+        """Re-check fingerprint-held tracks in bulk: owner/admin scoping comes from the
+        held list itself, each id runs under its per-id action lock, and one id's
+        failure never stops the sweep. Only ``fingerprint_mismatch`` holds can be
+        fingerprint-verified - every other reason reports "skipped". An explicit
+        id list runs in request order (deduped); an omitted list runs newest
+        first. Either way at most ``HELD_REVERIFY_BULK_LIMIT`` fingerprint checks
+        run per request (skipped rows are free).
+        """
+        held_rows = await self._store.list_held_imports(user_id, user_role)
+        if held_ids is None:
+            candidates = held_rows
+        else:
+            by_id = {held.id: held for held in held_rows}
+            candidates = [
+                by_id[held_id] for held_id in dict.fromkeys(held_ids) if held_id in by_id
+            ]
+        results: list[dict] = []
+        # The cap slices AFTER the skip filter below: unscannable rows report
+        # "skipped" without consuming the sweep budget, so management rows can
+        # never starve fingerprint holds. Truncation is silent by design.
+        checked = 0
+        for held in candidates:
+            if (
+                held.origin == "edition_conversion"
+                or held.reason != "fingerprint_mismatch"
+            ):
+                results.append(
+                    {
+                        "held_id": held.id,
+                        "status": "skipped",
+                        "final_path": None,
+                        "release_group_mbid": held.release_group_mbid,
+                        "message": "Only fingerprint-held tracks can be re-checked",
+                    }
+                )
+                continue
+            if checked >= HELD_REVERIFY_BULK_LIMIT:
+                break
+            checked += 1
+            try:
+                status, final_path = await self.reverify_held(
+                    held.id, user_id, user_role
+                )
+            except (ResourceNotFoundError, ValidationError, ConfigurationError) as exc:
+                results.append(
+                    {
+                        "held_id": held.id,
+                        "status": "error",
+                        "final_path": None,
+                        "release_group_mbid": held.release_group_mbid,
+                        "message": str(exc),
+                    }
+                )
+                continue
+            except Exception:  # noqa: BLE001 - one held id must not stop the sweep
+                logger.exception("Held re-check failed unexpectedly for %s", held.id)
+                results.append(
+                    {
+                        "held_id": held.id,
+                        "status": "error",
+                        "final_path": None,
+                        "release_group_mbid": held.release_group_mbid,
+                        "message": "Re-check failed",
+                    }
+                )
+                continue
+            results.append(
+                {
+                    "held_id": held.id,
+                    "status": status,
+                    "final_path": final_path,
+                    "release_group_mbid": held.release_group_mbid,
+                    "message": None,
+                }
+            )
+        return results
 
     async def retry_management_hold(
         self, source_task_id: str, user_id: str, user_role: str

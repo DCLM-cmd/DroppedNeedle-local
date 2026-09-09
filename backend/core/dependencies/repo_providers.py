@@ -9,6 +9,7 @@ import httpx
 from core.config import get_settings
 from infrastructure.http.client import (
     HttpClientFactory,
+    get_brainzmash_http_client,
     get_coverart_http_client,
     get_http_client,
     get_listenbrainz_http_client,
@@ -57,11 +58,19 @@ def get_musicbrainz_repository() -> "MusicBrainzRepository":
     cache = get_cache()
     preferences_service = get_preferences_service()
     http_client = _get_configured_http_client()
+    brainzmash_client = get_brainzmash_http_client(
+        get_settings(),
+        timeout=float(preferences_service.get_advanced_settings().http_timeout),
+        connect_timeout=float(
+            preferences_service.get_advanced_settings().http_connect_timeout
+        ),
+    )
     return MusicBrainzRepository(
         http_client,
         cache,
         preferences_service,
         mb_canonical_store=get_mb_canonical_store(),
+        brainzmash_http_client=brainzmash_client,
     )
 
 
@@ -543,9 +552,9 @@ def _build_coverart_repository(
         * 1024,
         cover_non_monitored_ttl_seconds=advanced.cache_ttl_recently_viewed_bytes,
         library_db=library_db,
-        local_cover_priority=lambda: get_preferences_service()
-        .get_advanced_settings()
-        .prefer_local_cover_art,
+        local_cover_priority=lambda: (
+            get_preferences_service().get_advanced_settings().prefer_local_cover_art
+        ),
         native_library_store=native_library_store,
     )
 
@@ -646,7 +655,8 @@ def get_slskd_repository() -> "SlskdRepository":
     from repositories.slskd.slskd_repository import SlskdRepository
 
     settings = get_settings()
-    dc = get_preferences_service().get_download_client_settings_raw()
+    prefs = get_preferences_service()
+    dc = prefs.get_download_client_settings_raw()
     return SlskdRepository(
         client=get_slskd_client(),
         url=dc.url,
@@ -656,6 +666,7 @@ def get_slskd_repository() -> "SlskdRepository":
         ),
         concurrent_searches=settings.download_client_concurrent_searches,
         concurrent_enqueues=settings.download_client_concurrent_enqueues,
+        incomplete_mount=prefs.get_slskd_incomplete_mount(),
     )
 
 
@@ -715,13 +726,14 @@ def build_newznab_client(url: str, api_key: str) -> "NewznabClient":
     )
     return NewznabClient(http, url, api_key, indexer_name=url)
 
-
 def build_slskd_repository(url: str, api_key: str) -> "SlskdRepository":
     """Transient (not cached) repo from caller-supplied credentials.
 
     Test-connection validates what the admin typed before saving, so it needs a
     one-off repo from the submitted url/key, not the stored config. Distinct httpx
-    client name so it never shares the live config.
+    client name so it never shares the live config. The incomplete fallback stays
+    off here (incomplete_mount=None): test-connection checks reachability, never
+    file locations.
     """
     from pathlib import Path
 
@@ -733,7 +745,7 @@ def build_slskd_repository(url: str, api_key: str) -> "SlskdRepository":
         name="slskd-verify", timeout=30.0, connect_timeout=5.0
     )
     return SlskdRepository(
-        client=SlskdClient(http, url, api_key),
+        client=SlskdClient(http, url, api_key, use_verify_breaker=True),
         url=url,
         api_key=api_key,
         downloads_mount=Path(settings.slskd_downloads_path),
@@ -779,7 +791,9 @@ def get_sabnzbd_download_client() -> "SabnzbdDownloadClient":
     )
 
 
-def build_sabnzbd_download_client(url: str, api_key: str) -> "SabnzbdDownloadClient":
+def build_sabnzbd_download_client(
+    url: str, api_key: str, downloads_mount: str = "/tmp"
+) -> "SabnzbdDownloadClient":
     """Transient client from caller-supplied credentials, for the Test-connection route."""
     from pathlib import Path
 
@@ -790,7 +804,7 @@ def build_sabnzbd_download_client(url: str, api_key: str) -> "SabnzbdDownloadCli
         name="sabnzbd-verify", timeout=60.0, connect_timeout=5.0
     )
     return SabnzbdDownloadClient(
-        SabnzbdClient(http, url, api_key), url, api_key, Path("/tmp")
+        SabnzbdClient(http, url, api_key), url, api_key, Path(downloads_mount)
     )
 
 

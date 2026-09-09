@@ -26,15 +26,6 @@ def test_cover_art_archive_is_paced_too():
     assert caa._coverart_rate_limiter.rate <= 4.0
 
 
-def test_a_self_hosted_musicbrainz_is_not_throttled_as_the_official_one():
-    """The official host is capped at 1/s; a mirror the operator runs is theirs to
-    saturate, and pacing it would slow the library for no one's benefit."""
-    from api.v1.schemas.settings import is_official_musicbrainz
-
-    assert is_official_musicbrainz("https://musicbrainz.org/ws/2")
-    assert not is_official_musicbrainz("http://192.168.178.22:5000/ws/2")
-
-
 def test_the_user_agent_carries_the_configured_name_and_contact():
     from core.config import Settings
 

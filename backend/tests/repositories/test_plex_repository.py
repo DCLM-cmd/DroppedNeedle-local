@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
-from core.exceptions import ExternalServiceError, PlexApiError, PlexAuthError
+from core.exceptions import ExternalServiceError, NonRetriableExternalServiceError, PlexApiError, PlexAuthError
 from repositories.plex_models import (
     PlexAlbum,
     PlexArtist,
@@ -714,6 +715,34 @@ class TestAccountAuthCalls:
                 await repo.get_account_server_ids("user-token", "client-123")
 
     @pytest.mark.asyncio
+    async def test_non_list_resources_raises_without_logging_body(self, caplog):
+        # Transient plex.tv body (e.g. dict) must raise, never silently yield
+        # "no servers" - and the warning must not include the body itself,
+        # which carries per-server accessTokens.
+
+        repo, _, _ = _make_repo()
+        response = MagicMock(spec=httpx.Response)
+        response.status_code = 200
+        response.json.return_value = {
+            "clientIdentifier": "server-machine-id",
+            "accessToken": "super-secret-token",
+        }
+
+        with patch("httpx.AsyncClient") as MockClient:
+            MockClient.return_value = _mock_fresh_client(response)
+            with caplog.at_level(logging.WARNING, logger="repositories.plex_repository"):
+                with pytest.raises(PlexApiError):
+                    await repo.get_account_server_ids("user-token", "client-123")
+            assert "super-secret-token" not in caplog.text
+
+        with patch("httpx.AsyncClient") as MockClient:
+            MockClient.return_value = _mock_fresh_client(response)
+            with pytest.raises(PlexApiError):
+                await repo.get_server_access_token(
+                    "user-token", "client-123", "server-machine-id"
+                )
+
+    @pytest.mark.asyncio
     async def test_resolves_server_specific_access_token(self):
         repo, _, _ = _make_repo()
         response = MagicMock(spec=httpx.Response)
@@ -851,9 +880,33 @@ class TestCircuitBreaker:
 class TestUnconfigured:
     @pytest.mark.asyncio
     async def test_request_raises_when_not_configured(self):
-        repo, _, _ = _make_repo(configured=False)
-        with pytest.raises(ExternalServiceError, match="not configured"):
-            await repo._request("/test")
+        repo, client, _ = _make_repo(configured=False)
+        with patch(
+            "infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock
+        ) as mock_sleep:
+            with pytest.raises(ExternalServiceError, match="not configured"):
+                await repo._request("/test")
+        client.get.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
+        from infrastructure.resilience.retry import CircuitState
+
+        assert _plex_circuit_breaker.state == CircuitState.CLOSED
+        assert _plex_circuit_breaker.failure_count == 0
+
+    @pytest.mark.asyncio
+    async def test_request_not_configured_is_non_retriable_subtype(self):
+        repo, client, _ = _make_repo(configured=False)
+        with patch(
+            "infrastructure.resilience.retry.asyncio.sleep", new_callable=AsyncMock
+        ) as mock_sleep:
+            with pytest.raises(NonRetriableExternalServiceError, match="not configured"):
+                await repo._request("/test")
+        client.get.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
+        from infrastructure.resilience.retry import CircuitState
+
+        assert _plex_circuit_breaker.state == CircuitState.CLOSED
+        assert _plex_circuit_breaker.failure_count == 0
 
     @pytest.mark.asyncio
     async def test_proxy_head_raises(self):

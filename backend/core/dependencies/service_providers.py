@@ -29,6 +29,7 @@ from .cache_providers import (
     get_genre_index,
     get_youtube_store,
     get_mbid_store,
+    get_mb_canonical_store,
     get_sync_state_store,
     get_discovery_snapshot_store,
     get_preferences_service,
@@ -192,6 +193,17 @@ def get_genre_artwork_service() -> "GenreArtworkService":
         get_cached_local_artwork_service(),
         get_settings().cache_dir / "genre_sections",
     )
+
+
+@singleton
+def get_navidrome_playlist_export_service() -> "NavidromePlaylistExportService":
+    from services.navidrome_playlist_export_service import (
+        NavidromePlaylistExportService,
+    )
+
+    from .cache_providers import get_native_library_store
+
+    return NavidromePlaylistExportService(get_native_library_store())
 
 
 @singleton
@@ -596,9 +608,9 @@ def get_library_administrative_work_service() -> "LibraryAdministrativeWorkServi
 
 def get_mb_provider_availability() -> Callable[[], bool]:
     """Live MusicBrainz breaker read shared by identification and activity routes."""
-    from repositories.musicbrainz_base import mb_circuit_breaker
+    from repositories.musicbrainz_base import get_mb_provider_circuit_breaker
 
-    return lambda: not mb_circuit_breaker.is_open()
+    return lambda: not get_mb_provider_circuit_breaker().is_open()
 
 
 @singleton
@@ -625,7 +637,7 @@ def get_target_album_identification_service() -> "AlbumIdentificationService":
         resolved_any = False
         for local_album_id in local_album_ids or ():
             try:
-                rg_scope, artist_scope = store.album_catalog_scope_ids(
+                rg_scope, artist_scope = await store.album_catalog_scope_ids(
                     str(local_album_id)
                 )
             except Exception:  # noqa: BLE001 - resolution failure falls back to bulk sweep
@@ -1284,17 +1296,30 @@ def _build_file_processor(
     from services.native.file_processor import FileProcessor
     from services.native.recycle_bin import resolve_bin_path
 
-    from .repo_providers import get_download_client_repository, get_download_store
+    from .repo_providers import (
+        _mount_with_subpath,
+        get_download_client_repository,
+        get_download_store,
+    )
 
     policy = get_preferences_service().get_download_policy()
     settings = get_settings()
+    # Prune and locate must agree on the effective downloads root: when the mount
+    # points at a parent (e.g. the whole media share), the repository confines
+    # lookups to mount + downloads_subpath, so the importer must prune only up to
+    # that same root - never the subpath dir itself (the Unraid completed/ layout).
+    # An empty subpath resolves to the raw mount, exactly as before.
+    downloads_root = _mount_with_subpath(
+        settings.slskd_downloads_path,
+        get_preferences_service().get_download_client_settings_raw().downloads_subpath,
+    )
     return FileProcessor(
         get_audio_tagger(),
         naming_engine=get_naming_template_engine(),
         library_manager=library_manager,
         library_paths=[Path(path) for path in library_paths],
         client=get_download_client_repository(),
-        slskd_downloads_path=Path(settings.slskd_downloads_path),
+        slskd_downloads_path=downloads_root,
         fingerprinter=get_audio_fingerprinter(),
         verify_downloads=policy.verify_downloads,
         download_store=get_download_store(),
@@ -1591,6 +1616,11 @@ def get_follow_service() -> "FollowService":
 
 
 @singleton
+def get_release_type_policy_transition_lock() -> asyncio.Lock:
+    return asyncio.Lock()
+
+
+@singleton
 def get_lidarr_import_service() -> "LidarrImportService":
     from services.lidarr_import_service import LidarrImportService
 
@@ -1616,6 +1646,8 @@ def _build_new_release_service(*, library_repo, acquisition) -> "NewReleaseServi
         download_store=get_download_store(),
         library_repo=library_repo,
         sse_publisher=get_sse_publisher(),
+        preferences_service=get_preferences_service(),
+        policy_transition_lock=get_release_type_policy_transition_lock(),
     )
 
 
@@ -2284,6 +2316,7 @@ def get_settings_service() -> "SettingsService":
         preferences_service,
         cache,
         discovery_snapshot_store=get_discovery_snapshot_store(),
+        disk_cache=get_disk_cache(),
     )
 
 
@@ -2297,6 +2330,7 @@ def get_target_settings_service() -> "SettingsService":
         navidrome_library_getter=get_target_navidrome_library_service,
         plex_library_getter=get_target_plex_library_service,
         discovery_snapshot_store=get_discovery_snapshot_store(),
+        disk_cache=get_disk_cache(),
     )
 
 
@@ -2373,6 +2407,7 @@ def _build_album_discovery_service(library_repo, library_db) -> "AlbumDiscoveryS
         listenbrainz_repo=listenbrainz_repo,
         library_db=library_db,
         mbid_store=get_mbid_store(),
+        mb_canonical_store=get_mb_canonical_store(),
     )
     return AlbumDiscoveryService(
         listenbrainz_repo=listenbrainz_repo,
@@ -2512,13 +2547,13 @@ def _build_discover_service(
     lastfm_repo = get_lastfm_repository()
     audiodb_image_service = get_audiodb_image_service()
     genre_index = genre_index or get_genre_index()
-
     radio_mbid_svc = MbidResolutionService(
         musicbrainz_repo=musicbrainz_repo,
         library_repo=library_repo,
         listenbrainz_repo=listenbrainz_repo,
         library_db=library_db,
         mbid_store=mbid_store,
+        mb_canonical_store=get_mb_canonical_store(),
     )
     radio_integration = IntegrationHelpers(preferences_service)
     radio_service = DiscoverRadioService(
@@ -2557,6 +2592,7 @@ def _build_discover_service(
         genre_artwork_service=genre_artwork_service,
         discovery_snapshot_store=get_discovery_snapshot_store(),
         workload_gate=get_background_workload_gate(),
+        mb_canonical_store=get_mb_canonical_store(),
     )
 
 

@@ -15,15 +15,29 @@ from core.exceptions import (
     ResourceNotFoundError,
     ValidationError,
 )
-from core.task_registry import TaskRegistry
+from api.v1.schemas.settings import DownloadPolicySettings
 from infrastructure.queue.priority_queue import RequestPriority
+from models.acquisition_quality import (
+    AcquisitionQualitySnapshot,
+    AudioQualityEvidence,
+    CodecFamily,
+    EvidenceCertainty,
+    EvidenceProvenance,
+    QualityDecision,
+    QualityReason,
+    QualityRecipeEntry,
+)
 from models.download import DownloadTask, ScoredCandidate, SearchJob
 from repositories.protocols.download_client import DownloadSearchResult
+from core.task_registry import TaskRegistry
 from services.native.download_service import (
     ALREADY_IN_LIBRARY,
     DownloadService,
+    _ordinary_held_action_locks,
+    _ordinary_held_action_lock_users,
     check_downloads_mount,
 )
+from services.native.acquisition import quality as acq_quality
 
 
 def _candidate() -> ScoredCandidate:
@@ -294,6 +308,83 @@ async def test_pick_candidate_creates_queued_task_and_matches():
     assert kwargs["search_job_id"] == "job1"
     assert kwargs["candidate_index"] == 0
     store.update_search_job_status.assert_any_await("job1", "matched")
+
+
+def _quality_pick_fixture(*, hard: bool):
+    snapshot = acq_quality.build_snapshot(
+        DownloadPolicySettings(
+            quality_min="lossless",
+            quality_max="lossless",
+            quality_recipe=[
+                QualityRecipeEntry(format="flac", quality="cd"),
+            ],
+        )
+    )
+    evidence = AudioQualityEvidence(
+        extension="mp3",
+        codec_family=CodecFamily.LOSSY,
+        bitrate_kbps=192,
+        certainty=EvidenceCertainty.EXACT,
+        provenance=EvidenceProvenance.SOURCE_METADATA,
+    )
+    decision = QualityDecision(
+        eligible=False,
+        disposition="outside_policy",
+        tier="mp3_192",
+        evidence=evidence,
+        reasons=[
+            QualityReason.LOSSY_BITRATE_BELOW_MINIMUM
+            if hard
+            else QualityReason.OUTSIDE_GLOBAL_PREFERENCE
+        ],
+        summary="quality test",
+    )
+    candidate = ScoredCandidate(
+        username="alice",
+        parent_directory="A - B",
+        final_score=0.88,
+        tier="manual",
+        quality_evidence=evidence,
+        quality_decision=decision,
+    )
+    return snapshot, candidate
+
+
+@pytest.mark.asyncio
+async def test_pick_candidate_persists_soft_quality_override():
+    service, store, *_ = _make_service()
+    snapshot, candidate = _quality_pick_fixture(hard=False)
+    store.get_search_job.return_value = SearchJob(
+        id="job1",
+        user_id="u1",
+        artist_name="A",
+        album_title="B",
+        quality_snapshot_json=acq_quality.encode_snapshot(snapshot),
+    )
+    store.get_search_job_candidates.return_value = [candidate]
+
+    await service.pick_candidate("u1", "job1", 0)
+
+    assert store.create_task.await_args.kwargs["manual_quality_override"] is True
+
+
+@pytest.mark.asyncio
+async def test_pick_candidate_rejects_hard_quality_override():
+    service, store, *_ = _make_service()
+    snapshot, candidate = _quality_pick_fixture(hard=True)
+    store.get_search_job.return_value = SearchJob(
+        id="job1",
+        user_id="u1",
+        artist_name="A",
+        album_title="B",
+        quality_snapshot_json=acq_quality.encode_snapshot(snapshot),
+    )
+    store.get_search_job_candidates.return_value = [candidate]
+
+    with pytest.raises(ValidationError):
+        await service.pick_candidate("u1", "job1", 0)
+
+    store.create_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1000,8 +1091,10 @@ async def _record_held(
     store,
     path,
     *,
+    user_id="user-a",
     task_id="t-1",
     reason="fingerprint_mismatch",
+    origin="user",
     track_number=3,
     release_mbid=None,
     release_track_mbid=None,
@@ -1010,9 +1103,10 @@ async def _record_held(
     management_next_retry_at=None,
 ):
     return await store.record_held_import(
-        user_id="user-a",
+        user_id=user_id,
         held_path=str(path),
         reason=reason,
+        origin=origin,
         source="usenet",
         source_task_id=task_id,
         release_group_mbid="rg-1",
@@ -1097,6 +1191,435 @@ async def test_import_held_places_and_resolves(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reverify_held_confirmed_imports_through_settle_path(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+    fp.reverify_held_file = AsyncMock(return_value="confirmed")
+    fp.place_held_file = AsyncMock(
+        return_value=Path("/music/Led Zeppelin/03 You Shook Me.flac")
+    )
+    reconciler = MagicMock()
+    reconciler.reconcile_with_filesystem = AsyncMock()
+    svc = _held_service(store, fp, reconciler)
+
+    status, final_path = await svc.reverify_held(hid, "user-a", "user")
+
+    assert status == "imported"
+    assert final_path.endswith("03 You Shook Me.flac")
+    fp.reverify_held_file.assert_awaited_once()
+    fp.place_held_file.assert_awaited_once()
+    reconciler.reconcile_with_filesystem.assert_awaited_once_with(
+        targets=[Path("/music/Led Zeppelin")]
+    )
+    svc._orchestrator.settle_after_manual_import.assert_awaited_once_with("t-1")
+    assert await store.list_held_imports("user-a", "user") == []
+    assert _ordinary_held_action_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_still_held_keeps_row_and_file(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+    fp.reverify_held_file = AsyncMock(return_value="still_held")
+    svc = _held_service(store, fp)
+
+    assert await svc.reverify_held(hid, "user-a", "user") == ("still_held", None)
+
+    fp.place_held_file.assert_not_called()
+    assert held_file.exists()
+    held = await store.get_held_import(hid, "user-a", "user")
+    assert held is not None and held.status == "held"
+    assert _ordinary_held_action_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_missing_file_discards_row(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+    fp.reverify_held_file = AsyncMock(side_effect=FileNotFoundError(str(held_file)))
+    svc = _held_service(store, fp)
+
+    with pytest.raises(ValidationError, match="no longer available"):
+        await svc.reverify_held(hid, "user-a", "user")
+
+    assert await store.list_held_imports("user-a", "user") == []
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_owner_admin_matrix(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    fp = MagicMock()
+    fp.reverify_held_file = AsyncMock(return_value="still_held")
+    svc = _held_service(store, fp)
+
+    with pytest.raises(ResourceNotFoundError):
+        await svc.reverify_held(hid, "user-b", "user")
+    assert await svc.reverify_held(hid, "user-a", "user") == ("still_held", None)
+    assert await svc.reverify_held(hid, "admin-1", "admin") == ("still_held", None)
+    assert fp.reverify_held_file.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_only_verifies_fingerprint_holds(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    management_id = await _record_held(
+        store, held_file, reason="management:PROFILE_CHANGED", track_number=4
+    )
+    assert management_id is not None
+    tag_path = tmp_path / "held" / "tag.flac"
+    tag_path.write_bytes(b"audio")
+    tag_id = await _record_held(store, tag_path, reason="tag_mismatch", track_number=6)
+    assert tag_id is not None
+    wrong_path = tmp_path / "held" / "wrong.flac"
+    wrong_path.write_bytes(b"audio")
+    wrong_id = await _record_held(
+        store, wrong_path, reason="wrong_track", track_number=7
+    )
+    assert wrong_id is not None
+    conversion_path = tmp_path / "held" / "y.flac"
+    conversion_path.write_bytes(b"audio")
+    conversion_id = await _record_held(
+        store, conversion_path, origin="edition_conversion", track_number=5
+    )
+    assert conversion_id is not None
+    fp = MagicMock()
+    svc = _held_service(store, fp)
+
+    # a tag-vetoed file whose AcoustID agrees must NOT import here: the normal
+    # path would still reject it on the tag veto, so reverify refuses outright.
+    with pytest.raises(ValidationError, match="Only fingerprint-held tracks"):
+        await svc.reverify_held(management_id, "user-a", "user")
+    with pytest.raises(ValidationError, match="Only fingerprint-held tracks"):
+        await svc.reverify_held(tag_id, "user-a", "user")
+    with pytest.raises(ValidationError, match="Only fingerprint-held tracks"):
+        await svc.reverify_held(wrong_id, "user-a", "user")
+    with pytest.raises(ValidationError, match="dedicated edition conversion workflow"):
+        await svc.reverify_held(conversion_id, "user-a", "user")
+    fp.reverify_held_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_without_processor_is_503_safe(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "x.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    hid = await _record_held(store, held_file)
+    svc = _held_service(store, None)
+
+    with pytest.raises(ConfigurationError, match="unavailable"):
+        await svc.reverify_held(hid, "user-a", "user")
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_bulk_reports_per_id_results(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    (tmp_path / "held").mkdir()
+    first = tmp_path / "held" / "a.flac"
+    first.write_bytes(b"audio")
+    first_id = await _record_held(store, first, track_number=1)
+    second = tmp_path / "held" / "b.flac"
+    second.write_bytes(b"audio")
+    second_id = await _record_held(store, second, track_number=2)
+    third = tmp_path / "held" / "c.flac"
+    third.write_bytes(b"audio")
+    third_id = await _record_held(
+        store, third, track_number=3, reason="management:PROFILE_CHANGED"
+    )
+    fp = MagicMock()
+    fp.reverify_held_file = AsyncMock(return_value="still_held")
+    fp.place_held_file = AsyncMock(return_value=Path("/music/x.flac"))
+    svc = _held_service(store, fp)
+
+    results = await svc.reverify_held_bulk("user-a", "user")
+
+    by_id = {item["held_id"]: item for item in results}
+    assert by_id[first_id]["status"] == "still_held"
+    assert by_id[second_id]["status"] == "still_held"
+    assert by_id[third_id]["status"] == "skipped"
+
+    scoped = await svc.reverify_held_bulk("user-a", "user", held_ids=[first_id])
+    assert [item["held_id"] for item in scoped] == [first_id]
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_bulk_skips_tag_mismatch_hold(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    (tmp_path / "held").mkdir()
+    fingerprinted = tmp_path / "held" / "a.flac"
+    fingerprinted.write_bytes(b"audio")
+    fingerprinted_id = await _record_held(store, fingerprinted, track_number=1)
+    tagged = tmp_path / "held" / "b.flac"
+    tagged.write_bytes(b"audio")
+    tagged_id = await _record_held(
+        store, tagged, track_number=2, reason="tag_mismatch"
+    )
+    fp = MagicMock()
+    fp.reverify_held_file = AsyncMock(return_value="still_held")
+    svc = _held_service(store, fp)
+
+    results = await svc.reverify_held_bulk("user-a", "user")
+
+    by_id = {item["held_id"]: item for item in results}
+    assert by_id[fingerprinted_id]["status"] == "still_held"
+    assert by_id[tagged_id]["status"] == "skipped"
+    assert fp.reverify_held_file.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_bulk_reports_single_error_row_on_unexpected_failure(
+    tmp_path,
+):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    (tmp_path / "held").mkdir()
+    ids = []
+    for index in range(3):
+        path = tmp_path / "held" / f"{index}.flac"
+        path.write_bytes(b"audio")
+        ids.append(await _record_held(store, path, track_number=10 + index))
+    svc = _held_service(store, MagicMock())
+
+    async def _boom(held_id, user_id, user_role):
+        if held_id == ids[1]:
+            raise RuntimeError("boom")
+        return ("still_held", None)
+
+    svc.reverify_held = AsyncMock(side_effect=_boom)
+
+    results = await svc.reverify_held_bulk("user-a", "user", held_ids=ids)
+
+    # exactly one row per requested id, in request order - the bad id reports a
+    # single error row (no fall-through second row reusing stale values).
+    assert [item["held_id"] for item in results] == ids
+    assert results[0]["status"] == "still_held"
+    assert results[2]["status"] == "still_held"
+    assert results[1] == {
+        "held_id": ids[1],
+        "status": "error",
+        "final_path": None,
+        "release_group_mbid": "rg-1",
+        "message": "Re-check failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_bulk_scopes_to_caller(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    (tmp_path / "held").mkdir()
+    mine = tmp_path / "held" / "mine.flac"
+    mine.write_bytes(b"audio")
+    mine_id = await _record_held(store, mine, track_number=1, user_id="user-b")
+    theirs = tmp_path / "held" / "theirs.flac"
+    theirs.write_bytes(b"audio")
+    await _record_held(store, theirs, track_number=2, user_id="user-a")
+    fp = MagicMock()
+    fp.reverify_held_file = AsyncMock(return_value="still_held")
+    svc = _held_service(store, fp)
+
+    results = await svc.reverify_held_bulk("user-b", "user")
+
+    assert [item["held_id"] for item in results] == [mine_id]
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_bulk_is_capped(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+    from services.native.download_service import HELD_REVERIFY_BULK_LIMIT
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    (tmp_path / "held").mkdir()
+    for index in range(HELD_REVERIFY_BULK_LIMIT + 5):
+        path = tmp_path / "held" / f"{index}.flac"
+        path.write_bytes(b"audio")
+        await _record_held(store, path, track_number=100 + index)
+    fp = MagicMock()
+    fp.reverify_held_file = AsyncMock(return_value="still_held")
+    svc = _held_service(store, fp)
+
+    results = await svc.reverify_held_bulk("user-a", "user")
+
+    assert len(results) == HELD_REVERIFY_BULK_LIMIT
+    assert fp.reverify_held_file.await_count == HELD_REVERIFY_BULK_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_bulk_skips_do_not_consume_cap(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+    from services.native.download_service import HELD_REVERIFY_BULK_LIMIT
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    (tmp_path / "held").mkdir()
+    for index in range(HELD_REVERIFY_BULK_LIMIT + 5):
+        path = tmp_path / "held" / f"{index}.flac"
+        path.write_bytes(b"audio")
+        await _record_held(store, path, track_number=100 + index)
+    # skipped rows sort newest-first ahead of the checks below: they report
+    # without consuming the sweep budget, then the cap still allows 25 checks.
+    for index in range(5):
+        path = tmp_path / "held" / f"mgmt-{index}.flac"
+        path.write_bytes(b"audio")
+        await _record_held(
+            store, path, track_number=200 + index, reason="management:PROFILE_CHANGED"
+        )
+    fp = MagicMock()
+    fp.reverify_held_file = AsyncMock(return_value="still_held")
+    svc = _held_service(store, fp)
+
+    results = await svc.reverify_held_bulk("user-a", "user")
+
+    statuses = [item["status"] for item in results]
+    assert statuses.count("skipped") == 5
+    assert fp.reverify_held_file.await_count == HELD_REVERIFY_BULK_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_reverify_held_bulk_continues_past_single_failure(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    (tmp_path / "held").mkdir()
+    gone = tmp_path / "held" / "gone.flac"
+    gone.write_bytes(b"audio")
+    gone_id = await _record_held(store, gone, track_number=1)
+    gone.unlink()
+    kept = tmp_path / "held" / "kept.flac"
+    kept.write_bytes(b"audio")
+    kept_id = await _record_held(store, kept, track_number=2)
+    fp = MagicMock()
+
+    async def _verdict(held):
+        if held.id == gone_id:
+            raise FileNotFoundError(held.held_path)
+        return "still_held"
+
+    fp.reverify_held_file = AsyncMock(side_effect=_verdict)
+    svc = _held_service(store, fp)
+
+    results = await svc.reverify_held_bulk("user-a", "user")
+
+    by_id = {item["held_id"]: item for item in results}
+    assert by_id[gone_id]["status"] == "error"
+    assert by_id[kept_id]["status"] == "still_held"
+
+
+@pytest.mark.asyncio
+async def test_edition_conversion_held_actions_stay_in_conversion_workflow(
+    tmp_path,
+):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "conversion.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    held_id = await _record_held(store, held_file, origin="edition_conversion")
+    processor = MagicMock()
+    svc = _held_service(store, processor)
+
+    for action in (svc.import_held, svc.discard_held):
+        with pytest.raises(
+            ValidationError, match="dedicated edition conversion workflow"
+        ):
+            await action(held_id, "user-a", "user")
+
+    assert held_file.exists()
+    held = await store.get_held_import(held_id, "user-a", "user")
+    assert held is not None and held.status == "held"
+    processor.place_held_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_held_import_remains_allowed(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "upgrade.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    held_id = await _record_held(store, held_file, origin="upgrade")
+    processor = MagicMock()
+    processor.place_held_file = AsyncMock(return_value=Path("/music/upgrade.flac"))
+    reconciler = MagicMock()
+    reconciler.reconcile_with_filesystem = AsyncMock()
+    svc = _held_service(store, processor, reconciler)
+
+    result = await svc.import_held(held_id, "user-a", "user")
+
+    assert result == "/music/upgrade.flac"
+    processor.place_held_file.assert_awaited_once()
+    assert await store.get_held_import(held_id, "user-a", "user") is None
+
+
+@pytest.mark.asyncio
 async def test_import_held_without_library_root_propagates_and_stays_held(tmp_path):
     """No library root configured: the ConfigurationError propagates to the route's
     400 mapping and the row stays held - the user restores a root and retries."""
@@ -1126,6 +1649,254 @@ async def test_import_held_without_library_root_propagates_and_stays_held(tmp_pa
     held = await store.list_held_imports("user-a", "user")
     assert [value.id for value in held] == [hid]
     assert await store.has_unresolved_held_for_task("t-1") is True
+    assert _ordinary_held_action_locks == {}
+    assert _ordinary_held_action_lock_users == {}
+
+
+@pytest.mark.asyncio
+async def test_automatic_management_hold_propagates_and_stays_held(tmp_path):
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "blocked.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"audio")
+    held_id = await _record_held(store, held_file)
+    processor = MagicMock()
+    processor.place_held_file = AsyncMock(
+        side_effect=AutomaticManagementHoldError(
+            "TRACK_NOT_MAPPED",
+            "provider secret /srv/private/profile.py path /library/blocked.flac",
+        )
+    )
+    svc = _held_service(store, processor)
+    store.resolve_held_import = AsyncMock()
+
+    with pytest.raises(AutomaticManagementHoldError):
+        await svc.import_held(held_id, "user-a", "user")
+
+    store.resolve_held_import.assert_not_awaited()
+    assert held_file.exists()
+    held = await store.get_held_import(held_id, "user-a", "user")
+    assert held is not None and held.status == "held"
+
+
+@pytest.mark.parametrize("winner", ["import", "discard"])
+@pytest.mark.asyncio
+async def test_ordinary_held_import_and_discard_serialize_by_held_id(tmp_path, winner):
+    import sqlite3
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    assert _ordinary_held_action_locks == {}
+    assert _ordinary_held_action_lock_users == {}
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "track.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"held-bytes")
+    held_id = await _record_held(store, held_file, task_id="ordinary-held")
+    destination = tmp_path / "library" / "track.flac"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def import_effect(held):  # noqa: ANN001
+        entered.set()
+        await release.wait()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(Path(held.held_path).read_bytes())
+        Path(held.held_path).unlink()
+        return destination
+
+    async def discard_effect(held):  # noqa: ANN001
+        entered.set()
+        await release.wait()
+        for value in held:
+            Path(value.held_path).unlink(missing_ok=True)
+
+    import_processor = MagicMock()
+    import_processor.place_held_file = AsyncMock(side_effect=import_effect)
+    discard_processor = MagicMock()
+    discard_processor.place_held_file = AsyncMock()
+    service_import = _held_service(store, import_processor)
+    service_discard = _held_service(store, discard_processor)
+    delete = AsyncMock(side_effect=discard_effect)
+    service_discard._delete_discarded_held_files = delete
+
+    if winner == "import":
+        first = asyncio.create_task(
+            service_import.import_held(held_id, "user-a", "user")
+        )
+    else:
+        first = asyncio.create_task(
+            service_discard.discard_held(held_id, "user-a", "user")
+        )
+    await entered.wait()
+    if winner == "import":
+        second = asyncio.create_task(
+            service_discard.discard_held(held_id, "user-a", "user")
+        )
+    else:
+        second = asyncio.create_task(
+            service_import.import_held(held_id, "user-a", "user")
+        )
+    await asyncio.sleep(0)
+
+    assert not second.done()
+    assert _ordinary_held_action_lock_users[held_id] == 2
+    if winner == "import":
+        import_processor.place_held_file.assert_awaited_once()
+        discard_processor.place_held_file.assert_not_awaited()
+        delete.assert_not_awaited()
+    else:
+        import_processor.place_held_file.assert_not_awaited()
+        discard_processor.place_held_file.assert_not_awaited()
+        assert delete.await_count == 1
+
+    release.set()
+    await first
+    with pytest.raises(ResourceNotFoundError):
+        await second
+
+    with sqlite3.connect(store.db_path) as connection:
+        status = connection.execute(
+            "SELECT status FROM held_imports WHERE id=?", (held_id,)
+        ).fetchone()[0]
+    assert status == ("imported" if winner == "import" else "discarded")
+    assert not held_file.exists()
+    if winner == "import":
+        assert destination.read_bytes() == b"held-bytes"
+    else:
+        assert not destination.exists()
+    assert _ordinary_held_action_locks == {}
+    assert _ordinary_held_action_lock_users == {}
+
+
+@pytest.mark.asyncio
+async def test_duplicate_ordinary_held_imports_have_one_side_effect(
+    tmp_path,
+):
+    import sqlite3
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    assert _ordinary_held_action_locks == {}
+    assert _ordinary_held_action_lock_users == {}
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "track.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"held-bytes")
+    held_id = await _record_held(store, held_file, task_id="ordinary-held")
+    destination = tmp_path / "library" / "track.flac"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def import_effect(held):  # noqa: ANN001
+        entered.set()
+        await release.wait()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(Path(held.held_path).read_bytes())
+        Path(held.held_path).unlink()
+        return destination
+
+    first_processor = MagicMock()
+    first_processor.place_held_file = AsyncMock(side_effect=import_effect)
+    second_processor = MagicMock()
+    second_processor.place_held_file = AsyncMock()
+    first_service = _held_service(store, first_processor)
+    second_service = _held_service(store, second_processor)
+
+    first = asyncio.create_task(first_service.import_held(held_id, "user-a", "user"))
+    await entered.wait()
+    second = asyncio.create_task(second_service.import_held(held_id, "user-a", "user"))
+    await asyncio.sleep(0)
+
+    assert not second.done()
+    assert _ordinary_held_action_lock_users[held_id] == 2
+    assert first_processor.place_held_file.await_count == 1
+    assert second_processor.place_held_file.await_count == 0
+
+    release.set()
+    assert await first == str(destination)
+    with pytest.raises(ResourceNotFoundError):
+        await second
+
+    with sqlite3.connect(store.db_path) as connection:
+        status = connection.execute(
+            "SELECT status FROM held_imports WHERE id=?", (held_id,)
+        ).fetchone()[0]
+    assert (
+        first_processor.place_held_file.await_count
+        + second_processor.place_held_file.await_count
+        == 1
+    )
+    assert status == "imported"
+    assert not held_file.exists()
+    assert destination.read_bytes() == b"held-bytes"
+    assert _ordinary_held_action_locks == {}
+    assert _ordinary_held_action_lock_users == {}
+
+
+@pytest.mark.asyncio
+async def test_ordinary_held_action_registry_cleans_up_cancelled_waiter(tmp_path):
+    import sqlite3
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+
+    assert _ordinary_held_action_locks == {}
+    assert _ordinary_held_action_lock_users == {}
+    store = DownloadStore(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    held_file = tmp_path / "held" / "track.flac"
+    held_file.parent.mkdir()
+    held_file.write_bytes(b"held-bytes")
+    held_id = await _record_held(store, held_file, task_id="ordinary-held")
+    destination = tmp_path / "library" / "track.flac"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def import_effect(held):  # noqa: ANN001
+        entered.set()
+        await release.wait()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(Path(held.held_path).read_bytes())
+        Path(held.held_path).unlink()
+        return destination
+
+    first_processor = MagicMock()
+    first_processor.place_held_file = AsyncMock(side_effect=import_effect)
+    second_processor = MagicMock()
+    second_processor.place_held_file = AsyncMock()
+    first_service = _held_service(store, first_processor)
+    second_service = _held_service(store, second_processor)
+
+    first = asyncio.create_task(first_service.import_held(held_id, "user-a", "user"))
+    await entered.wait()
+    second = asyncio.create_task(second_service.import_held(held_id, "user-a", "user"))
+    await asyncio.sleep(0)
+    assert _ordinary_held_action_lock_users[held_id] == 2
+
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    assert _ordinary_held_action_lock_users[held_id] == 1
+    assert first_processor.place_held_file.await_count == 1
+    assert second_processor.place_held_file.await_count == 0
+
+    release.set()
+    assert await first == str(destination)
+    with sqlite3.connect(store.db_path) as connection:
+        status = connection.execute(
+            "SELECT status FROM held_imports WHERE id=?", (held_id,)
+        ).fetchone()[0]
+    assert status == "imported"
+    assert not held_file.exists()
+    assert destination.read_bytes() == b"held-bytes"
+    assert _ordinary_held_action_locks == {}
+    assert _ordinary_held_action_lock_users == {}
 
 
 @pytest.mark.asyncio
@@ -1960,44 +2731,40 @@ def _conversion_held() -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_held_file_reserved_by_a_live_conversion_cannot_be_imported_alone():
-    """The conversion clears the slot it writes into as part of its own apply.
+async def test_manual_search_pins_snapshot_for_job_and_scorer():
+    service, store, _bus, _indexer, scorer, _orchestrator = _make_service()
+    snapshot = AcquisitionQualitySnapshot(
+        quality_preference_order=["lossless"],
+        source_selection_mode="quality_first",
+        snapshot_hash="manual-snapshot",
+        summary="Try lossless.",
+    )
+    snapshot.snapshot_hash = acq_quality.snapshot_policy_hash(snapshot)
+    service._snapshot_factory = lambda: snapshot
 
-    Importing the file by itself hits that not-yet-cleared file and used to fail as
-    "a planned destination is occupied by different content" - accurate but
-    unactionable, and the user retries it forever.
-    """
-    service, store, *_ = _make_service()
-    store.get_held_import.return_value = _conversion_held()
-    store.find_active_edition_conversion_for_held_path.return_value = "job-1"
+    job_id = await service.search_album("u1", "A", "B", release_group_mbid="rg")
+    await TaskRegistry.get_instance().get_all()["search-job1"]
 
-    with pytest.raises(ValidationError, match="pending exact-edition conversion"):
-        await service.import_held(718, "u1", "admin")
-
-    store.resolve_held_import.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_held_file_reserved_by_a_live_conversion_cannot_be_discarded_alone():
-    service, store, *_ = _make_service()
-    store.get_held_import.return_value = _conversion_held()
-    store.find_active_edition_conversion_for_held_path.return_value = "job-1"
-
-    with pytest.raises(ValidationError, match="pending exact-edition conversion"):
-        await service.discard_held(718, "u1", "admin")
-
-    store.resolve_held_import.assert_not_awaited()
+    create_kwargs = store.create_search_job.call_args.kwargs
+    assert create_kwargs["quality_snapshot_hash"] == snapshot.snapshot_hash
+    assert scorer.rank.await_args.kwargs["snapshot"] == snapshot
+    assert job_id == "job1"
 
 
 @pytest.mark.asyncio
-async def test_held_file_from_a_finished_conversion_stays_disposable():
-    """Only *live* jobs reserve a file. A cancelled or applied conversion must not
-    leave its leftovers permanently unimportable and undiscardable."""
-    service, store, *_ = _make_service()
-    store.get_held_import.return_value = _conversion_held()
-    store.find_active_edition_conversion_for_held_path.return_value = None
-    service._delete_discarded_held_files = AsyncMock()
+async def test_standalone_pick_uses_search_snapshot_on_new_task():
+    service, store, _bus, _indexer, _scorer, _orchestrator = _make_service()
+    snapshot = AcquisitionQualitySnapshot(
+        quality_preference_order=["lossless"],
+        source_selection_mode="quality_first",
+        snapshot_hash="job-snapshot",
+        summary="Try lossless.",
+    )
+    snapshot.snapshot_hash = acq_quality.snapshot_policy_hash(snapshot)
+    service._snapshot_factory = lambda: snapshot
 
-    await service.discard_held(718, "u1", "admin")
+    await service.pick_candidate("u1", "job1", 0)
 
-    store.resolve_held_import.assert_awaited_once_with(718, "discarded")
+    create_kwargs = store.create_task.await_args.kwargs
+    assert create_kwargs["quality_snapshot_hash"] == snapshot.snapshot_hash
+    assert create_kwargs["quality_snapshot_summary"] == "Try lossless."

@@ -101,7 +101,54 @@ async def test_sabnzbd(
     if api_key == SABNZBD_API_KEY_MASK:
         api_key = preferences.get_sabnzbd_connection_raw().api_key
 
-    client = build_sabnzbd_download_client(settings.url, api_key)
+    client = build_sabnzbd_download_client(settings.url, api_key, settings.downloads_mount)
+    try:
+        status = await client.health_check()
+        if status.status != "ok":
+            return SabnzbdTestResponse(
+                valid=False, message=status.message or "SABnzbd unreachable"
+            )
+        cats = await client.get_categories()
+        complete_dir = await client.get_complete_dir()
+    except ExternalServiceError as exc:
+        return SabnzbdTestResponse(valid=False, message=str(exc))
+    # Catch a misconfigured downloads mount at config time (rokim's class of
+    # report): the submitted mount - not the stored one - is diagnosed, so an
+    # unsaved correction already shows the fixed verdict.
+    diagnosis = await client.diagnose_downloads_mount()
+    mount_message = None
+    if (
+        diagnosis.sampled_downloads > 0
+        and diagnosis.resolvable_downloads < diagnosis.sampled_downloads
+    ):
+        mount_message = (
+            f"Only {diagnosis.resolvable_downloads}/{diagnosis.sampled_downloads} "
+            f"sampled SABnzbd download(s) resolve under {settings.downloads_mount} - "
+            "the mount likely points at the wrong folder (for example a category "
+            "subfolder of SABnzbd's completed dir shown above)"
+        )
+    return SabnzbdTestResponse(
+        valid=True,
+        version=status.version,
+        message=f"SABnzbd {status.version}",
+        categories=cats,
+        complete_dir=complete_dir or None,
+        mount_has_files=diagnosis.mount_has_files,
+        resolvable_downloads=diagnosis.resolvable_downloads,
+        sampled_downloads=diagnosis.sampled_downloads,
+        mount_message=mount_message,
+    )
+
+
+@router.get("/sabnzbd/status", response_model=SabnzbdTestResponse)
+async def get_sabnzbd_status(
+    _: CurrentAdminDep, preferences=Depends(get_preferences_service)
+):
+    """Live per-client status checked against the SAVED config (not submitted values)."""
+    raw = preferences.get_sabnzbd_connection_raw()
+    if not raw.url.strip():
+        return SabnzbdTestResponse(valid=False, message="Not configured")
+    client = build_sabnzbd_download_client(raw.url, raw.api_key, raw.downloads_mount)
     try:
         status = await client.health_check()
         if status.status != "ok":
@@ -155,16 +202,14 @@ async def update_policy(
     # submitted field (Acquisition plan: never clamp new-field submissions).
     try:
         validate_new_quality_fields(payload)
-    except ValueError as exc:
+        policy = msgspec.convert(payload, type=DownloadPolicySettings)
+    except (ValueError, TypeError, msgspec.ValidationError) as exc:
         from core.exceptions import ValidationError
 
         raise ValidationError(str(exc)) from exc
-    policy = msgspec.convert(payload, type=DownloadPolicySettings)
     preferences.save_download_policy(policy)
     _clear_download_client_cache()
     return preferences.get_download_policy()
-
-
 
 
 @router.get("/policy-summary", response_model=PolicySummaryResponse)
@@ -197,10 +242,12 @@ async def get_policy_summary(
     return PolicySummaryResponse(
         summary=snapshot.summary,
         source_mode=policy.source_selection_mode,
-        legacy_rollback_compatible=legacy_rollback_compatible,
+        legacy_rollback_compatible=(
+            not policy.quality_recipe and legacy_rollback_compatible
+        ),
+        quality_recipe_status=policy.quality_recipe_status,
+        quality_recipe_error=policy.quality_recipe_error,
     )
-
-
 
 
 @router.post("/policy/impact", response_model=PolicyImpactResponse)
@@ -220,29 +267,20 @@ async def preview_policy_impact(
 
     try:
         validate_new_quality_fields(payload)
-    except ValueError as exc:
+        candidate = msgspec.convert(payload, type=DownloadPolicySettings)
+        snapshot = build_snapshot(candidate)
+    except (ValueError, TypeError, msgspec.ValidationError) as exc:
         from core.exceptions import ValidationError
 
         raise ValidationError(str(exc)) from exc
-    candidate = msgspec.convert(payload, type=DownloadPolicySettings)
-    snapshot = build_snapshot(candidate)
-    legacy_representable = (
-        snapshot.quality_preference_order == derive_default_order(
-            candidate.quality_min, candidate.quality_max
-        )
-        or snapshot.quality_preference_order == list(snapshot.quality_preference_order)
-        and False
-    )
     # Legacy-representable = EXACTLY today's default shape (hi-res-first over a
     # contiguous range with no custom targets/caps/evidence overrides) - i.e.
     # what an older image can reproduce on load.
     legacy_representable = (
-        sorted(snapshot.quality_preference_order) == sorted(
-            derive_default_order(candidate.quality_min, candidate.quality_max)
-        )
-        and snapshot.quality_preference_order == derive_default_order(
-            candidate.quality_min, candidate.quality_max
-        )
+        sorted(snapshot.quality_preference_order)
+        == sorted(derive_default_order(candidate.quality_min, candidate.quality_max))
+        and snapshot.quality_preference_order
+        == derive_default_order(candidate.quality_min, candidate.quality_max)
         and candidate.lossless_preference == "highest"
         and candidate.lossless_max_bit_depth is None
         and candidate.lossless_max_sample_rate_hz is None
@@ -262,6 +300,7 @@ async def preview_policy_impact(
         held_reviews=buckets["held_reviews"],
         legacy_representable=bool(legacy_representable),
     )
+
 
 @router.get("/wanted", response_model=WantedWatcherSettings)
 async def get_wanted_watcher_settings(

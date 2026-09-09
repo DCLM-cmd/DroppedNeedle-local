@@ -794,11 +794,31 @@ export type JellyfinTrackPage = {
 	limit: number;
 };
 
+// mirrors backend api/v1/schemas/settings.py (NavidromeConnectionSettings, NavidromePlaylistSyncResult)
+export type NavidromePlaylistSyncScope = 'public' | 'all';
+
 export type NavidromeConnectionSettings = {
 	navidrome_url: string;
 	username: string;
 	password: string;
 	enabled: boolean;
+	playlist_sync_enabled: boolean;
+	playlist_sync_path: string;
+	playlist_sync_scope: NavidromePlaylistSyncScope;
+	playlist_sync_remove_deleted: boolean;
+};
+
+export type NavidromePlaylistSyncResult = {
+	success: boolean;
+	message: string;
+	written: number;
+	unchanged: number;
+	removed: number;
+	removal_failures: number;
+	skipped_empty: number;
+	skipped_not_ours: number;
+	tracks_missing_files: number;
+	tracks_unrepresentable: number;
 };
 
 export type NavidromeTrackInfo = {
@@ -2021,6 +2041,10 @@ export interface AlbumEditionsResponse {
 	selected_release_mbid: string | null;
 }
 
+export interface EditionPinResponse {
+	pinned_release_mbid: string | null;
+}
+
 export interface EditionAcquireResponse {
 	release_mbid: string;
 	total_tracks: number;
@@ -2106,6 +2130,7 @@ export interface DownloadClientConfig {
 	quality_max: string;
 	flac_mp3_only: boolean;
 	downloads_subpath: string;
+	slskd_incomplete_mount: string;
 	preflight_score_auto_accept: number;
 	preflight_score_manual_min: number;
 	download_stall_timeout_minutes: number;
@@ -2201,11 +2226,85 @@ export interface SabnzbdTestResult {
 	message: string;
 	categories: string[];
 	complete_dir?: string | null;
+	mount_has_files?: boolean | null;
+	resolvable_downloads?: number | null;
+	sampled_downloads?: number | null;
+	mount_message?: string | null;
+}
+
+export type QualityRecipeFormat = 'flac' | 'mp3';
+
+export type QualityRecipeQuality =
+	| 'below_192'
+	| '192_255'
+	| '256_319'
+	| '320_plus'
+	| 'cd'
+	| '24_48'
+	| '24_96'
+	| '24_192'
+	| 'hi_res'
+	| 'custom';
+
+export interface QualityRecipeEntry {
+	format: QualityRecipeFormat;
+	quality: QualityRecipeQuality;
+	min_bitrate_kbps?: number | null;
+	target_bitrate_kbps?: number | null;
+	max_bitrate_kbps?: number | null;
+	bit_depth?: number | null;
+	sample_rate_hz?: number | null;
 }
 
 export interface SourcePriority {
 	order: string[];
 }
+export type CodecFamily = 'lossy' | 'lossless' | 'unknown';
+export type EvidenceCertainty = 'exact' | 'partial' | 'inferred' | 'unknown';
+export type EvidenceProvenance =
+	| 'local_probe'
+	| 'source_metadata'
+	| 'archive_format'
+	| 'release_title'
+	| 'category'
+	| 'format_only'
+	| 'none';
+
+export interface AudioQualityEvidence {
+	extension: string;
+	codec_family: CodecFamily;
+	bitrate_kbps: number | null;
+	bit_depth: number | null;
+	sample_rate_hz: number | null;
+	total_bytes: number | null;
+	audio_file_count: number;
+	mixed_format: boolean;
+	mixed_quality: boolean;
+	certainty: EvidenceCertainty;
+	provenance: EvidenceProvenance;
+}
+
+export interface QualityDecision {
+	eligible: boolean;
+	disposition: string;
+	tier: string | null;
+	preference_step: number | null;
+	quality_recipe_index: number | null;
+	quality_recipe_entry: QualityRecipeEntry | null;
+	lossless_detail_step: number | null;
+	evidence: AudioQualityEvidence;
+	reasons: string[];
+	summary: string;
+}
+
+export interface QualityRejectionSummary {
+	outside_policy: number;
+	unknown_rejected: number;
+	not_importable: number;
+	needs_review: number;
+}
+
+export type QualityRecipeStatus = 'v1' | 'v2' | 'non_convertible' | 'invalid';
 
 export interface DownloadPolicySettings {
 	quality_min: string;
@@ -2232,6 +2331,18 @@ export interface DownloadPolicySettings {
 	background_upgrade_scan_enabled: boolean;
 	background_upgrade_scan_interval_hours: number;
 	background_upgrade_max_per_run: number;
+	quality_preference_order?: string[];
+	preferred_lossy_bitrate_kbps?: number | null;
+	lossy_min_bitrate_kbps?: number | null;
+	lossy_max_bitrate_kbps?: number | null;
+	lossless_preference?: string;
+	lossless_max_bit_depth?: number | null;
+	lossless_max_sample_rate_hz?: number | null;
+	unknown_quality_behavior?: string;
+	source_selection_mode?: string;
+	quality_recipe?: QualityRecipeEntry[];
+	quality_recipe_status?: QualityRecipeStatus;
+	quality_recipe_error?: string | null;
 }
 
 // Hand-mirrors backend WantedWatcherSettings (api/v1/schemas/settings.py).
@@ -2242,7 +2353,6 @@ export interface WantedWatcherSettings {
 	max_checks_per_sweep: number;
 	dormant_after_days: number;
 }
-
 export interface DownloadSearchResultFile {
 	username: string;
 	filename: string;
@@ -2257,9 +2367,7 @@ export interface DownloadSearchResultFile {
 	upload_speed: number;
 	queue_length?: number | null;
 }
-
 export type CandidateTier = 'auto' | 'manual' | 'rejected';
-
 export interface UsenetRelease {
 	indexer_id: string;
 	indexer_name: string;
@@ -2286,6 +2394,8 @@ export interface ScoredCandidate {
 	final_score: number;
 	tier: CandidateTier;
 	candidate_index?: number | null;
+	quality_evidence?: AudioQualityEvidence | null;
+	quality_decision?: QualityDecision | null;
 }
 
 export interface SearchAlbumResponse {
@@ -2300,6 +2410,8 @@ export interface SearchJobView {
 	album_title: string;
 	candidate_count: number;
 	top_score?: number | null;
+	quality_snapshot_summary?: string | null;
+	quality_rejections: QualityRejectionSummary;
 	candidates: ScoredCandidate[];
 }
 
@@ -2426,6 +2538,7 @@ export interface HeldImport {
 	original_filename: string | null;
 	file_format: string | null;
 	duration_seconds: number | null;
+	expected_duration_seconds: number | null;
 	reason: string;
 	reason_detail: string | null;
 	source: string;
@@ -2471,6 +2584,8 @@ export interface PolicySummary {
 	summary: string;
 	source_mode: 'source_first' | 'quality_first' | string;
 	legacy_rollback_compatible: boolean;
+	quality_recipe_status: QualityRecipeStatus;
+	quality_recipe_error: string | null;
 }
 
 export interface PolicyImpactResponse {
@@ -2516,6 +2631,7 @@ export interface RequestAccepted {
 	message: string;
 	musicbrainz_id: string;
 	status: RequestAcceptedStatus;
+	quality_snapshot_summary?: string | null;
 }
 
 export type TrackRequestStatus = 'awaiting_approval' | 'queued' | 'already_in_library';

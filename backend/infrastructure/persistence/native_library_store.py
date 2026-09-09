@@ -15,11 +15,12 @@ from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path, PurePosixPath
 import threading
 import time
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 import msgspec
 
 from core.exceptions import (
+    ConfigurationError,
     ConflictError,
     CustomEditionNotSealableError,
     ExactReleaseMappingIncompleteError,
@@ -131,19 +132,24 @@ from models.local_catalog import (
 MAX_REVISION = 9_223_372_036_854_775_807
 
 
-def _provider_base_url_for(decision_source: str) -> str | None:
-    """P2 full-mirror provenance stamp (owner decision 2026-08-24).
-
-    Auditability ONLY: records which MusicBrainz endpoint class served an
-    accepted AUTOMATIC identity (get_mb_api_base() at capture time). Never
-    read by identity predicates, never gates any decision; manual and
-    legacy_import rows stay NULL by definition.
-    """
+def _provider_provenance_for(
+    decision_source: str,
+    *,
+    source_mode: str | None = None,
+    source_id: str | None = None,
+    source_generation: int | None = None,
+) -> tuple[str | None, str | None, int | None]:
+    """Return only explicitly captured opaque provenance."""
     if decision_source != "automatic":
-        return None
-    from repositories.musicbrainz_base import get_mb_api_base
+        return None, None, None
+    if source_mode is None or source_id is None or source_generation is None:
+        return None, None, None
+    return source_mode, source_id, source_generation
 
-    return get_mb_api_base()
+
+def _provider_base_url_for(decision_source: str) -> str | None:
+    """Provider endpoints are never persisted in native identity rows."""
+    return None
 
 
 def _has_surrogates(text: str) -> bool:
@@ -603,6 +609,12 @@ def _review_filter_predicate(
                 else "COALESCE(attempt.candidate_count, 0)"
             )
             clauses.append(f"{expression} {'> 0' if normalized == 'true' else '= 0'}")
+        elif key == "exclude_active_jobs":
+            normalized = value.strip().casefold()
+            if normalized not in {"true", "false"}:
+                raise ValueError(f"Invalid boolean review selection filter: {key}")
+            if normalized == "true":
+                clauses.append("job.id IS NULL")
         elif key == "states":
             try:
                 states = msgspec.json.decode(value.encode())
@@ -980,6 +992,38 @@ def _strip_bundle_artwork(document: dict[str, Any]) -> None:
         for artifact in entry.get("artifacts") or ():
             if isinstance(artifact, dict):
                 artifact.pop("content", None)
+
+
+class ReferenceProvenanceSkip(NamedTuple):
+    """One legacy reference the batch apply could not materialize.
+
+    A skip means the row's source or target vanished between reference
+    resolution (a separate ``_read``) and this write transaction, or the
+    persisted key/parentage is malformed. Skipped rows record no provenance
+    and leave no ``library_*`` residue, so pending-count math still treats
+    them as pending. ``reason`` is one of ``not_materialized``,
+    ``invalid_key``, or ``integrity_error``.
+    """
+
+    source_kind: str
+    source_key: str
+    target_kind: str
+    target_id: str
+    reason: str
+
+
+class ReferenceProvenanceBatchResult(NamedTuple):
+    """Outcome of ``apply_reference_provenance_batch``.
+
+    ``int(result)`` is the inserted count for backward compatibility with
+    callers that ignore per-row disposition.
+    """
+
+    inserted: int
+    skipped: tuple[ReferenceProvenanceSkip, ...] = ()
+
+    def __int__(self) -> int:
+        return self.inserted
 
 
 class NativeLibraryStore(PersistenceBase):
@@ -1485,6 +1529,107 @@ class NativeLibraryStore(PersistenceBase):
             raise
 
     @staticmethod
+    def _ensure_identification_review_edition_tier(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Rebuild the review table once so its CHECK admits the tier state.
+
+        P2 RG edition-uncertain tier persists as review rows with
+        state='edition_to_confirm' (never 'needs_review') carrying the RG pin
+        flag plus ranked `rg:release` edition keys for the Confirm-edition UI.
+        """
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'library_identification_reviews'"
+        ).fetchone()
+        if row is None or "edition_to_confirm" in str(row[0]):
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE library_identification_reviews__edition_tier_v1 (
+                    id TEXT PRIMARY KEY,
+                    local_album_id TEXT REFERENCES local_albums(id) ON DELETE RESTRICT,
+                    local_track_id TEXT REFERENCES local_tracks(id) ON DELETE RESTRICT,
+                    state TEXT NOT NULL CHECK(state IN ('needs_review','keep_tagged','excluded','resolved','edition_to_confirm')),
+                    reason_code TEXT NOT NULL,
+                    attempt_id TEXT REFERENCES library_identification_attempts(id) ON DELETE RESTRICT,
+                    input_revision TEXT NOT NULL,
+                    decision_revision INTEGER NOT NULL DEFAULT 1 CHECK(decision_revision BETWEEN 1 AND 9223372036854775807),
+                    decided_by_user_id TEXT REFERENCES auth_users(id) ON DELETE SET NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    decided_at REAL,
+                    row_revision INTEGER NOT NULL DEFAULT 1 CHECK(row_revision BETWEEN 1 AND 9223372036854775807),
+                    edition_uncertain INTEGER NOT NULL DEFAULT 0 CHECK(edition_uncertain IN (0,1)),
+                    ranked_edition_keys_json TEXT NOT NULL DEFAULT '[]',
+                    CHECK((local_album_id IS NOT NULL) != (local_track_id IS NOT NULL))
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO library_identification_reviews__edition_tier_v1 (
+                    id, local_album_id, local_track_id, state, reason_code,
+                    attempt_id, input_revision, decision_revision,
+                    decided_by_user_id, created_at, updated_at, decided_at,
+                    row_revision, edition_uncertain, ranked_edition_keys_json
+                )
+                SELECT
+                    id, local_album_id, local_track_id, state, reason_code,
+                    attempt_id, input_revision, decision_revision,
+                    decided_by_user_id, created_at, updated_at, decided_at,
+                    row_revision, 0, '[]'
+                FROM library_identification_reviews
+                """
+            )
+            connection.execute("DROP TABLE library_identification_reviews")
+            connection.execute(
+                "ALTER TABLE library_identification_reviews__edition_tier_v1 "
+                "RENAME TO library_identification_reviews"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_library_reviews_active_album "
+                "ON library_identification_reviews(local_album_id, input_revision) "
+                "WHERE local_album_id IS NOT NULL AND state != 'resolved'"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_library_reviews_active_track "
+                "ON library_identification_reviews(local_track_id, input_revision) "
+                "WHERE local_track_id IS NOT NULL AND state != 'resolved'"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_library_reviews_cursor "
+                "ON library_identification_reviews(updated_at DESC, id DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_library_reviews_created_cursor "
+                "ON library_identification_reviews(created_at DESC, id DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_library_reviews_state_cursor "
+                "ON library_identification_reviews(state, updated_at DESC, id DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_library_reviews_reason_cursor "
+                "ON library_identification_reviews(reason_code, updated_at DESC, id DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_library_reviews_album "
+                "ON library_identification_reviews(local_album_id, updated_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_library_reviews_track_reason "
+                "ON library_identification_reviews(local_track_id, reason_code)"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+    @staticmethod
     def _ensure_foreign_key_validation_triggers(
         connection: sqlite3.Connection,
     ) -> None:
@@ -1525,6 +1670,7 @@ class NativeLibraryStore(PersistenceBase):
             connection.execute("PRAGMA foreign_keys=OFF")
             connection.executescript(SCHEMA_SQL)
             self._ensure_library_management_operation_kind(connection)
+            self._ensure_identification_review_edition_tier(connection)
             connection.execute("PRAGMA foreign_keys=ON")
             for statement in (
                 "ALTER TABLE library_identification_jobs ADD COLUMN checkpoint_json TEXT",
@@ -1606,6 +1752,15 @@ class NativeLibraryStore(PersistenceBase):
                 "ALTER TABLE local_track_external_identities ADD COLUMN release_track_position INTEGER CHECK(release_track_position IS NULL OR release_track_position > 0)",
                 "ALTER TABLE local_album_external_identities ADD COLUMN provider_base_url TEXT",
                 "ALTER TABLE local_track_external_identities ADD COLUMN provider_base_url TEXT",
+                "ALTER TABLE local_artist_external_identities ADD COLUMN provider_source_mode TEXT",
+                "ALTER TABLE local_artist_external_identities ADD COLUMN provider_source_id TEXT",
+                "ALTER TABLE local_artist_external_identities ADD COLUMN provider_source_generation INTEGER",
+                "ALTER TABLE local_album_external_identities ADD COLUMN provider_source_mode TEXT",
+                "ALTER TABLE local_album_external_identities ADD COLUMN provider_source_id TEXT",
+                "ALTER TABLE local_album_external_identities ADD COLUMN provider_source_generation INTEGER",
+                "ALTER TABLE local_track_external_identities ADD COLUMN provider_source_mode TEXT",
+                "ALTER TABLE local_track_external_identities ADD COLUMN provider_source_id TEXT",
+                "ALTER TABLE local_track_external_identities ADD COLUMN provider_source_generation INTEGER",
                 "ALTER TABLE library_management_plan_items ADD COLUMN destination_collision_key TEXT",
                 "ALTER TABLE library_management_plan_items ADD COLUMN catalog_document_json TEXT",
                 "ALTER TABLE library_management_plan_items ADD COLUMN catalog_document_hash TEXT",
@@ -2219,6 +2374,35 @@ class NativeLibraryStore(PersistenceBase):
                 if len(candidates) == 1:
                     resolved[identifier] = next(iter(candidates))
             return resolved
+
+        return await self._read(operation)
+
+    async def find_import_reuse_album_id(self, release_group_mbid: str) -> str | None:
+        """Issue #301: oldest active owner of a provider release group.
+
+        Import-only reuse differs from the canonical resolver on purpose:
+        zero owners -> None (caller mints via the grouping key), one owner
+        -> that album, and several active owners -> the oldest (min
+        created_at, tie-break by id) instead of staying unresolved. Active
+        means non-retired with at least one indexed track. Pin get/set
+        semantics in ``_resolve_target_album_pin_id`` are untouched.
+        """
+
+        def operation(connection: sqlite3.Connection) -> str | None:
+            row = connection.execute(
+                "SELECT album.id AS id FROM local_albums album "
+                "JOIN local_album_external_identities identity "
+                "ON identity.local_album_id = album.id "
+                "WHERE identity.provider = 'musicbrainz' "
+                "AND LOWER(identity.release_group_mbid) = LOWER(?) "
+                "AND album.retired_into_album_id IS NULL "
+                "AND EXISTS (SELECT 1 FROM local_tracks active_track "
+                "WHERE active_track.local_album_id = album.id "
+                "AND active_track.availability = 'indexed') "
+                "ORDER BY album.created_at ASC, album.id ASC LIMIT 1",
+                (release_group_mbid,),
+            ).fetchone()
+            return str(row["id"]) if row is not None else None
 
         return await self._read(operation)
 
@@ -4127,8 +4311,9 @@ class NativeLibraryStore(PersistenceBase):
     ) -> tuple[set[str], set[str]]:
         """ST1: provider ids a committed album contributes to catalog-scope
         invalidation - (release-group mbids, artist mbids). The album identity
-        row supplies the RG; artist mbids come from the indexed tracks'
-        musicbrainz identities. Empty sets are valid (nothing to delete)."""
+        row supplies the RG; artist mbids come from the album's and its
+        tracks' credited artists' musicbrainz identities. Empty sets are
+        valid (nothing to delete)."""
 
         def operation(
             connection: sqlite3.Connection,
@@ -4142,12 +4327,18 @@ class NativeLibraryStore(PersistenceBase):
                 {str(rg_row["release_group_mbid"])} if rg_row is not None else set()
             )
             artist_rows = connection.execute(
-                "SELECT DISTINCT te.provider_artist_id FROM "
-                "local_track_external_identities te "
-                "JOIN local_tracks t ON t.id = te.local_track_id "
-                "WHERE t.local_album_id = ? AND te.provider = 'musicbrainz' "
-                "AND te.provider_artist_id IS NOT NULL",
-                (local_album_id,),
+                "SELECT DISTINCT identity.provider_artist_id "
+                "FROM local_artist_external_identities identity "
+                "WHERE identity.provider = 'musicbrainz' "
+                "AND identity.provider_artist_id IS NOT NULL "
+                "AND (EXISTS (SELECT 1 FROM local_album_artists credit "
+                "WHERE credit.local_album_id = ? "
+                "AND credit.local_artist_id = identity.local_artist_id) "
+                "OR EXISTS (SELECT 1 FROM local_track_artists credit "
+                "JOIN local_tracks track ON track.id = credit.local_track_id "
+                "WHERE track.local_album_id = ? "
+                "AND credit.local_artist_id = identity.local_artist_id))",
+                (local_album_id, local_album_id),
             ).fetchall()
             artist_ids = {str(row["provider_artist_id"]) for row in artist_rows}
             return rg_ids, artist_ids
@@ -4375,6 +4566,12 @@ class NativeLibraryStore(PersistenceBase):
                     "WHERE state = 'needs_review'"
                 ).fetchone()[0]
             )
+            edition_to_confirm = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM library_identification_reviews "
+                    "WHERE state = 'edition_to_confirm'"
+                ).fetchone()[0]
+            )
             local_only = int(
                 connection.execute(
                     "SELECT COUNT(DISTINCT t.local_album_id) FROM local_tracks t "
@@ -4396,6 +4593,7 @@ class NativeLibraryStore(PersistenceBase):
                     str(item["file_format"]): int(item["count"]) for item in formats
                 },
                 "unmatched_count": unmatched,
+                "edition_to_confirm_count": edition_to_confirm,
                 "local_only_count": local_only,
                 "last_scan_at": float(last_scan) if last_scan is not None else None,
             }
@@ -5485,6 +5683,28 @@ class NativeLibraryStore(PersistenceBase):
             rows = connection.execute(
                 "SELECT * FROM library_playlist_tracks WHERE playlist_id = ? "
                 "ORDER BY position",
+                (playlist_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def list_target_playlist_export_rows(
+        self, playlist_id: str
+    ) -> list[dict[str, Any]]:
+        """Ordered playlist entries joined to the local file each one plays.
+
+        Entries with no local track (Navidrome/Plex/YouTube) return a NULL
+        ``file_path`` rather than being dropped, so the caller can report them.
+        """
+
+        def operation(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = connection.execute(
+                "SELECT pt.position, pt.track_name, pt.artist_name, "
+                "pt.duration, t.file_path "
+                "FROM library_playlist_tracks pt "
+                "LEFT JOIN local_tracks t ON t.id = pt.local_track_id "
+                "WHERE pt.playlist_id = ? ORDER BY pt.position",
                 (playlist_id,),
             ).fetchall()
             return [dict(row) for row in rows]
@@ -7076,6 +7296,16 @@ class NativeLibraryStore(PersistenceBase):
         *,
         expected_album_revision: int,
     ) -> tuple[int, int]:
+        provider_source_mode, provider_source_id, provider_source_generation = (
+            _provider_provenance_for(
+                identity.decision_source,
+                source_mode=identity.provider_source_mode,
+                source_id=identity.provider_source_id,
+                source_generation=identity.provider_source_generation,
+            )
+        )
+        provider_base_url = _provider_base_url_for(identity.decision_source)
+
         def operation(connection: sqlite3.Connection) -> tuple[int, int]:
             new_revision = self._require_revision_update(
                 connection,
@@ -7095,8 +7325,9 @@ class NativeLibraryStore(PersistenceBase):
                     "INSERT INTO local_album_external_identities "
                     "(local_album_id, provider, release_group_mbid, release_mbid, "
                     "decision_source, matcher_version, attempt_id, selected_by_user_id, "
-                    "selected_at, row_revision, provider_base_url) "
-                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "selected_at, row_revision, provider_base_url, provider_source_mode, "
+                    "provider_source_id, provider_source_generation) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         identity.local_album_id,
                         identity.release_group_mbid,
@@ -7107,7 +7338,10 @@ class NativeLibraryStore(PersistenceBase):
                         identity.selected_by_user_id,
                         identity.selected_at,
                         identity.row_revision,
-                        _provider_base_url_for(identity.decision_source),
+                        provider_base_url,
+                        provider_source_mode,
+                        provider_source_id,
+                        provider_source_generation,
                     ),
                 )
             else:
@@ -7115,7 +7349,8 @@ class NativeLibraryStore(PersistenceBase):
                     "UPDATE local_album_external_identities SET release_group_mbid = ?, "
                     "release_mbid = ?, decision_source = ?, matcher_version = ?, attempt_id = ?, "
                     "selected_by_user_id = ?, selected_at = ?, row_revision = row_revision + 1, "
-                    "provider_base_url = ? "
+                    "provider_base_url = ?, provider_source_mode = ?, provider_source_id = ?, "
+                    "provider_source_generation = ? "
                     "WHERE local_album_id = ? AND provider = 'musicbrainz' AND row_revision < ?",
                     (
                         identity.release_group_mbid,
@@ -7125,7 +7360,10 @@ class NativeLibraryStore(PersistenceBase):
                         identity.attempt_id,
                         identity.selected_by_user_id,
                         identity.selected_at,
-                        _provider_base_url_for(identity.decision_source),
+                        provider_base_url,
+                        provider_source_mode,
+                        provider_source_id,
+                        provider_source_generation,
                         identity.local_album_id,
                         MAX_REVISION,
                     ),
@@ -7182,6 +7420,15 @@ class NativeLibraryStore(PersistenceBase):
         *,
         expected_artist_revision: int,
     ) -> tuple[int, int]:
+        provider_source_mode, provider_source_id, provider_source_generation = (
+            _provider_provenance_for(
+                identity.decision_source,
+                source_mode=identity.provider_source_mode,
+                source_id=identity.provider_source_id,
+                source_generation=identity.provider_source_generation,
+            )
+        )
+
         def operation(connection: sqlite3.Connection) -> tuple[int, int]:
             artist_revision = self._require_revision_update(
                 connection,
@@ -7194,8 +7441,9 @@ class NativeLibraryStore(PersistenceBase):
             connection.execute(
                 "INSERT INTO local_artist_external_identities "
                 "(local_artist_id, provider, provider_artist_id, decision_source, attempt_id, "
-                "selected_by_user_id, selected_at, row_revision) "
-                "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?)",
+                "selected_by_user_id, selected_at, row_revision, provider_source_mode, "
+                "provider_source_id, provider_source_generation) "
+                "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     identity.local_artist_id,
                     identity.provider_artist_id,
@@ -7204,6 +7452,9 @@ class NativeLibraryStore(PersistenceBase):
                     identity.selected_by_user_id,
                     identity.selected_at,
                     identity.row_revision,
+                    provider_source_mode,
+                    provider_source_id,
+                    provider_source_generation,
                 ),
             )
             connection.executemany(
@@ -7250,6 +7501,15 @@ class NativeLibraryStore(PersistenceBase):
     async def attach_track_identity(
         self, identity: LocalTrackExternalIdentity, *, expected_track_revision: int
     ) -> tuple[int, int]:
+        provider_source_mode, provider_source_id, provider_source_generation = (
+            _provider_provenance_for(
+                identity.decision_source,
+                source_mode=identity.provider_source_mode,
+                source_id=identity.provider_source_id,
+                source_generation=identity.provider_source_generation,
+            )
+        )
+
         def operation(connection: sqlite3.Connection) -> tuple[int, int]:
             new_revision = self._require_revision_update(
                 connection,
@@ -7272,13 +7532,18 @@ class NativeLibraryStore(PersistenceBase):
                 "INSERT INTO local_track_external_identities "
                 "(local_track_id, provider, recording_mbid, release_mbid, release_track_mbid, "
                 "medium_position, release_track_position, decision_source, attempt_id, "
-                "selected_at, row_revision) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "selected_at, row_revision, provider_source_mode, provider_source_id, "
+                "provider_source_generation) "
+                "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(local_track_id, provider) DO UPDATE SET recording_mbid = excluded.recording_mbid, "
                 "release_mbid = excluded.release_mbid, release_track_mbid = excluded.release_track_mbid, "
                 "medium_position = excluded.medium_position, "
                 "release_track_position = excluded.release_track_position, "
                 "decision_source = excluded.decision_source, "
                 "attempt_id = excluded.attempt_id, selected_at = excluded.selected_at, "
+                "provider_source_mode = excluded.provider_source_mode, "
+                "provider_source_id = excluded.provider_source_id, "
+                "provider_source_generation = excluded.provider_source_generation, "
                 "row_revision = local_track_external_identities.row_revision + 1",
                 (
                     identity.local_track_id,
@@ -7291,6 +7556,9 @@ class NativeLibraryStore(PersistenceBase):
                     identity.attempt_id,
                     identity.selected_at,
                     identity.row_revision,
+                    provider_source_mode,
+                    provider_source_id,
+                    provider_source_generation,
                 ),
             )
             return new_revision, self._bump_catalog(connection)
@@ -8695,7 +8963,18 @@ class NativeLibraryStore(PersistenceBase):
         evidence: list[IdentificationEvidenceRecord],
         terminal_state: str,
         completed_at: float,
+        source_context: Any | None = None,
     ) -> tuple[int, int]:
+        provider_source_mode, provider_source_id, provider_source_generation = (
+            _provider_provenance_for(
+                "automatic",
+                source_mode=source_context.source_mode if source_context else None,
+                source_id=source_context.source_id if source_context else None,
+                source_generation=source_context.generation if source_context else None,
+            )
+        )
+        provider_base_url = _provider_base_url_for("automatic")
+
         def operation(connection: sqlite3.Connection) -> tuple[int, int]:
             connection.execute(
                 "INSERT INTO library_identification_attempts "
@@ -8759,7 +9038,17 @@ class NativeLibraryStore(PersistenceBase):
             stream_revision = self._bump_stream(connection, "identification")
             return int(updated["row_revision"]), stream_revision
 
-        return await self._write(operation)
+        from repositories.musicbrainz_base import (
+            is_mb_source_current,
+            mb_source_commit_lock,
+        )
+
+        async with mb_source_commit_lock:
+            if source_context is not None and not is_mb_source_current(source_context):
+                raise StaleRevisionError(
+                    "The MusicBrainz source changed before the identification result could be applied."
+                )
+            return await self._write(operation)
 
     async def get_album_identification_context(
         self, album_id: str
@@ -8947,8 +9236,21 @@ class NativeLibraryStore(PersistenceBase):
         completed_at: float,
         decision_source: str = "automatic",
         selected_by_user_id: str | None = None,
+        source_context: Any | None = None,
+        edition_uncertain: bool = False,
+        release_group_mbid: str | None = None,
+        ranked_edition_keys: list[str] | None = None,
     ) -> tuple[int, int, int]:
         """Commit evidence, review/identity, catalog, and job revisions atomically."""
+        provider_source_mode, provider_source_id, provider_source_generation = (
+            _provider_provenance_for(
+                decision_source,
+                source_mode=source_context.source_mode if source_context else None,
+                source_id=source_context.source_id if source_context else None,
+                source_generation=source_context.generation if source_context else None,
+            )
+        )
+        provider_base_url = _provider_base_url_for(decision_source)
 
         def operation(connection: sqlite3.Connection) -> tuple[int, int, int]:
             job = connection.execute(
@@ -8996,6 +9298,55 @@ class NativeLibraryStore(PersistenceBase):
                 raise StaleRevisionError(
                     "The album identity changed before its identification result could be applied."
                 )
+            current_before = connection.execute(
+                "SELECT decision_source, row_revision FROM local_album_external_identities "
+                "WHERE local_album_id = ? AND provider = 'musicbrainz'",
+                (attempt.local_album_id,),
+            ).fetchone()
+            protected_identity = bool(
+                current_before is not None
+                and current_before["decision_source"] in ("manual", "legacy_import")
+            )
+            tier_keys = [str(key) for key in (ranked_edition_keys or [])]
+            tier_rg = str(release_group_mbid or "")
+            # P2 RG edition-uncertain tier: non-review terminal. Pins the release
+            # GROUP only (release_mbid stays NULL: exact writes happen solely via
+            # manual confirm or the 0.95/0.05 auto path) and files the album under
+            # state='edition_to_confirm' with ranked `rg:release` keys. No track
+            # or artist identities: the exact edition is unproven.
+            is_tier = (
+                outcome == "edition_uncertain"
+                and edition_uncertain
+                and bool(tier_rg)
+                and bool(tier_keys)
+            )
+            # Defensive downgrade (unreachable from run_claimed_job, which only
+            # sends complete tier params): a malformed tier becomes an ordinary
+            # ambiguous review so the job terminal and review row stay consistent.
+            effective_outcome = (
+                "ambiguous" if outcome == "edition_uncertain" and not is_tier else outcome
+            )
+            # The tier commits its own RG pin below in this same transaction, so
+            # the attempt records the post-commit identity revision. The later
+            # Confirm-edition accept then staleness-checks against the RG pin it
+            # was evaluated from instead of tripping on our own write; any later
+            # change still mismatches and stays stale-guarded.
+            attempt_identity_revision_value = attempt.input_identity_revision
+            if is_tier and not protected_identity:
+                post_row_revision = (
+                    int(current_before["row_revision"]) + 1
+                    if current_before is not None
+                    else 1
+                )
+                attempt_identity_revision_value = _album_identity_revision(
+                    {
+                        "row_revision": post_row_revision,
+                        "release_group_mbid": tier_rg,
+                        "release_mbid": None,
+                        "decision_source": decision_source,
+                    },
+                    current_identity_tracks,
+                )
             connection.execute(
                 "INSERT INTO library_identification_attempts "
                 "(id, local_album_id, local_track_id, trigger, requested_by_user_id, "
@@ -9013,7 +9364,7 @@ class NativeLibraryStore(PersistenceBase):
                     attempt.input_tag_revision,
                     attempt.input_policy_revision,
                     attempt.input_file_revision,
-                    attempt.input_identity_revision,
+                    attempt_identity_revision_value,
                     attempt.matcher_version,
                     attempt.state,
                     attempt.terminal_reason_code,
@@ -9033,17 +9384,90 @@ class NativeLibraryStore(PersistenceBase):
                 ),
                 None,
             )
-            current_before = connection.execute(
-                "SELECT decision_source FROM local_album_external_identities "
-                "WHERE local_album_id = ? AND provider = 'musicbrainz'",
-                (attempt.local_album_id,),
-            ).fetchone()
-            protected_identity = bool(
-                current_before is not None
-                and current_before["decision_source"] in ("manual", "legacy_import")
-            )
-            if (
-                outcome == "identified"
+            if is_tier and not protected_identity:
+                connection.execute(
+                    "UPDATE local_albums SET updated_at = ?, row_revision = row_revision + 1 "
+                    "WHERE id = ? AND row_revision = ?",
+                    (completed_at, attempt.local_album_id, expected_album_revision),
+                )
+                connection.execute(
+                    "INSERT INTO local_album_external_identities "
+                    "(local_album_id, provider, release_group_mbid, release_mbid, decision_source, "
+                    "matcher_version, attempt_id, selected_by_user_id, selected_at, "
+                    "provider_base_url, provider_source_mode, provider_source_id, "
+                    "provider_source_generation) "
+                    "VALUES (?, 'musicbrainz', ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(local_album_id, provider) DO UPDATE SET "
+                    "release_group_mbid = excluded.release_group_mbid, "
+                    "release_mbid = NULL, decision_source = excluded.decision_source, "
+                    "matcher_version = excluded.matcher_version, attempt_id = excluded.attempt_id, "
+                    "selected_by_user_id = excluded.selected_by_user_id, "
+                    "selected_at = excluded.selected_at, row_revision = row_revision + 1, "
+                    "provider_base_url = excluded.provider_base_url, "
+                    "provider_source_mode = excluded.provider_source_mode, "
+                    "provider_source_id = excluded.provider_source_id, "
+                    "provider_source_generation = excluded.provider_source_generation",
+                    (
+                        attempt.local_album_id,
+                        tier_rg,
+                        decision_source,
+                        attempt.matcher_version,
+                        attempt.id,
+                        selected_by_user_id,
+                        completed_at,
+                        provider_base_url,
+                        provider_source_mode,
+                        provider_source_id,
+                        provider_source_generation,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE library_identification_reviews SET state = 'resolved', "
+                    "attempt_id = ?, updated_at = ?, row_revision = row_revision + 1 "
+                    "WHERE local_album_id = ? AND state IN ('needs_review', 'edition_to_confirm')",
+                    (attempt.id, completed_at, attempt.local_album_id),
+                )
+                connection.execute(
+                    "INSERT INTO library_identification_reviews "
+                    "(id, local_album_id, state, reason_code, attempt_id, input_revision, "
+                    "edition_uncertain, ranked_edition_keys_json, created_at, updated_at) "
+                    "VALUES (?, ?, 'edition_to_confirm', ?, ?, ?, 1, ?, ?, ?)",
+                    (
+                        review_id,
+                        attempt.local_album_id,
+                        attempt.terminal_reason_code,
+                        attempt.id,
+                        job["input_revision"],
+                        json.dumps(tier_keys, separators=(",", ":")),
+                        completed_at,
+                        completed_at,
+                    ),
+                )
+            elif is_tier:
+                connection.execute(
+                    "UPDATE library_identification_reviews SET state = 'resolved', "
+                    "attempt_id = ?, updated_at = ?, row_revision = row_revision + 1 "
+                    "WHERE local_album_id = ? AND state IN ('needs_review', 'edition_to_confirm')",
+                    (attempt.id, completed_at, attempt.local_album_id),
+                )
+                connection.execute(
+                    "INSERT INTO library_identification_reviews "
+                    "(id, local_album_id, state, reason_code, attempt_id, input_revision, "
+                    "edition_uncertain, ranked_edition_keys_json, created_at, updated_at) "
+                    "VALUES (?, ?, 'edition_to_confirm', ?, ?, ?, 1, ?, ?, ?)",
+                    (
+                        review_id,
+                        attempt.local_album_id,
+                        attempt.terminal_reason_code,
+                        attempt.id,
+                        job["input_revision"],
+                        json.dumps(tier_keys, separators=(",", ":")),
+                        completed_at,
+                        completed_at,
+                    ),
+                )
+            elif (
+                effective_outcome == "identified"
                 and selected is not None
                 and not protected_identity
             ):
@@ -9056,15 +9480,19 @@ class NativeLibraryStore(PersistenceBase):
                     "INSERT INTO local_album_external_identities "
                     "(local_album_id, provider, release_group_mbid, release_mbid, decision_source, "
                     "matcher_version, attempt_id, selected_by_user_id, selected_at, "
-                    "provider_base_url) "
-                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "provider_base_url, provider_source_mode, provider_source_id, "
+                    "provider_source_generation) "
+                    "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(local_album_id, provider) DO UPDATE SET "
                     "release_group_mbid = excluded.release_group_mbid, "
                     "release_mbid = excluded.release_mbid, decision_source = excluded.decision_source, "
                     "matcher_version = excluded.matcher_version, attempt_id = excluded.attempt_id, "
                     "selected_by_user_id = excluded.selected_by_user_id, "
                     "selected_at = excluded.selected_at, row_revision = row_revision + 1, "
-                    "provider_base_url = excluded.provider_base_url",
+                    "provider_base_url = excluded.provider_base_url, "
+                    "provider_source_mode = excluded.provider_source_mode, "
+                    "provider_source_id = excluded.provider_source_id, "
+                    "provider_source_generation = excluded.provider_source_generation",
                     (
                         attempt.local_album_id,
                         selected.release_group_mbid,
@@ -9074,7 +9502,10 @@ class NativeLibraryStore(PersistenceBase):
                         attempt.id,
                         selected_by_user_id,
                         completed_at,
-                        _provider_base_url_for(decision_source),
+                        provider_base_url,
+                        provider_source_mode,
+                        provider_source_id,
+                        provider_source_generation,
                     ),
                 )
                 connection.execute(
@@ -9090,8 +9521,9 @@ class NativeLibraryStore(PersistenceBase):
                         "INSERT INTO local_track_external_identities "
                         "(local_track_id, provider, recording_mbid, release_mbid, "
                         "release_track_mbid, medium_position, release_track_position, "
-                        "decision_source, attempt_id, selected_at, provider_base_url) "
-                        "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "decision_source, attempt_id, selected_at, provider_base_url, "
+                        "provider_source_mode, provider_source_id, provider_source_generation) "
+                        "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                         "ON CONFLICT(local_track_id, provider) DO UPDATE SET "
                         "recording_mbid = excluded.recording_mbid, release_mbid = excluded.release_mbid, "
                         "release_track_mbid = excluded.release_track_mbid, "
@@ -9099,7 +9531,10 @@ class NativeLibraryStore(PersistenceBase):
                         "release_track_position = excluded.release_track_position, "
                         "decision_source = excluded.decision_source, attempt_id = excluded.attempt_id, "
                         "selected_at = excluded.selected_at, row_revision = row_revision + 1, "
-                        "provider_base_url = excluded.provider_base_url",
+                        "provider_base_url = excluded.provider_base_url, "
+                        "provider_source_mode = excluded.provider_source_mode, "
+                        "provider_source_id = excluded.provider_source_id, "
+                        "provider_source_generation = excluded.provider_source_generation",
                         (
                             track.local_track_id,
                             track.recording_mbid,
@@ -9110,7 +9545,10 @@ class NativeLibraryStore(PersistenceBase):
                             decision_source,
                             attempt.id,
                             completed_at,
-                            _provider_base_url_for(decision_source),
+                            provider_base_url,
+                            provider_source_mode,
+                            provider_source_id,
+                            provider_source_generation,
                         ),
                     )
                 if (
@@ -9127,13 +9565,18 @@ class NativeLibraryStore(PersistenceBase):
                         connection.execute(
                             "INSERT INTO local_artist_external_identities "
                             "(local_artist_id, provider, provider_artist_id, decision_source, "
-                            "attempt_id, selected_by_user_id, selected_at) "
-                            "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?) "
+                            "attempt_id, selected_by_user_id, selected_at, provider_source_mode, "
+                            "provider_source_id, provider_source_generation) "
+                            "VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?) "
                             "ON CONFLICT(local_artist_id, provider) DO UPDATE SET "
                             "provider_artist_id = excluded.provider_artist_id, "
                             "decision_source = excluded.decision_source, attempt_id = excluded.attempt_id, "
                             "selected_by_user_id = excluded.selected_by_user_id, "
-                            "selected_at = excluded.selected_at, row_revision = row_revision + 1",
+                            "selected_at = excluded.selected_at, "
+                            "provider_source_mode = excluded.provider_source_mode, "
+                            "provider_source_id = excluded.provider_source_id, "
+                            "provider_source_generation = excluded.provider_source_generation, "
+                            "row_revision = row_revision + 1",
                             (
                                 artist_id,
                                 selected.artist_mbid,
@@ -9141,6 +9584,9 @@ class NativeLibraryStore(PersistenceBase):
                                 attempt.id,
                                 selected_by_user_id,
                                 completed_at,
+                                provider_source_mode,
+                                provider_source_id,
+                                provider_source_generation,
                             ),
                         )
                     else:
@@ -9161,14 +9607,14 @@ class NativeLibraryStore(PersistenceBase):
                 connection.execute(
                     "UPDATE library_identification_reviews SET state = 'resolved', "
                     "attempt_id = ?, updated_at = ?, row_revision = row_revision + 1 "
-                    "WHERE local_album_id = ? AND state = 'needs_review'",
+                    "WHERE local_album_id = ? AND state IN ('needs_review', 'edition_to_confirm')",
                     (attempt.id, completed_at, attempt.local_album_id),
                 )
-            elif outcome == "identified" and selected is not None:
+            elif effective_outcome == "identified" and selected is not None:
                 connection.execute(
                     "UPDATE library_identification_reviews SET state = 'resolved', "
                     "attempt_id = ?, updated_at = ?, row_revision = row_revision + 1 "
-                    "WHERE local_album_id = ? AND state = 'needs_review'",
+                    "WHERE local_album_id = ? AND state IN ('needs_review', 'edition_to_confirm')",
                     (attempt.id, completed_at, attempt.local_album_id),
                 )
             else:
@@ -9180,7 +9626,7 @@ class NativeLibraryStore(PersistenceBase):
                 if (
                     current_identity is not None
                     and current_identity["decision_source"] == "automatic"
-                    and outcome == "contradictory"
+                    and effective_outcome == "contradictory"
                 ):
                     connection.execute(
                         "DELETE FROM local_album_external_identities WHERE local_album_id = ? "
@@ -9199,9 +9645,19 @@ class NativeLibraryStore(PersistenceBase):
                         "WHERE id = ? AND row_revision = ?",
                         (completed_at, attempt.local_album_id, expected_album_revision),
                     )
+                # A newer review terminal supersedes a stale tier row: tier rows
+                # are never mutated in place, so resolve them before the upsert
+                # below (which keeps the legacy in-place match set and therefore
+                # can never hit a tier row).
+                connection.execute(
+                    "UPDATE library_identification_reviews SET state = 'resolved', "
+                    "attempt_id = ?, updated_at = ?, row_revision = row_revision + 1 "
+                    "WHERE local_album_id = ? AND state = 'edition_to_confirm'",
+                    (attempt.id, completed_at, attempt.local_album_id),
+                )
                 active_review = connection.execute(
                     "SELECT id FROM library_identification_reviews WHERE local_album_id = ? "
-                    "AND input_revision = ? AND state != 'resolved'",
+                    "AND input_revision = ? AND state IN ('needs_review', 'keep_tagged', 'excluded')",
                     (attempt.local_album_id, job["input_revision"]),
                 ).fetchone()
                 if active_review is None:
@@ -9230,7 +9686,11 @@ class NativeLibraryStore(PersistenceBase):
                             active_review["id"],
                         ),
                     )
-            terminal_state = "succeeded" if outcome == "identified" else "needs_review"
+            terminal_state = (
+                "succeeded"
+                if effective_outcome in ("identified", "edition_uncertain")
+                else "needs_review"
+            )
             updated = connection.execute(
                 "UPDATE library_identification_jobs SET state = ?, terminal_result_id = ?, "
                 "terminal_at = ?, updated_at = ?, lease_owner = NULL, lease_expires_at = NULL, "
@@ -9255,7 +9715,17 @@ class NativeLibraryStore(PersistenceBase):
             stream_revision = self._bump_stream(connection, "identification")
             return int(updated["row_revision"]), catalog_revision, stream_revision
 
-        return await self._write(operation)
+        from repositories.musicbrainz_base import (
+            is_mb_source_current,
+            mb_source_commit_lock,
+        )
+
+        async with mb_source_commit_lock:
+            if source_context is not None and not is_mb_source_current(source_context):
+                raise StaleRevisionError(
+                    "The MusicBrainz source changed before the identification result could be applied."
+                )
+            return await self._write(operation)
 
     async def defer_identification_job(
         self,
@@ -9606,6 +10076,18 @@ class NativeLibraryStore(PersistenceBase):
                     "WHERE state = 'keep_tagged'"
                 ).fetchone()[0]
             )
+            needs_review_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM library_identification_reviews "
+                    "WHERE state = 'needs_review'"
+                ).fetchone()[0]
+            )
+            edition_to_confirm_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM library_identification_reviews "
+                    "WHERE state = 'edition_to_confirm'"
+                ).fetchone()[0]
+            )
             failure = connection.execute(
                 "SELECT id, terminal_at FROM library_identification_jobs "
                 "WHERE state = 'failed' ORDER BY terminal_at DESC, id DESC LIMIT 1"
@@ -9656,6 +10138,8 @@ class NativeLibraryStore(PersistenceBase):
                 "deferred_reason_counts": deferred_reason_counts,
                 "attention_count": attention_count,
                 "kept_local_count": kept_local_count,
+                "needs_review_count": needs_review_count,
+                "edition_to_confirm_count": edition_to_confirm_count,
                 "active_priority": (
                     int(active_priority["priority"])
                     if active_priority is not None
@@ -15547,8 +16031,7 @@ class NativeLibraryStore(PersistenceBase):
                 }
             placeholders = ",".join("?" for _ in unique_ids)
             artists = connection.execute(
-                "SELECT * FROM local_artists "
-                f"WHERE id IN ({placeholders}) ORDER BY id",
+                f"SELECT * FROM local_artists WHERE id IN ({placeholders}) ORDER BY id",
                 unique_ids,
             ).fetchall()
             identities = connection.execute(
@@ -17940,6 +18423,7 @@ class NativeLibraryStore(PersistenceBase):
         metadata_incomplete: bool | None = None,
         candidate_available: bool | None = None,
         job_state: str | None = None,
+        exclude_active_jobs: bool = False,
         created_from: float | None = None,
         created_to: float | None = None,
         updated_from: float | None = None,
@@ -18015,6 +18499,9 @@ class NativeLibraryStore(PersistenceBase):
                 parameters.append(job_state)
                 count_clauses.append("job.state = ?")
                 count_parameters.append(job_state)
+            if exclude_active_jobs:
+                clauses.append("job.id IS NULL")
+                count_clauses.append("job.id IS NULL")
             if created_from is not None:
                 clauses.append("r.created_at >= ?")
                 parameters.append(created_from)
@@ -18092,12 +18579,19 @@ class NativeLibraryStore(PersistenceBase):
                     "GROUP BY reason_code"
                 ).fetchall()
             )
+            filtered_reason_counts = dict(
+                connection.execute(
+                    "SELECT reason_code, COUNT(*)" + base + f" WHERE {' AND '.join(count_clauses)} GROUP BY reason_code",
+                    count_parameters,
+                ).fetchall()
+            )
             return {
                 "rows": [dict(row) for row in rows[:limit]],
                 "has_more": len(rows) > limit,
                 "filtered_total": int(total),
                 "counts_by_state": state_counts,
                 "counts_by_reason": reason_counts,
+                "counts_by_reason_filtered": filtered_reason_counts,
             }
 
         return await self._read(operation)
@@ -22717,6 +23211,19 @@ class NativeLibraryStore(PersistenceBase):
                     (job_id,),
                 ).fetchall()
             }
+            # B1: per-source deferred breakdown for the preview header; the
+            # subquery keeps json_each off rows without the deferred key.
+            deferred_sources = {
+                str(row["source"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT deferred.value AS source, COUNT(*) AS count FROM "
+                    "(SELECT diff_json FROM library_management_plan_items "
+                    "WHERE job_id = ? AND json_valid(diff_json)) AS item, "
+                    "json_each(item.diff_json, '$.deferred_sources') AS deferred "
+                    "GROUP BY deferred.value ORDER BY deferred.value",
+                    (job_id,),
+                ).fetchall()
+            }
             roots = {
                 str(row["expected_root_id"]): int(row["count"])
                 for row in connection.execute(
@@ -22773,6 +23280,7 @@ class NativeLibraryStore(PersistenceBase):
                 "reasons": reasons,
                 "roots": roots,
                 "formats": formats,
+                "deferred_sources": deferred_sources,
                 "metadata_snapshot_ids": pinned,
             }
             updated = connection.execute(
@@ -23190,6 +23698,7 @@ class NativeLibraryStore(PersistenceBase):
                 "snapshot.profile_revision management_profile_revision, "
                 "snapshot.profile_snapshot_json management_profile_snapshot_json, "
                 "snapshot.target_root_id management_target_root_id, "
+                "snapshot.preview_expires_at management_preview_expires_at, "
                 "snapshot.proposed_settings_revision "
                 "management_proposed_settings_revision "
                 "FROM library_operation_jobs job JOIN "
@@ -23199,8 +23708,27 @@ class NativeLibraryStore(PersistenceBase):
                 + " ORDER BY job.created_at DESC,job.id DESC LIMIT ?",
                 (*parameters, min(max(limit, 1), 51)),
             ).fetchall()
-            return [dict(row) for row in rows]
-
+            results = [dict(row) for row in rows]
+            job_ids = [row["id"] for row in results]
+            if job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                counts = {
+                    str(count_row["job_id"]): dict(count_row)
+                    for count_row in connection.execute(
+                        "SELECT job_id, COALESCE(SUM(eligibility='eligible'), 0) "
+                        "eligible_count, COALESCE(SUM(eligibility='warning'), 0) "
+                        "warning_count, COALESCE(SUM(eligibility='blocked'), 0) "
+                        "blocked_count FROM library_management_plan_items "
+                        f"WHERE job_id IN ({placeholders}) GROUP BY job_id",
+                        tuple(job_ids),
+                    ).fetchall()
+                }
+                for row in results:
+                    count_row = counts.get(str(row["id"]), {})
+                    row["management_eligible_count"] = int(count_row.get("eligible_count", 0) or 0)
+                    row["management_warning_count"] = int(count_row.get("warning_count", 0) or 0)
+                    row["management_blocked_count"] = int(count_row.get("blocked_count", 0) or 0)
+            return results
         return await self._read(operation)
 
     async def get_library_management_bundle_plan_items(
@@ -24026,6 +24554,7 @@ class NativeLibraryStore(PersistenceBase):
         expected_policy_revision: str,
         result_paths_by_ordinal: dict[int, str],
         updated_at: float,
+        source_context: "MbSourceContext | None" = None,
     ) -> tuple[str, ...]:
         """Atomically adopt every published import and advance its journal."""
 
@@ -24350,6 +24879,7 @@ class NativeLibraryStore(PersistenceBase):
             if automatic_requests:
                 self._commit_automatic_import_management_tx(
                     connection,
+                    source_context=source_context,
                     bundle_id=bundle_id,
                     origin=sealed_bundle.origin,
                     policy_revision=expected_policy_revision,
@@ -24438,6 +24968,25 @@ class NativeLibraryStore(PersistenceBase):
                 raise StaleRevisionError("The import bundle changed before commit.")
             return tuple(ordered_track_ids)
 
+        if automatic_requests:
+            if source_context is None:
+                raise ConfigurationError(
+                    "Automatic import source context is required for catalog commit."
+                )
+            from repositories.musicbrainz_base import mb_publish_if_current
+
+            result_holder: list[tuple[str, ...]] = []
+
+            async def guarded_write() -> tuple[str, ...]:
+                result = await self._write(operation)
+                result_holder.append(result)
+                return result
+
+            if not await mb_publish_if_current(source_context, guarded_write):
+                raise StaleRevisionError(
+                    "MusicBrainz source changed before automatic import commit."
+                )
+            return result_holder[0]
         return await self._write(operation)
 
     @staticmethod
@@ -24858,6 +25407,7 @@ class NativeLibraryStore(PersistenceBase):
         self,
         connection: sqlite3.Connection,
         *,
+        source_context: "MbSourceContext | None",
         bundle_id: str,
         origin: str,
         policy_revision: str,
@@ -24870,6 +25420,19 @@ class NativeLibraryStore(PersistenceBase):
         conversion_before: dict[str, Any] | None = None,
     ) -> None:
         """Record accepted identities, recovery snapshots, and history atomically."""
+        if source_context is None:
+            raise ConfigurationError(
+                "Automatic import source context is required for catalog commit."
+            )
+        provider_source_mode, provider_source_id, provider_source_generation = (
+            _provider_provenance_for(
+                "automatic",
+                source_mode=source_context.source_mode,
+                source_id=source_context.source_id,
+                source_generation=source_context.generation,
+            )
+        )
+        provider_base_url = _provider_base_url_for("automatic")
 
         selected = {
             ordinal: (persisted[ordinal], request)
@@ -24918,21 +25481,27 @@ class NativeLibraryStore(PersistenceBase):
             "INSERT INTO local_album_external_identities "
             "(local_album_id,provider,release_group_mbid,release_mbid,decision_source,"
             "matcher_version,attempt_id,selected_by_user_id,selected_at,row_revision,"
-            "provider_base_url) "
-            "VALUES (?,'musicbrainz',?,?,'automatic','import-publisher-v1',NULL,NULL,?,1,?) "
+            "provider_base_url,provider_source_mode,provider_source_id,provider_source_generation) "
+            "VALUES (?,'musicbrainz',?,?,'automatic','import-publisher-v1',NULL,NULL,?,1,?,?,?,?) "
             "ON CONFLICT(local_album_id,provider) DO UPDATE SET "
             "release_group_mbid=excluded.release_group_mbid,"
             "release_mbid=excluded.release_mbid,decision_source='automatic',"
             "matcher_version=excluded.matcher_version,attempt_id=NULL,"
             "selected_by_user_id=NULL,selected_at=excluded.selected_at,"
             "row_revision=local_album_external_identities.row_revision+1,"
-            "provider_base_url=excluded.provider_base_url",
+            "provider_base_url=excluded.provider_base_url,"
+            "provider_source_mode=excluded.provider_source_mode,"
+            "provider_source_id=excluded.provider_source_id,"
+            "provider_source_generation=excluded.provider_source_generation",
             (
                 album_id,
                 release_group_mbid,
                 release_mbid,
                 now,
-                _provider_base_url_for("automatic"),
+                provider_base_url,
+                provider_source_mode,
+                provider_source_id,
+                provider_source_generation,
             ),
         )
         for (track_id, _write), request in selected.values():
@@ -24949,8 +25518,9 @@ class NativeLibraryStore(PersistenceBase):
                 "INSERT INTO local_track_external_identities "
                 "(local_track_id,provider,recording_mbid,release_mbid,release_track_mbid,"
                 "medium_position,release_track_position,decision_source,attempt_id,"
-                "selected_at,row_revision,provider_base_url) "
-                "VALUES (?,'musicbrainz',?,?,?,?,?,'automatic',NULL,?,1,?) "
+                "selected_at,row_revision,provider_base_url,provider_source_mode,"
+                "provider_source_id,provider_source_generation) "
+                "VALUES (?,'musicbrainz',?,?,?,?,?,'automatic',NULL,?,1,?,?,?,?) "
                 "ON CONFLICT(local_track_id,provider) DO UPDATE SET "
                 "recording_mbid=excluded.recording_mbid,"
                 "release_mbid=excluded.release_mbid,"
@@ -24959,8 +25529,11 @@ class NativeLibraryStore(PersistenceBase):
                 "release_track_position=excluded.release_track_position,"
                 "decision_source='automatic',attempt_id=NULL,"
                 "selected_at=excluded.selected_at,"
-                "row_revision=local_track_external_identities.row_revision+1,"
-                "provider_base_url=excluded.provider_base_url",
+                "provider_base_url=excluded.provider_base_url,"
+                "provider_source_mode=excluded.provider_source_mode,"
+                "provider_source_id=excluded.provider_source_id,"
+                "provider_source_generation=excluded.provider_source_generation,"
+                "row_revision=local_track_external_identities.row_revision+1",
                 (
                     track_id,
                     request.recording_mbid,
@@ -24969,7 +25542,10 @@ class NativeLibraryStore(PersistenceBase):
                     request.medium_position,
                     request.release_track_position,
                     now,
-                    _provider_base_url_for("automatic"),
+                    provider_base_url,
+                    provider_source_mode,
+                    provider_source_id,
+                    provider_source_generation,
                 ),
             )
         selection_json = json.dumps(
@@ -30175,6 +30751,33 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def find_active_repair_operation_for_album(
+        self, purpose: str, local_album_id: str
+    ) -> dict[str, Any] | None:
+        """Oldest non-terminal repair job for one (purpose, album) pair, if any.
+
+        (GH-386) Per-album auto-enqueue joins this row instead of minting a new
+        revision-suffixed job on every identification completion. Terminal rows
+        never coalesce: genuinely new work after completion still enqueues.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            return _row(
+                connection.execute(
+                    "SELECT job.* FROM library_operation_jobs job "
+                    "JOIN library_repair_snapshots snap ON snap.job_id = job.id "
+                    "WHERE job.kind = 'repair' "
+                    "AND job.state IN ('queued', 'running', 'paused') "
+                    "AND json_extract(snap.scope_json, '$.purpose') = ? "
+                    "AND EXISTS (SELECT 1 FROM json_each(snap.scope_json, '$.album_ids') "
+                    "WHERE value = ?) "
+                    "ORDER BY job.created_at ASC, job.id ASC LIMIT 1",
+                    (purpose, local_album_id),
+                ).fetchone()
+            )
+
+        return await self._read(operation)
+
     async def create_repair_operation(
         self,
         job: OperationJob,
@@ -32801,8 +33404,18 @@ class NativeLibraryStore(PersistenceBase):
         source_revision: str,
         tombstones: list[MigrationTombstone] | None = None,
         copy_playlists: bool = True,
-    ) -> int:
-        def operation(connection: sqlite3.Connection) -> int:
+    ) -> ReferenceProvenanceBatchResult:
+        """Materialize one batch of legacy references and record provenance.
+
+        One ``_write`` closure is still one transaction. Each row applies
+        under its own savepoint: a row whose source or target vanished after
+        resolution, whose persisted key is malformed, or whose parent rows
+        are missing is recorded in ``result.skipped`` and rolled back to its
+        savepoint, while materializable rows commit. The migration-run
+        revision guard and the provenance-divergence guard still raise
+        ``StaleRevisionError`` and abort the batch.
+        """
+        def operation(connection: sqlite3.Connection) -> ReferenceProvenanceBatchResult:
             def row_value(row: sqlite3.Row, key: str) -> Any:
                 return row[key] if key in row.keys() else None
 
@@ -33013,6 +33626,21 @@ class NativeLibraryStore(PersistenceBase):
                     "FROM playlists"
                 )
             inserted = 0
+            skipped: list[ReferenceProvenanceSkip] = []
+
+            def _record_skip(provenance: MigrationProvenance, reason: str) -> None:
+                skipped.append(
+                    ReferenceProvenanceSkip(
+                        provenance.source_kind,
+                        provenance.source_key,
+                        provenance.target_kind,
+                        provenance.target_id,
+                        reason,
+                    )
+                )
+                connection.execute("ROLLBACK TO SAVEPOINT dn_reference_row")
+                connection.execute("RELEASE dn_reference_row")
+
             for tombstone in tombstones or []:
                 connection.execute(
                     "INSERT INTO library_reference_tombstones "
@@ -33032,11 +33660,21 @@ class NativeLibraryStore(PersistenceBase):
                     ),
                 )
             for provenance in provenance_rows:
-                materialize_reference(provenance)
-                if not self._migration_reference_matches(connection, provenance):
-                    raise StaleRevisionError(
-                        "A persisted legacy reference was not materialized as planned."
+                connection.execute("SAVEPOINT dn_reference_row")
+                try:
+                    materialize_reference(provenance)
+                    materialized = self._migration_reference_matches(
+                        connection, provenance
                     )
+                except ValueError:
+                    _record_skip(provenance, "invalid_key")
+                    continue
+                except sqlite3.IntegrityError:
+                    _record_skip(provenance, "integrity_error")
+                    continue
+                if not materialized:
+                    _record_skip(provenance, "not_materialized")
+                    continue
                 existing = connection.execute(
                     "SELECT target_kind, target_id, source_revision "
                     "FROM library_migration_provenance "
@@ -33052,6 +33690,7 @@ class NativeLibraryStore(PersistenceBase):
                         raise StaleRevisionError(
                             "A persisted legacy reference changed after it was imported."
                         )
+                    connection.execute("RELEASE dn_reference_row")
                     continue
                 connection.execute(
                     "INSERT INTO library_migration_provenance "
@@ -33068,7 +33707,8 @@ class NativeLibraryStore(PersistenceBase):
                     ),
                 )
                 inserted += 1
-            return inserted
+                connection.execute("RELEASE dn_reference_row")
+            return ReferenceProvenanceBatchResult(inserted, tuple(skipped))
 
         return await self._write(operation)
 

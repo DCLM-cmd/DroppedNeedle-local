@@ -1650,6 +1650,7 @@ details[open] > summary .management-editor-chevron {
 
 .edition-finder-search {
 	display: flex;
+	flex-wrap: wrap;
 	align-items: end;
 	gap: 0.5rem;
 	margin-top: 0.85rem;
@@ -3944,6 +3945,23 @@ textarea {
 	);
 }
 
+/* Settings runs as a fixed two-pane app surface at desktop widths: the drawer
+   column locks to the viewport and the page's own panes scroll instead of the
+   document, so the shell stops emitting a third whole-page scrollbar. The
+   footer is omitted on this route, so main-content's fill-the-viewport
+   min-height would force a phantom document overflow; neutralize it and let
+   flexbox distribute the locked height instead. */
+@media (min-width: 1024px) {
+	.drawer-content.droppedneedle-pane-mode {
+		height: 100dvh;
+		overflow: hidden;
+	}
+
+	.droppedneedle-pane-mode .droppedneedle-main-content {
+		min-height: 0;
+	}
+}
+
 .droppedneedle-bottom-nav {
 	position: fixed;
 	right: 0;
@@ -3951,7 +3969,7 @@ textarea {
 	left: 0;
 	z-index: 60;
 	display: grid;
-	grid-template-columns: repeat(5, minmax(0, 1fr));
+	grid-template-columns: repeat(6, minmax(0, 1fr));
 	min-height: calc(var(--ms-bottom-nav-height) + var(--ms-safe-bottom));
 	padding: 0.45rem 0.5rem calc(0.45rem + var(--ms-safe-bottom));
 	border-top: 1px solid oklch(from var(--color-base-content) l c h / 0.08);
@@ -3961,11 +3979,17 @@ textarea {
 	box-shadow: 0 -10px 28px rgb(0 0 0 / 0.34);
 }
 
+/* Non-admins have no Settings tab, so the bar holds five slots and keeps them evenly spaced. */
+.droppedneedle-bottom-nav--no-settings {
+	grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
 .droppedneedle-bottom-nav__item {
 	position: relative;
 	display: inline-flex;
 	min-width: 0;
 	min-height: 3.5rem;
+	flex-direction: column;
 	align-items: center;
 	justify-content: center;
 	gap: 0.2rem;
@@ -4468,11 +4492,11 @@ textarea {
 
 .tonearm {
 	transform-origin: 88% 12%;
-	transform: rotate(-3deg);
+	transform: rotate(-148deg);
 	transition: transform 0.9s var(--ease-overshoot);
 }
 .tonearm.is-playing {
-	transform: rotate(-31deg);
+	transform: rotate(-117deg);
 }
 
 .deck-halo {
@@ -4591,16 +4615,6 @@ textarea {
 		opacity: 0 !important;
 		transition: none !important;
 	}
-	.acq-order-row {
-		transition: none !important;
-	}
-}
-
-/* Acquisition quality order editor (settings): rows ease when reordered. */
-.acq-order-row {
-	transition:
-		transform 0.15s ease-out,
-		opacity 0.15s ease-out;
 }
 
 dialog.whats-new-modal::backdrop {

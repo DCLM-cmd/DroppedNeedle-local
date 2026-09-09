@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
+from rapidfuzz import fuzz
 
 from core.exceptions import (
     AutomaticManagementHoldError,
@@ -46,6 +47,7 @@ from services.native.title_match import (
     artists_overlap,
     match_key,
     names_different_album,
+    normalize_recording_title,
     similarity,
     title_containment_score,
 )
@@ -104,6 +106,12 @@ NOT_AN_UPGRADE = "not better than the copy already in the library"
 UPGRADE_NEEDS_RECYCLE_BIN = (
     "the old copy cannot be preserved - no recycle bin is configured"
 )
+# not a quarantine reason: the bytes on disk don't match the size slskd advertised.
+# The cheap locate paths ignore size and mutagen's MP3 duration reads the Xing
+# header (truncation-invariant), so a short file otherwise imports as if whole.
+# The shortfall is local (a partial write / stale copy), never proof the peer is
+# bad - so it must fail without blacklisting the source.
+SIZE_MISMATCH = "size_mismatch"
 
 
 class VerifyStatus:
@@ -173,7 +181,12 @@ class ProcessResult(AppStruct):
 
 
 def _workspace_disposition(failures: list[FileFailure]) -> str:
-    local_faults = {DOWNLOADS_MOUNT_UNAVAILABLE, IMPORT_FAILED, SOURCE_FILE_MISSING}
+    local_faults = {
+        DOWNLOADS_MOUNT_UNAVAILABLE,
+        IMPORT_FAILED,
+        SOURCE_FILE_MISSING,
+        SIZE_MISMATCH,
+    }
     return (
         "preserve"
         if any(value.reason in local_faults for value in failures)
@@ -215,6 +228,7 @@ class _PlannedImport(NamedTuple):
     download_task_id: str | None
     source_path: str
     replacement: dict | None = None
+    reviewed_recording_identity: bool = False
 
 
 def _filename_track_number(path: Path) -> int | None:
@@ -293,7 +307,7 @@ def _slskd_expected_track(
     return track, authoritative, None
 
 
-_TITLE_CONFLICT_RATIO = 50  # below this, a real title tag names a different track
+_TITLE_CONFLICT_RATIO = 50  # at or below this, a real title tag names a different track
 
 
 def _title_conflicts(candidate: _FolderCandidate, track: ExpectedTrack) -> bool:
@@ -304,10 +318,42 @@ def _title_conflicts(candidate: _FolderCandidate, track: ExpectedTrack) -> bool:
     blocks a genuinely-untagged correct file (the D18 case)."""
     if not track.title:
         return False
-    tag_title = (candidate.tag.title or "").strip()
+    tag_title = normalize_recording_title(candidate.tag.title)
     if not tag_title:
         return False  # untagged -> trust duration/filename, don't reject on title
-    return similarity(tag_title, track.title) < _TITLE_CONFLICT_RATIO
+    return (
+        fuzz.token_set_ratio(tag_title, normalize_recording_title(track.title))
+        <= _TITLE_CONFLICT_RATIO
+    )
+
+
+def _fingerprint_recording_proof(fp, expected_recording_id: str | None) -> bool | None:  # noqa: ANN001
+    """Return whether a confident fingerprint candidate set contains the expected
+    recording, or ``None`` when no positive recording proof is available.
+
+    Parsed results expose all valid candidate IDs in ``recording_ids``. An empty
+    collection falls back to the singular ``recording_id`` for manually constructed
+    and legacy results.
+    """
+    if getattr(fp, "status", None) != "pass":
+        return None
+    expected = (expected_recording_id or "").strip().casefold()
+    if not expected:
+        return None
+
+    candidates = getattr(fp, "recording_ids", None) or ()
+    candidate_ids = {
+        candidate.strip().casefold()
+        for candidate in candidates
+        if isinstance(candidate, str) and candidate.strip()
+    }
+    if not candidate_ids:
+        singular = (getattr(fp, "recording_id", None) or "").strip().casefold()
+        if singular:
+            candidate_ids.add(singular)
+    if not candidate_ids:
+        return None
+    return expected in candidate_ids
 
 
 def _import_confidence(*, tag, info, expected_track, canonical_duration, fp) -> float:  # noqa: ANN001
@@ -334,7 +380,7 @@ def _import_confidence(*, tag, info, expected_track, canonical_duration, fp) -> 
         tag_rec = (tag.musicbrainz_recording_id or "").strip().lower()
         if tag_rec and tag_rec == expected_rec:
             return 1.0
-        if fp is not None and _fingerprint_proves_recording(fp, expected_rec):
+        if _fingerprint_recording_proof(fp, expected_rec) is True:
             return 1.0
     if (
         canonical_duration
@@ -405,22 +451,26 @@ def _tag_conflict_reason(tag, info, manifest, expected_track) -> str | None:  # 
         tag_artist
         and expected_artist
         and "various" not in expected_artist.lower()
-        # A downloaded file frequently credits every performer where the provider
-        # credits only the primary (or the reverse). One artist named on both sides
-        # is the same release, so only a credit with NO overlap at all conflicts.
-        and not artists_overlap(
-            tag_artist, expected_artist, floor=_TAG_ARTIST_CONFLICT_RATIO
+        and fuzz.token_set_ratio(
+            normalize_recording_title(tag_artist),
+            normalize_recording_title(expected_artist),
         )
+        < _TAG_ARTIST_CONFLICT_RATIO
     )
-    tag_title = (tag.title or "").strip()
+    tag_title = normalize_recording_title(tag.title)
 
     if expected_track is not None and expected_track.title:
         # A real title tag naming a clearly different SONG rejects on its own
-        # (same rule as the folder path's _title_conflicts).
+        # (same rule as the folder path's _title_conflicts). Compared on the
+        # normalized form so same-recording spelling variants - and bracket-only
+        # markers like "[Explicit]" - never reject.
         if (
             tag_title
-            and similarity(tag_title, expected_track.title)
-            < _TITLE_CONFLICT_RATIO
+            and fuzz.token_set_ratio(
+                tag_title,
+                normalize_recording_title(expected_track.title),
+            )
+            <= _TITLE_CONFLICT_RATIO
         ):
             return "tag_mismatch"
         if artist_conflict:
@@ -452,44 +502,17 @@ def _tag_conflict_reason(tag, info, manifest, expected_track) -> str | None:  # 
     return None
 
 
-# Below this, the fingerprint named a different song than the one expected.
-#
-# ``similarity`` is token_set_ratio over the punctuation/case-folded form, which
-# scores 100 whenever one title's tokens are a subset of the other's - so every
-# legitimate difference lands there: "Avalon" vs "Avalon (Live)", "Song (Remastered)"
-# vs "Song [Remastered]", a featuring credit on one side only. Measured against real
-# pairs, genuine mismatches sit at 18-50 and legitimate ones at 100, so the floor
-# belongs inside that gap rather than on either edge. The previous ``< 50`` sat
-# exactly on the mismatch ceiling, and a pair scoring precisely 50 - half its tokens
-# unrelated - was read as agreement.
-_WRONG_SONG_TITLE_FLOOR = 60
-
-
-def _fingerprint_recording_ids(fp) -> set[str]:  # noqa: ANN001 - FingerprintResult
-    """EVERY recording MBID the fingerprint resolves to, case-folded.
-
-    AcoustID answers with every recording entity the audio resolves to, in no
-    meaningful order, and MusicBrainz splits one performance across editions - so
-    membership in this set is the identity test, never equality against
-    ``recording_id`` alone (see ``models.audio.FingerprintResult.recording_ids``).
-    Comparing the first id only held correct files as ``fingerprint_mismatch``:
-    on this library every Björk track AcoustID named EXACTLY right was rejected
-    because the wanted edition's entity was not the one listed first."""
-    return {
-        str(value).strip().casefold()
-        for value in (
-            *(getattr(fp, "recording_ids", None) or ()),
-            getattr(fp, "recording_id", None),
-        )
-        if value
-    }
-
-
-def _fingerprint_proves_recording(fp, recording_mbid: str | None) -> bool:  # noqa: ANN001
-    """Whether a PASS fingerprint positively identifies ``recording_mbid``."""
-    if not recording_mbid or getattr(fp, "status", None) != "pass":
-        return False
-    return recording_mbid.strip().casefold() in _fingerprint_recording_ids(fp)
+def _lengths_agree(
+    file_duration_seconds: float | None, expected_duration_seconds: float | None
+) -> bool | None:
+    """Whether the file length corroborates the expected recording under the existing
+    ``max(15s, 10%)`` gate, or ``None`` when either side is unknown (legacy rows and
+    duration-less manifests fall back to the pre-existing fingerprint-only rule)."""
+    if not file_duration_seconds or not expected_duration_seconds:
+        return None
+    return abs(file_duration_seconds - expected_duration_seconds) <= max(
+        15.0, 0.10 * expected_duration_seconds
+    )
 
 
 def _fingerprint_disagrees(
@@ -497,59 +520,68 @@ def _fingerprint_disagrees(
     expected_track,
     expected_artist: str | None,
     *,
-    tag_identity_level: int = _TAG_IDENTITY_NONE,
+    file_duration_seconds: float | None = None,
+    expected_duration_seconds: float | None = None,
 ) -> bool:
     """True only when AcoustID CONFIDENTLY (status=pass) identified the audio as a clearly
     different SONG, or a clearly different ARTIST, than expected.
 
-    ``tag_identity_level``: when the file's own tags carry a MusicBrainz id naming this
-    track, AcoustID does not get to overrule them. Tags are the stronger signal - they
-    were written by whoever prepared the release, while an acoustic match is an
-    inference over a crowd-sourced database, and a remaster, a live take or a
-    mislabelled fingerprint entry all produce a confident-but-wrong "different song".
-    Files were being held as ``fingerprint_mismatch`` while their tags were correct. Release-group/edition is
+    A length-consistent file (the existing ``max(15s, 10%)`` gate) is never held on the
+    fingerprint alone: duration corroboration outranks a conflicting AcoustID mapping,
+    while a length-divergent conflict still holds. Release-group/edition is
     deliberately NOT checked: AcoustID's RG coverage is incomplete and one recording appears
     on many editions (original / reissue / compilation), so gating on the requested RG
     false-rejects valid tracks (e.g. a 2011 reissue + its BBC-session bonuses). Lidarr
     verifies recording identity, not edition, and fails OPEN - a non-pass result never
     rejects, leaving the tag/duration match to stand. ``expected_track`` may be None (the
-    slskd path has no per-file title), in which case only the artist is checked. When both
-    sides provide a recording ID, a PASS fingerprint that names NONE of the expected
-    recording's entities rejects before artist allowances, and one that names it permits
-    display-credit differences after the title veto. Identity is MEMBERSHIP in the
-    fingerprint's whole ``recording_ids`` set, not equality with the first entry -
-    AcoustID orders them arbitrarily, so comparing the first alone held correct files.
-    Without both IDs, the existing conservative artist gate remains in force."""
+    slskd path has no per-file title), in which case only the artist is checked.
+    When a confident result provides candidate recording IDs, membership in that set
+    rejects before artist allowances and a matching candidate permits display-credit
+    fallback (for legacy/manual results) and existing conservative artist gate remain.
+    Both sides are compared on their normalized recording-title form (censored
+    spellings, bracketed prefixes, case/punctuation folds) so same-recording spelling
+    variants never veto. A length-consistent file (the existing ``max(15s, 10%)``
+    gate) is never held on the fingerprint alone: duration corroboration outranks
+    a conflicting mapping; a length-divergent conflict still holds.
+    """
     if getattr(fp, "status", None) != "pass":
         return False
-    if tag_identity_level == _TAG_IDENTITY_CERTAIN:
-        return False
-    fp_title = (getattr(fp, "title", None) or "").strip()
-    fp_artist = (getattr(fp, "artist", None) or "").strip()
+    fp_title = normalize_recording_title(getattr(fp, "title", None))
+    fp_artist = normalize_recording_title(getattr(fp, "artist", None))
     expected_title = (
-        getattr(expected_track, "title", None) if expected_track is not None else None
-    )
-    if (
-        fp_title
-        and expected_title
-        and similarity(fp_title, expected_title) < _WRONG_SONG_TITLE_FLOOR
-    ):
-        return True  # clearly the wrong song
-
-    fp_recording_ids = _fingerprint_recording_ids(fp)
-    expected_recording_id = (
-        (getattr(expected_track, "recording_mbid", None) or "").strip().casefold()
+        normalize_recording_title(getattr(expected_track, "title", None))
         if expected_track is not None
         else ""
     )
-    if fp_recording_ids and expected_recording_id:
-        return expected_recording_id not in fp_recording_ids
+    length_ok = _lengths_agree(file_duration_seconds, expected_duration_seconds)
+    if (
+        fp_title
+        and expected_title
+        and fuzz.token_set_ratio(fp_title, expected_title) <= 50
+    ):
+        # Clearly the wrong song - unless the length corroborates the expected
+        # recording (AcoustID metadata disagreements lose to a matching length).
+        return length_ok is not True
+
+    recording_proof = _fingerprint_recording_proof(
+        fp,
+        getattr(expected_track, "recording_mbid", None)
+        if expected_track is not None
+        else None,
+    )
+    if recording_proof is not None:
+        if recording_proof:
+            return False
+        return length_ok is not True
 
     # Wrong artist - but skip for various-artists compilations, where the album artist
     # legitimately differs from a track's performing artist.
     if fp_artist and expected_artist and "various" not in expected_artist.lower():
-        if not artists_overlap(fp_artist, expected_artist, floor=55):
-            return True
+        if (
+            fuzz.token_set_ratio(fp_artist, normalize_recording_title(expected_artist))
+            < 55
+        ):
+            return length_ok is not True
     return False
 
 
@@ -734,6 +766,43 @@ def _basename(filename: str) -> str:
     return filename.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def _log_import_failure(
+    message: str,
+    exc: BaseException,
+    *,
+    task_id: str,
+    bundle: str,
+    planned: list[_PlannedImport],
+) -> None:
+    """Log one sanitized line for an IMPORT_FAILED bundle outcome (#185 part A).
+
+    The user-facing ``FileFailure`` keeps the fixed generic reason string; all
+    diagnosis (errno, exception type, basenames, bundle identity) goes to the
+    server log only via ``logger.exception`` (traceback included). Basenames via
+    :func:`_basename` - never absolute paths, hosts, or tokens.
+    """
+    files = [_basename(value.source.name) for value in planned]
+    exc_type = type(exc).__name__
+    errno = getattr(exc, "errno", None)
+    logger.exception(
+        "%s for task %s: %s errno=%s files=%s bundle=%s",
+        message,
+        task_id,
+        exc_type,
+        errno,
+        files,
+        bundle,
+        extra={
+            "task_id": task_id,
+            "exc_type": exc_type,
+            "errno": errno,
+            "files": files,
+            "file_count": len(files),
+            "bundle": bundle,
+        },
+    )
+
+
 def _row_tier(row: dict) -> str:
     """A library_files row's quality tier, judged exactly like the scanner/gate."""
     return tier_for(
@@ -745,9 +814,7 @@ def _is_strict_upgrade(existing_tier: str, info: AudioInfo) -> bool:
     """Strictly-better only (D4): equal or worse NEVER replaces."""
     return tier_rank(
         tier_for(info.file_format or "", info.bitrate, info.bit_depth)
-    ) > tier_rank(
-        existing_tier
-    )
+    ) > tier_rank(existing_tier)
 
 
 class FileProcessor:
@@ -809,6 +876,22 @@ class FileProcessor:
                 continue
             matches.append((root_id, relative.as_posix()))
         if len(matches) != 1:
+            # Sanitized diagnosability (#185 part A): counts + target basename only,
+            # never the absolute path. Task/bundle context rides on the caller's
+            # bundle-outcome log; this message string itself is unchanged.
+            target_name = _basename(resolved.name)
+            logger.warning(
+                "Import target resolves to %s library roots (expected exactly 1): "
+                "target=%s roots=%s",
+                len(matches),
+                target_name,
+                len(self._library_paths),
+                extra={
+                    "match_count": len(matches),
+                    "target": target_name,
+                    "root_count": len(self._library_paths),
+                },
+            )
             raise RuntimeError("Import target does not resolve to one library root.")
         return matches[0]
 
@@ -857,6 +940,7 @@ class FileProcessor:
                     replacement_root_id=replacement_root_id,
                     replacement_relative_path=replacement_relative,
                     recycle_bin_path=recycle_bin_path,
+                    reviewed_recording_identity=value.reviewed_recording_identity,
                 )
             )
         digest = hashlib.sha256(
@@ -947,7 +1031,10 @@ class FileProcessor:
         for expected in targets:
             try:
                 target = await self._process_one(
-                    expected, manifest, used_expected_positions
+                    expected,
+                    manifest,
+                    used_expected_positions,
+                    consult_partial=only_filenames is not None,
                 )
                 if isinstance(target, _PlannedImport):
                     planned.append(target)
@@ -979,10 +1066,13 @@ class FileProcessor:
                     succeeded.extend(
                         await self._hold_conversion_bundle(planned, manifest)
                     )
-                except Exception:  # noqa: BLE001 - an undurable hold preserves source
-                    logger.exception(
-                        "Could not durably hold conversion audio for task %s",
-                        manifest.task_id,
+                except Exception as exc:  # noqa: BLE001 - an undurable hold preserves source
+                    _log_import_failure(
+                        "Could not durably hold conversion audio",
+                        exc,
+                        task_id=manifest.task_id,
+                        bundle=f"acquisition:{manifest.task_id}:files",
+                        planned=planned,
                     )
                     failed.extend(
                         FileFailure(filename=value.source.name, reason=IMPORT_FAILED)
@@ -1002,10 +1092,13 @@ class FileProcessor:
                 management_hold_message = str(hold)
                 try:
                     await self._hold_management_bundle(planned, manifest, hold)
-                except Exception:  # noqa: BLE001 - an undurable hold preserves source
-                    logger.exception(
-                        "Could not durably hold import bundle for task %s",
-                        manifest.task_id,
+                except Exception as exc:  # noqa: BLE001 - an undurable hold preserves source
+                    _log_import_failure(
+                        "Could not durably hold import bundle",
+                        exc,
+                        task_id=manifest.task_id,
+                        bundle=f"acquisition:{manifest.task_id}:files",
+                        planned=planned,
                     )
                     failed.extend(
                         FileFailure(filename=value.source.name, reason=IMPORT_FAILED)
@@ -1017,9 +1110,13 @@ class FileProcessor:
                         FileFailure(filename=value.source.name, reason=MANAGEMENT_HELD)
                         for value in planned
                     )
-            except Exception:  # noqa: BLE001 - one bundle has one failure outcome
-                logger.exception(
-                    "Shared import publication failed for task %s", manifest.task_id
+            except Exception as exc:  # noqa: BLE001 - one bundle has one failure outcome
+                _log_import_failure(
+                    "Shared import publication failed",
+                    exc,
+                    task_id=manifest.task_id,
+                    bundle=f"acquisition:{manifest.task_id}:files",
+                    planned=planned,
                 )
                 failed.extend(
                     FileFailure(filename=value.source.name, reason=IMPORT_FAILED)
@@ -1157,10 +1254,13 @@ class FileProcessor:
                     succeeded.extend(
                         await self._hold_conversion_bundle(planned, manifest)
                     )
-                except Exception:  # noqa: BLE001 - an undurable hold preserves source
-                    logger.exception(
-                        "Could not durably hold conversion folder for task %s",
-                        manifest.task_id,
+                except Exception as exc:  # noqa: BLE001 - an undurable hold preserves source
+                    _log_import_failure(
+                        "Could not durably hold conversion folder",
+                        exc,
+                        task_id=manifest.task_id,
+                        bundle=f"acquisition:{manifest.task_id}:folder",
+                        planned=planned,
                     )
                     failed.extend(
                         FileFailure(filename=value.source.name, reason=IMPORT_FAILED)
@@ -1180,10 +1280,13 @@ class FileProcessor:
                 management_hold_message = str(hold)
                 try:
                     await self._hold_management_bundle(planned, manifest, hold)
-                except Exception:  # noqa: BLE001 - an undurable hold preserves source
-                    logger.exception(
-                        "Could not durably hold folder import for task %s",
-                        manifest.task_id,
+                except Exception as exc:  # noqa: BLE001 - an undurable hold preserves source
+                    _log_import_failure(
+                        "Could not durably hold folder import",
+                        exc,
+                        task_id=manifest.task_id,
+                        bundle=f"acquisition:{manifest.task_id}:folder",
+                        planned=planned,
                     )
                     failed.extend(
                         FileFailure(filename=value.source.name, reason=IMPORT_FAILED)
@@ -1195,10 +1298,13 @@ class FileProcessor:
                         FileFailure(filename=value.source.name, reason=MANAGEMENT_HELD)
                         for value in planned
                     )
-            except Exception:  # noqa: BLE001 - one bundle has one failure outcome
-                logger.exception(
-                    "Shared folder import publication failed for task %s",
-                    manifest.task_id,
+            except Exception as exc:  # noqa: BLE001 - one bundle has one failure outcome
+                _log_import_failure(
+                    "Shared folder import publication failed",
+                    exc,
+                    task_id=manifest.task_id,
+                    bundle=f"acquisition:{manifest.task_id}:folder",
+                    planned=planned,
                 )
                 failed.extend(
                     FileFailure(filename=value.source.name, reason=IMPORT_FAILED)
@@ -1459,7 +1565,8 @@ class FileProcessor:
                 fp,
                 track,
                 manifest.artist_name,
-                tag_identity_level=_tag_identity(candidate, track),
+                file_duration_seconds=info.duration_seconds,
+                expected_duration_seconds=track.duration_seconds,
             ):
                 await self._hold_for_review(
                     source=source,
@@ -1473,6 +1580,7 @@ class FileProcessor:
                     track_title=track.title,
                     recording_mbid=track.recording_mbid,
                     duration_seconds=info.duration_seconds,
+                    expected_duration_seconds=track.duration_seconds,
                     file_format=info.file_format,
                 )
                 raise VerificationFailed(
@@ -1480,8 +1588,8 @@ class FileProcessor:
                     reason="fingerprint_mismatch",
                     filename=source.name,
                 )
-            if conversion_verification and not _fingerprint_proves_recording(
-                fp, track.recording_mbid
+            if conversion_verification and (
+                _fingerprint_recording_proof(fp, track.recording_mbid) is not True
             ):
                 raise VerificationFailed(
                     "AcoustID could not prove the requested recording",
@@ -1614,6 +1722,7 @@ class FileProcessor:
         duration_seconds: float | None,
         file_format: str | None,
         reason_detail: str | None = None,
+        expected_duration_seconds: float | None = None,
     ) -> bool:
         """Copy a verify-rejected file into the held area and record it for an "import anyway"
         review. The verifier said the audio/tags aren't the expected recording, but that's
@@ -1653,6 +1762,7 @@ class FileProcessor:
                 original_filename=source.name,
                 file_format=file_format,
                 duration_seconds=duration_seconds,
+                expected_duration_seconds=expected_duration_seconds,
                 evidence_title=evidence_title,
                 evidence_artist=evidence_artist,
                 evidence_score=evidence_score,
@@ -1900,11 +2010,54 @@ class FileProcessor:
                     download_task_id=held.source_task_id,
                     source_path=held.held_path,
                     replacement=replacement,
+                    reviewed_recording_identity=bool(
+                        (held.recording_mbid or "").strip()
+                    ),
                 )
             ],
             idempotency_key=f"acquisition:held:{held.id}",
         )
         return Path(published.paths[0])
+
+    async def reverify_held_file(self, held: "HeldImport") -> str:
+        """Re-run the fingerprint identity check on the stored held file.
+
+        Returns ``"confirmed"`` when a confident AcoustID result no longer
+        disagrees with the held identity (the caller imports through the same
+        path as "import anyway"), else ``"still_held"`` - including when no
+        fingerprinter is wired or the result is inconclusive (fail-open: an
+        unverifiable file stays in review, it is never auto-imported).
+        Raises ``FileNotFoundError`` when the held copy is gone.
+        """
+        source = Path(held.held_path)
+        if not source.exists():
+            raise FileNotFoundError(held.held_path)
+        if self._fingerprinter is None:
+            return "still_held"
+        fp = await self._fingerprinter.fingerprint(source)
+        if getattr(fp, "status", None) != "pass":
+            return "still_held"
+        try:
+            _tag, info = await asyncio.to_thread(self._tagger.read_tags, source)
+        except Exception:  # noqa: BLE001 - unreadable copy stays in review
+            logger.warning("Could not re-read held file %s", source.name)
+            return "still_held"
+        expected = ExpectedTrack(
+            track_number=held.track_number or 0,
+            disc_number=held.disc_number or 1,
+            duration_seconds=held.expected_duration_seconds,
+            recording_mbid=held.recording_mbid,
+            title=held.track_title,
+        )
+        if _fingerprint_disagrees(
+            fp,
+            expected,
+            held.artist_name,
+            file_duration_seconds=info.duration_seconds,
+            expected_duration_seconds=held.expected_duration_seconds,
+        ):
+            return "still_held"
+        return "confirmed"
 
     @staticmethod
     def _build_folder_target_tag(
@@ -1933,11 +2086,29 @@ class FileProcessor:
             compilation=file_tag.compilation,
         )
 
+    async def _locate_partial(
+        self, manifest: DownloadManifest, expected: ExpectedFile
+    ) -> Path | None:
+        """Best-effort incomplete-mount probe for the retry signal; never raises.
+
+        Duck-typed: only the slskd repository offers ``locate_partial`` (a
+        separate method so ``get_file_path`` stays byte-identical); other
+        clients simply have no partial fallback.
+        """
+        locate = getattr(self._client, "locate_partial", None)
+        if locate is None:
+            return None
+        try:
+            return await locate(manifest.handle, expected.filename, expected.size)
+        except Exception:  # noqa: BLE001 - a probe must never fail the import
+            return None
+
     async def _process_one(
         self,
         expected: ExpectedFile,
         manifest: DownloadManifest,
         used_expected_positions: set[tuple[int, int]] | None = None,
+        consult_partial: bool = False,
     ) -> Path | _PlannedImport:
         """Verify and plan one file for the shared bundle publisher. Raises ``VerificationFailed``
         (per-file) or ``AlreadyImported`` (crash-idempotency)."""
@@ -1993,11 +2164,49 @@ class FileProcessor:
                 )
             # (c) mount healthy but the file isn't where we look -> a local locate
             # failure, not the peer's fault (SOURCE_FILE_MISSING is non-quarantine)
+            # Subset imports (per-file failover) may still hold the file's partial
+            # bytes in slskd's incomplete dir: surface those as the same retry
+            # signal WITHOUT a tag read or import (import still requires full byte
+            # size via the gate below). Full-manifest imports (only=None) never
+            # consult partials.
+            if consult_partial and await self._locate_partial(manifest, expected):
+                logger.info(
+                    "process.partial_retry",
+                    extra={
+                        "task_id": manifest.task_id,
+                        "file": _basename(expected.filename),
+                    },
+                )
             raise VerificationFailed(
                 f"Missing file: {expected.filename}",
                 reason=SOURCE_FILE_MISSING,
                 filename=expected.filename,
             )
+        # Size gate, before the tag read: the cheap locate paths ignore size and
+        # mutagen's MP3 duration reads the Xing header (truncation-invariant), so a
+        # short file otherwise imports as if whole. A mismatch is a LOCAL fault -
+        # never quarantine the peer for our truncated copy. Fail open when the
+        # expected size is unknown (None/<=0) or the file can't be stat'ed.
+        if expected.size is not None and expected.size > 0:
+            try:
+                actual_size = source.stat().st_size
+            except OSError:
+                logger.warning(
+                    "process.size_unreadable",
+                    extra={
+                        "task_id": manifest.task_id,
+                        "file": _basename(expected.filename),
+                    },
+                )
+            else:
+                if actual_size != expected.size:
+                    raise VerificationFailed(
+                        f"Size mismatch for {expected.filename} "
+                        f"({actual_size} bytes on disk, "
+                        f"expected {expected.size})",
+                        reason=SIZE_MISMATCH,
+                        filename=expected.filename,
+                    )
 
         # mutagen is sync; wrap in to_thread, mirroring the scanner
         try:
@@ -2139,6 +2348,7 @@ class FileProcessor:
                         else tag.musicbrainz_recording_id
                     ),
                     duration_seconds=info.duration_seconds,
+                    expected_duration_seconds=expected.duration,
                     file_format=info.file_format,
                 )
             raise VerificationFailed(
@@ -2170,6 +2380,11 @@ class FileProcessor:
                     else tag.musicbrainz_recording_id
                 ),
                 duration_seconds=info.duration_seconds,
+                expected_duration_seconds=(
+                    expected_track.duration_seconds
+                    if expected_track is not None
+                    else expected.duration
+                ),
                 file_format=info.file_format,
             )
             raise VerificationFailed(
@@ -2199,8 +2414,11 @@ class FileProcessor:
                 fp,
                 expected_track,
                 manifest.artist_name,
-                tag_identity_level=tag_identity(
-                    tag, tag.disc_number or 1, expected_track
+                file_duration_seconds=info.duration_seconds,
+                expected_duration_seconds=(
+                    expected_track.duration_seconds
+                    if expected_track is not None
+                    else expected.duration
                 ),
             ):
                 await self._hold_for_review(
@@ -2215,6 +2433,11 @@ class FileProcessor:
                     track_title=tag.title,
                     recording_mbid=tag.musicbrainz_recording_id,
                     duration_seconds=info.duration_seconds,
+                    expected_duration_seconds=(
+                        expected_track.duration_seconds
+                        if expected_track is not None
+                        else expected.duration
+                    ),
                     file_format=info.file_format,
                 )
                 raise VerificationFailed(
@@ -2222,16 +2445,25 @@ class FileProcessor:
                     reason="fingerprint_mismatch",
                     filename=expected.filename,
                 )
-            proves_recording = expected_track is not None and (
-                _fingerprint_proves_recording(fp, expected_track.recording_mbid)
-            )
-            if conversion_verification and not proves_recording:
+            if conversion_verification and (
+                _fingerprint_recording_proof(
+                    fp,
+                    expected_track.recording_mbid
+                    if expected_track is not None
+                    else None,
+                )
+                is not True
+            ):
                 raise VerificationFailed(
                     "AcoustID could not prove the requested recording",
                     reason="fingerprint_unverified",
                     filename=expected.filename,
                 )
-            if proves_recording:
+            if (
+                expected_track is not None
+                and _fingerprint_recording_proof(fp, expected_track.recording_mbid)
+                is True
+            ):
                 authoritative_mapping = bool(
                     manifest.release_mbid and expected_track.release_track_mbid
                 )
@@ -2281,9 +2513,11 @@ class FileProcessor:
 
     def _prune_empty_source_dirs(self, source: Path) -> None:
         """Remove the now-empty folders slskd left behind after a file is moved out of
-        the downloads dir, walking up to but not including the mount root. ``rmdir``
-        only deletes empty dirs, so a half-imported album (siblings still present) is
-        left alone. Best-effort: never fails the import."""
+        the downloads dir, walking up to but not including the downloads root. The root
+        is the effective downloads dir (mount + downloads_subpath), so a subpath layout
+        (e.g. .../completed) keeps its own dir while empty album subdirs still prune.
+        ``rmdir`` only deletes empty dirs, so a half-imported album (siblings still
+        present) is left alone. Best-effort: never fails the import."""
         mount = self._slskd_downloads_path
         if mount is None:
             return

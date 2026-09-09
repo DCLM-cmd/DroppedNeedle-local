@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import msgspec
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from api.v1.schemas.settings import (
     UserPreferences,
     LibrarySyncSettings,
@@ -12,6 +12,7 @@ from api.v1.schemas.settings import (
     JellyfinVerifyResponse,
     JellyfinUserInfo,
     NavidromeConnectionSettings,
+    NavidromePlaylistSyncResult,
     ListenBrainzConnectionSettings,
     YouTubeConnectionSettings,
     LastFmConnectionSettings,
@@ -22,6 +23,8 @@ from api.v1.schemas.settings import (
     PlexConnectionSettings,
     PlexVerifyResponse,
     MusicBrainzConnectionSettings,
+    MusicBrainzSettingsUpdate,
+    MusicBrainzBindingRequest,
     SecuritySettings,
     OIDCConnectionSettings,
     LibrarySettings,
@@ -46,12 +49,14 @@ from api.v1.schemas.advanced_settings import (
 )
 from core.dependencies import (
     get_events_watcher_getter,
+    get_navidrome_playlist_export_service,
     get_preferences_service,
     get_settings_service,
     get_oidc_user_auth_service,
 )
+from core.dependencies.type_aliases import ReleaseTypePolicyTransitionLockDep
 from services.oidc_user_auth_service import OIDCUserAuthService
-from core.exceptions import ConfigurationError
+from core.exceptions import ConfigurationError, RateLimitedError, ValidationError
 from core.dependencies.cleanup import clear_library_policy_dependent_caches
 from infrastructure.msgspec_fastapi import AppStruct, MsgSpecBody, MsgSpecRoute
 from middleware import CurrentAdminDep
@@ -62,6 +67,18 @@ logger = logging.getLogger(__name__)
 
 
 async def _admin_guard(_: CurrentAdminDep) -> None: ...
+
+
+async def _musicbrainz_verify_payload(
+    payload: object = Body(...),
+) -> MusicBrainzBindingRequest | MusicBrainzSettingsUpdate:
+    """Decode the verification union without allowing BrainzMash as a client update."""
+    try:
+        if isinstance(payload, dict) and "source_mode" not in payload:
+            return msgspec.convert(payload, type=MusicBrainzBindingRequest, strict=True)
+        return msgspec.convert(payload, type=MusicBrainzSettingsUpdate, strict=True)
+    except (msgspec.ValidationError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 router = APIRouter(
@@ -81,18 +98,20 @@ async def get_preferences(
 
 @router.put("/preferences", response_model=UserPreferences)
 async def update_preferences(
+    policy_transition_lock: ReleaseTypePolicyTransitionLockDep,
     preferences: UserPreferences = MsgSpecBody(UserPreferences),
     preferences_service: PreferencesService = Depends(get_preferences_service),
     settings_service: SettingsService = Depends(get_settings_service),
 ):
     try:
-        previous = preferences_service.get_preferences()
-        preferences_service.save_preferences(preferences)
-        # ST1 phase 1: identical payload -> no sweep at all; changed types ->
-        # no prefix sweeps either (search results embed sorted types in their
-        # cache key now; raw MB caches filter per request).
-        await settings_service.apply_preference_change(previous, preferences)
-        return preferences
+        async with policy_transition_lock:
+            previous = preferences_service.get_preferences()
+            preferences_service.save_preferences(preferences)
+            # ST1 phase 1: identical payload -> no sweep at all; changed types ->
+            # no prefix sweeps either (search results embed sorted types in their
+            # cache key now; raw MB caches filter per request).
+            await settings_service.apply_preference_change(previous, preferences)
+            return preferences
     except ConfigurationError as e:
         logger.warning(f"Configuration error updating preferences: {e}")
         raise HTTPException(status_code=400, detail="Couldn't save these settings")
@@ -353,6 +372,43 @@ async def update_navidrome_settings(
         )
 
 
+@router.post("/navidrome/playlist-sync", response_model=NavidromePlaylistSyncResult)
+async def sync_navidrome_playlists(
+    preferences_service: PreferencesService = Depends(get_preferences_service),
+    export_service: "NavidromePlaylistExportService" = Depends(
+        get_navidrome_playlist_export_service
+    ),
+):
+    """Write DroppedNeedle playlists into the configured directory.
+
+    No request body: the target comes from saved settings, so no caller can
+    name an arbitrary directory to write into.
+    """
+    settings = preferences_service.get_navidrome_connection()
+    if not settings.playlist_sync_enabled:
+        return NavidromePlaylistSyncResult(
+            success=False,
+            message="Playlist sync is turned off. Enable it and save first.",
+        )
+    result = await export_service.sync(
+        target_dir=settings.playlist_sync_path,
+        scope=settings.playlist_sync_scope,
+        remove_deleted=settings.playlist_sync_remove_deleted,
+    )
+    return NavidromePlaylistSyncResult(
+        success=result.success,
+        message=result.message,
+        written=result.written,
+        unchanged=result.unchanged,
+        removed=result.removed,
+        removal_failures=result.removal_failures,
+        skipped_empty=result.skipped_empty,
+        skipped_not_ours=result.skipped_not_ours,
+        tracks_missing_files=result.tracks_missing_files,
+        tracks_unrepresentable=result.tracks_unrepresentable,
+    )
+
+
 @router.post("/navidrome/verify", response_model=VerifyConnectionResponse)
 async def verify_navidrome_connection(
     settings: NavidromeConnectionSettings = MsgSpecBody(NavidromeConnectionSettings),
@@ -448,7 +504,13 @@ async def verify_listenbrainz_connection(
     ),
     settings_service: SettingsService = Depends(get_settings_service),
 ):
-    result = await settings_service.verify_listenbrainz(settings)
+    try:
+        result = await settings_service.verify_listenbrainz(settings)
+    except RateLimitedError:
+        raise HTTPException(
+            status_code=429,
+            detail="ListenBrainz is temporarily rate-limiting this server. Try again shortly.",
+        ) from None
     return VerifyConnectionResponse(valid=result.valid, message=result.message)
 
 
@@ -823,38 +885,132 @@ async def update_primary_music_source(
 @router.get("/musicbrainz", response_model=MusicBrainzConnectionSettings)
 async def get_musicbrainz_settings(
     preferences_service: PreferencesService = Depends(get_preferences_service),
-):
+) -> MusicBrainzConnectionSettings:
     return preferences_service.get_musicbrainz_connection()
 
 
 @router.put("/musicbrainz", response_model=MusicBrainzConnectionSettings)
 async def update_musicbrainz_settings(
-    settings: MusicBrainzConnectionSettings = MsgSpecBody(
-        MusicBrainzConnectionSettings
+    settings: MusicBrainzSettingsUpdate = MsgSpecBody(MusicBrainzSettingsUpdate),
+    preferences_service: PreferencesService = Depends(get_preferences_service),
+    settings_service: SettingsService = Depends(get_settings_service),
+) -> MusicBrainzConnectionSettings:
+    try:
+        return await settings_service.save_musicbrainz_update(settings)
+    except ConfigurationError as exc:
+        raise HTTPException(
+            status_code=422, detail="MusicBrainz settings are incomplete or invalid"
+        ) from exc
+
+
+@router.post(
+    "/musicbrainz/brainzmash/stage",
+    response_model=MusicBrainzConnectionSettings,
+)
+async def stage_brainzmash(
+    settings_service: SettingsService = Depends(get_settings_service),
+) -> MusicBrainzConnectionSettings:
+    try:
+        return await settings_service.stage_brainzmash()
+    except ConfigurationError as exc:
+        raise HTTPException(
+            status_code=422, detail="Could not stage BrainzMash"
+        ) from exc
+
+
+@router.post(
+    "/musicbrainz/brainzmash/consent",
+    response_model=MusicBrainzConnectionSettings,
+)
+async def consent_brainzmash(
+    admin: CurrentAdminDep,
+    binding: MusicBrainzBindingRequest = MsgSpecBody(MusicBrainzBindingRequest),
+    preferences_service: PreferencesService = Depends(get_preferences_service),
+) -> MusicBrainzConnectionSettings:
+    try:
+        return preferences_service.accept_brainzmash_consent(
+            binding, str(getattr(admin, "id", "admin"))
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/musicbrainz/verify", response_model=MusicBrainzConnectionSettings)
+async def verify_musicbrainz_connection(
+    verify_request: MusicBrainzBindingRequest | MusicBrainzSettingsUpdate = Depends(
+        _musicbrainz_verify_payload
     ),
     preferences_service: PreferencesService = Depends(get_preferences_service),
     settings_service: SettingsService = Depends(get_settings_service),
-):
-    try:
-        preferences_service.save_musicbrainz_connection(settings)
-        await settings_service.on_musicbrainz_settings_changed(settings)
-        return settings
-    except ConfigurationError as e:
-        logger.warning(f"Configuration error updating MusicBrainz settings: {e}")
+) -> MusicBrainzConnectionSettings:
+    current = preferences_service.get_musicbrainz_connection()
+    selected_mode = (
+        current.selected_source_mode
+        if current.pending_brainzmash is not None
+        else current.source_mode
+    )
+    if isinstance(verify_request, MusicBrainzBindingRequest):
+        if selected_mode != "brainzmash":
+            raise HTTPException(
+                status_code=422,
+                detail="BrainzMash binding is only valid for a selected BrainzMash proposal",
+            )
+        try:
+            result = await settings_service.verify_brainzmash(verify_request)
+            if not result.valid:
+                raise HTTPException(status_code=502, detail=result.message)
+            return preferences_service.record_brainzmash_verification(verify_request)
+        except ValidationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    from api.v1.schemas.settings import is_brainzmash_active_binding_valid
+    from repositories.musicbrainz_base import brainzmash_runtime_enabled
+
+    if brainzmash_runtime_enabled() and is_brainzmash_active_binding_valid(current):
         raise HTTPException(
-            status_code=400, detail="MusicBrainz settings are incomplete or invalid"
+            status_code=409,
+            detail="Alternative MusicBrainz tests are disabled while BrainzMash is active; save to switch sources",
         )
 
+    if verify_request.source_mode == "brainzmash":
+        raise HTTPException(
+            status_code=422,
+            detail="BrainzMash verification requires the consent binding",
+        )
+    draft = MusicBrainzConnectionSettings(
+        source_mode=verify_request.source_mode,
+        api_url=verify_request.api_url or "https://musicbrainz.org/ws/2",
+        rate_limit=verify_request.rate_limit,
+        concurrent_searches=verify_request.concurrent_searches,
+        community_acknowledged=bool(verify_request.community_acknowledged),
+        selected_source_mode=verify_request.source_mode,
+        source_id=current.source_id,
+        generation=current.generation,
+    )
+    result = await settings_service.verify_musicbrainz(draft)
+    if not result.valid:
+        raise HTTPException(status_code=502, detail=result.message)
+    return current
 
-@router.post("/musicbrainz/verify", response_model=VerifyConnectionResponse)
-async def verify_musicbrainz_connection(
-    settings: MusicBrainzConnectionSettings = MsgSpecBody(
-        MusicBrainzConnectionSettings
-    ),
+
+@router.post(
+    "/musicbrainz/activate",
+    response_model=MusicBrainzConnectionSettings,
+)
+async def activate_brainzmash(
+    binding: MusicBrainzBindingRequest = MsgSpecBody(MusicBrainzBindingRequest),
+    preferences_service: PreferencesService = Depends(get_preferences_service),
     settings_service: SettingsService = Depends(get_settings_service),
-):
-    result = await settings_service.verify_musicbrainz(settings)
-    return VerifyConnectionResponse(valid=result.valid, message=result.message)
+) -> MusicBrainzConnectionSettings:
+    try:
+        return await settings_service.activate_brainzmash(binding)
+    except ValidationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail="Could not activate BrainzMash"
+        ) from exc
 
 
 @router.get("/security", response_model=SecuritySettings)

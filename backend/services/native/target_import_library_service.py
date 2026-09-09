@@ -54,6 +54,7 @@ from core.exceptions import (
     StaleRevisionError,
     ValidationError,
 )
+from repositories.musicbrainz_base import MbSourceContext, capture_mb_source_context
 
 if TYPE_CHECKING:
     from infrastructure.persistence.native_library_store import NativeLibraryStore
@@ -112,24 +113,32 @@ class TargetImportLibraryService:
         if self._management_publisher is None:
             raise RuntimeError("The staged import publisher is not configured.")
 
+        source_context = capture_mb_source_context()
         if self._automatic_management is not None:
-            bundle = await self._automatic_management.prepare(bundle)
+            bundle = await self._automatic_management.prepare(
+                bundle,
+                source_context=source_context,
+            )
 
         async def commit(
             bundle_id: str,
             files: tuple[LibraryManagementPublishedImportFile, ...],
+            commit_source_context: MbSourceContext | None,
         ) -> tuple[str, ...]:
             async with self._policy_transition_lock:
                 return await self._commit_published_import_bundle(
                     bundle_id,
                     files,
                     expected_policy_revision=bundle.policy_revision,
+                    source_context=commit_source_context,
                 )
 
         automatic = any(value.pinned_profile is not None for value in bundle.files)
         try:
             return await self._management_publisher.publish_import_bundle(
-                bundle, commit
+                bundle,
+                commit,
+                source_context=source_context if automatic else None,
             )
         except AutomaticManagementHoldError:
             raise
@@ -275,6 +284,19 @@ class TargetImportLibraryService:
                         raise
             raise AssertionError("Policy retry loop did not return")
 
+    async def _import_reuse_album_id(
+        self, release_group_mbid: str | None
+    ) -> str | None:
+        """Issue #301: reuse the owning album for a provider release group.
+
+        Returns the oldest active owner, or None when nothing owns the RG
+        yet (caller falls back to the grouping-key album id). Never raises
+        on multiple owners — ambiguity resolves to the oldest, never a mint.
+        """
+        if not release_group_mbid:
+            return None
+        return await self._store.find_import_reuse_album_id(release_group_mbid)
+
     async def _upsert_file_once(
         self,
         audio_path: Path,
@@ -316,10 +338,8 @@ class TargetImportLibraryService:
             f"{root.id}:{directory}:{normalize_group_value(album_title)}:"
             f"{normalize_group_value(album_artist)}"
         )
-        album_id = (
-            await self._store.resolve_target_id("album", release_group_mbid)
-            if release_group_mbid
-            else None
+        album_id = await self._import_reuse_album_id(
+            release_group_mbid
         ) or grouping_album_id(grouping_key)
         existing = await self._store.get_target_track_by_path(str(audio_path))
         track_id = (
@@ -459,6 +479,7 @@ class TargetImportLibraryService:
         files: tuple[LibraryManagementPublishedImportFile, ...],
         *,
         expected_policy_revision: str,
+        source_context: MbSourceContext | None = None,
     ) -> tuple[str, ...]:
         resolver = self._resolver_getter()
         if resolver.policy_revision != expected_policy_revision:
@@ -536,6 +557,7 @@ class TargetImportLibraryService:
                 value.request.ordinal: value.destination_path for value in files
             },
             updated_at=time.time(),
+            source_context=source_context,
         )
         automatic_ordinals = {
             value.request.ordinal
@@ -604,10 +626,8 @@ class TargetImportLibraryService:
             f"{root.id}:{directory}:{normalize_group_value(album_title)}:"
             f"{normalize_group_value(album_artist)}"
         )
-        album_id = (
-            await self._store.resolve_target_id("album", release_group_mbid)
-            if release_group_mbid
-            else None
+        album_id = await self._import_reuse_album_id(
+            release_group_mbid
         ) or grouping_album_id(grouping_key)
         existing = await self._store.get_target_track_by_path(str(audio_path))
         track_id = (

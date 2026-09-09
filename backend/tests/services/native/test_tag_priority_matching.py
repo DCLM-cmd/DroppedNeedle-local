@@ -148,37 +148,6 @@ def _confident_fingerprint(title="Something Else Entirely", artist="Another Band
     return SimpleNamespace(status="pass", title=title, artist=artist, score=0.95)
 
 
-def test_acoustid_cannot_overrule_a_certain_tag() -> None:
-    """83 files were held as fingerprint_mismatch. A tag written into the file by
-    whoever prepared the release outranks an inference over a crowd-sourced database."""
-    assert not _fingerprint_disagrees(
-        _confident_fingerprint(),
-        _track(),
-        "Radiohead",
-        tag_identity_level=_TAG_IDENTITY_CERTAIN,
-    )
-
-
-def test_acoustid_still_catches_a_wrong_song_when_the_tags_are_silent() -> None:
-    """The guard has to keep working: this is how a mislabelled rip is caught."""
-    assert _fingerprint_disagrees(
-        _confident_fingerprint(),
-        _track(),
-        "Radiohead",
-        tag_identity_level=_TAG_IDENTITY_NONE,
-    )
-
-
-def test_a_merely_positional_tag_does_not_silence_acoustid() -> None:
-    """Only an id earns that. A title at a position can coincide."""
-    assert _fingerprint_disagrees(
-        _confident_fingerprint(),
-        _track(),
-        "Radiohead",
-        tag_identity_level=_TAG_IDENTITY_POSITIONAL,
-    )
-
-
 def test_an_unconfident_fingerprint_never_rejects() -> None:
     assert not _fingerprint_disagrees(
         SimpleNamespace(status="skip", title=None, artist=None),

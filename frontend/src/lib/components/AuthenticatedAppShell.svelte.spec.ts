@@ -163,6 +163,7 @@ import Layout from '../../routes/+layout.svelte';
 import { authStore, type AuthUser } from '$lib/stores/authStore.svelte';
 import { discographyDownloadStore } from '$lib/stores/discographyDownload.svelte';
 import { batchDownloadStore } from '$lib/stores/batchDownloadStatus.svelte';
+import { toastStore } from '$lib/stores/toast';
 
 type IntegrationState = {
 	download_client: boolean;
@@ -333,5 +334,202 @@ describe('AuthenticatedAppShell sidebar scroll at short desktop heights (#281)',
 			},
 			{ timeout: 3000 }
 		);
+	});
+});
+
+// GH-182: portrait phones showed only Home/Discover/Search/Library/Settings while
+// Downloads, Playlists, Requests, Following and the admin destinations existed
+// only in the md+ sidebar, and non-admins got a Settings tab that bounced to
+// Home. These specs pin the More overflow sheet at a 360px portrait viewport
+// (the harness drives real browser CSS, so viewport control is practical and
+// the md:hidden bar is genuinely visible).
+describe('AuthenticatedAppShell mobile overflow menu (#182)', () => {
+	beforeEach(async () => {
+		vi.clearAllMocks();
+		routeState.pathname = '/';
+		playerState.isPlayerVisible = true;
+		authStore.clear();
+		await page.viewport(360, 800);
+	});
+
+	afterEach(async () => {
+		authStore.clear();
+		discographyDownloadStore.close();
+		batchDownloadStore.clear();
+		window.history.pushState({}, '', '/');
+		await page.viewport(1280, 720);
+	});
+
+	function bottomNav(): HTMLElement {
+		const nav = document.querySelector('.droppedneedle-bottom-nav');
+		if (!(nav instanceof HTMLElement)) throw new Error('bottom nav did not render');
+		return nav;
+	}
+
+	function barEntryNames(): string[] {
+		return [...bottomNav().querySelectorAll(':scope > a, :scope > button')].map(
+			(el) => el.textContent?.trim() ?? ''
+		);
+	}
+
+	function openMoreSheet(): HTMLDialogElement {
+		const more = bottomNav().querySelector('button[aria-label="More navigation options"]');
+		if (!(more instanceof HTMLButtonElement)) throw new Error('More tab did not render');
+		more.click();
+		const sheet = document.getElementById('more_nav_sheet');
+		if (!(sheet instanceof HTMLDialogElement)) throw new Error('More sheet did not render');
+		return sheet;
+	}
+
+	it('exposes the missing destinations behind More with resolved hrefs', async () => {
+		authStore.setUser(testUser());
+		renderLayout();
+		await expect.element(page.getByTestId('page-content')).toBeInTheDocument();
+
+		expect(barEntryNames()).toEqual(['Home', 'Discover', 'Search', 'Library', 'Settings', 'More']);
+
+		const sheet = openMoreSheet();
+		await vi.waitFor(() => expect(sheet.open).toBe(true));
+
+		const hrefs = [...sheet.querySelectorAll('a')].map((a) => a.getAttribute('href'));
+		// withBasePath resolves against the mocked '/dn' base
+		expect(hrefs).toContain('/dn/downloads');
+		expect(hrefs).toContain('/dn/following');
+		expect(hrefs).toContain('/dn/playlists');
+		expect(hrefs).toContain('/dn/requests');
+		expect(hrefs).toContain('/dn/library/management');
+		expect(hrefs).toContain('/dn/requests?tab=approvals');
+	});
+
+	it('hides Settings and admin entries from non-admins', async () => {
+		authStore.setUser(testUser('user'));
+		renderLayout();
+		await expect.element(page.getByTestId('page-content')).toBeInTheDocument();
+
+		// No Settings tab to bounce to Home; the five-slot grid keeps even spacing.
+		expect(barEntryNames()).toEqual(['Home', 'Discover', 'Search', 'Library', 'More']);
+		expect(bottomNav().className).toContain('droppedneedle-bottom-nav--no-settings');
+
+		const sheet = openMoreSheet();
+		await vi.waitFor(() => expect(sheet.open).toBe(true));
+		const text = sheet.textContent ?? '';
+		expect(text).not.toContain('Settings');
+		expect(text).not.toContain('Approvals');
+		expect(text).not.toContain('Library Management');
+		expect(text).toContain('Downloads');
+		expect(text).toContain('Playlists');
+	});
+
+	it('fits six slots without horizontal overflow at 360px', async () => {
+		authStore.setUser(testUser());
+		renderLayout();
+		await expect.element(page.getByTestId('page-content')).toBeInTheDocument();
+
+		const nav = bottomNav();
+		await vi.waitFor(() => expect(nav.getBoundingClientRect().width).toBeGreaterThan(0));
+		expect(nav.scrollWidth).toBeLessThanOrEqual(nav.clientWidth + 1);
+		for (const item of nav.querySelectorAll(':scope > a, :scope > button')) {
+			const el = item as HTMLElement;
+			expect(el.scrollWidth, `${el.textContent?.trim()} tab overflows`).toBeLessThanOrEqual(
+				el.clientWidth + 1
+			);
+		}
+		expect(getComputedStyle(nav).gridTemplateColumns.split(' ').length).toBe(6);
+	});
+
+	it('highlights More and the matching entry when a sheet destination is active', async () => {
+		authStore.setUser(testUser());
+		window.history.pushState({}, '', '/dn/downloads');
+		renderLayout();
+		await expect.element(page.getByTestId('page-content')).toBeInTheDocument();
+
+		const more = bottomNav().querySelector('button[aria-label="More navigation options"]');
+		if (!(more instanceof HTMLButtonElement)) throw new Error('More tab did not render');
+		expect(more.className).toContain('active');
+
+		const sheet = openMoreSheet();
+		await vi.waitFor(() => expect(sheet.open).toBe(true));
+		const downloads = sheet.querySelector('a[href="/dn/downloads"]');
+		if (!(downloads instanceof HTMLAnchorElement))
+			throw new Error('Downloads entry did not render');
+		expect(downloads.getAttribute('aria-current')).toBe('page');
+	});
+
+	it('omits Playlists and Requests when no download client is configured', async () => {
+		authStore.setUser(testUser());
+		integrationState.download_client = false;
+		try {
+			renderLayout();
+			await expect.element(page.getByTestId('page-content')).toBeInTheDocument();
+
+			const sheet = openMoreSheet();
+			await vi.waitFor(() => expect(sheet.open).toBe(true));
+			const text = sheet.textContent ?? '';
+			expect(text).toContain('Downloads');
+			expect(text).toContain('Following');
+			expect(text).not.toContain('Playlists');
+			expect(text).not.toContain('Requests');
+		} finally {
+			integrationState.download_client = true;
+		}
+	});
+});
+
+// N1: toastStore had zero subscribers, so management mutation toasts
+// ("Organization preview queued" et al) never displayed. The shell now
+// renders the store with role=status.
+describe('AuthenticatedAppShell global toast (toastStore)', () => {
+	beforeEach(async () => {
+		vi.clearAllMocks();
+		routeState.pathname = '/';
+		playerState.isPlayerVisible = true;
+		authStore.clear();
+		authStore.setUser(testUser());
+		toastStore.hide();
+		await page.viewport(1280, 720);
+	});
+
+	afterEach(async () => {
+		toastStore.hide();
+		authStore.clear();
+		discographyDownloadStore.close();
+		batchDownloadStore.clear();
+		await page.viewport(1280, 720);
+	});
+
+	function globalToast(): Element | null {
+		return document.querySelector('.droppedneedle-playback-toast div[role="status"]');
+	}
+
+	it('renders a management success toast with role=status', async () => {
+		renderLayout();
+		await expect.element(page.getByTestId('page-content')).toBeInTheDocument();
+
+		toastStore.show({ message: 'Organization preview queued', type: 'success' });
+
+		await vi.waitFor(() => {
+			const toast = globalToast();
+			expect(toast?.textContent).toContain('Organization preview queued');
+		});
+		expect(globalToast()?.className).toContain('alert-success');
+	});
+
+	it('renders error toasts and dismisses them', async () => {
+		renderLayout();
+		await expect.element(page.getByTestId('page-content')).toBeInTheDocument();
+
+		toastStore.show({ message: 'Could not queue the management preview', type: 'error' });
+
+		await vi.waitFor(() => {
+			const toast = globalToast();
+			expect(toast?.textContent).toContain('Could not queue the management preview');
+		});
+		expect(globalToast()?.className).toContain('alert-error');
+
+		toastStore.hide();
+
+		await vi.waitFor(() => {
+			expect(globalToast()).toBeNull();
+		});
 	});
 });

@@ -46,8 +46,8 @@ def _track(index: int, *, recording: str) -> dict:
 def _service(tmp_path: Path, *, source_ready: bool = True):
     store = AsyncMock()
     store.get_active_edition_conversion.return_value = None
-    store.create_edition_conversion.side_effect = (
-        lambda job, targets, local_files: EditionConversionJob(
+    store.create_edition_conversion.side_effect = lambda job, targets, local_files: (
+        EditionConversionJob(
             **{
                 field: getattr(job, field)
                 for field in EditionConversionJob.__struct_fields__
@@ -210,9 +210,26 @@ async def test_start_blocks_acquisition_when_no_source_is_ready(tmp_path: Path) 
     store.start_edition_conversion.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "fingerprint",
+    [
+        pytest.param(
+            SimpleNamespace(status="no_match", recording_id=None),
+            id="no-proof",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                status="pass",
+                recording_id="recording-other",
+                recording_ids=["recording-other"],
+            ),
+            id="absent-expected-recording",
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_final_preview_reverifies_a_retained_copy_with_acoustid(
-    tmp_path: Path,
+    tmp_path: Path, fingerprint: SimpleNamespace
 ) -> None:
     service, store, _albums = _service(tmp_path)
     source = tmp_path / "retained.flac"
@@ -270,12 +287,9 @@ async def test_final_preview_reverifies_a_retained_copy_with_acoustid(
         ],
     }
     service._assert_current = AsyncMock()
-    service._fingerprinter.fingerprint.return_value = SimpleNamespace(
-        status="skip", recording_id=None, recording_ids=[], error=None
-    )
+    service._fingerprinter.fingerprint.return_value = fingerprint
 
-    # no audio confirmation AND no release-track tag to fall back on
-    with pytest.raises(ValidationError, match="could not be checked"):
+    with pytest.raises(ValidationError, match="could not be verified"):
         await service._ensure_final_preview(job, preview_token="preview-token")
 
     service._fingerprinter.fingerprint.assert_awaited_once()

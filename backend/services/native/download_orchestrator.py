@@ -22,7 +22,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import msgspec
-import msgspec as _msgspec
 
 from core.exceptions import (
     ConflictError,
@@ -120,7 +119,11 @@ def _is_local_fault(message: str | None) -> bool:
 
 def _generation_of(value: object | None) -> int | None:
     generation = getattr(value, "generation", None)
-    return generation if isinstance(generation, int) and not isinstance(generation, bool) else None
+    return (
+        generation
+        if isinstance(generation, int) and not isinstance(generation, bool)
+        else None
+    )
 
 
 # _poll_until_done outcomes.
@@ -146,9 +149,7 @@ _FILES_NOT_FOUND_MSG = (
     "Files downloaded, but couldn't be found in the slskd downloads folder - check "
     "the slskd downloads path points to where slskd saves completed files"
 )
-_TAG_MISMATCH_MSG = (
-    "Files downloaded and found, but their embedded tags did not match the requested music"
-)
+_TAG_MISMATCH_MSG = "Files downloaded and found, but their embedded tags did not match the requested music"
 # slskd delivered the files and we found them, but writing them into the library failed
 # (perms, disk full, a cross-mount copy the filesystem rejected). Local fault, not the
 # peer's - blaming Soulseek sends users chasing the wrong problem.
@@ -239,15 +240,14 @@ def _log_task_exception(task: "asyncio.Task") -> None:
 
 
 def json_dumps_safe(snapshot) -> str:
-    import json as _json
-    from infrastructure.serialization import to_jsonable as _to
-
-    return _json.dumps(_to(snapshot))
+    """Compatibility wrapper for callers/tests; snapshots use one codec."""
+    return acq_quality.encode_snapshot(snapshot)
 
 
 class _DefaultPolicyShim:
     """Last-resort legacy-default policy mirror for tests constructing the
     orchestrator without a policy getter."""
+
     quality_min = "mp3_320"
     quality_max = "lossless"
     quality_preference_order: list[str] = []
@@ -586,9 +586,7 @@ class DownloadOrchestrator:
         joined = " or ".join(names) if names else "any source"
         return f"{_NO_MATCH_MSG} on {joined}"
 
-    async def _search_and_score(
-        self, task, source: str, *, snapshot=None
-    ):  # noqa: ANN001, ANN201
+    async def _search_and_score(self, task, source: str, *, snapshot=None):  # noqa: ANN001, ANN201
         """Search ONE source under ``snapshot`` (resolved per task when omitted),
         returning its snapshot-ranked candidates via the source strategy."""
         if snapshot is None:
@@ -603,33 +601,42 @@ class DownloadOrchestrator:
         )
 
     async def _task_quality_snapshot(self, task):  # noqa: ANN001
-        """Decode-or-derive the snapshot for THIS task (stored governs; legacy
-        rows synthesise a migration-tagged snapshot from the live policy so
-        pre-backfill behaviour is preserved without ever re-snapshotting new
-        work against mutable settings)."""
+        """Resolve the immutable task snapshot.
+
+        A NULL legacy row may be migration-snapshotted once. Any non-NULL
+        malformed, unsupported, or tampered blob is a hard task failure; never
+        silently replace it with mutable live settings.
+        """
         raw = getattr(task, "quality_snapshot_json", None)
-        if raw:
+        if raw is not None:
             try:
-                return _msgspec.json.decode(raw, type=AcquisitionQualitySnapshot)
-            except ValueError:
+                return acq_quality.decode_snapshot(raw)
+            except acq_quality.SnapshotValidationError as exc:
                 logger.warning("download.snapshot_decode_failed task=%s", task.id)
+                raise OrchestrationError(
+                    "Stored quality policy snapshot is invalid"
+                ) from exc
         if self._get_download_policy is not None:
             return acq_quality.migration_snapshot(self._get_download_policy())
-        return acq_quality.build_snapshot(
-            _DefaultPolicyShim()
-        )
+        return acq_quality.build_snapshot(_DefaultPolicyShim())
 
-    def _source_selection_mode(self) -> str:
+    def _source_selection_mode(
+        self, snapshot: AcquisitionQualitySnapshot | None = None
+    ) -> str:
+        """Use the task snapshot when available; live policy is migration-only."""
+        if snapshot is not None:
+            return snapshot.source_selection_mode
         if self._get_download_policy is not None:
             return self._get_download_policy().source_selection_mode
         return "source_first"
 
-    async def _concurrent_search_and_score(self, task):  # noqa: ANN001
+    async def _concurrent_search_and_score(self, task, *, snapshot=None):  # noqa: ANN001
         """quality_first (opt-in): search every enabled source CONCURRENTLY under
         the existing per-source timeout, pooling results per source. One failed
         or slow source never erases another's candidates."""
+        if snapshot is None:
+            snapshot = await self._task_quality_snapshot(task)
         enabled = [s for s in self._source_priority if self._source_enabled(s)]
-        snapshot = await self._task_quality_snapshot(task)
 
         async def run_one(source):
             try:
@@ -670,7 +677,9 @@ class DownloadOrchestrator:
                 -acq_quality.CERTAINTY_RANK[
                     candidate.quality_evidence.certainty
                     if candidate.quality_evidence is not None
-                    else __import__("models.acquisition_quality", fromlist=["EvidenceCertainty"]).EvidenceCertainty.PARTIAL
+                    else __import__(
+                        "models.acquisition_quality", fromlist=["EvidenceCertainty"]
+                    ).EvidenceCertainty.PARTIAL
                 ],
                 next(
                     (
@@ -735,8 +744,8 @@ class DownloadOrchestrator:
         )
 
         remembered: list[list] = []
-        if self._source_selection_mode() == "quality_first":
-            by_source = await self._concurrent_search_and_score(task)
+        if self._source_selection_mode(snapshot) == "quality_first":
+            by_source = await self._concurrent_search_and_score(task, snapshot=snapshot)
             for source in self._source_priority:
                 if self._source_enabled(source):
                     remembered.append(by_source.get(source, []))
@@ -747,6 +756,8 @@ class DownloadOrchestrator:
             )
             if picked is not None:
                 index, selected = picked
+                selected_decision = getattr(selected, "quality_decision", None)
+                selected_evidence = getattr(selected, "quality_evidence", None)
                 await self._store.link_picked_candidate(
                     task_id=task.id,
                     search_job_id=job.id,
@@ -756,6 +767,21 @@ class DownloadOrchestrator:
                     preflight_score=selected.final_score,
                     source=selected.source,
                     download_client=_CLIENT_FOR_SOURCE.get(selected.source, "slskd"),
+                    quality_preference_step=(
+                        selected_decision.preference_step
+                        if selected_decision is not None
+                        else None
+                    ),
+                    quality_certainty=(
+                        selected_evidence.certainty.value
+                        if selected_evidence is not None
+                        else None
+                    ),
+                    quality_provenance=(
+                        selected_evidence.provenance.value
+                        if selected_evidence is not None
+                        else None
+                    ),
                 )
                 return True
             if any(c.tier in ("auto", "manual") for c in pooled_flat):
@@ -773,9 +799,7 @@ class DownloadOrchestrator:
         for source in self._source_priority:
             if not self._source_enabled(source):
                 continue
-            candidates = await self._search_and_score(
-                task, source, snapshot=snapshot
-            )
+            candidates = await self._search_and_score(task, source, snapshot=snapshot)
             remembered.append(candidates)
             logger.info(
                 "download.search.completed",
@@ -799,6 +823,8 @@ class DownloadOrchestrator:
                 pooled = [c for group in remembered for c in group]
                 index = sum(len(group) for group in remembered[:-1]) + candidate_index
                 await self._store.set_search_job_candidates(job.id, pooled)
+                selected_decision = getattr(selected, "quality_decision", None)
+                selected_evidence = getattr(selected, "quality_evidence", None)
                 await self._store.link_picked_candidate(
                     task_id=task.id,
                     search_job_id=job.id,
@@ -808,6 +834,21 @@ class DownloadOrchestrator:
                     preflight_score=selected.final_score,
                     source=selected.source,
                     download_client=_CLIENT_FOR_SOURCE.get(selected.source, "slskd"),
+                    quality_preference_step=(
+                        selected_decision.preference_step
+                        if selected_decision is not None
+                        else None
+                    ),
+                    quality_certainty=(
+                        selected_evidence.certainty.value
+                        if selected_evidence is not None
+                        else None
+                    ),
+                    quality_provenance=(
+                        selected_evidence.provenance.value
+                        if selected_evidence is not None
+                        else None
+                    ),
                 )
                 return True
 
@@ -833,9 +874,50 @@ class DownloadOrchestrator:
         SABnzbd client exists, so a missing one falls through to Soulseek's client here."""
         return self._strategies.get(source) or self._strategies["soulseek"]
 
+    def _candidate_source_identity(self, candidate) -> str:  # noqa: ANN001
+        """Return the source-owned identity used to skip a failed candidate."""
+        source = getattr(candidate, "source", "soulseek") or "soulseek"
+        return self._strategy(source).candidate_identity(candidate)
+
     def _download_client_for(self, task) -> "DownloadClientProtocol":  # noqa: ANN001
         """The download client that owns this task's source (D2/D3)."""
         return self._strategy(task.source).client
+
+    async def _disk_present_filenames(self, task, manifest) -> set[str]:  # noqa: ANN001
+        """Filenames from ``manifest.target_files`` already complete on disk (#131).
+
+        slskd transfer records can vanish (pruned after completion, no-show,
+        stall/queued/deadline with an empty matched set) while every expected
+        file sits complete in the completed dir. Resolving via the owning
+        client's ``get_file_path`` lets the import proceed from disk instead of
+        starving on an empty succeeded set and re-downloading forever.
+        """
+        if task.source != "soulseek":
+            return set()
+        client = self._download_client_for(task)
+        handle = getattr(manifest, "handle", None)
+        present: set[str] = set()
+        for target in manifest.target_files or []:
+            try:
+                resolved = await client.get_file_path(
+                    handle, target.filename, getattr(target, "size", None)
+                )
+            except Exception:  # noqa: BLE001 - one bad file must not sink the album
+                continue
+            if resolved is not None:
+                present.add(target.filename)
+        return present
+
+    async def _only_with_disk_fallback(self, task, only):  # noqa: ANN001, ANN201
+        """Replace an empty soulseek ``only`` set with on-disk files when any (#131)."""
+        if only is None or only or task.source != "soulseek":
+            return only
+        try:
+            manifest = self._read_manifest(task.id)
+        except OrchestrationError:
+            return only
+        present = await self._disk_present_filenames(task, manifest)
+        return present or only
 
     async def _enqueue(  # noqa: ANN001 - DownloadTask
         self,
@@ -1150,6 +1232,7 @@ class DownloadOrchestrator:
                     only = None
                 else:
                     only = set(status.succeeded_filenames)
+                    only = await self._only_with_disk_fallback(task, only)
                 result, enumerated = await self._import_files(
                     task, only_filenames=only, completed=outcome == _OUT_COMPLETED
                 )
@@ -1429,6 +1512,8 @@ class DownloadOrchestrator:
         if not await self._candidate_passes_quality(task, cand):
             await self._settle_incomplete(task, False)
             return
+        decision = getattr(cand, "quality_decision", None)
+        evidence = getattr(cand, "quality_evidence", None)
         await self._store.link_picked_candidate(
             task.id,
             task.search_job_id,
@@ -1438,6 +1523,15 @@ class DownloadOrchestrator:
             cand.final_score,
             source=cand.source,
             download_client=_CLIENT_FOR_SOURCE.get(cand.source, "slskd"),
+            quality_preference_step=(
+                decision.preference_step if decision is not None else None
+            ),
+            quality_certainty=evidence.certainty.value
+            if evidence is not None
+            else None,
+            quality_provenance=evidence.provenance.value
+            if evidence is not None
+            else None,
         )
         task = await self._store.get_task(task.id)
         logger.info("download.track_duration_fallback", extra={"task_id": task.id})
@@ -1454,6 +1548,7 @@ class DownloadOrchestrator:
             if outcome in (_OUT_COMPLETED, _OUT_TERMINAL)
             else set(status.succeeded_filenames)
         )
+        only = await self._only_with_disk_fallback(task, only)
         result, _enumerated = await self._import_files(
             task, only_filenames=only, completed=outcome == _OUT_COMPLETED
         )
@@ -1503,14 +1598,31 @@ class DownloadOrchestrator:
         disposition: str,
         publisher_bundle_ids: list[str] | None = None,
     ) -> str | None:  # noqa: ANN001 - DownloadTask
-        manifest = (
-            manifest_override
-            if manifest_override is not None
-            else self._read_manifest(task.id)
-        )
-        attempt = await self._attempt_for_manifest(task, manifest)
-        if attempt is None:
-            return None
+        if manifest_override is not None:
+            manifest = manifest_override
+        else:
+            try:
+                manifest = self._read_manifest(task.id)
+            except OrchestrationError:
+                manifest = None
+        if manifest is None:
+            # #285: the enqueue failed before the manifest was written, so there
+            # is no manifest to resolve - fall back to the task's live attempt.
+            attempts = await self._store.list_download_attempts(task.id)
+            attempt = next(
+                (
+                    value
+                    for value in reversed(attempts)
+                    if value.state in {"acquiring", "in_use"}
+                ),
+                None,
+            )
+            if attempt is None:
+                return None
+        else:
+            attempt = await self._attempt_for_manifest(task, manifest)
+            if attempt is None:
+                return None
         scheduled = await self._store.schedule_download_attempt_cleanup(
             attempt.id,
             disposition=disposition,
@@ -1581,9 +1693,12 @@ class DownloadOrchestrator:
         if step is None:
             # Legacy blob: derive from canonical tier via fidelity rank so the
             # deadline ordering degrades gracefully pre-backfill.
-            legacy_step = {k: i for i, k in enumerate(
-                ("low", "mp3_192", "mp3_256", "mp3_320", "lossless")
-            )}.get(tier)
+            legacy_step = {
+                k: i
+                for i, k in enumerate(
+                    ("low", "mp3_192", "mp3_256", "mp3_320", "lossless")
+                )
+            }.get(tier)
             step = 10_000 - (legacy_step or 0)
         return {
             "format": "/".join(formats) or None,
@@ -1824,6 +1939,8 @@ class DownloadOrchestrator:
 
     async def _link_candidate_entry(self, task, entry):  # noqa: ANN001, ANN201
         idx, candidate = entry
+        decision = getattr(candidate, "quality_decision", None)
+        evidence = getattr(candidate, "quality_evidence", None)
         await self._store.link_picked_candidate(
             task.id,
             task.search_job_id,
@@ -1833,6 +1950,15 @@ class DownloadOrchestrator:
             candidate.final_score,
             source=candidate.source,
             download_client=_CLIENT_FOR_SOURCE.get(candidate.source, "slskd"),
+            quality_preference_step=(
+                decision.preference_step if decision is not None else None
+            ),
+            quality_certainty=evidence.certainty.value
+            if evidence is not None
+            else None,
+            quality_provenance=evidence.provenance.value
+            if evidence is not None
+            else None,
         )
         refreshed = await self._store.get_task(task.id)
         return await self._prepare_candidate_state(refreshed, reset_transfer_state=True)
@@ -1845,21 +1971,21 @@ class DownloadOrchestrator:
             return None
         return await self._link_candidate_entry(task, entry)
 
-    def _candidate_source_identity(self, cand) -> str:  # noqa: ANN001 - ScoredCandidate
-        return self._strategy(cand.source).candidate_identity(cand)
-
     def _stored_snapshot(self, task):  # noqa: ANN001
-        """The task's persisted creation-time snapshot; legacy rows (pre-backfill
-        blobs without JSON) fall back to a migration-tagged derivation from the
-        LIVE getter so they still re-gate against today's range instead of none."""
+        """Return the task snapshot, or explicitly migrate a NULL legacy row.
+
+        Persisted bytes are authoritative. Decode failures are held by the
+        orchestrator instead of being re-evaluated against live settings.
+        """
         raw = getattr(task, "quality_snapshot_json", None)
-        if raw:
+        if raw is not None:
             try:
-                return _msgspec.json.decode(
-                    raw, type=AcquisitionQualitySnapshot
-                )
-            except ValueError:
+                return acq_quality.decode_snapshot(raw)
+            except acq_quality.SnapshotValidationError as exc:
                 logger.warning("download.snapshot_decode_failed task=%s", task.id)
+                raise OrchestrationError(
+                    "Stored quality policy snapshot is invalid"
+                ) from exc
         if self._get_download_policy is not None:
             return acq_quality.migration_snapshot(self._get_download_policy())
         return None
@@ -1878,36 +2004,51 @@ class DownloadOrchestrator:
         if snapshot is None:
             return True
         # Codec gate mirrors the score-time filter for Soulseek folders.
-        if (
-            getattr(snapshot, "flac_mp3_only", False)
-            and cand.source != "usenet"
-        ):
+        if getattr(snapshot, "flac_mp3_only", False) and cand.source != "usenet":
             from services.native.quality_tiers import is_audio as _is_audio
             from services.native.quality_tiers import is_flac_or_mp3 as _is_flac
 
             audio_files = [f for f in cand.files if _is_audio(f)]
             if audio_files and not all(_is_flac(f) for f in audio_files):
                 return False
+        if (
+            acq_quality.is_recipe_snapshot(snapshot)
+            and cand.source == "soulseek"
+            and cand.files
+        ):
+            from services.native.album_preflight_scorer import _file_evidence
+
+            audio = [f for f in cand.files if is_audio(f)]
+            if not audio:
+                return False
+            decision = acq_quality.evaluate_worst(
+                snapshot, [_file_evidence(f) for f in audio]
+            )
+            return bool(decision.eligible)
         if cand.quality_evidence is not None:
-            # Post-cutover candidate: its evaluation is embedded in the blob.
+            # Post-cutover candidate carries one source-level evidence item in
+            # the blob; re-evaluate it under the stored snapshot.
             decision = acq_quality.evaluate(snapshot, cand.quality_evidence)
             return bool(decision.eligible)
         # Legacy blob projection.
         if cand.source == "usenet":
             if cand.usenet_release is None or self._usenet_scorer is None:
-                return True  # can't judge -> don't block
+                return False
             from services.native.newznab_release_scorer import _release_evidence
 
-            tier = self._usenet_scorer.release_tier(cand.usenet_release, task.track_count)
-            evidence = _release_evidence(cand.usenet_release, tier)
+            tier = self._usenet_scorer.release_tier(
+                cand.usenet_release, task.track_count
+            )
+            evidence = _release_evidence(cand.usenet_release, tier, snapshot)
         else:
             from services.native.album_preflight_scorer import _file_evidence
 
             audio = [f for f in cand.files if is_audio(f)]
             if not audio:
-                return True  # no judgeable audio -> don't block
-            decision_files = [_file_evidence(f) for f in audio]
-            merged = acq_quality.evaluate_worst(snapshot, decision_files)
+                return False
+            merged = acq_quality.evaluate_worst(
+                snapshot, [_file_evidence(f) for f in audio]
+            )
             evidence = merged.evidence
         decision = acq_quality.evaluate(snapshot, evidence)
         return bool(decision.eligible)
@@ -2062,7 +2203,10 @@ class DownloadOrchestrator:
                 and result.management_hold_reason_code is None
             ):
                 try:
-                    asked = len(self._read_manifest(task.id).target_files)
+                    manifest = self._read_manifest(task.id)
+                    # NZBs are opaque: Usenet manifests carry no target_files, so
+                    # fall back to the exact-edition tracklist for the asked count.
+                    asked = len(manifest.target_files) or len(manifest.expected_tracks)
                 except OrchestrationError:
                     asked = None
                 rows = []
@@ -2680,6 +2824,30 @@ class DownloadOrchestrator:
         logger.info(
             "download.cancelled", extra={"task_id": task.id, "user_id": task.user_id}
         )
+        # Cancelling stops the wanted watch too (one action, no secret second
+        # switch, #255): a surviving 'watching' row would re-dispatch
+        # origin='wanted' on its next due date and restart the ladder. Only the
+        # task owner's watching row is stopped (rows are per user + RG); a watch
+        # the user re-arms later works normally - stopping is not destructive.
+        # Best-effort: the cancellation itself already committed above.
+        if task.release_group_mbid and self._wanted_store is not None:
+            try:
+                watch = await self._wanted_store.get_watch(task.release_group_mbid)
+            except Exception:  # noqa: BLE001 - watch settlement is best-effort
+                watch = None
+            if (
+                watch is not None
+                and watch.state == "watching"
+                and watch.user_id == task.user_id
+                and await self._wanted_store.stop_watch(task.release_group_mbid)
+            ):
+                logger.info(
+                    "download.cancel_stopped_watch",
+                    extra={
+                        "task_id": task.id,
+                        "release_group_mbid": task.release_group_mbid,
+                    },
+                )
         # Flip the linked request to 'cancelled' too, so a cancelled (or stopped-retrying)
         # download clears the album UI's "retry scheduled" line instead of sitting failed.
         await self._sync_request_on_terminal(task, DownloadStatus.CANCELLED)
@@ -2746,20 +2914,16 @@ class DownloadOrchestrator:
 
     async def _reimport_task_locked(self, task_id: str):  # noqa: ANN201
         """Re-run only the import half of the pipeline for a ``failed``/``partial``
-        task whose download the user finished by hand in slskd (e.g. resumed a
-        stalled/errored transfer in slskd's own UI after DroppedNeedle had already
-        given up). This re-resolves the SAME candidate slskd already picked.
+        task whose download the user finished by hand (e.g. resumed a stalled
+        transfer, or a SABnzbd job whose files only became visible after the
+        import failed). This re-resolves the SAME picked candidate.
         Admin-gated at the route (``CurrentAdminDep``)."""
         task = await self._store.get_task(task_id)
         if task is None:
             raise ResourceNotFoundError("Download task not found")
         if task.status not in ("failed", "partial"):
             raise ValidationError("Only failed or partial downloads can be reimported")
-        if (
-            task.search_job_id is None
-            or task.candidate_index is None
-            or not task.source_username
-        ):
+        if task.search_job_id is None or task.candidate_index is None:
             raise ValidationError(
                 "This download never selected a source to reimport from"
             )
@@ -2768,8 +2932,27 @@ class DownloadOrchestrator:
         if task.candidate_index >= len(candidates):
             raise ValidationError("Original source is no longer available")
         candidate = candidates[task.candidate_index]
+        if (task.source or candidate.source) == "usenet":
+            # Usenet candidates never set a username; the journaled SABnzbd
+            # handle (job_name + nzo_id) is the source identity instead (#245).
+            # Without a journaled handle there are no files to reimport.
+            attempt = await self._store.get_download_attempt_for_candidate(
+                task.id, task.source, task.candidate_index
+            )
+            if (
+                attempt is None
+                or attempt.handle is None
+                or not (attempt.handle.job_name or attempt.handle.nzo_id)
+            ):
+                raise ValidationError(
+                    "This download never selected a source to reimport from"
+                )
+        elif not task.source_username:
+            raise ValidationError(
+                "This download never selected a source to reimport from"
+            )
         # NOTE: reimport is deliberately NOT quality-re-gated (owner D2). It re-imports
-        # files the admin already fetched by hand in slskd; blocking on a since-tightened
+        # files the admin already fetched by hand; blocking on a since-tightened
         # policy would only strand already-downloaded bytes, so honour the explicit action.
 
         # A 1-track album (a single) reimports under the same canonical-duration
@@ -2968,6 +3151,8 @@ class DownloadOrchestrator:
             quality_snapshot_hash=getattr(task, "quality_snapshot_hash", None),
             quality_snapshot_summary=getattr(task, "quality_snapshot_summary", None),
             quality_preference_step=getattr(task, "quality_preference_step", None),
+            quality_certainty=getattr(task, "quality_certainty", None),
+            quality_provenance=getattr(task, "quality_provenance", None),
         )
         # The retried task owns its staging dir from birth (#285 class): every
         # manifest write in the enqueue path targets <staging>/<new_id>/, and a
@@ -2980,7 +3165,6 @@ class DownloadOrchestrator:
         if linked:
             self.dispatch(new_task.id)
         return new_task.id
-
 
     async def _locate_track_request(self, task) -> object | None:  # noqa: ANN001 - DownloadTask
         """The exact-track history row tied to ``task`` - looked up by the old
@@ -3013,10 +3197,7 @@ class DownloadOrchestrator:
                 )
             else:
                 return True
-            if (
-                record is None
-                or getattr(record, "download_task_id", None) != task.id
-            ):
+            if record is None or getattr(record, "download_task_id", None) != task.id:
                 return True
             generation = _generation_of(record)
             if generation is not None:

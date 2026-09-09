@@ -5,14 +5,16 @@ on the shared 1/s MusicBrainz limiter; every other (user-facing) caller keeps th
 ``USER_INITIATED`` default. These assert the param is threaded to ``mb_api_get`` unchanged.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
-from core.exceptions import ExternalServiceError
+from core.exceptions import ConfigurationError, ExternalServiceError
 from infrastructure.queue.priority_queue import RequestPriority
+import repositories.musicbrainz_base as mb_base
 from repositories.musicbrainz_album import (
     MusicBrainzAlbumMixin,
     _RecordingSearchPayload,
@@ -37,6 +39,52 @@ class _Repo(MusicBrainzAlbumMixin):
         self._cache.set = AsyncMock()
         self._preferences_service = SimpleNamespace(
             get_advanced_settings=lambda: SimpleNamespace(cache_ttl_search=3600)
+        )
+
+
+@pytest.mark.asyncio
+async def test_grouped_search_rejects_mixed_source_generations():
+    from repositories.musicbrainz_repository import MusicBrainzRepository
+
+    repository = MusicBrainzRepository.__new__(MusicBrainzRepository)
+    original_source = mb_base.capture_mb_source_context()
+    original_source_id = mb_base.get_mb_source_id()
+    original_runtime = mb_base.brainzmash_runtime_enabled()
+    old_generation = original_source.generation + 1
+    mb_base.set_mb_api_base(
+        "https://old.example/ws/2",
+        source_mode="mirror",
+        source_id="old-grouped",
+        generation=old_generation,
+    )
+
+    async def search_artists(*_args, **_kwargs):
+        mb_base.set_mb_api_base(
+            "https://new.example/ws/2",
+            source_mode="mirror",
+            source_id="new-grouped",
+            generation=old_generation + 1,
+        )
+        return []
+
+    async def search_albums(*_args, **_kwargs):
+        return []
+
+    repository.search_artists = search_artists
+    repository.search_albums = search_albums
+    try:
+        with pytest.raises(ConfigurationError, match="grouped search"):
+            await repository.search_grouped(
+                "query",
+                {"artists": 1, "albums": 1},
+            )
+    finally:
+        mb_base.set_mb_api_base(
+            original_source.source_url,
+            source_mode=original_source.source_mode,
+            source_id=original_source_id,
+            generation=original_source.generation,
+            brainzmash_binding_valid=original_runtime,
         )
 
 
@@ -205,4 +253,45 @@ async def test_recording_search_escapes_structured_artist_and_title_fields():
 
     assert mock_get.await_args.kwargs["params"]["query"] == (
         'recording:"Song\\: \\"Live\\"" AND artist:"Artist \\+ Co"'
+    )
+
+
+@pytest.mark.asyncio
+async def test_mixed_priority_release_group_callers_get_separate_leaders():
+    repo = _Repo()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    priorities = []
+
+    async def provider(*_args, **kwargs):
+        priorities.append(kwargs["priority"])
+        started.set()
+        await release.wait()
+        return _ReleaseGroupSearchPayload()
+
+    mock_get = AsyncMock(side_effect=provider)
+    with patch("repositories.musicbrainz_album.mb_api_get", mock_get):
+        background = asyncio.create_task(
+            repo.search_release_groups(
+                "Artist",
+                "query",
+                priority=RequestPriority.BACKGROUND_SYNC,
+            )
+        )
+        await started.wait()
+        foreground = asyncio.create_task(
+            repo.search_release_groups(
+                "Artist",
+                "query",
+                priority=RequestPriority.USER_INITIATED,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not foreground.done()
+        release.set()
+        await asyncio.gather(background, foreground)
+
+    assert mock_get.await_count == 2
+    assert sorted(priorities) == sorted(
+        [RequestPriority.BACKGROUND_SYNC, RequestPriority.USER_INITIATED]
     )

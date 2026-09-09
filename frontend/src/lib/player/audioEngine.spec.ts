@@ -71,11 +71,7 @@ describe('AudioEngine', () => {
 		};
 
 		mockCtx = createMockContext(mockSource, filterFactory, mockAnalyser);
-		// A `function`, not an arrow: the engine calls `new AudioContext()`, and an
-		// arrow function cannot be a constructor - vitest 4 enforces that.
-		vi.mocked(AudioContext).mockImplementation(function () {
-			return mockCtx as unknown as AudioContext;
-		} as unknown as () => AudioContext);
+		vi.mocked(AudioContext).mockImplementation(function () { return mockCtx as unknown as AudioContext; });
 	});
 
 	describe('connect', () => {

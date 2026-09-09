@@ -8,12 +8,7 @@ const mockEngine = vi.hoisted(() => ({
 }));
 
 vi.mock('./audioEngine', () => {
-	// A `function`, not an arrow: the module under test calls `new AudioEngine(...)`,
-	// and an arrow function cannot be a constructor - vitest 4 follows that strictly,
-	// so `vi.fn().mockImplementation(() => obj)` no longer stands in for one.
-	const MockAudioEngine = vi.fn(function () {
-		return mockEngine;
-	});
+	const MockAudioEngine = vi.fn().mockImplementation(function () { return mockEngine; });
 	return { AudioEngine: MockAudioEngine };
 });
 
