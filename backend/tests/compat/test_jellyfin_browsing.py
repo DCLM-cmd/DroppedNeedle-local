@@ -58,6 +58,26 @@ async def test_items_both_dialects_albums(compat_env):
     ]  # every item carries SortName (strict clients)
 
 
+async def test_browse_albums_under_library_view_parent(compat_env):
+    # CarPlay browses each category with ParentId set to the music-view id, which it
+    # caches across sessions. Compute that id WITHOUT calling /UserViews so it is not in
+    # the id map - reproducing the field bug where an empty/stale map made the album
+    # category (and thus the CarPlay menu) come back empty. It must list the albums.
+    import hashlib
+
+    lib_id = hashlib.sha256(b"library:music").hexdigest()[:32]
+    body = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum", ParentId=lib_id)
+    assert body["Items"], "album browse under the library-view ParentId was empty"
+    assert body["Items"][0]["Type"] == "MusicAlbum"
+
+
+async def test_browse_unknown_parent_falls_through_instead_of_empty(compat_env):
+    # A ParentId the map cannot resolve (a client that cached an id since rotated) must
+    # fall through to a library-level listing, never blank the browse.
+    body = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum", ParentId="0" * 32)
+    assert body["Items"], "album browse with an unknown ParentId should not be empty"
+
+
 async def test_drilldown_artist_album_track(compat_env):
     artists = _jget(compat_env, "/Artists/AlbumArtists")["Items"]
     artist = next(a for a in artists if a["Name"] == "Radiohead")

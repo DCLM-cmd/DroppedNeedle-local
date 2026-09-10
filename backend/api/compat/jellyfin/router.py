@@ -578,9 +578,12 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
         try:
             parent_kind, parent_internal = await services.id_map.from_jf(parent)
         except JellyfinError:
-            return jm.BaseItemDtoQueryResult(
-                Items=[], TotalRecordCount=0, StartIndex=start
-            )
+            # An unresolved ParentId - a client that cached an id the map no longer
+            # holds, or the library view id against a fresh/empty map - must NOT blank
+            # the browse (that is the empty-CarPlay-menu bug). Fall through to a
+            # library-level listing of the requested item types, exactly as a request
+            # with no ParentId returns.
+            parent_kind = parent_internal = None
 
     if _wants_favorites(request):
         return await _favorite_items(services, b, user, types, start, limit)
@@ -847,7 +850,9 @@ async def _latest(request, services, user, **_) -> list[jm.BaseItemDto]:
         try:
             parent_kind, parent_internal = await services.id_map.from_jf(parent)
         except JellyfinError:
-            return []
+            # See _browse: an unresolved ParentId falls through to a library-level
+            # listing rather than an empty result.
+            parent_kind = parent_internal = None
 
     if parent_kind == "album":
         tracks = await services.view.get_album_tracks(parent_internal, user=user)

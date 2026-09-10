@@ -56,3 +56,23 @@ async def test_unknown_id_raises_jellyfin_404(compat_id_map_service):
 async def test_invalid_kind_raises(compat_id_map_service):
     with pytest.raises(ValueError):
         await compat_id_map_service.to_jf("bogus", "x")
+
+
+async def test_library_view_id_resolves_without_a_stored_row(compat_id_map_service):
+    # Clients cache the music-view id and use it as the ParentId for the top browse
+    # categories. It must resolve even against an EMPTY map (fresh db, or a client that
+    # cached it before the row was written) - otherwise from_jf 404s and the browse
+    # comes back empty (the empty-CarPlay-menu bug). No to_jf call here, so nothing is
+    # stored: resolution has to come from the deterministic sentinel.
+    import hashlib
+
+    library_jf = hashlib.sha256(b"library:music").hexdigest()[:32]
+    assert await compat_id_map_service.from_jf(library_jf) == ("library", "music")
+    # dashed and uppercase forms normalize to the same result
+    dashed = (
+        f"{library_jf[:8]}-{library_jf[8:12]}-{library_jf[12:16]}"
+        f"-{library_jf[16:20]}-{library_jf[20:]}"
+    )
+    assert await compat_id_map_service.from_jf(dashed) == ("library", "music")
+    # to_jf still returns that same deterministic id
+    assert await compat_id_map_service.to_jf("library", "music") == library_jf

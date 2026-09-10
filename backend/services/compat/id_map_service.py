@@ -14,6 +14,16 @@ from infrastructure.persistence.compat_id_map_store import CompatIdMapStore
 
 VALID_KINDS = {"artist", "album", "track", "playlist", "genre", "library"}
 
+# The music library view is the one singleton id: its (kind, internal) is fixed and
+# its jf_id is a pure hash of them, so it can be resolved WITHOUT a stored row. This
+# matters because clients cache the view id across sessions and use it as the ParentId
+# for the top browse categories; if the id map is empty or stale (a fresh db, a client
+# that cached the id before the mapping was written), resolving it from the store alone
+# 404s and the whole browse comes back empty. Recognising it directly keeps the library
+# browsable regardless of map state.
+_LIBRARY_MUSIC_INTERNAL = "music"
+_LIBRARY_MUSIC_JF_ID = hashlib.sha256(b"library:music").hexdigest()[:32]
+
 
 def _normalize_jf_id(jf_id: str) -> str:
     return jf_id.replace("-", "").strip().lower()
@@ -34,7 +44,10 @@ class CompatIdMapService:
         return jf_id
 
     async def from_jf(self, jf_id: str) -> tuple[str, str]:
-        mapping = await self._store.get_mapping(_normalize_jf_id(jf_id))
+        normalized = _normalize_jf_id(jf_id)
+        if normalized == _LIBRARY_MUSIC_JF_ID:
+            return ("library", _LIBRARY_MUSIC_INTERNAL)
+        mapping = await self._store.get_mapping(normalized)
         if mapping is None:
             raise JellyfinError(404, f"Unknown item id: {jf_id}")
         return mapping
