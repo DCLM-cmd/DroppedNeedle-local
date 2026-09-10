@@ -51,6 +51,7 @@
 	>(null);
 	let migrationMessage = $state<string | null>(null);
 	let sourceSelectionMode = $state('source_first');
+	let preferExplicit = $state(true);
 	let verifyDownloads = $state(true);
 	let autoAccept = $state(0.7);
 	let manualMin = $state(0.5);
@@ -113,6 +114,7 @@
 			lossyMinBitrateKbps = d.lossy_min_bitrate_kbps ?? null;
 			lossyMaxBitrateKbps = d.lossy_max_bitrate_kbps ?? null;
 			sourceSelectionMode = d.source_selection_mode ?? 'source_first';
+			preferExplicit = d.prefer_explicit ?? true;
 			baselineFingerprint = recipeFingerprint(migration.recipe, unknown);
 			seeded = true;
 		});
@@ -170,6 +172,7 @@
 			lossless_max_sample_rate_hz: d.lossless_max_sample_rate_hz ?? null,
 			unknown_quality_behavior: unknownQualityBehavior,
 			source_selection_mode: sourceSelectionMode,
+			prefer_explicit: preferExplicit,
 			quality_recipe_status: 'v2',
 			quality_recipe_error: null
 		};
@@ -263,6 +266,26 @@
 			<div>
 				<h3 class="font-medium">Source selection</h3>
 				<SourceSelectionSection bind:sourceSelectionMode />
+			</div>
+
+			<div>
+				<h3 class="font-medium">Editions</h3>
+				<label class="mt-1 flex items-start gap-3">
+					<input
+						type="checkbox"
+						class="checkbox mt-0.5"
+						bind:checked={preferExplicit}
+						aria-describedby="prefer-explicit-help"
+					/>
+					<span class="min-w-0">
+						<span class="font-medium">Prefer explicit editions</span>
+						<span id="prefer-explicit-help" class="block text-sm text-base-content/70">
+							Among equal-quality candidates, rank the explicit/uncensored cut higher and a
+							“(Clean)” one lower. Turn this off to ignore edition markers when choosing a
+							download.
+						</span>
+					</span>
+				</label>
 			</div>
 
 			<AdvancedBehaviorSection
