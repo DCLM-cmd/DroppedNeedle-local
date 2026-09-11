@@ -83,3 +83,44 @@ async def test_favorites_unified_across_protocols(compat_env):
     assert item["UserData"]["IsFavorite"] is True
     # native FavoritesService sees the same row
     assert await compat_env.favorites.is_favorite("user-alice", "track", file_id) is True
+
+
+async def test_favorites_honor_sort_by_random(compat_env, monkeypatch):
+    # Jellyfin reshuffles the favourites list on SortBy=Random; Finamp's home relies on
+    # it to reorder favourites every refresh. Favourite several tracks, then confirm the
+    # random request returns the same set but in a shuffled order (shuffle stubbed to a
+    # reverse so the assertion is deterministic), while a plain request does not shuffle.
+    import api.compat.jellyfin.router as router
+
+    album_id = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum")["Items"][0]["Id"]
+    track_ids = [t["Id"] for t in _jget(compat_env, "/Items", ParentId=album_id)["Items"]]
+    assert len(track_ids) >= 2, "seed needs >=2 tracks to observe a reorder"
+    for tid in track_ids:
+        r = compat_env.client.post(
+            f"/jellyfin/UserFavoriteItems/{tid}",
+            params={"userId": "user-alice"},
+            headers=_h(compat_env),
+        )
+        assert r.status_code == 200
+
+    stable = [
+        i["Id"]
+        for i in _jget(
+            compat_env, "/Items", IncludeItemTypes="Audio", Filters="IsFavorite"
+        )["Items"]
+    ]
+    assert set(stable) == set(track_ids)
+
+    monkeypatch.setattr(router.random, "shuffle", lambda seq: seq.reverse())
+    shuffled = [
+        i["Id"]
+        for i in _jget(
+            compat_env,
+            "/Items",
+            IncludeItemTypes="Audio",
+            Filters="IsFavorite",
+            SortBy="Random",
+        )["Items"]
+    ]
+    assert set(shuffled) == set(track_ids)  # same favourites, reordered
+    assert shuffled == list(reversed(stable))  # SortBy=Random applied the shuffle

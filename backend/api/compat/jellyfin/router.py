@@ -7,6 +7,7 @@ import base64
 import inspect
 import ipaddress
 import logging
+import random
 from functools import lru_cache
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
@@ -557,6 +558,13 @@ def _sort_key(request: Request, table: dict, default: str) -> str:
     return default
 
 
+def _wants_random(request: Request) -> bool:
+    """Whether the client asked for SortBy=Random - Jellyfin reshuffles the result on
+    every request, which is how Finamp's home sections (favourites especially) get a
+    fresh order on each refresh."""
+    return any(s.casefold() == "random" for s in _csv_param(request, "SortBy"))
+
+
 async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
     q = _params(request)
     b = _builder(services, request)
@@ -586,7 +594,7 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
             parent_kind = parent_internal = None
 
     if _wants_favorites(request):
-        return await _favorite_items(services, b, user, types, start, limit)
+        return await _favorite_items(request, services, b, user, types, start, limit)
 
     if parent_kind == "album":
         tracks = await services.view.get_album_tracks(parent_internal, user=user)
@@ -679,7 +687,7 @@ async def _items_by_ids(services, b, ids, user):
     return built
 
 
-async def _favorite_items(services, b, user, types, start, limit):
+async def _favorite_items(request, services, b, user, types, start, limit):
     primary = _primary_type(types, None)
     kind = {"MusicArtist": "artist", "MusicAlbum": "album", "Audio": "track"}.get(
         primary, "track"
@@ -690,6 +698,11 @@ async def _favorite_items(services, b, user, types, start, limit):
         item = await _single_item(services, b, kind, internal, user)
         if item is not None:
             built.append(item)
+    # Jellyfin honours SortBy=Random on the favourites list; Finamp's home "Favourites"
+    # relies on that to reshuffle on every refresh. The catalog favourites order is
+    # stable, so apply the shuffle here when the client asked for it.
+    if _wants_random(request):
+        random.shuffle(built)
     return await _build_page(_passthrough, built, start, limit)
 
 
