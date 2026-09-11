@@ -365,6 +365,7 @@ _TASK_UPDATABLE = frozenset(
         "quality_certainty",
         "quality_provenance",
         "manual_quality_override",
+        "delivered_blocklist_json",
         "staging_path",
         "final_path",
         "error_message",
@@ -573,6 +574,7 @@ class DownloadStore(PersistenceBase):
                     quality_certainty TEXT,
                     quality_provenance TEXT,
                     manual_quality_override INTEGER NOT NULL DEFAULT 0,
+                    delivered_blocklist_json TEXT,
                     staging_path TEXT,
                     final_path TEXT,
                     error_message TEXT,
@@ -642,6 +644,7 @@ class DownloadStore(PersistenceBase):
                 ("quality_certainty", "TEXT"),
                 ("quality_provenance", "TEXT"),
                 ("manual_quality_override", "INTEGER NOT NULL DEFAULT 0"),
+                ("delivered_blocklist_json", "TEXT"),
             ):
                 try:
                     conn.execute(

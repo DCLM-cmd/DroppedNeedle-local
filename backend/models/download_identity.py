@@ -52,3 +52,24 @@ def usenet_identity(title: str, size_bytes: int) -> str:
     norm = _WS.sub(" ", title.strip().lower())
     size_mb = size_bytes // (1024 * 1024)
     return f"{norm}{_UNIT}{size_mb}"
+
+
+def delivered_identities(candidate) -> list[tuple[str, str]]:  # noqa: ANN001
+    """The blocklist identities of whatever a delivered candidate contained.
+
+    Usenet blocks per release (title+size); Soulseek per delivered file. Kept
+    here, next to the identity encoders, so the orchestrator (which persists this
+    at delivery time) and the manual blacklist (which reads it back later) derive
+    byte-for-byte the same strings the scorers match a re-download against.
+    Duck-typed on ``ScoredCandidate`` to avoid a models import cycle."""
+    if getattr(candidate, "source", None) == SOURCE_USENET:
+        release = getattr(candidate, "usenet_release", None)
+        if release is None:
+            return []
+        return [(SOURCE_USENET, usenet_identity(release.title, release.size_bytes))]
+    username = getattr(candidate, "username", "") or ""
+    return [
+        (SOURCE_SOULSEEK, soulseek_identity(username, file.filename))
+        for file in (getattr(candidate, "files", None) or [])
+        if getattr(file, "filename", "")
+    ]

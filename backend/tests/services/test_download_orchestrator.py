@@ -9,6 +9,7 @@ harvest, auto-failover to the next candidate, cancel, retry and startup_resume. 
 full real import is covered by the E2E gate."""
 
 import asyncio
+import json
 import sqlite3
 import threading
 import time as _t
@@ -31,7 +32,7 @@ from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.sse_publisher import SSEPublisher
 from models.common import ServiceStatus
 from models.download import DownloadTask, ScoredCandidate
-from models.download_identity import soulseek_identity
+from models.download_identity import SOURCE_SOULSEEK, soulseek_identity
 from models.download_manifest import (
     DownloadManifest,
     ExpectedFile,
@@ -500,6 +501,11 @@ async def test_process_task_autopicks_and_completes(tmp_path: Path):
     assert not (tmp_path / "staging" / task.id).exists()  # staging cleaned
     job = await store.get_search_job(final.search_job_id)
     assert job.status == "matched"  # (AUD-8) auto-pick matched the job
+    # The delivered candidate's blocklist identity is pinned on the task at completion,
+    # so "Never accept this release again" can block it after the job is later pruned.
+    assert json.loads(final.delivered_blocklist_json) == [
+        [SOURCE_SOULSEEK, soulseek_identity("peer", "peer/01.flac")]
+    ]
 
 
 @pytest.mark.asyncio

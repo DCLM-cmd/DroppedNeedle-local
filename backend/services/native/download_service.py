@@ -6,6 +6,7 @@ dispatches the orchestrator.
 """
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -28,12 +29,7 @@ from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.filesystem_mounts import check_move_boundary
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.sse_publisher import SSEPublisher
-from models.download_identity import (
-    SOURCE_SOULSEEK,
-    SOURCE_USENET,
-    soulseek_identity,
-    usenet_identity,
-)
+from models.download_identity import delivered_identities
 from models.download import (
     DownloadsMountStatus,
     ScoredCandidate,
@@ -2520,11 +2516,22 @@ class DownloadService:
     async def _delivered_identities(self, task) -> list[tuple[str, str]]:  # noqa: ANN001
         """The blocklist identities of whatever this task actually downloaded.
 
-        Rebuilt from the stored candidate rather than from the task row: the task
-        keeps only the peer name, and Soulseek is blocked per file. A task whose
-        search job has since been pruned yields nothing, which the caller reports
-        rather than papering over with a peer-wide block that would not match.
+        Prefers the identity pinned on the task at completion
+        (``delivered_blocklist_json``): it survives the 7-day pruning of the search
+        job's candidate blob, which is what let "Never accept this release again"
+        silently blocklist nothing for an album removed weeks after it landed.
+
+        Legacy rows finalized before that column existed carry no pin, so fall back
+        to re-deriving from the stored candidate (the task keeps only the peer name,
+        and Soulseek is blocked per file). A task whose search job has since been
+        pruned yields nothing, which the caller reports rather than papering over
+        with a peer-wide block that would not match.
         """
+        pinned = self._decode_delivered_blocklist(
+            getattr(task, "delivered_blocklist_json", None)
+        )
+        if pinned:
+            return pinned
         if not task.search_job_id or task.candidate_index is None:
             return []
         try:
@@ -2535,19 +2542,23 @@ class DownloadService:
             return []
         if not 0 <= task.candidate_index < len(candidates):
             return []
-        candidate = candidates[task.candidate_index]
-        if candidate.source == SOURCE_USENET:
-            release = candidate.usenet_release
-            if release is None:
-                return []
+        return delivered_identities(candidates[task.candidate_index])
+
+    @staticmethod
+    def _decode_delivered_blocklist(raw: str | None) -> list[tuple[str, str]]:
+        """Decode the task's pinned ``[[source, identity], ...]``; tolerant of a
+        malformed row rather than failing the whole blacklist over one bad blob."""
+        if not raw:
+            return []
+        try:
+            pairs = json.loads(raw)
             return [
-                (SOURCE_USENET, usenet_identity(release.title, release.size_bytes))
+                (str(pair[0]), str(pair[1]))
+                for pair in pairs
+                if isinstance(pair, (list, tuple)) and len(pair) == 2 and all(pair)
             ]
-        return [
-            (SOURCE_SOULSEEK, soulseek_identity(candidate.username, file.filename))
-            for file in candidate.files
-            if file.filename
-        ]
+        except (ValueError, TypeError):
+            return []
 
     async def clear_history(self, user_id: str, user_role: str) -> int:
         """Empty the queue's History: completed, cancelled, and finished failures.

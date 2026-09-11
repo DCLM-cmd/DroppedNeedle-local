@@ -8,6 +8,7 @@ import { HomeQueryKeyFactory } from '../HomeQueryKeyFactory';
 import { WantedQueryKeyFactory } from '../wanted/WantedQueryKeyFactory';
 import { invalidateQueriesWithPersister, setQueryDataWithPersister } from '../QueryClient';
 import { LOCAL_KEYS } from '../local/LocalQueries.svelte';
+import { toastStore } from '$lib/stores/toast';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import type {
 	AlbumRemoveResponse,
@@ -33,7 +34,26 @@ export function removeLibraryAlbum() {
 				`${API.library.removeAlbum(mbid)}?delete_files=true&stop_wanted=${stopWanted}` +
 					`&blacklist=${blacklist}`
 			),
-		onSuccess: async (result, { mbid: requestedMbid }) => {
+		onSuccess: async (result, { mbid: requestedMbid, blacklist }) => {
+			// "Never accept this release again" can quietly block nothing - e.g. an album
+			// scanned in, or one whose download history has been pruned - so tell the user
+			// rather than let them believe a block is in place that is not.
+			if (blacklist && 'blacklist_skipped' in result) {
+				if (result.blacklist_skipped || !result.blacklisted) {
+					toastStore.show({
+						message:
+							"Album removed, but nothing could be blocklisted - a re-request may return the same release.",
+						type: 'info',
+						duration: 7000
+					});
+				} else {
+					toastStore.show({
+						message: `Album removed; blocklisted ${result.blacklisted} source${result.blacklisted === 1 ? '' : 's'}.`,
+						type: 'success',
+						duration: 5000
+					});
+				}
+			}
 			const responseMbids =
 				'album_mbid' in result ? [result.album_mbid, ...result.removed_mbids] : [result.id];
 			const removedMbids = [requestedMbid, ...responseMbids].filter(
