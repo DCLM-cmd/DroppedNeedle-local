@@ -717,6 +717,107 @@ async def test_unique_empty_automatic_shell_retires_and_preserves_alias(
 
 
 @pytest.mark.asyncio
+async def test_self_referential_alias_does_not_wedge_shell_retirement(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A shell whose alias points at itself must still retire cleanly.
+
+    Regression: a self-referential alias (alias == local_album_id == shell) tripped the
+    retirement conflict guard (ConflictError), so catalog_identity_hygiene raised
+    WORKER_ERROR, left the work item stuck 'running', and every repair job re-queued the
+    same poison subject and failed at finalize forever.
+    """
+    pink_floyd = _artist("artist-pink-floyd", "Pink Floyd", 1)
+    target_id = "album-target"
+    shell_id = "album-shell"
+    target_track = _track(
+        "track-target", target_id, "Pink Floyd", filename="0101 One.flac"
+    )
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=LocalAlbum(
+                id=target_id,
+                root_id="root-1",
+                grouping_key="active",
+                title="The Wall",
+                album_artist_id=pink_floyd.id,
+                album_artist_name="Pink Floyd",
+                created_at=1,
+                updated_at=1,
+            ),
+            artists=[pink_floyd],
+            tracks=[target_track],
+            album_credits=[
+                LocalArtistCredit(local_artist_id=pink_floyd.id, position=0)
+            ],
+            track_credits={
+                target_track.id: [
+                    LocalArtistCredit(local_artist_id=pink_floyd.id, position=0)
+                ]
+            },
+        )
+    )
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=LocalAlbum(
+                id=shell_id,
+                root_id="root-1",
+                grouping_key="stale-shell",
+                title="The Wall",
+                album_artist_id=pink_floyd.id,
+                album_artist_name="Pink Floyd",
+                created_at=2,
+                updated_at=2,
+            ),
+            album_credits=[
+                LocalArtistCredit(local_artist_id=pink_floyd.id, position=0)
+            ],
+        )
+    )
+    # Corrupt bookkeeping: the shell's alias resolves to itself.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_album_aliases (alias, local_album_id, kind, created_at) "
+            "VALUES (?, ?, 'merged_album', 2)",
+            (shell_id, shell_id),
+        )
+        connection.commit()
+
+    service = CatalogIdentityHygieneService(store, clock=lambda: 3)
+    await service.enqueue_backfill()
+    claimed = await store.claim_operation_job(
+        "worker", now=3, lease_seconds=60, kind="repair"
+    )
+    assert claimed is not None
+    await service.run_claimed(claimed, "worker")
+
+    with sqlite3.connect(db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT retired_into_album_id FROM local_albums WHERE id = ?",
+                (shell_id,),
+            ).fetchone()[0]
+            == target_id
+        )
+        # The self-alias was retargeted onto the survivor, not left dangling.
+        assert (
+            connection.execute(
+                "SELECT local_album_id FROM local_album_aliases WHERE alias = ?",
+                (shell_id,),
+            ).fetchone()[0]
+            == target_id
+        )
+        # No work item is left wedged in a non-terminal state.
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM library_operation_work "
+                "WHERE state IN ('pending', 'running')"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.asyncio
 async def test_empty_shell_never_transfers_unproven_provider_identity(
     store: NativeLibraryStore, db_path: Path
 ) -> None:

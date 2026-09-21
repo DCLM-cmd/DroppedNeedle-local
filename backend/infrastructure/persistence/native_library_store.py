@@ -16410,10 +16410,15 @@ class NativeLibraryStore(PersistenceBase):
     ) -> None:
         """Move live-facing album references while retaining historical audit rows."""
 
+        # A self-referential alias (alias == local_album_id == retired_album_id) is
+        # degenerate bookkeeping, not a genuine conflict: the retired album's alias
+        # merely points at itself. Excluding it lets the UPDATE below retarget it onto
+        # the survivor; treating it as a conflict wedges the hygiene repair forever
+        # (WORKER_ERROR -> work item stuck 'running' -> finalize never terminalizes).
         conflicting_alias = connection.execute(
             "SELECT local_album_id FROM local_album_aliases WHERE alias = ? "
-            "AND local_album_id != ?",
-            (retired_album_id, surviving_album_id),
+            "AND local_album_id NOT IN (?, ?)",
+            (retired_album_id, surviving_album_id, retired_album_id),
         ).fetchone()
         if conflicting_alias is not None:
             raise ConflictError("A retired album ID already resolves to another album.")
