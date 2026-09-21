@@ -70,32 +70,6 @@ def _to_response(result: object) -> Response:
     return jellyfin_response(result)
 
 
-def _log_browse_diag(request: Request, path: str, result) -> None:
-    """TEMP CarPlay diagnostic: log how many items each list/query response carries,
-    with the params that shaped it, so a browse that comes back EMPTY can be told apart
-    from one the server never populated (access logs only show status, not body). Only
-    fires for list/query results, so images/playback/etc. are untouched. Remove once the
-    CarPlay empty-browse cause is confirmed."""
-    if isinstance(result, jm.BaseItemDtoQueryResult):
-        count = f"{len(result.Items)}/{result.TotalRecordCount}"
-    elif isinstance(result, list):
-        count = str(len(result))
-    else:
-        return
-    p = _params(request)
-    logger.info(
-        "compat.browse_diag",
-        extra={
-            "path": path,
-            "parent": p.get("ParentId"),
-            "types": p.get("IncludeItemTypes"),
-            "sort": p.get("SortBy"),
-            "filters": p.get("Filters"),
-            "count": count,
-        },
-    )
-
-
 async def _handle(
     request: Request,
     services: CompatServices,
@@ -147,7 +121,6 @@ async def _handle(
         result = fn(request, services, user, **extra)
         if inspect.isawaitable(result):
             result = await result
-        _log_browse_diag(request, path, result)
         return _to_response(result)
     except Exception as exc:  # noqa: BLE001 - boundary: never reach global handlers
         if fn is _authenticate and isinstance(exc, JellyfinError) and exc.status == 401:
