@@ -1948,6 +1948,7 @@ class NativeLibraryStore(PersistenceBase):
                         'rolled_back','needs_attention','resolved'
                     )),
                     result_json TEXT NOT NULL DEFAULT '{}',
+                    acknowledged_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     row_revision INTEGER NOT NULL DEFAULT 1
@@ -1959,12 +1960,12 @@ class NativeLibraryStore(PersistenceBase):
                 """
                 INSERT INTO library_management_import_bundles__resolved_v1 (
                     id, idempotency_key, origin, policy_revision, request_json,
-                    request_hash, state, result_json, created_at, updated_at,
+                    request_hash, state, result_json, acknowledged_at, created_at, updated_at,
                     row_revision
                 )
                 SELECT
                     id, idempotency_key, origin, policy_revision, request_json,
-                    request_hash, state, result_json, created_at, updated_at,
+                    request_hash, state, result_json, acknowledged_at, created_at, updated_at,
                     row_revision
                 FROM library_management_import_bundles
                 """
@@ -2227,6 +2228,20 @@ class NativeLibraryStore(PersistenceBase):
                     if "duplicate column name" not in str(error).casefold():
                         raise
             self._ensure_library_management_import_resolved_state(connection)
+            # The resolved-state rebuild above (upstream) predates the fork's
+            # acknowledged_at column on import bundles and copies without it, so a DB
+            # rebuilt before this fix silently lost the column - and the rebuild's
+            # guard then refuses to run again. Re-add it here idempotently so an
+            # already-migrated DB is repaired and the recovery-diagnostics query
+            # (acknowledged_at IS NULL) stops raising OperationalError.
+            try:
+                connection.execute(
+                    "ALTER TABLE library_management_import_bundles "
+                    "ADD COLUMN acknowledged_at REAL"
+                )
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error).casefold():
+                    raise
             conversion_columns = {
                 str(row[1])
                 for row in connection.execute(

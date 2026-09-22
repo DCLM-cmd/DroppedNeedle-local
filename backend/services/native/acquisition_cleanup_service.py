@@ -686,7 +686,14 @@ class AcquisitionCleanupService:
         now = self._clock()
         try:
             if await self._store.has_download_cleanup_debt(
-                source="usenet", task_id=task_id, job_name=job_name
+                source="usenet",
+                task_id=task_id,
+                job_name=job_name,
+                # A legacy_unknown_task marker is a vacuous claim (the owning task was
+                # pruned before cleanup); don't let it pin an abandoned folder forever.
+                # The remaining checks below (task gone/inactive, no incomplete bundle,
+                # folder old, SAB job inactive) are the real safety gate.
+                ignore_error_codes=("legacy_unknown_task",),
             ):
                 return False
             task = await self._store.get_task(task_id)
