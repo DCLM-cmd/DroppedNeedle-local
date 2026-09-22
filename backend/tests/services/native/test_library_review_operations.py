@@ -11,6 +11,7 @@ import msgspec.json
 from api.v1.schemas.library_operations import (
     ArtistMergeApplyRequest,
     ArtistMergePreviewRequest,
+    AutomaticEditionUndoRequest,
     BulkReviewApplyRequest,
     BulkReviewPreviewRequest,
     BulkReviewSelection,
@@ -35,6 +36,11 @@ from core.exceptions import (
 )
 from infrastructure.persistence._database import reset_connection_pool
 from infrastructure.persistence.native_library_store import NativeLibraryStore
+from infrastructure.persistence.native_library_store import (
+    NativeLibraryStore,
+    _QUIET_MARGIN_FLOOR,
+    _quiet_top_candidate_agrees,
+)
 from infrastructure.resilience.retry import CircuitOpenError
 from models.audio import FingerprintResult
 from models.identification import (
@@ -78,7 +84,11 @@ from infrastructure.degradation import (
     try_get_degradation_context,
 )
 from services.native.album_candidate_service import AlbumCandidateService
-from services.native.album_evidence_engine import AlbumEvidenceEngine
+from services.native.album_evidence_engine import (
+    CANDIDATE_MARGIN_FLOOR,
+    MATCHER_VERSION,
+    AlbumEvidenceEngine,
+)
 from services.native.background_workload_gate import BackgroundWorkloadGate
 from services.native.catalog_correction_service import CatalogCorrectionService
 from services.native.conditional_fingerprint_service import (
@@ -894,6 +904,32 @@ async def test_review_supports_every_signed_filter_sort_and_typed_invalid_values
 
 
 @pytest.mark.asyncio
+async def test_review_state_depths_are_scoped_while_global_totals_persist(
+    store: NativeLibraryStore,
+) -> None:
+    # N-02 (T30): per-state depths must render from the scoped
+    # `counts_by_state_filtered` field, mirroring the existing
+    # `counts_by_reason_filtered` semantics - `counts_by_state` stays a
+    # global GROUP BY with no WHERE.
+    await _seed_album(store, "1")
+    await _seed_album(store, "2")
+    await _seed_album(store, "3", review_state="keep_tagged")
+    service = LibraryReviewService(store)
+
+    scoped = await service.list_reviews(limit=10, state="needs_review")
+    unscoped = await service.list_reviews(limit=10)
+
+    assert scoped.counts_by_state == {"needs_review": 2, "keep_tagged": 1}
+    assert scoped.counts_by_state_filtered == {"needs_review": 2}
+    assert scoped.counts_by_reason_filtered == {"NO_SAFE_MATCH": 2}
+    assert unscoped.counts_by_state_filtered == {
+        "needs_review": 2,
+        "keep_tagged": 1,
+    }
+    assert [item.id for item in scoped.items] == ["review-2", "review-1"]
+
+
+@pytest.mark.asyncio
 async def test_plain_keep_refuses_identity_and_detach_keep_is_atomic_and_read_only(
     store: NativeLibraryStore, tmp_path: Path
 ) -> None:
@@ -1115,6 +1151,92 @@ async def test_manual_candidate_override_records_choice_and_attaches_only_suppor
     callback.assert_awaited_once_with(
         "album-1", album_input_revisions(context["tracks"])[2]
     )
+
+
+@pytest.mark.asyncio
+async def test_tier_edition_accept_never_schedules_management(
+    store: NativeLibraryStore,
+) -> None:
+    """Confirming a tier-row edition is catalog-only: the lane promises files
+    never change there, so (unlike the needs_review accept above) the sealed
+    exact must not schedule management."""
+    await _seed_album(store, "1", two_tracks=True, review_state="edition_to_confirm")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    tag_revision, file_revision, policy_revision = album_input_revisions(
+        context["tracks"]
+    )
+    attempt = IdentificationAttempt(
+        id="attempt-tier",
+        local_album_id="album-1",
+        input_tag_revision=tag_revision,
+        input_policy_revision=policy_revision,
+        input_file_revision=file_revision,
+        input_identity_revision=album_identity_revision(
+            context["identity"], context["tracks"]
+        ),
+        matcher_version="feedback-fixes-v1",
+        state="edition_uncertain",
+        terminal_reason_code="EDITION_UNCERTAIN",
+        started_at=2,
+        completed_at=2,
+    )
+    evidence = CandidateEvidence(
+        release_group_mbid="rg-tier",
+        release_mbid="release-tier",
+        matcher_version="feedback-fixes-v1",
+        track_evidence=[
+            TrackEvidence(
+                local_track_id="track-1-1",
+                classification="supported",
+                recording_mbid="recording-1",
+            ),
+            TrackEvidence(
+                local_track_id="track-1-2",
+                classification="supported",
+                recording_mbid="recording-2",
+            ),
+        ],
+        # The engine said SUPPORTED; the gate vetoed it into a tier row, so
+        # the tier-ness lives in the review state, not the evidence reason.
+        reason_code="SUPPORTED",
+    )
+    await store.replace_review_attempt(
+        "review-1",
+        expected_review_revision=1,
+        attempt=attempt,
+        evidence=[
+            IdentificationEvidenceRecord(
+                id="evidence-tier",
+                attempt_id=attempt.id,
+                candidate_key="rg-tier:release-tier",
+                evidence=evidence,
+                created_at=2,
+            )
+        ],
+        updated_at=2,
+    )
+    callback = AsyncMock()
+    response = await LibraryReviewService(
+        store, on_identified=callback
+    ).accept_candidate(
+        "review-1",
+        CandidateAcceptanceRequest(
+            expected_review_revision=2,
+            expected_catalog_revision=await store.get_catalog_revision(),
+            expected_evidence_revision="evidence-tier",
+            candidate_key="rg-tier:release-tier",
+            manual_override=False,
+            confirmation=True,
+        ),
+        "admin",
+        now=3,
+    )
+    assert response.state == "resolved"
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    assert context["identity"]["release_mbid"] == "release-tier"
+    callback.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1416,6 +1538,81 @@ async def test_bulk_candidate_preview_finds_and_binds_one_shared_safe_candidate(
         "album-1",
         "album-2",
     }
+
+
+@pytest.mark.asyncio
+async def test_bulk_tier_edition_accept_never_schedules_management(
+    store: NativeLibraryStore,
+) -> None:
+    """Bulk confirms honor the same tier exemption as single accepts: the
+    sealed exact lands, the row resolves, and no management is scheduled."""
+    await _seed_album(store, "1", review_state="edition_to_confirm")
+    attempt = IdentificationAttempt(
+        id="attempt-1",
+        local_album_id="album-1",
+        matcher_version="feedback-fixes-v1",
+        state="edition_uncertain",
+        terminal_reason_code="EDITION_UNCERTAIN",
+        started_at=2,
+        completed_at=2,
+    )
+    await store.replace_review_attempt(
+        "review-1",
+        expected_review_revision=1,
+        attempt=attempt,
+        evidence=[
+            IdentificationEvidenceRecord(
+                id="evidence-1",
+                attempt_id=attempt.id,
+                candidate_key="rg-tier:release-tier",
+                evidence=CandidateEvidence(
+                    release_group_mbid="rg-tier",
+                    release_mbid="release-tier",
+                    matcher_version="feedback-fixes-v1",
+                    reason_code="SUPPORTED",
+                ),
+                created_at=2,
+            )
+        ],
+        updated_at=2,
+    )
+    reviews = LibraryReviewService(store)
+    selection = BulkReviewSelection(
+        review_ids=["review-1"],
+        expected_revisions={"review-1": 2},
+        catalog_revision=await store.get_catalog_revision(),
+    )
+    preview = await reviews.preview_bulk(
+        BulkReviewPreviewRequest(
+            action="accept_candidate",
+            selection=selection,
+            candidate_key="rg-tier:release-tier",
+        ),
+        now=11,
+    )
+    assert preview.eligible_count == 1
+    operation = await reviews.apply_bulk(
+        BulkReviewApplyRequest(
+            preview_token=preview.preview_token,
+            idempotency_key="bulk-tier-1",
+            action="accept_candidate",
+            selection=selection,
+            candidate_key="rg-tier:release-tier",
+        ),
+        "admin",
+        now=12,
+    )
+    assert operation.expected_work_count == 1
+    callback = AsyncMock()
+    worker = LibraryOperationService(store, on_identified=callback)
+    claimed = await worker.claim("worker", now=13)
+    assert claimed is not None
+    completed = await worker.run_bulk_claimed(claimed, "worker", "admin", now=14)
+    assert completed.succeeded_count == 1
+    callback.assert_not_awaited()
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    assert context["identity"]["release_mbid"] == "release-tier"
 
 
 @pytest.mark.asyncio
@@ -2711,6 +2908,773 @@ async def test_automatic_identification_commit_preserves_missing_track_identity_
         "track-1-1": ("indexed", "recording-new"),
         "track-1-2": ("missing", "recording-track-1-2"),
     }
+
+
+def _quiet_attempt(
+    attempt_id: str,
+    revisions: list[str],
+    identity_revision: str,
+    *,
+    candidate_key: str | None = None,
+    candidate_count: int = 1,
+    reason_code: str = "CONFLICTING_TRACK_EVIDENCE",
+) -> IdentificationAttempt:
+    return IdentificationAttempt(
+        id=attempt_id,
+        local_album_id="album-1",
+        input_tag_revision=revisions[0],
+        input_file_revision=revisions[1],
+        input_policy_revision=revisions[2],
+        input_identity_revision=identity_revision,
+        matcher_version=MATCHER_VERSION,
+        state="contradictory",
+        terminal_reason_code=reason_code,
+        selected_candidate_key=candidate_key,
+        candidate_count=candidate_count,
+        started_at=3,
+        completed_at=3,
+    )
+
+
+def _quiet_evidence(
+    evidence_id: str,
+    attempt_id: str,
+    group: str,
+    release: str | None,
+    score: float,
+) -> IdentificationEvidenceRecord:
+    return IdentificationEvidenceRecord(
+        id=evidence_id,
+        attempt_id=attempt_id,
+        candidate_key=f"{group}:{release or ''}",
+        evidence=CandidateEvidence(
+            release_group_mbid=group,
+            release_mbid=release,
+            album_title="Album 1",
+            album_artist_name="Artist 1",
+            album_title_classification="supported",
+            album_artist_classification="supported",
+            track_evidence=[
+                TrackEvidence(
+                    local_track_id="track-1-1",
+                    classification="contradictory",
+                    evidence_kinds=["recording_mbid_conflict"],
+                    recording_mbid="recording-provider",
+                    release_track_mbid="release-track-1-1",
+                )
+            ],
+            score=score,
+            reason_code="CONFLICTING_TRACK_EVIDENCE",
+            matcher_version=MATCHER_VERSION,
+        ),
+        created_at=3,
+    )
+
+
+async def _quiet_claim(
+    store: NativeLibraryStore, revisions: list[str]
+) -> dict:
+    queue = IdentificationQueueService(store)
+    await queue.enqueue_album("album-1", input_revision=":".join(revisions), now=1)
+    claimed = await queue.claim("worker", now=2)
+    assert claimed is not None
+    return claimed
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_agreeing_candidate_files_no_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A contradictory re-match that agrees with the manual identity is a
+    settled question: stale reviews resolve, nothing new files, the job
+    succeeds, and every identity row is untouched."""
+    await _seed_album(store, "1", identity_source="manual")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_artist_external_identities "
+            "(local_artist_id, provider, provider_artist_id, decision_source, "
+            "selected_at) VALUES ('artist-1', 'musicbrainz', 'artist-mbid-1', "
+            "'manual', 2)"
+        )
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    indexed = [
+        track for track in context["tracks"] if track["availability"] == "indexed"
+    ]
+    revisions = album_input_revisions(indexed)
+    identity_revision = album_identity_revision(context["identity"], indexed)
+    claimed = await _quiet_claim(store, revisions)
+    attempt = _quiet_attempt("quiet-agree-attempt", revisions, identity_revision)
+
+    await store.finish_identification_job(
+        claimed["id"],
+        worker_id="worker",
+        expected_job_revision=int(claimed["row_revision"]),
+        expected_album_revision=int(context["album"]["row_revision"]),
+        expected_input_revision=":".join(revisions),
+        attempt=attempt,
+        evidence=[
+            _quiet_evidence(
+                "quiet-agree-evidence", attempt.id, "rg-1", "release-1", 1.0
+            )
+        ],
+        outcome="contradictory",
+        review_id="quiet-agree-review",
+        completed_at=3,
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        open_reviews = connection.execute(
+            "SELECT id FROM library_identification_reviews WHERE local_album_id = ? "
+            "AND state IN ('needs_review', 'edition_to_confirm')",
+            ("album-1",),
+        ).fetchall()
+        assert open_reviews == []
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+        assert job_state["state"] == "succeeded"
+        flags = connection.execute(
+            "SELECT degradation_flags_json FROM library_identification_attempts WHERE id = ?",
+            (attempt.id,),
+        ).fetchone()
+        assert "identity_reconfirmed:kept_protected" in flags["degradation_flags_json"]
+        identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid, decision_source "
+            "FROM local_album_external_identities WHERE local_album_id = ?",
+            ("album-1",),
+        ).fetchone()
+        assert dict(identity) == {
+            "release_group_mbid": "rg-1",
+            "release_mbid": "release-1",
+            "decision_source": "manual",
+        }
+        track_identity = connection.execute(
+            "SELECT recording_mbid, release_mbid, decision_source "
+            "FROM local_track_external_identities WHERE local_track_id = ?",
+            ("track-1-1",),
+        ).fetchone()
+        assert dict(track_identity) == {
+            "recording_mbid": "recording-track-1-1",
+            "release_mbid": "release-1",
+            "decision_source": "manual",
+        }
+        artist_identity = connection.execute(
+            "SELECT provider_artist_id, decision_source, attempt_id "
+            "FROM local_artist_external_identities WHERE local_artist_id = ?",
+            ("artist-1",),
+        ).fetchone()
+        assert dict(artist_identity) == {
+            "provider_artist_id": "artist-mbid-1",
+            "decision_source": "manual",
+            "attempt_id": None,
+        }
+        stored_evidence = connection.execute(
+            "SELECT id FROM library_identification_evidence WHERE attempt_id = ?",
+            (attempt.id,),
+        ).fetchall()
+        assert [row["id"] for row in stored_evidence] == ["quiet-agree-evidence"]
+        seeded_review = connection.execute(
+            "SELECT state, attempt_id, reason_code FROM library_identification_reviews "
+            "WHERE id = 'review-1'",
+        ).fetchone()
+        assert dict(seeded_review) == {
+            "state": "resolved",
+            "attempt_id": attempt.id,
+            "reason_code": "NO_SAFE_MATCH",
+        }
+        album_revision = connection.execute(
+            "SELECT row_revision FROM local_albums WHERE id = ?",
+            ("album-1",),
+        ).fetchone()
+        assert int(album_revision["row_revision"]) == int(
+            context["album"]["row_revision"]
+        ) + 1
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_disagreeing_candidate_still_files_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Agreement is required: a top candidate naming a different release
+    group still files its review and the job still needs review."""
+    await _seed_album(store, "1", identity_source="manual")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    indexed = [
+        track for track in context["tracks"] if track["availability"] == "indexed"
+    ]
+    revisions = album_input_revisions(indexed)
+    identity_revision = album_identity_revision(context["identity"], indexed)
+    claimed = await _quiet_claim(store, revisions)
+    attempt = _quiet_attempt("quiet-disagree-attempt", revisions, identity_revision)
+
+    await store.finish_identification_job(
+        claimed["id"],
+        worker_id="worker",
+        expected_job_revision=int(claimed["row_revision"]),
+        expected_album_revision=int(context["album"]["row_revision"]),
+        expected_input_revision=":".join(revisions),
+        attempt=attempt,
+        evidence=[
+            _quiet_evidence(
+                "quiet-disagree-evidence", attempt.id, "rg-other", "release-other", 1.0
+            )
+        ],
+        outcome="contradictory",
+        review_id="quiet-disagree-review",
+        completed_at=3,
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        filed = connection.execute(
+            "SELECT state, reason_code FROM library_identification_reviews "
+            "WHERE attempt_id = ?",
+            (attempt.id,),
+        ).fetchone()
+        assert filed is not None
+        assert filed["state"] == "needs_review"
+        assert filed["reason_code"] == "CONFLICTING_TRACK_EVIDENCE"
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+        assert job_state["state"] == "needs_review"
+        flags = connection.execute(
+            "SELECT degradation_flags_json FROM library_identification_attempts WHERE id = ?",
+            (attempt.id,),
+        ).fetchone()
+        assert "identity_reconfirmed:kept_protected" not in flags["degradation_flags_json"]
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_top_score_tie_files_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Ties fail closed: an agreeing candidate that shares the top score
+    with a disagreeing one still files its review."""
+    await _seed_album(store, "1", identity_source="manual")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    indexed = [
+        track for track in context["tracks"] if track["availability"] == "indexed"
+    ]
+    revisions = album_input_revisions(indexed)
+    identity_revision = album_identity_revision(context["identity"], indexed)
+    claimed = await _quiet_claim(store, revisions)
+    attempt = _quiet_attempt(
+        "quiet-tie-attempt", revisions, identity_revision, candidate_count=2
+    )
+
+    await store.finish_identification_job(
+        claimed["id"],
+        worker_id="worker",
+        expected_job_revision=int(claimed["row_revision"]),
+        expected_album_revision=int(context["album"]["row_revision"]),
+        expected_input_revision=":".join(revisions),
+        attempt=attempt,
+        evidence=[
+            _quiet_evidence(
+                "quiet-tie-evidence-agree", attempt.id, "rg-1", "release-1", 1.0
+            ),
+            _quiet_evidence(
+                "quiet-tie-evidence-other", attempt.id, "rg-other", "release-other", 1.0
+            ),
+        ],
+        outcome="contradictory",
+        review_id="quiet-tie-review",
+        completed_at=3,
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        filed = connection.execute(
+            "SELECT state FROM library_identification_reviews WHERE attempt_id = ?",
+            (attempt.id,),
+        ).fetchone()
+        assert filed is not None
+        assert filed["state"] == "needs_review"
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+        assert job_state["state"] == "needs_review"
+        flags = connection.execute(
+            "SELECT degradation_flags_json FROM library_identification_attempts WHERE id = ?",
+            (attempt.id,),
+        ).fetchone()
+        assert "identity_reconfirmed:kept_protected" not in flags["degradation_flags_json"]
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_without_protected_identity_files_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Protection is required: an agreeing candidate against an automatic
+    identity still files its review (and retracts, per existing rules)."""
+    await _seed_album(store, "1", identity_source="automatic")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    indexed = [
+        track for track in context["tracks"] if track["availability"] == "indexed"
+    ]
+    revisions = album_input_revisions(indexed)
+    identity_revision = album_identity_revision(context["identity"], indexed)
+    claimed = await _quiet_claim(store, revisions)
+    attempt = _quiet_attempt("quiet-auto-attempt", revisions, identity_revision)
+
+    await store.finish_identification_job(
+        claimed["id"],
+        worker_id="worker",
+        expected_job_revision=int(claimed["row_revision"]),
+        expected_album_revision=int(context["album"]["row_revision"]),
+        expected_input_revision=":".join(revisions),
+        attempt=attempt,
+        evidence=[
+            _quiet_evidence(
+                "quiet-auto-evidence", attempt.id, "rg-1", "release-1", 1.0
+            )
+        ],
+        outcome="contradictory",
+        review_id="quiet-auto-review",
+        completed_at=3,
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        filed = connection.execute(
+            "SELECT state FROM library_identification_reviews WHERE attempt_id = ?",
+            (attempt.id,),
+        ).fetchone()
+        assert filed is not None
+        assert filed["state"] == "needs_review"
+        flags = connection.execute(
+            "SELECT degradation_flags_json FROM library_identification_attempts WHERE id = ?",
+            (attempt.id,),
+        ).fetchone()
+        assert "identity_reconfirmed:kept_protected" not in flags["degradation_flags_json"]
+        retracted = connection.execute(
+            "SELECT local_album_id FROM local_album_external_identities "
+            "WHERE local_album_id = ?",
+            ("album-1",),
+        ).fetchall()
+        assert retracted == []
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_rg_only_candidate_agrees(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Release matching is lenient one way: an RG-only candidate (no exact
+    release claimed) against a stored exact release still agrees - the album
+    is settled, only exact-edition proof is missing."""
+    await _seed_album(store, "1", identity_source="manual")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    indexed = [
+        track for track in context["tracks"] if track["availability"] == "indexed"
+    ]
+    revisions = album_input_revisions(indexed)
+    identity_revision = album_identity_revision(context["identity"], indexed)
+    claimed = await _quiet_claim(store, revisions)
+    attempt = _quiet_attempt("quiet-rg-only-attempt", revisions, identity_revision)
+
+    await store.finish_identification_job(
+        claimed["id"],
+        worker_id="worker",
+        expected_job_revision=int(claimed["row_revision"]),
+        expected_album_revision=int(context["album"]["row_revision"]),
+        expected_input_revision=":".join(revisions),
+        attempt=attempt,
+        evidence=[
+            _quiet_evidence(
+                "quiet-rg-only-evidence", attempt.id, "rg-1", None, 1.0
+            )
+        ],
+        outcome="contradictory",
+        review_id="quiet-rg-only-review",
+        completed_at=3,
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        open_reviews = connection.execute(
+            "SELECT id FROM library_identification_reviews WHERE local_album_id = ? "
+            "AND state IN ('needs_review', 'edition_to_confirm')",
+            ("album-1",),
+        ).fetchall()
+        assert open_reviews == []
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+        assert job_state["state"] == "succeeded"
+        flags = connection.execute(
+            "SELECT degradation_flags_json FROM library_identification_attempts WHERE id = ?",
+            (attempt.id,),
+        ).fetchone()
+        assert "identity_reconfirmed:kept_protected" in flags["degradation_flags_json"]
+        identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid, decision_source "
+            "FROM local_album_external_identities WHERE local_album_id = ?",
+            ("album-1",),
+        ).fetchone()
+        assert dict(identity) == {
+            "release_group_mbid": "rg-1",
+            "release_mbid": "release-1",
+            "decision_source": "manual",
+        }
+        album_revision = connection.execute(
+            "SELECT row_revision FROM local_albums WHERE id = ?",
+            ("album-1",),
+        ).fetchone()
+        assert int(album_revision["row_revision"]) == int(
+            context["album"]["row_revision"]
+        ) + 1
+
+
+def test_quiet_top_candidate_agrees_edges() -> None:
+    """Predicate edges: empty evidence, blank stored group, stored
+    release-blank leniency, and case-insensitive MBID agreement."""
+    attempt_id = "quiet-predicate-attempt"
+    record = _quiet_evidence("quiet-predicate-evidence", attempt_id, "RG-1", "Release-1", 1.0)
+    assert _quiet_top_candidate_agrees([record], "rg-1", "release-1") is True
+    assert _quiet_top_candidate_agrees([record], "rg-1", None) is True
+    assert _quiet_top_candidate_agrees([], "rg-1", "release-1") is False
+    assert _quiet_top_candidate_agrees([record], "", "release-1") is False
+    assert _quiet_top_candidate_agrees([record], None, None) is False
+    # The quiet floor mirrors the engine's winner margin by value (a local
+    # constant so persistence never imports services); pin the equality.
+    assert _QUIET_MARGIN_FLOOR == CANDIDATE_MARGIN_FLOOR
+
+
+async def _quiet_round(
+    store: NativeLibraryStore,
+    attempt_id: str,
+    records: list[IdentificationEvidenceRecord],
+    *,
+    identity_source: str = "manual",
+    review_state: str = "needs_review",
+    reason_code: str = "CONFLICTING_TRACK_EVIDENCE",
+) -> tuple[dict, IdentificationAttempt]:
+    """Seed album-1, run one contradictory finish, return (claimed, attempt)."""
+    await _seed_album(
+        store, "1", identity_source=identity_source, review_state=review_state
+    )
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    indexed = [
+        track for track in context["tracks"] if track["availability"] == "indexed"
+    ]
+    revisions = album_input_revisions(indexed)
+    identity_revision = album_identity_revision(context["identity"], indexed)
+    claimed = await _quiet_claim(store, revisions)
+    attempt = _quiet_attempt(
+        attempt_id,
+        revisions,
+        identity_revision,
+        candidate_count=len(records),
+        reason_code=reason_code,
+    )
+    await store.finish_identification_job(
+        claimed["id"],
+        worker_id="worker",
+        expected_job_revision=int(claimed["row_revision"]),
+        expected_album_revision=int(context["album"]["row_revision"]),
+        expected_input_revision=":".join(revisions),
+        attempt=attempt,
+        evidence=records,
+        outcome="contradictory",
+        review_id=f"{attempt_id}-review",
+        completed_at=3,
+    )
+    return claimed, attempt
+
+
+def _quiet_review_state(db_path: Path, attempt_id: str) -> str | None:
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT state FROM library_identification_reviews WHERE attempt_id = ? "
+            "AND state = 'needs_review'",
+            (attempt_id,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+
+def _quiet_open_reviews(db_path: Path) -> list:
+    with sqlite3.connect(db_path) as connection:
+        return connection.execute(
+            "SELECT id FROM library_identification_reviews WHERE local_album_id = ? "
+            "AND state IN ('needs_review', 'edition_to_confirm')",
+            ("album-1",),
+        ).fetchall()
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_same_group_other_release_files_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Both sides name a release, so releases must agree: same group but a
+    different release still files its review."""
+    attempt_id = "quiet-other-release-attempt"
+    _, attempt = await _quiet_round(
+        store,
+        attempt_id,
+        [_quiet_evidence("quiet-other-release-ev", attempt_id, "rg-1", "release-other", 1.0)],
+    )
+    assert _quiet_review_state(db_path, attempt.id) == "needs_review"
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_stale_identity_code_files_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """The quiet arm is restricted to the track-evidence veto: an agreeing
+    top candidate under MANUAL_IDENTITY_STALE still files its review."""
+    attempt_id = "quiet-stale-code-attempt"
+    _, attempt = await _quiet_round(
+        store,
+        attempt_id,
+        [_quiet_evidence("quiet-stale-code-ev", attempt_id, "rg-1", "release-1", 1.0)],
+        reason_code="MANUAL_IDENTITY_STALE",
+    )
+    assert _quiet_review_state(db_path, attempt.id) == "needs_review"
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_agreeing_outscored_files_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Only the top candidate can re-confirm: an agreeing candidate
+    outscored by a disagreeing one still files its review."""
+    attempt_id = "quiet-outscored-attempt"
+    _, attempt = await _quiet_round(
+        store,
+        attempt_id,
+        [
+            _quiet_evidence("quiet-outscored-agree", attempt_id, "rg-1", "release-1", 0.5),
+            _quiet_evidence(
+                "quiet-outscored-other", attempt_id, "rg-other", "release-other", 1.0
+            ),
+        ],
+    )
+    assert _quiet_review_state(db_path, attempt.id) == "needs_review"
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_agreeing_unique_top_goes_quiet(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A unique agreeing top over a distant disagreeing runner-up goes
+    quiet: only near rivals block re-confirmation."""
+    attempt_id = "quiet-unique-top-attempt"
+    claimed, attempt = await _quiet_round(
+        store,
+        attempt_id,
+        [
+            _quiet_evidence("quiet-unique-top-agree", attempt_id, "rg-1", "release-1", 1.0),
+            _quiet_evidence(
+                "quiet-unique-top-other", attempt_id, "rg-other", "release-other", 0.5
+            ),
+        ],
+    )
+    assert _quiet_open_reviews(db_path) == []
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+        assert job_state["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_near_disagreeing_rival_files_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A disagreeing runner-up within the margin floor is genuine
+    ambiguity: the review still files."""
+    attempt_id = "quiet-near-rival-attempt"
+    _, attempt = await _quiet_round(
+        store,
+        attempt_id,
+        [
+            _quiet_evidence("quiet-near-rival-agree", attempt_id, "rg-1", "release-1", 1.0),
+            _quiet_evidence(
+                "quiet-near-rival-other", attempt_id, "rg-other", "release-other", 0.96
+            ),
+        ],
+    )
+    assert _quiet_review_state(db_path, attempt.id) == "needs_review"
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_far_disagreeing_rival_goes_quiet(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A disagreeing runner-up beyond the margin floor does not block:
+    the decisive top still re-confirms quietly."""
+    attempt_id = "quiet-far-rival-attempt"
+    claimed, attempt = await _quiet_round(
+        store,
+        attempt_id,
+        [
+            _quiet_evidence("quiet-far-rival-agree", attempt_id, "rg-1", "release-1", 1.0),
+            _quiet_evidence(
+                "quiet-far-rival-other", attempt_id, "rg-other", "release-other", 0.90
+            ),
+        ],
+    )
+    assert _quiet_open_reviews(db_path) == []
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+        assert job_state["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_agreeing_tie_goes_quiet(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A top tie where every tied candidate agrees is settled, not
+    ambiguous: same identity named twice goes quiet."""
+    attempt_id = "quiet-agree-tie-attempt"
+    claimed, attempt = await _quiet_round(
+        store,
+        attempt_id,
+        [
+            _quiet_evidence("quiet-agree-tie-exact", attempt_id, "rg-1", "release-1", 1.0),
+            _quiet_evidence("quiet-agree-tie-rg", attempt_id, "rg-1", None, 1.0),
+        ],
+    )
+    assert _quiet_open_reviews(db_path) == []
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+        assert job_state["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_margin_boundary_goes_quiet(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """The margin block is exclusive-below like the engine's: a disagreeing
+    rival exactly at the floor still re-confirms quietly."""
+    attempt_id = "quiet-boundary-attempt"
+    claimed, attempt = await _quiet_round(
+        store,
+        attempt_id,
+        [
+            _quiet_evidence("quiet-boundary-agree", attempt_id, "rg-1", "release-1", 1.0),
+            _quiet_evidence(
+                "quiet-boundary-other", attempt_id, "rg-other", "release-other", 0.95
+            ),
+        ],
+    )
+    assert _quiet_open_reviews(db_path) == []
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+        assert job_state["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_legacy_identity_goes_quiet(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Protection covers legacy_import as well as manual: an agreeing top
+    candidate goes quiet for both. The identity attaches after claiming
+    because the queue refuses legacy albums (pending-migration lane owns
+    them); finish reads protection fresh."""
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    indexed = [
+        track for track in context["tracks"] if track["availability"] == "indexed"
+    ]
+    revisions = album_input_revisions(indexed)
+    claimed = await _quiet_claim(store, revisions)
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id="album-1",
+            release_group_mbid="rg-1",
+            release_mbid="release-1",
+            decision_source="legacy_import",
+            selected_at=2,
+        ),
+        expected_album_revision=int(context["album"]["row_revision"]),
+    )
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    indexed = [
+        track for track in context["tracks"] if track["availability"] == "indexed"
+    ]
+    attempt_id = "quiet-legacy-attempt"
+    attempt = _quiet_attempt(
+        attempt_id,
+        revisions,
+        album_identity_revision(context["identity"], indexed),
+    )
+    await store.finish_identification_job(
+        claimed["id"],
+        worker_id="worker",
+        expected_job_revision=int(claimed["row_revision"]),
+        expected_album_revision=int(context["album"]["row_revision"]),
+        expected_input_revision=":".join(revisions),
+        attempt=attempt,
+        evidence=[_quiet_evidence("quiet-legacy-ev", attempt_id, "rg-1", "release-1", 1.0)],
+        outcome="contradictory",
+        review_id=f"{attempt_id}-review",
+        completed_at=3,
+    )
+    assert _quiet_open_reviews(db_path) == []
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+        assert job_state["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_quiet_reconfirm_resolves_edition_to_confirm(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """The resolve covers both open states: a seeded edition_to_confirm
+    row resolves on quiet re-confirmation."""
+    attempt_id = "quiet-tier-attempt"
+    _, attempt = await _quiet_round(
+        store,
+        attempt_id,
+        [_quiet_evidence("quiet-tier-ev", attempt_id, "rg-1", "release-1", 1.0)],
+        review_state="edition_to_confirm",
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        open_reviews = connection.execute(
+            "SELECT id FROM library_identification_reviews WHERE local_album_id = ? "
+            "AND state IN ('needs_review', 'edition_to_confirm')",
+            ("album-1",),
+        ).fetchall()
+        assert open_reviews == []
+        seeded = connection.execute(
+            "SELECT state, attempt_id FROM library_identification_reviews WHERE id = 'review-1'",
+        ).fetchone()
+        assert seeded["state"] == "resolved"
+        assert seeded["attempt_id"] == attempt.id
 
 
 @pytest.mark.asyncio
@@ -4134,7 +5098,51 @@ async def test_explicit_reidentification_fingerprints_contradictory_text_evidenc
     assert operation.reidentification_candidates[0].automatic_safe is True
     assert operation.reidentification_candidates[0].evidence.track_evidence[
         0
-    ].evidence_kinds == ["recording_mbid"]
+    ].evidence_kinds == ["fingerprint_recording_mbid"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_reidentification_cached_off_release_fingerprint_is_support_only(
+    store: NativeLibraryStore,
+) -> None:
+    """#392: a cached matched fingerprint outcome carrying an off-release
+    recording ID lands in the support-only slot - exact text evidence still
+    supports the track instead of vetoing with recording_mbid_conflict."""
+    await _seed_album(store, "1")
+    await store.record_fingerprint_outcome(
+        FingerprintOutcome(
+            id="cached-off-release",
+            local_track_id="track-1-1",
+            stat_revision="stat-1-1",
+            fingerprinter_version="fpcalc-acoustid-v1",
+            state="matched",
+            recording_mbid="off-release-recording",
+            release_group_ids=["rg-explicit"],
+            first_attempt_at=1,
+            last_attempt_at=1,
+        )
+    )
+    worker = ExplicitReidentificationWorker(
+        store,
+        AlbumCandidateService(_IdentificationProvider()),
+        AlbumEvidenceEngine(),
+    )
+    created = await ReidentificationService(store).create_or_coalesce(
+        "album-1", "admin", idempotency_key="off-release-fingerprint", now=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker", now=2, lease_seconds=60, kind="explicit_reidentification"
+    )
+    assert claimed is not None
+
+    ready = await worker.run_claimed(claimed, "worker", now=3)
+    operation = await LibraryOperationService(store).get(created["id"])
+
+    assert ready["state"] == "ready"
+    kinds = operation.reidentification_candidates[0].evidence.track_evidence[
+        0
+    ].evidence_kinds
+    assert "recording_mbid_conflict" not in kinds
 
 
 @pytest.mark.asyncio
@@ -4838,7 +5846,7 @@ async def test_repair_dry_run_and_apply_detach_only_complete_hard_failure(
     assert ready.repair_summary.playable_after_detach_track_count == 1
     assert ready.repair_summary.estimated_apply_changes == 1
     assert ready.repair_summary.catalog_snapshot_revision >= 1
-    assert ready.repair_summary.target_matcher_version == "feedback-fixes-v2"
+    assert ready.repair_summary.target_matcher_version == "quiet-reconfirm-v1"
     assert findings.items[0].finding_code == "safe_detach"
     assert findings.items[0].apply_eligible is True
     apply_job = await repair.begin_apply(
@@ -5035,7 +6043,7 @@ async def test_repair_audit_generates_missing_evidence_and_defers_whole_job_when
             "SELECT trigger, matcher_version FROM library_identification_attempts "
             "WHERE local_album_id = 'album-1' AND trigger = 'repair_audit'"
         ).fetchone()
-    assert generated == ("repair_audit", "feedback-fixes-v2")
+    assert generated == ("repair_audit", MATCHER_VERSION)
 
     await _seed_album(store, "2")
     context = await store.get_album_identification_context("album-2")
@@ -5250,10 +6258,12 @@ async def test_repair_reuses_revision_keyed_fingerprint_as_shared_evidence(
     evidence = await store.get_latest_album_candidate_evidence(
         "album-1", "rg-explicit:release-explicit"
     )
-    assert finding.finding_code == "needs_review"
+    # #392: the reused off-release fingerprint is support-only, so exact text
+    # evidence passes the audit; the fingerprint fill still blocks auto-apply.
+    assert finding.finding_code == "valid"
     assert finding.apply_eligible is False
     assert evidence is not None
-    assert evidence.evidence.track_evidence[0].classification == "contradictory"
+    assert evidence.evidence.track_evidence[0].classification == "supported"
 
 
 @pytest.mark.asyncio
@@ -8268,6 +9278,71 @@ async def test_undo_restores_prior_manual_identity_snapshot(
     assert len(undo_audits) == 1
     assert undo_audits[0]["actor_user_id"] == "admin"
     assert reviews == []
+
+
+@pytest.mark.asyncio
+async def test_undo_automatic_edition_invalidates_display_caches(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store, "1")
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    _seed_stored_attempt(
+        db_path,
+        local_album_id="album-1",
+        attempt_id="attempt-auto-invalidate",
+        revisions=album_input_revisions(context["tracks"]),
+        evidence=[
+            (
+                "evidence-auto-invalidate",
+                _suggestion_evidence(release_mbid="release-one"),
+            )
+        ],
+    )
+    provider = _SuggestedEditionProvider(
+        {
+            "release-one": _tie_release(
+                "release-one", status="Official", date="2021-05-01", country="DE"
+            )
+        }
+    )
+    preparation, created, _ = await _run_auto_preparation(
+        store, provider, idempotency_key="auto-invalidate", opt_in=True
+    )
+    accepted = (
+        await preparation.findings(
+            created.id, finding_category="exact_release_auto_accepted"
+        )
+    ).items[0]
+    assert accepted.automatic_undo is not None
+    invalidate = AsyncMock()
+    service = IdentityRepairService(store, invalidate=invalidate)
+    response = await service.undo_automatic_edition(
+        "album-1",
+        AutomaticEditionUndoRequest(
+            expected_album_revision=accepted.automatic_undo.expected_album_revision,
+            expected_identity_revision=(
+                accepted.automatic_undo.expected_identity_revision
+            ),
+        ),
+        "admin",
+    )
+    assert response.local_album_id == "album-1"
+    invalidate.assert_awaited_once()
+    domains, album_ids = invalidate.await_args.args
+    assert album_ids == ["album-1"]
+    # Same domain set as identification: undo restores a prior identity,
+    # which search/home/discover may have cached too.
+    assert set(domains) == {
+        "library",
+        "artist",
+        "search",
+        "home",
+        "discover",
+        "compatibility",
+        "artwork",
+        "review",
+    }
 
 
 @pytest.mark.asyncio

@@ -292,9 +292,7 @@ def test_brainzmash_verification_rejects_preconsent_without_probe(monkeypatch):
     )
     preferences_service = MagicMock()
     preferences_service.get_musicbrainz_connection.return_value = current
-    settings_service = SettingsService(
-        preferences_service=preferences_service, cache=InMemoryCache()
-    )
+    settings_service = SettingsService(preferences_service=preferences_service, cache=InMemoryCache(), mb_response_store=AsyncMock(), follow_store=AsyncMock())
     probe = AsyncMock()
     monkeypatch.setattr(mb_base, "mb_api_probe", probe)
     app, _, _ = _build_app(

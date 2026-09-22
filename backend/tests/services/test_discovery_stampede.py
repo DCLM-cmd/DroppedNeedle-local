@@ -24,6 +24,9 @@ def _make_service() -> tuple[ArtistDiscoveryService, AsyncMock]:
     mb_repo = AsyncMock()
     memory_cache = AsyncMock()
     memory_cache.get = AsyncMock(return_value=None)
+    memory_cache.get_with_metadata = AsyncMock(return_value=(None, None))
+    memory_cache.set_if_token = AsyncMock(return_value=True)
+    memory_cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
 
     svc = ArtistDiscoveryService(
         listenbrainz_repo=lb_repo,

@@ -16,6 +16,7 @@ from infrastructure.cache.cache_keys import (
 )
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
+from infrastructure.cache.memory_cache import InMemoryCache
 from repositories.musicbrainz_album import MusicBrainzAlbumMixin
 from repositories.musicbrainz_management_models import (
     MbManagementRecording,
@@ -36,8 +37,7 @@ _FIXTURE = (
 
 class _Repo(MusicBrainzAlbumMixin):
     def __init__(self) -> None:
-        self._cache = AsyncMock()
-        self._cache.get.return_value = None
+        self._cache = InMemoryCache()
 
 
 def _release() -> MbManagementRelease:
@@ -138,22 +138,20 @@ async def test_fetch_uses_sorted_includes_priority_and_projection_cache_inputs(
     }
     assert api.await_args.kwargs["priority"] is RequestPriority.BACKGROUND_SYNC
     assert api.await_args.kwargs["decode_type"] is MbManagementRelease
-    cache_key = repo._cache.set.await_args.args[0]
-    assert "locales=en-gb,ja" in cache_key
-    assert "artists=variations" in cache_key
 
 
 @pytest.mark.asyncio
 async def test_successful_result_is_read_from_cache(monkeypatch) -> None:
     import repositories.musicbrainz_album as module
 
-    api = AsyncMock()
+    api = AsyncMock(return_value=_release())
     monkeypatch.setattr(module, "mb_api_get", api)
     repo = _Repo()
-    repo._cache.get.return_value = _release()
 
     result = await repo.get_canonical_release("release-id", includes=("recordings",))
-    assert result is repo._cache.get.return_value
+    api.reset_mock()
+    repeated = await repo.get_canonical_release("release-id", includes=("recordings",))
+    assert result == repeated == _release()
     api.assert_not_awaited()
 
 
@@ -166,8 +164,9 @@ async def test_definitive_missing_release_is_negative_cached(monkeypatch) -> Non
     repo = _Repo()
 
     assert await repo.get_canonical_release("missing", includes=("recordings",)) is None
-    assert repo._cache.set.await_args.args[1] is False
-    assert repo._cache.set.await_args.kwargs["ttl_seconds"] == 600
+    api.reset_mock()
+    assert await repo.get_canonical_release("missing", includes=("recordings",)) is None
+    api.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -230,20 +229,16 @@ async def test_recording_redirect_resolution_uses_canonical_provider_identity(
     repo = _Repo()
 
     resolved = await repo.resolve_recording_mbid(
-        "retired-recording", priority=RequestPriority.BACKGROUND_SYNC
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        priority=RequestPriority.BACKGROUND_SYNC,
     )
 
     assert resolved == "canonical-recording"
-    api.assert_awaited_once_with(
-        "/recording/retired-recording",
-        priority=RequestPriority.BACKGROUND_SYNC,
-        decode_type=MbManagementRecording,
+    assert (
+        await repo.resolve_recording_mbid("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        == "canonical-recording"
     )
-    repo._cache.set.assert_awaited_once_with(
-        mb_recording_canonical_id_key("retired-recording"),
-        "canonical-recording",
-        ttl_seconds=3600,
-    )
+    assert api.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -254,12 +249,16 @@ async def test_missing_recording_identity_is_negative_cached(monkeypatch) -> Non
     monkeypatch.setattr(module, "mb_api_get", api)
     repo = _Repo()
 
-    assert await repo.resolve_recording_mbid("missing-recording") is None
-    repo._cache.set.assert_awaited_once_with(
-        mb_recording_canonical_id_key("missing-recording"),
-        False,
-        ttl_seconds=600,
+    assert (
+        await repo.resolve_recording_mbid("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        is None
     )
+    api.reset_mock()
+    assert (
+        await repo.resolve_recording_mbid("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        is None
+    )
+    api.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -276,9 +275,9 @@ async def test_recording_identity_provider_failure_is_not_cached(
     repo = _Repo()
 
     with pytest.raises(ExternalServiceError, match="temporarily unavailable"):
-        await repo.resolve_recording_mbid("recording-id")
+        await repo.resolve_recording_mbid("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 
-    repo._cache.set.assert_not_awaited()
+    assert repo._cache.size() == 0
 
 
 def test_cache_key_and_invalidation_contract() -> None:

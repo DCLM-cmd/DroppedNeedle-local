@@ -191,6 +191,11 @@ class TargetLibraryPolicyService:
                 raise
             if cancelled:
                 raise asyncio.CancelledError
+            # S-01 Hook B writer: the restore path funnels through here too,
+            # so both settings entry points mark affected scopes dirty.
+            self._settings.mark_scan_scopes_dirty(
+                LibraryPolicyService._scope_ids(scopes)
+            )
             current = await self.get_settings()
             payload = msgspec.to_builtins(current)
             payload["actions_applied"] = [

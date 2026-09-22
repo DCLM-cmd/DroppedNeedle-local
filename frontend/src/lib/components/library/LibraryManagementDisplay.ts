@@ -490,3 +490,8 @@ export const MANAGEMENT_REASON_LABELS: Record<string, string> = {
 export function managementReasonLabel(value: string): string {
 	return MANAGEMENT_REASON_LABELS[value] ?? titleManagementValue(value);
 }
+
+export function firstDeferredSource(item: LibraryManagementPlanItem): string | null {
+	const sources = item.diff.deferred_sources;
+	return Array.isArray(sources) && typeof sources[0] === 'string' ? sources[0] : null;
+}

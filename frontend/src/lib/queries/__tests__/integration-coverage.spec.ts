@@ -14,6 +14,8 @@ import { localAlbumEditionPinUrl } from '$lib/queries/albums/EditionQueries.svel
 
 // [description, actual path produced by the API builder, expected backend route]
 const COVERAGE: Array<[string, string, string]> = [
+	['discovery activity', API.discoverActivity(), '/api/v1/discover/activity'],
+	['queue preview', API.discoverQueuePreview('RG1'), '/api/v1/discover/queue/preview/RG1'],
 	['device session', API.auth.deviceSessions(), '/api/v1/auth/device-sessions'],
 	// local password recovery
 	[
@@ -42,6 +44,15 @@ const COVERAGE: Array<[string, string, string]> = [
 		API.downloads.restartWithPolicy('T1'),
 		'/api/v1/downloads/T1/restart-with-current-policy'
 	],
+	// local file downloads (album viewer)
+	['download access', API.download.access(), '/api/v1/download/access'],
+	['local track download', API.download.localTrack('F1'), '/api/v1/download/local/track/F1'],
+	['local album zip', API.download.localAlbum('A1'), '/api/v1/download/local/album/A1'],
+	[
+		'local album zip by MBID',
+		API.download.localAlbumByMbid('M1'),
+		'/api/v1/download/local/album/mbid/M1'
+	],
 	// download-clients policy (Acquisition plan)
 	[
 		'download-client policy summary',
@@ -68,6 +79,11 @@ const COVERAGE: Array<[string, string, string]> = [
 		'management hold discard',
 		API.downloads.heldManagementDiscard('T1'),
 		'/api/v1/downloads/held/management/T1/discard'
+	],
+	[
+		'verdict hold discard',
+		API.downloads.heldVerdictDiscard('T1'),
+		'/api/v1/downloads/held/verdict/T1/discard'
 	],
 	['held single reverify', API.downloads.heldReverify(7), '/api/v1/downloads/held/7/reverify'],
 	['held bulk reverify', API.downloads.heldReverifyBulk(), '/api/v1/downloads/held/reverify'],
@@ -102,6 +118,7 @@ const COVERAGE: Array<[string, string, string]> = [
 	['library provider IDs', API.library.mbids(), '/api/v1/library/mbids'],
 	['library membership', API.library.membership(), '/api/v1/library/membership'],
 	['local track lyrics', API.local.lyrics('T1'), '/api/v1/local/tracks/T1/lyrics'],
+	['local album match', API.local.albumMatch('M1'), '/api/v1/local/albums/match/M1'],
 	['recently added albums', API.library.recentlyAdded(), '/api/v1/library/recently-added?limit=20'],
 	['local album detail', API.library.albumDetail('A1'), '/api/v1/library/albums/A1'],
 	[
@@ -155,9 +172,21 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/covers/release/R1?size=250'
 	],
 	['local album copies', API.library.albumCopies('A1'), '/api/v1/library/albums/A1/copies'],
-	['get local album edition pin', localAlbumEditionPinUrl('A1'), '/api/v1/library/albums/A1/edition'],
-	['set local album edition pin', localAlbumEditionPinUrl('A1'), '/api/v1/library/albums/A1/edition'],
-	['clear local album edition pin', localAlbumEditionPinUrl('A1'), '/api/v1/library/albums/A1/edition'],
+	[
+		'get local album edition pin',
+		localAlbumEditionPinUrl('A1'),
+		'/api/v1/library/albums/A1/edition'
+	],
+	[
+		'set local album edition pin',
+		localAlbumEditionPinUrl('A1'),
+		'/api/v1/library/albums/A1/edition'
+	],
+	[
+		'clear local album edition pin',
+		localAlbumEditionPinUrl('A1'),
+		'/api/v1/library/albums/A1/edition'
+	],
 	['local artist detail', API.library.artistDetail('R1'), '/api/v1/library/artists/R1'],
 	['local artist albums', API.library.artistAlbums('R1'), '/api/v1/library/artists/R1/albums'],
 	[
@@ -254,12 +283,6 @@ const COVERAGE: Array<[string, string, string]> = [
 	['remove library album', API.library.removeAlbum('M1'), '/api/v1/library/album/M1'],
 	['rescan album', API.library.rescanAlbum('M1'), '/api/v1/library/albums/M1/rescan'],
 	['library activity', API.library.activity(), '/api/v1/library/activity'],
-	['library activity stream', API.library.activityStream(), '/api/v1/library/activity/stream'],
-	[
-		'library operations stream',
-		API.library.operationsStream(),
-		'/api/v1/library/operations/stream'
-	],
 	[
 		'library management settings',
 		API.libraryManagement.settings(),
@@ -341,6 +364,11 @@ const COVERAGE: Array<[string, string, string]> = [
 		'/api/v1/settings/library-management/activation-confirmations'
 	],
 	[
+		'library management activation health',
+		API.libraryManagement.activationHealth(),
+		'/api/v1/settings/library-management/activation-health'
+	],
+	[
 		'create library management preview',
 		API.libraryManagement.previews(),
 		'/api/v1/library/management/previews'
@@ -419,6 +447,11 @@ const COVERAGE: Array<[string, string, string]> = [
 		'library management recovery diagnostics',
 		API.libraryManagement.recoveryDiagnostics(),
 		'/api/v1/library/management/recovery/diagnostics'
+	],
+	[
+		'resolve library management import bundle',
+		API.libraryManagement.resolveImportBundle('B1'),
+		'/api/v1/library/management/recovery/import-bundles/B1/resolve'
 	],
 	[
 		'pause identification',
@@ -625,6 +658,8 @@ const COVERAGE: Array<[string, string, string]> = [
 	// QW9 runtime observability (admin diagnostics card)
 	['system queue stats', API.system.queueStats(), '/api/v1/system/queue-stats'],
 	['system provider stats', API.system.providerStats(), '/api/v1/system/provider-stats'],
+	['cache sync status', API.cacheSync.status(), '/api/v1/cache/sync/status'],
+	['cache sync cancel', API.cacheSync.cancel(), '/api/v1/cache/sync/cancel'],
 	// keyless 30s previews (user-scoped)
 	[
 		'track preview',
@@ -668,7 +703,7 @@ const COVERAGE: Array<[string, string, string]> = [
 		API.following.markNewReleasesSeen(),
 		'/api/v1/following/new-releases/seen'
 	],
-	['following events', API.following.events(), '/api/v1/following/events'],
+	['mux events stream', API.events.stream(), '/api/v1/events/stream'],
 	// upcoming events / concerts (user-scoped)
 	['concerts', API.following.concerts(), '/api/v1/following/concerts'],
 	['concert cities', API.following.concertCities(), '/api/v1/following/concerts/cities'],
@@ -693,6 +728,19 @@ const COVERAGE: Array<[string, string, string]> = [
 	['connect jellyfin', API.me.jellyfin(), '/api/v1/me/connections/jellyfin'],
 	['plex link pin', API.me.plexAuthPin(), '/api/v1/me/connections/plex/auth/pin'],
 	['plex link poll', API.me.plexAuthPoll(7), '/api/v1/me/connections/plex/auth/poll?pin_id=7'],
+	['connections list', API.me.connections(), '/api/v1/me/connections'],
+	['connection by service', API.me.connection('plex'), '/api/v1/me/connections/plex'],
+	['lastfm link token', API.me.lastfmAuthToken(), '/api/v1/me/connections/lastfm/auth/token'],
+	['lastfm link session', API.me.lastfmAuthSession(), '/api/v1/me/connections/lastfm/auth/session'],
+	['connect listenbrainz', API.me.listenbrainz(), '/api/v1/me/connections/listenbrainz'],
+	['spotify auth url', API.me.spotifyAuthUrl(), '/api/v1/me/connections/spotify/auth/url'],
+	['spotify playlists', API.me.spotifyPlaylists(), '/api/v1/me/spotify/playlists'],
+	[
+		'spotify playlist import',
+		API.me.spotifyImport('PL1'),
+		'/api/v1/me/spotify/playlists/PL1/import'
+	],
+	['scrobble preferences', API.me.scrobblePreferences(), '/api/v1/me/scrobble-preferences'],
 	[
 		'Jellyfin user playlist image',
 		API.jellyfinLibrary.playlistImage('P1', 'I1', 300),
@@ -802,7 +850,11 @@ const COVERAGE: Array<[string, string, string]> = [
 	// Lidarr import (LidarrImport): admin config/test, user status/artists/import
 	['lidarr-import config', API.lidarrImport.config(), '/api/v1/lidarr-import/config'],
 	['lidarr-import test', API.lidarrImport.test(), '/api/v1/lidarr-import/test'],
-	['lidarr-import status', API.lidarrImport.status(), '/api/v1/lidarr-import/status'],
+	// Prowlarr: admin config/test (same single-connection shape)
+	['prowlarr config', API.prowlarr.config(), '/api/v1/prowlarr/config'],
+	['prowlarr test', API.prowlarr.test(), '/api/v1/prowlarr/test'],
+	// Usenet search backend selector (either/or)
+	['indexers search-backend', API.indexers.searchBackend(), '/api/v1/indexers/search-backend'],
 	['lidarr-import artists', API.lidarrImport.artists(), '/api/v1/lidarr-import/artists'],
 	['lidarr-import import', API.lidarrImport.import(), '/api/v1/lidarr-import/import'],
 	// Get it (phase 01): the lazy Where-to-buy endpoint + the admin settings card
@@ -844,6 +896,7 @@ const COVERAGE: Array<[string, string, string]> = [
 	// Plugin API (phase 01b): admin roster + curator source surfaces
 	['plugins list', API.plugins.list(), '/api/v1/plugins'],
 	['plugin install', API.plugins.install(), '/api/v1/plugins/install'],
+	['plugin sources', API.plugins.sources(), '/api/v1/plugins/sources'],
 	['plugin update', API.plugins.update('P1'), '/api/v1/plugins/P1'],
 	['plugin uninstall', API.plugins.uninstall('P1'), '/api/v1/plugins/P1'],
 	// Drop importer (Store Sync 01c): curator-gated upload/jobs/match/discard

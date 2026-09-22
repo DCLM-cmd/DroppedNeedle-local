@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import sqlite3
 from types import SimpleNamespace
@@ -11,13 +12,21 @@ from core.exceptions import (
     AudioWriteError,
     ConflictError,
     LibraryManagementDestinationConflictError,
+    ResourceNotFoundError,
     StaleRevisionError,
 )
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.library_management import LibraryManagementJobSnapshot
+from services.native.automatic_scan_management_service import (
+    AutomaticScanManagementService,
+)
 from services.native.library_management_planner import LibraryManagementPlanner
 from services.native.library_management_publisher import LibraryManagementPublisher
-from services.native.library_management_worker import LibraryManagementWorker
+from services.native.library_management_worker import (
+    MAX_SCAN_PREVIEW_STALE_REQUEUES,
+    STALE_INPUT_RETRIES_EXHAUSTED,
+    LibraryManagementWorker,
+)
 from services.native.library_management_undo_service import LibraryManagementUndoService
 from services.native.library_management_baseline_service import (
     LibraryManagementBaselineService,
@@ -43,7 +52,25 @@ def _snapshot() -> LibraryManagementJobSnapshot:
     )
 
 
-def _worker() -> tuple[LibraryManagementWorker, AsyncMock, AsyncMock]:
+def _scan_preview_snapshot() -> LibraryManagementJobSnapshot:
+    snapshot = _snapshot()
+    snapshot.mode = "preview"
+    snapshot.phase = "planning"
+    snapshot.origin = "scan_discovered"
+    snapshot.selection_json = json.dumps({"kind": "albums", "ids": ["album-1"]})
+    snapshot.profile_snapshot_json = json.dumps({"profile": {"id": "profile-1"}})
+    return snapshot
+
+
+def _scan_gate(*, settled: bool) -> AsyncMock:
+    gate = AsyncMock(spec=AutomaticScanManagementService)
+    gate.scan_preview_settled.return_value = settled
+    return gate
+
+
+def _worker(
+    scan_settle_gate: AsyncMock | None = None,
+) -> tuple[LibraryManagementWorker, AsyncMock, AsyncMock]:
     store = AsyncMock(spec=NativeLibraryStore)
     publisher = AsyncMock(spec=LibraryManagementPublisher)
     worker = LibraryManagementWorker(
@@ -53,6 +80,7 @@ def _worker() -> tuple[LibraryManagementWorker, AsyncMock, AsyncMock]:
         AsyncMock(spec=LibraryManagementUndoService),
         AsyncMock(spec=LibraryManagementBaselineService),
         AsyncMock(spec=LibraryManagementDuplicateService),
+        scan_settle_gate=scan_settle_gate,
     )
     store.get_library_management_job_snapshot.return_value = _snapshot()
     store.checkpoint_operation_control.return_value = None
@@ -322,6 +350,210 @@ async def test_scan_preview_with_blockers_remains_held_and_inert() -> None:
 
     assert result["state"] == "ready"
     store.begin_library_management_apply.assert_not_awaited()
+
+
+# Slice C (stale-storm fix): scan_discovered previews that go stale at pickup
+# requeue with a fresh snapshot after settle instead of terminal-failing.
+
+
+@pytest.mark.asyncio
+async def test_stale_scan_preview_requeues_then_succeeds_after_settle() -> None:
+    # Pre-fix behavior: the StaleRevisionError below finished the job as
+    # failed/STALE_INPUT with no replacement, so the preview lineage died.
+    gate = _scan_gate(settled=True)
+    worker, store, _publisher = _worker(scan_settle_gate=gate)
+    snapshot = _scan_preview_snapshot()
+    store.get_library_management_job_snapshot.return_value = snapshot
+    store.get_operation_job.side_effect = [
+        {
+            "id": "management-1",
+            "requested_by_user_id": None,
+            "idempotency_key": "automatic-scan:abc123",
+        },
+        {
+            "id": "management-2",
+            "state": "ready",
+            "row_revision": 4,
+        },
+    ]
+    worker._planner.run_claimed_preview.side_effect = StaleRevisionError(
+        "The library catalog changed while the preview was being built."
+    )
+    worker._planner.create_preview.return_value = SimpleNamespace(job_id="management-2")
+    store.finish_operation_job.return_value = {
+        "id": "management-1",
+        "state": "failed",
+        "terminal_code": "STALE_INPUT",
+    }
+
+    result = await worker.run_claimed({"id": "management-1"}, "management-worker")
+
+    # The stale attempt keeps its honest STALE_INPUT record, but the lineage
+    # continues through a fresh replacement instead of terminating.
+    assert result["state"] == "failed"
+    assert store.finish_operation_job.await_args.kwargs["terminal_code"] == (
+        "STALE_INPUT"
+    )
+    create = worker._planner.create_preview.await_args.kwargs
+    assert create["origin"] == "scan_discovered"
+    assert create["selection"].kind == "albums"
+    assert tuple(create["selection"].ids) == ("album-1",)
+    assert create["profile_id"] == "profile-1"
+    assert create["actor_user_id"] is None
+    assert create["expected_settings_revision"] == snapshot.settings_revision
+    assert create["expected_policy_revision"] == snapshot.policy_revision
+    assert create["idempotency_key"] == "automatic-scan:abc123:stale-retry:1"
+
+    # The replacement is a live queued lineage: picked up after settle it
+    # plans clean and flows into automatic apply instead of failing.
+    ready = msgspec.structs.replace(
+        snapshot,
+        job_id="management-2",
+        phase="ready",
+        summary_json='{"blocked_count":0,"stale_count":0}',
+        preview_token_hash="proof",
+    )
+    worker._planner.run_claimed_preview.side_effect = None
+    worker._planner.run_claimed_preview.return_value = ready
+    store.begin_library_management_apply.return_value = {
+        "id": "management-2",
+        "state": "queued",
+    }
+
+    followup = await worker.run_claimed({"id": "management-2"}, "management-worker")
+
+    assert followup["state"] == "queued"
+    apply = store.begin_library_management_apply.await_args.kwargs
+    assert apply["idempotency_key"] == "automatic-scan-apply:management-2"
+
+
+@pytest.mark.asyncio
+async def test_stale_scan_preview_cap_exhaustion_terminals_honestly() -> None:
+    # Pre-fix behavior: every stale attempt terminalled STALE_INPUT, so an
+    # exhausted lineage was indistinguishable from a first stale.
+    gate = _scan_gate(settled=True)
+    worker, store, _publisher = _worker(scan_settle_gate=gate)
+    store.get_library_management_job_snapshot.return_value = _scan_preview_snapshot()
+    store.get_operation_job.return_value = {
+        "id": "management-1",
+        "requested_by_user_id": None,
+        "idempotency_key": f"automatic-scan:abc123:stale-retry:{MAX_SCAN_PREVIEW_STALE_REQUEUES}",
+    }
+    worker._planner.run_claimed_preview.side_effect = StaleRevisionError(
+        "The library catalog changed while the preview was being built."
+    )
+    store.finish_operation_job.return_value = {
+        "id": "management-1",
+        "state": "failed",
+        "terminal_code": STALE_INPUT_RETRIES_EXHAUSTED,
+    }
+
+    result = await worker.run_claimed({"id": "management-1"}, "management-worker")
+
+    assert result["state"] == "failed"
+    assert store.finish_operation_job.await_args.kwargs["terminal_code"] == (
+        STALE_INPUT_RETRIES_EXHAUSTED
+    )
+    worker._planner.create_preview.assert_not_awaited()
+    gate.scan_preview_settled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_manual_preview_terminals_immediately_without_requeue() -> None:
+    # Unchanged pre/post fix: explicit user intent never auto-reissues.
+    gate = _scan_gate(settled=True)
+    worker, store, _publisher = _worker(scan_settle_gate=gate)
+    snapshot = _snapshot()
+    snapshot.mode = "preview"
+    snapshot.phase = "planning"
+    assert snapshot.origin == "manual"
+    store.get_library_management_job_snapshot.return_value = snapshot
+    worker._planner.run_claimed_preview.side_effect = StaleRevisionError(
+        "The library catalog changed while the preview was being built."
+    )
+    store.finish_operation_job.return_value = {
+        "id": "management-1",
+        "state": "failed",
+        "terminal_code": "STALE_INPUT",
+    }
+
+    result = await worker.run_claimed({"id": "management-1"}, "management-worker")
+
+    assert result["state"] == "failed"
+    assert store.finish_operation_job.await_args.kwargs["terminal_code"] == (
+        "STALE_INPUT"
+    )
+    store.get_operation_job.assert_not_awaited()
+    worker._planner.create_preview.assert_not_awaited()
+    gate.scan_preview_settled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_scan_preview_with_deleted_profile_terminals_without_requeue() -> (
+    None
+):
+    # Pre-fix behavior: terminal STALE_INPUT. Post-fix the worker still
+    # terminals, but only after attempting the faithful rebuild, which the
+    # planner refuses when the profile is gone.
+    gate = _scan_gate(settled=True)
+    worker, store, _publisher = _worker(scan_settle_gate=gate)
+    store.get_library_management_job_snapshot.return_value = _scan_preview_snapshot()
+    store.get_operation_job.return_value = {
+        "id": "management-1",
+        "requested_by_user_id": None,
+        "idempotency_key": "automatic-scan:abc123",
+    }
+    worker._planner.run_claimed_preview.side_effect = StaleRevisionError(
+        "The library catalog changed while the preview was being built."
+    )
+    worker._planner.create_preview.side_effect = ResourceNotFoundError(
+        "Library Management profile not found."
+    )
+    store.finish_operation_job.return_value = {
+        "id": "management-1",
+        "state": "failed",
+        "terminal_code": "STALE_INPUT",
+    }
+
+    result = await worker.run_claimed({"id": "management-1"}, "management-worker")
+
+    assert result["state"] == "failed"
+    assert store.finish_operation_job.await_args.kwargs["terminal_code"] == (
+        "STALE_INPUT"
+    )
+    worker._planner.create_preview.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_scan_preview_before_settle_terminals_without_requeue() -> None:
+    # Pre-fix behavior: terminal STALE_INPUT. Post-fix an unsettled catalog
+    # still terminals this attempt (no requeue until settle); the spawn flow
+    # recreates the preview once the catalog settles.
+    gate = _scan_gate(settled=False)
+    worker, store, _publisher = _worker(scan_settle_gate=gate)
+    store.get_library_management_job_snapshot.return_value = _scan_preview_snapshot()
+    store.get_operation_job.return_value = {
+        "id": "management-1",
+        "requested_by_user_id": None,
+        "idempotency_key": "automatic-scan:abc123",
+    }
+    worker._planner.run_claimed_preview.side_effect = StaleRevisionError(
+        "The library catalog changed while the preview was being built."
+    )
+    store.finish_operation_job.return_value = {
+        "id": "management-1",
+        "state": "failed",
+        "terminal_code": "STALE_INPUT",
+    }
+
+    result = await worker.run_claimed({"id": "management-1"}, "management-worker")
+
+    assert result["state"] == "failed"
+    assert store.finish_operation_job.await_args.kwargs["terminal_code"] == (
+        "STALE_INPUT"
+    )
+    gate.scan_preview_settled.assert_awaited_once()
+    worker._planner.create_preview.assert_not_awaited()
 
 
 @pytest.mark.asyncio

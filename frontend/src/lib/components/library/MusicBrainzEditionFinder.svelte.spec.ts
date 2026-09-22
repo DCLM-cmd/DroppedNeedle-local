@@ -47,7 +47,8 @@ const h = vi.hoisted(() => ({
 	}
 }));
 
-vi.mock('$lib/stores/authStore.svelte', () => ({
+vi.mock('$lib/stores/authStore.svelte', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/stores/authStore.svelte')>()),
 	authStore: { user: { id: 'admin-1' } }
 }));
 vi.mock('$lib/queries/library/LibraryEditionQueries.svelte', () => ({
@@ -89,7 +90,7 @@ beforeEach(() => {
 describe('MusicBrainzEditionFinder', () => {
 	it('keeps artist and release title separate, allows an unknown artist, and pages results', async () => {
 		const oncheck = vi.fn();
-		render(MusicBrainzEditionFinder, {
+		await render(MusicBrainzEditionFinder, {
 			props: {
 				albumId: 'album-1',
 				artistName: 'Signal Artist',
@@ -139,7 +140,7 @@ describe('MusicBrainzEditionFinder', () => {
 			}
 		];
 		const oncheck = vi.fn();
-		render(MusicBrainzEditionFinder, {
+		await render(MusicBrainzEditionFinder, {
 			props: {
 				albumId: 'album-1',
 				artistName: 'Signal Artist',
@@ -172,7 +173,7 @@ describe('MusicBrainzEditionFinder', () => {
 
 	it('accepts a canonical MusicBrainz release URL', async () => {
 		const oncheck = vi.fn();
-		render(MusicBrainzEditionFinder, {
+		await render(MusicBrainzEditionFinder, {
 			props: {
 				albumId: 'album-1',
 				artistName: 'Signal Artist',
@@ -201,10 +202,10 @@ describe('MusicBrainzEditionFinder', () => {
 			}
 		} as unknown as Parameters<typeof render>[1]);
 		await expect.element(page.getByText('No editions found')).toBeVisible();
-		empty.unmount();
+		await empty.unmount();
 
 		h.queryState.isError = true;
-		render(MusicBrainzEditionFinder, {
+		await render(MusicBrainzEditionFinder, {
 			props: {
 				albumId: 'album-1',
 				artistName: 'Signal Artist',

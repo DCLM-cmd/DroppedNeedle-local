@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from services.preferences_service import PreferencesService
+from infrastructure.observability.optional_work import OptionalWorkDeferred
+
+if TYPE_CHECKING:
+    from services.plugin_sources import PluginSourceRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +32,13 @@ def resolve_source_value(
 
 
 class HomeIntegrationHelpers:
-    def __init__(self, preferences_service: PreferencesService):
+    def __init__(
+        self,
+        preferences_service: PreferencesService,
+        plugin_sources: PluginSourceRegistry | None = None,
+    ):
         self._preferences = preferences_service
+        self._plugin_sources = plugin_sources
 
     def is_listenbrainz_enabled(self) -> bool:
         lb_settings = self._preferences.get_listenbrainz_connection()
@@ -42,7 +51,11 @@ class HomeIntegrationHelpers:
     def is_download_client_configured(self) -> bool:
         # Any acquisition source counts - slskd (Soulseek) OR SABnzbd (Usenet). A
         # Usenet-only setup must not show the "connect a download client" prompt.
-        return self._preferences.is_download_source_ready()
+        if self._preferences.is_download_source_ready():
+            return True
+        return bool(
+            self._plugin_sources is not None and self._plugin_sources.is_any_source_ready()
+        )
 
     def is_library_configured(self) -> bool:
         # The native library scanner is always present.
@@ -114,6 +127,9 @@ class HomeIntegrationHelpers:
         keys = list(tasks.keys())
         coros = list(tasks.values())
         raw_results = await asyncio.gather(*coros, return_exceptions=True)
+        for result in raw_results:
+            if isinstance(result, OptionalWorkDeferred):
+                raise result
         results = {}
         for key, result in zip(keys, raw_results):
             if isinstance(result, Exception):

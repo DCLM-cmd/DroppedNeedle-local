@@ -27,12 +27,18 @@ vi.mock('$lib/stores/toast', () => ({
 	toastStore: { show: vi.fn() }
 }));
 
-import { createDiscoveryBatch, removeDiscoveryBatch } from './DiscoveryBatchQuery.svelte';
+import {
+	createDiscoveryBatch,
+	discoveryBatchKeys,
+	removeDiscoveryBatch
+} from './DiscoveryBatchQuery.svelte';
+import { DownloadQueryKeyFactory } from '../downloads/DownloadQueryKeyFactory';
+import { LibraryQueryKeyFactory } from '../library/LibraryQueryKeyFactory';
 
-const BATCH_LIST_KEY = ['discover', 'user-1', 'batches'];
-const TASKS_KEY = ['downloads', 'tasks', 'user-1'];
-const STATS_KEY = ['library', 'stats'];
-const RECENTLY_ADDED_KEY = ['library', 'recently-added'];
+const BATCH_LIST_KEY = discoveryBatchKeys.list('user-1');
+const TASKS_KEY = DownloadQueryKeyFactory.tasks('user-1');
+const STATS_KEY = LibraryQueryKeyFactory.stats();
+const RECENTLY_ADDED_KEY = LibraryQueryKeyFactory.recentlyAdded();
 
 beforeEach(() => {
 	vi.clearAllMocks();

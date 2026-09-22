@@ -859,7 +859,7 @@ def test_brainzmash_binding_is_compare_and_swap_protected(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_coordinated_brainzmash_stage_applies_pending_transition(tmp_path: Path):
     prefs = _preferences(tmp_path)
-    service = SettingsService(prefs, cache=object())
+    service = SettingsService(prefs, cache=object(), mb_response_store=AsyncMock(), follow_store=AsyncMock())
     applied: list[MusicBrainzConnectionSettings] = []
 
     async def apply(settings: MusicBrainzConnectionSettings) -> None:
@@ -889,7 +889,7 @@ async def test_coordinated_musicbrainz_update_rolls_back_on_runtime_failure(
     new_url = "https://new.example/ws/2"
     runtime = {"settings": old}
     applied: list[MusicBrainzConnectionSettings] = []
-    service = SettingsService(prefs, cache=object())
+    service = SettingsService(prefs, cache=object(), mb_response_store=AsyncMock(), follow_store=AsyncMock())
 
     async def apply(settings: MusicBrainzConnectionSettings) -> None:
         applied.append(settings)
@@ -923,7 +923,7 @@ async def test_coordinated_musicbrainz_update_rolls_back_on_cancellation(
     new_url = "https://new.example/ws/2"
     runtime = {"settings": old}
     applied: list[MusicBrainzConnectionSettings] = []
-    service = SettingsService(prefs, cache=object())
+    service = SettingsService(prefs, cache=object(), mb_response_store=AsyncMock(), follow_store=AsyncMock())
 
     async def apply(settings: MusicBrainzConnectionSettings) -> None:
         applied.append(settings)
@@ -958,7 +958,7 @@ async def test_coordinated_musicbrainz_update_does_not_clobber_newer_cas_save(
     newer_url = "https://newer.example/ws/2"
     runtime = {"settings": old}
     applied: list[MusicBrainzConnectionSettings] = []
-    service = SettingsService(prefs, cache=object())
+    service = SettingsService(prefs, cache=object(), mb_response_store=AsyncMock(), follow_store=AsyncMock())
 
     async def apply(settings: MusicBrainzConnectionSettings) -> None:
         applied.append(settings)
@@ -992,6 +992,8 @@ async def test_runtime_brainzmash_commit_pins_ten_per_second_capacity():
 
     service._cache = _Cache()
     service._disk_cache = None
+    service._mb_response_store = AsyncMock()
+    service._follow_store = AsyncMock()
     old_source = mb_base.capture_mb_source_context()
     old_rate = mb_base.mb_rate_limiter.rate
     old_capacity = mb_base.mb_rate_limiter.capacity

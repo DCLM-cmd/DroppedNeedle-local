@@ -302,8 +302,7 @@ async def test_old_sidecar_with_created_at_only_reads_and_evicts(tmp_path):
     assert cached is not None and cached["musicbrainz_id"] == mbid
 
     # eviction remains deterministic from the durable fallback values
-    freed = await restarted.enforce_recent_size_limits()
-    assert isinstance(freed, int)
+    assert await restarted.cleanup_recent() == (0, 0)
     assert (meta_path.parent / f"{_cache_hash(mbid)}.json").exists()
 
 
@@ -318,8 +317,9 @@ async def test_expiry_still_removes_pairs_and_failed_touch_keeps_payload(tmp_pat
 
     # expiry path untouched: advancing past expires_at removes the pair
     clock["now"] += 120
-    removed = await cache.cleanup_expired_recent()
-    assert removed >= 1 and not data_file.exists()
+    removed, freed = await cache.cleanup_recent()
+    assert (removed, freed) == (1, 0)
+    assert not data_file.exists() and not meta_path.exists()
 
     # refill; a failing sidecar touch must not hide the valid payload
     await cache.set_album(mbid, _album_payload(mbid), ttl_seconds=600)
@@ -355,10 +355,9 @@ async def test_recent_eviction_prefers_least_recently_touched_entry(tmp_path):
     # budget equals the fresh entry's size: deleting exactly ONE entry frees
     # enough, so the recency ordering alone decides which entry that is.
     total_size = old_data.stat().st_size + fresh_data.stat().st_size
-    freed = small._enforce_size_limit_for_directory(
-        tmp_path / "recent" / "albums",
-        max_size_bytes=total_size - old_data.stat().st_size,
-    )
+    small.recent_metadata_max_size_bytes = total_size - old_data.stat().st_size
+    removed, freed = await small.cleanup_recent()
+    assert removed == 0
     assert freed > 0
     assert not old_data.exists(), "stale entry must be the eviction victim"
     assert fresh_data.exists(), "freshly touched entry must survive"
@@ -366,7 +365,7 @@ async def test_recent_eviction_prefers_least_recently_touched_entry(tmp_path):
 
 @pytest.mark.asyncio
 async def test_restart_eviction_falls_back_to_durable_sidecars(tmp_path):
-    clock = {"now": 2_000_000_000.0}
+    clock = {"now": time.time()}
     cache = DiskMetadataCache(base_path=tmp_path, clock=lambda: clock["now"])
     touched_id = "ccccccc8-3333-4386-b3a2-4b4a918eb31f"
     stale_id = "ddddddd8-4444-4386-b3a2-4b4a918eb31f"
@@ -381,10 +380,9 @@ async def test_restart_eviction_falls_back_to_durable_sidecars(tmp_path):
     stale_data = tmp_path / "recent" / "albums" / f"{_cache_hash(stale_id)}.json"
     touched_data = tmp_path / "recent" / "albums" / f"{_cache_hash(touched_id)}.json"
     total_size = stale_data.stat().st_size + touched_data.stat().st_size
-    freed = restarted._enforce_size_limit_for_directory(
-        tmp_path / "recent" / "albums",
-        max_size_bytes=total_size - stale_data.stat().st_size,
-    )
+    restarted.recent_metadata_max_size_bytes = total_size - stale_data.stat().st_size
+    removed, freed = await restarted.cleanup_recent()
+    assert removed == 0
     assert freed > 0
     assert (tmp_path / "recent" / "albums" / f"{_cache_hash(touched_id)}.json").exists()
     assert not (tmp_path / "recent" / "albums" / f"{_cache_hash(stale_id)}.json").exists()
@@ -423,3 +421,47 @@ async def test_artist_profiles_persist_across_restart_and_musicbrainz_clear(tmp_
 
     await restarted.clear_musicbrainz()
     assert await restarted.get_artist(mbid) is None
+
+
+@pytest.mark.asyncio
+async def test_recent_cleanup_expires_before_shared_size_eviction(tmp_path):
+    cache = DiskMetadataCache(tmp_path, clock=lambda: 1000)
+    cache.recent_metadata_max_size_bytes = 64
+    rows = [
+        (cache._recent_albums_dir / "expired.json", 900, 100),
+        (cache._recent_artists_dir / "old.json", 2000, 1),
+        (cache._recent_audiodb_albums_dir / "warm.json", 2000, 0),
+    ]
+    for path, expiry, access in rows:
+        path.write_bytes(b"x" * 64)
+        cache._meta_path(path).write_text(json.dumps({
+            "expires_at": expiry, "last_accessed": access,
+        }))
+    cache._touch_memory[str(cache._meta_path(rows[2][0]))] = 10
+
+    assert await cache.cleanup_recent() == (1, 64)
+    assert not rows[0][0].exists()
+    assert not rows[1][0].exists()
+    assert rows[2][0].read_bytes() == b"x" * 64
+
+
+@pytest.mark.asyncio
+async def test_recent_cleanup_skips_disappearing_data_and_expires_orphans(tmp_path, monkeypatch):
+    cache = DiskMetadataCache(tmp_path, clock=lambda: 1000)
+    cache.recent_metadata_max_size_bytes = 64
+    directory = cache._recent_albums_dir
+    for name in ("gone.json", "keep.json"):
+        (directory / name).write_bytes(b"x" * 64)
+    orphan = directory / "orphan.meta.json"
+    orphan.write_text('{"expires_at":900}')
+    original = cache._load_meta
+
+    def load(meta_path):
+        if meta_path.name == "gone.meta.json":
+            (directory / "gone.json").unlink(missing_ok=True)
+        return original(meta_path)
+
+    monkeypatch.setattr(cache, "_load_meta", load)
+    assert await cache.cleanup_recent() == (1, 0)
+    assert not orphan.exists()
+    assert (directory / "keep.json").read_bytes() == b"x" * 64

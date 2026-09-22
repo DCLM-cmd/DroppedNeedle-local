@@ -10,6 +10,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -32,11 +33,27 @@ def _escape_like(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _dominant_release_type(concatenated: str | None) -> str | None:
+    """Dominant non-empty stripped release type from an ordered CHAR(31)-joined
+    per-track value list (disc/track order); ties keep the earliest value."""
+    if not concatenated:
+        return None
+    counts: Counter[str] = Counter()
+    for raw in concatenated.split("\x1f"):
+        value = raw.strip()
+        if value:
+            counts[value] += 1
+    if not counts:
+        return None
+    return counts.most_common(1)[0][0]
+
+
 # On UPDATE, id / imported_at / download_task_id are preserved, never overwritten.
 _LIBRARY_FILE_VALUE_COLUMNS = (
     "release_group_mbid",
     "release_mbid",
     "recording_mbid",
+    "embedded_release_mbid",
     "disc_number",
     "track_number",
     "track_title",
@@ -71,6 +88,7 @@ _LIBRARY_FILE_VALUE_COLUMNS = (
     "replaygain_album_gain",
     "replaygain_track_peak",
     "replaygain_album_peak",
+    "release_type",
 )
 
 # SQL mirror of quality_tiers.tier_for (lossless extension set + kbps bands), ranked
@@ -312,6 +330,7 @@ class LibraryDB(PersistenceBase):
                 release_group_mbid TEXT,
                 release_mbid TEXT,
                 recording_mbid TEXT,
+                embedded_release_mbid TEXT,
                 disc_number INTEGER NOT NULL DEFAULT 1,
                 track_number INTEGER NOT NULL,
                 track_title TEXT NOT NULL,
@@ -425,6 +444,15 @@ class LibraryDB(PersistenceBase):
         # (no separate backfill). Existing NULL rows fill on the next re-scan.
         _safe_alter(conn, "ALTER TABLE library_files ADD COLUMN genre TEXT")
         _safe_alter(conn, "ALTER TABLE library_files ADD COLUMN channels INTEGER")
+        # File-tag release type (RELEASETYPE/MUSICBRAINZ_ALBUMTYPE); NULL keeps the
+        # legacy Compilation-or-None output until a rescan fills the row.
+        _safe_alter(conn, "ALTER TABLE library_files ADD COLUMN release_type TEXT")
+        # Embedded MusicBrainz release ID from file tags (Beets/Picard); NULL
+        # rows are simply not unanimous, so the edition pick falls through to
+        # file-count/ranked until a rescan fills the row.
+        _safe_alter(
+            conn, "ALTER TABLE library_files ADD COLUMN embedded_release_mbid TEXT"
+        )
         for column, column_type in (
             ("track_sort_name", "TEXT"),
             ("artist_sort_name", "TEXT"),
@@ -909,6 +937,72 @@ class LibraryDB(PersistenceBase):
 
         return await self._read(operation)
 
+    async def existing_library_albums(self, identifiers: list[str]) -> set[str]:
+        """Candidate-scoped ``get_all_album_mbids`` (E3).
+
+        Same ghost-row filter (``library_albums`` row plus active files),
+        restricted to the supplied release-group MBIDs through the
+        ``mbid_lower`` primary key: one indexed lookup per batch instead of
+        a table scan. Returns raw stored case like the full-set version;
+        callers normalize.
+        """
+        normalized = list(
+            dict.fromkeys(
+                value.strip().casefold() for value in identifiers if value.strip()
+            )
+        )
+        if not normalized:
+            return set()
+
+        def operation(conn: sqlite3.Connection) -> set[str]:
+            found: set[str] = set()
+            for offset in range(0, len(normalized), 500):
+                batch = normalized[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    "SELECT la.mbid FROM library_albums la "
+                    f"WHERE la.mbid_lower IN ({placeholders}) AND EXISTS ("
+                    "  SELECT 1 FROM library_files lf "
+                    "  WHERE lf.release_group_mbid = la.mbid_lower "
+                    "  AND lf.deleted_at IS NULL)",
+                    batch,
+                ).fetchall()
+                found.update(str(row["mbid"]) for row in rows if row["mbid"])
+            return found
+
+        return await self._read(operation)
+
+    async def existing_library_artists(self, identifiers: list[str]) -> set[str]:
+        """Candidate-scoped ``get_all_artist_mbids`` (E3).
+
+        Same ``library_artists`` membership (materialised owned artists, not
+        file-level contributor appearances), restricted to the supplied
+        artist MBIDs through the ``mbid_lower`` primary key. Returns raw
+        stored case like the full-set version; callers normalize.
+        """
+        normalized = list(
+            dict.fromkeys(
+                value.strip().casefold() for value in identifiers if value.strip()
+            )
+        )
+        if not normalized:
+            return set()
+
+        def operation(conn: sqlite3.Connection) -> set[str]:
+            found: set[str] = set()
+            for offset in range(0, len(normalized), 500):
+                batch = normalized[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    "SELECT mbid FROM library_artists "
+                    f"WHERE mbid_lower IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                found.update(str(row["mbid"]) for row in rows if row["mbid"])
+            return found
+
+        return await self._read(operation)
+
     async def get_all_albums_for_matching(self) -> list[tuple[str, str, str, str]]:
         """Return (title, artist_name, album_mbid, artist_mbid) for all library albums."""
 
@@ -1105,6 +1199,7 @@ class LibraryDB(PersistenceBase):
                        MAX(lf.imported_at) AS last_imported_at,
                        COUNT(*) AS track_count,
                        SUM(lf.file_size_bytes) AS total_size_bytes,
+                       SUM(COALESCE(lf.duration_seconds, 0)) AS total_duration_seconds,
                        -- highest-quality format present, not MIN() which is
                        -- alphabetical (would pick 'alac' over 'flac', 'mp3' over 'wav')
                        (SELECT q.file_format FROM library_files q
@@ -1118,6 +1213,13 @@ class LibraryDB(PersistenceBase):
                         LIMIT 1) AS file_format,
                        MAX(lf.year) AS year,
                        MAX(lf.is_compilation) AS is_compilation,
+                       (SELECT GROUP_CONCAT(ordered_rt.rt, CHAR(31)) FROM (
+                           SELECT q.release_type AS rt FROM library_files q
+                           WHERE q.release_group_mbid = lf.release_group_mbid
+                             AND q.deleted_at IS NULL
+                             AND q.release_type IS NOT NULL AND TRIM(q.release_type) != ''
+                           ORDER BY q.disc_number, q.track_number, q.id
+                       ) AS ordered_rt) AS release_type_values,
                        lam.cover_url AS cover_url
                 FROM library_files lf
                 LEFT JOIN library_album_meta lam
@@ -1129,7 +1231,12 @@ class LibraryDB(PersistenceBase):
                 """,
                 (*params, max(limit, 1), max(offset, 0)),
             ).fetchall()
-            return [dict(r) for r in rows], total
+            out = []
+            for r in rows:
+                row = dict(r)
+                row["release_type"] = _dominant_release_type(row.pop("release_type_values", None))
+                out.append(row)
+            return out, total
 
         return await self._read(operation)
 
@@ -1271,9 +1378,17 @@ class LibraryDB(PersistenceBase):
                        MAX(lf.album_artist_mbid) AS album_artist_mbid,
                        COUNT(*) AS track_count,
                        SUM(lf.file_size_bytes) AS total_size_bytes,
+                       SUM(COALESCE(lf.duration_seconds, 0)) AS total_duration_seconds,
                        MAX(lf.year) AS year,
                        MAX(lf.is_compilation) AS is_compilation,
                        MAX(lf.imported_at) AS last_imported_at,
+                       (SELECT GROUP_CONCAT(ordered_rt.rt, CHAR(31)) FROM (
+                           SELECT q.release_type AS rt FROM library_files q
+                           WHERE q.release_group_mbid = lf.release_group_mbid
+                             AND q.deleted_at IS NULL
+                             AND q.release_type IS NOT NULL AND TRIM(q.release_type) != ''
+                           ORDER BY q.disc_number, q.track_number, q.id
+                       ) AS ordered_rt) AS release_type_values,
                        lam.cover_url AS cover_url
                 FROM library_files lf
                 LEFT JOIN library_album_meta lam
@@ -1285,7 +1400,12 @@ class LibraryDB(PersistenceBase):
                 """,
                 (artist_mbid,),
             ).fetchall()
-            return [dict(r) for r in rows]
+            out = []
+            for r in rows:
+                row = dict(r)
+                row["release_type"] = _dominant_release_type(row.pop("release_type_values", None))
+                out.append(row)
+            return out
 
         return await self._read(operation)
 
@@ -1341,21 +1461,26 @@ class LibraryDB(PersistenceBase):
         return await self._read(operation)
 
     async def get_files_by_artist_mbids(
-        self, mbids: list[str], *, limit: int = 50
+        self, mbids: list[str], *, limit: int = 50, order: str = "random"
     ) -> list[dict[str, Any]]:
         """Active files whose track OR album artist is one of the given MBIDs
-        (Q12 same-artist + related pools; Q23 union semantics). Random order."""
+        (Q12 same-artist + related pools; Q23 union semantics). Random order by
+        default; ``order=\"recent\"`` returns newest imports first for callers
+        that need a deterministic subset (appears-on fan-out)."""
         if not mbids:
             return []
 
         def operation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             ph = ", ".join("?" for _ in mbids)
+            order_sql = (
+                "imported_at DESC, id" if order == "recent" else "RANDOM()"
+            )
             rows = conn.execute(
                 f"""
                 SELECT * FROM library_files
                 WHERE deleted_at IS NULL AND release_group_mbid IS NOT NULL
                   AND (artist_mbid IN ({ph}) OR album_artist_mbid IN ({ph}))
-                ORDER BY RANDOM()
+                ORDER BY {order_sql}
                 LIMIT ?
                 """,
                 (*mbids, *mbids, max(limit, 1)),

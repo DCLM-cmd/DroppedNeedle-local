@@ -13,7 +13,8 @@ from core.dependencies import (
     get_preferences_service,
 )
 from core.exceptions import ConfigurationError, ExternalServiceError, TokenNotAuthorizedError
-from tests.helpers import add_production_exception_handlers
+from middleware import _get_current_admin
+from tests.helpers import add_production_exception_handlers, mock_admin_user
 
 
 def _default_settings() -> LastFmConnectionSettings:
@@ -51,6 +52,23 @@ def auth_client(mock_preferences, mock_auth_service):
     app.include_router(lastfm_router)
     app.dependency_overrides[get_preferences_service] = lambda: mock_preferences
     app.dependency_overrides[get_lastfm_auth_service] = lambda: mock_auth_service
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    add_production_exception_handlers(app)
+    return TestClient(app)
+
+
+@pytest.fixture
+def user_client(mock_preferences, mock_auth_service):
+    from fastapi import HTTPException
+
+    def _deny_admin():
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    app = FastAPI()
+    app.include_router(lastfm_router)
+    app.dependency_overrides[get_preferences_service] = lambda: mock_preferences
+    app.dependency_overrides[get_lastfm_auth_service] = lambda: mock_auth_service
+    app.dependency_overrides[_get_current_admin] = _deny_admin
     add_production_exception_handlers(app)
     return TestClient(app)
 
@@ -126,3 +144,12 @@ def test_exchange_session_token_not_authorized(auth_client, mock_auth_service):
     assert response.status_code == 502
     data = response.json()
     assert "authorize" in data["error"]["message"].lower()
+
+
+def test_global_lastfm_auth_forbids_regular_users(user_client):
+    """F-16: global Last.fm linking writes shared settings — admin only."""
+    assert user_client.post("/lastfm/auth/token").status_code == 403
+    assert (
+        user_client.post("/lastfm/auth/session", json={"token": "tok-123"}).status_code
+        == 403
+    )

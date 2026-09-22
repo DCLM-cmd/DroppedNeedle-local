@@ -1,6 +1,8 @@
 import { CACHE_KEYS, CACHE_TTL } from '$lib/constants';
 import { clearLocalStorageNamespace, createLocalStorageCache } from '$lib/utils/localStorageCache';
 import type { DiscoverQueueItemFull } from '$lib/types';
+import { musicBrainzSourceKey } from '$lib/queries/musicbrainz/sourceScope.svelte';
+import type { MusicBrainzSourceIdentity } from '$lib/stores/authStore.svelte';
 
 export interface QueueCacheData {
 	items: DiscoverQueueItemFull[];
@@ -8,7 +10,12 @@ export interface QueueCacheData {
 	queueId: string;
 }
 
-const queueCache = createLocalStorageCache<QueueCacheData>(
+type QueueCacheEnvelope = QueueCacheData & {
+	version: 2;
+	scope: MusicBrainzSourceIdentity & { user_id: string | null };
+};
+
+const queueCache = createLocalStorageCache<QueueCacheEnvelope>(
 	CACHE_KEYS.DISCOVER_QUEUE,
 	CACHE_TTL.DISCOVER_QUEUE
 );
@@ -30,14 +37,17 @@ export function subscribeQueueCacheChanges(listener: () => void): () => void {
 	};
 }
 
-// Entries scoped per user so a shared browser never serves one user's queue to
-// another. One queue per user (the source dimension is gone: the queue follows
-// the user's primary source server-side).
+// Legacy and other source generations must never resume a consumed deck.
 export const getQueueCachedData = (userId: string) => {
 	const cached = queueCache.get(userId);
 	if (!cached) return null;
 
-	if (queueCache.isStale(cached.timestamp)) {
+	if (
+		cached.data.version !== 2 ||
+		!cached.data.scope?.source_id ||
+		JSON.stringify(cached.data.scope) !== JSON.stringify(musicBrainzSourceKey(userId)) ||
+		queueCache.isStale(cached.timestamp)
+	) {
 		queueCache.remove(userId);
 		notifyQueueCacheChanged();
 		return null;
@@ -47,7 +57,9 @@ export const getQueueCachedData = (userId: string) => {
 };
 
 export const setQueueCachedData = (data: QueueCacheData, userId: string) => {
-	queueCache.set(data, userId);
+	const scope = musicBrainzSourceKey(userId);
+	if (!scope.source_id) return;
+	queueCache.set({ ...data, version: 2, scope }, userId);
 	notifyQueueCacheChanged();
 };
 

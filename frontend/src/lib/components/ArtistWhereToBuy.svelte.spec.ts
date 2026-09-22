@@ -42,7 +42,7 @@ describe('ArtistWhereToBuy', () => {
 			],
 			bandcamp_search_url: 'https://bandcamp.com/search?q=Test+Artist&item_type=b'
 		};
-		render(ArtistWhereToBuy, props);
+		await render(ArtistWhereToBuy, props);
 		await expect.element(page.getByText('Support the artist')).toBeVisible();
 		await expect.element(page.getByRole('link', { name: 'Bandcamp', exact: true })).toBeVisible();
 		await expect.element(page.getByRole('link', { name: 'More on Bandcamp' })).toBeVisible();
@@ -53,7 +53,7 @@ describe('ArtistWhereToBuy', () => {
 			links: [],
 			bandcamp_search_url: 'https://bandcamp.com/search?q=Test+Artist&item_type=b'
 		};
-		render(ArtistWhereToBuy, props);
+		await render(ArtistWhereToBuy, props);
 		await expect.element(page.getByRole('link', { name: 'Search Bandcamp' })).toBeVisible();
 	});
 

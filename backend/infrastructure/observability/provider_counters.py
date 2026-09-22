@@ -30,7 +30,14 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from enum import StrEnum
+from collections.abc import AsyncIterator, Iterator
+
+import httpx
 from typing import Any
+from uuid import uuid4
 
 from infrastructure.cache.cache_metrics import WindowedCounterMap
 from infrastructure.queue.priority_queue import RequestPriority
@@ -44,6 +51,7 @@ PROVIDER_NAMES = (
     "coverart",
     "audiodb",
     "discogs",
+    "youtube",
 )
 
 OUTCOME_OK = "ok"
@@ -56,8 +64,87 @@ UNLANED = "unlaned"
 
 DEFAULT_WINDOW_SECONDS = 3600
 
-_counters = WindowedCounterMap()
+MAX_PROVIDER_SERIES = 1024
+_OVERFLOW_KEY = ("overflow", "overflow", "overflow", "", "", 0, "other", "other", "other")
+
+
+class ProviderWorkload(StrEnum):
+    FOREGROUND = "foreground"
+    HOME = "home"
+    QUEUE = "queue"
+    ARTIST = "artist"
+    FOLLOW = "follow"
+    IDENTITY = "identity"
+    ACQUISITION = "acquisition"
+    MAINTENANCE = "maintenance"
+    OTHER = "other"
+
+
+_workload: ContextVar[ProviderWorkload] = ContextVar(
+    "provider_workload", default=ProviderWorkload.OTHER
+)
+
+
+@contextmanager
+def provider_workload(workload: ProviderWorkload) -> Iterator[None]:
+    token = _workload.set(ProviderWorkload(workload))
+    try:
+        yield
+    finally:
+        _workload.reset(token)
+
+
+UNKNOWN_ROUTE = "unknown"
+
+provider_route: ContextVar[str] = ContextVar(
+    "provider_route", default=UNKNOWN_ROUTE
+)
+
+
+@contextmanager
+def route_scope(name: str) -> Iterator[None]:
+    token = provider_route.set(name)
+    try:
+        yield
+    finally:
+        provider_route.reset(token)
+
+
+class ProviderCounterMap:
+    """Bound detailed series without losing overflow attempts or body totals."""
+
+    def __init__(self) -> None:
+        self.attempts = WindowedCounterMap()
+        self.body_totals: dict[tuple[Any, ...], list[int]] = {}
+
+    def record(
+        self, key: tuple[Any, ...], response: httpx.Response | None,
+        decoded_body_bytes: int | None = None,
+    ) -> None:
+        values = self.body_totals.get(key)
+        if values is None:
+            if len(self.body_totals) >= MAX_PROVIDER_SERIES:
+                key = _OVERFLOW_KEY
+                values = self.body_totals.get(key)
+            if values is None:
+                values = self.body_totals[key] = [0, 0, 0]
+        self.attempts.increment(key)
+        if response is None:
+            values[2] += 1
+        else:
+            values[0] += response.num_bytes_downloaded
+            values[1] += (
+                len(response.content) if decoded_body_bytes is None else decoded_body_bytes
+            )
+
+
+_counters = ProviderCounterMap()
+# Per-route side map, keyed (provider, route, category). Windowed like the
+# main map but deliberately separate: route labels never join the
+# MAX_PROVIDER_SERIES-capped main key.
+_route_counters = WindowedCounterMap()
 _started_at = int(time.time())
+_process_epoch = uuid4().hex
 
 
 def classify_outcome(status_code: int | None) -> str:
@@ -81,24 +168,36 @@ def record_provider_call(
     priority: RequestPriority | str | None,
     status_code: int | None,
     source_context: Any | None = None,
+    *,
+    response: httpx.Response | None = None,
+    category: str = "other",
+    profile: str = "other",
+    decoded_body_bytes: int | None = None,
 ) -> None:
     """Record one wire attempt and, for source-bound calls, its identity.
 
     Source metadata is deliberately limited to the mode, opaque source id, and
     generation. Endpoints and request URLs never enter telemetry.
     """
-    key: tuple[Any, ...] = (
-        provider,
+    key = (
+        provider if provider in PROVIDER_NAMES else "other",
         lane_label(priority),
         classify_outcome(status_code),
+        str(getattr(source_context, "source_mode", "")),
+        str(getattr(source_context, "source_id", "")),
+        int(getattr(source_context, "generation", 0)),
+        category if category in {"lookup", "browse", "search", "probe", "other"} else "other",
+        profile if profile in MB_INCLUDE_PROFILES.values() or profile == "browse" else "other",
+        _workload.get().value,
     )
-    if source_context is not None:
-        key += (
-            str(getattr(source_context, "source_mode", "")),
-            str(getattr(source_context, "source_id", "")),
-            int(getattr(source_context, "generation", 0)),
+    _counters.record(key, response, decoded_body_bytes)
+    _route_counters.increment(
+        (
+            provider if provider in PROVIDER_NAMES else "other",
+            provider_route.get(),
+            category if category in {"lookup", "browse", "search", "probe", "other"} else "other",
         )
-    _counters.increment(key)
+    )
 
 
 def snapshot_provider_rows(
@@ -106,9 +205,9 @@ def snapshot_provider_rows(
 ) -> list[dict[str, Any]]:
     """Rows sorted by (provider, lane, outcome) for stable rendering."""
     window = DEFAULT_WINDOW_SECONDS if window_seconds is None else int(window_seconds)
-    snapshot = _counters.snapshot(window)
-    totals = _counters.totals()
-    per_minute_divisor = window / 60
+    snapshot = _counters.attempts.snapshot(window)
+    totals = _counters.attempts.totals()
+    per_minute_divisor = max(1, window) / 60
     rows: list[dict[str, Any]] = []
     for key, window_count in sorted(snapshot.items()):
         provider, lane, outcome = key[:3]
@@ -119,7 +218,17 @@ def snapshot_provider_rows(
             "count_total": totals.get(key, 0),
             "rate_per_min_window": round(window_count / per_minute_divisor, 2),
         }
-        if len(key) == 6:
+        body = _counters.body_totals[key]
+        row.update(
+            request_category=key[6],
+            include_profile=key[7],
+            workload=key[8],
+            downloaded_body_bytes_total=body[0],
+            decoded_body_bytes_total=body[1],
+            unknown_body_attempts_total=body[2],
+            overflow=key == _OVERFLOW_KEY,
+        )
+        if key[3]:
             row.update(
                 {
                     "source_mode": key[3],
@@ -131,9 +240,76 @@ def snapshot_provider_rows(
     return rows
 
 
+def snapshot_provider_route_rows(
+    window_seconds: int | None = None,
+) -> list[dict[str, Any]]:
+    """Side-map rows sorted by (provider, route, category) for stable rendering.
+
+    Routes are templates stamped by route_scope (MsgSpecRoute handler plus
+    compat dispatcher overrides); unstamped calls record route="unknown".
+    Windowed exactly like the main snapshot.
+    """
+    window = DEFAULT_WINDOW_SECONDS if window_seconds is None else int(window_seconds)
+    snapshot = _route_counters.snapshot(window)
+    totals = _route_counters.totals()
+    per_minute_divisor = max(1, window) / 60
+    rows: list[dict[str, Any]] = []
+    for key, window_count in sorted(snapshot.items()):
+        provider, route, category = key
+        rows.append(
+            {
+                "provider": provider,
+                "route": route,
+                "request_category": category,
+                "count_total": totals.get(key, 0),
+                "rate_per_min_window": round(window_count / per_minute_divisor, 2),
+            }
+        )
+    return rows
+
+
 def counters_since() -> int:
     """Wall-clock epoch seconds when this process started counting."""
     return _started_at
+
+
+def counters_epoch() -> str:
+    """Unique process identity; cumulative deltas cannot span a restart."""
+    return _process_epoch
+
+
+def current_provider_workload() -> ProviderWorkload:
+    return _workload.get()
+
+
+@asynccontextmanager
+async def provider_workload_scope(workload: ProviderWorkload) -> AsyncIterator[None]:
+    with provider_workload(workload):
+        yield
+
+
+MB_INCLUDE_PROFILES = {
+    ("artist", frozenset({"tags", "aliases", "url-rels"})): "artist_core",
+    ("release-group", frozenset({"artist-credits", "releases", "tags", "url-rels"})): "group_core",
+    ("release-group", frozenset({"artist-credits", "releases"})): "group_editions",
+    ("release", frozenset({"release-groups"})): "release_mapping",
+    ("release", frozenset({"recordings", "url-rels"})): "release_tracklist",
+    ("recording", frozenset({"url-rels"})): "recording_links",
+}
+
+
+def musicbrainz_request_labels(
+    path: str, params: dict[str, Any] | None
+) -> tuple[str, str]:
+    """Finite labels only: never record request paths, IDs or search terms."""
+    params = params or {}
+    parts = path.strip("/").split("/")
+    if "query" in params:
+        return "search", "other"
+    if len(parts) == 1:
+        return "browse", "browse"
+    includes = frozenset(str(params.get("inc", "")).split("+"))
+    return "lookup", MB_INCLUDE_PROFILES.get((parts[0], includes), "other")
 
 
 LOW_REMAINING_THRESHOLD = 3

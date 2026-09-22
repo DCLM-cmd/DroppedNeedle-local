@@ -11,7 +11,8 @@
 		FolderSearch,
 		LogIn,
 		Eye,
-		EyeOff
+		EyeOff,
+		Download
 	} from 'lucide-svelte';
 	import { api } from '$lib/api/client';
 	import type { OIDCConnectionSettings } from '$lib/types';
@@ -22,6 +23,7 @@
 		hsts_max_age: number;
 		hsts_include_subdomains: boolean;
 		hsts_preload: boolean;
+		library_download_access: 'everyone' | 'trusted' | 'admin';
 	}
 
 	const DEFAULTS: SecuritySettingsForm = {
@@ -29,7 +31,8 @@
 		hibp_local_path: '',
 		hsts_max_age: 0,
 		hsts_include_subdomains: false,
-		hsts_preload: false
+		hsts_preload: false,
+		library_download_access: 'everyone'
 	};
 
 	const form = createSettingsForm<SecuritySettingsForm>({
@@ -247,6 +250,69 @@
 						</p>
 					{/if}
 				{/if}
+			</div>
+		</div>
+
+		<!-- Library downloads -->
+		<div class="card bg-base-200">
+			<div class="card-body gap-4">
+				<div class="flex items-center gap-2">
+					<div class="bg-success/10 rounded-lg p-2">
+						<Download class="h-5 w-5 text-success" />
+					</div>
+					<div>
+						<h3 class="font-semibold">Library downloads</h3>
+						<p class="text-xs text-base-content/50">
+							Who can download library files and full-album archives. Streaming is never restricted.
+						</p>
+					</div>
+				</div>
+
+				<div class="form-control gap-1">
+					<label class="label cursor-pointer justify-start gap-4">
+						<input
+							type="radio"
+							name="library-download-access"
+							class="radio radio-primary"
+							value="everyone"
+							bind:group={form.data.library_download_access}
+						/>
+						<div>
+							<span class="label-text font-medium">Everyone</span>
+							<p class="text-xs text-base-content/50 mt-0.5">
+								Any logged-in user can download. This is the default.
+							</p>
+						</div>
+					</label>
+					<label class="label cursor-pointer justify-start gap-4">
+						<input
+							type="radio"
+							name="library-download-access"
+							class="radio radio-primary"
+							value="trusted"
+							bind:group={form.data.library_download_access}
+						/>
+						<div>
+							<span class="label-text font-medium">Trusted users and admins</span>
+							<p class="text-xs text-base-content/50 mt-0.5">
+								Regular users can stream but not download.
+							</p>
+						</div>
+					</label>
+					<label class="label cursor-pointer justify-start gap-4">
+						<input
+							type="radio"
+							name="library-download-access"
+							class="radio radio-primary"
+							value="admin"
+							bind:group={form.data.library_download_access}
+						/>
+						<div>
+							<span class="label-text font-medium">Admins only</span>
+							<p class="text-xs text-base-content/50 mt-0.5">Only admins can download.</p>
+						</div>
+					</label>
+				</div>
 			</div>
 		</div>
 

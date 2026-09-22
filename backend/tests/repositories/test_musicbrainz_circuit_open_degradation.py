@@ -13,13 +13,12 @@ import repositories.musicbrainz_album as album_module
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
 from repositories.musicbrainz_album import MusicBrainzAlbumMixin
+from infrastructure.cache.memory_cache import InMemoryCache
 
 
 class _Repo(MusicBrainzAlbumMixin):
     def __init__(self) -> None:
-        self._cache = AsyncMock()
-        self._cache.get = AsyncMock(return_value=None)
-        self._cache.set = AsyncMock()
+        self._cache = InMemoryCache()
         self._preferences_service = SimpleNamespace(
             get_advanced_settings=lambda: SimpleNamespace(cache_ttl_search=3600)
         )
@@ -62,7 +61,12 @@ async def test_get_release_group_by_id_degrades_quietly_when_breaker_open(
     open_breaker, caplog
 ) -> None:
     with caplog.at_level(logging.ERROR, logger="repositories.musicbrainz_album"):
-        assert await _Repo().get_release_group_by_id("rg-1") is None
+        assert (
+            await _Repo().get_release_group_by_id(
+                "11111111-1111-4111-8111-111111111111"
+            )
+            is None
+        )
     assert caplog.records == []
     open_breaker.assert_called_once()
 
@@ -73,7 +77,10 @@ async def test_get_release_by_id_degrades_quietly_when_breaker_open(
 ) -> None:
     with caplog.at_level(logging.ERROR, logger="repositories.musicbrainz_album"):
         assert (
-            await _Repo().get_release_by_id("release-1", priority=RequestPriority.USER_INITIATED)
+            await _Repo().get_release_by_id(
+                "22222222-2222-4222-8222-222222222222",
+                priority=RequestPriority.USER_INITIATED,
+            )
             is None
         )
     assert caplog.records == []
@@ -85,7 +92,12 @@ async def test_get_recording_by_id_degrades_quietly_when_breaker_open(
     open_breaker, caplog
 ) -> None:
     with caplog.at_level(logging.ERROR, logger="repositories.musicbrainz_album"):
-        assert await _Repo().get_recording_by_id("recording-1") is None
+        assert (
+            await _Repo().get_recording_by_id(
+                "33333333-3333-4333-8333-333333333333"
+            )
+            is None
+        )
     assert caplog.records == []
     open_breaker.assert_called_once()
 
@@ -106,7 +118,10 @@ async def test_resolve_recording_to_release_group_degrades_quietly_when_breaker_
 ) -> None:
     with caplog.at_level(logging.ERROR, logger="repositories.musicbrainz_album"):
         assert (
-            await _Repo().resolve_recording_to_release_group("recording-1") is None
+            await _Repo().resolve_recording_to_release_group(
+                "33333333-3333-4333-8333-333333333333"
+            )
+            is None
         )
     assert caplog.records == []
     open_breaker.assert_called_once()
@@ -120,7 +135,12 @@ async def test_real_errors_still_log(open_breaker, caplog, monkeypatch) -> None:
         AsyncMock(side_effect=RuntimeError("boom")),
     )
     with caplog.at_level(logging.ERROR, logger="repositories.musicbrainz_album"):
-        assert await _Repo().get_recording_by_id("recording-1") is None
+        assert (
+            await _Repo().get_recording_by_id(
+                "33333333-3333-4333-8333-333333333333"
+            )
+            is None
+        )
     assert len(caplog.records) == 1
     open_breaker.assert_called_once()
 

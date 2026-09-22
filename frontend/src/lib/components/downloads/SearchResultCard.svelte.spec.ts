@@ -8,8 +8,8 @@ import SearchResultCard from './SearchResultCard.svelte';
 
 type RenderOpts = Parameters<typeof render<typeof SearchResultCard>>[1];
 
-function renderCard(props: Record<string, unknown>) {
-	return render(SearchResultCard, { props } as unknown as RenderOpts);
+async function renderCard(props: Record<string, unknown>) {
+	return await render(SearchResultCard, { props } as unknown as RenderOpts);
 }
 
 function makeDecision(overrides: Partial<QualityDecision> = {}): QualityDecision {
@@ -69,7 +69,7 @@ function makeCandidate(overrides: Partial<ScoredCandidate> = {}): ScoredCandidat
 
 describe('SearchResultCard.svelte', () => {
 	it('renders folder, peer, score percentage and format', async () => {
-		renderCard({ candidate: makeCandidate() });
+		await renderCard({ candidate: makeCandidate() });
 		await expect.element(page.getByText('Radiohead - OK Computer (1997)')).toBeInTheDocument();
 		await expect.element(page.getByText('alice')).toBeInTheDocument();
 		await expect.element(page.getByText('88%')).toBeInTheDocument();
@@ -78,14 +78,14 @@ describe('SearchResultCard.svelte', () => {
 
 	it('calls onPick when Pick is clicked', async () => {
 		const onPick = vi.fn();
-		renderCard({ candidate: makeCandidate(), onPick });
+		await renderCard({ candidate: makeCandidate(), onPick });
 		await page.getByRole('button', { name: /Pick candidate from alice/ }).click();
 		expect(onPick).toHaveBeenCalledOnce();
 	});
 
 	it('locks the Pick button when disabled (double-pick guard)', async () => {
 		const onPick = vi.fn();
-		renderCard({ candidate: makeCandidate(), onPick, disabled: true });
+		await renderCard({ candidate: makeCandidate(), onPick, disabled: true });
 		// a disabled button can't dispatch onclick, so this proves a second pick can't fire
 		await expect
 			.element(page.getByRole('button', { name: /Pick candidate from alice/ }))
@@ -94,10 +94,24 @@ describe('SearchResultCard.svelte', () => {
 	});
 
 	it('exposes the score breakdown via a tooltip', async () => {
-		renderCard({ candidate: makeCandidate() });
+		await renderCard({ candidate: makeCandidate() });
 		await expect.element(page.getByText('88%')).toBeInTheDocument();
 		const tip = document.querySelector('[data-tip]');
 		expect(tip?.getAttribute('data-tip')).toContain('Coherence');
+	});
+
+	it('shows the track-match overlap in the breakdown tooltip when computed', async () => {
+		await renderCard({ candidate: makeCandidate({ track_overlap: 0.42 }) });
+		await expect.element(page.getByText('88%')).toBeInTheDocument();
+		const tip = document.querySelector('[data-tip]');
+		expect(tip?.getAttribute('data-tip')).toContain('Track match 42%');
+	});
+
+	it('omits track-match from the tooltip for pre-overlap candidates', async () => {
+		await renderCard({ candidate: makeCandidate() });
+		await expect.element(page.getByText('88%')).toBeInTheDocument();
+		const tip = document.querySelector('[data-tip]');
+		expect(tip?.getAttribute('data-tip')).not.toContain('Track match');
 	});
 
 	it('renders the Usenet variant with indexer, format and size', async () => {
@@ -118,12 +132,35 @@ describe('SearchResultCard.svelte', () => {
 				usenet_date: null
 			}
 		});
-		renderCard({ candidate: usenet, albumTitle: 'OK Computer' });
+		await renderCard({ candidate: usenet, albumTitle: 'OK Computer' });
 		await expect.element(page.getByText('OK Computer')).toBeInTheDocument(); // clean album heading
 		await expect.element(page.getByText('DrunkenSlug')).toBeInTheDocument();
 		// the format badge is exactly "FLAC" (the release title also contains "FLAC").
 		await expect.element(page.getByText('FLAC', { exact: true })).toBeInTheDocument();
 		await expect.element(page.getByText('2.2 GB')).toBeInTheDocument();
+	});
+
+	it('renders the plugin variant with title, size, tier and score first', async () => {
+		const plugin = makeCandidate({
+			source: 'plugin:bandcamp',
+			username: '',
+			parent_directory: '',
+			files: [],
+			plugin_release: {
+				title: 'bc-exclusive-master',
+				size_bytes: 400_000_000,
+				score: 0.9,
+				quality_tier: 'hi-res',
+				files: [{ username: 'bc', filename: 'track.flac', size: 200_000_000 }],
+				payload: 'opaque-token'
+			}
+		});
+		await renderCard({ candidate: plugin });
+		await expect.element(page.getByText('bc-exclusive-master')).toBeVisible();
+		await expect.element(page.getByText('381 MB')).toBeVisible();
+		await expect.element(page.getByText('hi-res')).toBeVisible();
+		await expect.element(page.getByText('plugin score 90%')).toBeVisible();
+		await expect.element(page.getByText('1 file')).toBeVisible();
 	});
 
 	it('shows "unknown" format when an obfuscated title has no quality category', async () => {
@@ -144,12 +181,12 @@ describe('SearchResultCard.svelte', () => {
 				usenet_date: null
 			}
 		});
-		renderCard({ candidate: usenet, albumTitle: 'Some Album' });
+		await renderCard({ candidate: usenet, albumTitle: 'Some Album' });
 		await expect.element(page.getByText('unknown')).toBeInTheDocument();
 	});
 
 	it('labels legacy candidates Within policy and keeps the pick action as Pick anyway', async () => {
-		renderCard({ candidate: makeCandidate() });
+		await renderCard({ candidate: makeCandidate() });
 		await expect.element(page.getByText('Within policy', { exact: true })).toBeVisible();
 		await expect
 			.element(page.getByRole('button', { name: /Pick candidate from alice/ }))
@@ -157,7 +194,7 @@ describe('SearchResultCard.svelte', () => {
 	});
 
 	it('marks the top-ranked step as Preferred with a plain Pick button', async () => {
-		renderCard({
+		await renderCard({
 			candidate: makeCandidate({
 				tier: 'auto',
 				quality_decision: makeDecision({
@@ -175,7 +212,7 @@ describe('SearchResultCard.svelte', () => {
 	});
 
 	it('maps computed fallback steps into the Quality chip', async () => {
-		renderCard({
+		await renderCard({
 			candidate: makeCandidate({
 				quality_decision: makeDecision({
 					preference_step: 2,
@@ -186,7 +223,7 @@ describe('SearchResultCard.svelte', () => {
 		});
 		await expect.element(page.getByText('Fallback 2', { exact: true })).toBeVisible();
 		await expect.element(page.getByText('Unknown', { exact: true })).not.toBeInTheDocument();
-		renderCard({
+		await renderCard({
 			candidate: makeCandidate({
 				quality_decision: makeDecision({
 					preference_step: 2,
@@ -211,7 +248,7 @@ describe('SearchResultCard.svelte', () => {
 				summary: 'This copy is outside the accepted recipe.'
 			})
 		});
-		renderCard({ candidate });
+		await renderCard({ candidate });
 		await expect.element(page.getByText('Outside policy', { exact: true })).toBeVisible();
 		await expect.element(page.getByText('Recipe step 2', { exact: true })).toBeVisible();
 		await expect.element(page.getByText('Certainty: Inferred', { exact: true })).toBeVisible();
@@ -225,7 +262,7 @@ describe('SearchResultCard.svelte', () => {
 
 	it('blocks unimportable candidates while outside-policy imports stay reachable via Show all', async () => {
 		const onPick = vi.fn();
-		renderCard({ candidate: makeCandidate({ tier: 'rejected' }), onPick });
+		await renderCard({ candidate: makeCandidate({ tier: 'rejected' }), onPick });
 		const button = page.getByRole('button', {
 			name: /Blocked: outside the accepted quality policy/
 		});
@@ -235,7 +272,7 @@ describe('SearchResultCard.svelte', () => {
 		expect(onPick).not.toHaveBeenCalled();
 	});
 	it('keeps hard quality rejection unavailable and explains its nested disposition', async () => {
-		renderCard({
+		await renderCard({
 			candidate: makeCandidate({
 				tier: 'rejected',
 				quality_decision: makeDecision({
@@ -258,7 +295,7 @@ describe('SearchResultCard.svelte', () => {
 	});
 	it('blocks outside-policy candidates with hard quality reasons', async () => {
 		const onPick = vi.fn();
-		renderCard({
+		await renderCard({
 			candidate: makeCandidate({
 				quality_decision: makeDecision({
 					eligible: false,
@@ -282,7 +319,7 @@ describe('SearchResultCard.svelte', () => {
 	});
 	it('uses the generic identity reason for rejected candidates with eligible quality', async () => {
 		const onPick = vi.fn();
-		renderCard({
+		await renderCard({
 			candidate: makeCandidate({
 				tier: 'rejected',
 				quality_decision: makeDecision({

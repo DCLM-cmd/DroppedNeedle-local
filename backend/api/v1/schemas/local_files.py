@@ -30,6 +30,10 @@ class LocalAlbumMatch(AppStruct):
     tracks: list[LocalTrackInfo] = []
     total_size_bytes: int = 0
     primary_format: str | None = None
+    # Whether the caller may download these files (setting + role, computed
+    # per request by match_local_album; default True keeps other producers
+    # fail-open).
+    download_allowed: bool = True
 
 
 class LocalAlbumSummary(AppStruct):
@@ -43,6 +47,16 @@ class LocalAlbumSummary(AppStruct):
     primary_format: str | None = None
     cover_url: str | None = None
     date_added: str | None = None
+    # Whether the caller may download this album's files (setting + role,
+    # computed per request by the local-library list routes; default True keeps
+    # other producers fail-open).
+    download_allowed: bool = True
+
+
+class DownloadAccessResponse(AppStruct):
+    """Viewer capability: whether the caller may download library files."""
+
+    allowed: bool
 
 
 class LocalPaginatedResponse(AppStruct):

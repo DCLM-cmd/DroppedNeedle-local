@@ -313,6 +313,9 @@ CREATE TABLE IF NOT EXISTS local_tracks (
     applied_policy TEXT NOT NULL DEFAULT 'automatic' CHECK(applied_policy IN ('local_metadata','automatic','excluded')),
     manual_excluded INTEGER NOT NULL DEFAULT 0 CHECK(manual_excluded IN (0,1)),
     row_revision INTEGER NOT NULL DEFAULT 1 CHECK(row_revision BETWEEN 1 AND 9223372036854775807),
+    title_provenance TEXT NOT NULL DEFAULT 'absent' CHECK(title_provenance IN ('tag','parsed','placeholder','absent')),
+    album_title_provenance TEXT NOT NULL DEFAULT 'absent' CHECK(album_title_provenance IN ('tag','parsed','placeholder','absent')),
+    album_artist_provenance TEXT NOT NULL DEFAULT 'absent' CHECK(album_artist_provenance IN ('tag','parsed','placeholder','absent')),
     UNIQUE(root_id, relative_path)
 );
 
@@ -575,6 +578,7 @@ CREATE TABLE IF NOT EXISTS audio_fingerprint_outcomes (
     duration_seconds REAL,
     recording_mbid TEXT,
     release_group_ids_json TEXT NOT NULL DEFAULT '[]',
+    partial_decode INTEGER NOT NULL DEFAULT 0 CHECK(partial_decode IN (0,1)),
     score REAL,
     failure_code TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 1 CHECK(attempt_count >= 1),
@@ -914,7 +918,7 @@ CREATE TABLE IF NOT EXISTS library_management_import_bundles (
               AND request_hash NOT GLOB '*[^0-9a-f]*'),
     state TEXT NOT NULL CHECK(state IN (
         'preparing','publishing','catalog_committed','cleanup_pending','completed',
-        'rolled_back','needs_attention'
+        'rolled_back','needs_attention','resolved'
     )),
     result_json TEXT NOT NULL DEFAULT '{}',
     acknowledged_at REAL,
@@ -931,7 +935,7 @@ CREATE TABLE IF NOT EXISTS library_management_import_journal (
     state TEXT NOT NULL CHECK(state IN (
         'planned','staged','validated','replacement_backed_up','published',
         'catalog_committed','cleanup_pending','completed','rollback_pending',
-        'rolled_back','needs_attention'
+        'rolled_back','needs_attention','resolved'
     )),
     source_fingerprint TEXT NOT NULL
         CHECK(length(source_fingerprint) = 64
@@ -1764,6 +1768,8 @@ CREATE INDEX IF NOT EXISTS idx_management_plan_cursor
 ON library_management_plan_items(job_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_management_plan_eligibility
 ON library_management_plan_items(job_id, eligibility, ordinal);
+CREATE INDEX IF NOT EXISTS idx_management_plan_track
+ON library_management_plan_items(job_id, local_track_id);
 CREATE INDEX IF NOT EXISTS idx_management_journal_recovery
 ON library_file_mutation_journal(state, updated_at, id);
 CREATE INDEX IF NOT EXISTS idx_management_journal_job

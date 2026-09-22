@@ -10,6 +10,7 @@ from api.v1.schemas.discover import (
     DiscoverIgnoredRelease,
     QueueSettings,
 )
+from infrastructure.observability.optional_work import OptionalWorkDeferred
 from infrastructure.persistence import LibraryDB, MBIDStore
 from repositories.protocols import (
     ListenBrainzRepositoryProtocol,
@@ -24,7 +25,7 @@ from infrastructure.persistence.user_listening_prefs_store import (
     UserListeningPrefsStore,
 )
 from services.discover.integration_helpers import IntegrationHelpers
-from services.discover.mbid_resolution_service import MbidResolutionService
+from services.discover.mbid_resolution_service import MbidResolutionService, with_resolution_user
 from services.discover.queue_strategies import (
     build_similar_artist_pools,
     discover_by_genres,
@@ -95,6 +96,7 @@ class DiscoverQueueService:
             resolved,
         )
 
+    @with_resolution_user
     async def build_queue(
         self, user_id: str, count: int | None = None
     ) -> DiscoverQueueResponse:
@@ -120,6 +122,8 @@ class DiscoverQueueService:
                 ignored_mbids = await self._mbid_store.get_ignored_release_mbids(
                     user_id
                 )
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
                 logger.warning("Failed to load ignored release MBIDs from cache")
 
@@ -228,6 +232,8 @@ class DiscoverQueueService:
                             )
                         )
                         seen_mbids.add(mbid)
+            except OptionalWorkDeferred:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to get Last.fm seed artists: %s", e)
 
@@ -247,6 +253,8 @@ class DiscoverQueueService:
                         if mbid and mbid not in seen_mbids:
                             seeds.append(a)
                             seen_mbids.add(mbid)
+                except OptionalWorkDeferred:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to get LB top artists ({range_}): {e}")
 
@@ -274,6 +282,8 @@ class DiscoverQueueService:
                                 )
                             )
                             seen_mbids.add(mbid)
+                except OptionalWorkDeferred:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to get Jellyfin seed artists: {e}")
                     continue
@@ -285,6 +295,8 @@ class DiscoverQueueService:
         if self._library_db:
             try:
                 library_mbids = await self._library_db.existing_library_mbids(mbids)
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "Failed to load album MBIDs from library cache for validation"
@@ -296,6 +308,8 @@ class DiscoverQueueService:
                     library_mbids = await self._mbid.get_library_album_mbids(
                         True, mbids
                     )
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
                 logger.warning("Failed to load album MBIDs from Lidarr for validation")
         if not library_mbids:
@@ -344,6 +358,8 @@ class DiscoverQueueService:
     ) -> list[DiscoverQueueItemLight]:
         try:
             genre_activity = await self._lb_repo.get_user_genre_activity(username)
+        except OptionalWorkDeferred:
+            raise
         except Exception:  # noqa: BLE001
             logger.warning("Failed to fetch user genre activity from ListenBrainz")
             return []
@@ -366,6 +382,8 @@ class DiscoverQueueService:
     ) -> list[DiscoverQueueItemLight]:
         try:
             fresh_releases = await self._lb_repo.get_user_fresh_releases(username)
+        except OptionalWorkDeferred:
+            raise
         except Exception:  # noqa: BLE001
             logger.warning("Failed to fetch fresh releases from ListenBrainz")
             return []
@@ -420,6 +438,8 @@ class DiscoverQueueService:
                 username=username,
                 count=50,
             )
+        except OptionalWorkDeferred:
+            raise
         except Exception:  # noqa: BLE001
             logger.warning("Failed to fetch loved recordings from ListenBrainz")
             return []
@@ -450,6 +470,9 @@ class DiscoverQueueService:
             ],
             return_exceptions=True,
         )
+        for outcome in results:
+            if isinstance(outcome, OptionalWorkDeferred):
+                raise outcome
 
         items: list[DiscoverQueueItemLight] = []
         seen_rg_mbids: set[str] = set()
@@ -569,6 +592,9 @@ class DiscoverQueueService:
                         ],
                         return_exceptions=True,
                     )
+                    for outcome in album_fetch_results:
+                        if isinstance(outcome, OptionalWorkDeferred):
+                            raise outcome
                     sim_albums_map: list[tuple[Any, list]] = []
                     for sim, result in zip(valid_sims, album_fetch_results):
                         if isinstance(result, Exception):
@@ -587,14 +613,20 @@ class DiscoverQueueService:
                         resolver_cache=mbid_resolution_cache,
                         use_album_artist_name=False,
                     )
+                except OptionalWorkDeferred:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     logger.debug(
                         f"Failed to get similar artists for seed {seed_mbid[:8]}: {e}"
                     )
 
-            await asyncio.gather(
-                *[_process_seed_lastfm(i, seed) for i, seed in enumerate(seeds)]
+            outcomes = await asyncio.gather(
+                *[_process_seed_lastfm(i, seed) for i, seed in enumerate(seeds)],
+                return_exceptions=True,
             )
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
         else:
             deep_cut_excluded = excluded_mbids | listened_release_group_mbids
             strategy_names = [
@@ -621,6 +653,9 @@ class DiscoverQueueService:
                 ),
                 return_exceptions=True,
             )
+            for outcome in strategy_results:
+                if isinstance(outcome, OptionalWorkDeferred):
+                    raise outcome
 
             similar_seed_pools = strategy_results[0]
             if isinstance(similar_seed_pools, list):
@@ -728,6 +763,9 @@ class DiscoverQueueService:
                     ],
                     return_exceptions=True,
                 )
+                for outcome in album_fetch_results:
+                    if isinstance(outcome, OptionalWorkDeferred):
+                        raise outcome
                 artist_albums_pairs: list[tuple[Any, list]] = []
                 for artist, result in zip(valid_artists, album_fetch_results):
                     if isinstance(result, Exception):
@@ -765,6 +803,8 @@ class DiscoverQueueService:
                         )
                     )
                     exclude.add(rg_mbid.lower())
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Failed to get trending for anonymous queue: {e}")
 

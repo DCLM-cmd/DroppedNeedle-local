@@ -73,6 +73,8 @@ NPM    ?= pnpm
 	backend-test-multidisc \
 	test-library-management-multidisc-naming \
 	test-library-management-profile-sharing \
+	test-library-findings-core \
+	test-library-findings-hardening \
 	test-performance-snapshot-storage \
 	backend-test-performance \
 	backend-test-preferences \
@@ -191,13 +193,37 @@ frontend-test-connect-apps: ## Connect Apps: SettingsConnectApps component + dat
 	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/settings/SettingsConnectApps.svelte.spec.ts
 	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project server src/lib/queries/connect-apps
 
+frontend-test-best-fit-edition: ## Best-fit edition: badge, album page, review browser/detail specs
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/library/LocalIdentityBadge.svelte.spec.ts
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/library/LibraryReviewBrowser.svelte.spec.ts
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/library/LibraryReviewDetail.svelte.spec.ts
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client "src/routes/album/[id]/localPage.svelte.spec.ts"
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client "src/routes/album/[id]/AlbumHeader.svelte.spec.ts"
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/library/AlbumIdentificationPanel.svelte.spec.ts
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/library/AlbumOrganizationDialog.svelte.spec.ts
+
+test-best-fit-edition: backend-test-best-fit-edition frontend-test-best-fit-edition ## Best-fit edition: full feature suite
+
 test-compat: backend-test-compat frontend-test-connect-apps ## Connect Apps: full backend + frontend suite
 
 backend-test-album-refresh: $(BACKEND_VENV_STAMP) ## Run album refresh endpoint tests
 	$(PYTEST) tests/routes/test_album_refresh.py tests/services/test_navidrome_cache_invalidation.py -v
 
+backend-test-sse-mux: $(BACKEND_VENV_STAMP) ## Run mux SSE stream + revision poller backend tests
+	$(PYTEST) tests/routes/test_events_routes.py tests/services/native/test_library_revision_poller.py -v
+
+backend-test-ident-quiet-reconfirm: $(BACKEND_VENV_STAMP) ## Quiet re-confirmation + collab-artist subset rule (engine, finish path, oracle)
+	$(PYTEST) tests/services/native/test_album_evidence_engine.py tests/services/native/test_identification_pipeline.py tests/services/native/test_library_review_operations.py tests/services/native/test_lane_equivalence_oracle.py tests/infrastructure/test_native_library_store.py -v
+
 backend-test-album-owned-release: $(BACKEND_VENV_STAMP) ## Owned album shows the edition on disc, not the largest ranked release
 	$(PYTEST) tests/services/test_album_service.py tests/services/test_album_singleflight.py -v
+
+backend-test-best-fit-edition: $(BACKEND_VENV_STAMP) ## Best-fit edition: display tiers, stale-tag fallback, edition hold, undo invalidation
+	$(PYTEST) tests/services/test_edition_selection.py tests/services/native/test_identification_pipeline.py tests/services/native/test_lane_equivalence_oracle.py tests/routes/test_undo_automatic_edition_route.py tests/services/native/test_library_review_operations.py tests/services/native/test_target_consumer_services.py -v
+	# NOTE: test_target_consumer_services.py carries 2 pre-existing failures on main
+	# (test_target_local_routes_cover_full_catalog_read_surface,
+	# test_target_native_contract_separates_local_and_provider_ids_and_redirects_aliases),
+	# verified failing on the untouched tree - unrelated to this feature.
 
 backend-test-local-stats: $(BACKEND_VENV_STAMP) ## Listening Room stats sourced from the library DB (home entry-card parity)
 	$(PYTEST) tests/services/test_local_files_service.py tests/test_advanced_settings_roundtrip.py -v
@@ -410,6 +436,9 @@ backend-test-download-routes: $(BACKEND_VENV_STAMP) ## Phase 6b/7: download-clie
 backend-test-orchestrator: $(BACKEND_VENV_STAMP) ## Phase 7: DownloadOrchestrator + FileProcessor.process_downloaded
 	$(PYTEST) tests/services/test_download_orchestrator.py tests/services/test_file_processor.py -v
 
+test-tracklist-acquisition: $(BACKEND_VENV_STAMP) ## Tracklist-aware acquisition (overlap rank, verdict, failover, pinned coverage, audio targets)
+	$(PYTEST) tests/services/test_tracklist_overlap.py tests/services/test_acquisition_corpus.py tests/services/test_album_preflight_scorer.py tests/services/test_download_orchestrator.py tests/services/test_download_service.py tests/services/test_acquisition_strategy_expected_tracks.py tests/services/test_acquisition_strategy_singles.py tests/services/test_album_utils.py tests/services/test_wanted_watcher_service.py tests/routes/test_downloads_routes.py
+
 test-acquisition-cleanup: $(BACKEND_VENV_STAMP) ## Durable attempt cleanup: store, clients, filesystem safety, API and UI
 	$(PYTEST) tests/infrastructure/test_acquisition_cleanup_store.py \
 		tests/infrastructure/test_acquisition_cleanup_task.py \
@@ -435,6 +464,32 @@ backend-test-usenet: $(BACKEND_VENV_STAMP) ## Usenet/SABnzbd: protocol split, Ne
 		tests/services/test_preferences_download_clients.py \
 		tests/services/test_newznab_release_scorer.py \
 		tests/infrastructure/test_e2e_usenet.py -v
+
+# Frontend warming-bound spec (frontend has no per-feature make convention):
+# cd frontend && pnpm exec vitest run --project server src/lib/queries/artist/ArtistQueries.spec.ts
+.PHONY: backend-test-mb-efficiency
+backend-test-mb-efficiency: $(BACKEND_VENV_STAMP) ## BrainzMashEfficiency: pagination, follow poll, MB transport, caches, validators, telemetry
+	$(PYTEST) tests/services/test_artist_release_pagination.py \
+		tests/infrastructure/test_follow_store.py \
+		tests/services/test_new_release_service.py \
+		tests/infrastructure/test_wanted_watcher_task.py \
+		tests/infrastructure/test_follow_poll_task.py \
+		tests/services/test_artist_discovery_service.py \
+		tests/services/native/test_canonical_release_metadata_service.py \
+		tests/repositories/test_musicbrainz_transport_resilience.py \
+		tests/infrastructure/test_mb_canonical_store.py \
+		tests/repositories/test_musicbrainz_artist_rgs_cache.py \
+		tests/repositories/test_musicbrainz_album_release_group.py \
+		tests/repositories/test_musicbrainz_response_cache.py \
+		tests/repositories/test_musicbrainz_contribution_repository.py \
+		tests/infrastructure/test_validators.py \
+		tests/services/test_spotify_import_service.py \
+		tests/services/test_spotify_import_mbid_cache.py \
+		tests/infrastructure/test_provider_route_attribution.py \
+		tests/test_cache_key_contracts.py \
+		tests/test_error_leakage.py \
+		tests/services/test_target_library_repository_artist_paging.py \
+		tests/services/test_mbid_resolution_incremental.py -v
 
 backend-test-e2e-download: $(BACKEND_VENV_STAMP) ## Phase 7: blocking E2E gate (search -> import -> library_files)
 	$(PYTEST) tests/infrastructure/test_e2e_download.py -v
@@ -514,6 +569,46 @@ test-library-roots-restore: $(BACKEND_VENV_STAMP) ## Run library roots wipe guar
 	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project server \
 		src/lib/queries/__tests__/integration-coverage.spec.ts
 	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client src/lib/components/settings/SettingsLibrary.svelte.spec.ts
+
+test-library-findings-core: $(BACKEND_VENV_STAMP) ## Run LibraryFindings-All Phase 0-2 (fixtures, P0/P1 correctness) scoped suites
+	$(PYTEST) \
+		tests/services/native/test_lane_equivalence_oracle.py \
+		tests/services/native/test_album_evidence_engine.py \
+		tests/services/native/test_identification_pipeline.py \
+		tests/infrastructure/test_native_library_store.py \
+		tests/repositories/test_edition_policy.py \
+		tests/services/test_edition_selection.py \
+		tests/services/test_drop_import_service.py \
+		tests/services/test_audio_fingerprinter.py \
+		tests/services/native/test_target_scan_runtime.py \
+		tests/infrastructure/test_target_scan_lifecycle.py \
+		tests/services/native/test_library_policy_service.py \
+		tests/services/native/test_target_library_policy_service.py \
+		tests/services/test_preferences_library_settings.py \
+		tests/benchmarks/test_feedback_fixes_benchmark.py -v
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client \
+		src/lib/components/settings/SettingsOnboardingChecklist.svelte.spec.ts \
+		src/lib/components/library/LibraryScanScheduleControl.svelte.spec.ts \
+		src/lib/components/library/LibraryScanningPanel.svelte.spec.ts
+
+test-library-findings-hardening: $(BACKEND_VENV_STAMP) ## Run LibraryFindings-All Phase 3-4 (resilience, review, docs) scoped suites
+	$(PYTEST) \
+		tests/services/native/test_target_scan_runtime.py \
+		tests/infrastructure/test_target_scan_lifecycle.py \
+		tests/services/native/test_identification_pipeline.py \
+		tests/services/native/test_album_evidence_engine.py \
+		tests/infrastructure/test_native_library_store.py \
+		tests/infrastructure/test_hostile_filesystem_qualification.py \
+		tests/infrastructure/test_legacy_pending_migration.py \
+		tests/services/test_drop_import_service.py \
+		tests/services/test_edition_selection.py \
+		tests/services/test_download_service.py \
+		tests/compat/test_subsonic_scan.py \
+		tests/routes/test_target_application.py -v
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project client \
+		src/lib/components/library/LibraryReviewBrowser.svelte.spec.ts \
+		src/lib/components/import/DropImportJobList.svelte.spec.ts \
+		src/lib/components/AuthenticatedAppShell.svelte.spec.ts
 
 test-performance-snapshot-storage: $(BACKEND_VENV_STAMP) ## Run snapshot storage and recovery contract tests
 	$(PYTEST) \
@@ -907,6 +1002,9 @@ frontend-test-client: ## Run frontend client-project tests only (chromium, needs
 
 frontend-test-connections: ## Run per-user connections + scrobble-preferences frontend tests
 	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project server src/lib/queries/connections src/lib/queries/scrobble-preferences
+
+frontend-test-sse-mux: ## Run mux SSE stream + consumer migration frontend tests
+	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run --project server src/lib/queries/events src/lib/queries/following/FollowingEvents.spec.ts src/lib/queries/library/LibraryActivityEvents.spec.ts src/lib/queries/library-management/LibraryManagementEvents.spec.ts src/lib/stores/syncStatus.spec.ts src/lib/stores/nowPlayingSessions.spec.ts
 
 frontend-test-home-discover: ## Run Phase 5 per-user home/discover key + cache-isolation frontend tests (AMU-5/AMU-8)
 	cd "$(FRONTEND_DIR)" && $(NPM) exec vitest run src/lib/queries/HomeQueryKeyFactory.spec.ts src/lib/queries/discover/DiscoverQueryKeyFactory.spec.ts src/lib/queries/discover/DiscoverQuery.spec.ts src/lib/queries/clearOnUserSwitch.svelte.spec.ts src/lib/utils/discoverQueueCache.svelte.spec.ts src/lib/components/TimeRangeView.svelte.spec.ts src/lib/components/RadioSection.spec.ts

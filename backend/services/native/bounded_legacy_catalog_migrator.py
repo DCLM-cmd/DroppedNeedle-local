@@ -1081,6 +1081,8 @@ class BoundedLegacyCatalogMigrator:
                 # the store reports per-row disposition (GH-367): a skipped row
                 # must not be counted as mapped, or final validation fails.
                 pending: list[tuple[str, str | None, bool, bool]] = []
+                rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+                provenance_by_key: dict[tuple[str, str], MigrationProvenance] = {}
                 for row, target in zip(rows, targets, strict=True):
                     source_key, user_id = self._reference_key(kind, row)
                     if source_key in migrated_ids:
@@ -1129,15 +1131,16 @@ class BoundedLegacyCatalogMigrator:
                             "jellyfin_id_map",
                         }
                         pending.append((source_key, user_id, False, retained))
-                    provenance.append(
-                        self._provenance(
-                            kind,
-                            source_key,
-                            target,
-                            row,
-                            migrated_at,
-                        )
+                    rows_by_key[(kind, source_key)] = row
+                    entry = self._provenance(
+                        kind,
+                        source_key,
+                        target,
+                        row,
+                        migrated_at,
                     )
+                    provenance_by_key[(kind, source_key)] = entry
+                    provenance.append(entry)
                 skipped = await self._apply_references(
                     provenance,
                     tombstones=tombstones,
@@ -1149,14 +1152,7 @@ class BoundedLegacyCatalogMigrator:
                 }
                 for source_key, user_id, tombstoned, retained in pending:
                     skip = skipped_by_key.get((kind, source_key))
-                    if skip is not None:
-                        self._record_reference_skip(
-                            kind,
-                            source_key,
-                            skip.reason,
-                            user_id=user_id,
-                        )
-                    else:
+                    if skip is None:
                         self._increment(
                             kind,
                             mapped=True,
@@ -1164,6 +1160,54 @@ class BoundedLegacyCatalogMigrator:
                             retained=retained,
                             tombstoned=tombstoned,
                         )
+                        continue
+                    routed = self._route_malformed_skip_to_review(
+                        kind,
+                        source_key,
+                        skip,
+                        rows_by_key.get((kind, source_key)),
+                        provenance_by_key.get((kind, source_key)),
+                        migrated_at,
+                    )
+                    if routed is None:
+                        self._record_reference_skip(
+                            kind,
+                            source_key,
+                            skip.reason,
+                            user_id=user_id,
+                        )
+                        continue
+                    review, parked_provenance = routed
+                    recorded = await self._store.apply_parked_reference_reviews(
+                        [review],
+                        [parked_provenance],
+                        migration_run_id=migration_id,
+                        source_revision=source_revision,
+                    )
+                    if source_key not in recorded:
+                        # The target vanished under the write: fall back to a
+                        # plain parked skip so the row stays retryable.
+                        self._record_reference_skip(
+                            kind,
+                            source_key,
+                            skip.reason,
+                            user_id=user_id,
+                        )
+                        continue
+                    self._increment(
+                        kind,
+                        mapped=True,
+                        user_id=user_id,
+                        retained=retained,
+                        tombstoned=tombstoned,
+                    )
+                    self._skipped[kind] += 1
+                    logger.warning(
+                        "legacy reference skipped kind=%s ref=%s reason=%s",
+                        kind,
+                        _redacted_reference(kind, source_key),
+                        skip.reason,
+                    )
                 await self._store.materialize_unlinked_history_batch(
                     unlinked_history,
                     migration_run_id=migration_id,
@@ -1486,6 +1530,57 @@ class BoundedLegacyCatalogMigrator:
             _redacted_reference(kind, source_key),
             reason,
         )
+
+    def _route_malformed_skip_to_review(
+        self,
+        kind: str,
+        source_key: str,
+        skip: ReferenceProvenanceSkip,
+        row: dict[str, Any] | None,
+        provenance: MigrationProvenance | None,
+        migrated_at: float,
+    ) -> tuple[MigrationReview, MigrationProvenance] | None:
+        """N-03b: park a malformed skip as a human-visible needs_review.
+
+        Only ``invalid_key``/``integrity_error`` skips whose provenance still
+        points at a local track qualify: the reviews table requires exactly
+        one of album/track, so target-less skips (unresolvable
+        playlist_track/jellyfin_id_map/other refs) and non-track targets
+        stay terminal-parked with ``skipped_counts`` evidence, as do
+        proof-absent skips (outside-roots, ``not_materialized``, scan-owned
+        dedupe). The review reuses ``_linked_review`` against a
+        kind-namespaced synthetic row id (legacy reference rows share no
+        single id column); the paired provenance settles the row so later
+        ``migrate_pending`` runs pick it up as handled.
+        """
+        if skip.reason not in {"invalid_key", "integrity_error"}:
+            return None
+        if provenance is None or provenance.target_kind != "local_track":
+            return None
+        if not provenance.target_id or row is None:
+            return None
+        # The linked review_row/manual_decision provenance is intentionally
+        # dropped: it names a synthetic key that would unbalance the
+        # review_row validation counts. Only the ref-kind provenance below
+        # settles the skipped row. The synthetic resolution gives the review
+        # its distinct parked reason while keeping state needs_review.
+        review, _linked_provenance = self._linked_review(
+            {
+                **row,
+                "id": f"{kind}:{source_key}",
+                "resolution": f"reference_parked_{skip.reason}",
+            },
+            provenance.target_id,
+            migrated_at,
+        )
+        parked = self._provenance(
+            kind,
+            source_key,
+            (provenance.target_kind, provenance.target_id),
+            row,
+            migrated_at,
+        )
+        return review, parked
 
     def _merge_counts(
         self, source: dict[tuple[str, str | None], MigrationReferenceCount]

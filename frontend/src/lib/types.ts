@@ -14,6 +14,19 @@ export type Artist = {
 	local_id?: string | null;
 };
 
+/**
+ * Provider-lane edition pick basis (mirrors AlbumService._effective_release_id):
+ * pin > owned identity > unanimous embedded tags > file count > ranked.
+ */
+export type EditionPickBasis = 'pin' | 'owned' | 'embedded_tags' | 'file_count' | 'ranked';
+
+/**
+ * Native-lane pick basis (TargetNativeLibraryService._display_pick): per-copy
+ * pin, owned identity, or unanimous tags only - there is no file-count/ranked
+ * fallback on that path, so unproven albums without tags get no pick.
+ */
+export type NativePickBasis = 'pin' | 'owned' | 'embedded_tags';
+
 export type Album = {
 	title: string;
 	artist: string | null;
@@ -36,6 +49,7 @@ export type Album = {
 	listen_count?: number | null;
 	score?: number;
 	selected_release_mbid?: string | null;
+	pick_basis?: EditionPickBasis | null;
 	local_id?: string | null;
 	cover_available?: boolean;
 };
@@ -195,6 +209,7 @@ export type Track = {
 	length?: number | null;
 	recording_id?: string | null;
 	release_track_id?: string | null;
+	media_format?: string | null;
 };
 
 export type AlbumBasicInfo = {
@@ -562,6 +577,19 @@ export type DiscoverQueueEnrichment = {
 	youtube_search_available: boolean;
 	artist_description: string | null;
 	listen_count: number | null;
+};
+
+export type DiscoverActivity = {
+	feature: 'home' | 'discover' | 'queue' | 'artist';
+	artist_mbid?: string;
+	section?: 'similar' | 'top_songs' | 'top_albums';
+	provider?: 'lastfm' | 'listenbrainz';
+};
+
+export type DiscoverQueuePreview = {
+	status: 'available' | 'not_found' | 'unavailable';
+	youtube_url: string | null;
+	youtube_search_url: string | null;
 };
 
 export type YouTubeSearchResponse = {
@@ -1116,6 +1144,7 @@ export type LocalAlbumMatch = {
 	tracks: LocalTrackInfo[];
 	total_size_bytes: number;
 	primary_format?: string | null;
+	download_allowed?: boolean;
 };
 
 export type LocalAlbumSummary = {
@@ -1129,6 +1158,11 @@ export type LocalAlbumSummary = {
 	primary_format?: string | null;
 	cover_url?: string | null;
 	date_added?: string | null;
+	download_allowed?: boolean;
+};
+
+export type DownloadAccessResponse = {
+	allowed: boolean;
 };
 
 export type CrateReason = 'recent' | 'rediscover' | 'surprise' | 'same_era';
@@ -1557,10 +1591,7 @@ export type AlbumSort = 'recent' | 'title' | 'artist';
 export type TrackSort = 'recent' | 'title' | 'artist' | 'album';
 
 export type AlbumIdentityState =
-	| 'local_only'
-	| 'release_group_linked'
-	| 'release_linked'
-	| 'custom_edition';
+	'local_only' | 'release_group_linked' | 'release_linked' | 'custom_edition';
 
 export type ArtistIdentityState = 'local_only' | 'musicbrainz_linked';
 
@@ -1613,11 +1644,12 @@ export interface LibraryAlbumSummary {
 	musicbrainz_artist_id: string | null;
 	album_identity_state: AlbumIdentityState;
 	track_count: number;
-	total_duration_seconds: number;
+	total_duration_seconds: number | null;
 	total_size_bytes: number;
 	format: string | null;
 	year: number | null;
 	is_compilation: boolean;
+	release_type: string | null;
 	cover_available: boolean;
 	date_added: number | null;
 	sort_name: string | null;
@@ -1629,6 +1661,7 @@ export interface LibraryAlbumSummary {
 export interface LibraryAlbumDetail extends LibraryAlbumSummary {
 	row_revision: number;
 	input_revision: string;
+	download_allowed?: boolean;
 	identification_status:
 		| 'identified'
 		| 'needs_review'
@@ -1665,17 +1698,12 @@ export interface LibraryAlbumDetail extends LibraryAlbumSummary {
 		row_revision: number;
 		final_preview_job_id: string | null;
 	} | null;
+	display_release_mbid: string | null;
+	pick_basis: NativePickBasis | null;
 }
 
 export type ContributionState =
-	| 'draft'
-	| 'ready'
-	| 'seeded'
-	| 'verifying'
-	| 'linked'
-	| 'needs_review'
-	| 'stale'
-	| 'cancelled';
+	'draft' | 'ready' | 'seeded' | 'verifying' | 'linked' | 'needs_review' | 'stale' | 'cancelled';
 
 export type ContributionNextAction =
 	| 'edit_draft'
@@ -2086,17 +2114,7 @@ export interface LibraryStats {
 }
 
 export type ScanFrequency =
-	| 'manual'
-	| '5min'
-	| '10min'
-	| '30min'
-	| '1hr'
-	| '6hr'
-	| '12hr'
-	| '24hr'
-	| '3d'
-	| '7d'
-	| 'daily';
+	'manual' | '5min' | '10min' | '30min' | '1hr' | '6hr' | '12hr' | '24hr' | '3d' | '7d' | 'daily';
 
 export interface LibraryScanSchedule {
 	scan_frequency: ScanFrequency;
@@ -2159,6 +2177,7 @@ export interface DownloadClientStatus {
 	mount: DownloadsMountStatus;
 	mount_advisory?: string | null;
 	slskd_downloads_dir?: string | null;
+	effective_downloads_path?: string | null;
 }
 
 export interface HomeIntegrationStatus {
@@ -2202,6 +2221,25 @@ export interface IndexerTestResult {
 
 export interface IndexerSavedResponse {
 	id: string;
+}
+
+export interface ProwlarrConnectionSettings {
+	enabled: boolean;
+	url: string;
+	api_key: string;
+}
+
+export interface ProwlarrTestResult {
+	valid: boolean;
+	version?: string | null;
+	message: string;
+	indexer_count?: number | null;
+}
+
+export type UsenetSearchBackendName = 'indexers' | 'prowlarr';
+
+export interface UsenetSearchBackend {
+	backend: UsenetSearchBackendName;
 }
 
 export interface OperationResult {
@@ -2384,21 +2422,96 @@ export interface UsenetRelease {
 	usenet_date?: number | null;
 }
 
+export interface PluginFileRef {
+	username: string;
+	filename: string;
+	size: number;
+}
+
+// Hand-mirrors backend PluginSearchResult (repositories/protocols/indexer.py).
+export interface PluginSearchResult {
+	title: string;
+	size_bytes: number;
+	score: number;
+	quality_tier: string;
+	files: PluginFileRef[];
+	payload: string;
+}
+
 export interface ScoredCandidate {
-	// "soulseek" | "usenet" - selects the review-card variant (D16). Optional for
+	// "soulseek" | "usenet" | "plugin:<name>" - selects the review-card variant (D16). Optional for
 	// backward-compat with older cached candidate blobs (default soulseek).
 	source?: string;
 	username: string;
 	parent_directory: string;
 	files: DownloadSearchResultFile[];
 	usenet_release?: UsenetRelease | null;
+	// Plugin release for a "plugin:<name>" candidate; null for soulseek/usenet.
+	// Optional for backward-compat with older cached candidate blobs.
+	plugin_release?: PluginSearchResult | null;
 	coherence: number;
 	file_confidence: number;
 	final_score: number;
 	tier: CandidateTier;
+	track_overlap?: number | null;
 	candidate_index?: number | null;
 	quality_evidence?: AudioQualityEvidence | null;
 	quality_decision?: QualityDecision | null;
+}
+
+// Hand-mirrors backend PluginSourceInfo (api/v1/schemas/plugins.py).
+export type PluginSourceHealth = 'ok' | 'degraded' | 'error' | 'unknown';
+export interface PluginSourceInfo {
+	key: string;
+	plugin: string;
+	display_name: string;
+	has_client: boolean;
+	has_indexer: boolean;
+	target_source: string;
+	configured: boolean;
+	health: PluginSourceHealth;
+}
+
+// Hand-mirrors backend PluginSourcesResponse (api/v1/schemas/plugins.py).
+export interface PluginSourcesResponse {
+	sources: PluginSourceInfo[];
+}
+// Alias used by acquisition surfaces; same wire shape as PluginSourcesResponse.
+export type PluginSourceListResponse = PluginSourcesResponse;
+
+// Hand-mirrors backend PluginStreamRef (infrastructure/plugins/protocols.py).
+// Exactly one of path/url is set; url may carry transcode hints.
+export interface PluginStreamRef {
+	path: string;
+	url: string;
+	content_type: string;
+	duration_seconds: number | null;
+}
+
+// Hand-mirrors backend PluginRouteRequest/PluginRouteResponse
+// (infrastructure/plugins/protocols.py). Typed transport for one /ext/ call.
+export interface PluginRouteRequest {
+	method: string;
+	subpath: string;
+	query: Record<string, string>;
+	body: unknown;
+}
+export interface PluginRouteResponse {
+	status: number;
+	body: unknown;
+}
+
+// Envelope for the admin-only plugin UI bundle (panel.js) RPC channel.
+export interface PluginUiRpcRequest {
+	request_id: string;
+	method: string;
+	params: Record<string, unknown>;
+}
+export interface PluginUiRpcResponse {
+	request_id: string;
+	ok: boolean;
+	result: unknown;
+	error: string | null;
 }
 
 export interface SearchAlbumResponse {
@@ -2430,13 +2543,7 @@ export interface DismissReviewResponse {
 }
 
 export type DownloadStatus =
-	| 'queued'
-	| 'downloading'
-	| 'processing'
-	| 'completed'
-	| 'partial'
-	| 'failed'
-	| 'cancelled';
+	'queued' | 'downloading' | 'processing' | 'completed' | 'partial' | 'failed' | 'cancelled';
 
 // mirrors backend DownloadTaskResponse (api/v1/schemas/download.py)
 export interface DownloadTask {
@@ -2480,12 +2587,7 @@ export interface DownloadTask {
 	// [15, 30, 60, 120, 240, 480]. Empty when auto-retry is off. Drives the Wanted ladder.
 	retry_ladder_minutes: number[];
 	acquisition_cleanup_state:
-		| 'not_tracked'
-		| 'in_use'
-		| 'pending'
-		| 'complete'
-		| 'preserved'
-		| 'needs_attention';
+		'not_tracked' | 'in_use' | 'pending' | 'complete' | 'preserved' | 'needs_attention';
 	quality_format: string | null;
 	quality_bitrate?: number | null;
 	quality_bit_depth: number | null;
@@ -2506,6 +2608,9 @@ export interface DownloadTask {
 	attempt_total: number;
 	has_next_source: boolean;
 	held_for_review: boolean;
+	// Wrong-product verdict (Slice 2). Optional for backward-compat with cached responses.
+	wrong_product_verdict_at?: number | null;
+	wrong_product_detail?: string | null;
 }
 
 export interface DownloadListResponse {
@@ -2621,13 +2726,7 @@ export interface DownloadProgress extends DownloadSourceUpdate {
 
 // mirrors backend RequestAcceptedResponse (api/v1/schemas/request.py)
 export type RequestAcceptedStatus =
-	| 'pending'
-	| 'awaiting_approval'
-	| 'queued'
-	| 'downloading'
-	| 'cancelling'
-	| 'failed'
-	| 'imported';
+	'pending' | 'awaiting_approval' | 'queued' | 'downloading' | 'cancelling' | 'failed' | 'imported';
 
 export interface RequestAccepted {
 	success: boolean;

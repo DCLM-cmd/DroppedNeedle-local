@@ -60,7 +60,10 @@ class DiscoveryBatchService:
 
         library_mbids: set[str] = set()
         try:
-            library_mbids = {m.lower() for m in await self._library_db.get_all_album_mbids()}
+            owned = await self._library_db.existing_library_albums(
+                [item.release_group_mbid for item in body.items]
+            )
+            library_mbids = {m.lower() for m in owned}
         except Exception:  # noqa: BLE001
             logger.warning("Discovery batch: library membership check failed; treating all as new")
         active = await self._history.async_get_active_mbids()
@@ -131,7 +134,10 @@ class DiscoveryBatchService:
     async def _item_statuses(self, items: list[dict[str, Any]]) -> list[DiscoveryBatchItemStatus]:
         library_mbids: set[str] = set()
         try:
-            library_mbids = {m.lower() for m in await self._library_db.get_all_album_mbids()}
+            owned = await self._library_db.existing_library_albums(
+                [item["release_group_mbid"] for item in items]
+            )
+            library_mbids = {m.lower() for m in owned}
         except Exception:  # noqa: BLE001
             pass
         out: list[DiscoveryBatchItemStatus] = []

@@ -16,12 +16,22 @@ from core.dependencies import (
 )
 from core.exceptions import ConfigurationError, ExternalServiceError, TokenNotAuthorizedError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
+from middleware import CurrentAdminDep
 from services.lastfm_auth_service import LastFmAuthService
 from services.preferences_service import PreferencesService
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(route_class=MsgSpecRoute, prefix="/lastfm", tags=["lastfm"])
+
+async def _admin_guard(_: CurrentAdminDep) -> None: ...
+
+
+router = APIRouter(
+    route_class=MsgSpecRoute,
+    prefix="/lastfm",
+    tags=["lastfm"],
+    dependencies=[Depends(_admin_guard)],
+)
 
 
 @router.post("/auth/token", response_model=LastFmAuthTokenResponse)

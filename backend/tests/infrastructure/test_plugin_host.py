@@ -83,6 +83,165 @@ def test_manifest_requires_entrypoint_shape(tmp_path):
     with pytest.raises(ManifestError, match="entrypoint"):
         load_manifest(tmp_path / "p")
 
+V1_MANIFEST = """
+[plugin]
+name = "v1-plugin"
+version = "1.0.0"
+api_version = 1
+entrypoint = "plugin:TestPlugin"
+capabilities = ["scrobbler"]
+"""
+
+
+def test_manifest_v0_rejects_v1_only_capability(tmp_path):
+    bad = VALID_MANIFEST.replace('["scrobbler"]', '["download_client"]')
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="unknown capabilities"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_api_version_2_names_supported_versions(tmp_path):
+    bad = VALID_MANIFEST.replace("api_version = 0", "api_version = 2")
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match=r"\(0, 1\)"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_v1_accepts_all_nine_capabilities(tmp_path):
+    manifest = V1_MANIFEST.replace(
+        'capabilities = ["scrobbler"]',
+        'capabilities = ["scrobbler", "purchase_links", "download_client", "indexer",'
+        ' "subscriber", "publisher", "metadata_provider", "scheduler", "streaming_source"]',
+    ) + '\n[schedule]\ninterval_minutes = 60\n'
+    _write_plugin(tmp_path, "p", manifest, "")
+    loaded = load_manifest(tmp_path / "p")
+    assert len(loaded.capabilities) == 9
+
+
+@pytest.mark.parametrize("bad_name", ["Upper-Case", "has_underscore", "..", "a" * 33])
+def test_manifest_v1_rejects_non_kebab_names(tmp_path, bad_name):
+    bad = V1_MANIFEST.replace('"v1-plugin"', f'"{bad_name}"')
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="invalid plugin name"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_v0_legacy_name_check_is_unchanged(tmp_path):
+    ok = VALID_MANIFEST.replace('"test-plugin"', '"legacy_Name"')
+    _write_plugin(tmp_path, "p", ok, "")
+    assert load_manifest(tmp_path / "p").name == "legacy_Name"
+
+
+def test_manifest_rejects_unknown_plugin_key(tmp_path):
+    bad = VALID_MANIFEST.replace('capabilities = ["scrobbler"]', 'capabilities = ["scrobbler"]\nsoruce = "x"')
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="unknown"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_rejects_unknown_top_level_table(tmp_path):
+    bad = VALID_MANIFEST + '\n[capability_typo]\nfoo = 1\n'
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="unknown"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_route_requires_publisher_capability(tmp_path):
+    bad = V1_MANIFEST + '\n[[route]]\npath = "lookup"\nmethod = "GET"\nauth = "user"\n'
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="publisher"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_route_requires_api_1(tmp_path):
+    bad = VALID_MANIFEST + '\n[[route]]\npath = "lookup"\nmethod = "GET"\nauth = "user"\n'
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="api_version 1"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_plugin_ui_requires_api_1(tmp_path):
+    bad = VALID_MANIFEST + '\n[plugin_ui]\nentry = "ui/dist/panel.js"\n'
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="api_version 1"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_scheduler_requires_schedule_table(tmp_path):
+    bad = V1_MANIFEST.replace('["scrobbler"]', '["scheduler"]')
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="schedule"):
+        load_manifest(tmp_path / "p")
+
+
+@pytest.mark.parametrize("interval", [1, 4, 1441, 100000])
+def test_manifest_scheduler_rejects_out_of_range_interval(tmp_path, interval):
+    bad = V1_MANIFEST.replace('["scrobbler"]', '["scheduler"]') + f"\n[schedule]\ninterval_minutes = {interval}\n"
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="interval_minutes"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_schedule_requires_api_1(tmp_path):
+    bad = VALID_MANIFEST + "\n[schedule]\ninterval_minutes = 60\n"
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="api_version 1"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_capability_id_must_be_declared(tmp_path):
+    bad = V1_MANIFEST + '\n[[capability]]\nid = "indexer"\ntarget_source = "usenet"\n'
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="capabilities"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_rejects_unknown_capability_key(tmp_path):
+    bad = V1_MANIFEST.replace('["scrobbler"]', '["scrobbler", "indexer"]') + (
+        '\n[[capability]]\nid = "indexer"\ntarget_source = "usenet"\nsoruce = "x"\n'
+    )
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="unknown"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_rejects_bad_source_alias(tmp_path):
+    bad = V1_MANIFEST.replace('["scrobbler"]', '["download_client"]') + (
+        '\n[[capability]]\nid = "download_client"\nsource = "Bad_Name"\n'
+    )
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="source"):
+        load_manifest(tmp_path / "p")
+
+
+@pytest.mark.parametrize("target", ["soulseek", "plugin:Bad_Name", "http://x"])
+def test_manifest_rejects_bad_target_source(tmp_path, target):
+    bad = V1_MANIFEST.replace('["scrobbler"]', '["indexer"]') + (
+        f'\n[[capability]]\nid = "indexer"\ntarget_source = "{target}"\n'
+    )
+    _write_plugin(tmp_path, "p", bad, "")
+    with pytest.raises(ManifestError, match="target_source"):
+        load_manifest(tmp_path / "p")
+
+
+def test_manifest_v1_full_tables_accept(tmp_path):
+    manifest = (
+        V1_MANIFEST.replace('"v1-plugin"', '"full-plugin"').replace(
+            '["scrobbler"]', '["download_client", "indexer", "publisher", "scheduler"]'
+        )
+        + '\n[[capability]]\nid = "download_client"\nsource = "full-plugin"\ndisplay_name = "Full Plugin"\n'
+        + '\n[[capability]]\nid = "indexer"\ntarget_source = "plugin:full-plugin"\n'
+        + "\n[schedule]\ninterval_minutes = 60\nrun_on_load = true\n"
+        + '\n[[route]]\npath = "lookup"\nmethod = "POST"\nauth = "user"\nrate_limit_per_minute = 60\n'
+        + '\n[plugin_ui]\nentry = "ui/dist/panel.js"\npages = ["panel"]\n'
+    )
+    _write_plugin(tmp_path, "p", manifest, "")
+    loaded = load_manifest(tmp_path / "p")
+    assert [c.id for c in loaded.capability_configs] == ["download_client", "indexer"]
+    assert loaded.schedule is not None and loaded.schedule.interval_minutes == 60
+    assert loaded.routes[0].path == "lookup" and loaded.routes[0].method == "POST"
+    assert loaded.ui_entry == "ui/dist/panel.js" and loaded.ui_pages == ["panel"]
+
 
 # -- trust model --
 
@@ -168,15 +327,65 @@ def test_one_crashing_scrobbler_does_not_stop_the_next(tmp_path):
     module = type(worker_plugin.instance).__module__
     assert sys.modules[module].SEEN == ["Song"]
 
+@pytest.mark.asyncio
+async def test_scrobble_kind_reaches_subscriber_and_scrobbler_exactly_once(tmp_path):
+    """One ``dispatch_event`` with a scrobble kind notifies the subscriber path
+    AND fires v0 ``on_scrobble`` exactly once (the scrobble service calls only
+    ``dispatch_event``; a second direct ``dispatch_scrobble`` would double it)."""
+    from infrastructure.plugins.protocols import PluginEvent
+
+    manifest = V1_MANIFEST.replace('"v1-plugin"', '"both-plugin"').replace(
+        'capabilities = ["scrobbler"]', 'capabilities = ["scrobbler", "subscriber"]'
+    )
+    code = (
+        "SEEN = []\nEVENTS = []\n\nclass TestPlugin:\n"
+        "    def __init__(self, context):\n        self.ctx = context\n"
+        "    async def on_scrobble(self, event):\n        SEEN.append(event.track)\n"
+        "    async def on_event(self, event):\n        EVENTS.append(event.kind)\n"
+    )
+    prefs = FakePrefs()
+    prefs.enable("both-plugin")
+    _write_plugin(tmp_path, "both-plugin", manifest, code)
+    host = PluginHost(plugins_dir=tmp_path, preferences_service=prefs)
+    host.load_all()
+    plugin = host.get("both-plugin")
+    assert plugin is not None
+    assert set(plugin.active_capabilities) == {"scrobbler", "subscriber"}
+
+    await host.dispatch_event(
+        PluginEvent(
+            kind="scrobble",
+            payload=ScrobbleEvent(artist="A", track="Song"),
+            causation_id="once-1",
+        )
+    )
+    await asyncio.sleep(0.3)
+
+    import sys
+
+    module = sys.modules[type(plugin.instance).__module__]
+    assert module.SEEN == ["Song"]
+    assert module.EVENTS == ["scrobble"]
+
 
 def test_no_capability_acquires_content(tmp_path):
-    """D22: the host offers no way for a plugin to fetch audio. A manifest asking
-    for the old `audio_source` capability fails to load loudly rather than being
-    silently ignored, and the host exposes no dispatch method for it."""
+    """v1 pins its nine capability ids; the old `audio_source` fetch path stays
+    gone: unknown at load, with no host dispatch for it."""
     from infrastructure.plugins.manifest import KNOWN_CAPABILITIES
 
+    assert set(KNOWN_CAPABILITIES) == {
+        "scrobbler",
+        "purchase_links",
+        "download_client",
+        "indexer",
+        "subscriber",
+        "publisher",
+        "metadata_provider",
+        "scheduler",
+        "streaming_source",
+    }
     assert "audio_source" not in KNOWN_CAPABILITIES
-    for gone in ("sources", "source_search", "source_fetch", "require_source"):
+    for gone in ("source_search", "source_fetch"):
         assert not hasattr(PluginHost, gone), f"PluginHost.{gone} came back"
 
     manifest = VALID_MANIFEST.replace(
@@ -257,19 +466,40 @@ class _FakeResponse:
         self.content = content
         self.headers = headers or {}
 
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        for offset in range(0, len(self.content), chunk_size):
+            yield self.content[offset:offset + chunk_size]
+
+
+class _FakeStream:
+    """Sync-built async context manager mirroring ``httpx.AsyncClient.stream``."""
+
+    def __init__(self, response: _FakeResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self._response
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
 
 def _fake_http(responses: dict[str, _FakeResponse]):
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, MagicMock
 
     http = AsyncMock()
 
-    async def _get(url: str, **_kwargs):
+    def _match(url: str) -> _FakeResponse:
         for fragment, response in responses.items():
             if fragment in url:
                 return response
         return _FakeResponse(404)
 
+    async def _get(url: str, **_kwargs):
+        return _match(url)
+
     http.get = AsyncMock(side_effect=_get)
+    http.stream = MagicMock(side_effect=lambda *args, **kwargs: _FakeStream(_match(args[1])))
     return http
 
 
@@ -339,6 +569,66 @@ async def test_install_refuses_an_oversized_repo_before_buffering(tmp_path):
 
     with pytest.raises(PluginInstallError, match="too large"):
         await host.install_from_github("https://github.com/owner/repo", http)
+
+@pytest.mark.asyncio
+async def test_install_refuses_a_streamed_body_over_the_cap(tmp_path, monkeypatch):
+    """No (or lying) content-length: the streamed accumulation still refuses."""
+    import infrastructure.plugins.host as host_module
+    from infrastructure.plugins.host import PluginInstallError
+
+    monkeypatch.setattr(host_module, "_MAX_PLUGIN_ZIP_BYTES", 1024)
+    host = PluginHost(plugins_dir=tmp_path, preferences_service=FakePrefs())
+    http = _fake_http({"heads/main": _FakeResponse(200, b"x" * 2048)})
+
+    with pytest.raises(PluginInstallError, match="too large"):
+        await host.install_from_github("https://github.com/owner/repo", http)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_install_refuses_a_zip_bomb(tmp_path):
+    """A tiny archive decompressing past the per-file cap is refused."""
+    import io
+    import zipfile
+
+    import infrastructure.plugins.host as host_module
+    from infrastructure.plugins.host import PluginInstallError
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("repo-main/plugin.toml", VALID_MANIFEST)
+        zf.writestr("repo-main/plugin.py", SCROBBLER_CODE)
+        zf.writestr("repo-main/bomb.bin", b"\0" * (host_module._MAX_PLUGIN_ZIP_FILE_BYTES + 1))
+    archive = buffer.getvalue()
+    assert len(archive) < host_module._MAX_PLUGIN_ZIP_BYTES
+
+    host = PluginHost(plugins_dir=tmp_path, preferences_service=FakePrefs())
+    http = _fake_http({"heads/main": _FakeResponse(200, archive)})
+
+    with pytest.raises(PluginInstallError, match="oversized|too large"):
+        await host.install_from_github("https://github.com/owner/repo", http)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_unpack_refuses_total_decompressed_bytes(tmp_path, monkeypatch):
+    """Many small files summing past the total cap are refused mid-extract."""
+    import io
+    import zipfile
+
+    import infrastructure.plugins.host as host_module
+    from infrastructure.plugins.host import PluginInstallError
+
+    monkeypatch.setattr(host_module, "_MAX_PLUGIN_ZIP_DECOMPRESSED_BYTES", 100)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("repo-main/plugin.toml", VALID_MANIFEST)
+        zf.writestr("repo-main/plugin.py", SCROBBLER_CODE)
+    host = PluginHost(plugins_dir=tmp_path, preferences_service=FakePrefs())
+
+    with pytest.raises(PluginInstallError, match="too large"):
+        host._unpack_plugin_zip(buffer.getvalue())
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.asyncio

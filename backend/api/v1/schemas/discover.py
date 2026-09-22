@@ -7,6 +7,25 @@ from models.youtube import YouTubeQuotaResponse as YouTubeQuotaResponse
 from infrastructure.msgspec_fastapi import AppStruct
 
 
+class DiscoverActivityRequest(AppStruct):
+    feature: Literal["home", "discover", "queue", "artist"]
+    artist_mbid: str | None = None
+    section: Literal["similar", "top_songs", "top_albums"] | None = None
+    provider: Literal["lastfm", "listenbrainz"] | None = None
+
+
+
+class DiscoverActivityResponse(AppStruct):
+    source_mode: str
+    source_id: str
+    generation: int
+
+class DiscoverQueuePreview(AppStruct):
+    status: Literal["available", "not_found", "unavailable"]
+    youtube_url: str | None = None
+    youtube_search_url: str | None = None
+
+
 class BecauseYouListenTo(AppStruct):
     seed_artist: str
     seed_artist_mbid: str

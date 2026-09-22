@@ -12,6 +12,8 @@ from api.v1.schemas.library_policies import (
 )
 from api.v1.schemas.settings import (
     ACOUSTID_KEY_MASK,
+    LibraryScanFilesystemWatcherSettings,
+    LibraryScanScheduleSettings,
     LibrarySettings,
     LibrarySyncSettings,
 )
@@ -157,3 +159,47 @@ def test_seeds_library_paths_from_legacy_root(tmp_path: Path):
     )
     prefs = PreferencesService(settings)
     assert prefs.get_library_settings().library_paths == ["/legacy/music"]
+
+
+def test_scan_dirty_scopes_default_empty(prefs):
+    assert prefs.get_library_scan_dirty_scopes().scope_ids == []
+
+
+def test_scan_filesystem_watcher_defaults_on_with_300s_poll(prefs):
+    """T15 (S-01 Hook C, D6): the poller defaults ON at 300s/60s."""
+    watcher = prefs.get_library_scan_filesystem_watcher()
+    assert watcher.enabled is True
+    assert watcher.poll_interval_seconds == 300.0
+    assert watcher.batch_window_seconds == 60.0
+
+
+def test_scan_filesystem_watcher_round_trip(prefs):
+    prefs.save_library_scan_filesystem_watcher(
+        LibraryScanFilesystemWatcherSettings(
+            enabled=False, poll_interval_seconds=60.0, batch_window_seconds=10.0
+        )
+    )
+    reloaded = prefs.get_library_scan_filesystem_watcher()
+    assert reloaded.enabled is False
+    assert reloaded.poll_interval_seconds == 60.0
+    assert reloaded.batch_window_seconds == 10.0
+
+
+def test_scan_dirty_scopes_mark_unions_and_clear_drops_consumed(prefs):
+    prefs.mark_library_scan_dirty_scopes(["root-a"])
+    prefs.mark_library_scan_dirty_scopes(["root-b", "root-a"])
+    assert prefs.get_library_scan_dirty_scopes().scope_ids == ["root-a", "root-b"]
+    prefs.clear_library_scan_dirty_scopes(["root-a"])
+    assert prefs.get_library_scan_dirty_scopes().scope_ids == ["root-b"]
+    prefs.clear_library_scan_dirty_scopes(["root-b"])
+    assert prefs.get_library_scan_dirty_scopes().scope_ids == []
+
+
+def test_unrelated_section_saves_mark_no_dirty_scopes(prefs):
+    """T16 (S-01 Hook B): schedule-text and non-library saves mark nothing."""
+    prefs.save_library_scan_schedule(
+        LibraryScanScheduleSettings(scan_frequency="manual")
+    )
+    prefs.save_library_sync_settings(LibrarySyncSettings(sync_frequency="6hr"))
+    prefs.save_library_settings(LibrarySettings(library_paths=["/m"]))
+    assert prefs.get_library_scan_dirty_scopes().scope_ids == []

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from core.exceptions import NewznabApiError
 from models.acquisition_quality import AcquisitionQualitySnapshot
 from models.download import ScoredCandidate, TargetAlbum, TargetTrack
 from models.download_identity import soulseek_identity, usenet_identity
@@ -23,15 +24,15 @@ from repositories.protocols.download_client import (
     EnqueueRequest,
     TaskHandle,
 )
+from services.album_utils import audio_tracks
+from services.native.acquisition import scoring_core
 from services.native.acquisition.errors import OrchestrationError
 from services.native.file_processor import (
     DOWNLOADS_MOUNT_UNAVAILABLE,
     QUARANTINE_REASONS,
     FileFailure,
     ProcessResult,
-    _TAG_TITLE_WEAK,
 )
-from services.native.title_match import title_containment_score
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,9 @@ async def _expected_tracks_for_task(  # noqa: ANN001, ANN201
             info = await album_service.get_album_tracks_info(task.release_group_mbid)
     except Exception as error:  # noqa: BLE001 - no exact proof means no enqueue
         raise OrchestrationError("could not verify the exact album edition") from error
+    # Audio media only: DVD-video positions are not downloadable audio, and the
+    # manifest must measure the same target set as request time and coverage.
+    tracks = audio_tracks(list(info.tracks))
     expected = [
         ExpectedTrack(
             track_number=track.position,
@@ -113,7 +117,7 @@ async def _expected_tracks_for_task(  # noqa: ANN001, ANN201
             title=track.title,
             release_track_mbid=track.release_track_id,
         )
-        for track in info.tracks
+        for track in tracks
     ]
     if (
         not expected
@@ -152,26 +156,16 @@ def _file_serves_expected(value, tracks) -> bool:  # noqa: ANN001
     title only excludes when duration cannot rescue it (peer paths like ``02.flac``
     carry no title signal), a hard duration miss always excludes, and a track with
     no usable signal cannot be discriminated - its files pass rather than strand
-    the position on every candidate."""
-    stem = value.filename.replace("\\", "/").rsplit("/", 1)[-1]
-    base, dot, _ext = stem.rpartition(".")
-    if dot and base:
-        stem = base
-    for track in tracks:
-        title_ok = None
-        if track.title and stem:
-            title_ok = title_containment_score(track.title, stem) >= _TAG_TITLE_WEAK
-        duration_ok = None
-        if track.duration_seconds and value.duration:
-            duration_ok = abs(value.duration - track.duration_seconds) <= max(
-                15.0, 0.10 * track.duration_seconds
-            )
-        if duration_ok is False:
-            continue
-        if title_ok is False and duration_ok is not True:
-            continue
-        return True
-    return False
+    the position on every candidate. Thin wrapper over the shared
+    ``scoring_core`` pair rule so the failover filter and grab-time overlap can
+    never drift apart."""
+    stem = scoring_core.filename_stem(value.filename)
+    return any(
+        scoring_core.pair_serves_track(
+            stem, value.duration, track.title, track.duration_seconds
+        )
+        for track in tracks
+    )
 
 
 def pre_publication_quality_check(
@@ -520,6 +514,21 @@ class SoulseekStrategy:
             timeout=timeout,
         )
         results = [r.soulseek for r in indexer_results if r.soulseek is not None]
+        # Grab-time overlap input: the same pinned-edition tracklist the import
+        # will verify against, resolved WITHOUT pinning side-effects
+        # (task_store=None - pinning stays at enqueue). Advisory only: any
+        # resolution failure falls back to today's tracklist-blind rank.
+        expected_tracks: list = []
+        if self._album_service is not None and task.release_group_mbid:
+            try:
+                _, expected_tracks = await _expected_tracks_for_task(
+                    task, self._album_service, None
+                )
+            except OrchestrationError as exc:
+                logger.info(
+                    "download.overlap_unresolved",
+                    extra={"task_id": task.id, "reason": str(exc)},
+                )
         return await self._scorer.rank(
             target,
             results,
@@ -528,6 +537,8 @@ class SoulseekStrategy:
             auto_accept_threshold=auto,
             manual_threshold=manual,
             held_tier=held_tier,
+            expected_tracks=expected_tracks,
+            release_group_mbid=task.release_group_mbid,
         )
 
     async def _search_under_aliases(
@@ -621,6 +632,8 @@ class SoulseekStrategy:
                 for value in candidate.files
                 if _file_serves_expected(value, expected_tracks)
             ]
+            if not serving:
+                raise OrchestrationError("candidate has no files serving the remaining tracks")
 
         files = [
             DownloadFileRef(
@@ -943,6 +956,31 @@ class UsenetStrategy:
             },
         )
 
+    async def _blocklist_content_rejected_release(self, task, release) -> None:  # noqa: ANN001
+        """Quarantine a release whose NZB fetch returned an indexer error/limit page.
+
+        A non-NZB body is deterministic (propagation can't fix an indexer error
+        page), so no age leniency applies - unlike ``maybe_blocklist_on_failure``.
+        Same title+size identity and ``download_failed`` reason vocabulary so a
+        follow-up search/score run skips this release.
+        """
+        identity = usenet_identity(release.title, release.size_bytes)
+        await self._store.record_quarantine(
+            source="usenet",
+            identity=identity,
+            reason="download_failed",
+            release_group_mbid=task.release_group_mbid,
+        )
+        logger.info(
+            "download.quarantined",
+            extra={
+                "task_id": task.id,
+                "source": "usenet",
+                "reason": "nzb_content_rejected",
+                "identity": identity,
+            },
+        )
+
     async def search_and_score(self, task, *, timeout, auto, manual, snapshot):  # noqa: ANN001, ANN201
         # A track upgrade still fetches the album NZB (D4), but its floor is the
         # RECORDING's held tier - _upgrade_held_tier scopes by download_type.
@@ -1057,6 +1095,18 @@ class UsenetStrategy:
                     post_processing=self._post_processing,
                 )
             )
+        except NewznabApiError as exc:
+            if getattr(exc, "content_rejection", False):
+                # Deterministic indexer content rejection (an HTML error/limit page
+                # instead of an NZB): blocklist this release by title+size so a
+                # re-search skips it, then fail over surfacing the safe message.
+                # ``exc.message`` (not ``str(exc)``) - ``str`` appends ``details``,
+                # which carries the indexer body snippet that must never reach the
+                # user-facing task error.
+                await self._blocklist_content_rejected_release(task, release)
+                raise OrchestrationError(exc.message) from exc
+            logger.exception("Usenet enqueue failed for task %s", task.id)
+            raise OrchestrationError("enqueue failed") from exc
         except Exception as exc:  # noqa: BLE001 - any client error -> task failed
             logger.exception("Usenet enqueue failed for task %s", task.id)
             raise OrchestrationError("enqueue failed") from exc

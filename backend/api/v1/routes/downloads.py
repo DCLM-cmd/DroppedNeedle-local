@@ -43,6 +43,7 @@ from api.v1.schemas.download import (
     HeldManagementActionResponse,
     HeldReevaluateResponse,
     HeldReverifyResponse,
+    HeldVerdictActionResponse,
     NextSourceRequest,
     NextSourceResponse,
     ReimportDownloadResponse,
@@ -141,6 +142,8 @@ def _to_response(  # noqa: ANN001 - DownloadTask
         attempt_total=task.attempt_total,
         has_next_source=task.has_next_source,
         held_for_review=held_for_review,
+        wrong_product_verdict_at=task.wrong_product_verdict_at,
+        wrong_product_detail=task.wrong_product_detail,
     )
 
 
@@ -610,6 +613,23 @@ async def discard_management_hold(
         source_task_id, current_user.id, current_user.role
     )
     return HeldManagementActionResponse(status="discarded", files=count)
+
+
+@router.post(
+    "/held/verdict/{source_task_id}/discard",
+    response_model=HeldVerdictActionResponse,
+)
+async def discard_held_verdict(
+    source_task_id: str,
+    current_user: CurrentUserDep,
+    service=Depends(get_download_service),
+):
+    """Discard every verification-held track for one download (the wrong-product
+    verdict action) and clear the verdict (admin/owner)."""
+    count = await service.discard_held_for_task(
+        source_task_id, current_user.id, current_user.role
+    )
+    return HeldVerdictActionResponse(status="discarded", files=count)
 
 
 @router.post("/held/{held_id}/import", response_model=HeldActionResponse)

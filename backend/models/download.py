@@ -8,8 +8,7 @@ service/persistence-layer domain types.
 from infrastructure.msgspec_fastapi import AppStruct
 from models.acquisition_quality import AudioQualityEvidence, QualityDecision
 from repositories.protocols.download_client import DownloadSearchResult
-from repositories.protocols.indexer import UsenetRelease
-
+from repositories.protocols.indexer import PluginSearchResult, UsenetRelease
 
 class ScoredCandidate(AppStruct):
     """A scored acquisition candidate - the convergence point for both sources
@@ -32,10 +31,17 @@ class ScoredCandidate(AppStruct):
     parent_directory: str = ""
     files: list[DownloadSearchResult] = []
     usenet_release: UsenetRelease | None = None
+    # Plugin release for a ``plugin:<name>`` candidate; None for soulseek/usenet.
+    # Optional + defaulted so pre-feature blobs decode unchanged (strict=False).
+    plugin_release: PluginSearchResult | None = None
     coherence: float = 0.0
     file_confidence: float = 0.0
     final_score: float = 0.0
     tier: str = "rejected"
+    # Grab-time tracklist overlap (0..1) when the rank knew the pinned
+    # edition's tracklist, else None (pre-feature blobs, manual searches, and
+    # unresolvable tracklists). Folds into final_score; shown on review cards.
+    track_overlap: float | None = None
     # Response-only pointer into the persisted candidate list. It lets a current-policy
     # review projection reorder/filter older blobs without changing what a Pick indexes.
     candidate_index: int | None = None
@@ -213,3 +219,9 @@ class DownloadTask(AppStruct):
     completed_at: float | None = None
     cancelled_at: float | None = None
     updated_at: float = 0.0
+    # Wrong-product verdict: set when an album import processed files but
+    # imported nothing and every failure was tag-verification (the grabbed
+    # folder is a different product wearing the right name). The detail names
+    # the grabbed folder; member evidence stays on the per-file held rows.
+    wrong_product_verdict_at: float | None = None
+    wrong_product_detail: str | None = None

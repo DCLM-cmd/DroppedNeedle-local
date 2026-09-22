@@ -4,21 +4,49 @@ from fastapi import APIRouter, Depends, HTTPException
 from starlette.background import BackgroundTask
 from starlette.responses import FileResponse
 
-from core.dependencies import get_local_files_service
-from core.exceptions import ExternalServiceError, ResourceNotFoundError
+from api.v1.schemas.local_files import DownloadAccessResponse
+from core.dependencies import get_local_files_service, get_preferences_service
+from core.exceptions import (
+    ExternalServiceError,
+    PermissionDeniedError,
+    ResourceNotFoundError,
+)
 from infrastructure.msgspec_fastapi import MsgSpecRoute
+from middleware import CurrentUserDep
 from services.local_files_service import LocalFilesService
+from services.preferences_service import PreferencesService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(route_class=MsgSpecRoute, prefix="/download", tags=["download"])
 
+_FORBIDDEN_DOWNLOAD_MESSAGE = "Library downloads are restricted by the administrator"
+
+
+def _require_library_download(preferences: PreferencesService, role: str) -> None:
+    if not preferences.is_library_download_allowed(role):
+        raise PermissionDeniedError(_FORBIDDEN_DOWNLOAD_MESSAGE)
+
+
+@router.get("/access", response_model=DownloadAccessResponse)
+async def download_access(
+    current_user: CurrentUserDep,
+    preferences: PreferencesService = Depends(get_preferences_service),
+) -> DownloadAccessResponse:
+    """Viewer capability for card/menu download items (no album in hand)."""
+    return DownloadAccessResponse(
+        allowed=preferences.is_library_download_allowed(current_user.role)
+    )
+
 
 @router.get("/local/track/{track_id}")
 async def download_track(
     track_id: str,
+    current_user: CurrentUserDep,
     local_service: LocalFilesService = Depends(get_local_files_service),
+    preferences: PreferencesService = Depends(get_preferences_service),
 ) -> FileResponse:
+    _require_library_download(preferences, current_user.role)
     try:
         file_path, filename, media_type = await local_service.get_download_track(track_id)
         return FileResponse(
@@ -42,9 +70,12 @@ async def download_track(
 
 @router.get("/local/album/{album_id}")
 async def download_album(
-    album_id: int,
+    album_id: str,
+    current_user: CurrentUserDep,
     local_service: LocalFilesService = Depends(get_local_files_service),
+    preferences: PreferencesService = Depends(get_preferences_service),
 ) -> FileResponse:
+    _require_library_download(preferences, current_user.role)
     try:
         zip_path, zip_filename = await local_service.create_album_zip(album_id)
         return FileResponse(
@@ -69,8 +100,11 @@ async def download_album(
 @router.get("/local/album/mbid/{mbid}")
 async def download_album_by_mbid(
     mbid: str,
+    current_user: CurrentUserDep,
     local_service: LocalFilesService = Depends(get_local_files_service),
+    preferences: PreferencesService = Depends(get_preferences_service),
 ) -> FileResponse:
+    _require_library_download(preferences, current_user.role)
     try:
         zip_path, zip_filename = await local_service.create_album_zip_by_mbid(mbid)
         return FileResponse(

@@ -8,6 +8,12 @@ import {
 	updateDiscoverQueueCacheTTL
 } from './discoverQueueCache';
 
+const { source } = vi.hoisted(() => ({
+	source: { source_mode: 'brainzmash', source_id: 'opaque-a', generation: 1 }
+}));
+vi.mock('$lib/queries/musicbrainz/sourceScope.svelte', () => ({
+	musicBrainzSourceKey: (userId: string) => ({ user_id: userId, ...source })
+}));
 const USER_A = 'user-a';
 const USER_B = 'user-b';
 
@@ -16,6 +22,8 @@ describe('discoverQueueCache', () => {
 		localStorage.clear();
 		updateDiscoverQueueCacheTTL(CACHE_TTL.DISCOVER_QUEUE);
 		vi.restoreAllMocks();
+		source.source_id = 'opaque-a';
+		source.generation = 1;
 	});
 
 	it('stores and retrieves queue items with enrichment payload', () => {
@@ -105,5 +113,30 @@ describe('discoverQueueCache', () => {
 		expect(getQueueCachedData(USER_A)?.data.queueId).toBe('queue-a');
 		expect(getQueueCachedData(USER_B)?.data.queueId).toBe('queue-b');
 		expect(getQueueCachedData('user-c')).toBeNull();
+	});
+	it('rejects legacy envelopes without provenance', () => {
+		localStorage.setItem(
+			`${CACHE_KEYS.DISCOVER_QUEUE}_${USER_A}`,
+			JSON.stringify({
+				data: { items: [], currentIndex: 0, queueId: 'legacy' },
+				timestamp: Date.now()
+			})
+		);
+		expect(getQueueCachedData(USER_A)).toBeNull();
+	});
+
+	it('does not revive an old A queue after A to B to A, even without reading in B', () => {
+		setQueueCachedData({ items: [], currentIndex: 0, queueId: 'old-a' }, USER_A);
+		source.source_id = 'opaque-b';
+		source.generation = 2;
+		source.source_id = 'opaque-a-new';
+		source.generation = 3;
+		expect(getQueueCachedData(USER_A)).toBeNull();
+	});
+
+	it('rejects writes before source identity is known', () => {
+		source.source_id = '';
+		setQueueCachedData({ items: [], currentIndex: 0, queueId: 'unknown' }, USER_A);
+		expect(getQueueCachedData(USER_A)).toBeNull();
 	});
 });

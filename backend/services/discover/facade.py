@@ -17,11 +17,14 @@ if TYPE_CHECKING:
     )
     from services.home.genre_artwork_service import GenreArtworkService
     from services.native.background_workload_gate import BackgroundWorkloadGate
-
+    from services.plugin_sources import PluginSourceRegistry
 from fastapi import HTTPException
 
 from api.v1.schemas.discover import (
     DiscoverQueueEnrichment,
+    DiscoverActivityRequest,
+    DiscoverActivityResponse,
+    DiscoverQueuePreview,
     DiscoverQueueResponse,
     DiscoverIgnoredRelease,
     PlaylistSuggestionsRequest,
@@ -51,6 +54,9 @@ from services.per_user_client_factory import PerUserClientFactory
 from infrastructure.persistence.user_listening_prefs_store import (
     UserListeningPrefsStore,
 )
+from infrastructure.observability.provider_counters import ProviderWorkload, provider_workload
+from infrastructure.queue.priority_queue import RequestPriority
+from repositories.protocols.youtube import YouTubeRepositoryProtocol
 
 
 class DiscoverService:
@@ -86,11 +92,13 @@ class DiscoverService:
         discovery_snapshot_store: "DiscoverySnapshotStore | None" = None,
         workload_gate: "BackgroundWorkloadGate | None" = None,
         mb_canonical_store: Any = None,
+        plugin_sources: "PluginSourceRegistry | None" = None,
     ):
-        self._integration = IntegrationHelpers(preferences_service)
+        self._integration = IntegrationHelpers(preferences_service, plugin_sources)
         self._client_factory = client_factory
         self._prefs_store = listening_prefs_store
         self._ownership = ownership_service
+        self._snapshot_store = discovery_snapshot_store
 
         self._mbid_resolution = MbidResolutionService(
             musicbrainz_repo=musicbrainz_repo,
@@ -99,6 +107,7 @@ class DiscoverService:
             library_db=library_db,
             mbid_store=mbid_store,
             mb_canonical_store=mb_canonical_store,
+            progress_store=discovery_snapshot_store,
         )
 
         self._enrichment = QueueEnrichmentService(
@@ -159,6 +168,27 @@ class DiscoverService:
             lfm_repo=lastfm_repo,
             preview_repo=preview_repo,
         )
+    async def record_activity(self, user_id: str, request: DiscoverActivityRequest) -> DiscoverActivityResponse:
+        import time
+        import msgspec
+        from api.v1.schemas.discover import DiscoverActivityResponse
+        from core.exceptions import ValidationError
+        from infrastructure.validators import is_valid_mbid
+        from repositories.musicbrainz_base import capture_mb_source_context, mb_publish_if_current
+
+        if request.feature == "artist":
+            if not request.artist_mbid or not is_valid_mbid(request.artist_mbid) or not request.section or not request.provider:
+                raise ValidationError("Artist activity requires artist, section and provider")
+        elif request.artist_mbid is not None or request.section is not None or request.provider is not None:
+            raise ValidationError("Artist fields require the artist feature")
+        source = capture_mb_source_context()
+        source_key = msgspec.json.encode((source.source_mode, source.source_id, source.generation)).decode()
+        if self._snapshot_store:
+            await mb_publish_if_current(source, lambda: self._snapshot_store.record_activity(
+                user_id, request.feature, source_key, time.time(),
+                request.artist_mbid or "", request.section or "", request.provider or "",
+            ))
+        return DiscoverActivityResponse(source_mode=source.source_mode, source_id=source.source_id, generation=source.generation)
 
     async def get_discover_data(self, user_id: str):
         response = await self._homepage.get_discover_data(user_id)
@@ -171,14 +201,12 @@ class DiscoverService:
     async def refresh_discover_data(self, user_id: str) -> None:
         return await self._homepage.refresh_discover_data(user_id)
 
-    async def warm_cache(self, user_id: str) -> None:
+    async def warm_cache(self, user_id: str) -> bool:
         return await self._homepage.warm_cache(user_id)
 
     async def peek_freshness(self, user_id: str) -> tuple[bool, bool]:
         return await self._homepage.peek_freshness(user_id)
 
-    async def warm_cache_thorough(self, user_id: str) -> None:
-        return await self._homepage.warm_cache_thorough(user_id)
 
     async def build_discover_data(self, user_id: str):
         response = await self._homepage.build_discover_data(user_id)
@@ -295,7 +323,11 @@ class DiscoverService:
     async def enrich_queue_item(
         self, release_group_mbid: str
     ) -> DiscoverQueueEnrichment:
-        return await self._enrichment.enrich_queue_item(release_group_mbid)
+        with provider_workload(ProviderWorkload.QUEUE):
+            return await self._enrichment.enrich_queue_item(release_group_mbid, priority=RequestPriority.USER_INITIATED)
+
+    async def preview_queue_item(self, release_group_mbid: str, youtube_repo: YouTubeRepositoryProtocol) -> DiscoverQueuePreview:
+        return await self._enrichment.preview_queue_item(release_group_mbid, youtube_repo)
 
     def resolve_source(self, source: str | None) -> str:
         return self._integration.resolve_source(source)

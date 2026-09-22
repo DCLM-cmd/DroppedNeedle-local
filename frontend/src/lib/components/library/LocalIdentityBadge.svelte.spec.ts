@@ -10,7 +10,7 @@ describe('LocalIdentityBadge.svelte', () => {
 		['custom_edition', 'Custom edition'],
 		['release_linked', 'MusicBrainz linked']
 	] as const)('shows the album identity state %s', async (state, label) => {
-		render(LocalIdentityBadge, {
+		await render(LocalIdentityBadge, {
 			props: { state, subject: 'album', showDescription: true }
 		} as Parameters<typeof render<typeof LocalIdentityBadge>>[1]);
 
@@ -18,10 +18,57 @@ describe('LocalIdentityBadge.svelte', () => {
 	});
 
 	it('describes artist identity independently', async () => {
-		render(LocalIdentityBadge, {
+		await render(LocalIdentityBadge, {
 			props: { state: 'musicbrainz_linked', subject: 'artist', showDescription: true }
 		} as Parameters<typeof render<typeof LocalIdentityBadge>>[1]);
 
 		await expect.element(page.getByText('This artist is linked to MusicBrainz.')).toBeVisible();
+	});
+
+	it('shows a best-fit edition when tags agree on a pressing', async () => {
+		await render(LocalIdentityBadge, {
+			props: {
+				state: 'release_group_linked',
+				subject: 'album',
+				showDescription: true,
+				pickBasis: 'embedded_tags'
+			}
+		} as Parameters<typeof render<typeof LocalIdentityBadge>>[1]);
+
+		await expect.element(page.getByText('Best-fit edition', { exact: true })).toBeVisible();
+		await expect
+			.element(
+				page.getByText('Your files agree on this pressing, shown as the best fit until verified.')
+			)
+			.toBeVisible();
+	});
+
+	it('shows a best-fit edition when the pressing is pinned', async () => {
+		await render(LocalIdentityBadge, {
+			props: {
+				state: 'release_group_linked',
+				subject: 'album',
+				showDescription: true,
+				pickBasis: 'pin'
+			}
+		} as Parameters<typeof render<typeof LocalIdentityBadge>>[1]);
+
+		await expect.element(page.getByText('Best-fit edition', { exact: true })).toBeVisible();
+	});
+
+	it('shows a best-fit edition when the pressing matches the identity', async () => {
+		await render(LocalIdentityBadge, {
+			props: {
+				state: 'release_group_linked',
+				subject: 'album',
+				showDescription: true,
+				pickBasis: 'owned'
+			}
+		} as Parameters<typeof render<typeof LocalIdentityBadge>>[1]);
+
+		await expect.element(page.getByText('Best-fit edition', { exact: true })).toBeVisible();
+		await expect
+			.element(page.getByText('This pressing matches your identified edition and is shown.'))
+			.toBeVisible();
 	});
 });

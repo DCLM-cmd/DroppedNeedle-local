@@ -130,6 +130,16 @@ async def get_status(
         if configured
         else ServiceStatus(status="error", message="not configured")
     )
+    # The actual lookup dir: the container mount plus the UI subfolder. Shown in
+    # the UI so a wrong subfolder reads as a wrong path, not a mystery.
+    subpath = (
+        preferences.get_download_client_settings_raw().downloads_subpath or ""
+    )
+    effective_downloads_path = (
+        str(Path(app_settings.slskd_downloads_path) / subpath)
+        if subpath
+        else str(app_settings.slskd_downloads_path)
+    )
     # Catch the silent misconfig: a mount that passes the basic checks but where
     # slskd's finished downloads aren't actually visible (wrong path / unreadable).
     advisory: str | None = None
@@ -141,20 +151,32 @@ async def get_status(
         saves_to = f" slskd saves to {slskd_dir}." if slskd_dir else ""
         if diag.supported and diag.completed_downloads > 0:
             if not diag.mount_has_files:
-                advisory = (
-                    f"slskd has {diag.completed_downloads} finished download(s), but the downloads "
-                    f"folder at {mount.path} looks empty.{saves_to} Make sure it points to slskd's "
-                    f"downloads directory and that the container can read it (check the PUID/GID)."
-                )
+                if subpath:
+                    # The base mount is fine; the subfolder below doubled it into a
+                    # path that holds nothing. Name the box, not permissions.
+                    advisory = (
+                        f"slskd has {diag.completed_downloads} finished download(s), but nothing is "
+                        f"visible in {effective_downloads_path}. That path is your mount plus the "
+                        f"downloads subfolder below.{saves_to} If the mount already points at slskd's "
+                        f"folder, clear the subfolder box and save again."
+                    )
+                else:
+                    advisory = (
+                        f"slskd has {diag.completed_downloads} finished download(s), but the downloads "
+                        f"folder at {mount.path} looks empty.{saves_to} Make sure it points to slskd's "
+                        f"downloads directory and that the container can read it (check the PUID/GID)."
+                    )
             elif diag.sampled_downloads > 0 and diag.resolvable_downloads == 0:
                 # Mount has files but NONE of slskd's finished downloads resolve under it -
                 # the classic "mounted a parent (whole media share) instead of slskd's
                 # completed-downloads dir" footgun. The finder then can't reach them.
+                # The mount itself lives in docker-compose, so the in-UI fix is the
+                # subfolder box, not the mount.
                 advisory = (
                     f"None of slskd's {diag.completed_downloads} finished download(s) are visible "
-                    f"under {mount.path}.{saves_to} The downloads mount usually points at a parent "
+                    f"under {mount.path}.{saves_to} The downloads mount usually covers a parent "
                     f"folder (e.g. your whole media share) instead of slskd's completed-downloads "
-                    f"folder. Point it at the completed-downloads folder."
+                    f"folder. Type the rest of the path in the downloads subfolder below."
                 )
     return DownloadClientStatusResponse(
         configured=configured,
@@ -162,4 +184,5 @@ async def get_status(
         mount=mount,
         mount_advisory=advisory,
         slskd_downloads_dir=slskd_dir,
+        effective_downloads_path=effective_downloads_path,
     )

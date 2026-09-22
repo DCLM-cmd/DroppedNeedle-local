@@ -11,8 +11,9 @@ import logging
 import os
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -20,6 +21,8 @@ from core.exceptions import (
     ImportDestinationOccupiedError,
     AutomaticManagementHoldError,
     ConfigurationError,
+    ConflictError,
+    OrganizerRetryAlreadyRunningError,
     PermissionDeniedError,
     ResourceNotFoundError,
     ValidationError,
@@ -31,6 +34,7 @@ from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.sse_publisher import SSEPublisher
 from models.download_identity import delivered_identities
 from models.download import (
+    DownloadActivitySummary,
     DownloadsMountStatus,
     ScoredCandidate,
     SearchJob,
@@ -170,6 +174,45 @@ def check_downloads_mount(
 # more. Bounded so a pathological history cannot turn one button press into an
 # unbounded scan.
 _BLACKLIST_TASK_SCAN_LIMIT = 50
+def _organizer_retry_payload(
+    *,
+    state: str,
+    stage: str,
+    files_completed: int,
+    files_total: int,
+    files_imported: int | None = None,
+    error: str | None = None,
+) -> dict:
+    """The single constructor for ``organizer_retry`` SSE payloads.
+
+    ``files_imported`` appears on terminal complete only; ``error`` on terminal
+    failed only. Every event carries the full state so a reconnecting client can
+    settle from the latest snapshot alone.
+    """
+    payload = {
+        "state": state,
+        "stage": stage,
+        "files_completed": files_completed,
+        "files_total": files_total,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if files_imported is not None:
+        payload["files_imported"] = files_imported
+    if error is not None:
+        payload["error"] = error
+    return payload
+
+
+def _organizer_retry_user_error(exc: Exception) -> str:
+    """User-safe text for the terminal failed ``organizer_retry`` event.
+
+    Deliberate domain (4xx) messages are user-safe by the house error contract;
+    anything else (filesystem paths, provider text, unexpected tracebacks)
+    collapses to a fixed string - never interpolated.
+    """
+    if isinstance(exc, (ValidationError, ResourceNotFoundError, ConfigurationError)):
+        return str(exc)
+    return "The organizer retry failed before it could finish. Try again."
 
 
 class DownloadService:
@@ -203,6 +246,8 @@ class DownloadService:
         library_reconciler=None,
         snapshot_factory=None,  # Callable[[], AcquisitionQualitySnapshot] (post-cutover)
         native_library_store=None,  # NativeLibraryStore | None
+        plugin_sources=None,  # PluginSourceRegistry | None - live per-call, never cached
+        plugin_scorer=None,  # PluginReleaseScorer | None
     ):
         self._client = download_client
         self._indexer = indexer
@@ -230,6 +275,8 @@ class DownloadService:
         self._auto = auto_accept_threshold
         self._manual = manual_threshold
         self._enabled = enabled
+        self._plugin_sources = plugin_sources
+        self._plugin_scorer = plugin_scorer
         self._quota = quota_service
         self._pins = release_pin_store
         self._ownership = ownership_service
@@ -281,13 +328,50 @@ class DownloadService:
                 else:
                     _ordinary_held_action_lock_users[held_id] = users
 
+    def _client_for_source(self, source: str) -> str:
+        if source in _CLIENT_FOR_SOURCE:
+            return _CLIENT_FOR_SOURCE[source]
+        if source and source.startswith("plugin:"):
+            registry = self._plugin_sources
+            if registry is not None:
+                try:
+                    spec = registry.spec_for(source)
+                except Exception:  # noqa: BLE001 - absence reads as unknown
+                    spec = None
+                if spec is not None:
+                    return source
+            from core.exceptions import ValidationError as _VE
+
+            raise _VE(f"Unknown source {source}")
+        from core.exceptions import ValidationError as _VE2
+
+        raise _VE2(f"Unknown source {source}")
+
+    def _plugin_search_specs(self) -> list:
+        registry = self._plugin_sources
+        if registry is None:
+            return []
+        try:
+            specs = registry.specs
+        except Exception:  # noqa: BLE001 - absence reads as no plugins
+            return []
+        return [s for s in specs if getattr(s, "key", "") and getattr(s, "target_source", s.key) == s.key and getattr(s, "has_indexer", False)]
+
     def _ensure_enabled(self) -> None:
         # flag captured at construction; the config-save PUT clears the
-        # DownloadService singleton to pick up changes
-        if not self._enabled:
-            raise ConfigurationError(
-                "The download client is disabled. Enable it in Settings to start downloads."
-            )
+        # DownloadService singleton to pick up changes. Plugin state reads live.
+        if self._enabled:
+            return
+        registry = self._plugin_sources
+        if registry is not None:
+            try:
+                if registry.is_any_source_ready():
+                    return
+            except Exception:  # noqa: BLE001 - absence reads as disabled
+                pass
+        raise ConfigurationError(
+            "The download client is disabled. Enable it in Settings to start downloads."
+        )
 
     async def _already_satisfied(
         self, release_group_mbid: str, origin: str = "user"
@@ -324,8 +408,9 @@ class DownloadService:
         it (every request/auto-download path does today). Without it the preflight
         scorer can't down-rank a partial folder and the orchestrator's completeness
         gate accepts a 2-of-12 source as 'complete'. Best-effort: a MusicBrainz failure
-        must never block the download. Reuses the album page's resolver so the gate's
-        'expected' matches the track count the user sees on the album."""
+        must never block the download. Counts AUDIO media only (the album page may
+        show DVD-video positions too, but they are not acquisition targets and every
+        acquisition denominator must agree with the request-time count)."""
         if (
             track_count is not None
             or not release_group_mbid
@@ -343,7 +428,9 @@ class DownloadService:
                 release_group_mbid,
             )
             return None
-        return info.total_tracks or None
+        from services.album_utils import audio_tracks
+
+        return len(audio_tracks(list(info.tracks or []))) or None
 
     async def _single_track_identity(
         self,
@@ -371,9 +458,12 @@ class DownloadService:
                 release_group_mbid,
             )
             return None, None, None
-        if len(info.tracks) != 1:
+        from services.album_utils import audio_tracks
+
+        tracks = audio_tracks(list(info.tracks or []))
+        if len(tracks) != 1:
             return None, None, None
-        track = info.tracks[0]
+        track = tracks[0]
         # MusicBrainz track lengths are MILLISECONDS (see UsenetStrategy._expected_tracks).
         duration = (track.length / 1000.0) if track.length else None
         return track.recording_id, track.title, duration
@@ -428,6 +518,15 @@ class DownloadService:
 
         selected_release = release_mbid or getattr(info, "selected_release_mbid", None)
         tracks = list(getattr(info, "tracks", []) or [])
+        if recording_mbid is None and release_track_mbid is None:
+            # Album acquisition targets audio media only: a CD+DVD edition's DVD
+            # positions are not downloadable audio, and the request-time count
+            # must agree with the enqueue manifest and the coverage gate.
+            # Explicit per-track requests keep the full map so video-medium
+            # tracks stay requestable.
+            from services.album_utils import audio_tracks
+
+            tracks = audio_tracks(tracks)
         if not selected_release or not tracks:
             raise ValidationError(
                 "The exact MusicBrainz edition has no complete tracklist. No download was started."
@@ -586,15 +685,25 @@ class DownloadService:
                         target, single_identity, snapshot=snapshot
                     )
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - fan-out drops only the soulseek group (D15/D16)
                 logger.exception("soulseek album search failed for job %s", job_id)
                 soulseek_ok = False
         if self._usenet_enabled:
             try:
                 candidates.extend(await self._search_usenet(target, snapshot=snapshot))
-            except Exception:
+            except Exception:  # noqa: BLE001 - fan-out drops only the usenet group (D15/D16)
                 logger.exception("usenet album search failed for job %s", job_id)
-
+        for spec in self._plugin_search_specs():
+            try:
+                candidates.extend(
+                    await self._search_plugin(target, spec, snapshot=snapshot)
+                )
+            except Exception:  # noqa: BLE001 - fan-out drops only the plugin group (D15/D16)
+                logger.exception(
+                    "plugin album search failed for job %s source=%s",
+                    job_id,
+                    getattr(spec, "key", "?"),
+                )
         if not candidates and not soulseek_ok:
             await self._store.update_search_job_status(
                 job_id, "failed", error="search failed"
@@ -680,6 +789,61 @@ class DownloadService:
             track_count=target.track_count,
         )
 
+    async def _search_plugin(
+        self, target: TargetAlbum, spec, *, snapshot=None
+    ) -> list[ScoredCandidate]:
+        snapshot = snapshot or self._search_snapshot()
+        registry = self._plugin_sources
+        if registry is None:
+            return []
+        try:
+            indexers = registry.indexers_for_target(spec.key)
+        except Exception:  # noqa: BLE001 - absence reads as no results
+            return []
+        if not indexers:
+            return []
+        results = await asyncio.gather(
+            *(
+                idx.search_album(
+                    target.artist_name,
+                    target.album_title,
+                    target.year,
+                    target.track_count,
+                )
+                for idx in indexers
+            ),
+            return_exceptions=True,
+        )
+        releases = []
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            for row in res or []:
+                plugin = getattr(row, "plugin", None)
+                if plugin is not None:
+                    releases.append(plugin)
+        if not releases:
+            return []
+        scorer = self._plugin_scorer
+        if scorer is None:
+            try:
+                from services.native.plugin_release_scorer import (  # type: ignore
+                    PluginReleaseScorer as _PluginScorer,
+                )
+
+                scorer = _PluginScorer(self._store)
+            except Exception:  # noqa: BLE001 - absence reads as no results
+                return []
+        return await scorer.rank(
+            target,
+            releases,
+            snapshot=snapshot,
+            auto_accept_threshold=self._auto,
+            manual_threshold=self._manual,
+            track_count=target.track_count,
+            source_key=spec.key,
+        )
+
     async def scout_album(
         self,
         artist_name: str,
@@ -727,16 +891,27 @@ class DownloadService:
                         target, single_identity, snapshot=snapshot
                     )
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - scout fan-out drops only the soulseek group
                 logger.exception(
                     "soulseek scout search failed for %s", release_group_mbid
                 )
         if self._usenet_enabled:
             try:
                 candidates.extend(await self._search_usenet(target, snapshot=snapshot))
-            except Exception:
+            except Exception:  # noqa: BLE001 - scout fan-out drops only the usenet group
                 logger.exception(
                     "usenet scout search failed for %s", release_group_mbid
+                )
+        for spec in self._plugin_search_specs():
+            try:
+                candidates.extend(
+                    await self._search_plugin(target, spec, snapshot=snapshot)
+                )
+            except Exception:  # noqa: BLE001 - scout fan-out drops only the plugin group
+                logger.exception(
+                    "plugin scout search failed for %s source=%s",
+                    release_group_mbid,
+                    getattr(spec, "key", "?"),
                 )
         return candidates
 
@@ -861,7 +1036,7 @@ class DownloadService:
                 source_directory=candidate.parent_directory,
                 preflight_score=candidate.final_score,
                 source=candidate.source,
-                download_client=_CLIENT_FOR_SOURCE.get(candidate.source, "slskd"),
+                download_client=self._client_for_source(candidate.source),
                 quality_preference_step=(
                     selected_decision.preference_step
                     if selected_decision is not None
@@ -932,7 +1107,7 @@ class DownloadService:
             track_duration_seconds=track_duration_seconds,
             origin="user",
             source=candidate.source,
-            download_client=_CLIENT_FOR_SOURCE.get(candidate.source, "slskd"),
+            download_client=self._client_for_source(candidate.source),
             source_username=candidate.username,
             source_directory=candidate.parent_directory,
             preflight_score=candidate.final_score,
@@ -1354,9 +1529,11 @@ class DownloadService:
             ) from exc
         if not release:
             raise ValidationError("Could not load that edition from MusicBrainz")
-        from services.album_utils import extract_tracks
+        from services.album_utils import audio_tracks, extract_tracks
 
         tracks, _total_length = extract_tracks(release)
+        # Audio media only: never per-track-request DVD-video positions.
+        tracks = audio_tracks(tracks)
         if not tracks:
             raise ValidationError("That edition has no tracklist")
 
@@ -1470,7 +1647,9 @@ class DownloadService:
             page_size=page_size,
         )
 
-    async def get_activity_summary(self, user_id: str, user_role: str):
+    async def get_activity_summary(
+        self, user_id: str, user_role: str
+    ) -> DownloadActivitySummary:
         return await self._store.get_activity_summary(user_id, user_role)
 
     async def cleanup_states(self, task_ids: list[str]) -> dict[str, str]:
@@ -1844,6 +2023,39 @@ class DownloadService:
                 )
         logger.info("download.held_reevaluated", extra=counts)
         return counts
+    async def discard_held_for_task(
+        self, source_task_id: str, user_id: str, user_role: str
+    ) -> int:
+        """Discard every verification-held track for one download task (the
+        wrong-product verdict action) and clear the verdict. Task-scoped, not
+        verdict-scoped, so it also cleans tasks that held before verdicts
+        existed. Management and conversion holds are refused - they have
+        their own unit actions."""
+        async with self._management_hold_action(source_task_id):
+            held = await self.list_held(
+                user_id, user_role, source_task_id=source_task_id
+            )
+            if not held:
+                raise ResourceNotFoundError(
+                    "No held tracks found for this download"
+                )
+            if any(value.reason.startswith("management:") for value in held):
+                raise ValidationError(
+                    "Library Management holds must be discarded as one complete"
+                    " acquisition unit"
+                )
+            if any(value.origin == "edition_conversion" for value in held):
+                raise ValidationError(_EDITION_CONVERSION_HELD_ACTION_MESSAGE)
+            await self._store.resolve_held_imports(
+                [value.id for value in held], "discarded"
+            )
+            await self._delete_discarded_held_files(held)
+            await self._store.clear_wrong_product_verdict(source_task_id)
+            logger.info(
+                "download.verdict_discarded",
+                extra={"task_id": source_task_id, "files": len(held)},
+            )
+            return len(held)
 
     async def reverify_held(
         self, held_id: int, user_id: str, user_role: str
@@ -1928,7 +2140,12 @@ class DownloadService:
                 status, final_path = await self.reverify_held(
                     held.id, user_id, user_role
                 )
-            except (ResourceNotFoundError, ValidationError, ConfigurationError) as exc:
+            except (
+                ResourceNotFoundError,
+                ValidationError,
+                ConfigurationError,
+                ConflictError,
+            ) as exc:
                 results.append(
                     {
                         "held_id": held.id,
@@ -1966,17 +2183,84 @@ class DownloadService:
         self, source_task_id: str, user_id: str, user_role: str
     ) -> list[str]:
         """Re-plan and publish a complete held acquisition against current settings."""
-
+        async with self._management_hold_locks_guard:
+            in_flight = self._management_hold_locks.get(source_task_id)
+            if in_flight is not None and in_flight.locked():
+                raise OrganizerRetryAlreadyRunningError()
+        channel = f"download:{source_task_id}"
         async with self._management_hold_action(source_task_id):
+            await self._bus.publish(
+                channel,
+                "organizer_retry",
+                _organizer_retry_payload(
+                    state="running",
+                    stage="preparing",
+                    files_completed=0,
+                    files_total=0,
+                ),
+            )
+            progress = {"stage": "preparing", "files_completed": 0, "files_total": 0}
+
+            async def report_progress(
+                stage: str, files_completed: int, files_total: int
+            ) -> None:
+                progress["stage"] = stage
+                progress["files_completed"] = files_completed
+                progress["files_total"] = files_total
+                await self._bus.publish(
+                    channel,
+                    "organizer_retry",
+                    _organizer_retry_payload(
+                        state="running",
+                        stage=stage,
+                        files_completed=files_completed,
+                        files_total=files_total,
+                    ),
+                )
+
             try:
-                return await self._retry_management_hold_locked(
-                    source_task_id, user_id, user_role
+                targets = await self._retry_management_hold_locked(
+                    source_task_id, user_id, user_role, on_progress=report_progress
                 )
-            except ValidationError:
-                await self._schedule_management_hold_after_failure(
-                    source_task_id, user_id
+            except Exception as exc:
+                await self._bus.publish(
+                    channel,
+                    "organizer_retry",
+                    _organizer_retry_payload(
+                        state="failed",
+                        stage=progress["stage"],
+                        files_completed=progress["files_completed"],
+                        files_total=progress["files_total"],
+                        error=_organizer_retry_user_error(exc),
+                    ),
                 )
+                if isinstance(exc, ValidationError):
+                    await self._schedule_management_hold_after_failure(
+                        source_task_id, user_id
+                    )
                 raise
+            await self._bus.publish(
+                channel,
+                "organizer_retry",
+                _organizer_retry_payload(
+                    state="running",
+                    stage="finalizing",
+                    files_completed=len(targets),
+                    files_total=len(targets),
+                ),
+            )
+            await self._bus.publish(
+                channel,
+                "organizer_retry",
+                _organizer_retry_payload(
+                    state="complete",
+                    stage="finalizing",
+                    files_completed=len(targets),
+                    files_total=len(targets),
+                    files_imported=len(targets),
+                ),
+            )
+            return targets
 
     async def _schedule_management_hold_after_failure(
         self, source_task_id: str, user_id: str
@@ -2059,7 +2343,11 @@ class DownloadService:
         for source_task_id, user_id in due:
             try:
                 await self.retry_management_hold(source_task_id, user_id, "admin")
-            except (ResourceNotFoundError, ValidationError):
+            except (
+                ResourceNotFoundError,
+                ValidationError,
+                OrganizerRetryAlreadyRunningError,
+            ):
                 continue
             except Exception:  # noqa: BLE001 - one held unit must not stop the sweep
                 logger.exception(
@@ -2308,7 +2596,12 @@ class DownloadService:
         return repaired
 
     async def _retry_management_hold_locked(
-        self, source_task_id: str, user_id: str, user_role: str
+        self,
+        source_task_id: str,
+        user_id: str,
+        user_role: str,
+        *,
+        on_progress: Callable[[str, int, int], Awaitable[None]] | None = None,
     ) -> list[str]:
         held = await self.list_held(user_id, user_role, source_task_id=source_task_id)
         if not held:
@@ -2324,7 +2617,9 @@ class DownloadService:
         held = await self._repair_legacy_management_hold(source_task_id, held)
         ids = [value.id for value in held]
         try:
-            targets = await self._file_processor.place_held_management_bundle(held)
+            targets = await self._file_processor.place_held_management_bundle(
+                held, on_progress=on_progress
+            )
         except AutomaticManagementHoldError as error:
             await self._store.update_held_import_reason(
                 ids,
@@ -2612,14 +2907,14 @@ class DownloadService:
         return stopped
 
     async def retry_all_failed(self, user_id: str, user_role: str) -> int:
-        """Re-dispatch every terminally-failed task the user has that will NOT auto-retry
-        (the "Retry all failed" bulk action): ``status == failed`` AND no pending
-        ``next_retry_at`` (auto-retry off, or attempts exhausted). Tasks still scheduled
-        to auto-retry are "wanted" and left for ``stop_all_retries``. Each is retried via
-        the same path as the per-task retry. Returns the number retried."""
-        tasks = await self._store.list_tasks_by_status(
-            user_id, user_role, [DownloadStatus.FAILED]
-        )
+        """Re-dispatch the newest terminally-failed task per download target that will
+        NOT auto-retry (the "Retry all failed" bulk action): ``status == failed`` AND
+        no pending ``next_retry_at`` (auto-retry off, or attempts exhausted). Historical
+        failures superseded by a newer task for the same target are skipped, so one
+        click retries each album/track once. Tasks still scheduled to auto-retry are
+        "wanted" and left for ``stop_all_retries``. Each is retried via the same path
+        as the per-task retry. Returns the number retried."""
+        tasks = await self._store.list_newest_failed_tasks(user_id, user_role)
         retried = 0
         for task in tasks:
             if self.next_retry_at(task) is not None:

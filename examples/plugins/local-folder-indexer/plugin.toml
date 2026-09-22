@@ -1,0 +1,18 @@
+[plugin]
+name = "local-folder-indexer"
+display_name = "Local Folder Indexer (example)"
+version = "1.0.0"
+api_version = 1
+entrypoint = "plugin:LocalFolderIndexer"
+capabilities = ["indexer"]
+description = "Reference indexer paired with local-folder-client: lists source-folder files as folder-mode results."
+author = "DroppedNeedle examples"
+
+[[capability]]
+id = "indexer"
+target_source = "plugin:local-folder-client"
+
+[[settings]]
+key = "source_dir"
+label = "Source directory"
+help = "Folder scanned for files; each file becomes one folder-mode result."

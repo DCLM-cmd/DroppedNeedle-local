@@ -1140,6 +1140,65 @@ async def test_get_file_path_whole_mount_fallback_disambiguates_by_size(tmp_path
     )
     assert path == right.resolve()
 
+
+@pytest.mark.asyncio
+async def test_get_file_path_stale_same_named_hit_with_known_size_returns_none(
+    tmp_path,
+):
+    # Issue #397: the previous peer's same-named leftover must not verify as the
+    # current peer's transfer. With a known expected size the cheap exact steps
+    # (leaf dir, one-level scan) skip a byte-mismatched hit and the walk
+    # fallbacks refuse an exact-named mismatch, so lookup ends at None and the
+    # file_processor (c)-path raises SOURCE_FILE_MISSING (local fault, never
+    # quarantined) instead of SIZE_MISMATCH against the wrong peer.
+    leaf = tmp_path / "AlbumX"
+    leaf.mkdir()
+    (leaf / "01 - Track.flac").write_bytes(b"x" * 10)  # stale, 10 bytes
+    other = tmp_path / "PrevPeerAlbum"
+    other.mkdir()
+    (other / "02 - Other.flac").write_bytes(b"y" * 10)  # stale, other leaf
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peerB"), "peerB\\AlbumX\\01 - Track.flac", size=999
+        )
+        is None
+    )
+    assert (
+        await repo.get_file_path(
+            _h("peerB"), "peerB\\AlbumX\\02 - Other.flac", size=999
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_matching_size_leaf_hit_still_resolves(tmp_path):
+    # The current peer's own same-named file (bytes match the advertised size)
+    # still resolves through the cheap leaf step.
+    leaf = tmp_path / "AlbumX"
+    leaf.mkdir()
+    current = leaf / "01 - Track.flac"
+    current.write_bytes(b"x" * 999)
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peerB"), "peerB\\AlbumX\\01 - Track.flac", size=999
+    )
+    assert path == current.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_unknown_size_keeps_name_only_leaf_hit(tmp_path):
+    # Unknown expected size keeps the old name-only behavior: a same-named hit
+    # resolves without any byte comparison.
+    leaf = tmp_path / "AlbumX"
+    leaf.mkdir()
+    stale = leaf / "01 - Track.flac"
+    stale.write_bytes(b"x" * 10)
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(_h("peerB"), "peerB\\AlbumX\\01 - Track.flac")
+    assert path == stale.resolve()
+
 @pytest.mark.asyncio
 async def test_get_file_path_fuzzy_resolves_album_folder_track_prefixed_punctuation_variant(
     tmp_path,

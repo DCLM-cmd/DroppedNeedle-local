@@ -791,3 +791,27 @@ async def test_clean_exit_result_is_not_marked_partial(monkeypatch, tmp_path):
     audio.write_bytes(b"clean")
     res = await fp.fingerprint(audio)
     assert res.partial_decode is False
+
+
+@pytest.mark.asyncio
+async def test_generate_tracked_propagates_partial_without_memo_key(monkeypatch):
+    """4.10a: the OSError content-key fallback still threads the tolerance
+    flag instead of laundering a partial decode to full."""
+    _patch_fpcalc(monkeypatch, returncode=1, stdout=_FP_OK)
+    fp = _make(_http_client(_pass_payload()))
+    fingerprint, duration, partial = await fp._generate_tracked(
+        Path("/nonexistent-ephemeral.flac")
+    )
+    assert fingerprint == "AQADtMmSaEkSRYkG"
+    assert duration == 183
+    assert partial is True
+
+
+@pytest.mark.asyncio
+async def test_generate_tracked_clean_exit_without_memo_key_is_full(monkeypatch):
+    _patch_fpcalc(monkeypatch)
+    fp = _make(_http_client(_pass_payload()))
+    _, _, partial = await fp._generate_tracked(
+        Path("/nonexistent-clean.flac")
+    )
+    assert partial is False

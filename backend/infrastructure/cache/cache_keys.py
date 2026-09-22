@@ -11,7 +11,6 @@ MB_ALBUM_SEARCH_PREFIX = "mb:album:search:"
 MB_RG_DETAIL_PREFIX = "mb:rg:detail:"
 MB_RELEASE_DETAIL_PREFIX = "mb:release:detail:"
 MB_RELEASE_TO_RG_PREFIX = "mb:release_to_rg:"
-MB_RELEASE_REC_PREFIX = "mb:release_rec_positions:"
 MB_RECORDING_PREFIX = "mb:recording:"
 MB_RECORDING_SEARCH_PREFIX = "mb:recording:search:"
 MB_RECORDING_TO_RG_PREFIX = "mb:recording_to_rg:"
@@ -25,6 +24,8 @@ MB_RELEASE_VERIFY_PREFIX = "mb:release:verify:"
 MB_DUPLICATE_SEARCH_PREFIX = "mb:release:duplicate-search:"
 MB_RELEASE_EDITION_SEARCH_PREFIX = "mb:release:edition-search:"
 MB_MANAGEMENT_RELEASE_PREFIX = "mb:management:release:"
+MB_REDIRECT_PREFIX = "mb:redirect:"
+MB_ISRC_PREFIX = "mb:isrc:"
 CAA_MANAGEMENT_PREFIX = "caa:management:"
 
 LB_PREFIX = "lb_"
@@ -185,7 +186,6 @@ def musicbrainz_prefixes() -> list[str]:
         MB_RG_DETAIL_PREFIX,
         MB_RELEASE_DETAIL_PREFIX,
         MB_RELEASE_TO_RG_PREFIX,
-        MB_RELEASE_REC_PREFIX,
         MB_RECORDING_PREFIX,
         MB_RECORDING_SEARCH_PREFIX,
         MB_RECORDING_TO_RG_PREFIX,
@@ -199,6 +199,8 @@ def musicbrainz_prefixes() -> list[str]:
         MB_DUPLICATE_SEARCH_PREFIX,
         MB_RELEASE_EDITION_SEARCH_PREFIX,
         MB_MANAGEMENT_RELEASE_PREFIX,
+        MB_REDIRECT_PREFIX,
+        MB_ISRC_PREFIX,
         # Provider-bearing composite responses must cold-clear with the
         # endpoint-specific MusicBrainz entries on a source change.
         ARTIST_INFO_PREFIX,
@@ -333,9 +335,13 @@ def mb_album_search_key(
     return f"{MB_ALBUM_SEARCH_PREFIX}{query}:{limit}:{offset}:{types_str}:{primary_str}"
 
 
-def mb_artist_detail_key(mbid: str, *, include_releases: bool = True) -> str:
-    suffix = "" if include_releases else ":basic"
-    return f"{MB_ARTIST_DETAIL_PREFIX}{_mbid_key(mbid)}{suffix}"
+def mb_artist_detail_key(
+    mbid: str, *, include_releases: bool = True,
+    release_group_limit: int = 50, profile: str | None = None,
+) -> str:
+    selected_profile = profile or ("full" if include_releases else "basic")
+    limit = max(int(release_group_limit), 1) if selected_profile == "full" else 0
+    return f"{MB_ARTIST_DETAIL_PREFIX}{_mbid_key(mbid)}:{selected_profile}:{limit}"
 
 
 def mb_artist_release_groups_key(artist_mbid: str) -> str:
@@ -351,6 +357,36 @@ def mb_artist_rgs_browse_key(artist_mbid: str, limit: int) -> str:
     contain ':', so the ':browse:' segment cannot collide.
     """
     return f"{MB_ARTIST_RGS_PREFIX}{_mbid_key(artist_mbid)}:browse:{limit}"
+
+
+def mb_artist_rgs_page_key(artist_mbid: str, limit: int, offset: int) -> str:
+    """Key for one artist->release-groups browse page.
+
+    Shape: ``mb:artist_rgs:{mbid}:page:{limit}:{offset}``. Extends
+    MB_ARTIST_RGS_PREFIX, so prefix sweeps cover it with no new list
+    membership. Collision-safe: the bare builder stores casefolded MBIDs
+    with no ':' segment, the QW1 builder uses ':browse:', and MBIDs never
+    contain ':', so ':page:' collides with neither shape.
+    """
+    return f"{MB_ARTIST_RGS_PREFIX}{_mbid_key(artist_mbid)}:page:{limit}:{offset}"
+
+
+def mb_redirect_key(kind: str, mbid: str) -> str:
+    """Key for a persisted MusicBrainz redirect mapping.
+
+    Shape: ``mb:redirect:{kind}:{mbid-casefolded}``. Callers pass the MBID
+    already lower-normalized.
+    """
+    return f"{MB_REDIRECT_PREFIX}{kind}:{mbid}"
+
+
+def mb_isrc_key(isrc: str) -> str:
+    """Key for a MusicBrainz ISRC lookup entry.
+
+    Shape: ``mb:isrc:{ISRC-upper}``. Callers pass the ISRC already
+    upper-normalized.
+    """
+    return f"{MB_ISRC_PREFIX}{isrc}"
 
 
 def mb_release_group_key(mbid: str, includes: Optional[list[str]] = None) -> str:

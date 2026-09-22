@@ -555,6 +555,57 @@ def test_stored_review_is_safely_reranked_without_losing_pick_indexes():
     assert [candidate.candidate_index for candidate in projected] == [2, 0]
 
 
+def test_stored_review_pre_overlap_blobs_rerank_sanely():
+    """Pre-overlap candidate blobs (no ``track_overlap`` key) decode with the
+    field neutral and re-rank without crashing; stored overlap values ride
+    through the projection untouched for the review UI."""
+    import msgspec
+
+    target = TargetAlbum(
+        artist_name="Anthony Green", album_title="Avalon", year=2008, track_count=12
+    )
+    old = ScoredCandidate(
+        username="old",
+        parent_directory="[2008] Avalon",
+        files=[
+            _mk(
+                "[2008] Avalon",
+                "Music/Anthony Green/[2008] Avalon/01 track.flac",
+                username="old",
+            )
+        ],
+        final_score=0.85,
+        tier="auto",
+    )
+    new = ScoredCandidate(
+        username="new",
+        parent_directory="[2008] Avalon (Deluxe)",
+        files=[
+            _mk(
+                "[2008] Avalon (Deluxe)",
+                "Music/Anthony Green/[2008] Avalon (Deluxe)/01 track.flac",
+                username="new",
+            )
+        ],
+        final_score=0.80,
+        tier="auto",
+        track_overlap=0.62,
+    )
+    # Same codec as DownloadStore.get_search_job_candidates; the old blob
+    # predates the field entirely.
+    blobs = msgspec.to_builtins([old, new])
+    del blobs[0]["track_overlap"]
+
+    decoded = msgspec.convert(blobs, type=list[ScoredCandidate], strict=False)
+
+    assert decoded[0].track_overlap is None
+    assert decoded[1].track_overlap == 0.62
+    projected = rank_stored_candidates(target, decoded)
+    assert [candidate.username for candidate in projected] == ["old", "new"]
+    assert [candidate.candidate_index for candidate in projected] == [0, 1]
+    assert projected[1].track_overlap == 0.62
+
+
 @pytest.mark.asyncio
 async def test_hires_folder_outranks_redbook_within_lossless():
     # H1: a 24/96 FLAC folder must rank ABOVE a 16/44 FLAC folder of the same album (same
@@ -905,3 +956,98 @@ async def test_lossless_cap_drops_hires_folder():
     uncapped = AlbumPreflightScorer(_store())
     assert await capped.rank(_TARGET, hires, snapshot=policy_snapshot()) == []
     assert len(await uncapped.rank(_TARGET, hires, snapshot=policy_snapshot())) == 1
+
+
+@pytest.mark.asyncio
+async def test_severely_incomplete_candidate_capped_to_manual():
+    """#388: a 1-file candidate for an 11-track album scores above the auto
+    threshold on identity signals but must not auto-accept - it stays listed
+    for manual review instead."""
+    parent = "Radiohead OK Computer 1997"
+    files = [_mk(parent, "Radiohead - OK Computer - 01 Airbag.flac")]
+    target = TargetAlbum(
+        artist_name="Radiohead", album_title="OK Computer", year=1997, track_count=11
+    )
+    scorer = AlbumPreflightScorer(_store())
+    candidates = await scorer.rank(target, files, snapshot=policy_snapshot())
+    assert candidates
+    top = candidates[0]
+    assert top.final_score >= 0.70
+    assert top.tier == "manual"
+
+
+def _flux_files(parent, username="alice"):
+    return [
+        _mk(parent, f"0{n}. {title}.flac", username=username)
+        for n, title in (
+            (1, "Flux"),
+            (2, "Lessen the Damage"),
+            (3, "So Mean"),
+            (4, "On the Level"),
+            (5, "Hysteria"),
+        )
+    ]
+
+
+_FLUX_TARGET = TargetAlbum(
+    artist_name="Poppy", album_title="Flux - Sessions", year=2021, track_count=5
+)
+
+
+@pytest.mark.asyncio
+async def test_excluded_folder_drops_all_peer_naming_variants():
+    from models.download_identity import soulseek_folder_identity
+
+    store = _store({("soulseek", soulseek_folder_identity("rg-1", "flux"))})
+    results = _flux_files("2021. Flux", username="peerA") + _flux_files(
+        "Flux (2021)", username="peerB"
+    )
+    ranked = await AlbumPreflightScorer(store).rank(
+        _FLUX_TARGET,
+        results,
+        snapshot=policy_snapshot(),
+        release_group_mbid="rg-1",
+    )
+    assert ranked == []
+
+
+@pytest.mark.asyncio
+async def test_folder_exclusion_is_rg_scoped_and_needs_an_rg():
+    from models.download_identity import soulseek_folder_identity
+
+    excluded = {("soulseek", soulseek_folder_identity("rg-1", "flux"))}
+    # Same folder, different release group: unaffected (a future Flux request
+    # for the main album must not lose its folders to this row).
+    ranked = await AlbumPreflightScorer(_store(excluded)).rank(
+        _FLUX_TARGET,
+        _flux_files("2021. Flux"),
+        snapshot=policy_snapshot(),
+        release_group_mbid="rg-2",
+    )
+    assert [c.parent_directory for c in ranked] == ["2021. Flux"]
+    # No RG (manual searches): the consult cannot run, nothing drops.
+    ranked = await AlbumPreflightScorer(_store(excluded)).rank(
+        _FLUX_TARGET, _flux_files("2021. Flux"), snapshot=policy_snapshot()
+    )
+    assert [c.parent_directory for c in ranked] == ["2021. Flux"]
+
+
+@pytest.mark.asyncio
+async def test_distinct_product_survives_sibling_exclusion():
+    from models.download_identity import soulseek_folder_identity
+
+    store = _store({("soulseek", soulseek_folder_identity("rg-1", "flux"))})
+    correct = [
+        _mk("Flux - Sessions", f"0{n}. {title}.flac")
+        for n, title in (
+            (1, "The Cutting Edge"),
+            (2, "The Day I Walked Away"),
+            (3, "Rot In LA"),
+            (4, "I Started Smoking"),
+            (5, "Kitty"),
+        )
+    ]
+    ranked = await AlbumPreflightScorer(store).rank(
+        _FLUX_TARGET, correct, snapshot=policy_snapshot(), release_group_mbid="rg-1"
+    )
+    assert [c.parent_directory for c in ranked] == ["Flux - Sessions"]

@@ -1,5 +1,5 @@
-"""Lidarr importer route tests: admin gating on config/test, user access to
-status/artists/import, masked-key passthrough, and the Test success/bad-key body.
+"""Lidarr importer route tests: admin gating on config/test/artists/import,
+masked-key passthrough, and the Test success/bad-key body.
 
 Auth gotcha (CLAUDE.md): overriding ``_get_current_user`` does NOT unlock admin routes -
 the admin endpoints resolve ``_get_current_admin`` directly, so override that."""
@@ -41,7 +41,6 @@ def _prefs():
         url="http://lidarr.test", api_key="real-key"
     )
     prefs.save_lidarr_import_connection.return_value = None
-    prefs.is_lidarr_import_configured.return_value = True
     return prefs
 
 
@@ -177,31 +176,28 @@ def test_test_connection_non_admin_forbidden():
     assert resp.status_code == 403
 
 
-# --- status / artists / import (user) -----------------------------------------
+# --- artists / import (admin-only) ------------------------------------------
 
 
-def test_status_user_returns_only_configured():
-    resp = build_test_client(_as_user(_app())).get("/lidarr-import/status")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body == {"configured": True}  # never leaks url/api_key
-
-
-def test_status_unauthenticated():
-    assert build_test_client(_app()).get("/lidarr-import/status").status_code == 401
-
-
-def test_list_artists_user_ok():
-    resp = build_test_client(_as_user(_app())).get("/lidarr-import/artists")
+def test_list_artists_admin_ok():
+    resp = build_test_client(_as_admin(_app())).get("/lidarr-import/artists")
     assert resp.status_code == 200
     body = resp.json()
     assert body["total"] == 1
     assert body["artists"][0]["mbid"] == MBID
 
 
-def test_import_user_returns_summary():
+def test_list_artists_non_admin_forbidden():
+    assert build_test_client(_as_user(_app())).get("/lidarr-import/artists").status_code == 403
+
+
+def test_list_artists_unauthenticated():
+    assert build_test_client(_app()).get("/lidarr-import/artists").status_code == 401
+
+
+def test_import_admin_returns_summary():
     service = _service()
-    resp = build_test_client(_as_user(_app(service=service))).post(
+    resp = build_test_client(_as_admin(_app(service=service))).post(
         "/lidarr-import/import", json={"selected_mbids": [MBID]}
     )
     assert resp.status_code == 200
@@ -211,8 +207,20 @@ def test_import_user_returns_summary():
     service.import_artists.assert_awaited_once()
 
 
+def test_import_non_admin_forbidden():
+    resp = build_test_client(_as_user(_app())).post(
+        "/lidarr-import/import", json={"selected_mbids": [MBID]}
+    )
+    assert resp.status_code == 403
+
+
 def test_import_unauthenticated():
     resp = build_test_client(_app()).post(
         "/lidarr-import/import", json={"selected_mbids": [MBID]}
     )
     assert resp.status_code == 401
+
+
+# /status was deleted by the Settings move.
+def test_status_route_deleted_returns_404():
+    assert build_test_client(_as_admin(_app())).get("/lidarr-import/status").status_code == 404

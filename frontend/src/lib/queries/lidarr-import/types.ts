@@ -12,10 +12,6 @@ export interface LidarrTestResult {
 	message: string;
 }
 
-export interface LidarrImportStatus {
-	configured: boolean;
-}
-
 export interface LidarrArtistCandidate {
 	mbid: string;
 	name: string;

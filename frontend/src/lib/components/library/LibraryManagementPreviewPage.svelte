@@ -4,11 +4,11 @@
 	import {
 		ArrowRight,
 		BookOpenCheck,
-		CheckCircle2,
+		CircleCheckBig,
 		Clock3,
 		FolderCog,
 		HardDrive,
-		Layers3,
+		Layers,
 		ShieldAlert,
 		Sparkles,
 		Tags,
@@ -47,6 +47,7 @@
 	} from '$lib/queries/library-management/types';
 	import { createUuid } from '$lib/utils/uuid';
 	import {
+		firstDeferredSource,
 		managementAudioFormat,
 		managementAlbumArtworkVersion,
 		managementArtworkPreviewHash,
@@ -184,6 +185,34 @@
 			.sort((left, right) => right[1] - left[1])
 			.slice(0, 3)
 	);
+
+	function qualifiedReasonLabel(code: string, deferredSource: string | null = null): string {
+		if (code !== 'OPTIONAL_ENRICHMENT_DEFERRED') return managementReasonLabel(code);
+		const base = 'Optional enrichment deferred · still applicable with warnings';
+		return deferredSource ? `${base} (${deferredSource})` : base;
+	}
+
+	function inspectorReasonLabel(code: string): string {
+		return qualifiedReasonLabel(code);
+	}
+
+	function staleBannerDetail(): string {
+		if (!preview) return '';
+		const labels = preview.stale_reasons.map((code) => qualifiedReasonLabel(code)).join(' · ');
+		// Persisted query-cache entries from before this fix lack the new keys.
+		const staleInputCount = preview.stale_input_count ?? 0;
+		if (!preview.stale_reasons.includes('FILE_CHANGED') || staleInputCount <= 0) return labels;
+		// Mirrors backend _STALE_INPUT_SAMPLE_LIMIT; the backend already caps.
+		const samples = (preview.stale_sample_relative_paths ?? []).slice(0, 5);
+		const shown = samples.join(', ');
+		const remaining = staleInputCount - samples.length;
+		const sampleText = shown
+			? `${shown}${remaining > 0 ? ` (+${remaining.toLocaleString()} more)` : ''}`
+			: '';
+		const fileText = `${staleInputCount.toLocaleString()} ${staleInputCount === 1 ? 'file' : 'files'}`;
+		return `${labels}. ${fileText} changed since planning${sampleText ? `: ${sampleText}` : ''}. Generate a fresh preview.`;
+	}
+
 	const culpritRelease = $derived.by(() => {
 		const top = topBlockers[0]?.[0];
 		if (!top) return null;
@@ -254,12 +283,26 @@
 		)
 	);
 	const recycleAvailable = $derived(Boolean(settingsQuery.data?.recycle_bin_path.trim()));
+	// Dead previews (stale/expired/non-ready/terminal/zero items) must not claim pinned
+	// metadata. Neutral copy keeps the badge in place; hiding it would shift the header.
+	const isDeadPreview = $derived(
+		!preview ||
+			preview.stale ||
+			preview.expired ||
+			preview.state !== 'ready' ||
+			Boolean(preview.terminal_code) ||
+			preview.summary.item_count === 0
+	);
 	const providerStatus = $derived(
-		preview?.summary.reasons.METADATA_UNAVAILABLE
-			? 'Required metadata unavailable'
-			: preview?.summary.reasons.OPTIONAL_ENRICHMENT_DEFERRED
-				? 'Optional enrichment deferred'
-				: 'Required metadata pinned'
+		isDeadPreview
+			? 'Provider status unavailable'
+			: preview?.summary.reasons.METADATA_UNAVAILABLE
+				? 'Required metadata unavailable'
+				: deferredSources.length
+					? `Deferred: ${deferredSources[0][0]} ×${deferredSources[0][1].toLocaleString()}`
+					: preview?.summary.reasons.OPTIONAL_ENRICHMENT_DEFERRED
+						? qualifiedReasonLabel('OPTIONAL_ENRICHMENT_DEFERRED')
+						: 'Required metadata pinned'
 	);
 	const identityBlockerCount = $derived(
 		(preview?.summary.reasons.TRACK_NOT_MAPPED ?? 0) +
@@ -358,7 +401,9 @@
 			format: managementAudioFormat(item),
 			status: titleManagementValue(item.eligibility),
 			statusTone: eligibilityTone(item.eligibility),
-			reason: item.reason_code ? managementReasonLabel(item.reason_code) : null,
+			reason: item.reason_code
+				? qualifiedReasonLabel(item.reason_code, firstDeferredSource(item))
+				: null,
 			reasonCode: item.reason_code,
 			changes: managementPlanChanges(item),
 			exceptional: managementPlanIsExceptional(item),
@@ -403,7 +448,7 @@
 
 	async function resumePreviewToken(currentJobId: string): Promise<void> {
 		try {
-			const handle = await reissuePreview.mutateAsync(currentJobId);
+			const handle = await reissuePreview.mutateAsync({ jobId: currentJobId });
 			rememberLibraryManagementPreviewToken(handle.job_id, handle.preview_token);
 			if (handle.job_id === jobId) reissuedToken = handle.preview_token;
 		} catch {
@@ -420,7 +465,7 @@
 	const applyDisabledReason = $derived.by((): string | null => {
 		if (canApply || activationPreview || preview?.state !== 'ready') return null;
 		if (preview.stale)
-			return `Apply is disabled: this preview is stale (${preview.stale_reasons.map(titleManagementValue).join(' · ') || 'inputs changed'}). Generate a fresh preview.`;
+			return `Apply is disabled: this preview is stale (${preview.stale_reasons.map(qualifiedReasonLabel).join(' · ') || 'inputs changed'}). Generate a fresh preview.`;
 		if (preview.expired)
 			return 'Apply is disabled: this preview expired. Generate a fresh preview.';
 		if (!preview.ready_for_confirmation)
@@ -536,7 +581,7 @@
 			{item}
 			{jobId}
 			{roots}
-			reasonLabel={managementReasonLabel}
+			reasonLabel={inspectorReasonLabel}
 			onresolve={openCollision}
 		/>
 	{/if}
@@ -615,7 +660,7 @@
 						{quantity(preview.summary.path_change_count, 'path change')}</span
 					>
 					<span class="badge badge-outline"
-						><Layers3 class="h-3 w-3" />
+						><Layers class="h-3 w-3" />
 						{quantity(preview.summary.sidecar_change_count, 'sidecar change')}</span
 					>
 					<span class="badge badge-outline"
@@ -630,7 +675,7 @@
 					<ShieldAlert class="mt-0.5 h-5 w-5" /><span
 						><strong>This preview cannot be applied.</strong><br />{preview.expired
 							? 'It expired. Generate a fresh preview.'
-							: preview.stale_reasons.map(titleManagementValue).join(' · ')}</span
+							: staleBannerDetail()}</span
 					>
 				</div>
 			{:else if preview.state === 'failed'}
@@ -669,7 +714,7 @@
 							<p class="mt-1 text-sm">
 								Top blockers: {topBlockers
 									.map(
-										([code, count]) => `${managementReasonLabel(code)} (${count.toLocaleString()})`
+										([code, count]) => `${qualifiedReasonLabel(code)} (${count.toLocaleString()})`
 									)
 									.join(' · ')}
 							</p>
@@ -681,15 +726,8 @@
 									class="link link-hover"
 									onclick={() => {
 										reasonCode = topBlockers[0][0];
-									}}>Filter to {managementReasonLabel(topBlockers[0][0])}</button
+									}}>Filter to {qualifiedReasonLabel(topBlockers[0][0])}</button
 								>
-							</p>
-						{/if}
-						{#if deferredSources.length}
-							<p class="mt-1 text-sm">
-								Deferred warnings: {deferredSources
-									.map(([source, count]) => `${source} (${count.toLocaleString()})`)
-									.join(' · ')}
 							</p>
 						{/if}
 						{#if identityBlockerCount > 0}
@@ -720,6 +758,20 @@
 							href={withBasePath('/library/management?tab=organize')}
 							>Open identity readiness <ArrowRight class="h-4 w-4" /></a
 						>
+					</div>
+				</div>
+			{/if}
+
+			{#if deferredSources.length}
+				<div class="alert alert-info items-start" role="status">
+					<Sparkles class="mt-0.5 h-5 w-5" />
+					<div class="min-w-0 flex-1">
+						<strong>Optional enrichment deferred · files planned without it.</strong>
+						<p class="mt-1 text-sm">
+							Deferred warnings: {deferredSources
+								.map(([source, count]) => `${source} (${count.toLocaleString()})`)
+								.join(' · ')}
+						</p>
 					</div>
 				</div>
 			{/if}
@@ -756,7 +808,7 @@
 							bind:value={reasonCode}
 							><option value="">All reasons</option
 							>{#each sortedReasons as [reason, count] (reason)}<option value={reason}
-									>{managementReasonLabel(reason)} ({count.toLocaleString()})</option
+									>{qualifiedReasonLabel(reason)} ({count.toLocaleString()})</option
 								>{/each}</select
 						></label
 					>
@@ -1061,7 +1113,7 @@
 					applyPreview.isPending}
 				onclick={() => void apply()}
 				>{#if applyPreview.isPending}<span class="loading loading-spinner loading-sm"
-					></span>{/if}<CheckCircle2 class="h-4 w-4" />
+					></span>{/if}<CircleCheckBig class="h-4 w-4" />
 				{applyAction.confirmButton}</button
 			>
 		</div>

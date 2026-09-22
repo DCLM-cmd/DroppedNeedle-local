@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -11,6 +12,8 @@ import msgspec
 from api.v1.schemas.settings import (
     UserPreferences,
     LibrarySyncSettings,
+    LibraryScanDirtyScopes,
+    LibraryScanFilesystemWatcherSettings,
     LibraryScanScheduleSettings,
     DownloadClientConnectionSettings,
     JellyfinConnectionSettings,
@@ -41,11 +44,13 @@ from api.v1.schemas.settings import (
     ACOUSTID_KEY_MASK,
     DOWNLOAD_CLIENT_API_KEY_MASK,
     INDEXER_API_KEY_MASK,
+    PROWLARR_API_KEY_MASK,
     SABNZBD_API_KEY_MASK,
     LIDARR_IMPORT_API_KEY_MASK,
     DownloadPolicySettings,
     LidarrImportConnectionSettings,
     NewznabIndexerSettings,
+    ProwlarrConnectionSettings,
     SabnzbdConnectionSettings,
     QualityRecipeEntry,
     SpotifySettings,
@@ -91,7 +96,9 @@ T = TypeVar("T", bound=msgspec.Struct)
 SPOTIFY_CALLBACK_PATH = "/api/v1/me/connections/spotify/auth/callback"
 
 _RELEASE_TYPE_POLICY_REVISION_KEY = "release_type_policy_revision"
-
+# Bundled sources plus manifest-charset plugin keys (v1 closed set is checked at
+# the PUT route against the live registry; persistence stays charset-lenient).
+_PLUGIN_KEY_RE = re.compile(r"^plugin:[a-z0-9][a-z0-9-]{0,31}$")
 
 class PreferencesService:
     def __init__(self, settings: Settings):
@@ -272,6 +279,58 @@ class PreferencesService:
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to save library scan schedule: {e}")
             raise ConfigurationError(f"Failed to save library scan schedule: {e}")
+
+    def get_library_scan_dirty_scopes(self) -> LibraryScanDirtyScopes:
+        return self._get_section("library_scan_dirty_scopes", LibraryScanDirtyScopes)
+
+    def mark_library_scan_dirty_scopes(self, scope_ids: list[str]) -> None:
+        """Union scope ids into the Hook B dirty-mark hints (S-01)."""
+        if not scope_ids:
+            return
+        try:
+            current = set(self.get_library_scan_dirty_scopes().scope_ids)
+            merged = sorted(current | set(scope_ids))
+            if merged != sorted(current):
+                self._save_section(
+                    "library_scan_dirty_scopes", LibraryScanDirtyScopes(scope_ids=merged)
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to mark library scan dirty scopes: {e}")
+            raise ConfigurationError(f"Failed to mark library scan dirty scopes: {e}")
+
+    def clear_library_scan_dirty_scopes(self, scope_ids: list[str]) -> None:
+        """Drop exactly the consumed ids; marks added concurrently survive."""
+        if not scope_ids:
+            return
+        try:
+            current = set(self.get_library_scan_dirty_scopes().scope_ids)
+            remaining = sorted(current - set(scope_ids))
+            if remaining != sorted(current):
+                self._save_section(
+                    "library_scan_dirty_scopes",
+                    LibraryScanDirtyScopes(scope_ids=remaining),
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to clear library scan dirty scopes: {e}")
+            raise ConfigurationError(f"Failed to clear library scan dirty scopes: {e}")
+
+    def get_library_scan_filesystem_watcher(
+        self,
+    ) -> LibraryScanFilesystemWatcherSettings:
+        return self._get_section(
+            "library_scan_filesystem_watcher", LibraryScanFilesystemWatcherSettings
+        )
+
+    def save_library_scan_filesystem_watcher(
+        self, watcher: LibraryScanFilesystemWatcherSettings
+    ) -> None:
+        try:
+            self._save_section("library_scan_filesystem_watcher", watcher)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to save library scan filesystem watcher: {e}")
+            raise ConfigurationError(
+                f"Failed to save library scan filesystem watcher: {e}"
+            )
 
     def get_advanced_settings(self) -> AdvancedSettings:
         return self._get_section("advanced_settings", AdvancedSettings)
@@ -571,27 +630,41 @@ class PreferencesService:
 
     def get_source_priority(self) -> list[str]:
         """The order acquisition sources are tried (D3). Defaults to Soulseek-first;
-        unknown/missing sources are appended so the list always covers both."""
+        bundled sources are always present; well-formed ``plugin:<name>`` keys pass
+        through verbatim order-preserved (stale keys kept for the greyed Settings
+        row) while anything else is dropped."""
         raw = self._load_config().get("source_priority")
-        order = (
-            [s for s in raw if s in ("soulseek", "usenet")]
-            if isinstance(raw, list)
-            else []
-        )
+        order: list[str] = []
+        if isinstance(raw, list):
+            for s in raw:
+                if s in ("soulseek", "usenet"):
+                    if s not in order:
+                        order.append(s)
+                elif isinstance(s, str) and _PLUGIN_KEY_RE.match(s):
+                    if s not in order:
+                        order.append(s)
         for source in ("soulseek", "usenet"):
             if source not in order:
                 order.append(source)
         return order
 
     def save_source_priority(self, order: list[str]) -> None:
-        clean = [s for s in order if s in ("soulseek", "usenet")]
+        # Charset-lenient by design: registry membership (unknown -> 400) is enforced
+        # at the PUT route, so a stored key that later goes stale survives reload.
+        clean: list[str] = []
+        for s in order:
+            if s in ("soulseek", "usenet"):
+                if s not in clean:
+                    clean.append(s)
+            elif isinstance(s, str) and _PLUGIN_KEY_RE.match(s):
+                if s not in clean:
+                    clean.append(s)
         for source in ("soulseek", "usenet"):
             if source not in clean:
                 clean.append(source)
         config = self._load_config().copy()
         config["source_priority"] = clean
         self._save_config(config)
-
     # --- SABnzbd download client (D5) - in the download_clients map -----------------
 
     def get_sabnzbd_connection(self) -> SabnzbdConnectionSettings:
@@ -691,9 +764,94 @@ class PreferencesService:
             raise ConfigurationError(f"Failed to save Lidarr import settings: {e}")
 
     def is_lidarr_import_configured(self) -> bool:
-        """True iff a Lidarr import URL + API key are both stored (the non-admin gate)."""
+        """True iff a Lidarr import URL + API key are both stored."""
         raw = self.get_lidarr_import_connection_raw()
         return bool(raw.url and raw.api_key)
+
+    # --- Prowlarr connection - single section (Prowlarr multiplexes indexers) -----
+
+    def get_prowlarr_connection(self) -> ProwlarrConnectionSettings:
+        """Prowlarr connection with the ``api_key`` MASKED (safe for API responses)."""
+        data = self._load_config().get("prowlarr", {})
+        settings = (
+            msgspec.convert(data, type=ProwlarrConnectionSettings)
+            if data
+            else ProwlarrConnectionSettings()
+        )
+        if settings.api_key:
+            settings.api_key = PROWLARR_API_KEY_MASK
+        return settings
+
+    def get_prowlarr_connection_raw(self) -> ProwlarrConnectionSettings:
+        """Prowlarr connection with the ``api_key`` DECRYPTED (for the client and
+        the readiness predicate - never the masked getter, whose sentinel is truthy)."""
+        data = self._load_config().get("prowlarr", {})
+        settings = (
+            msgspec.convert(data, type=ProwlarrConnectionSettings)
+            if data
+            else ProwlarrConnectionSettings()
+        )
+        stored = data.get("api_key", "")
+        settings.api_key = decrypt(stored)[0].strip() if stored else ""
+        return settings
+
+    def save_prowlarr_connection(self, settings: ProwlarrConnectionSettings) -> None:
+        """Upsert the single Prowlarr section. The ``api_key`` is encrypted, or
+        preserved when the masked sentinel comes back. Direct ``_load_config`` /
+        ``_save_config`` like ``save_lidarr_import_connection`` (no section lock
+        on this path)."""
+        try:
+            config = self._load_config().copy()
+            current = config.get("prowlarr", {})
+            api_key = settings.api_key.strip()
+            if api_key == PROWLARR_API_KEY_MASK:
+                api_key = current.get("api_key", "")  # preserve on masked sentinel
+            elif api_key:
+                api_key = encrypt(api_key)
+            config["prowlarr"] = {
+                "enabled": settings.enabled,
+                "url": settings.url,
+                "api_key": api_key,
+            }
+            self._save_config(config)
+            logger.info("Saved Prowlarr connection settings")
+        except Exception as e:  # noqa: BLE001
+            logger.error("Failed to save Prowlarr settings: %s", e)
+            raise ConfigurationError(f"Failed to save Prowlarr settings: {e}")
+
+    def is_prowlarr_configured(self) -> bool:
+        """True iff Prowlarr is enabled with a URL and a real (decrypted) API key."""
+        raw = self.get_prowlarr_connection_raw()
+        return bool(raw.enabled and raw.url and raw.api_key)
+
+    # --- Usenet search backend: "indexers" xor "prowlarr" (either/or) ------------
+
+    def get_usenet_search_backend(self) -> str:
+        """Which Usenet search backend is active: ``"indexers"`` (the native
+        Newznab priority list) or ``"prowlarr"`` (the single Prowlarr
+        connection). Unknown/missing values collapse to ``"indexers"`` so every
+        pre-existing setup behaves exactly as before with no migration."""
+        raw = self._load_config().get("usenet_search_backend", "indexers")
+        return raw if raw in ("indexers", "prowlarr") else "indexers"
+
+    def save_usenet_search_backend(self, backend: str) -> None:
+        """Select the active Usenet search backend. Only the selected side is
+        searched (plus usenet-targeting plugins) and only it counts toward
+        ``is_usenet_ready()`` - the unselected side sits untouched so switching
+        back restores it. Unknown values raise (the route surfaces a 400)."""
+        if backend not in ("indexers", "prowlarr"):
+            raise ConfigurationError(
+                f"Unknown Usenet search backend: {backend!r} "
+                "(expected 'indexers' or 'prowlarr')"
+            )
+        try:
+            config = self._load_config().copy()
+            config["usenet_search_backend"] = backend
+            self._save_config(config)
+            logger.info("Usenet search backend set to %s", backend)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Failed to save Usenet search backend: %s", e)
+            raise ConfigurationError(f"Failed to save Usenet search backend: {e}")
 
     # --- Newznab indexers (D6) - a list, each with its own encrypted api_key ------
 
@@ -792,14 +950,20 @@ class PreferencesService:
         return dc.enabled and bool(dc.url)
 
     def is_usenet_ready(self) -> bool:
-        """SABnzbd (Usenet) is enabled with a URL AND at least one enabled indexer to
-        search - SABnzbd with no indexer can't find anything to download."""
+        """SABnzbd (Usenet) is enabled with a URL AND a usable search side -
+        SABnzbd with nothing to search can't find anything to download. Only the
+        SELECTED backend counts (either/or): an enabled Newznab row when the
+        backend is ``"indexers"``, a configured Prowlarr connection (raw key -
+        the masked sentinel must never read as ready) when ``"prowlarr"``."""
+        # Masked SAB getter is safe here: only enabled+url are read, never the key.
+        # If a key ever joins this predicate, switch to get_sabnzbd_connection_raw()
+        # (a masked sentinel is truthy and would read as ready).
         sab = self.get_sabnzbd_connection()
-        return (
-            sab.enabled
-            and bool(sab.url)
-            and any(i.enabled for i in self.get_indexers())
-        )
+        if not (sab.enabled and sab.url):
+            return False
+        if self.get_usenet_search_backend() == "prowlarr":
+            return self.is_prowlarr_configured()
+        return any(i.enabled for i in self.get_indexers())
 
     def is_builtin_download_ready(self) -> bool:
         """A user-configured download client (Soulseek OR Usenet) is set up.
@@ -2497,3 +2661,12 @@ class PreferencesService:
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to save security settings: {e}")
             raise ConfigurationError("Failed to save security settings")
+
+    def is_library_download_allowed(self, role: str) -> bool:
+        """Whether `role` may download library files (album zips + tracks)."""
+        access = self.get_security_settings().library_download_access
+        if access == "everyone":
+            return True
+        if access == "trusted":
+            return role in ("admin", "trusted")
+        return role == "admin"

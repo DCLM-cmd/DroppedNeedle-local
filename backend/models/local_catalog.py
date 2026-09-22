@@ -7,6 +7,7 @@ from typing import Literal
 import msgspec
 
 from infrastructure.msgspec_fastapi import AppStruct
+from models.identification import TrackProvenance
 
 ArtistKind = Literal["person", "group", "various_artists", "unknown"]
 Availability = Literal["indexed", "excluded", "missing"]
@@ -90,6 +91,9 @@ class LocalTrack(AppStruct):
     # so grouping can split "A; B" into separate album-artists. None means the
     # single tag_album_artist_name is authoritative (one artist).
     tag_album_artists_json: str | None = None
+    title_provenance: TrackProvenance = "absent"
+    album_title_provenance: TrackProvenance = "absent"
+    album_artist_provenance: TrackProvenance = "absent"
     year: int | None = None
     genre: str | None = None
     title_sort: str | None = None
@@ -97,6 +101,8 @@ class LocalTrack(AppStruct):
     album_sort: str | None = None
     album_artist_sort: str | None = None
     disc_subtitle: str | None = None
+    # Raw file-tag release type (RELEASETYPE/MUSICBRAINZ_ALBUMTYPE); display mapping lives in compat.
+    release_type: str | None = None
     is_compilation: bool = False
     embedded_release_group_mbid: str | None = None
     embedded_release_mbid: str | None = None

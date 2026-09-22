@@ -61,7 +61,10 @@ const PROVIDER_STATS: ProviderStats = {
 		}
 	],
 	window_seconds: 3600,
-	counters_since: null
+	counters_since: null,
+	body_byte_scope: 'HTTP response bodies; excludes headers and TLS',
+	detailed_series_limit: 1024,
+	process_epoch: 'fixture-epoch'
 };
 
 function setQueryStates(queue: QueryFixture<QueueStats>, provider: QueryFixture<ProviderStats>) {
@@ -78,7 +81,7 @@ describe('SettingsDiagnostics', () => {
 	});
 
 	it('shows skeleton placeholders while the gauges load', async () => {
-		render(SettingsDiagnostics);
+		await render(SettingsDiagnostics);
 
 		await expect.element(page.getByLabelText('Loading queue gauges')).toBeVisible();
 		await expect.element(page.getByLabelText('Loading provider stats')).toBeVisible();
@@ -89,7 +92,7 @@ describe('SettingsDiagnostics', () => {
 			{ data: QUEUE_STATS, isLoading: false, error: null },
 			{ data: PROVIDER_STATS, isLoading: false, error: null }
 		);
-		render(SettingsDiagnostics);
+		await render(SettingsDiagnostics);
 
 		const queues = page.getByRole('region', { name: 'Outbound request queues' });
 		await expect.element(queues.getByText('User requests')).toBeVisible();
@@ -107,7 +110,7 @@ describe('SettingsDiagnostics', () => {
 	});
 
 	it('states plainly that counters reset on restart and are per-process', async () => {
-		render(SettingsDiagnostics);
+		await render(SettingsDiagnostics);
 
 		await expect
 			.element(page.getByText(/reset\s+whenever\s+the\s+server\s+restarts/))
@@ -120,7 +123,7 @@ describe('SettingsDiagnostics', () => {
 			{ data: QUEUE_STATS, isLoading: false, error: null },
 			{ data: null, isLoading: false, error: new Error('boom') }
 		);
-		render(SettingsDiagnostics);
+		await render(SettingsDiagnostics);
 		const alerts = await page.getByRole('alert').all();
 		expect(alerts.length).toBe(1);
 		await expect.element(alerts[0]).toHaveTextContent("Couldn't load provider stats.");

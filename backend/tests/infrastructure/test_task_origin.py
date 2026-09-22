@@ -125,6 +125,7 @@ async def test_pre_origin_db_migrates_and_backfills_user(tmp_path: Path):
                 source_username TEXT,
                 status TEXT NOT NULL DEFAULT 'queued',
                 created_at REAL NOT NULL,
+                completed_at REAL,
                 updated_at REAL NOT NULL
             )
             """

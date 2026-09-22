@@ -29,7 +29,7 @@ it('shows an accessible placeholder while loading only the requested tab', async
 	expect(loadSettingsTab).toHaveBeenCalledTimes(2);
 	expect(loadSettingsTab).toHaveBeenLastCalledWith('users', true);
 
-	view.unmount();
+	await view.unmount();
 });
 
 it('shows a retry action when a settings chunk fails to load', async () => {
@@ -44,5 +44,5 @@ it('shows a retry action when a settings chunk fails to load', async () => {
 	await expect.element(page.getByLabelText('Loading settings')).toBeInTheDocument();
 	expect(loadSettingsTab).toHaveBeenCalledTimes(2);
 
-	view.unmount();
+	await view.unmount();
 });

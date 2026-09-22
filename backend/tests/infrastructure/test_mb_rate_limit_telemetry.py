@@ -6,7 +6,6 @@ import logging
 
 import pytest
 
-from infrastructure.cache.cache_metrics import WindowedCounterMap
 from infrastructure.observability import provider_counters
 from infrastructure.observability.provider_counters import (
     LOW_REMAINING_THRESHOLD,
@@ -148,13 +147,13 @@ class TestLowRemainingTelemetry:
 class TestCallCountsUnaffected:
     @pytest.fixture
     def fresh_counters(self, monkeypatch):
-        counters = WindowedCounterMap()
+        counters = provider_counters.ProviderCounterMap()
         monkeypatch.setattr(provider_counters, "_counters", counters)
         return counters
 
     @pytest.mark.asyncio
     async def test_telemetry_does_not_perturb_call_outcomes(
-        self, fresh_counters: WindowedCounterMap
+        self, fresh_counters: provider_counters.ProviderCounterMap
     ):
         before = provider_counters.snapshot_provider_rows()
 

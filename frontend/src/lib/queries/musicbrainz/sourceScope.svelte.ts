@@ -171,12 +171,14 @@ export function resetMusicBrainzSourceScope(): void {
 	updateCurrentScope({ ...EMPTY_SCOPE });
 }
 
-export function musicBrainzSourceKey(userId?: string | null): {
+export interface MusicBrainzSourceKey {
 	user_id: string | null;
 	source_mode: MusicBrainzSourceMode;
 	source_id: string;
 	generation: number;
-} {
+}
+
+export function musicBrainzSourceKey(userId?: string | null): MusicBrainzSourceKey {
 	if (userId === undefined) {
 		return { ...musicBrainzSourceKeyForScope(getMusicBrainzSourceScope()) };
 	}

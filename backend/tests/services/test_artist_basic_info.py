@@ -47,6 +47,8 @@ def _make_service(
     library_repo = MagicMock()
     library_repo.is_configured.return_value = False
     library_repo.get_library_mbids = AsyncMock(return_value=set())
+    library_repo.existing_album_mbids = AsyncMock(return_value=set())
+    library_repo.existing_artist_mbids = AsyncMock(return_value=set())
     library_repo.get_requested_mbids = AsyncMock(return_value=set())
     library_repo.get_artist_mbids = AsyncMock(return_value=set())
 
@@ -66,11 +68,16 @@ def _make_service(
     )
 
     memory_cache = AsyncMock()
+    memory_cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
     memory_cache.get = AsyncMock(return_value=cached_artist)
+    memory_cache.get_with_metadata = AsyncMock(return_value=(cached_artist, None))
+    memory_cache.set_if_token = AsyncMock(return_value=True)
     memory_cache.set = AsyncMock()
 
     disk_cache = AsyncMock()
+    disk_cache.capture_clear_token = MagicMock(return_value=("test-disk", 0))
     disk_cache.get_artist = AsyncMock(return_value=None)
+    disk_cache.get_artist_with_metadata = AsyncMock(return_value=(None, None))
     disk_cache.set_artist = AsyncMock()
 
     svc = ArtistService(
@@ -191,18 +198,19 @@ class TestBasicInfoDeferralEquivalence:
         result = await svc.get_artist_info_basic(ARTIST_MBID)
 
         # Memory cache holds the exact object returned, inline on return.
+        # Freshness publishes through set_if_token(token, key, value, ...).
         artist_info_writes = [
             call
-            for call in svc.test_memory_cache.set.await_args_list
-            if call.args[0].startswith("artist_info:")
+            for call in svc.test_memory_cache.set_if_token.await_args_list
+            if len(call.args) > 1 and call.args[1].startswith("artist_info:")
         ]
         assert len(artist_info_writes) == 1
-        cached_value = artist_info_writes[0].args[1]
+        cached_value = artist_info_writes[0].args[2]
         assert msgspec.json.encode(cached_value) == msgspec.json.encode(result)
         rgs_writes = [
             call
-            for call in svc.test_memory_cache.set.await_args_list
-            if call.args[0].startswith("mb:artist_rgs:")
+            for call in svc.test_memory_cache.set_if_token.await_args_list
+            if len(call.args) > 1 and call.args[1].startswith("mb:artist_rgs:")
         ]
         assert not rgs_writes  # basic profile is detail-only; no warm side effect
 

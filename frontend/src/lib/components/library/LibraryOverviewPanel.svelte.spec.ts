@@ -157,19 +157,22 @@ beforeEach(() => {
 		isError: false
 	};
 	h.operations = { data: { pages: [{ items: [] }] }, isLoading: false, isError: false };
+	h.schedule = {
+		data: { scan_frequency: 'daily', daily_scan_time: '09:00', server_timezone: 'Europe/London' }
+	};
 	h.requestRun.mockResolvedValue({});
 });
 
 describe('LibraryOverviewPanel', () => {
 	it('shows an idle Current Work hero when nothing is running', async () => {
-		render(LibraryOverviewPanel);
+		await render(LibraryOverviewPanel);
 		await expect.element(page.getByText('Nothing is running right now')).toBeVisible();
 		await expect.element(page.getByText(/anything in progress will show up/)).toBeVisible();
 	});
 
 	it('shows active scan work with progress and an Open details link', async () => {
 		h.activity = { data: { work_items: [workItem()] }, isLoading: false, isError: false };
-		render(LibraryOverviewPanel);
+		await render(LibraryOverviewPanel);
 		await expect.element(page.getByRole('heading', { name: 'Scanning library' })).toBeVisible();
 		await expect.element(page.getByText(/40 \/ 100 files/)).toBeVisible();
 		await expect
@@ -178,7 +181,7 @@ describe('LibraryOverviewPanel', () => {
 	});
 
 	it('shows track and review stats with a link to the review queue', async () => {
-		render(LibraryOverviewPanel);
+		await render(LibraryOverviewPanel);
 		await expect.element(page.getByText('1,234')).toBeVisible();
 		await expect.element(page.getByText('Needs review')).toBeVisible();
 		await expect
@@ -205,7 +208,7 @@ describe('LibraryOverviewPanel', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryOverviewPanel);
+		await render(LibraryOverviewPanel);
 		await expect.element(page.getByText('Needs attention')).toBeVisible();
 		await expect
 			.element(page.getByRole('link', { name: /Needs attention/ }))
@@ -214,7 +217,7 @@ describe('LibraryOverviewPanel', () => {
 	});
 
 	it('requests an incremental scan from the quick action', async () => {
-		render(LibraryOverviewPanel);
+		await render(LibraryOverviewPanel);
 		await page.getByRole('button', { name: 'Scan for changes' }).click();
 		expect(h.requestRun).toHaveBeenCalledWith({
 			kind: 'incremental',
@@ -229,8 +232,77 @@ describe('LibraryOverviewPanel', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryOverviewPanel);
+		await render(LibraryOverviewPanel);
 		await expect.element(page.getByText('The local library is disabled')).toBeVisible();
 		await expect.element(page.getByRole('button', { name: 'Scan for changes' })).toBeDisabled();
+	});
+
+	it('names the file watcher when the rolling schedule is manual', async () => {
+		h.schedule = {
+			data: { scan_frequency: 'manual', daily_scan_time: '03:00', server_timezone: '' }
+		};
+		await render(LibraryOverviewPanel);
+		await expect
+			.element(page.getByText('Scheduled scans off (file watcher still active)'))
+			.toBeVisible();
+	});
+
+	it('shows a waiting-for-scan hint on queued previews while a scan is active', async () => {
+		h.activity = {
+			data: {
+				work_items: [
+					workItem(),
+					workItem({
+						id: 'preview-1',
+						kind: 'library_management',
+						state: 'queued',
+						phase: 'planning',
+						mode: 'preview',
+						effect: 'catalog_only',
+						processed: 0,
+						total: null,
+						unit: 'items',
+						indeterminate: true,
+						remaining_count: null,
+						subject_count: null,
+						started_at: null
+					})
+				]
+			},
+			isLoading: false,
+			isError: false
+		};
+		await render(LibraryOverviewPanel);
+		await expect.element(page.getByText('Preparing a Picard-style preview')).toBeVisible();
+		await expect.element(page.getByText(/Waiting for scan/)).toBeVisible();
+	});
+
+	it('shows no waiting-for-scan hint on queued previews when no scan is active', async () => {
+		h.activity = {
+			data: {
+				work_items: [
+					workItem({
+						id: 'preview-1',
+						kind: 'library_management',
+						state: 'queued',
+						phase: 'planning',
+						mode: 'preview',
+						effect: 'catalog_only',
+						processed: 0,
+						total: null,
+						unit: 'items',
+						indeterminate: true,
+						remaining_count: null,
+						subject_count: null,
+						started_at: null
+					})
+				]
+			},
+			isLoading: false,
+			isError: false
+		};
+		await render(LibraryOverviewPanel);
+		await expect.element(page.getByText('Preparing a Picard-style preview')).toBeVisible();
+		expect(page.getByText(/Waiting for scan/).elements()).toHaveLength(0);
 	});
 });

@@ -14,9 +14,11 @@
 	import { getQuarantineQuery } from '$lib/queries/downloads/QuarantineQueries.svelte';
 	import { bucketSections, collapseRetryChains } from '$lib/queries/downloads/downloadStatus';
 	import { authStore } from '$lib/stores/authStore.svelte';
+	import type { DownloadTask, HeldImport } from '$lib/types';
 
 	import DownloadItem from './DownloadItem.svelte';
 	import HeldTrackCard from './HeldTrackCard.svelte';
+	import HeldVerdictCard from './HeldVerdictCard.svelte';
 	import ManagementHoldCard from './ManagementHoldCard.svelte';
 	import NowPressingHero from './NowPressingHero.svelte';
 	import QuarantinePanel from './QuarantinePanel.svelte';
@@ -41,6 +43,24 @@
 	});
 	const heldTaskIds = $derived(
 		new Set(held.flatMap((item) => (item.source_task_id ? [item.source_task_id] : [])))
+	);
+	// Wrong-product verdicts: tasks whose import proved the grabbed folder is a different
+	// product collapse to one card with their member tracks (members must still be held -
+	// a verdict whose rows were all individually resolved shows nothing).
+	const verdictGroups = $derived.by(() => {
+		const groups: { task: DownloadTask; items: HeldImport[] }[] = [];
+		for (const task of query.data?.items ?? []) {
+			if (task.wrong_product_verdict_at == null) continue;
+			const items = verificationHeld.filter((item) => item.source_task_id === task.id);
+			if (items.length > 0) groups.push({ task, items });
+		}
+		return groups;
+	});
+	const verdictMemberIds = $derived(
+		new Set(verdictGroups.flatMap((group) => group.items.map((item) => item.id)))
+	);
+	const loneVerificationHeld = $derived(
+		verificationHeld.filter((item) => !verdictMemberIds.has(item.id))
 	);
 
 	const clear = clearHistory();
@@ -199,7 +219,10 @@
 					</button>
 				</div>
 				<div class="space-y-3">
-					{#each verificationHeld as item (item.id)}
+					{#each verdictGroups as group (group.task.id)}
+						<HeldVerdictCard task={group.task} items={group.items} />
+					{/each}
+					{#each loneVerificationHeld as item (item.id)}
 						<HeldTrackCard held={item} />
 					{/each}
 				</div>

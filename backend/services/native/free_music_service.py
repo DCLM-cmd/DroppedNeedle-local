@@ -313,7 +313,7 @@ class FreeMusicService:
             await self._run(task_id, task, cancel, lifecycle_lock)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception:  # noqa: BLE001 - task boundary records failure instead of raising
             logger.exception("Free Music task %s failed", task_id)
             await self._fail(task_id, task.user_id, "Something went wrong. Try again.")
 

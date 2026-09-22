@@ -623,6 +623,33 @@ export function discardHeldManagementUnit() {
 	}));
 }
 
+// Wrong-product verdict action: discard every verification-held track for one download.
+// invalidateTasks covers the held prefix nested under tasks, so the verdict card and its
+// member rows disappear together.
+export function discardHeldVerdict() {
+	return createMutation(() => ({
+		mutationFn: (input: HeldManagementActionInput) =>
+			api.global.post<{ status: string; files: number }>(
+				API.downloads.heldVerdictDiscard(input.taskId),
+				{}
+			),
+		onSuccess: (data: { files: number }) => {
+			toastStore.show({
+				message: `${data.files} held ${data.files === 1 ? 'file' : 'files'} discarded`,
+				type: 'info'
+			});
+			void invalidateTasks();
+		},
+		onError: (err: unknown) => {
+			void invalidateTasks();
+			toastStore.show({
+				message: errorMessage(err, 'Failed to discard held files'),
+				type: 'error'
+			});
+		}
+	}));
+}
+
 interface ReimportInput {
 	id: string;
 	release_group_mbid?: string | null;

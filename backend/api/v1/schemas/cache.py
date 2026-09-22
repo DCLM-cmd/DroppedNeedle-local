@@ -1,3 +1,7 @@
+from typing import Annotated, Literal
+
+import msgspec
+
 from infrastructure.msgspec_fastapi import AppStruct
 
 
@@ -26,12 +30,17 @@ class CacheStats(AppStruct):
     library_db_size_mb: float
     total_size_bytes: int
     total_size_mb: float
+    memory_accounting: Literal["shallow"] = "shallow"
+    response_entries: int = 0
+    response_logical_bytes: int = 0
+    response_hits: Annotated[int, msgspec.Meta(ge=0)] = 0
+    response_evictions: Annotated[int, msgspec.Meta(ge=0)] = 0
+    response_speculative_used: Annotated[int, msgspec.Meta(ge=0)] = 0
+    database_allocated_bytes: int = 0
+    database_wal_bytes: int = 0
     library_db_last_sync: int | None = None
     disk_audiodb_artist_count: int = 0
     disk_audiodb_album_count: int = 0
-    # QW9 Part 2 observability fields (additive-with-defaults keeps the
-    # pre-QW9 payload shape a strict prefix of this one). Globals reuse the
-    # InMemoryCache cumulative computation; per-prefix rows are windowed.
     memory_hits: int = 0
     memory_misses: int = 0
     memory_hit_rate_percent: float = 0.0
@@ -44,8 +53,8 @@ class CacheClearResponse(AppStruct):
     message: str
     cleared_memory_entries: int = 0
     cleared_disk_files: int = 0
+    cleared_response_entries: int = 0
     cleared_library_artists: int = 0
     cleared_library_albums: int = 0
-    # QW9 Part 4 split accounting: bulk clears report the cover files they
-    # deleted; the metadata-scoped clear reports 0 because covers are untouched.
+    # Cover files are a subset of cleared_disk_files; response rows are separate.
     cover_files_cleared: int = 0

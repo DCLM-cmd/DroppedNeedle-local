@@ -119,3 +119,17 @@ async def test_sweep_providerless_row_keeps_none_artist_mbid():
     kwargs = service.request_upgrade_album.await_args.kwargs
     assert kwargs["artist_name"] == "Providerless Artist"
     assert kwargs["artist_mbid"] is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_poison_item_does_not_starve_siblings():
+    """F-13: one failing item must not abort the sweep (siblings would wait 12h)."""
+    service = AsyncMock()
+    service.list_cutoff_unmet.return_value = [_item("rg-poison"), _item("rg-2")]
+    service.request_upgrade_album.side_effect = [RuntimeError("boom"), "task-2"]
+    admin = SimpleNamespace(id="admin-1", role="admin")
+
+    enqueued = await run_background_upgrade_sweep(service, _auth([admin]), _policy())
+
+    assert enqueued == 1
+    assert service.request_upgrade_album.await_count == 2

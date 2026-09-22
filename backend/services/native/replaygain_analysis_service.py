@@ -17,7 +17,7 @@ from models.library_management_enrichment import (
 _MAX_ALBUM_TRACKS = 500
 _MAX_ANALYSIS_SECONDS = 300
 
-ReplayGainRunner = Callable[[Sequence[str], int], subprocess.CompletedProcess[str]]
+ReplayGainRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
 
 
 def _number(value: str, suffix: str = "") -> float:
@@ -35,6 +35,26 @@ def _file_state(path: Path) -> tuple[int, int]:
 
 async def _snapshot_file_states(sources: tuple[Path, ...]) -> tuple[tuple[int, int], ...]:
     return await asyncio.to_thread(lambda: tuple(_file_state(path) for path in sources))
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    return isinstance(error, (subprocess.TimeoutExpired, TimeoutError))
+
+
+async def _probe_file_states(
+    sources: tuple[Path, ...],
+) -> tuple[dict[Path, tuple[int, int]], list[Path]]:
+    def _collect() -> tuple[dict[Path, tuple[int, int]], list[Path]]:
+        states: dict[Path, tuple[int, int]] = {}
+        missing: list[Path] = []
+        for path in sources:
+            try:
+                states[path] = _file_state(path)
+            except OSError:
+                missing.append(path)
+        return states, missing
+
+    return await asyncio.to_thread(_collect)
 
 
 class ReplayGainAnalysisService:
@@ -78,8 +98,14 @@ class ReplayGainAnalysisService:
                 status="deferred", reason="The loudgain analyzer is unavailable."
             )
         try:
-            before = await _snapshot_file_states(sources)
+            states = await _snapshot_file_states(sources)
+            before = dict(zip(sources, states))
         except OSError:
+            # One unreadable track must not poison the album: keep the
+            # readable subset and skip the rest individually.
+            before, _ = await _probe_file_states(sources)
+        candidates = tuple(path for path in sources if path in before)
+        if not candidates:
             return ReplayGainAnalysis(
                 status="deferred", reason="A ReplayGain source is unavailable."
             )
@@ -91,7 +117,7 @@ class ReplayGainAnalysisService:
             "s",
             "-O",
             "-q",
-            *(str(path) for path in sources),
+            *(str(path) for path in candidates),
         )
         async with self._semaphore:
             try:
@@ -101,53 +127,155 @@ class ReplayGainAnalysisService:
                         self._version = (
                             version.stdout.strip() or version.stderr.strip() or None
                         )
-                completed = await self._run_command(command, timeout)
             except (OSError, subprocess.SubprocessError, ValueError):
                 return ReplayGainAnalysis(
                     status="deferred",
                     analyzer_version=self._version,
                     reason="ReplayGain analysis failed.",
                 )
-        if completed.returncode != 0:
-            return ReplayGainAnalysis(
-                status="deferred",
-                analyzer_version=self._version,
-                reason="ReplayGain analysis failed.",
-            )
+            deadline = asyncio.get_running_loop().time() + timeout
+            analyzed: dict[str, ReplayGainTrackResult] = {}
+            failure_reason = "ReplayGain analysis failed."
+            try:
+                completed = await self._run_with_retry(command, timeout)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                # Only timeout-like errors escape the retry helper; a timeout
+                # is album-global and defers the whole album.
+                return ReplayGainAnalysis(
+                    status="deferred",
+                    analyzer_version=self._version,
+                    reason="ReplayGain analysis failed.",
+                )
+            if completed is not None and completed.returncode == 0:
+                try:
+                    tracks = self._parse_output(
+                        completed.stdout,
+                        sources=candidates,
+                        album_aware=album_aware,
+                    )
+                except (KeyError, ValueError):
+                    failure_reason = "ReplayGain returned an invalid result."
+                else:
+                    analyzed = {track.source_path: track for track in tracks}
+            if len(analyzed) < len(candidates):
+                missing = tuple(
+                    path for path in candidates if str(path) not in analyzed
+                )
+                try:
+                    for track in await self._analyze_each(
+                        executable, missing, deadline
+                    ):
+                        analyzed[track.source_path] = track
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    return ReplayGainAnalysis(
+                        status="deferred",
+                        analyzer_version=self._version,
+                        reason="ReplayGain analysis failed.",
+                    )
         try:
-            after = await _snapshot_file_states(sources)
+            states = await _snapshot_file_states(candidates)
+            after = dict(zip(candidates, states))
+            after_missing: list[Path] = []
         except OSError:
+            after, after_missing = await _probe_file_states(candidates)
+        gone = set(after_missing)
+        altered = {
+            path for path in candidates if path in after and after[path] != before[path]
+        }
+        for path in gone | altered:
+            analyzed.pop(str(path), None)
+        if not analyzed:
+            if len(gone | altered) == len(candidates):
+                if gone:
+                    return ReplayGainAnalysis(
+                        status="deferred",
+                        analyzer_version=self._version,
+                        reason="A ReplayGain source changed during analysis.",
+                    )
+                return ReplayGainAnalysis(
+                    status="deferred",
+                    analyzer_version=self._version,
+                    reason="The analyzer changed a source file.",
+                )
             return ReplayGainAnalysis(
                 status="deferred",
                 analyzer_version=self._version,
-                reason="A ReplayGain source changed during analysis.",
+                reason=failure_reason,
             )
-        if after != before:
-            return ReplayGainAnalysis(
-                status="deferred",
-                analyzer_version=self._version,
-                reason="The analyzer changed a source file.",
-            )
-        try:
-            tracks = self._parse_output(
-                completed.stdout,
-                sources=sources,
-                album_aware=album_aware,
-            )
-        except (KeyError, ValueError):
-            return ReplayGainAnalysis(
-                status="deferred",
-                analyzer_version=self._version,
-                reason="ReplayGain returned an invalid result.",
-            )
+        ordered = [analyzed[str(path)] for path in sources if str(path) in analyzed]
+        skipped = len(sources) - len(ordered)
         return ReplayGainAnalysis(
             status="available",
-            tracks=tracks,
+            tracks=tuple(ordered),
             analyzer_version=self._version,
+            reason=(
+                None
+                if skipped == 0
+                else f"ReplayGain analysis skipped {skipped} of {len(sources)} tracks."
+            ),
         )
 
+    async def _run_with_retry(
+        self, command: Sequence[str], timeout_budget: float
+    ) -> subprocess.CompletedProcess[str] | None:
+        """Invoke loudgain up to twice without exceeding the timeout budget.
+
+        Returns the successful result, the last nonzero result, or None when
+        the invocation itself kept failing. Only timeout-like errors escape;
+        they are album-global and must defer the whole album.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(timeout_budget, 0.0)
+        attempt_timeout = timeout_budget
+        last_completed: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(2):
+            try:
+                completed = await self._run_command(command, attempt_timeout)
+            except (OSError, subprocess.SubprocessError, ValueError) as error:
+                if _is_timeout_error(error):
+                    raise
+                last_completed = None
+            else:
+                if completed.returncode == 0:
+                    return completed
+                last_completed = completed
+            if attempt == 0:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                attempt_timeout = remaining
+        return last_completed
+
+    async def _analyze_each(
+        self,
+        executable: str,
+        tracks: Sequence[Path],
+        deadline: float,
+    ) -> list[ReplayGainTrackResult]:
+        """Analyze tracks one by one, skipping individual failures."""
+        results: list[ReplayGainTrackResult] = []
+        loop = asyncio.get_running_loop()
+        for path in tracks:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            completed = await self._run_with_retry(
+                (executable, "-r", "-s", "s", "-O", "-q", str(path)),
+                min(remaining, 30 + 10 * 1),
+            )
+            if completed is None or completed.returncode != 0:
+                continue
+            try:
+                (track,) = self._parse_output(
+                    completed.stdout, sources=(path,), album_aware=False
+                )
+            except (KeyError, ValueError):
+                continue
+            results.append(track)
+        return results
+
     async def _run_command(
-        self, command: Sequence[str], timeout_seconds: int
+        self, command: Sequence[str], timeout_seconds: float
     ) -> subprocess.CompletedProcess[str]:
         if self._runner is not None:
             return await asyncio.to_thread(self._runner, command, timeout_seconds)

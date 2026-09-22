@@ -1,4 +1,4 @@
-"""Post-cutover Subsonic scan projection staged without runtime registration."""
+"""Post-cutover Subsonic scan projection, registered via `get_target_compat_services().scan`."""
 
 from __future__ import annotations
 

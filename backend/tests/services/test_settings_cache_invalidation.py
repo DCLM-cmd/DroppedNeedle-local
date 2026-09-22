@@ -30,11 +30,9 @@ from services.settings_service import SettingsService
 
 async def _build_service(disk_cache=None) -> tuple[SettingsService, InMemoryCache]:
     cache = InMemoryCache(max_entries=500)
-    service = SettingsService(
-        preferences_service=None,
-        cache=cache,
-        disk_cache=disk_cache,
-    )
+    service = SettingsService(preferences_service=None,
+    cache=cache,
+    disk_cache=disk_cache, mb_response_store=AsyncMock(), follow_store=AsyncMock())
     return service, cache
 
 
@@ -479,7 +477,7 @@ async def test_musicbrainz_settings_endpoint_change_resets_and_clears(
     search_clear = MagicMock()
     monkeypatch.setattr(SearchService, "clear_cached_results", search_clear)
     mb_keys = [f"{p}endpoint" for p in musicbrainz_prefixes()]
-    assert len(mb_keys) == 28
+    assert len(mb_keys) == 29
     # Source switches clear only MusicBrainz-backed discovery categories.
     assert ARTIST_DISCOVERY_TOP_SONGS_PREFIX in musicbrainz_prefixes()
     assert ARTIST_DISCOVERY_TOP_ALBUMS_PREFIX in musicbrainz_prefixes()
@@ -656,7 +654,7 @@ async def test_musicbrainz_settings_clear_failure_leaves_live_state_for_retry(
 
     await service.on_musicbrainz_settings_changed(new_settings)
 
-    assert calls == 29
+    assert calls == 30
     assert get_mb_api_base() == new_settings.api_url
     assert mb_rate_limiter.rate == new_settings.rate_limit
     assert mb_rate_limiter.capacity == new_settings.concurrent_searches

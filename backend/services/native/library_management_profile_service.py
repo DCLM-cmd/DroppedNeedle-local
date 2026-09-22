@@ -11,6 +11,9 @@ from pathlib import Path
 import msgspec
 
 from api.v1.schemas.library_management import (
+    DEFAULT_SIDECAR_PATTERNS,
+    LEGACY_DEFAULT_SIDECAR_PATTERNS,
+    LibraryManagementActivationHealthResponse,
     LibraryManagementChangeImpact,
     ManagedFieldSettings,
     LibraryManagementPresetDiff,
@@ -79,6 +82,76 @@ def _active_automatic(assignment: LibraryManagementRootAssignment | None) -> boo
             or assignment.automatic_scan_discovered
         )
     )
+
+
+def _activation_is_current(
+    assignment: LibraryManagementRootAssignment,
+    effective: LibraryManagementProfile,
+    pinned: PinnedLibraryManagementProfile,
+    policy: LibraryPolicyResolver,
+) -> bool:
+    """The exact gate `prepare_automatic_profile` enforces, as a predicate.
+
+    Shared with `activation_health` so the automation tab reports precisely
+    the roots the automatic path would hold - the two must never drift.
+    """
+
+    return bool(
+        assignment.activation_profile_revision == profile_revision(effective)
+        and activation_naming_policy_matches(assignment, pinned)
+        and assignment.activation_policy_revision == policy.policy_revision
+        and assignment.activation_preview_token
+        and assignment.activation_preview_hash
+        and assignment.activation_confirmed_at is not None
+    )
+
+
+# Historical project-default sidecar patterns, oldest first. Load-time preset
+# migrations rewrite untouched profiles to the current defaults; an activation
+# that reviewed exactly "this effective profile with historical defaults" is
+# still valid, so the automatic gate carries it forward instead of demanding a
+# dry run for a change the user never made (owner decision, 2026-09-13: a
+# default-only migration must never pause the organizer). Entries must be
+# kept: activations pinned by old releases verify against them, and pins only
+# converge to current hashes on the next user-confirmed dry run. Future
+# default migrations append a copy of their superseded list here alongside
+# the migration (copies, so a later mutation of the live constant cannot
+# corrupt historical pins).
+_SIDECAR_DEFAULT_HISTORY: tuple[list[str], ...] = (
+    list(LEGACY_DEFAULT_SIDECAR_PATTERNS),
+)
+
+
+def migration_carry_applies(
+    assignment: LibraryManagementRootAssignment,
+    effective: LibraryManagementProfile,
+    pinned: PinnedLibraryManagementProfile,
+    policy: LibraryPolicyResolver,
+) -> bool:
+    """Whether a default-only migration is the sole activation drift.
+
+    Returns True only when the stored profile carries the current project
+    defaults and the activation is current for that same effective profile
+    with a historical default list substituted back in - i.e. the reviewed
+    state plus a project-blessed default evolution, the same class of
+    change the organizer engine itself undergoes without invalidating dry
+    runs. Any real user delta, naming/policy drift, or missing proof still
+    needs a fresh dry run. Read-only: pins converge on the next confirmed
+    dry run rather than being rewritten here.
+    """
+
+    if effective.organization.sidecar_patterns != DEFAULT_SIDECAR_PATTERNS:
+        return False
+    for historical in _SIDECAR_DEFAULT_HISTORY:
+        pre_migration = msgspec.structs.replace(
+            effective,
+            organization=msgspec.structs.replace(
+                effective.organization, sidecar_patterns=list(historical)
+            ),
+        )
+        if _activation_is_current(assignment, pre_migration, pinned, policy):
+            return True
+    return False
 
 
 def _profile_scope_payload(profile: LibraryManagementProfile) -> dict:
@@ -819,18 +892,59 @@ class LibraryManagementProfileService:
             return None
         effective = self._effective_profile(settings, assignment)
         pinned = self._pin_effective_profile(settings, assignment)
-        if (
-            assignment.activation_profile_revision != profile_revision(effective)
-            or not activation_naming_policy_matches(assignment, pinned)
-            or assignment.activation_policy_revision != policy.policy_revision
-            or not assignment.activation_preview_token
-            or not assignment.activation_preview_hash
-            or assignment.activation_confirmed_at is None
-        ):
+        if not _activation_is_current(
+            assignment, effective, pinned, policy
+        ) and not migration_carry_applies(assignment, effective, pinned, policy):
             raise StaleRevisionError(
                 "Library Management activation is stale; run and confirm a new dry run."
             )
         return settings, assignment, effective, policy
+
+    def activation_health(self) -> LibraryManagementActivationHealthResponse:
+        """Report dry-run activation health for active automatic roots.
+
+        Advisory read for the automation tab. One broken assignment must
+        not hide the others. Roots whose effective profile cannot even
+        resolve land in blocked: a dry run re-validates the same
+        settings and would fail identically, so no dry run is offered.
+        Roots that resolve but no longer match their stored activation
+        land in stale. A policy that cannot resolve at all (unknown
+        root, unavailable path, recycle-bin overlap) blocks every active
+        root with the policy error as the reason.
+        """
+
+        settings = self._preferences.get_library_management_settings_raw()
+        try:
+            policy = self._validate_root_assignments(settings)
+        except ConfigurationError as error:
+            blocked = [
+                assignment.root_id
+                for assignment in settings.root_assignments
+                if _active_automatic(assignment)
+            ]
+            return LibraryManagementActivationHealthResponse(
+                blocked_root_ids=blocked,
+                blocked_reason=str(error) if blocked else None,
+            )
+        stale: list[str] = []
+        blocked: list[str] = []
+        for assignment in settings.root_assignments:
+            if not _active_automatic(assignment):
+                continue
+            try:
+                effective = self._effective_profile(settings, assignment)
+                pinned = self._pin_effective_profile(settings, assignment)
+            except Exception:  # noqa: BLE001 - health must survive one bad root
+                blocked.append(assignment.root_id)
+                continue
+            if _activation_is_current(
+                assignment, effective, pinned, policy
+            ) or migration_carry_applies(assignment, effective, pinned, policy):
+                continue
+            stale.append(assignment.root_id)
+        return LibraryManagementActivationHealthResponse(
+            stale_root_ids=stale, blocked_root_ids=blocked
+        )
 
     def prepare_conversion_profile(
         self,

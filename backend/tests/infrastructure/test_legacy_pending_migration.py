@@ -480,7 +480,7 @@ async def test_completed_input_a_does_not_suppress_new_pending_input_b(
         )
 
     counts = await store.get_pending_legacy_counts()
-    assert any(value > 0 for value in counts.values())
+    assert any(value > 0 for value in counts["retryable"].values())
     revision_b = await store.get_bounded_legacy_source_revision()
     assert revision_b != revision_a
     candidate = pending_run_id(resolvable_resolver.policy_revision, revision_b)
@@ -543,7 +543,8 @@ async def test_schedule_without_marker_or_pending_launches_nothing(
     ).migrate("empty-migration", now=300)
     empty_service = LegacyPendingMigrationService(empty_store, lambda: resolver)
     counts = await empty_store.get_pending_legacy_counts()
-    assert all(value == 0 for value in counts.values())
+    assert all(value == 0 for value in counts["retryable"].values())
+    assert counts["terminal_parked"] == {"needs_review": 0}
     assert await empty_service.schedule() is False
 
 
@@ -724,7 +725,7 @@ async def test_pending_migration_projects_moved_root_after_restoration(
         skip_unmappable_paths=True,
     ).migrate("lenient-migration", now=100)
     counts = await store.get_pending_legacy_counts()
-    assert counts["library_file"] == 2
+    assert counts["retryable"]["library_file"] == 2
 
     # Root restoration: the user points the root at the CURRENT mount.
     resolver = _resolver(("root", current_root))
@@ -819,7 +820,7 @@ async def test_pending_migration_keeps_wrong_size_destination_pending(
         ).fetchone()[0]
     assert track_count == 0  # nothing was guessed
     counts = await store.get_pending_legacy_counts()
-    assert counts["library_file"] == 2  # rows remain pending and retryable
+    assert counts["retryable"]["library_file"] == 2  # rows remain pending and retryable
 
 
 @pytest.mark.asyncio
@@ -846,8 +847,8 @@ async def test_policy_revision_change_during_pending_run_fails_closed(
         skip_unmappable_paths=True,
     ).migrate("lenient-migration", now=100)
     counts = await store.get_pending_legacy_counts()
-    assert counts["library_file"] == 2
-    assert counts["review_row"] == 4
+    assert counts["retryable"]["library_file"] == 2
+    assert counts["retryable"]["review_row"] == 4
 
     resolver = _resolver(("root", historical_root))
     policy_a = resolver.policy_revision
@@ -884,8 +885,8 @@ async def test_policy_revision_change_during_pending_run_fails_closed(
         ).fetchone()[0]
     assert state != "completed"
     counts = await store.get_pending_legacy_counts()
-    assert counts["library_file"] == 0  # imported before the policy flip
-    assert counts["review_row"] == 4  # never processed: still retryable
+    assert counts["retryable"]["library_file"] == 0  # imported before the policy flip
+    assert counts["retryable"]["review_row"] == 4  # never processed: still retryable
 
     # Follow-up schedule runs under the new revision and converges.
     service = LegacyPendingMigrationService(store, lambda: resolver)
@@ -915,8 +916,8 @@ async def test_policy_revision_change_during_pending_run_fails_closed(
             "WHERE source_kind = 'review_row'"
         ).fetchone()[0]
     counts = await store.get_pending_legacy_counts()
-    assert counts["review_row"] == 0
-    assert counts["library_file"] == 0
+    assert counts["retryable"]["review_row"] == 0
+    assert counts["retryable"]["library_file"] == 0
     assert review_provenance == 4  # imported exactly once, under P2
     assert await service.schedule() is False
 
@@ -1269,7 +1270,7 @@ async def test_pending_migration_completes_with_poison_reference_and_reports_ski
             == 2
         )
     counts = await store.get_pending_legacy_counts()
-    assert counts["favorite"] > 0
+    assert counts["retryable"]["favorite"] > 0
     service = LegacyPendingMigrationService(store, lambda: resolver)
     assert await service.schedule() is False
 
@@ -1463,3 +1464,112 @@ async def test_pending_migration_resume_counts_prior_provenance(
         assert connection.execute("SELECT COUNT(*) FROM local_tracks").fetchone() == (
             4,
         )
+
+
+@pytest.mark.asyncio
+async def test_malformed_reference_skip_routes_to_needs_review(
+    tmp_path: Path,
+) -> None:
+    """N-03b: a malformed skip with a live track target becomes human-visible.
+
+    A poison compat queue item (unparseable index) resolves to a real track
+    but fails at apply (``invalid_key``). It must surface as a ``needs_review``
+    row plus ``skipped_counts`` evidence, carry legacy provenance so later
+    pending runs pick it up as handled, and shift the pending-counts split
+    toward terminal-parked - while the run still completes per GH-367.
+    """
+    historical_root = tmp_path / "Historical" / "Music"
+    _write_catalog_files(historical_root)
+    database = tmp_path / "library.db"
+    _create_source(database, historical_root)
+    with sqlite3.connect(database) as connection:
+        connection.execute("DELETE FROM compat_play_queue_items")
+        connection.commit()
+    store = _store(database)
+    resolver = _resolver(("root", historical_root))
+
+    first = await BoundedLegacyCatalogMigrator(
+        store,
+        resolver,
+        emit_progress=lambda _message: None,
+        batch_size=1,
+        skip_unmappable_paths=True,
+    ).migrate("cutover", now=100)
+    assert first.blocker_count == 0
+    assert first.report.state == "applied"
+
+    with sqlite3.connect(database) as connection:
+        track_id = connection.execute(
+            "SELECT id FROM local_tracks LIMIT 1"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO compat_play_queue_items VALUES ('alice', 'junk-index', ?)",
+            (track_id,),
+        )
+        connection.commit()
+
+    pending = await BoundedLegacyCatalogMigrator(
+        store,
+        resolver,
+        emit_progress=lambda _message: None,
+        batch_size=1,
+        skip_unmappable_paths=True,
+    ).migrate_pending(f"legacy-pending-{resolver.policy_revision}", now=200)
+
+    assert pending.blocker_count == 0
+    assert pending.report.state == "applied"
+    assert pending.skipped_counts.get("compat_play_queue_item", 0) == 1
+    with sqlite3.connect(database) as connection:
+        review = connection.execute(
+            "SELECT local_track_id, state, reason_code "
+            "FROM library_identification_reviews "
+            "WHERE local_track_id = ? AND state = 'needs_review' "
+            "AND reason_code LIKE 'legacy_%'",
+            (track_id,),
+        ).fetchone()
+        provenance = connection.execute(
+            "SELECT target_kind, target_id FROM library_migration_provenance "
+            "WHERE source_kind = 'compat_play_queue_item' "
+            "AND source_key = 'alice:junk-index'"
+        ).fetchone()
+    assert review is not None
+    assert review[0] == track_id
+    assert review[1] == "needs_review"
+    assert review[2] == "legacy_reference_parked_invalid_key"
+    assert provenance == ("local_track", track_id)
+    counts = await store.get_pending_legacy_counts()
+    assert counts["terminal_parked"]["needs_review"] >= 1
+    assert all(value >= 0 for value in counts["retryable"].values())
+
+
+@pytest.mark.asyncio
+async def test_source_revision_ignores_auth_users_activity(tmp_path: Path) -> None:
+    """A login mid-run must not stale the pending migration revision.
+
+    Regression test: auth_users.last_login_at flips on every login while the
+    pending migration runs at startup. Hashing that table aborted every boot
+    with StaleRevisionError and retried the same run forever. Genuine input
+    changes must still flip the revision.
+    """
+    historical_root = tmp_path / "Historical" / "Music"
+    _write_catalog_files(historical_root)
+    database = tmp_path / "library.db"
+    _create_source(database, historical_root)
+    store = _store(database)
+
+    before = await store.get_bounded_legacy_source_revision()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE auth_users SET display_name = ? WHERE id = ?",
+            ("Alice Logged In", "alice"),
+        )
+        connection.commit()
+    assert await store.get_bounded_legacy_source_revision() == before
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE library_files SET track_title = ? WHERE id = ?",
+            ("Changed", TRACK_1),
+        )
+        connection.commit()
+    assert await store.get_bounded_legacy_source_revision() != before

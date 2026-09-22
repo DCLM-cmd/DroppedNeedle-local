@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { CircleCheck, HardDrive, Layers3, Sparkles } from 'lucide-svelte';
-	import type { AlbumIdentityState, ArtistIdentityState } from '$lib/types';
+	import { CircleCheck, HardDrive, Layers, Sparkles } from 'lucide-svelte';
+	import type { AlbumIdentityState, ArtistIdentityState, NativePickBasis } from '$lib/types';
 
 	interface Props {
 		state: AlbumIdentityState | ArtistIdentityState;
@@ -8,6 +8,7 @@
 		compact?: boolean;
 		showDescription?: boolean;
 		className?: string;
+		pickBasis?: NativePickBasis | null;
 	}
 
 	let {
@@ -15,11 +16,24 @@
 		subject,
 		compact = false,
 		showDescription = false,
-		className = ''
+		className = '',
+		pickBasis = null
 	}: Props = $props();
+
+	const pickBasisNote: Record<NativePickBasis, string> = {
+		pin: 'This pressing was pinned and is shown as the best fit.',
+		owned: 'This pressing matches your identified edition and is shown.',
+		embedded_tags: 'Your files agree on this pressing, shown as the best fit until verified.'
+	};
 
 	const content = $derived.by(() => {
 		if (state === 'release_group_linked') {
+			if (subject === 'album' && pickBasis && pickBasisNote[pickBasis]) {
+				return {
+					label: 'Best-fit edition',
+					description: `This album is linked to a MusicBrainz release group. ${pickBasisNote[pickBasis]}`
+				};
+			}
 			return {
 				label: 'Local edition',
 				description:
@@ -63,7 +77,7 @@
 		{#if state === 'local_only'}
 			<HardDrive class={compact ? 'h-3 w-3' : 'h-3.5 w-3.5'} />
 		{:else if state === 'release_group_linked'}
-			<Layers3 class={compact ? 'h-3 w-3' : 'h-3.5 w-3.5'} />
+			<Layers class={compact ? 'h-3 w-3' : 'h-3.5 w-3.5'} />
 		{:else if state === 'custom_edition'}
 			<Sparkles class={compact ? 'h-3 w-3' : 'h-3.5 w-3.5'} />
 		{:else}

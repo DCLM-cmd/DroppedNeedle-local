@@ -5,6 +5,7 @@
 	import { getApiUrl } from '$lib/api/api-utils';
 	import type { LibraryManagementPlanItem } from '$lib/queries/library-management/types';
 	import {
+		firstDeferredSource,
 		formatManagementValue,
 		managementAdapter,
 		managementAudioFormat,
@@ -49,6 +50,7 @@
 	const title = $derived(managementPlanTitle(item));
 	const artist = $derived(managementPlanArtist(item));
 	const album = $derived(managementPlanAlbum(item));
+	const deferredSource = $derived(firstDeferredSource(item));
 
 	function rootLabel(value: string | null): string {
 		return (
@@ -161,7 +163,10 @@
 				? 'border-warning/25 bg-warning/5 text-warning'
 				: 'border-error/20 bg-error/5 text-error'}"
 		>
-			{reasonLabel(item.reason_code)}
+			{reasonLabel(item.reason_code)}{item.reason_code === 'OPTIONAL_ENRICHMENT_DEFERRED' &&
+			deferredSource
+				? ` (${deferredSource})`
+				: ''}
 		</p>
 	{/if}
 

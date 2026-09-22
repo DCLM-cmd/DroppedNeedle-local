@@ -52,7 +52,7 @@ describe('PreviewWidget', () => {
 		await page.getByRole('button', { name: /close preview/i }).click();
 		expect(sampler.stop).toHaveBeenCalled();
 
-		unmount();
+		await unmount();
 	});
 
 	it('is hidden when the sampler is idle', async () => {
@@ -60,6 +60,6 @@ describe('PreviewWidget', () => {
 		const { container, unmount } = await render(PreviewWidget);
 		expect(container.querySelector('.preview-widget')).toBeNull();
 		sampler.status = 'playing';
-		unmount();
+		await unmount();
 	});
 });

@@ -1,180 +1,92 @@
-"""A2 parts 1+2: lane discipline and pipeline restructure for the
-discover-queue enrichment chain.
-
-- Build legs (RG lookup, release lookup, artist lookup) must request
-  BACKGROUND_SYNC; the recording leg keeps its existing literal.
-- The overlapped pipeline produces the same enrichment payload as the old
-  serial order and survives mid-build cancellation without orphan futures.
-"""
-
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from api.v1.schemas.discover import DiscoverQueueEnrichment
-from infrastructure.queue.priority_queue import RequestPriority
+from api.v1.schemas.settings import YouTubeConnectionSettings
 from services.discover.enrichment_service import QueueEnrichmentService
 
 RG = "074aa5b0-712e-4d6c-8d14-8aedc43e84fd"
 
 
-def _rg_payload() -> dict:
-    return {
-        "id": RG,
-        "title": "Some Album",
-        "tags": [{"name": "rock"}],
+def make_service():
+    mb = AsyncMock()
+    mb.get_release_group_by_id.return_value = {
+        "id": RG, "title": "Some Album", "tags": [{"name": "rock"}],
         "artist-credit": [{"artist": {"id": "artist-1", "name": "The Artist"}}],
         "releases": [{"id": "release-1", "date": "2020-01-01"}],
     }
-
-
-def _make_service(
-    *,
-    release_hang: float | None = None,
-) -> tuple[QueueEnrichmentService, AsyncMock, dict]:
-    mb_repo = AsyncMock()
-    captured: dict[str, list[RequestPriority]] = {
-        "rg": [],
-        "release": [],
-        "artist": [],
-    }
-
-    async def fake_rg(mbid, includes=None, priority=RequestPriority.USER_INITIATED):
-        captured["rg"].append(priority)
-        return _rg_payload()
-
-    async def fake_release(rid, includes=None, priority=RequestPriority.USER_INITIATED):
-        captured["release"].append(priority)
-        if release_hang:
-            await asyncio.sleep(release_hang)
-        return {"media": []}
-
-    async def fake_artist(mbid, priority=RequestPriority.USER_INITIATED):
-        captured["artist"].append(priority)
-        return {"country": "GB", "relations": []}
-
-    mb_repo.get_release_group_by_id = AsyncMock(side_effect=fake_rg)
-    mb_repo.get_release_by_id = AsyncMock(side_effect=fake_release)
-    mb_repo.get_recording_by_id = AsyncMock(return_value={})
-    mb_repo.get_artist_by_id = AsyncMock(side_effect=fake_artist)
-
-    def _extract(payload):
-        for rel in payload.get("relations") or []:
-            resource = rel.get("url", {}).get("resource", "")
-            if "youtube.com" in resource:
-                return resource
-        return ""
-
-    mb_repo.extract_youtube_url_from_relations = _extract
-    mb_repo.youtube_url_to_embed = lambda raw: f"embed:{raw}"
-
-    lb_repo = AsyncMock()
-    lb_repo.get_release_group_popularity_batch = AsyncMock(return_value={})
-
+    mb.get_artist_core.return_value = {"country": "GB", "relations": []}
+    mb.extract_youtube_url_from_relations = MagicMock(return_value=None)
     prefs = MagicMock()
-    yt = MagicMock(enabled=True, api_enabled=True)
-    yt.has_valid_api_key.return_value = True
-    prefs.get_youtube_connection.return_value = yt
-
+    prefs.get_youtube_connection.return_value = YouTubeConnectionSettings()
     integration = MagicMock()
-    integration.get_queue_settings().enrich_ttl = 60
     integration.is_lastfm_enabled.return_value = False
-
-    svc = QueueEnrichmentService(
-        musicbrainz_repo=mb_repo,
-        listenbrainz_repo=lb_repo,
-        preferences_service=prefs,
-        integration=integration,
-        memory_cache=None,
-        wikidata_repo=None,
-        lastfm_repo=None,
-    )
-    # Fast coalescer window so tests do not wait out the real 500 ms.
-    svc._POPULARITY_WINDOW_SECONDS = 0.02
-    return svc, mb_repo, captured
+    lastfm = AsyncMock()
+    service = QueueEnrichmentService(mb, AsyncMock(), prefs, integration, lastfm_repo=lastfm)
+    service._coalesce_popularity = AsyncMock(return_value=15)
+    return service, mb, integration, lastfm
 
 
-class TestLaneDiscipline:
-    @pytest.mark.asyncio
-    async def test_build_legs_request_background_sync(self):
-        svc, _mb, captured = _make_service()
+@pytest.mark.asyncio
+async def test_artist_core_and_popularity_resolve_independently():
+    service, mb, _, _ = make_service()
+    artist_entered, popularity_entered = asyncio.Event(), asyncio.Event()
 
-        await svc.enrich_queue_item(RG)
+    async def artist(*_args, **_kwargs):
+        artist_entered.set()
+        await popularity_entered.wait()
+        return {"country": "GB"}
 
-        assert captured["rg"] == [RequestPriority.BACKGROUND_SYNC]
-        assert captured["release"] == [RequestPriority.BACKGROUND_SYNC]
-        assert captured["artist"] == [RequestPriority.BACKGROUND_SYNC]
+    async def popularity(*_args):
+        popularity_entered.set()
+        await artist_entered.wait()
+        return 15
 
-    @pytest.mark.asyncio
-    async def test_explicit_lane_override_is_threaded(self):
-        svc, _mb, captured = _make_service()
-
-        await svc.enrich_queue_item(RG, priority=RequestPriority.BACKGROUND_SYNC)
-
-        assert set(captured["rg"]) == {RequestPriority.BACKGROUND_SYNC}
-
-
-class TestPipelineEquivalence:
-    @pytest.mark.asyncio
-    async def test_overlapped_pipeline_matches_serial_expectations(self):
-        svc, _mb, _captured = _make_service()
-
-        enrichment = await svc.enrich_queue_item(RG)
-
-        assert isinstance(enrichment, DiscoverQueueEnrichment)
-        assert enrichment.tags == ["rock"]
-        assert enrichment.artist_mbid == "artist-1"
-        assert enrichment.release_date == "2020-01-01"
-        assert enrichment.country == "GB"  # artist leg ran
-        assert enrichment.youtube_search_available is True  # no YT anywhere
-        assert enrichment.youtube_url is None
-        # LB popularity returned {} -> listen_count stays None (B4 repo path).
-        assert enrichment.listen_count is None
-
-    @pytest.mark.asyncio
-    async def test_youtube_from_release_still_wins_when_present(self):
-        svc, mb_repo, _captured = _make_service()
-
-        async def fake_release(
-            rid, includes=None, priority=RequestPriority.USER_INITIATED
-        ):
-            return {
-                "media": [],
-                "relations": [
-                    {
-                        "type": "streaming",
-                        "url": {"resource": "https://youtube.com/watch?v=xyz"},
-                    }
-                ],
-            }
-
-        mb_repo.get_release_by_id = AsyncMock(side_effect=fake_release)
-        mb_repo.youtube_url_to_embed = lambda raw: f"embed:{raw}"
-
-        enrichment = await svc.enrich_queue_item(RG)
-
-        assert enrichment.youtube_url == "embed:https://youtube.com/watch?v=xyz"
+    mb.get_artist_core.side_effect = artist
+    service._coalesce_popularity.side_effect = popularity
+    result = await asyncio.wait_for(service.enrich_queue_item(RG), timeout=1)
+    assert (result.country, result.listen_count, result.tags, result.release_date) == ("GB", 15, ["rock"], "2020-01-01")
+    assert result.youtube_url is None
+    mb.get_release_by_id.assert_not_awaited()
+    mb.get_recording_by_id.assert_not_awaited()
+    mb.get_artist_by_id.assert_not_awaited()
 
 
-class TestCancellationSafety:
-    @pytest.mark.asyncio
-    async def test_mid_build_cancel_leaves_no_orphan_futures(self):
-        svc, mb_repo, _captured = _make_service(release_hang=10.0)
+@pytest.mark.asyncio
+async def test_lastfm_bio_fallback_retains_existing_core_tags():
+    service, _, integration, lastfm = make_service()
+    integration.is_lastfm_enabled.return_value = True
+    lastfm.get_album_info.return_value = SimpleNamespace(tags=[], summary="An album recorded in London.")
+    result = await service.enrich_queue_item(RG)
+    assert result.artist_description == "An album recorded in London."
+    assert result.tags == ["rock"]
+    assert result.country == "GB"
+    lastfm.get_artist_info.assert_not_awaited()
 
-        task = asyncio.create_task(svc.enrich_queue_item(RG))
-        await asyncio.sleep(0.05)  # let it enter the hanging release fetch
-        task.cancel()
 
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.shield(task)
+@pytest.mark.asyncio
+async def test_cancelling_core_hydration_stops_artist_work_and_allows_retry():
+    service, mb, _, _ = make_service()
+    entered, stopped = asyncio.Event(), asyncio.Event()
 
-        # All spawned tasks finished (none left pending after cancellation).
-        done = (
-            await asyncio.gather(
-                *svc._popularity_pending.values(), return_exceptions=True
-            )
-            if svc._popularity_pending
-            else []
-        )
-        assert all(isinstance(r, (BaseException, type(None))) for r in done)
+    async def artist(*_args, **_kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    mb.get_artist_core.side_effect = artist
+    task = asyncio.create_task(service.enrich_queue_item(RG))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(stopped.wait(), timeout=1)
+    mb.get_artist_core.side_effect = None
+    mb.get_artist_core.return_value = {"country": "FR"}
+    retry = await service.enrich_queue_item(RG)
+    assert retry.country == "FR"
+    assert retry.tags == ["rock"]

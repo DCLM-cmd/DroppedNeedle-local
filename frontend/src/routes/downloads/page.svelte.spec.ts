@@ -57,7 +57,7 @@ describe('/downloads page', () => {
 	it('shows the admin setup CTA when the client is not configured', async () => {
 		h.isAdmin = true;
 		h.isTrusted = true;
-		render(DownloadsPage);
+		await render(DownloadsPage);
 		await expect.element(page.getByText('Download client not configured')).toBeVisible();
 		await expect
 			.element(page.getByRole('link', { name: 'Configure Download Client' }))
@@ -66,7 +66,7 @@ describe('/downloads page', () => {
 
 	it('shows a non-admin message (no CTA) when not configured', async () => {
 		h.isAdmin = false;
-		render(DownloadsPage);
+		await render(DownloadsPage);
 		await expect
 			.element(page.getByText('Contact your admin to configure the download client.'))
 			.toBeVisible();
@@ -83,14 +83,14 @@ describe('/downloads page', () => {
 
 	it('hides the Import tab from plain users', async () => {
 		h.isTrusted = false;
-		render(DownloadsPage);
+		await render(DownloadsPage);
 		await expect.element(page.getByText('Download client not configured')).toBeVisible();
 		await expect.element(page.getByRole('tab', { name: 'Import' })).not.toBeInTheDocument();
 	});
 
 	it('lets a curator switch to the Import tab and see the drop zone', async () => {
 		h.isTrusted = true;
-		render(DownloadsPage);
+		await render(DownloadsPage);
 		await page.getByRole('tab', { name: 'Import' }).click();
 		await expect.element(page.getByText('Drop your purchases here')).toBeVisible();
 	});
@@ -98,7 +98,7 @@ describe('/downloads page', () => {
 	it('shows the everyone toggle only to admins on the Import tab', async () => {
 		h.isTrusted = true;
 		h.isAdmin = true;
-		render(DownloadsPage);
+		await render(DownloadsPage);
 		await page.getByRole('tab', { name: 'Import' }).click();
 		await expect.element(page.getByText("Show everyone's imports")).toBeVisible();
 	});

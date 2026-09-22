@@ -33,6 +33,7 @@ from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
 from models.download_identity import soulseek_identity, usenet_identity
 from models.wanted import WantedRetrying, WantedWatch
+from services.album_utils import audio_tracks
 from services.native.acquisition.status import is_terminal
 from services.native.coverage import match_rows_to_tracks, uncovered_tracks
 
@@ -144,6 +145,7 @@ class WantedWatcherService:
         preferences: "PreferencesService",
         inter_want_delay: float = 5.0,
         provider_available: Callable[[], bool] | None = None,
+        plugin_host=None,  # noqa: ANN001 - PluginHost, optional (01b events)
     ) -> None:
         self._store = wanted_store
         self._requests = request_history
@@ -158,6 +160,32 @@ class WantedWatcherService:
         self._preferences = preferences
         self._inter_want_delay = inter_want_delay
         self._provider_available = provider_available
+        self._plugin_host = plugin_host
+        self._plugin_tasks: set[asyncio.Task] = set()
+
+    def _emit_request_fulfilled(self, *, request_id: str, user_id: str) -> None:
+        host = getattr(self, "_plugin_host", None)
+        if host is None:
+            return
+        try:
+            import uuid as _uuid
+
+            from infrastructure.plugins.protocols import PluginEvent, RequestEvent
+
+            event = PluginEvent(
+                kind="request_fulfilled",
+                payload=RequestEvent(
+                    request_id=request_id,
+                    user_id=user_id or "",
+                    release_group_mbid=request_id,
+                    status="imported",
+                ),
+                causation_id=_uuid.uuid4().hex,
+            )
+            task = asyncio.create_task(host.dispatch_event(event))
+            task.add_done_callback(self._plugin_tasks.discard)
+        except Exception:  # noqa: BLE001 - events never break the watcher
+            pass
 
     async def run_sweep(self) -> WantedSweepSummary:
         # Read fresh every sweep so flipping the toggle needs no restart (§5.3).
@@ -890,6 +918,19 @@ class WantedWatcherService:
         identities = [(c.source, self._candidate_identity(c)) for c in candidates]
 
         if settings.auto_download_on_find and self._has_auto_hit(candidates):
+            # Scouting can outlast the user's patience: the sweep's due row is
+            # only a snapshot, so re-read the watch immediately before the first
+            # mutating action instead of dispatching from stale state.
+            current_watch = await self._store.get_watch(mbid)
+            if current_watch is None or current_watch.state != "watching":
+                logger.info(
+                    "wanted.dispatch_skipped",
+                    extra={
+                        "release_group_mbid": mbid,
+                        "reason": "watch_not_watching",
+                    },
+                )
+                return "skipped"
             if (
                 await self._dispatch(
                     want,
@@ -1114,7 +1155,10 @@ class WantedWatcherService:
             )
         except Exception:  # noqa: BLE001 - coverage is fail-open (§5.2.3.a)
             return None
-        tracks = list(info.tracks or [])
+        # Audio media only (Slices 4+5): DVD-video positions are neither
+        # satisfiable nor dispatchable - counting them keeps CD+DVD wants
+        # searching forever for tracks that can never verify.
+        tracks = audio_tracks(list(info.tracks or []))
         return tracks or None
 
     async def _file_rows(self, mbid: str) -> list[dict]:
@@ -1165,6 +1209,7 @@ class WantedWatcherService:
                 "wanted.request_flip_failed", extra={"release_group_mbid": mbid}
             )
         logger.info("wanted.fulfilled", extra={"release_group_mbid": mbid})
+        self._emit_request_fulfilled(request_id=mbid, user_id=getattr(want, "user_id", ""))
         await self._publish(want, "wanted_fulfilled", {})
 
     async def _publish(self, want: WantedWatch, event: str, extra: dict) -> None:

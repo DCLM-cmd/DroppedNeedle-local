@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -69,12 +70,19 @@ class ScrobbleService:
         self._forward_tasks.add(task)
         task.add_done_callback(self._forward_tasks.discard)
 
-    def _dispatch_to_plugins(self, request: ScrobbleRequest) -> None:
-        """Fan the accepted play out to scrobbler plugins, fire-and-forget so a
-        slow plugin never adds latency to the client's scrobble call."""
+    def _dispatch_to_plugins(self, request: ScrobbleRequest, user_id: str = "") -> None:
+        """Fan the accepted play out to scrobbler + subscriber plugins, fire-and-forget so a
+        slow plugin never adds latency to the client's scrobble call.
+
+        Same gate as external forwarding: short tracks (<30s) and Navidrome-delegated
+        plays never reach here (early returns above), so neither ``scrobble`` nor
+        ``playback_started`` fires for them. The ``scrobble`` kind goes through
+        ``dispatch_event`` ONLY: the host fans it to subscriber plugins and to v0
+        ``scrobbler`` plugins exactly once (a direct ``dispatch_scrobble`` call here
+        as well would fire ``on_scrobble`` twice)."""
         if self._plugin_host is None:
             return
-        from infrastructure.plugins.protocols import ScrobbleEvent
+        from infrastructure.plugins.protocols import PlaybackEvent, PluginEvent, ScrobbleEvent
 
         event = ScrobbleEvent(
             artist=request.artist_name,
@@ -84,9 +92,30 @@ class ScrobbleService:
             duration_ms=request.duration_ms or None,
             recording_mbid=request.mbid,
         )
-        task = asyncio.create_task(self._plugin_host.dispatch_scrobble(event))
-        self._plugin_tasks.add(task)
-        task.add_done_callback(self._plugin_tasks.discard)
+        try:
+            scrobble_event = PluginEvent(
+                kind="scrobble", payload=event, causation_id=uuid.uuid4().hex
+            )
+            task = asyncio.create_task(self._plugin_host.dispatch_event(scrobble_event))
+            self._plugin_tasks.add(task)
+            task.add_done_callback(self._plugin_tasks.discard)
+        except Exception:  # noqa: BLE001 - events never break scrobbling
+            pass
+        try:
+            playback = PlaybackEvent(
+                artist=request.artist_name,
+                track=request.track_name,
+                album=request.album_name,
+                user_id=user_id,
+            )
+            playback_event = PluginEvent(
+                kind="playback_started", payload=playback, causation_id=uuid.uuid4().hex
+            )
+            task = asyncio.create_task(self._plugin_host.dispatch_event(playback_event))
+            self._plugin_tasks.add(task)
+            task.add_done_callback(self._plugin_tasks.discard)
+        except Exception:  # noqa: BLE001 - events never break scrobbling
+            pass
 
     def _dedup_key(self, user_id: str, artist: str, track: str, timestamp: int) -> str:
         # user_id-scoped so two users scrobbling the same track aren't cross-deduped
@@ -201,7 +230,7 @@ class ScrobbleService:
             )
             return ScrobbleResponse(accepted=True, services={})
 
-        self._dispatch_to_plugins(request)
+        self._dispatch_to_plugins(request, user_id)
 
         tasks: dict[str, Any] = {}
         duration_sec = request.duration_ms // 1000 if request.duration_ms > 0 else 0

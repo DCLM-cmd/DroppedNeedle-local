@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from infrastructure.observability.provider_counters import ProviderWorkload, provider_workload_scope
 import asyncio
 import time
 from typing import Any, TYPE_CHECKING
@@ -13,6 +14,7 @@ from services.cache_status_service import CacheStatusService
 from core.exceptions import ExternalServiceError
 from infrastructure.cache.cache_keys import ALBUM_INFO_PREFIX
 from infrastructure.validators import is_unknown_mbid, is_valid_mbid
+from infrastructure.observability.optional_work import OptionalWorkDeferred
 
 from .artist_phase import ArtistPhase
 from .album_phase import AlbumPhase
@@ -61,7 +63,8 @@ class LibraryPrecacheService:
     def _sort_by_cover_priority(self, items, item_type):
         return self._audiodb_phase.sort_by_cover_priority(items, item_type)
 
-    async def precache_library_resources(self, artists: list[dict], albums: list[Any], resume: bool = False) -> None:
+    @provider_workload_scope(ProviderWorkload.MAINTENANCE)
+    async def precache_library_resources(self, artists: list[dict], albums: list[Any], resume: bool = False, *, initiating_user_id: str | None = None) -> None:
         status_service = CacheStatusService(self._sync_state_store)
         task = None
 
@@ -70,7 +73,10 @@ class LibraryPrecacheService:
         max_timeout_s = advanced_settings.sync_max_timeout_hours * 3600
 
         try:
-            task = asyncio.create_task(self._do_precache(artists, albums, status_service, resume))
+            task = asyncio.create_task(self._do_precache(
+                artists, albums, status_service, resume,
+                initiating_user_id=initiating_user_id,
+            ))
             from core.task_registry import TaskRegistry
             TaskRegistry.get_instance().register("precache-library", task)
 
@@ -149,7 +155,7 @@ class LibraryPrecacheService:
                 logger.error(msg)
                 raise ExternalServiceError(msg)
 
-    async def _do_precache(self, artists: list[dict], albums: list[Any], status_service: CacheStatusService, resume: bool = False) -> None:
+    async def _do_precache(self, artists: list[dict], albums: list[Any], status_service: CacheStatusService, resume: bool = False, *, initiating_user_id: str | None = None) -> None:
         from core.dependencies import get_album_service
         generation = 0
         try:
@@ -187,7 +193,7 @@ class LibraryPrecacheService:
             if status_service.is_cancelled():
                 return
 
-            if self._artist_discovery_service and not skip_artists:
+            if self._artist_discovery_service and initiating_user_id and not skip_artists:
                 artist_mbids = list(dict.fromkeys(
                     a.get('mbid') for a in artists
                     if is_valid_mbid(a.get('mbid'))
@@ -205,7 +211,10 @@ class LibraryPrecacheService:
                             artist_mbids, delay=precache_delay,
                             status_service=status_service, mbid_to_name=mbid_to_name,
                             generation=generation,
+                            user_id=initiating_user_id,
                         )
+                    except OptionalWorkDeferred:
+                        raise
                     except Exception as e:  # noqa: BLE001
                         logger.warning(f"Discovery precache failed (non-fatal): {e}")
                 else:
@@ -259,6 +268,8 @@ class LibraryPrecacheService:
 
             try:
                 await self._audiodb_phase.precache_audiodb_data(artists, albums, status_service, generation=generation)
+            except OptionalWorkDeferred:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"AudioDB pre-warming failed (non-fatal): {e}")
 

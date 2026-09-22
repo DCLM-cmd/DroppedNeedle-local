@@ -30,6 +30,11 @@ class PluginInfo(AppStruct):
     error: str | None = None
     settings_fields: list[PluginSettingFieldInfo] = []
     settings_values: dict[str, str] = {}
+    ui_entry: str = ""
+    ui_pages: list[str] = []
+    ui_external_url: str = ""
+    sources: list[str] = []
+    targets: list[str] = []
 
 
 class PluginListResponse(AppStruct):
@@ -43,3 +48,18 @@ class PluginUpdateRequest(AppStruct):
 
 class PluginInstallRequest(AppStruct):
     repository_url: str
+
+
+class PluginSourceInfo(AppStruct):
+    key: str
+    plugin: str = ""
+    display_name: str = ""
+    has_client: bool = False
+    has_indexer: bool = False
+    target_source: str = ""
+    configured: bool = False
+    health: str = "unknown"
+
+
+class PluginSourcesResponse(AppStruct):
+    sources: list[PluginSourceInfo] = []

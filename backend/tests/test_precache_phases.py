@@ -147,3 +147,52 @@ class TestShimIdentity:
         from services.home_charts_service import HomeChartsService as ShimClass
         from services.home.charts_service import HomeChartsService as RealClass
         assert ShimClass is RealClass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initiator", [None, "maintenance-user"])
+async def test_discovery_precache_requires_deliberate_user_without_skipping_other_phases(
+    monkeypatch, tmp_path, initiator
+):
+    album_service = MagicMock()
+    album_service._cache.get = AsyncMock(return_value=None)
+    monkeypatch.setattr("core.dependencies.get_album_service", lambda: album_service)
+    library_repo = AsyncMock()
+    library_repo.get_artist_mbids.return_value = set()
+    library_repo.get_library_mbids.return_value = set()
+    cover_repo = MagicMock(cache_dir=tmp_path)
+    discovery = AsyncMock()
+    svc = LibraryPrecacheService(
+        library_repo=library_repo,
+        cover_repo=cover_repo,
+        preferences_service=MagicMock(),
+        sync_state_store=AsyncMock(),
+        genre_index=AsyncMock(),
+        library_db=AsyncMock(),
+        artist_discovery_service=discovery,
+    )
+    svc._artist_phase.precache_artist_images = AsyncMock()
+    svc._album_phase.precache_album_data = AsyncMock()
+    svc._audiodb_phase.precache_audiodb_data = AsyncMock()
+    status = MagicMock()
+    status.is_cancelled.return_value = False
+    status.is_syncing.return_value = False
+    status.start_sync = AsyncMock(return_value=1)
+    status.update_phase = AsyncMock()
+    status.skip_phase = AsyncMock()
+    status.complete_sync = AsyncMock()
+    artist = {"mbid": "11111111-1111-1111-1111-111111111111", "name": "Artist"}
+    album = {"mbid": "22222222-2222-2222-2222-222222222222"}
+
+    await svc._do_precache(
+        [artist], [album], status, initiating_user_id=initiator
+    )
+
+    svc._artist_phase.precache_artist_images.assert_awaited_once()
+    svc._album_phase.precache_album_data.assert_awaited_once()
+    svc._audiodb_phase.precache_audiodb_data.assert_awaited_once()
+    if initiator is None:
+        discovery.precache_artist_discovery.assert_not_awaited()
+    else:
+        discovery.precache_artist_discovery.assert_awaited_once()
+        assert discovery.precache_artist_discovery.await_args.kwargs["user_id"] == initiator

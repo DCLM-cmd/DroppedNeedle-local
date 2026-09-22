@@ -10,7 +10,7 @@ import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
 import { hasActiveTask } from './downloadStatus';
 
 const IDLE_ACTIVITY_RECOVERY_MS = 120_000;
-const ACTIVE_ACTIVITY_RECOVERY_MS = 750;
+const ACTIVE_ACTIVITY_RECOVERY_MS = 5_000;
 
 // The global summary is the only recurring downloads HTTP owner. Progress is carried
 // by per-task SSE; its structural revision refreshes the detailed page after status,

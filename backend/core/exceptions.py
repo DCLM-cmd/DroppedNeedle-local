@@ -166,6 +166,19 @@ class MediaAccountRelinkRequiredError(ConflictError):
     error_code = "MEDIA_ACCOUNT_RELINK_REQUIRED"
 
 
+class OrganizerRetryAlreadyRunningError(ConflictError):
+    """A second organizer retry started while one was already running.
+
+    Mapped to HTTP 409 by the registered handler."""
+
+    def __init__(
+        self,
+        message: str = "An organizer retry is already running for this album.",
+        details: Any = None,
+    ) -> None:
+        super().__init__(message, details)
+
+
 class PlaylistNotFoundError(ResourceNotFoundError):
     pass
 
@@ -397,6 +410,45 @@ class NewznabAuthError(NewznabApiError):
     """Newznab auth failure (error code 100-199, or a missing/invalid API key)."""
 
     pass
+
+
+class ProwlarrApiError(ExternalServiceError):
+    """Transport/HTTP/decode error talking to Prowlarr.
+
+    Mapped to HTTP 503 ``EXTERNAL_SERVICE_UNAVAILABLE`` by the registered
+    ``ExternalServiceError`` handler - no new code, no separate handler (the
+    Newznab precedent added none). ``code`` is the HTTP status when one was
+    received, else None. Mirrors ``NewznabApiError``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        details: Any = None,
+        code: int | None = None,
+    ):
+        super().__init__(message, details)
+        self.code = code
+
+
+class ProwlarrAuthError(ProwlarrApiError):
+    """Prowlarr 401/403: wrong or missing API key.
+
+    Deterministic misconfiguration, not an outage: never retried, and carried
+    in the test-response body (``auth``), never a leaked exception body.
+    Mirrors ``SlskdAuthError``/``LidarrImportError``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        details: Any = None,
+        code: int | None = None,
+        *,
+        auth: bool = True,
+    ):
+        super().__init__(message, details, code)
+        self.auth = auth
 
 
 class LidarrImportError(ExternalServiceError):

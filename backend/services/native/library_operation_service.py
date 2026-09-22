@@ -17,6 +17,7 @@ from api.v1.schemas.library_operations import (
 from core.exceptions import ResourceNotFoundError, ValidationError
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.identification_revisions import album_input_revisions
+from services.native.library_review_service import TIER_STATE
 
 LEASE_SECONDS = 60.0
 AUTOMATIC_SAFE_EVIDENCE_REASONS = frozenset(
@@ -214,6 +215,9 @@ class LibraryOperationService:
                 result["state"] == "succeeded"
                 and str(work["action"]).startswith("accept_candidate:")
                 and work["local_album_id"] is not None
+                # Tier-row accepts are catalog-only (the confirm lane
+                # promises files never change there), like single accepts.
+                and result.get("prior_state") != TIER_STATE
             ):
                 await self._schedule_scan_management(str(work["local_album_id"]))
             if checkpoint is not None:

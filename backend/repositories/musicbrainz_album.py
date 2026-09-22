@@ -27,7 +27,6 @@ from infrastructure.cache.cache_keys import (
     MB_RG_DETAIL_PREFIX,
     MB_RELEASE_DETAIL_PREFIX,
     MB_RELEASE_TO_RG_PREFIX,
-    MB_RELEASE_REC_PREFIX,
     MB_RECORDING_PREFIX,
     MB_RECORDING_SEARCH_PREFIX,
     MB_RECORDING_TO_RG_PREFIX,
@@ -50,11 +49,13 @@ from repositories.musicbrainz_base import (
     mb_deduplicator,
     clear_mb_response_context,
     capture_mb_source_context,
+    capture_mb_cache_token,
     dedupe_by_id,
     escape_lucene_phrase,
     get_mb_response_context,
     is_mb_source_current,
     normalize_mb_id,
+    resolve_redirect_mbid,
     get_score,
     extract_artist_name,
     parse_year,
@@ -62,6 +63,7 @@ from repositories.musicbrainz_base import (
 )
 from infrastructure.degradation import try_get_degradation_context
 from infrastructure.integration_result import IntegrationResult
+from infrastructure.validators import is_valid_mbid
 from models.library_contribution import (
     MusicBrainzDuplicateFacts,
     MusicBrainzUrlResolution,
@@ -83,10 +85,20 @@ from repositories.musicbrainz_release_search_models import MbReleaseSearchRespon
 logger = logging.getLogger(__name__)
 
 
-def _record_mb_degradation(msg: str) -> None:
+def _record_mb_degradation(msg: str, *, deterministic: bool = False) -> None:
+    """Bank a MusicBrainz degradation; deterministic=True marks caller-input
+    failures (invalid MBIDs) for UNMAPPABLE_PROVIDER_PAYLOAD classification
+    (F-IDENT-02). Failure/exception records keep the transient default."""
     ctx = try_get_degradation_context()
     if ctx:
-        ctx.record(IntegrationResult.error(source="musicbrainz", msg=msg))
+        if deterministic:
+            ctx.record(
+                IntegrationResult.deterministic_error(
+                    source="musicbrainz", msg=msg
+                )
+            )
+        else:
+            ctx.record(IntegrationResult.error(source="musicbrainz", msg=msg))
 
 
 def _record_mb_unmappable_payload(method: str) -> None:
@@ -133,7 +145,6 @@ class _ReleaseLookupPayload(msgspec.Struct):
     release_group: dict[str, Any] = msgspec.field(
         name="release-group", default_factory=dict
     )
-    media: list[dict[str, Any]] = msgspec.field(default_factory=list)
 
 
 class _RecordingReleaseGroupPayload(msgspec.Struct):
@@ -342,6 +353,8 @@ class MusicBrainzAlbumMixin:
     _cache: CacheInterface
     _preferences_service: PreferencesService
 
+    # Search entries take free text (artist/title), not MBIDs - no MBID gate here
+    # (same for _search_release_groups and _search_recordings_uncached below).
     async def search_release_editions(
         self,
         title: str,
@@ -353,6 +366,7 @@ class MusicBrainzAlbumMixin:
     ) -> ReleaseEditionSearchPage:
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         normalized_title = " ".join(title.split())
         normalized_artist = " ".join(artist.split())
         normalized_limit = max(1, min(limit, 12))
@@ -439,13 +453,11 @@ class MusicBrainzAlbumMixin:
                 limit=normalized_limit,
             )
             ttl = self._preferences_service.get_advanced_settings().cache_ttl_search
-            await mb_cache_set_if_current(
-                self._cache,
-                cache_key,
-                page,
-                ttl_seconds=ttl,
-                context=response_context,
-            )
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            page,
+            ttl_seconds=ttl,
+            context=response_context, cache_token=cache_token)
             return page
 
         dedupe_key = f"{cache_key}:priority={int(priority)}"
@@ -554,6 +566,7 @@ class MusicBrainzAlbumMixin:
     ) -> list[SearchResult]:
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         if include_all_types:
             cache_key = f"{cache_key}:all"
 
@@ -599,13 +612,11 @@ class MusicBrainzAlbumMixin:
                 # Transient failures never cache (F-MATCH-05: except paths below
                 # return without writing).
                 _search_ttl = advanced_settings.cache_ttl_search * 2 if results else 600
-                await mb_cache_set_if_current(
-                    self._cache,
-                    cache_key,
-                    results,
-                    ttl_seconds=_search_ttl,
-                    context=response_context,
-                )
+                await mb_cache_set_if_current(self._cache,
+                cache_key,
+                results,
+                ttl_seconds=_search_ttl,
+                context=response_context, cache_token=cache_token)
                 return results
             except InvalidExternalPayloadError:
                 _record_mb_unmappable_payload("release-group search")
@@ -630,6 +641,7 @@ class MusicBrainzAlbumMixin:
     ) -> list[SearchResult]:
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         type_policy = (
             "<default>"
             if included_secondary_types is None
@@ -673,13 +685,11 @@ class MusicBrainzAlbumMixin:
                         break
 
                 advanced_settings = self._preferences_service.get_advanced_settings()
-                await mb_cache_set_if_current(
-                    self._cache,
-                    cache_key,
-                    results,
-                    ttl_seconds=advanced_settings.cache_ttl_search * 2,
-                    context=response_context,
-                )
+                await mb_cache_set_if_current(self._cache,
+                cache_key,
+                results,
+                ttl_seconds=advanced_settings.cache_ttl_search * 2,
+                context=response_context, cache_token=cache_token)
                 return results
             except Exception as e:  # noqa: BLE001
                 if not isinstance(e, CircuitOpenError):
@@ -699,9 +709,20 @@ class MusicBrainzAlbumMixin:
     ) -> dict | None:
         clear_mb_response_context()
         source_context = source_context or capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         if includes is None:
             includes = ["artist-credits", "releases"]
         mbid = normalize_mb_id(mbid)
+        if not is_valid_mbid(mbid):
+            _record_mb_degradation("release-group invalid mbid", deterministic=True)
+            return None
+        mbid = await resolve_redirect_mbid(
+            "release-group",
+            mbid,
+            source_context,
+            self._cache,
+            getattr(self, "_mb_canonical_store", None),
+        )
         includes_str = "+".join(sorted(includes))
         cache_key = mb_release_group_key(mbid, includes)
 
@@ -716,7 +737,8 @@ class MusicBrainzAlbumMixin:
         return await mb_deduplicator.dedupe(
             dedupe_key,
             lambda: self._fetch_release_group_by_id(
-                mbid, includes, cache_key, priority, source_context=source_context
+                mbid, includes, cache_key, priority, source_context=source_context,
+                cache_token=cache_token,
             ),
         )
 
@@ -728,6 +750,7 @@ class MusicBrainzAlbumMixin:
         priority: RequestPriority = RequestPriority.USER_INITIATED,
         *,
         source_context: MbSourceContext | None = None,
+        cache_token: tuple[object, int],
     ) -> dict | None:
         source_context = source_context or capture_mb_source_context()
         mbid = normalize_mb_id(mbid)
@@ -746,21 +769,17 @@ class MusicBrainzAlbumMixin:
                 # so a merged/deleted/passthrough-garbage RG mbid isn't re-fetched on every
                 # discover build. Short TTL bounds staleness and self-heals; the except
                 # (transient) path stays uncached on purpose.
-                await mb_cache_set_if_current(
-                    self._cache,
-                    cache_key,
-                    {},
-                    ttl_seconds=600,
-                    context=response_context,
-                )
-                return None
-            await mb_cache_set_if_current(
-                self._cache,
+                await mb_cache_set_if_current(self._cache,
                 cache_key,
-                result,
-                ttl_seconds=3600,
-                context=response_context,
-            )
+                {},
+                ttl_seconds=600,
+                context=response_context, cache_token=cache_token)
+                return None
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            result,
+            ttl_seconds=3600,
+            context=response_context, cache_token=cache_token)
             return result
         except InvalidExternalPayloadError:
             _record_mb_unmappable_payload("release-group fetch")
@@ -775,6 +794,8 @@ class MusicBrainzAlbumMixin:
         """Fetch a release group and map it to ``AlbumInfo`` (the
         MusicBrainzRepository protocol method). Used to backfill an album's
         year/title/artist when a request omits them."""
+        # Steps 05-1/03-8 inherited transitively via get_release_group_by_id;
+        # no double-gate here.
         rg = await self.get_release_group_by_id(release_group_mbid)
         if not rg:
             return None
@@ -798,14 +819,25 @@ class MusicBrainzAlbumMixin:
     ) -> dict | None:
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         if includes is None:
             includes = ["recordings", "labels"]
         release_id = normalize_mb_id(release_id)
+        if not is_valid_mbid(release_id):
+            _record_mb_degradation("release invalid mbid", deterministic=True)
+            return None
+        release_id = await resolve_redirect_mbid(
+            "release",
+            release_id,
+            source_context,
+            self._cache,
+            getattr(self, "_mb_canonical_store", None),
+        )
         cache_key = mb_release_key(release_id, includes)
 
         cached = await mb_cache_get_if_current(self._cache, cache_key, source_context)
         if cached is not None:
-            return cached
+            return None if cached == {} else cached
 
         includes_str = "+".join(sorted(includes))
         dedupe_key = (
@@ -815,7 +847,8 @@ class MusicBrainzAlbumMixin:
         return await mb_deduplicator.dedupe(
             dedupe_key,
             lambda: self._fetch_release_by_id(
-                release_id, includes, cache_key, priority, source_context=source_context
+                release_id, includes, cache_key, priority, source_context=source_context,
+                cache_token=cache_token,
             ),
         )
 
@@ -838,6 +871,7 @@ class MusicBrainzAlbumMixin:
         """
         clear_mb_response_context()
         source_context = source_context or capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         release_mbid = normalize_mb_id(release_mbid)
         normalized_includes = tuple(sorted(set(includes)))
         cache_key = mb_management_release_key(
@@ -872,21 +906,17 @@ class MusicBrainzAlbumMixin:
                 ) from error
 
             if not result.id:
-                await mb_cache_set_if_current(
-                    self._cache,
-                    cache_key,
-                    False,
-                    ttl_seconds=600,
-                    context=response_context,
-                )
-                return None
-            await mb_cache_set_if_current(
-                self._cache,
+                await mb_cache_set_if_current(self._cache,
                 cache_key,
-                result,
-                ttl_seconds=3600,
-                context=response_context,
-            )
+                False,
+                ttl_seconds=600,
+                context=response_context, cache_token=cache_token)
+                return None
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            result,
+            ttl_seconds=3600,
+            context=response_context, cache_token=cache_token)
             return result
 
         dedupe_key = f"{cache_key}:fresh" if bypass_cache else cache_key
@@ -902,7 +932,18 @@ class MusicBrainzAlbumMixin:
         """Resolve a recording MBID through MusicBrainz merge redirects."""
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         recording_mbid = normalize_mb_id(recording_mbid)
+        if not is_valid_mbid(recording_mbid):
+            _record_mb_degradation("recording invalid mbid", deterministic=True)
+            return None
+        recording_mbid = await resolve_redirect_mbid(
+            "recording",
+            recording_mbid,
+            source_context,
+            self._cache,
+            getattr(self, "_mb_canonical_store", None),
+        )
         cache_key = mb_recording_canonical_id_key(recording_mbid)
         cached = await mb_cache_get_if_current(self._cache, cache_key, source_context)
         if isinstance(cached, str):
@@ -927,13 +968,11 @@ class MusicBrainzAlbumMixin:
                     )
                 if recording_mbid.casefold() in persisted:
                     resolved_id = persisted[recording_mbid.casefold()]
-                    await mb_cache_set_if_current(
-                        self._cache,
-                        cache_key,
-                        resolved_id,
-                        ttl_seconds=3600,
-                        context=source_context,
-                    )
+                    await mb_cache_set_if_current(self._cache,
+                    cache_key,
+                    resolved_id,
+                    ttl_seconds=3600,
+                    context=source_context, cache_token=cache_token)
                     return resolved_id
             except Exception:  # noqa: BLE001 - store miss falls to wire
                 logger.warning("MusicBrainz canonical redirect store read failed")
@@ -956,21 +995,17 @@ class MusicBrainzAlbumMixin:
             if not result.id:
                 # 600 s miss sentinel STAYS memory-only - do not durably bank
                 # absence (a 404 today may resolve after later edits).
-                await mb_cache_set_if_current(
-                    self._cache,
-                    cache_key,
-                    False,
-                    ttl_seconds=600,
-                    context=response_context,
-                )
-                return None
-            await mb_cache_set_if_current(
-                self._cache,
+                await mb_cache_set_if_current(self._cache,
                 cache_key,
-                result.id,
-                ttl_seconds=3600,
-                context=response_context,
-            )
+                False,
+                ttl_seconds=600,
+                context=response_context, cache_token=cache_token)
+                return None
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            result.id,
+            ttl_seconds=3600,
+            context=response_context, cache_token=cache_token)
             # ST2 P1 write-through: bank the redirect durably under the same
             if canonical_store is not None and operation_context is not None:
                 try:
@@ -1001,6 +1036,7 @@ class MusicBrainzAlbumMixin:
     ) -> MusicBrainzUrlResolution:
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         cache_key = _url_cache_key(resource_url, includes)
         if not bypass_cache:
             cached = await mb_cache_get_if_current(
@@ -1060,13 +1096,11 @@ class MusicBrainzAlbumMixin:
                     )
                 ),
             )
-            await mb_cache_set_if_current(
-                self._cache,
-                cache_key,
-                resolution,
-                ttl_seconds=3600,
-                context=response_context,
-            )
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            resolution,
+            ttl_seconds=3600,
+            context=response_context, cache_token=cache_token)
             return resolution
 
         dedupe_key = f"{cache_key}:fresh" if bypass_cache else cache_key
@@ -1082,7 +1116,18 @@ class MusicBrainzAlbumMixin:
     ) -> MusicBrainzVerifiedRelease | None:
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         release_mbid = normalize_mb_id(release_mbid)
+        if not is_valid_mbid(release_mbid):
+            _record_mb_degradation("release invalid mbid", deterministic=True)
+            return None
+        release_mbid = await resolve_redirect_mbid(
+            "release",
+            release_mbid,
+            source_context,
+            self._cache,
+            getattr(self, "_mb_canonical_store", None),
+        )
         cache_key = f"{MB_RELEASE_VERIFY_PREFIX}{release_mbid}"
         if not bypass_cache:
             cached = await mb_cache_get_if_current(
@@ -1111,13 +1156,11 @@ class MusicBrainzAlbumMixin:
                 ) from error
             normalized = _verified_release(result)
             if normalized is not None:
-                await mb_cache_set_if_current(
-                    self._cache,
-                    cache_key,
-                    normalized,
-                    ttl_seconds=3600,
-                    context=response_context,
-                )
+                await mb_cache_set_if_current(self._cache,
+                cache_key,
+                normalized,
+                ttl_seconds=3600,
+                context=response_context, cache_token=cache_token)
             return normalized
 
         dedupe_key = f"{cache_key}:fresh" if bypass_cache else cache_key
@@ -1133,6 +1176,7 @@ class MusicBrainzAlbumMixin:
     ) -> list[MusicBrainzVerifiedRelease]:
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         bounded_limit = max(1, min(limit, 10))
         cache_key = _duplicate_search_key(facts, bounded_limit)
         cached = await mb_cache_get_if_current(self._cache, cache_key, source_context)
@@ -1174,13 +1218,11 @@ class MusicBrainzAlbumMixin:
                 for release in result.releases
                 if (normalized := _verified_release(release)) is not None
             ]
-            await mb_cache_set_if_current(
-                self._cache,
-                cache_key,
-                releases,
-                ttl_seconds=900,
-                context=response_context,
-            )
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            releases,
+            ttl_seconds=900,
+            context=response_context, cache_token=cache_token)
             return releases
 
         dedupe_key = f"{cache_key}:priority={int(priority)}"
@@ -1194,6 +1236,7 @@ class MusicBrainzAlbumMixin:
         priority: RequestPriority = RequestPriority.USER_INITIATED,
         *,
         source_context: MbSourceContext | None = None,
+        cache_token: tuple[object, int],
     ) -> dict | None:
         source_context = source_context or capture_mb_source_context()
         release_id = normalize_mb_id(release_id)
@@ -1207,14 +1250,22 @@ class MusicBrainzAlbumMixin:
             )
             response_context = get_mb_response_context() or source_context
             if not result:
-                return None
-            await mb_cache_set_if_current(
-                self._cache,
+                # Definitive miss: mb_api_get returns {} only on 404 (503/5xx
+                # raise into the except below). Negative-cache briefly so a
+                # merged/deleted/garbage release mbid isn't re-fetched every
+                # tick; short TTL bounds staleness and self-heals. The
+                # transient except path stays uncached on purpose.
+                await mb_cache_set_if_current(self._cache,
                 cache_key,
-                result,
-                ttl_seconds=3600,
-                context=response_context,
-            )
+                {},
+                ttl_seconds=600,
+                context=response_context, cache_token=cache_token)
+                return None
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            result,
+            ttl_seconds=3600,
+            context=response_context, cache_token=cache_token)
             return result
         except InvalidExternalPayloadError:
             _record_mb_unmappable_payload("release fetch")
@@ -1234,7 +1285,18 @@ class MusicBrainzAlbumMixin:
     ) -> str | None:
         clear_mb_response_context()
         source_context = source_context or capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         release_id = normalize_mb_id(release_id)
+        if not is_valid_mbid(release_id):
+            _record_mb_degradation("release invalid mbid", deterministic=True)
+            return None
+        release_id = await resolve_redirect_mbid(
+            "release",
+            release_id,
+            source_context,
+            self._cache,
+            getattr(self, "_mb_canonical_store", None),
+        )
         cache_key = f"{MB_RELEASE_TO_RG_PREFIX}{release_id}"
         # ST2 P1 read-tier: memory -> durable canonical map -> dedupe + wire.
         cached = await mb_cache_get_if_current(self._cache, cache_key, source_context)
@@ -1254,13 +1316,11 @@ class MusicBrainzAlbumMixin:
                     )
                 rg_id = persisted.get(release_id.casefold())
                 if rg_id is not None:
-                    await mb_cache_set_if_current(
-                        self._cache,
-                        cache_key,
-                        rg_id,
-                        ttl_seconds=86400,
-                        context=source_context,
-                    )
+                    await mb_cache_set_if_current(self._cache,
+                    cache_key,
+                    rg_id,
+                    ttl_seconds=86400,
+                    context=source_context, cache_token=cache_token)
                     return rg_id or None
             except Exception:  # noqa: BLE001
                 logger.warning("MusicBrainz canonical release map read failed")
@@ -1275,6 +1335,7 @@ class MusicBrainzAlbumMixin:
                 cache_key,
                 priority,
                 source_context=source_context,
+                cache_token=cache_token,
             ),
         )
 
@@ -1289,6 +1350,7 @@ class MusicBrainzAlbumMixin:
         """
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         resolved_normalized: dict[str, str | None] = {}
         aliases: dict[str, list[str]] = {}
         pending: list[str] = []
@@ -1298,6 +1360,15 @@ class MusicBrainzAlbumMixin:
             normalized_id = normalize_mb_id(caller_id)
             if not normalized_id:
                 continue
+            if not is_valid_mbid(normalized_id):
+                _record_mb_degradation("release invalid mbid", deterministic=True)
+                gated_aliases = aliases.setdefault(normalized_id, [])
+                if caller_id not in gated_aliases:
+                    gated_aliases.append(caller_id)
+                resolved_normalized[normalized_id] = None
+                continue
+            # Pre-resolve inherited transitively: pending ids fan out through
+            # get_release_group_id_from_release, which pre-resolves.
             alias_list = aliases.setdefault(normalized_id, [])
             if caller_id not in alias_list:
                 alias_list.append(caller_id)
@@ -1329,13 +1400,11 @@ class MusicBrainzAlbumMixin:
                 for normalized_id in pending:
                     if normalized_id in persisted:
                         rg_id = persisted[normalized_id]
-                        await mb_cache_set_if_current(
-                            self._cache,
-                            f"{MB_RELEASE_TO_RG_PREFIX}{normalized_id}",
-                            rg_id,
-                            ttl_seconds=86400,
-                            context=source_context,
-                        )
+                        await mb_cache_set_if_current(self._cache,
+                        f"{MB_RELEASE_TO_RG_PREFIX}{normalized_id}",
+                        rg_id,
+                        ttl_seconds=86400,
+                        context=source_context, cache_token=cache_token)
                         resolved_normalized[normalized_id] = rg_id or None
                     else:
                         still_pending.append(normalized_id)
@@ -1376,14 +1445,26 @@ class MusicBrainzAlbumMixin:
         priority: RequestPriority = RequestPriority.BACKGROUND_SYNC,
         *,
         source_context: MbSourceContext | None = None,
+        cache_token: tuple[object, int],
     ) -> str | None:
         source_context = source_context or capture_mb_source_context()
         operation_context = source_context
         canonical_store = getattr(self, "_mb_canonical_store", None)
+        release_id = normalize_mb_id(release_id)
+        if not is_valid_mbid(release_id):
+            _record_mb_degradation("release invalid mbid", deterministic=True)
+            return None
+        release_id = await resolve_redirect_mbid(
+            "release",
+            release_id,
+            source_context,
+            self._cache,
+            canonical_store,
+        )
         try:
             result = await mb_api_get(
                 f"/release/{release_id}",
-                params={"inc": "release-groups+recordings"},
+                params={"inc": "release-groups"},
                 priority=priority,
                 decode_type=_ReleaseLookupPayload,
                 source_context=operation_context,
@@ -1391,13 +1472,11 @@ class MusicBrainzAlbumMixin:
             response_context = get_mb_response_context() or operation_context
             rg = result.release_group
             rg_id = rg.get("id")
-            await mb_cache_set_if_current(
-                self._cache,
-                cache_key,
-                rg_id or "",
-                ttl_seconds=86400,
-                context=response_context,
-            )
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            rg_id or "",
+            ttl_seconds=86400,
+            context=response_context, cache_token=cache_token)
 
             # ST2 P1 write-through: bank the answer durably ('' negative
             # included - a successfully decoded response that proves "no
@@ -1410,25 +1489,6 @@ class MusicBrainzAlbumMixin:
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning("MusicBrainz release-to-group persistence failed")
-
-            positions: dict[str, list[int]] = {}
-            for medium in result.media:
-                disc = medium.get("position", 1)
-                for track in medium.get("tracks", medium.get("track-list", [])):
-                    rec = track.get("recording", {})
-                    rec_id = normalize_mb_id(rec.get("id"))
-                    trk_pos = track.get("position")
-                    if rec_id and trk_pos is not None:
-                        positions[rec_id] = [disc, trk_pos]
-            if positions:
-                pos_cache_key = f"{MB_RELEASE_REC_PREFIX}{release_id}"
-                await mb_cache_set_if_current(
-                    self._cache,
-                    pos_cache_key,
-                    positions,
-                    ttl_seconds=86400,
-                    context=response_context,
-                )
 
             return rg_id
         except Exception as e:  # noqa: BLE001
@@ -1453,6 +1513,7 @@ class MusicBrainzAlbumMixin:
         if not artist or not title:
             return []
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         cache_key = (
             f"{MB_RECORDING_SEARCH_PREFIX}{artist.lower()}|{title.lower()}:{limit}"
         )
@@ -1472,6 +1533,7 @@ class MusicBrainzAlbumMixin:
                 priority,
                 cache_key,
                 source_context=source_context,
+                cache_token=cache_token,
             ),
         )
 
@@ -1484,6 +1546,7 @@ class MusicBrainzAlbumMixin:
         cache_key: str,
         *,
         source_context: MbSourceContext,
+        cache_token: tuple[object, int],
     ) -> list["RecordingMatch"]:
         try:
             result = await mb_api_get(
@@ -1547,13 +1610,11 @@ class MusicBrainzAlbumMixin:
             # P1-C(d): same positive-extend / proven-empty-negative policy as the
             # release-group search lane. Transient failures never cache (F-MATCH-05).
             _recording_ttl = advanced_settings.cache_ttl_search * 2 if matches else 600
-            await mb_cache_set_if_current(
-                self._cache,
-                cache_key,
-                matches,
-                ttl_seconds=_recording_ttl,
-                context=response_context,
-            )
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            matches,
+            ttl_seconds=_recording_ttl,
+            context=response_context, cache_token=cache_token)
             return matches
         except InvalidExternalPayloadError:
             _record_mb_unmappable_payload("recording search")
@@ -1599,9 +1660,20 @@ class MusicBrainzAlbumMixin:
         """
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         recording_mbid = normalize_mb_id(recording_mbid)
         if not recording_mbid:
             return None
+        if not is_valid_mbid(recording_mbid):
+            _record_mb_degradation("recording invalid mbid", deterministic=True)
+            return None
+        recording_mbid = await resolve_redirect_mbid(
+            "recording",
+            recording_mbid,
+            source_context,
+            self._cache,
+            getattr(self, "_mb_canonical_store", None),
+        )
         cache_key = f"{MB_RECORDING_TO_RG_PREFIX}{recording_mbid}"
         if _artist_preference_active(expected_artist):
             artist_key = " ".join((expected_artist or "").split()).casefold()
@@ -1618,6 +1690,7 @@ class MusicBrainzAlbumMixin:
                 cache_key,
                 source_context=source_context,
                 expected_artist=expected_artist,
+                cache_token=cache_token,
             ),
         )
 
@@ -1627,6 +1700,7 @@ class MusicBrainzAlbumMixin:
         cache_key: str,
         *,
         source_context: MbSourceContext | None = None,
+        cache_token: tuple[object, int],
         expected_artist: str | None = None,
     ) -> str | None:
         source_context = source_context or capture_mb_source_context()
@@ -1641,13 +1715,11 @@ class MusicBrainzAlbumMixin:
             response_context = get_mb_response_context() or source_context
             best = _pick_best_release_group(result.releases, expected_artist)
             rg_id = best[0] if best else None
-            await mb_cache_set_if_current(
-                self._cache,
-                cache_key,
-                rg_id or "",
-                ttl_seconds=86400,
-                context=response_context,
-            )
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            rg_id or "",
+            ttl_seconds=86400,
+            context=response_context, cache_token=cache_token)
             return rg_id
         except Exception as e:  # noqa: BLE001
             # F-MATCH-05: same policy as the release-to-rg helper - a transient
@@ -1664,17 +1736,23 @@ class MusicBrainzAlbumMixin:
         release_id: str,
         recording_mbid: str,
     ) -> tuple[int, int] | None:
-        clear_mb_response_context()
-        source_context = capture_mb_source_context()
         release_id = normalize_mb_id(release_id)
         recording_mbid = normalize_mb_id(recording_mbid)
-        pos_cache_key = f"{MB_RELEASE_REC_PREFIX}{release_id}"
-        positions = await mb_cache_get_if_current(
-            self._cache, pos_cache_key, source_context
-        )
-        if positions and recording_mbid in positions:
-            disc, track = positions[recording_mbid]
-            return (disc, track)
+        if not release_id or not recording_mbid:
+            return None
+        # Steps 05-1/03-8 inherited transitively via get_release_by_id;
+        # no double-gate here.
+        release = await self.get_release_by_id(release_id, includes=["recordings"])
+        if not release:
+            return None
+        for medium in release.get("media", []):
+            disc = medium.get("position", 1)
+            for track in medium.get("tracks", medium.get("track-list", [])):
+                recording = track.get("recording", {})
+                if normalize_mb_id(recording.get("id")) == recording_mbid:
+                    position = track.get("position")
+                    if position is not None:
+                        return (disc, position)
         return None
 
     @staticmethod
@@ -1708,14 +1786,25 @@ class MusicBrainzAlbumMixin:
     ) -> dict | None:
         clear_mb_response_context()
         source_context = capture_mb_source_context()
+        cache_token = capture_mb_cache_token(self._cache)
         if includes is None:
             includes = ["url-rels"]
         recording_id = normalize_mb_id(recording_id)
+        if not is_valid_mbid(recording_id):
+            _record_mb_degradation("recording invalid mbid", deterministic=True)
+            return None
+        recording_id = await resolve_redirect_mbid(
+            "recording",
+            recording_id,
+            source_context,
+            self._cache,
+            getattr(self, "_mb_canonical_store", None),
+        )
         inc_str = "+".join(sorted(includes))
         cache_key = f"{MB_RECORDING_PREFIX}{recording_id}:{inc_str}"
         cached = await mb_cache_get_if_current(self._cache, cache_key, source_context)
         if cached is not None:
-            return cached
+            return None if cached == {} else cached
         dedupe_key = (
             f"{cache_key}:priority={int(RequestPriority.BACKGROUND_SYNC)}"
             f":g{source_context.generation}"
@@ -1723,7 +1812,8 @@ class MusicBrainzAlbumMixin:
         return await mb_deduplicator.dedupe(
             dedupe_key,
             lambda: self._get_recording_by_id_uncached(
-                recording_id, inc_str, cache_key, source_context=source_context
+                recording_id, inc_str, cache_key, source_context=source_context,
+                cache_token=cache_token,
             ),
         )
 
@@ -1734,6 +1824,7 @@ class MusicBrainzAlbumMixin:
         cache_key: str,
         *,
         source_context: MbSourceContext | None = None,
+        cache_token: tuple[object, int],
     ) -> dict | None:
         source_context = source_context or capture_mb_source_context()
         try:
@@ -1745,14 +1836,22 @@ class MusicBrainzAlbumMixin:
             )
             response_context = get_mb_response_context() or source_context
             if not result:
-                return None
-            await mb_cache_set_if_current(
-                self._cache,
+                # Definitive miss: mb_api_get returns {} only on 404 (503/5xx
+                # raise into the except below). Negative-cache briefly so a
+                # merged/deleted/garbage recording mbid isn't re-fetched every
+                # tick; short TTL bounds staleness and self-heals. The
+                # transient except path stays uncached on purpose.
+                await mb_cache_set_if_current(self._cache,
                 cache_key,
-                result,
-                ttl_seconds=3600,
-                context=response_context,
-            )
+                {},
+                ttl_seconds=600,
+                context=response_context, cache_token=cache_token)
+                return None
+            await mb_cache_set_if_current(self._cache,
+            cache_key,
+            result,
+            ttl_seconds=3600,
+            context=response_context, cache_token=cache_token)
             return result
         except InvalidExternalPayloadError:
             _record_mb_unmappable_payload("recording fetch")

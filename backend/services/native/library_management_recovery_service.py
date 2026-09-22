@@ -13,7 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from core.exceptions import ConflictError, StaleRevisionError, ValidationError
+from core.exceptions import (
+    ConflictError,
+    LibraryManagementPolicyChangedError,
+    ResourceNotFoundError,
+    StaleRevisionError,
+    ValidationError,
+)
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.library_management import (
     LibraryFileMutationJournal,
@@ -113,6 +119,7 @@ class LibraryManagementRecoveryService:
         if limit < 1 or limit > RECOVERY_BATCH_SIZE:
             raise ValidationError("Startup recovery page size is out of range.")
         totals = LibraryManagementRecoveryRun()
+        converged = False
         while totals.examined_bundles < STARTUP_RECOVERY_MAX_BUNDLES:
             current = await self.recover_once(
                 limit=min(
@@ -120,9 +127,11 @@ class LibraryManagementRecoveryService:
                     STARTUP_RECOVERY_MAX_BUNDLES - totals.examined_bundles,
                 ),
                 force_expired_process_leases=True,
-                # F-178: committed-but-uncleaned imports must drain or block
-                # startup like the manual lane, so the first scan never races
-                # a duplicate source+destination pair.
+                # F-178: committed-but-uncleaned imports must drain before
+                # startup so the first scan never races a duplicate
+                # source+destination pair. Imports that drain without
+                # converging escalate to needs_attention below (#387)
+                # instead of refusing to boot forever.
                 include_committed_imports=True,
             )
             totals = LibraryManagementRecoveryRun(
@@ -139,6 +148,18 @@ class LibraryManagementRecoveryService:
                 skipped_bundles=totals.skipped_bundles + current.skipped_bundles,
             )
             if current.examined_bundles == 0:
+                converged = True
+                break
+            if (
+                current.recovered_bundles == 0
+                and current.rolled_back_bundles == 0
+                and current.needs_attention_bundles == 0
+            ):
+                # Everything examined keeps failing source cleanup (an
+                # unwritable or changed source can never succeed), so further
+                # passes only repeat the same failures. Stop draining and
+                # escalate below instead of spinning to the bundle cap (#387).
+                converged = True
                 break
         remaining_manual = await self._store.list_recoverable_management_bundles(
             limit=1
@@ -148,11 +169,67 @@ class LibraryManagementRecoveryService:
                 limit=1, include_committed_cleanup=True
             )
         )
-        if remaining_manual or remaining_imports:
+        if remaining_manual or (remaining_imports and not converged):
             raise ConflictError(
                 "Library Management recovery did not reach a safe startup boundary."
             )
+        if remaining_imports:
+            escalated = await self._escalate_stuck_import_cleanups()
+            remaining_imports = (
+                await self._store.list_recoverable_library_management_import_bundles(
+                    limit=1, include_committed_cleanup=True
+                )
+            )
+            if remaining_imports:
+                raise ConflictError(
+                    "Library Management recovery did not reach a safe startup boundary."
+                )
+            totals = LibraryManagementRecoveryRun(
+                examined_bundles=totals.examined_bundles,
+                recovered_bundles=totals.recovered_bundles,
+                rolled_back_bundles=totals.rolled_back_bundles,
+                needs_attention_bundles=(totals.needs_attention_bundles + escalated),
+                skipped_bundles=totals.skipped_bundles,
+            )
         return totals
+
+    async def _escalate_stuck_import_cleanups(self) -> int:
+        """Move persistently uncleanable import bundles to needs_attention.
+
+        The drain loop above only converges when every remaining import keeps
+        failing source cleanup, which a reboot can never fix. Leaving them
+        recoverable refuses every future boot (#387); the catalog commit
+        already succeeded, so flag them for the operator (visible in recovery
+        diagnostics and closable through the verified resolve flow) and let
+        startup proceed. Source files are retained here, never deleted.
+        """
+        escalated = 0
+        while True:
+            batch = (
+                await self._store.list_recoverable_library_management_import_bundles(
+                    limit=RECOVERY_BATCH_SIZE, include_committed_cleanup=True
+                )
+            )
+            if not batch:
+                return escalated
+            progressed = False
+            for record in batch:
+                if record.state not in ("catalog_committed", "cleanup_pending"):
+                    continue
+                logger.warning(
+                    "Library Management import cleanup keeps failing for bundle"
+                    " %s; moving it to needs_attention so startup can proceed",
+                    record.id,
+                )
+                await self._store.mark_library_management_import_needs_attention(
+                    record.id,
+                    failure_code="SOURCE_CLEANUP_FAILED",
+                    updated_at=self._clock(),
+                )
+                escalated += 1
+                progressed = True
+            if not progressed:
+                return escalated
 
     async def recover_once(
         self,
@@ -247,6 +324,70 @@ class LibraryManagementRecoveryService:
                 acknowledged,
             )
         return acknowledged
+    async def resolve_import_bundle(self, bundle_id: str) -> dict[str, object]:
+        """Close a stuck `needs_attention` import bundle after verification.
+
+        Every `needs_attention` journal must still prove its destination file
+        on disk: the destination resolves through the publisher's own root
+        mechanism and its content hash must equal the sealed
+        `staged_fingerprint`. Any failure closes the request with a
+        `ConflictError` carrying per-file `{ordinal, reason}` details and
+        changes no state. Staged temporaries are user data and are never
+        deleted here.
+        """
+
+        record = await self._store.get_library_management_import_bundle(bundle_id)
+        if record is None:
+            raise ResourceNotFoundError("Import publication bundle not found.")
+        if record.state != "needs_attention":
+            raise ConflictError(
+                "Only an import bundle needing attention can be resolved."
+            )
+        journals = await self._store.list_library_management_import_journals(
+            bundle_id
+        )
+        pending = [
+            journal for journal in journals if journal.state == "needs_attention"
+        ]
+        failures: list[dict[str, object]] = []
+        for journal in pending:
+            if journal.staged_fingerprint is None:
+                failures.append({"ordinal": journal.ordinal, "reason": "unverifiable"})
+                continue
+            try:
+                destination = self._publisher.import_destination_path(
+                    record.policy_revision,
+                    journal.destination_root_id,
+                    journal.destination_relative_path,
+                )
+                digest = await asyncio.to_thread(
+                    LibraryManagementPublisher._hash_file, destination
+                )
+            except (LibraryManagementPolicyChangedError, ValidationError):
+                failures.append({"ordinal": journal.ordinal, "reason": "unverifiable"})
+            except (FileNotFoundError, NotADirectoryError):
+                failures.append({"ordinal": journal.ordinal, "reason": "missing"})
+            except OSError:
+                failures.append({"ordinal": journal.ordinal, "reason": "unverifiable"})
+            else:
+                if digest != journal.staged_fingerprint:
+                    failures.append(
+                        {"ordinal": journal.ordinal, "reason": "fingerprint_mismatch"}
+                    )
+        if failures:
+            raise ConflictError(
+                "The import bundle destinations failed verification.",
+                details=failures,
+            )
+        resolved = await self._store.resolve_library_management_import_bundle(
+            bundle_id, updated_at=self._clock()
+        )
+        return {
+            "bundle_id": resolved.id,
+            "state": resolved.state,
+            "verified_files": len(pending),
+            "total_files": len(pending),
+        }
 
     async def _recover_bundle(
         self,

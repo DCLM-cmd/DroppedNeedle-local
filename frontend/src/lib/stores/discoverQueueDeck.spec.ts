@@ -32,6 +32,7 @@ const { apiMock, statusMock, cacheMock, cacheTtls, authMock } = vi.hoisted(() =>
 			triggerGenerate: vi.fn().mockResolvedValue(undefined),
 			startPolling: vi.fn(),
 			stopPolling: vi.fn(),
+			reset: vi.fn(),
 			markConsumed: vi.fn()
 		},
 		cacheMock: {
@@ -54,9 +55,28 @@ vi.mock('$lib/stores/authStore.svelte', () => ({
 vi.mock('$lib/queries/QueryClient', () => ({
 	invalidateQueriesWithPersister: vi.fn().mockResolvedValue(undefined)
 }));
+vi.mock('$lib/queries/discover/DiscoverDemand.svelte', () => ({
+	recordDiscoverActivity: vi.fn().mockResolvedValue(undefined)
+}));
+vi.mock('$lib/queries/musicbrainz/sourceScope.svelte', () => ({
+	musicBrainzSourceKey: () => ({ source_mode: 'brainzmash', source_id: 'source-a', generation: 1 }),
+	subscribeMusicBrainzSourceScope: () => () => {},
+	watchMusicBrainzSourceScope: () => () => {}
+}));
 
 import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
+import { DiscoverQueryKeyFactory } from '$lib/queries/discover/DiscoverQueryKeyFactory';
 import { discoverQueueDeck } from './discoverQueueDeck.svelte';
+
+// Promise.withResolvers needs Node 22+; this repo runs Node 20. The deferred
+// below keeps the same linear hand-off for the late-response tests.
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((settle) => {
+		resolve = settle;
+	});
+	return { promise, resolve };
+}
 
 function makeItem(mbid: string) {
 	return {
@@ -315,7 +335,7 @@ describe('discoverQueueDeck state machine', () => {
 		);
 		expect(discoverQueueDeck.queue.map((i) => i.release_group_mbid)).toEqual(['rg-2']);
 		expect(invalidateQueriesWithPersister).toHaveBeenCalledWith({
-			queryKey: ['discover', 'user-1']
+			queryKey: DiscoverQueryKeyFactory.discover('user-1')
 		});
 	});
 
@@ -332,5 +352,58 @@ describe('discoverQueueDeck state machine', () => {
 		expect(discoverQueueDeck.phase).toBe('finished');
 		expect(cacheMock.removeQueueCachedData).toHaveBeenCalledWith('user-1');
 		expect(statusMock.triggerGenerate).toHaveBeenCalledWith(false);
+	});
+	it('keeps the loaded deck usable while an explicit forced replacement builds or fails', async () => {
+		cacheMock.getQueueCachedData.mockReturnValue({
+			data: { items: [makeItem('rg-1'), makeItem('rg-2')], currentIndex: 0, queueId: 'q1' },
+			timestamp: Date.now()
+		});
+		await discoverQueueDeck.init();
+		discoverQueueDeck.buildNow();
+		expect(statusMock.triggerGenerate).toHaveBeenCalledWith(true);
+		expect(discoverQueueDeck.phase).toBe('ready');
+		discoverQueueDeck.next();
+		expect(discoverQueueDeck.current?.release_group_mbid).toBe('rg-2');
+		statusMock.emit({ status: 'error', error: 'replacement failed' });
+		expect(discoverQueueDeck.current?.release_group_mbid).toBe('rg-2');
+		expect(discoverQueueDeck.replacing).toBe(false);
+	});
+
+	it('publishes candidates without awaiting hydration and hydrates only current and next', async () => {
+		statusMock.fetchStatus.mockResolvedValue({ status: 'ready' });
+		apiMock.global.get.mockImplementation((url: string) =>
+			url.endsWith('/queue')
+				? Promise.resolve({
+						items: ['a', 'b', 'c', 'd'].map((id) => ({ ...makeItem(id), enrichment: null })),
+						queue_id: 'light'
+					})
+				: new Promise<unknown>(() => {})
+		);
+		await discoverQueueDeck.init();
+		expect(discoverQueueDeck.phase).toBe('ready');
+		expect(discoverQueueDeck.current?.release_group_mbid).toBe('a');
+		expect(apiMock.global.get.mock.calls.map(([url]) => url)).toEqual([
+			'/api/v1/discover/queue',
+			'/api/v1/discover/queue/enrich/a',
+			'/api/v1/discover/queue/enrich/b'
+		]);
+		discoverQueueDeck.next();
+		expect(apiMock.global.get).toHaveBeenLastCalledWith(
+			'/api/v1/discover/queue/enrich/c',
+			expect.anything()
+		);
+	});
+
+	it('ignores a late queue response from a destroyed session', async () => {
+		statusMock.fetchStatus.mockResolvedValue({ status: 'ready' });
+		const response = deferred<unknown>();
+		apiMock.global.get.mockReturnValue(response.promise);
+		const pending = discoverQueueDeck.init();
+		await vi.waitFor(() => expect(apiMock.global.get).toHaveBeenCalled());
+		discoverQueueDeck.destroy();
+		response.resolve({ items: [makeItem('stale')], queue_id: 'stale' });
+		await pending;
+		expect(discoverQueueDeck.phase).toBe('idle');
+		expect(discoverQueueDeck.queue).toEqual([]);
 	});
 });

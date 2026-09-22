@@ -7,6 +7,7 @@ request relink writes, capped per-track partial dispatch with per-recording
 dedup, satisfaction-first (no search on a covered want), the active-work
 guards, cadence math with jitter bounds, and dormancy."""
 
+import asyncio
 import sqlite3
 import threading
 import time
@@ -30,6 +31,7 @@ from services.native.download_orchestrator import (
     _NO_MATCH_MSG,
     _NO_SOURCE_MSG,
     _TAG_MISMATCH_MSG,
+    _TARGET_OCCUPIED_MSG,
     DownloadOrchestrator,
 )
 from services.native.download_service import ALREADY_IN_LIBRARY, DownloadService
@@ -89,9 +91,20 @@ def _cand(
     )
 
 
-def _track(rec: str | None, title: str, position: int, length: int = 200_000):
+def _track(
+    rec: str | None,
+    title: str,
+    position: int,
+    length: int = 200_000,
+    media_format: str | None = None,
+):
     return SimpleNamespace(
-        recording_id=rec, title=title, position=position, disc_number=1, length=length
+        recording_id=rec,
+        title=title,
+        position=position,
+        disc_number=1,
+        length=length,
+        media_format=media_format,
     )
 
 
@@ -309,7 +322,14 @@ async def test_track_failures_are_excluded_from_album_wanted_enrolment(env):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "message", [_FILES_NOT_FOUND_MSG, _IMPORT_FAILED_MSG, "download failed", None]
+    "message",
+    [
+        _FILES_NOT_FOUND_MSG,
+        _IMPORT_FAILED_MSG,
+        _TARGET_OCCUPIED_MSG,
+        "download failed",
+        None,
+    ],
 )
 async def test_local_faults_do_not_enrol(env, message):
     _serve_history(env, failed=[_record()])
@@ -317,6 +337,14 @@ async def test_local_faults_do_not_enrol(env, message):
     summary = await env.watcher.run_sweep()
     assert summary.enrolled == 0
     assert await env.store.get_watch("rg-1") is None
+
+
+def test_occupied_message_matches_no_availability_prefix():
+    """The collision message must never prefix-match an enrolment constant in
+    either direction: re-search cannot fix local bytes blocking the path."""
+    for constant in (_NO_SOURCE_MSG, _NO_MATCH_MSG, _TAG_MISMATCH_MSG):
+        assert not _TARGET_OCCUPIED_MSG.startswith(constant)
+        assert not constant.startswith(_TARGET_OCCUPIED_MSG)
 
 
 @pytest.mark.asyncio
@@ -1574,3 +1602,80 @@ async def test_stopped_watch_rearms_and_redispatches_after_cancel(env, tmp_path)
     summary = await env.watcher.run_sweep()
     assert summary.dispatched == 1
     env.ds.request_album.assert_awaited_once()
+
+
+def _cd_dvd_tracks():
+    return [
+        _track("rec-1", "Song 1", 1, media_format="CD"),
+        _track("rec-2", "Song 2", 2, media_format="CD"),
+        _track("rec-v1", "Clip 1", 1, media_format="DVD"),
+        _track("rec-v2", "Clip 2", 2, media_format="DVD"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_partial_want_satisfied_by_audio_coverage_ignores_dvd(env):
+    """A CD+DVD want with every audio track in the library is satisfied -
+    DVD-video positions are neither satisfiable nor dispatchable (Slice 5)."""
+    await _add_watch(env, kind="partial")
+    env.album_service.get_album_tracks_info.side_effect = None
+    env.album_service.get_album_tracks_info.return_value = SimpleNamespace(
+        tracks=_cd_dvd_tracks()
+    )
+    env.library.get_file_rows_for_album.return_value = [_row("rec-1"), _row("rec-2")]
+    env.ds.scout_album.return_value = [_cand(tier="auto")]
+
+    summary = await env.watcher.run_sweep()
+
+    assert summary.fulfilled == 1
+    assert (await env.store.get_watch("rg-1")).state == "fulfilled"
+    env.ds.request_track.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partial_want_never_dispatches_video_positions(env):
+    await _add_watch(env, kind="partial")
+    env.album_service.get_album_tracks_info.side_effect = None
+    env.album_service.get_album_tracks_info.return_value = SimpleNamespace(
+        tracks=_cd_dvd_tracks()
+    )
+    env.library.get_file_rows_for_album.return_value = [_row("rec-1")]  # 1 of 2 audio
+    env.ds.scout_album.return_value = [_cand(tier="auto")]
+
+    await env.watcher.run_sweep()
+
+    requested = {
+        c.kwargs["recording_mbid"] for c in env.ds.request_track.await_args_list
+    }
+    assert requested == {"rec-2"}
+
+
+@pytest.mark.asyncio
+async def test_watch_stopped_while_scouting_is_not_dispatched(env):
+    await _add_watch(env)
+    scout_started = asyncio.Event()
+    finish_scout = asyncio.Event()
+
+    async def scout(**_kwargs):
+        scout_started.set()
+        await finish_scout.wait()
+        return [_cand(tier="auto")]
+
+    env.ds.capture_quality_snapshot = Mock(return_value=SimpleNamespace())
+    env.ds.scout_album = AsyncMock(side_effect=scout)
+    sweep = asyncio.create_task(env.watcher.run_sweep())
+    try:
+        await scout_started.wait()
+        await env.store.stop_watch("rg-1")
+    finally:
+        finish_scout.set()
+        try:
+            summary = await asyncio.wait_for(sweep, timeout=5)
+        except asyncio.TimeoutError:
+            sweep.cancel()
+            await asyncio.gather(sweep, return_exceptions=True)
+            raise
+
+    assert summary.dispatched == 0
+    env.ds.request_album.assert_not_awaited()
+    assert (await env.store.get_watch("rg-1")).state == "stopped"

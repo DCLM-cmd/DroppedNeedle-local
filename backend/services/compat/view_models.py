@@ -23,6 +23,45 @@ class ViewArtist(AppStruct):
     provider_identity_projected: bool = False
 
 
+_RELEASE_TYPE_TOKENS = {
+    "album": "Album",
+    "single": "Single",
+    "ep": "EP",
+    "compilation": "Compilation",
+    "soundtrack": "Soundtrack",
+    "live": "Live",
+    "remix": "Remix",
+    "mixtape": "Mixtape",
+    "mixtape/street": "Mixtape",
+    "demo": "Demo",
+    "audiobook": "Audiobook",
+    "spokenword": "Spokenword",
+    "interview": "Interview",
+    "dj-mix": "DJ-mix",
+    "audio drama": "Audio drama",
+    "field recording": "Field recording",
+    "broadcast": "Broadcast",
+    "other": "Other",
+}
+
+
+def release_types_for_album(
+    release_type: str | None, is_compilation: bool
+) -> list[str] | None:
+    """Map a raw file-tag release type to OpenSubsonic display tokens.
+
+    Lookup is case-insensitive so beets lowercase and Picard casing both land.
+    Unknown/empty input falls back to the legacy Compilation-or-None signal;
+    a compilation flag appends "Compilation" when not already present.
+    """
+    token = _RELEASE_TYPE_TOKENS.get((release_type or "").strip().lower())
+    if token is None:
+        return ["Compilation"] if is_compilation else None
+    if is_compilation and token != "Compilation":
+        return [token, "Compilation"]
+    return [token]
+
+
 class ViewAlbum(AppStruct):
     rg_mbid: str
     title: str
@@ -35,6 +74,7 @@ class ViewAlbum(AppStruct):
     cover_available: bool = False
     date_added: int | None = None
     is_compilation: bool = False
+    release_types: list[str] | None = None  # OpenSubsonic display tokens
     starred_at: float | None = None  # per-user
     play_count: int | None = None  # per-user (optional)
     played_at: str | None = None

@@ -633,13 +633,104 @@ async def test_album_service_selects_by_active_target_album_file_count(
         ],
     }
 
-    selected, owned, pinned = await service._effective_release_id(
+    selected, owned, pinned, basis = await service._effective_release_id(
         release_group_mbid, payload
     )
 
     assert selected == release_20
     assert owned is None
     assert pinned is None
+    assert basis == "file_count"
+
+
+@pytest.mark.asyncio
+async def test_target_two_albums_sharing_a_group_yield_no_library_evidence(
+    target_services,
+) -> None:
+    """B1 durable proof, unmocked: two active albums under one group (one
+    fully tagged, one untagged) must not combine into file-count or embedded
+    evidence - 20 files would otherwise infer the 20-track edition."""
+    store, _view, _favorites, _history, root = target_services
+    release_group_mbid = "70000000-0000-4000-8000-000000000002"
+    release_11 = "71000000-0000-4000-8000-000000000002"
+    release_20 = "72000000-0000-4000-8000-000000000002"
+
+    async def _seed_album(suffix: str, embedded: str | None) -> str:
+        album_id = f"10000000-0000-4000-8000-0000000000{suffix}"
+        membership = _membership(
+            album_id=album_id,
+            track_id=f"20000000-0000-4000-8000-0000000000{suffix}",
+            artist_id=f"30000000-0000-4000-8000-0000000000{suffix}",
+            root=root,
+            title=f"Split {suffix}",
+        )
+        template = membership.tracks[0]
+        first = msgspec.structs.replace(template, embedded_release_mbid=embedded)
+        membership.tracks[0] = first
+        membership.track_credits[first.id] = list(
+            membership.track_credits[template.id]
+        )
+        for position in range(2, 11):
+            track_id = f"29{suffix}00000-0000-4000-8000-{position:012d}"
+            path = root / f"{track_id}.flac"
+            path.write_bytes(b"fLaC" + b"\0" * 64)
+            track = msgspec.structs.replace(
+                template,
+                id=track_id,
+                file_path=str(path),
+                relative_path=path.name,
+                path_hash=f"hash:{track_id}",
+                stat_revision=f"stat:{track_id}",
+                title=f"Split Track {position}",
+                track_number=position,
+                embedded_release_mbid=embedded,
+            )
+            membership.tracks.append(track)
+            membership.track_credits[track_id] = list(
+                membership.track_credits[template.id]
+            )
+        await store.create_catalog_membership(membership)
+        return album_id
+
+    album_a = await _seed_album("91", release_11)
+    album_b = await _seed_album("92", None)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.executemany(
+            "INSERT INTO local_album_external_identities "
+            "(local_album_id, provider, release_group_mbid, decision_source, selected_at) "
+            "VALUES (?, 'musicbrainz', ?, 'manual', 3)",
+            [(album_a, release_group_mbid), (album_b, release_group_mbid)],
+        )
+
+    service = object.__new__(AlbumService)
+    service._library_db = TargetLibraryRepository(store)
+    service._release_pins = TargetAlbumReleasePinStore(store)
+    payload = {
+        "id": release_group_mbid,
+        "releases": [
+            {
+                "id": release_11,
+                "status": "Official",
+                "country": "XW",
+                "media": [{"track-count": 11}],
+            },
+            {
+                "id": release_20,
+                "status": "Official",
+                "country": "US",
+                "media": [{"track-count": 20}],
+            },
+        ],
+    }
+
+    selected, owned, pinned, basis = await service._effective_release_id(
+        release_group_mbid, payload
+    )
+
+    assert selected == release_11
+    assert owned is None
+    assert pinned is None
+    assert basis == "ranked"
 
 
 @pytest.mark.asyncio
@@ -1565,6 +1656,7 @@ async def test_spotify_and_personal_mix_write_only_target_playlists(
         playlist_repo=None,
         mb_repo=AsyncMock(),
         playlist_service=playlists,
+        cache=InMemoryCache(),
         async_playlist_repo=repository,
     )
     spotify_playlist_id = await spotify.ensure_playlist_record(
@@ -1639,6 +1731,7 @@ async def test_spotify_import_persists_cover_in_target_store(
         playlist_repo=None,
         mb_repo=AsyncMock(),
         playlist_service=playlists,
+        cache=InMemoryCache(),
         async_playlist_repo=repository,
         cover_fetcher=cover_fetcher_for(cdn.client()),
     )
@@ -2220,7 +2313,7 @@ async def test_isolated_target_compat_routes_browse_play_and_write_stable_refere
     provider_covers.get_release_group_cover_etag.return_value = None
     provider_covers.get_artist_image.return_value = None
     provider_covers.get_artist_image_etag.return_value = None
-    plugin_host = SimpleNamespace(dispatch_scrobble=AsyncMock())
+    plugin_host = SimpleNamespace(dispatch_event=AsyncMock(), dispatch_scrobble=AsyncMock())
     target = build_target_consumer_composition(
         store=store,
         preferences=preferences,
@@ -2448,7 +2541,7 @@ async def test_isolated_target_compat_routes_browse_play_and_write_stable_refere
             "SELECT local_track_id FROM library_compat_play_queue_items"
         ).fetchone() == (LOCAL_TRACK_ID,)
 
-    plugin_calls = plugin_host.dispatch_scrobble.await_count
+    plugin_calls = plugin_host.dispatch_event.await_count
     await target.scrobble_service.submit_scrobble(
         ScrobbleRequest(
             track_name="Target Track",
@@ -2459,7 +2552,12 @@ async def test_isolated_target_compat_routes_browse_play_and_write_stable_refere
         user_id="user-1",
     )
     await asyncio.gather(*target.scrobble_service._plugin_tasks)
-    assert plugin_host.dispatch_scrobble.await_count == plugin_calls + 1
+    assert plugin_host.dispatch_event.await_count == plugin_calls + 2
+    kinds = [
+        call.args[0].kind
+        for call in plugin_host.dispatch_event.await_args_list[plugin_calls:]
+    ]
+    assert kinds == ["scrobble", "playback_started"]
 
     with sqlite3.connect(store.db_path) as connection:
         connection.execute(
@@ -3056,3 +3154,159 @@ async def test_resolve_tracks_200_item_boundary_unchanged():
     assert len(response.items) == 200
     requested = store.resolve_canonical_target_ids.await_args.args[1]
     assert len(requested) == 200
+
+
+EMBEDDED_RELEASE_MBID = "80000000-0000-4000-8000-000000000001"
+PINNED_RELEASE_MBID = "81000000-0000-4000-8000-000000000001"
+OWNED_RELEASE_MBID = "82000000-0000-4000-8000-000000000001"
+
+
+def _display_tracks(*embedded: str | None) -> list[dict]:
+    return [{"embedded_release_mbid": value} for value in embedded]
+
+
+def test_display_pick_prefers_pin_over_owned_and_tags() -> None:
+    pick = TargetNativeLibraryService._display_pick(
+        {"release_mbid": OWNED_RELEASE_MBID},
+        _display_tracks(EMBEDDED_RELEASE_MBID, EMBEDDED_RELEASE_MBID),
+        PINNED_RELEASE_MBID,
+    )
+
+    assert pick == (PINNED_RELEASE_MBID, "pin")
+
+
+def test_display_pick_rejects_garbage_pin_and_returns_canonical_mbid() -> None:
+    # A stale non-MBID pin row must never render as a confident pick.
+    assert TargetNativeLibraryService._display_pick(
+        {"release_mbid": OWNED_RELEASE_MBID},
+        _display_tracks(EMBEDDED_RELEASE_MBID, EMBEDDED_RELEASE_MBID),
+        "not-a-mbid",
+    ) == (OWNED_RELEASE_MBID, "owned")
+    # Unanimous tags differing only by case return the stored original.
+    assert TargetNativeLibraryService._display_pick(
+        {"release_mbid": None},
+        _display_tracks(
+            EMBEDDED_RELEASE_MBID.upper(), EMBEDDED_RELEASE_MBID.upper()
+        ),
+        None,
+    ) == (EMBEDDED_RELEASE_MBID.upper(), "embedded_tags")
+    # A malformed owned MBID falls through to tags instead of rendering.
+    assert TargetNativeLibraryService._display_pick(
+        {"release_mbid": "not-a-mbid"},
+        _display_tracks(EMBEDDED_RELEASE_MBID, EMBEDDED_RELEASE_MBID),
+        None,
+    ) == (EMBEDDED_RELEASE_MBID, "embedded_tags")
+
+
+def test_display_pick_owned_beats_embedded_tags() -> None:
+    pick = TargetNativeLibraryService._display_pick(
+        {"release_mbid": OWNED_RELEASE_MBID},
+        _display_tracks(EMBEDDED_RELEASE_MBID, EMBEDDED_RELEASE_MBID),
+        None,
+    )
+
+    assert pick == (OWNED_RELEASE_MBID, "owned")
+
+
+def test_display_pick_embedded_tags_requires_full_coverage() -> None:
+    assert TargetNativeLibraryService._display_pick(
+        {"release_mbid": None},
+        _display_tracks(EMBEDDED_RELEASE_MBID, EMBEDDED_RELEASE_MBID),
+        None,
+    ) == (EMBEDDED_RELEASE_MBID, "embedded_tags")
+    # Partial coverage falls through.
+    assert TargetNativeLibraryService._display_pick(
+        {"release_mbid": None},
+        _display_tracks(EMBEDDED_RELEASE_MBID, None),
+        None,
+    ) == (None, None)
+    # Conflicting tags fall through.
+    assert TargetNativeLibraryService._display_pick(
+        {"release_mbid": None},
+        _display_tracks(EMBEDDED_RELEASE_MBID, OWNED_RELEASE_MBID),
+        None,
+    ) == (None, None)
+    # Invalid MBIDs fall through.
+    assert TargetNativeLibraryService._display_pick(
+        {"release_mbid": None},
+        _display_tracks("not-a-mbid", "not-a-mbid"),
+        None,
+    ) == (None, None)
+    # No tracks, no pick (this lane has no ranked fallback).
+    assert TargetNativeLibraryService._display_pick(
+        {"release_mbid": None}, [], None
+    ) == (None, None)
+    assert TargetNativeLibraryService._display_pick(None, [], None) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_album_detail_surfaces_embedded_tags_pick(target_services) -> None:
+    store, _view, _favorites, _history, root = target_services
+    album_id = "10000000-0000-4000-8000-000000000091"
+    membership = _membership(
+        album_id=album_id,
+        track_id="20000000-0000-4000-8000-000000000091",
+        artist_id="30000000-0000-4000-8000-000000000091",
+        root=root,
+        title="Tagged",
+    )
+    membership = msgspec.structs.replace(
+        membership,
+        tracks=[
+            msgspec.structs.replace(
+                membership.tracks[0], embedded_release_mbid=EMBEDDED_RELEASE_MBID
+            )
+        ],
+    )
+    await store.create_catalog_membership(membership)
+
+    detail = await TargetNativeLibraryService(store).album_detail(album_id)
+
+    assert detail is not None
+    assert detail.display_release_mbid == EMBEDDED_RELEASE_MBID
+    assert detail.pick_basis == "embedded_tags"
+    # The display pick must not fabricate owned identity.
+    assert detail.musicbrainz_release_id is None
+
+
+@pytest.mark.asyncio
+async def test_album_detail_surfaces_pin_pick(target_services) -> None:
+    store, _view, _favorites, _history, _root = target_services
+    await store.set_target_album_release_pin(
+        IDENTIFIED_ALBUM_ID, PINNED_RELEASE_MBID, "user-1", "2026-09-09"
+    )
+
+    detail = await TargetNativeLibraryService(store).album_detail(IDENTIFIED_ALBUM_ID)
+
+    assert detail is not None
+    assert detail.display_release_mbid == PINNED_RELEASE_MBID
+    assert detail.pick_basis == "pin"
+
+
+@pytest.mark.asyncio
+async def test_album_detail_drops_pin_from_another_group(target_services) -> None:
+    """A well-formed pin for the wrong group (re-identified since pinning)
+    must not render as a confident pick; the row stays for re-pinning."""
+    store, _view, _favorites, _history, _root = target_services
+    await store.set_target_album_release_pin(
+        IDENTIFIED_ALBUM_ID, PINNED_RELEASE_MBID, "user-1", "2026-09-09"
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_album_external_identities SET release_group_mbid = ? "
+            "WHERE local_album_id = ?",
+            ("0f0f0f0f-0000-4000-8000-000000000000", IDENTIFIED_ALBUM_ID),
+        )
+        connection.commit()
+        pin_row = connection.execute(
+            "SELECT release_mbid FROM library_album_release_pins "
+            "WHERE local_album_id = ?",
+            (IDENTIFIED_ALBUM_ID,),
+        ).fetchone()
+
+    detail = await TargetNativeLibraryService(store).album_detail(IDENTIFIED_ALBUM_ID)
+
+    assert pin_row is not None
+    assert detail is not None
+    assert detail.display_release_mbid is None
+    assert detail.pick_basis is None

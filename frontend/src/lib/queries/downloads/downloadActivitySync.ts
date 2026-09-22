@@ -1,9 +1,11 @@
+import { getDownloadScope } from './downloadScope.svelte';
 import type { DownloadActivitySummary } from '$lib/types';
 
 export interface DownloadActivityObservation {
 	userId: string | null;
 	revision: number | null;
 	landed: Set<string>;
+	scopeGeneration?: number;
 }
 
 export interface DownloadActivityActions {
@@ -21,6 +23,12 @@ export function reconcileDownloadActivity(
 	userId: string | null,
 	summary: DownloadActivitySummary | undefined
 ): DownloadActivityActions {
+	const generation = getDownloadScope().generation;
+	if (observed.scopeGeneration !== generation) {
+		observed.scopeGeneration = generation;
+		observed.revision = null;
+		observed.landed = new Set();
+	}
 	if (!userId || !summary) {
 		observed.userId = userId;
 		observed.revision = null;

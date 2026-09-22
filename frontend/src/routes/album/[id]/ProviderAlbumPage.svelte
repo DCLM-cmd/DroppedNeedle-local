@@ -5,6 +5,7 @@
 	import Toast from '$lib/components/Toast.svelte';
 	import LastFmAlbumEnrichmentComponent from '$lib/components/LastFmAlbumEnrichment.svelte';
 	import DeleteAlbumModal from '$lib/components/DeleteAlbumModal.svelte';
+	import RemoveTrackFileDialog from './RemoveTrackFileDialog.svelte';
 	import AddToPlaylistModal from '$lib/components/AddToPlaylistModal.svelte';
 	import { ApiError } from '$lib/api/client';
 	import { createAlbumPageState } from './albumPageState.svelte';
@@ -126,6 +127,7 @@
 				mbTrackCount={state.tracksInfo?.total_tracks ?? 0}
 				releaseGroupMbid={album.musicbrainz_id}
 				{localCopies}
+				downloadAllowed={state.localMatch?.download_allowed !== false}
 				onrequest={state.handleRequest}
 				ondelete={state.handleDeleteClick}
 				onrefresh={state.refreshAll}
@@ -305,6 +307,16 @@
 </div>
 
 <Toast bind:show={state.showToast} message={state.toastMessage} type={state.toastType} />
+
+{#if state.removeFileTarget}
+	<RemoveTrackFileDialog
+		trackTitle={state.removeFileTarget.title}
+		removing={state.removeFilePending}
+		error={state.removeFileError}
+		onconfirm={state.confirmRemoveFile}
+		onclose={state.closeRemoveFileDialog}
+	/>
+{/if}
 
 {#if state.showDeleteModal && state.album}
 	<DeleteAlbumModal

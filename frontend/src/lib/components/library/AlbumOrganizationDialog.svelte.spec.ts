@@ -41,7 +41,9 @@ const album: LibraryAlbumDetail = {
 	management_excluded_at: null,
 	active_edition_conversion: null,
 	contribution_id: null,
-	contribution_state: null
+	contribution_state: null,
+	display_release_mbid: null,
+	pick_basis: null
 };
 
 function track(id: string, number: number): NativeTrackListItem {
@@ -144,7 +146,7 @@ beforeEach(() => {
 
 describe('AlbumOrganizationDialog', () => {
 	it('previews exact membership and states that files and tags stay unchanged', async () => {
-		render(AlbumOrganizationDialog, {
+		await render(AlbumOrganizationDialog, {
 			props: { album, tracks }
 		} as unknown as Parameters<typeof render>[1]);
 		await openSplitAndPreview();
@@ -176,7 +178,7 @@ describe('AlbumOrganizationDialog', () => {
 
 	it('keeps a stale grouping open and returns to Preview', async () => {
 		h.apply.mockRejectedValue(new Error('stale revision'));
-		render(AlbumOrganizationDialog, {
+		await render(AlbumOrganizationDialog, {
 			props: { album, tracks }
 		} as unknown as Parameters<typeof render>[1]);
 		await openSplitAndPreview();
@@ -187,7 +189,7 @@ describe('AlbumOrganizationDialog', () => {
 	});
 
 	it('returns focus to the exact organization action after cancellation', async () => {
-		render(AlbumOrganizationDialog, {
+		await render(AlbumOrganizationDialog, {
 			props: { album, tracks }
 		} as unknown as Parameters<typeof render>[1]);
 		await page.getByText('Album organization').click();

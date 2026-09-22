@@ -13,6 +13,7 @@ import urllib.parse
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import get_args
 from unittest.mock import AsyncMock
 
@@ -37,6 +38,7 @@ from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.library_reconciler import LibraryReconciler
 from services.native.library_scan_coordinator import LibraryScanCoordinator
 from services.native.library_scan_scheduler import LibraryAutomaticScanScheduler
+from services.native.library_scan_supervisor import supervise_target_scans
 from services.native.library_schedule_service import LibraryScheduleService
 
 
@@ -2340,6 +2342,75 @@ async def test_paused_run_retains_fence_until_terminal(target_store: NativeLibra
 
 
 @pytest.mark.asyncio
+async def test_settle_spin_exhaustion_returns_stop_signal_without_raising(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T18 (R-02): endless StaleRevisionError contention settles bounded -
+    exactly SETTLE_STALE_MAX_RETRIES attempts with a sleep each, then the
+    still-unsettled run is returned (stop-signal: the pending-control entry
+    is kept so checkpoint keeps returning False and the supervisor retries
+    later). Nothing raises."""
+    from unittest.mock import AsyncMock
+
+    from services.native import library_scan_coordinator as coordinator_module
+
+    store = AsyncMock()
+    pausing = ScanRun(
+        id="run-1",
+        kind="incremental",
+        trigger="manual",
+        state="pausing",
+        phase="reconciling",
+        row_revision=7,
+    )
+    store.get_scan_run.return_value = (pausing, [], {})
+    store.transition_scan_run.side_effect = StaleRevisionError("revision moved")
+    coordinator = LibraryScanCoordinator(
+        store, AsyncMock(), AsyncMock(), AsyncMock(), lambda: None
+    )
+    coordinator._pending_control_run_ids.add("run-1")
+
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    baseline = coordinator_module._scan_metrics.snapshot().counters.get(
+        "settle_stale_retries", 0
+    )
+    with caplog.at_level(
+        logging.WARNING, logger="services.native.library_scan_coordinator"
+    ):
+        # Must not raise despite every transition attempt going stale.
+        settled = await coordinator._settle_pending_control("run-1")
+
+    assert store.transition_scan_run.await_count == (
+        coordinator_module.SETTLE_STALE_MAX_RETRIES
+    )
+    assert len(sleeps) == coordinator_module.SETTLE_STALE_MAX_RETRIES - 1
+    assert all(0 < delay <= 0.075 + 1e-9 for delay in sleeps)
+    # Stop-signal path: the run comes back still unsettled, the
+    # pending-control entry is kept, and the exhaustion was metered + logged.
+    assert settled.id == "run-1"
+    assert settled.state == "pausing"
+    assert "run-1" in coordinator._pending_control_run_ids
+    assert (
+        coordinator_module._scan_metrics.snapshot().counters.get(
+            "settle_stale_retries", 0
+        )
+        - baseline
+        == 1
+    )
+    assert any(
+        "exhausted" in record.getMessage() and "run-1" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_duplicate_during_active_run_queues_follow_up_that_survives_failure(
     target_store: NativeLibraryStore, tmp_path: Path
 ) -> None:
@@ -2466,6 +2537,79 @@ async def test_incompatible_request_during_active_conflicts_without_mutation(
     assert conflict.conflicting_kind == "rescan_files"
     assert await target_store.row_count("library_scan_runs") == 2
     assert await target_store.get_stream_revision("scan") == 3
+
+
+@pytest.mark.asyncio
+async def test_scheduler_tick_conflicts_without_duplicate_run(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """T21 (S-05): tick with an incompatible queued follow-up returns False,
+    leaves the queued follow-up alone, and creates no duplicate run."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    await coordinator.request_run(_request(resolver))
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None
+    follow_up = await coordinator.request_run(
+        _request(resolver, relative_path="Disc 1", kind="rescan_files")
+    )
+    assert follow_up.disposition == "queued"
+    before = await target_store.row_count("library_scan_runs")
+
+    # Fresh store has no terminal history, so the tick is due and reaches
+    # request_run - which conflicts with the incompatible queued follow-up.
+    ticked = await LibraryAutomaticScanScheduler().tick(
+        coordinator,
+        resolver,
+        frequency="5min",
+        daily_time="03:00",
+        timezone_name="Europe/London",
+        now=datetime.now().astimezone(),
+    )
+
+    assert ticked is False
+    assert await target_store.row_count("library_scan_runs") == before
+    queued, _, _ = await target_store.get_scan_run(follow_up.run_id)
+    assert queued.state == "queued"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_tick_coalesced_returns_true(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """T21 (S-05 edge): a due tick that coalesces onto a compatible queued
+    follow-up returns True - coalesced/expanded mean work will run."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+
+    await coordinator.request_run(_request(resolver))
+    active = await target_store.claim_next_scan_run(now=1_800_000_001)
+    assert active is not None
+    follow_up = await coordinator.request_run(
+        _request(resolver, trigger="manual")
+    )
+    assert follow_up.disposition == "queued"
+    before = await target_store.row_count("library_scan_runs")
+
+    ticked = await LibraryAutomaticScanScheduler().tick(
+        coordinator,
+        resolver,
+        frequency="5min",
+        daily_time="03:00",
+        timezone_name="Europe/London",
+        now=datetime.now().astimezone(),
+    )
+
+    assert ticked is True
+    # Coalesced onto the follow-up: no new run row.
+    assert await target_store.row_count("library_scan_runs") == before
+    coalesced, _, _ = await target_store.get_scan_run(follow_up.run_id)
+    assert coalesced.coalesced_request_count == 1
 
 
 @pytest.mark.asyncio
@@ -3274,14 +3418,17 @@ async def test_cjk_and_nfd_twin_filenames_survive_walk_index_identity(
         ).fetchall()
     assert len(rows) == 2
     stored_paths = [row[1] for row in rows]
-    # raw FS bytes preserved verbatim: exactly one NFC name and one NFD name
-    normalized = [unicodedata.normalize("NFC", name) for name in stored_paths]
-    assert len(set(normalized)) == 2 or True  # distinct dirs; see hash check
-    nfc_stored = next(name for name in stored_paths if unicodedata.is_normalized("NFC", name))
-    nfd_stored = next(name for name in stored_paths if not unicodedata.is_normalized("NFC", name))
-    assert nfc_stored.endswith("-01.flac") and nfd_stored.endswith("-02.flac")
+    # Step 4.13 (F-16) deliberately changes this contract: inventory keys
+    # are NFC-normalized at key-build (plus classify-side), so the NFD
+    # directory component is stored in its NFC form. The two files live in
+    # different directories with different basenames, so normalization
+    # never collapses them: still two rows, two distinct keys, two hashes.
+    assert all(unicodedata.is_normalized("NFC", name) for name in stored_paths)
+    assert len(set(stored_paths)) == 2
+    assert sum(name.endswith("-01.flac") for name in stored_paths) == 1
+    assert sum(name.endswith("-02.flac") for name in stored_paths) == 1
     hashes = {row[2] for row in rows}
-    assert len(hashes) == 2  # distinct byte strings give distinct path hashes
+    assert len(hashes) == 2  # distinct keys give distinct path hashes
 
     ids_before = {row[0] for row in rows}
     await coordinator.request_run(_request(resolver))
@@ -3338,3 +3485,360 @@ async def test_a_failing_cover_prewarm_never_fails_the_scan(
     completed = await coordinator.run_once({"root-a": root})
 
     assert completed is not None and completed.state == "completed"
+def _boot_supervisor_kwargs(
+    coordinator: LibraryScanCoordinator,
+    resolver: LibraryPolicyResolver,
+    root: Path,
+) -> dict:
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    return {
+        "coordinator_getter": lambda: coordinator,
+        "root_paths_getter": lambda: {"root-a": root},
+        "work_wakeups": wakeups,
+        "scheduler_getter": lambda: LibraryAutomaticScanScheduler(),
+        "resolver_getter": lambda: resolver,
+        "schedule_settings_getter": lambda: {
+            "frequency": "24hr",
+            "daily_time": "03:00",
+            "timezone_name": "UTC",
+        },
+    }
+
+
+def _run_triggers(db_path: Path) -> list[str]:
+    with sqlite3.connect(db_path) as connection:
+        return [
+            row[0]
+            for row in connection.execute(
+                "SELECT trigger FROM library_scan_run_triggers "
+                "ORDER BY trigger_sequence"
+            ).fetchall()
+        ]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_starts_clean_boot_scan(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """T14 (S-01 Hook A lifecycle): a clean boot starts one startup_resume run."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    await supervise_target_scans(**_boot_supervisor_kwargs(coordinator, resolver, root))
+    assert await target_store.row_count("library_scan_runs") == 1
+    triggers = _run_triggers(tmp_path / "target.db")
+    assert triggers and triggers[0] == "startup_resume"
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_skips_boot_with_queued_work(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """T14 (S-01 Hook A lifecycle): seeded queued work means started-vs-coalesced,
+    never a duplicate run."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver)
+    seeded = await coordinator.request_run(_request(resolver))
+    assert seeded.disposition == "started"
+    duplicate = await coordinator.request_run(_request(resolver, trigger="startup_resume"))
+    assert duplicate.disposition == "coalesced"
+    assert duplicate.run_id == seeded.run_id
+    await supervise_target_scans(**_boot_supervisor_kwargs(coordinator, resolver, root))
+    assert await target_store.row_count("library_scan_runs") == 1
+    assert "startup_resume" in _run_triggers(tmp_path / "target.db")
+
+
+def _queued_automatic_identification_jobs(db_path: Path) -> int:
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM library_identification_jobs "
+            "WHERE kind = 'automatic' AND state = 'queued'"
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+@pytest.mark.asyncio
+async def test_exclude_unexclude_incremental_recovers_via_reconcile(
+    target_store: NativeLibraryStore, tmp_path: Path
+) -> None:
+    """T26 (S-03): exclude -> scan -> un-exclude -> incremental converges via
+    reconcile, not the indexer: availability/applied-policy restore,
+    identification re-enqueues, tag reads stay flat, and reconcile runs
+    despite the indexer skip. Uses plain incremental on purpose - the
+    `rescan_files` bypass is covered separately."""
+    root = tmp_path / "music"
+    root.mkdir()
+    track = root / "track-1.flac"
+    track.write_bytes(b"one")
+    reader = _TagReader()
+    resolver = _resolver(root)
+    coordinator = _coordinator(target_store, resolver, reader)
+    await coordinator.request_run(_request(resolver))
+    first = await coordinator.run_once({"root-a": root})
+    assert first is not None and first.state == "completed"
+    indexed = await target_store.get_target_track_by_path(str(track))
+    assert indexed is not None
+    assert indexed["availability"] == "indexed"
+    assert indexed["applied_policy"] == "automatic"
+    tag_reads_after_index = len(reader.calls)
+    assert tag_reads_after_index > 0
+
+    excluded_resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(
+                    id="root-a", path=str(root), label="Library", policy="excluded"
+                )
+            ]
+        )
+    )
+    excluded_coordinator = _coordinator(target_store, excluded_resolver, reader)
+    await excluded_coordinator.request_run(_request(excluded_resolver))
+    excluded_run = await excluded_coordinator.run_once({"root-a": root})
+    assert excluded_run is not None and excluded_run.state == "completed"
+    excluded = await target_store.get_target_track_by_path(str(track))
+    assert excluded is not None
+    assert excluded["availability"] == "excluded"
+    assert excluded["applied_policy"] == "excluded"
+
+    restored_resolver = _resolver(root)
+    restored_coordinator = _coordinator(target_store, restored_resolver, reader)
+    reconcile_calls: list[str] = []
+    real_reconcile = restored_coordinator._reconciler.reconcile
+
+    async def _recording_reconcile(run_id, scopes, checkpoint=None):
+        reconcile_calls.append(run_id)
+        return await real_reconcile(run_id, scopes, checkpoint=checkpoint)
+
+    restored_coordinator._reconciler.reconcile = _recording_reconcile  # type: ignore[method-assign]
+    jobs_before = _queued_automatic_identification_jobs(tmp_path / "target.db")
+    await restored_coordinator.request_run(_request(restored_resolver))
+    restored_run = await restored_coordinator.run_once({"root-a": root})
+    assert restored_run is not None and restored_run.state == "completed"
+    assert restored_run.kind == "incremental"
+    restored = await target_store.get_target_track_by_path(str(track))
+    assert restored is not None
+    assert restored["availability"] == "indexed"
+    assert restored["applied_policy"] == "automatic"
+    assert len(reader.calls) == tag_reads_after_index
+    assert reconcile_calls != []
+    assert _queued_automatic_identification_jobs(tmp_path / "target.db") > jobs_before
+
+
+_LEGACY_MTIME_BASE_S = 1_700_000_000.0
+_LEGACY_MTIME_BASE_NS = 1_700_000_000_000_000_001
+# ~477ns above the base second after float64 rounding (grid spacing at
+# 1.7e9 s is ~238ns): inside the 1us epsilon band, but strictly above the
+# base instant so the old one-sided/truncating compares flipped to changed.
+_LEGACY_MTIME_WOBBLE_S = 1_700_000_000.0000005
+
+
+async def _seed_legacy_track(
+    store: NativeLibraryStore,
+    *,
+    kind: str,
+    mtime_ns: int,
+    tags_read_at: float | None,
+    run_id: str = "scan-legacy-1",
+) -> None:
+    """Seed one legacy-kind track plus its scan run for classify tests."""
+    from models.local_catalog import (
+        CatalogMembership,
+        LocalAlbum,
+        LocalArtist,
+        LocalArtistCredit,
+        LocalTrack,
+    )
+
+    artist = LocalArtist(
+        id="artist-legacy-1",
+        display_name="Legacy Artist",
+        folded_name="legacy artist",
+        normalized_name="legacy artist",
+        kind="person",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id="album-legacy-1",
+        root_id="root-1",
+        grouping_key="group-legacy-1",
+        title="Legacy Album",
+        album_artist_id=artist.id,
+        album_artist_name=artist.display_name,
+        created_at=1,
+        updated_at=1,
+    )
+    track = LocalTrack(
+        id="track-legacy-1",
+        local_album_id=album.id,
+        root_id="root-1",
+        file_path="/music/legacy.flac",
+        relative_path="legacy.flac",
+        path_hash="hash-legacy-1",
+        file_size_bytes=100,
+        file_mtime_ns=mtime_ns,
+        stat_revision=f"100:{mtime_ns}",
+        title="Legacy Track",
+        artist_name=artist.display_name,
+        album_title=album.title,
+        album_artist_name=artist.display_name,
+        file_format="flac",
+        imported_at=1,
+    )
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=[track],
+            track_credits={track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]},
+        )
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET file_size_bytes = 100, file_mtime_ns = ?, "
+            "stat_revision = ?, stat_revision_kind = ?, tags_read_at = ? "
+            "WHERE id = 'track-legacy-1'",
+            (mtime_ns, f"100:{mtime_ns}", kind, tags_read_at),
+        )
+        connection.execute(
+            "INSERT INTO library_scan_runs "
+            "(id, kind, trigger, state, phase, aggregate_scope, queued_at, updated_at) "
+            "VALUES (?, 'incremental', 'manual', 'indexing', 'indexing', 'root-1', 1, 1)",
+            (run_id,),
+        )
+        connection.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["legacy_float", "legacy_review"])
+async def test_classify_legacy_mtime_float_wobble_is_unchanged(
+    target_store: NativeLibraryStore, kind: str
+) -> None:
+    """4.12 (F-15): same-nanosecond float wobble stays within the symmetric
+    band and classifies as unchanged on both legacy branches."""
+    tags_read_at = _LEGACY_MTIME_BASE_S if kind == "legacy_review" else None
+    await _seed_legacy_track(
+        target_store,
+        kind=kind,
+        mtime_ns=_LEGACY_MTIME_BASE_NS,
+        tags_read_at=tags_read_at,
+    )
+    result = await target_store.classify_scan_paths(
+        "root-1",
+        [
+            (
+                "legacy.flac",
+                100,
+                1_700_000_000_000_000_000,
+                _LEGACY_MTIME_WOBBLE_S,
+                "100:1700000000000000000",
+            )
+        ],
+        run_id="scan-legacy-1",
+    )
+    assert result["legacy.flac"][0] == "unchanged"
+    failures, _ = await target_store.list_scan_run_failures("scan-legacy-1")
+    assert failures == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["legacy_float", "legacy_review"])
+async def test_classify_legacy_mtime_rewrite_is_changed(
+    target_store: NativeLibraryStore, kind: str
+) -> None:
+    """4.12 (F-15): a real rewrite (hours of drift) still classifies as
+    changed - the band covers float error only."""
+    await _seed_legacy_track(
+        target_store,
+        kind=kind,
+        mtime_ns=_LEGACY_MTIME_BASE_NS,
+        tags_read_at=None,
+    )
+    rewritten_s = _LEGACY_MTIME_BASE_S + 7200.0
+    rewritten_ns = int(rewritten_s * 1_000_000_000)
+    result = await target_store.classify_scan_paths(
+        "root-1",
+        [("legacy.flac", 100, rewritten_ns, rewritten_s, f"100:{rewritten_ns}")],
+        run_id="scan-legacy-1",
+    )
+    assert result["legacy.flac"][0] == "changed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["legacy_float", "legacy_review"])
+async def test_classify_legacy_mtime_skew_beyond_band_records_failure(
+    target_store: NativeLibraryStore, kind: str
+) -> None:
+    """4.12 (F-15): beyond-band wall/FS drift records an MTIME_SKEW row via
+    record_scan_failures (phase + failure_code + recorded_at)."""
+    await _seed_legacy_track(
+        target_store,
+        kind=kind,
+        mtime_ns=_LEGACY_MTIME_BASE_NS,
+        tags_read_at=_LEGACY_MTIME_BASE_S - 30.0,
+    )
+    result = await target_store.classify_scan_paths(
+        "root-1",
+        [
+            (
+                "legacy.flac",
+                100,
+                1_700_000_000_000_000_000,
+                _LEGACY_MTIME_WOBBLE_S,
+                "100:1700000000000000000",
+            )
+        ],
+        run_id="scan-legacy-1",
+    )
+    failures, _ = await target_store.list_scan_run_failures("scan-legacy-1")
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure.failure_code == "MTIME_SKEW"
+    assert failure.phase == "discovering"
+    assert failure.root_id == "root-1"
+    assert failure.relative_path == "legacy.flac"
+    assert failure.recorded_at > 0
+    # Skew evidence is independent of the verdict: the float branch still
+    # matches its saved mtime, while the review branch disagrees with its
+    # wall-clock tags.
+    expected = "unchanged" if kind == "legacy_float" else "changed"
+    assert result["legacy.flac"][0] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["legacy_float", "legacy_review"])
+async def test_classify_legacy_mtime_null_tags_skips_skew_check(
+    target_store: NativeLibraryStore, kind: str
+) -> None:
+    """4.12 (F-15): NULL tags_read_at records no skew evidence either way."""
+    await _seed_legacy_track(
+        target_store,
+        kind=kind,
+        mtime_ns=_LEGACY_MTIME_BASE_NS,
+        tags_read_at=None,
+    )
+    result = await target_store.classify_scan_paths(
+        "root-1",
+        [
+            (
+                "legacy.flac",
+                100,
+                1_700_000_000_000_000_000,
+                _LEGACY_MTIME_WOBBLE_S,
+                "100:1700000000000000000",
+            )
+        ],
+        run_id="scan-legacy-1",
+    )
+    failures, _ = await target_store.list_scan_run_failures("scan-legacy-1")
+    assert failures == []
+    expected = "unchanged" if kind == "legacy_float" else "changed"
+    assert result["legacy.flac"][0] == expected

@@ -3,7 +3,7 @@
 Single-track scoring with no group/coherence phase: scores each candidate file
 against the target track and wraps the best as a one-file ``ScoredCandidate`` so
 the orchestrator's track branch and the Review tab consume it identically to an
-album candidate. Reuses the album scorer's ``_file_confidence`` and the shared
+album candidate. Reuses the shared scoring core's ``file_confidence`` and the shared
 quarantine + quality-tier filters (codec/tier gate + absolute highest-tier
 preference). ``tier='auto'`` additionally requires the requested artist to be
 named somewhere in the candidate's remote path (``title_match.artist_evidence``,
@@ -21,7 +21,8 @@ from models.acquisition_quality import (
 from models.download import ScoredCandidate, TargetTrack
 from models.download_identity import soulseek_identity
 from repositories.protocols.download_client import DownloadSearchResult
-from services.native.album_preflight_scorer import _file_confidence, _file_evidence
+from services.native.acquisition.scoring_core import file_confidence
+from services.native.album_preflight_scorer import _file_evidence
 from services.native.title_match import artist_evidence
 from services.native.acquisition import quality as acq_quality
 from services.native.quality_tiers import (
@@ -118,11 +119,13 @@ class TrackMatcher:
         for file in filtered:
             # strict_title: a track title is directly comparable to a filename,
             # so the containment metric applies.
-            score = _file_confidence(
+            score = file_confidence(
                 target.track_title,
                 target.artist_name,
                 target.duration_seconds,
-                file,
+                file.filename,
+                file.parent_directory,
+                file.duration,
                 strict_title=True,
             )
             if score >= auto_accept_threshold and artist_evidence(

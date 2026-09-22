@@ -2382,6 +2382,12 @@ def legacy_audio_projection(
         )
 
     compilation = metadata.value_for("compilation")
+    release_type_raw = metadata.value_for("release_type")
+    if isinstance(release_type_raw, tuple):
+        release_type_raw = release_type_raw[0] if release_type_raw else None
+    release_type = (
+        release_type_raw.strip() or None if isinstance(release_type_raw, str) else None
+    )
     tag = AudioTag(
         title=scalar("title") or "",
         artist=metadata.artist_display or (artist_names[0] if artist_names else ""),
@@ -2403,6 +2409,7 @@ def legacy_audio_projection(
         musicbrainz_album_artist_id=(album_artist_ids[0] if album_artist_ids else None),
         acoustid_id=scalar("acoustid_id"),
         compilation=compilation if isinstance(compilation, bool) else False,
+        release_type=release_type,
         title_sort=scalar("title_sort"),
         artist_sort=(metadata.strings_for("artist_sort") or (None,))[0],
         album_sort=scalar("album_sort"),

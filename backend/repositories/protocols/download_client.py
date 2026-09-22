@@ -57,6 +57,10 @@ class EnqueueRequest(AppStruct):
     category: str | None = None
     priority: int | None = None
     post_processing: int | None = None
+    # Plugin correlation token: the opaque ``PluginSearchResult.payload`` handed back
+    # verbatim so a plugin download client can match the enqueue to its own records.
+    # soulseek/usenet leave it empty; additive so old blobs still decode.
+    payload: str = ""
 
 
 class TaskHandle(AppStruct):
@@ -72,6 +76,9 @@ class TaskHandle(AppStruct):
     filenames: list[str] = []
     job_name: str = ""
     nzo_id: str = ""
+    # Plugin correlation id, written by plugin download clients at enqueue (mirrors
+    # ``EnqueueRequest.payload``). soulseek/usenet leave it empty; additive defaulted.
+    plugin_token: str = ""
 
 
 class DownloadTaskStatus(AppStruct):

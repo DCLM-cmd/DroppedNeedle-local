@@ -5,16 +5,26 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
+
+import msgspec
 
 from core.exceptions import (
+    ConfigurationError,
     ConflictError,
     LibraryManagementDestinationConflictError,
+    ResourceNotFoundError,
     StaleRevisionError,
     ValidationError,
 )
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.library_filesystem_coordinator import (
     LibraryFilesystemCoordinator,
+)
+from models.library_management import LibraryManagementJobSnapshot
+from models.library_management_planning import (
+    LibraryManagementSelection,
+    NormalizedLibraryManagementSelection,
 )
 from services.native.library_management_planner import LibraryManagementPlanner
 from services.native.library_operation_service import LEASE_SECONDS
@@ -28,7 +38,86 @@ from services.native.library_management_duplicate_service import (
 )
 from services.native.library_image_hash_service import LibraryImageHashService
 
+if TYPE_CHECKING:
+    from services.native.automatic_scan_management_service import (
+        AutomaticScanManagementService,
+    )
+
 logger = logging.getLogger(__name__)
+
+# Slice C (stale-storm fix): cap on stale requeues per scan_discovered lineage.
+# Replacements spawn only after settle, so a handful of generations covers a
+# flapping catalog; beyond that the lineage terminal-fails honestly.
+MAX_SCAN_PREVIEW_STALE_REQUEUES = 3
+
+# Terminal code for a scan_discovered lineage that kept going stale past the
+# cap. Distinct from STALE_INPUT so history shows the attempts ran out.
+STALE_INPUT_RETRIES_EXHAUSTED = "STALE_INPUT_RETRIES_EXHAUSTED"
+
+# Generation suffix chained onto the stale job's idempotency key. The cap
+# counter rides the job row's existing idempotency_key column, so replacement
+# creation stays idempotent per generation with no schema change.
+_STALE_RETRY_KEY_SUFFIX = ":stale-retry:"
+
+
+def _stale_retry_attempt(idempotency_key: str) -> int:
+    """Generation of a stale-retry lineage encoded on the job row's key."""
+    _, separator, tail = idempotency_key.rpartition(_STALE_RETRY_KEY_SUFFIX)
+    if not separator or not tail.isdigit():
+        return 0
+    return int(tail)
+
+
+def _stale_scan_preview_rebuild(
+    snapshot: LibraryManagementJobSnapshot,
+    *,
+    idempotency_key: str,
+    attempt: int,
+    actor_user_id: str | None,
+) -> dict | None:
+    """Rebuild kwargs for a faithful scan_discovered replacement, or None.
+
+    Faithful means origin=scan_discovered with the same selection. Anything
+    that cannot carry over exactly (tag-edit intent, a non-album scope, an
+    undecodable selection or pinned profile) returns None so the caller
+    terminal-fails as before instead of requeueing a mangled preview.
+    """
+    if (snapshot.intent_json or "").strip() not in ("{}", "", "null"):
+        return None
+    if not snapshot.selection_json or not snapshot.profile_snapshot_json:
+        return None
+    try:
+        normalized = msgspec.json.decode(
+            snapshot.selection_json.encode("utf-8"),
+            type=NormalizedLibraryManagementSelection,
+        )
+    except (msgspec.DecodeError, msgspec.ValidationError):
+        return None
+    if normalized.kind != "albums" or not normalized.ids or normalized.root_scopes:
+        return None
+    try:
+        profile_doc = json.loads(snapshot.profile_snapshot_json)
+        profile_id = profile_doc.get("profile", {}).get("id")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(profile_id, str) or not profile_id:
+        return None
+    base, separator, tail = idempotency_key.rpartition(_STALE_RETRY_KEY_SUFFIX)
+    base_key = base if separator and tail.isdigit() else idempotency_key
+    return {
+        "selection": LibraryManagementSelection(
+            kind="albums",
+            ids=tuple(normalized.ids),
+            catalog_filter=normalized.catalog_filter,
+        ),
+        "profile_id": profile_id,
+        "expected_settings_revision": snapshot.settings_revision,
+        "expected_policy_revision": snapshot.policy_revision,
+        "actor_user_id": actor_user_id,
+        "idempotency_key": f"{base_key}{_STALE_RETRY_KEY_SUFFIX}{attempt + 1}",
+        "origin": "scan_discovered",
+        "target_root_id": snapshot.target_root_id,
+    }
 
 
 class LibraryManagementWorker:
@@ -42,6 +131,8 @@ class LibraryManagementWorker:
         duplicates: LibraryManagementDuplicateService,
         filesystem: "LibraryFilesystemCoordinator | None" = None,
         image_hashes: "LibraryImageHashService | None" = None,
+        *,
+        scan_settle_gate: AutomaticScanManagementService | None = None,
     ) -> None:
         self._store = store
         self._planner = planner
@@ -54,6 +145,7 @@ class LibraryManagementWorker:
         # Artwork blurhashes are computed here, once, the way Jellyfin computes them
         # during a scan - never while a client is waiting for a listing.
         self._image_hashes = image_hashes
+        self._scan_settle_gate = scan_settle_gate
 
     async def run_claimed(self, job: dict, worker_id: str) -> dict:
         job_id = str(job["id"])
@@ -174,13 +266,7 @@ class LibraryManagementWorker:
             else:
                 planned = await self._planner.run_claimed_preview(job, worker_id)
         except StaleRevisionError:
-            return await self._store.finish_operation_job(
-                job_id,
-                worker_id,
-                state="failed",
-                terminal_code="STALE_INPUT",
-                now=time.time(),
-            )
+            return await self._finish_stale_preview(job_id, worker_id, snapshot)
         except (ValidationError, ConflictError):
             return await self._store.finish_operation_job(
                 job_id,
@@ -256,6 +342,134 @@ class LibraryManagementWorker:
                 job_id,
                 exc_info=True,
             )
+
+    async def _finish_stale_preview(
+        self,
+        job_id: str,
+        worker_id: str,
+        snapshot: LibraryManagementJobSnapshot,
+    ) -> dict:
+        """Stale-input terminal path for preview planning.
+
+        A scan_discovered preview whose inputs moved is rebuilt with a fresh
+        snapshot after the catalog settles instead of terminal-failing, up to
+        MAX_SCAN_PREVIEW_STALE_REQUEUES generations. Manual previews never
+        auto-reissue: explicit user intent terminal-fails exactly as before.
+        """
+        if snapshot.origin == "scan_discovered":
+            requeued = await self._maybe_requeue_stale_scan_preview(
+                job_id, worker_id, snapshot
+            )
+            if requeued is not None:
+                return requeued
+        return await self._store.finish_operation_job(
+            job_id,
+            worker_id,
+            state="failed",
+            terminal_code="STALE_INPUT",
+            now=time.time(),
+        )
+
+    async def _maybe_requeue_stale_scan_preview(
+        self,
+        job_id: str,
+        worker_id: str,
+        snapshot: LibraryManagementJobSnapshot,
+    ) -> dict | None:
+        """Queue a fresh replacement for a stale scan preview, or None.
+
+        Returns the stale attempt's honest STALE_INPUT record after queueing
+        its replacement, the EXHAUSTED record past the cap, or None when no
+        requeue issues (caller terminal-fails as before). The existing
+        reissue_preview_token mechanism does not fit: it re-derives the sealed
+        token for a ready, non-stale preview and raises on stale input, while
+        a stale preview needs fresh pinned revisions via create_preview.
+        """
+        operation = await self._store.get_operation_job(job_id)
+        if operation is None:
+            return None
+        idempotency_key = operation.get("idempotency_key")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            return None
+        attempt = _stale_retry_attempt(idempotency_key)
+        if attempt >= MAX_SCAN_PREVIEW_STALE_REQUEUES:
+            logger.warning(
+                "Library management stale scan preview exhausted job_id=%s attempts=%s",
+                job_id,
+                attempt,
+            )
+            return await self._store.finish_operation_job(
+                job_id,
+                worker_id,
+                state="failed",
+                terminal_code=STALE_INPUT_RETRIES_EXHAUSTED,
+                now=time.time(),
+            )
+        rebuild = _stale_scan_preview_rebuild(
+            snapshot,
+            idempotency_key=idempotency_key,
+            attempt=attempt,
+            actor_user_id=operation.get("requested_by_user_id"),
+        )
+        if rebuild is None:
+            return None
+        if not await self._settle_gate_open():
+            logger.info(
+                "Library management stale scan preview waiting for settle "
+                "job_id=%s attempt=%s",
+                job_id,
+                attempt,
+            )
+            return None
+        try:
+            handle = await self._planner.create_preview(**rebuild)
+        except (
+            StaleRevisionError,
+            ValidationError,
+            ConfigurationError,
+            ResourceNotFoundError,
+        ) as error:
+            # The profile is gone, or settings/policy/catalog raced the
+            # rebuild: terminal, no requeue. The spawn flow recreates once
+            # inputs are identifiable again.
+            logger.info(
+                "Library management stale scan preview rebuild refused "
+                "job_id=%s attempt=%s reason=%s",
+                job_id,
+                attempt,
+                type(error).__name__,
+            )
+            return None
+        logger.info(
+            "Library management stale scan preview requeued "
+            "job_id=%s attempt=%s replacement_job_id=%s",
+            job_id,
+            attempt + 1,
+            handle.job_id,
+        )
+        return await self._store.finish_operation_job(
+            job_id,
+            worker_id,
+            state="failed",
+            terminal_code="STALE_INPUT",
+            now=time.time(),
+        )
+
+    async def _settle_gate_open(self) -> bool:
+        """Debounce stale requeues on the spawn gate's settle notion.
+
+        Reuses AutomaticScanManagementService.scan_preview_settled exactly;
+        the worker defines no second notion of settle. Unwired workers share
+        the process singleton (warm memo); tests inject a fake gate.
+        """
+        gate = self._scan_settle_gate
+        if gate is None:
+            from core.dependencies.service_providers import (
+                get_automatic_scan_management_service,
+            )
+
+            gate = get_automatic_scan_management_service()
+        return await gate.scan_preview_settled()
 
     async def _run_apply(self, job_id: str, worker_id: str) -> dict:
         snapshot = await self._store.get_library_management_job_snapshot(job_id)
@@ -386,7 +600,7 @@ class LibraryManagementWorker:
                     failure_code="PUBLICATION_FAILED",
                     completed_at=time.time(),
                 )
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - F-107 poison bundle must terminate durably, not requeue
                 # F-107: an unclassified failure must still terminate the work
                 # row durably; otherwise a deterministic poison bundle requeues
                 # forever with no administrator-visible outcome.

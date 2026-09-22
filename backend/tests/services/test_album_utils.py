@@ -171,3 +171,72 @@ def test_is_clean_release_names_only_the_censored_cut():
     assert is_clean_release({"disambiguation": "clean"}) is True
     assert is_clean_release({"disambiguation": "explicit"}) is False
     assert is_clean_release({"disambiguation": ""}) is False
+from types import SimpleNamespace
+
+from services.album_utils import audio_tracks, is_audio_medium
+
+
+def test_extract_tracks_stamps_medium_format_per_medium():
+    release_data = {
+        "media": [
+            {
+                "position": "1",
+                "format": "CD",
+                "tracks": [
+                    {
+                        "position": "1",
+                        "title": "Audio Song",
+                        "recording": {"id": "rec-1", "title": "Audio Song"},
+                    }
+                ],
+            },
+            {
+                "position": "2",
+                "format": "DVD",
+                "tracks": [
+                    {
+                        "position": "1",
+                        "title": "Video Clip",
+                        "recording": {"id": "rec-2", "title": "Video Clip"},
+                    }
+                ],
+            },
+            {
+                "position": "3",
+                "tracks": [
+                    {
+                        "position": "1",
+                        "title": "Unknown Carrier",
+                        "recording": {"id": "rec-3", "title": "Unknown Carrier"},
+                    }
+                ],
+            },
+        ]
+    }
+
+    tracks, _total = extract_tracks(release_data)
+
+    assert [track.media_format for track in tracks] == ["CD", "DVD", None]
+
+
+def test_is_audio_medium_video_carriers_excluded_audio_kept():
+    for fmt in ("CD", "DVD-Audio", "SACD", "Vinyl", "Digital Media", "Cassette"):
+        assert is_audio_medium(fmt) is True
+    for fmt in ("DVD", "DVD-Video", "Blu-ray", "HD-DVD", "VHS", "Video CD", "Laserdisc"):
+        assert is_audio_medium(fmt) is False
+    assert is_audio_medium("  dvd  ") is False  # case/whitespace tolerant
+    # Fail-open: missing or unrecognized formats never strand an acquisition.
+    assert is_audio_medium(None) is True
+    assert is_audio_medium("") is True
+    assert is_audio_medium("Future-Carrier-3000") is True
+
+
+def test_audio_tracks_filters_video_duck_typed_and_fail_open():
+    tracks = [
+        SimpleNamespace(title="a", media_format="CD"),
+        SimpleNamespace(title="b", media_format="DVD"),
+        SimpleNamespace(title="c"),  # legacy shape without the field: kept
+        SimpleNamespace(title="d", media_format=None),  # local rows: kept
+    ]
+
+    assert [t.title for t in audio_tracks(tracks)] == ["a", "c", "d"]

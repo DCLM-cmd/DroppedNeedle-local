@@ -304,3 +304,109 @@ async def test_cancellation_reaps_before_release_with_offload(tmp_path: Path, mo
     monkeypatch.setattr("services.native.replaygain_analysis_service._snapshot_file_states", slow_snapshot)
     # Reuse existing cancellation test logic but ensure it still passes
     await test_cancellation_reaps_analyzer_before_releasing_concurrency_slot(tmp_path, monkeypatch)
+
+
+def _track_output(path: Path) -> str:
+    header = (
+        "File\tLoudness\tRange\tTrue_Peak\tTrue_Peak_dBTP\tReference\t"
+        "Will_clip\tClip_prevent\tGain\tNew_Peak\tNew_Peak_dBTP"
+    )
+    return "\n".join(
+        (
+            header,
+            f"{path}\t-21.75 LUFS\t0.00 dB\t0.125093\t-18.06 dBTP\t"
+            "-18.00 LUFS\tN\tN\t3.75 dB\t0.192705\t-14.30 dBTP",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_bad_track_is_skipped_while_album_stays_available(
+    tmp_path: Path,
+) -> None:
+    """Pre-fix behavior: the album-wide failure deferred every track in the album."""
+    good = tmp_path / "good.flac"
+    bad = tmp_path / "bad.flac"
+    good.write_bytes(b"good audio")
+    bad.write_bytes(b"bad audio")
+
+    def isolating_runner(command, _timeout):  # noqa: ANN001
+        if "--version" in command:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="loudgain 0.6.8\n", stderr=""
+            )
+        requested = [part for part in command if part.endswith(".flac")]
+        if any(Path(part).name == "bad.flac" for part in requested):
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="cannot decode"
+            )
+        assert len(requested) == 1
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_track_output(Path(requested[0])), stderr=""
+        )
+
+    service = ReplayGainAnalysisService(
+        executable="/usr/bin/loudgain", runner=isolating_runner
+    )
+
+    result = await service.analyze((good, bad), album_aware=True)
+
+    assert result.status == "available"
+    assert [track.source_path for track in result.tracks] == [str(good)]
+    assert result.tracks[0].track_gain_db == 3.75
+    assert result.tracks[0].track_peak == 0.125093
+    assert result.reason == "ReplayGain analysis skipped 1 of 2 tracks."
+
+
+@pytest.mark.asyncio
+async def test_total_failure_still_defers_album(tmp_path: Path) -> None:
+    """Pre-fix behavior: identical; nothing analyzable still defers the album."""
+    first = tmp_path / "first.flac"
+    second = tmp_path / "second.flac"
+    first.write_bytes(b"first audio")
+    second.write_bytes(b"second audio")
+
+    service = ReplayGainAnalysisService(
+        executable="/usr/bin/loudgain", runner=_runner("", returncode=1)
+    )
+
+    result = await service.analyze((first, second), album_aware=True)
+
+    assert result.status == "deferred"
+    assert result.reason == "ReplayGain analysis failed."
+
+
+@pytest.mark.asyncio
+async def test_transient_subprocess_failure_recovers_via_single_retry(
+    tmp_path: Path,
+) -> None:
+    """Pre-fix behavior: the first failure deferred the album with no retry."""
+    first = tmp_path / "first.flac"
+    second = tmp_path / "second.flac"
+    first.write_bytes(b"first audio")
+    second.write_bytes(b"second audio")
+    attempts = 0
+
+    def flaky_runner(command, _timeout):  # noqa: ANN001
+        nonlocal attempts
+        if "--version" in command:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="loudgain 0.6.8\n", stderr=""
+            )
+        attempts += 1
+        if attempts == 1:
+            raise subprocess.SubprocessError("transient loudgain failure")
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_output(first, second), stderr=""
+        )
+
+    service = ReplayGainAnalysisService(
+        executable="/usr/bin/loudgain", runner=flaky_runner
+    )
+
+    result = await service.analyze((first, second), album_aware=True)
+
+    assert result.status == "available"
+    assert attempts == 2
+    assert len(result.tracks) == 2
+    assert result.reason is None

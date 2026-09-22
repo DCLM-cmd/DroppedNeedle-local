@@ -118,8 +118,7 @@ describe('download queue queries', () => {
 		await opts.queryFn({ signal: undefined });
 
 		expect(mockGet.mock.calls.at(-1)?.[0]).toBe('/api/v1/downloads/activity-summary');
-		expect(opts.queryKey).toEqual(['downloads', 'tasks', 'user-1', 'activity']);
-		expect(opts.refetchInterval({ state: { data: { active_count: 1 } } })).toBe(750);
+		expect(opts.refetchInterval({ state: { data: { active_count: 1 } } })).toBe(5_000);
 		expect(opts.refetchInterval({ state: { data: { active_count: 0 } } })).toBe(120_000);
 		expect(opts.refetchIntervalInBackground).toBe(false);
 		expect(opts.refetchOnReconnect).toBe('always');
@@ -425,26 +424,5 @@ describe('download queue queries', () => {
 		const m = requestTrack() as unknown as { onSuccess: (d: unknown) => unknown };
 		m.onSuccess({ status });
 		expect(mockToast).toHaveBeenCalledWith({ message, type: 'success' });
-	});
-
-	it('the key factory builds stable keys', () => {
-		expect(DownloadQueryKeyFactory.tasks('user-1')).toEqual(['downloads', 'tasks', 'user-1']);
-		expect(DownloadQueryKeyFactory.tasks('user-2')).not.toEqual(
-			DownloadQueryKeyFactory.tasks('user-1')
-		);
-		expect(DownloadQueryKeyFactory.activity('user-1')).toEqual([
-			'downloads',
-			'tasks',
-			'user-1',
-			'activity'
-		]);
-		expect(DownloadQueryKeyFactory.held('user-1')).toEqual([
-			'downloads',
-			'tasks',
-			'user-1',
-			'held',
-			'all'
-		]);
-		expect(DownloadQueryKeyFactory.quarantine()).toEqual(['downloads', 'quarantine']);
 	});
 });

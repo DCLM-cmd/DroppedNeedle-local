@@ -14,26 +14,31 @@ Future matching releases remain durable dispatch-pending until their date.
 import asyncio
 import logging
 import re
+import json
+import time
+import uuid
 from collections.abc import Callable
 from datetime import date, datetime, timezone
 
-import httpx
 import msgspec
 
-from core.exceptions import ConfigurationError, ExternalServiceError
+from core.exceptions import ConfigurationError
 from infrastructure.persistence.follow_store import (
     DistinctFollowedArtist,
     FollowStore,
+    InventoryInvalidated,
     NewReleaseInput,
 )
 from infrastructure.queue.priority_queue import RequestPriority
-from infrastructure.resilience.retry import CircuitOpenError
 from models.release_type_policy import should_include_release
 from services.native.download_service import ALREADY_IN_LIBRARY
+from repositories.musicbrainz_base import MbCachePolicy, capture_mb_source_context, mb_publish_if_current
+from infrastructure.observability.provider_counters import ProviderWorkload, provider_workload
 
 logger = logging.getLogger(__name__)
 
-_MB_PAGE_LIMIT = 50
+_MB_PAGE_LIMIT = 100
+_PROCESS = uuid.uuid4().hex
 _MB_FETCH_TIMEOUT = 30.0
 _COMPLETE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -106,55 +111,42 @@ class NewReleaseService:
         self._preferences = preferences_service
         self._policy_transition_lock = policy_transition_lock
         self._today_factory = today_factory
+        self._poll_lock = asyncio.Lock()
 
     async def run_poll(self) -> PollSummary:
-        artists = await self._store.list_distinct_followed_artists()
-        if not artists:
-            return PollSummary()
-        owned = await self._owned_release_groups()
+        async with self._poll_lock:
+            with provider_workload(ProviderWorkload.FOLLOW):
+                return await self._run_due_poll()
+
+    async def _run_due_poll(self) -> PollSummary:
+        attempted = 0
+        visited: set[str] = set()
         baselined = new_releases = enqueued = errors = 0
-        for index, artist in enumerate(artists):
-            try:
-                result = await self._process_artist(artist, owned)
-                baselined += 1 if result.baselined else 0
-                new_releases += result.new_releases
-                enqueued += result.enqueued
-            except (
-                CircuitOpenError,
-                ExternalServiceError,
-                httpx.HTTPError,
-                asyncio.TimeoutError,
-            ) as exc:
-                # A failed provider fetch must not advance the successful cursor.
-                async with self._policy_transition_lock:
-                    await self._store.update_cursor(
-                        artist.artist_mbid_lower, "error", str(exc)
-                    )
-                logger.warning(
-                    "Follow poll: MusicBrainz unavailable for %s: %s",
-                    artist.artist_mbid_lower,
-                    exc,
-                )
-                errors += 1
-            except Exception as exc:  # noqa: BLE001 - one artist must never kill the run
-                logger.error(
-                    "Follow poll: unexpected error for %s: %s",
-                    artist.artist_mbid_lower,
-                    exc,
-                    exc_info=True,
-                )
-                errors += 1
-            if index < len(artists) - 1 and self._inter_artist_delay > 0:
-                await asyncio.sleep(self._inter_artist_delay)
-        summary = PollSummary(
-            artists_polled=len(artists),
-            baselined=baselined,
-            new_releases=new_releases,
-            enqueued=enqueued,
-            errors=errors,
+        while attempted < 10:
+            artists = await self._store.list_due_artists(time.time(), 10)
+            if not artists:
+                break
+            for artist in artists:
+                attempted += 1
+                visited.add(artist.artist_mbid_lower)
+                try:
+                    result = await self._process_artist(artist)
+                    baselined += int(result.baselined)
+                    new_releases += result.new_releases
+                    enqueued += result.enqueued
+                except InventoryInvalidated:
+                    pass
+                except Exception as exc:  # noqa: BLE001 - isolate each artist
+                    logger.warning("Follow poll failed for %s: %s", artist.artist_mbid_lower, exc)
+                    errors += 1
+                if attempted >= 10:
+                    break
+                if self._inter_artist_delay > 0:
+                    await asyncio.sleep(self._inter_artist_delay)
+        return PollSummary(
+            artists_polled=len(visited), baselined=baselined,
+            new_releases=new_releases, enqueued=enqueued, errors=errors,
         )
-        logger.info("Follow poll complete: %s", summary)
-        return summary
 
     async def _owned_release_groups(self) -> set[str]:
         try:
@@ -164,162 +156,207 @@ class NewReleaseService:
             return set()
         return {str(m).casefold() for m in owned}
 
-    async def _process_artist(
-        self, artist: DistinctFollowedArtist, owned: set[str]
-    ) -> _ArtistPollResult:
-        # Provider I/O intentionally stays outside the shared policy lock.
-        release_groups, _total = await asyncio.wait_for(
-            self._mb.get_artist_release_groups_or_raise(
-                artist.artist_mbid, offset=0, limit=_MB_PAGE_LIMIT
-            ),
-            timeout=_MB_FETCH_TIMEOUT,
-        )
-        observed_groups: list[dict] = []
-        observed_lowers: list[str] = []
-        seen: set[str] = set()
-        for release_group in release_groups:
-            if not isinstance(release_group, dict):
-                continue
-            release_group_id = release_group.get("id")
-            if not isinstance(release_group_id, str) or not release_group_id:
-                continue
-            release_group_lower = release_group_id.casefold()
-            if release_group_lower in seen:
-                continue
-            seen.add(release_group_lower)
-            observed_groups.append(release_group)
-            observed_lowers.append(release_group_lower)
-
+    async def _process_artist(self, artist: DistinctFollowedArtist) -> _ArtistPollResult:
+        context = capture_mb_source_context()
+        source = json.dumps([context.source_mode, context.source_id, context.generation])
         async with self._policy_transition_lock:
-            preferences, policy_revision = (
-                self._preferences.get_preferences_with_revision()
-            )
-            state = await self._store.get_release_check_state(artist.artist_mbid_lower)
-            if (
-                state is None
-                or state.release_type_policy_revision is None
-                or state.release_type_policy_revision != policy_revision
-            ):
-                await self._store.seed_baseline(
-                    artist.artist_mbid_lower,
-                    observed_lowers,
-                    policy_revision,
-                )
-                return _ArtistPollResult(baselined=True)
-
-            known = await self._store.known_release_set(artist.artist_mbid_lower)
-            pending = await self._store.pending_release_set(
-                artist.artist_mbid_lower, policy_revision
-            )
-            prior_cursor_date = _utc_cursor_date(state.last_checked_at)
-            today = self._today_factory()
-            candidates = [
-                release_group
-                for release_group in observed_groups
-                if should_include_release(
-                    release_group,
-                    preferences.secondary_types,
-                    preferences.primary_types,
-                )
-            ]
-            candidates_by_id = {
-                release_group["id"].casefold(): release_group
-                for release_group in candidates
-            }
-
-            # A current-revision pending row is already proof that its release
-            # passed the historical discovery cutoff. Keep it pending while the
-            # observed row remains policy-matching and has a complete date;
-            # applying the advancing cursor here would erase failed work.
-            preserved_pending: set[str] = set()
-            for release_group_id in pending & candidates_by_id.keys():
-                release_date = _parse_release_date(
-                    candidates_by_id[release_group_id].get("first-release-date")
-                )
-                if release_date is not None:
-                    preserved_pending.add(release_group_id)
-
-            eligible_fresh: list[dict] = []
-            if prior_cursor_date is not None:
-                for release_group in candidates:
-                    release_group_id = release_group["id"].casefold()
-                    if release_group_id in known or release_group_id in owned:
-                        continue
-                    release_date = _parse_release_date(
-                        release_group.get("first-release-date")
+            _, revision = self._preferences.get_preferences_with_revision()
+            state = None
+            async def prepare():
+                nonlocal state
+                state = await self._store.prepare_inventory(artist.artist_mbid_lower, source, revision, _PROCESS)
+            if not await mb_publish_if_current(context, prepare):
+                return _ArtistPollResult()
+        try:
+            return await self._observe_artist(artist, context, source, revision, state)
+        except Exception as exc:
+            async with self._policy_transition_lock:
+                _, current_revision = self._preferences.get_preferences_with_revision()
+                if current_revision != revision:
+                    raise InventoryInvalidated() from exc
+                recorded = False
+                async def fail():
+                    nonlocal recorded
+                    snapshot = state or {}
+                    # A failed mid-walk observation must not re-walk within the
+                    # hour; fresh observations keep the ladder (a pure 429 rides
+                    # retry_after through max() with no floor).
+                    walk_failure = (
+                        snapshot.get("phase") == "verifying"
+                        or (snapshot.get("offset") or 0) > 0
+                        or (snapshot.get("diverge_count") or 0) > 0
                     )
-                    if release_date is not None and release_date >= prior_cursor_date:
-                        eligible_fresh.append(release_group)
-
-            eligible_auto_followers: list[str] = []
-            if eligible_fresh:
-                eligible_auto_followers = (
-                    await self._store.list_auto_download_followers(
-                        artist.artist_mbid_lower
+                    recorded = await self._store.fail_inventory(
+                        state,
+                        str(exc),
+                        float(getattr(exc, "retry_after_seconds", 0) or 0),
+                        min_delay=3600 if walk_failure else 0,
                     )
-                )
+                if not await mb_publish_if_current(context, fail) or not recorded:
+                    raise InventoryInvalidated() from exc
+            raise
 
-            pending_to_persist = set(preserved_pending)
-            if eligible_auto_followers:
-                pending_to_persist.update(
-                    release_group["id"].casefold() for release_group in eligible_fresh
+    async def _observe_artist(self, artist, context, source, revision, state) -> _ArtistPollResult:
+        release_groups, total, response_context = await asyncio.wait_for(
+            self._mb.get_artist_release_groups_with_context(
+                artist.artist_mbid, offset=state["offset"], limit=_MB_PAGE_LIMIT,
+                priority=RequestPriority.BACKGROUND_SYNC,
+                preserve_fetch_width=True, source_context=context,
+                # Detection freshness: the poller must see live pages, never
+                # L1-cached ones. Cadence stays bounded by tick jitter plus
+                # the 1 h fail-path re-walk floor.
+                cache_policy=MbCachePolicy.BYPASS,
+            ), timeout=_MB_FETCH_TIMEOUT,
+        )
+        if response_context != context:
+            return _ArtistPollResult()
+        if any(not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"] for row in release_groups):
+            raise ValueError("Incomplete release-group page")
+        rows = [{key: row.get(key) for key in ("id", "title", "first-release-date", "primary-type", "secondary-types")} for row in release_groups]
+        async with self._policy_transition_lock:
+            preferences, current_revision = self._preferences.get_preferences_with_revision()
+            if current_revision != revision:
+                return _ArtistPollResult()
+            observed_groups = None
+            async def stage():
+                nonlocal observed_groups
+                observed_groups = await self._store.stage_inventory_page(state, rows, total)
+            if not await mb_publish_if_current(context, stage) or observed_groups is None:
+                return _ArtistPollResult()
+            owned = await self._owned_release_groups()
+            detection_result = _ArtistPollResult()
+            dispatch_candidates = []
+            async def detect():
+                nonlocal detection_result, dispatch_candidates
+                detection_result, dispatch_candidates = await self._detect_inventory(
+                    artist, owned, observed_groups, preferences, revision, source,
                 )
-            feed_rows = [
-                self._to_input(release_group, artist)
-                for release_group in eligible_fresh
-            ]
-            dispatch_candidates: list[dict] = []
-            dispatch_ids: set[str] = set()
-            for release_group in eligible_fresh:
-                release_group_id = release_group["id"].casefold()
-                release_date = _parse_release_date(
-                    release_group.get("first-release-date")
-                )
-                if (
-                    eligible_auto_followers
-                    and release_date is not None
-                    and release_date <= today
-                ):
-                    dispatch_candidates.append(release_group)
-                    dispatch_ids.add(release_group_id)
-            for release_group_id in preserved_pending:
-                release_group = candidates_by_id[release_group_id]
-                release_date = _parse_release_date(
-                    release_group.get("first-release-date")
-                )
-                if release_date is not None and release_date <= today:
-                    if release_group_id not in dispatch_ids:
-                        dispatch_candidates.append(release_group)
-                        dispatch_ids.add(release_group_id)
-
-            # This transaction is the durable discovery hand-off: each fresh
-            # candidate is known/visible in the feed, while only fresh rows with
-            # an eligible follower or preserved pending work are marked pending
-            # before acquisition starts.
-            await self._store.record_new_releases(
-                artist.artist_mbid_lower,
-                feed_rows,
-                [],
-                observed_rg_lowers=observed_lowers,
-                pending_rg_lowers=sorted(pending_to_persist),
-                policy_revision=policy_revision,
-            )
-
+            if not await mb_publish_if_current(context, detect):
+                return _ArtistPollResult()
             enqueued = 0
             for release_group in dispatch_candidates:
-                result = await self._enqueue_for_followers(
-                    release_group, artist, owned, today
-                )
+                result = await self._enqueue_for_followers(release_group, artist, owned, self._today_factory())
                 if result.terminal:
-                    await self._store.clear_pending_release(
-                        artist.artist_mbid_lower, release_group["id"]
-                    )
-                if result.enqueued:
-                    enqueued += 1
-            return _ArtistPollResult(
-                new_releases=len(feed_rows),
-                enqueued=enqueued,
+                    await self._store.clear_pending_release(artist.artist_mbid_lower, release_group["id"])
+                enqueued += int(result.enqueued)
+            return _ArtistPollResult(baselined=detection_result.baselined, new_releases=detection_result.new_releases, enqueued=enqueued)
+
+    async def _detect_inventory(self, artist, owned, observed_groups, preferences, policy_revision, source):
+        observed_lowers = [row["id"].casefold() for row in observed_groups]
+        state = await self._store.get_release_check_state(artist.artist_mbid_lower)
+        if (
+            state is None
+            or state.release_type_policy_revision is None
+            or state.release_type_policy_revision != policy_revision
+        ):
+            await self._store.seed_baseline(
+                artist.artist_mbid_lower,
+                observed_lowers,
+                policy_revision,
+                inventory_source=source,
             )
+            return _ArtistPollResult(baselined=True), []
+
+        known = await self._store.known_release_set(artist.artist_mbid_lower)
+        pending = await self._store.pending_release_set(
+            artist.artist_mbid_lower, policy_revision
+        )
+        prior_cursor_date = _utc_cursor_date(state.last_checked_at)
+        today = self._today_factory()
+        candidates = [
+            release_group
+            for release_group in observed_groups
+            if should_include_release(
+                release_group,
+                preferences.secondary_types,
+                preferences.primary_types,
+            )
+        ]
+        candidates_by_id = {
+            release_group["id"].casefold(): release_group
+            for release_group in candidates
+        }
+
+        # A current-revision pending row is already proof that its release
+        # passed the historical discovery cutoff. Keep it pending while the
+        # observed row remains policy-matching and has a complete date;
+        # applying the advancing cursor here would erase failed work.
+        preserved_pending: set[str] = set()
+        for release_group_id in pending & candidates_by_id.keys():
+            release_date = _parse_release_date(
+                candidates_by_id[release_group_id].get("first-release-date")
+            )
+            if release_date is not None:
+                preserved_pending.add(release_group_id)
+
+        eligible_fresh: list[dict] = []
+        if prior_cursor_date is not None:
+            for release_group in candidates:
+                release_group_id = release_group["id"].casefold()
+                if release_group_id in known or release_group_id in owned:
+                    continue
+                release_date = _parse_release_date(
+                    release_group.get("first-release-date")
+                )
+                if release_date is not None and release_date >= prior_cursor_date:
+                    eligible_fresh.append(release_group)
+
+        eligible_auto_followers: list[str] = []
+        if eligible_fresh:
+            eligible_auto_followers = (
+                await self._store.list_auto_download_followers(
+                    artist.artist_mbid_lower
+                )
+            )
+
+        pending_to_persist = set(preserved_pending)
+        if eligible_auto_followers:
+            pending_to_persist.update(
+                release_group["id"].casefold() for release_group in eligible_fresh
+            )
+        feed_rows = [
+            self._to_input(release_group, artist)
+            for release_group in eligible_fresh
+        ]
+        dispatch_candidates: list[dict] = []
+        dispatch_ids: set[str] = set()
+        for release_group in eligible_fresh:
+            release_group_id = release_group["id"].casefold()
+            release_date = _parse_release_date(
+                release_group.get("first-release-date")
+            )
+            if (
+                eligible_auto_followers
+                and release_date is not None
+                and release_date <= today
+            ):
+                dispatch_candidates.append(release_group)
+                dispatch_ids.add(release_group_id)
+        for release_group_id in preserved_pending:
+            release_group = candidates_by_id[release_group_id]
+            release_date = _parse_release_date(
+                release_group.get("first-release-date")
+            )
+            if release_date is not None and release_date <= today:
+                if release_group_id not in dispatch_ids:
+                    dispatch_candidates.append(release_group)
+                    dispatch_ids.add(release_group_id)
+
+        # This transaction is the durable discovery hand-off: each fresh
+        # candidate is known/visible in the feed, while only fresh rows with
+        # an eligible follower or preserved pending work are marked pending
+        # before acquisition starts.
+        await self._store.record_new_releases(
+            artist.artist_mbid_lower,
+            feed_rows,
+            [],
+            observed_rg_lowers=observed_lowers,
+            pending_rg_lowers=sorted(pending_to_persist),
+            policy_revision=policy_revision,
+            inventory_source=source,
+        )
+
+        return _ArtistPollResult(new_releases=len(feed_rows)), dispatch_candidates
 
     @staticmethod
     def _to_input(rg: dict, artist: DistinctFollowedArtist) -> NewReleaseInput:

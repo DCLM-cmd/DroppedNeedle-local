@@ -1,7 +1,6 @@
 """Tests for discovery precache double-execution prevention and throttling."""
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,7 +22,7 @@ def _reset_precache_flag():
 
 def _make_service(
     *, lb_configured: bool = True, lastfm_enabled: bool = False,
-    client_factory=None, auth_store=None, workload_gate=None,
+    client_factory=None, workload_gate=None,
 ):
     lb_repo = MagicMock()
     lb_repo.is_configured.return_value = lb_configured
@@ -51,7 +50,6 @@ def _make_service(
         lastfm_repo=lastfm_repo,
         preferences_service=prefs,
         client_factory=client_factory,
-        auth_store=auth_store,
         workload_gate=workload_gate,
     )
     return svc
@@ -74,12 +72,12 @@ async def test_duplicate_invocation_skipped():
         patch.object(svc, "get_top_albums", new_callable=AsyncMock, return_value=MagicMock()),
     ):
         task1 = asyncio.create_task(
-            svc.precache_artist_discovery(["mbid-a"], delay=0)
+            svc.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0)
         )
         await asyncio.sleep(0.01)
 
         assert _ads_module._discovery_precache_running is True
-        result2 = await svc.precache_artist_discovery(["mbid-b"], delay=0)
+        result2 = await svc.precache_artist_discovery(["mbid-b"], user_id="initiator-1", delay=0)
         assert result2 == 0
 
         gate.set()
@@ -100,7 +98,7 @@ async def test_lock_released_after_exception():
         side_effect=RuntimeError("boom"),
     ):
         with pytest.raises(RuntimeError, match="boom"):
-            await svc.precache_artist_discovery(["mbid-a"], delay=0)
+            await svc.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0)
 
     assert _ads_module._discovery_precache_running is False
 
@@ -109,7 +107,7 @@ async def test_lock_released_after_exception():
         patch.object(svc, "get_top_songs", new_callable=AsyncMock, return_value=MagicMock()),
         patch.object(svc, "get_top_albums", new_callable=AsyncMock, return_value=MagicMock()),
     ):
-        result = await svc.precache_artist_discovery(["mbid-a"], delay=0)
+        result = await svc.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0)
         assert result >= 0
 
 
@@ -120,7 +118,7 @@ async def test_precache_rechecks_background_gate_for_each_source() -> None:
     svc = _make_service(lastfm_enabled=True, workload_gate=gate)
     svc._cache.get = AsyncMock(return_value=object())
 
-    await svc.precache_artist_discovery(["mbid-a"], delay=0)
+    await svc.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0)
 
     assert gate.wait_until_available.await_count == 2
 
@@ -137,8 +135,20 @@ async def test_listenbrainz_fallback_and_expected_misses_reuse_lastfm_cache() ->
         assert ttl_seconds > 0
         cache_values[key] = value
 
+    async def cache_get_with_metadata(key: str):
+        return cache_values.get(key), None
+
+    async def cache_set_if_token(token, key: str, value: object, ttl_seconds, metadata=None):
+        del token, metadata
+        assert ttl_seconds > 0
+        cache_values[key] = value
+        return True
+
     svc._cache.get = AsyncMock(side_effect=cache_get)
     svc._cache.set = AsyncMock(side_effect=cache_set)
+    svc._cache.get_with_metadata = AsyncMock(side_effect=cache_get_with_metadata)
+    svc._cache.set_if_token = AsyncMock(side_effect=cache_set_if_token)
+    svc._cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
     svc._lb_repo.get_similar_artists = AsyncMock(return_value=[])
     svc._lb_repo.get_artist_top_recordings = AsyncMock(return_value=[])
     svc._lb_repo.get_artist_top_release_groups = AsyncMock(return_value=[])
@@ -147,17 +157,20 @@ async def test_listenbrainz_fallback_and_expected_misses_reuse_lastfm_cache() ->
     svc._lastfm_repo.get_artist_top_albums = AsyncMock(return_value=[])
     svc._library_repo.get_library_mbids = AsyncMock(return_value=set())
     svc._library_repo.get_requested_mbids = AsyncMock(return_value=set())
-    svc._mb_repo.get_release_groups_by_artist = AsyncMock(return_value=[])
+    svc._library_repo.existing_artist_mbids = AsyncMock(return_value=set())
+    svc._mb_repo.get_artist_release_groups_with_context = AsyncMock(
+        return_value=([], 0, None)
+    )
 
-    await svc.precache_artist_discovery(["mbid-a"], delay=0)
+    await svc.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0)
 
     svc._lastfm_repo.get_similar_artists.assert_awaited_once()
     svc._lastfm_repo.get_artist_top_tracks.assert_awaited_once()
     svc._lastfm_repo.get_artist_top_albums.assert_awaited_once()
     assert {key for key in cache_values if key.endswith(":lastfm")} == {
-        svc._build_cache_key("similar", "mbid-a", 15, "lastfm"),
-        svc._build_cache_key("top_songs", "mbid-a", 10, "lastfm"),
-        svc._build_cache_key("top_albums", "mbid-a", 10, "lastfm"),
+        svc._build_cache_key("similar", "mbid-a", 15, "lastfm", user_id="initiator-1"),
+        svc._build_cache_key("top_songs", "mbid-a", 10, "lastfm", user_id="initiator-1"),
+        svc._build_cache_key("top_albums", "mbid-a", 10, "lastfm", user_id="initiator-1"),
     }
 
 
@@ -178,10 +191,7 @@ async def test_delay_does_not_hold_semaphore_slot():
         patch.object(svc, "get_top_songs", new_callable=AsyncMock, return_value=MagicMock()),
         patch.object(svc, "get_top_albums", new_callable=AsyncMock, return_value=MagicMock()),
     ):
-        await svc.precache_artist_discovery(
-            ["mbid-a", "mbid-b", "mbid-c", "mbid-d"],
-            delay=0.15,
-        )
+        await svc.precache_artist_discovery(["mbid-a", "mbid-b", "mbid-c", "mbid-d"], user_id="initiator-1", delay=0.15,)
 
     assert len(timestamps) == 4
     # With concurrency=2 and delay=0.15s OUTSIDE semaphore, the 3rd artist
@@ -212,10 +222,7 @@ async def test_cached_artists_skip_api_calls():
         patch.object(svc, "get_top_songs", new_callable=AsyncMock, return_value=MagicMock()),
         patch.object(svc, "get_top_albums", new_callable=AsyncMock, return_value=MagicMock()),
     ):
-        result = await svc.precache_artist_discovery(
-            ["mbid-a", "mbid-b"],
-            delay=0,
-        )
+        result = await svc.precache_artist_discovery(["mbid-a", "mbid-b"], user_id="initiator-1", delay=0,)
 
     assert call_count == 0, "Expected no API calls when all cache keys are populated"
     assert result == 2
@@ -239,11 +246,11 @@ async def test_guard_survives_instance_recreation():
         patch.object(svc1, "get_top_albums", new_callable=AsyncMock, return_value=MagicMock()),
     ):
         task1 = asyncio.create_task(
-            svc1.precache_artist_discovery(["mbid-a"], delay=0)
+            svc1.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0)
         )
         await asyncio.sleep(0.01)
 
-        result2 = await svc2.precache_artist_discovery(["mbid-b"], delay=0)
+        result2 = await svc2.precache_artist_discovery(["mbid-b"], user_id="initiator-1", delay=0)
         assert result2 == 0, "Second instance should be blocked by module-level flag"
 
         gate.set()
@@ -271,9 +278,7 @@ async def test_worker_timeout_fires_and_updates_progress():
         patch.object(svc, "get_top_albums", new_callable=AsyncMock, side_effect=hang_forever),
         patch("services.artist_discovery_service._DISCOVERY_WORKER_TIMEOUT", 0.1),
     ):
-        result = await svc.precache_artist_discovery(
-            ["mbid-a"], delay=0, status_service=status,
-        )
+        result = await svc.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0, status_service=status,)
 
     assert result == 0
     assert status.update_progress.await_count >= 1
@@ -282,15 +287,11 @@ async def test_worker_timeout_fires_and_updates_progress():
 
 
 @pytest.mark.asyncio
-async def test_precache_uses_first_admin_as_credential_source():
-    """Precache warms a global cache, so it resolves the first admin and threads
-    that id into the per-user fetches."""
+async def test_precache_uses_initiating_user_as_credential_source():
     factory = MagicMock()
-    factory.resolve_listenbrainz = AsyncMock(return_value=MagicMock())  # admin linked
+    factory.resolve_listenbrainz = AsyncMock(return_value=MagicMock())
     factory.resolve_lastfm = AsyncMock(return_value=None)
-    auth_store = MagicMock()
-    auth_store.get_first_admin = AsyncMock(return_value=SimpleNamespace(id="admin-1"))
-    svc = _make_service(lb_configured=False, client_factory=factory, auth_store=auth_store)
+    svc = _make_service(lb_configured=False, client_factory=factory)
 
     seen = {}
 
@@ -303,29 +304,26 @@ async def test_precache_uses_first_admin_as_credential_source():
         patch.object(svc, "get_top_songs", new_callable=AsyncMock, return_value=MagicMock()),
         patch.object(svc, "get_top_albums", new_callable=AsyncMock, return_value=MagicMock()),
     ):
-        result = await svc.precache_artist_discovery(["mbid-a"], delay=0)
+        result = await svc.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0)
 
     assert result == 1
-    assert seen["user_id"] == "admin-1"
-    factory.resolve_listenbrainz.assert_awaited_with("admin-1")
+    assert seen["user_id"] == "initiator-1"
+    factory.resolve_listenbrainz.assert_awaited_with("initiator-1")
 
 
 @pytest.mark.asyncio
-async def test_precache_skips_when_no_linked_admin():
-    """A factory with no linked admin has no credential source -> skip (return 0)."""
+async def test_precache_skips_when_initiator_has_no_linked_provider():
     factory = MagicMock()
     factory.resolve_listenbrainz = AsyncMock(return_value=None)
     factory.resolve_lastfm = AsyncMock(return_value=None)
-    auth_store = MagicMock()
-    auth_store.get_first_admin = AsyncMock(return_value=None)
-    svc = _make_service(lb_configured=False, client_factory=factory, auth_store=auth_store)
+    svc = _make_service(lb_configured=False, client_factory=factory)
 
     with (
         patch.object(svc, "get_similar_artists", new_callable=AsyncMock) as sim,
         patch.object(svc, "get_top_songs", new_callable=AsyncMock),
         patch.object(svc, "get_top_albums", new_callable=AsyncMock),
     ):
-        result = await svc.precache_artist_discovery(["mbid-a"], delay=0)
+        result = await svc.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0)
 
     assert result == 0
     sim.assert_not_called()

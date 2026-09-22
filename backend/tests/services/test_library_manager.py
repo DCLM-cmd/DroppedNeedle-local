@@ -91,6 +91,23 @@ async def test_album_quality_format_is_highest_present_not_alphabetical(manager,
 
 
 @pytest.mark.asyncio
+async def test_upsert_persists_embedded_release_mbid_from_tags(tmp_path: Path):
+    # The tags-win edition tier reads library_files.embedded_release_mbid;
+    # the scan must persist the tag's MusicBrainz release ID on write.
+    db = LibraryDB(db_path=tmp_path / "library.db", write_lock=threading.Lock())
+    manager = LibraryManager(db)
+    await manager.upsert_file(
+        tmp_path / "a.flac",
+        _tag(musicbrainz_release_id="rel-1"),
+        _info(),
+        release_group_mbid="rg-1",
+        recording_mbid="rec-1",
+    )
+    rows = await db.get_library_files_for_album("rg-1")
+    assert [row["embedded_release_mbid"] for row in rows] == ["rel-1"]
+
+
+@pytest.mark.asyncio
 async def test_upsert_new_path_inserts_fresh_uuid(manager, tmp_path):
     id_a = await _upsert(manager, tmp_path / "a.flac", rec="rec-a")
     id_b = await _upsert(manager, tmp_path / "b.flac", rec="rec-b")

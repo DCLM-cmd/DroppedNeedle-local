@@ -3,6 +3,7 @@
 	import PlexIcon from '$lib/components/PlexIcon.svelte';
 	import { UserRound } from 'lucide-svelte';
 	import { getImportCandidatesQuery } from '$lib/queries/auth/ImportCandidatesQuery.svelte';
+	import { authStore } from '$lib/stores/authStore.svelte';
 	import { createImportUsersMutation } from '$lib/queries/auth/UserImportMutations.svelte';
 	import { getApiUrl } from '$lib/api/api-utils';
 
@@ -18,7 +19,8 @@
 
 	const candidatesQuery = getImportCandidatesQuery(
 		() => activeProvider,
-		() => open
+		() => open,
+		() => authStore.user?.id
 	);
 	const candidates = $derived(candidatesQuery.data?.users ?? []);
 	const importMutation = createImportUsersMutation();

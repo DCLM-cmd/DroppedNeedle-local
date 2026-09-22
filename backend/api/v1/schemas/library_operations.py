@@ -60,6 +60,7 @@ class ReviewListResponse(AppStruct):
     counts_by_state: dict[str, int] = msgspec.field(default_factory=dict)
     counts_by_reason: dict[str, int] = msgspec.field(default_factory=dict)
     counts_by_reason_filtered: dict[str, int] = msgspec.field(default_factory=dict)
+    counts_by_state_filtered: dict[str, int] = msgspec.field(default_factory=dict)
     catalog_revision: int = 0
 
 
@@ -324,7 +325,7 @@ class RepairCreateRequest(AppStruct):
     idempotency_key: str
     root_ids: list[str] = msgspec.field(default_factory=list)
     source_matcher_version: str | None = None
-    target_matcher_version: str = "feedback-fixes-v2"
+    target_matcher_version: str = "quiet-reconfirm-v1"
 
 
 class RepairEstimateResponse(AppStruct):

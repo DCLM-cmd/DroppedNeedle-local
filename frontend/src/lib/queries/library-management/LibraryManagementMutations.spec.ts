@@ -38,6 +38,7 @@ import {
 	importLibraryManagementProfileMutation,
 	previewLibraryManagementProfileImportMutation,
 	reissueLibraryManagementPreviewMutation,
+	resolveLibraryManagementImportBundleMutation,
 	updateLibraryManagementSettingsMutation
 } from './LibraryManagementMutations.svelte';
 
@@ -204,5 +205,43 @@ describe('Library Management mutations', () => {
 		expect(api.global.post).toHaveBeenCalledWith(
 			'/api/v1/library/management/previews/preview%2F1/reissue'
 		);
+	});
+
+	it('resolves a stuck import bundle with a POST and no body', async () => {
+		resolveLibraryManagementImportBundleMutation();
+		const mutation = currentMutation<{ bundleId: string }>();
+
+		await mutation.mutationFn({ bundleId: 'bundle/1' });
+
+		expect(api.global.post).toHaveBeenCalledWith(
+			'/api/v1/library/management/recovery/import-bundles/bundle%2F1/resolve'
+		);
+	});
+
+	it('returns the verified file counts from the resolve response', async () => {
+		resolveLibraryManagementImportBundleMutation();
+		const mutation = currentMutation<
+			{ bundleId: string },
+			{
+				bundle_id: string;
+				state: string;
+				verified_files: number;
+				total_files: number;
+			}
+		>();
+		vi.mocked(api.global.post).mockResolvedValue({
+			bundle_id: 'bundle-1',
+			state: 'resolved',
+			verified_files: 4,
+			total_files: 4
+		});
+
+		const result = await mutation.mutationFn({ bundleId: 'bundle-1' });
+
+		expect(api.global.post).toHaveBeenCalledWith(
+			'/api/v1/library/management/recovery/import-bundles/bundle-1/resolve'
+		);
+		expect(result.verified_files).toBe(4);
+		expect(result.total_files).toBe(4);
 	});
 });

@@ -1,10 +1,13 @@
 from contextvars import ContextVar
 
+from dataclasses import dataclass
 import asyncio
 import copy
 import logging
+import time
 import msgspec
 from typing import Any, Optional, TYPE_CHECKING
+from infrastructure.observability.optional_work import OptionalWorkDeferred, is_optional_work
 from api.v1.schemas.artist import (
     ArtistInfo,
     ArtistExtendedInfo,
@@ -51,7 +54,14 @@ from repositories.musicbrainz_base import (
     is_mb_source_current,
     mb_deduplicator,
     mb_publish_if_current,
+    is_mb_metadata_current,
     normalize_mb_id,
+    namespace_mb_cache_key,
+    mb_cache_set_if_current, mb_cache_get_if_current,
+)
+from repositories.musicbrainz_response_cache import (
+    MbCachePolicy, MbResponseMetadata, capture_mb_projection, restore_mb_projection,
+    get_mb_response_metadata, response_metadata, merge_mb_metadata, bound_mb_metadata,
 )
 from services.audiodb_image_service import AudioDBImageService
 from repositories.audiodb_models import AudioDBArtistImages
@@ -67,18 +77,34 @@ logger = logging.getLogger(__name__)
 _artist_source_context: ContextVar[MbSourceContext | None] = ContextVar(
     "artist_source_context", default=None
 )
+_artist_cache_tokens: ContextVar[tuple[Any, Any] | None] = ContextVar(
+    "artist_cache_tokens", default=None
+)
+
+
+@dataclass(frozen=True)
+class ReleaseGroupWarmSeed:
+    context: MbSourceContext
+    items: list[dict[str, Any]]
+    total: int
+    metadata: MbResponseMetadata | None
+    cache_token: tuple[object, int]
 
 
 def _clear_release_group_warm_seed(
     task: "asyncio.Task[None]",
-    seeds: dict[str, tuple[MbSourceContext, list[dict[str, Any]], int]],
+    seeds: dict[str, ReleaseGroupWarmSeed],
     cache_key: str,
-    source_context: MbSourceContext,
+    original: ReleaseGroupWarmSeed,
 ) -> None:
-    """Drop a partial seed after its generation-specific walker settles."""
+    """Drop an untouched seed after its generation-specific walker settles.
+
+    Identity-compared against the seed captured at spawn: a walker that
+    extended its seed (cap-exit partial / failure cooldown) replaced the
+    object, and that extension survives task settlement.
+    """
     del task
-    state = seeds.get(cache_key)
-    if state is not None and state[0] == source_context:
+    if seeds.get(cache_key) is original:
         seeds.pop(cache_key, None)
 
 
@@ -105,6 +131,11 @@ def _log_deferred_disk_write_failure(task: "asyncio.Task[None]") -> None:
 
 # (1000 release groups) so pathological artists don't hog the limiter.
 _MAX_RG_PAGES = 10
+# Cap-exit partial seeds stay servable (warming) for 10 minutes: at most one
+# walk per 600 s per instance for catalogs exceeding _MAX_RG_PAGES.
+_RG_PARTIAL_TTL_SECONDS = 600
+# Failed/cancelled walks suppress respawn for 60 s (cooldown, not data).
+_RG_WARM_COOLDOWN_SECONDS = 60
 # Keep every retained first-page seed bounded to the repository's canonical
 # browse width; the full catalog lives only in the completion cache.
 _MAX_RG_SEED_ITEMS = 100
@@ -125,6 +156,14 @@ def _release_group_warm_state_key(
     cache_key: str, source_context: MbSourceContext
 ) -> str:
     return f"{cache_key}:g{source_context.generation}"
+
+
+def _release_group_ids(mb_artist: object) -> list[str]:
+    """Release-group MBIDs embedded in an artist payload (E3 candidates)."""
+    if not isinstance(mb_artist, dict):
+        return []
+    groups = mb_artist.get("release-group-list") or []
+    return [str(group["id"]) for group in groups if group.get("id")]
 
 
 class ArtistService:
@@ -167,14 +206,14 @@ class ArtistService:
         # generation-specific walker is alive. This prevents successive page-0
         # warming polls from re-browsing the same provider window.
         self._release_group_warm_seeds: dict[
-            str, tuple[MbSourceContext, list[dict[str, Any]], int]
+            str, ReleaseGroupWarmSeed
         ] = {}
 
-    async def _get_library_cache_mbids(self) -> set[str]:
+    async def _get_library_cache_mbids(self, candidates: list[str]) -> set[str]:
         if self._library_db is None:
             return set()
         try:
-            raw = await self._library_db.get_all_album_mbids()
+            raw = await self._library_db.existing_library_albums(candidates)
             return {m.lower() for m in raw if m}
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to read library cache MBIDs: %s", e)
@@ -185,17 +224,37 @@ class ArtistService:
             result = copy.deepcopy(artist_info)
             await self._refresh_library_flags(result)
             return result
-        cache_mbids = await self._get_library_cache_mbids()
+        # E3: candidate-scoped membership. Release-level IDs in the old
+        # full-set union could never match a release-group id, so restricting
+        # both lookups to the displayed releases preserves the flag outcome.
+        release_ids = [
+            rid
+            for release_list in (
+                artist_info.albums,
+                artist_info.singles,
+                artist_info.eps,
+            )
+            if release_list
+            for release in release_list
+            for rid in [
+                (release.get("id") or "")
+                if isinstance(release, dict)
+                else (release.id or "")
+            ]
+            if rid
+        ]
+        cache_mbids = await self._get_library_cache_mbids(release_ids)
         try:
-            library_mbids = await self._library_repo.get_library_mbids(
-                include_release_ids=True
+            library_mbids = await self._library_repo.existing_album_mbids(
+                release_ids
             )
         except Exception:  # noqa: BLE001
             library_mbids = set()
         all_mbids = library_mbids | cache_mbids
-        if not all_mbids:
-            return artist_info
-
+        # No empty-union fast path: with candidate scoping an empty union means
+        # "nothing displayed is owned" (stale flags must clear), not "the
+        # library is empty". Per-source failures still degrade to empty sets,
+        # exactly as the full-set union did.
         result = copy.deepcopy(artist_info)
         for release_list in (result.albums, result.singles, result.eps):
             if not release_list:
@@ -223,7 +282,9 @@ class ArtistService:
                         if new_in_library and release.requested:
                             release.requested = False
 
-        artist_mbids = await self._get_library_artist_mbids()
+        artist_mbids = await self._get_library_artist_mbids(
+            [result.musicbrainz_id] if result.musicbrainz_id else []
+        )
         new_artist_in_library = (
             result.musicbrainz_id and result.musicbrainz_id.lower() in artist_mbids
         )
@@ -232,11 +293,11 @@ class ArtistService:
 
         return result
 
-    async def _get_library_artist_mbids(self) -> set[str]:
+    async def _get_library_artist_mbids(self, candidates: list[str]) -> set[str]:
         if self._library_db is None:
             return set()
         try:
-            raw = await self._library_db.get_all_artist_mbids()
+            raw = await self._library_db.existing_library_artists(candidates)
             return {m.lower() for m in raw if m}
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to read library artist cache MBIDs: %s", e)
@@ -268,7 +329,7 @@ class ArtistService:
                     mbid
                 )
             if images is None or images.is_negative:
-                if not allow_fetch and images is None and self._audiodb_browse_queue:
+                if not allow_fetch and images is None and self._audiodb_browse_queue and not is_optional_work():
                     settings = self._preferences_service.get_advanced_settings()
                     if settings.audiodb_enabled:
                         await self._audiodb_browse_queue.enqueue(
@@ -295,6 +356,8 @@ class ArtistService:
                 artist_info.clearart_url = images.clearart_url
             if images.cutout_url:
                 artist_info.cutout_url = images.cutout_url
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "Failed to apply AudioDB images for artist %s: %s", mbid[:8], e
@@ -309,6 +372,7 @@ class ArtistService:
     ) -> ArtistInfo:
         source_context = capture_mb_source_context()
         _artist_source_context.set(source_context)
+        self._begin_projection()
         try:
             artist_id = normalize_mb_id(validate_mbid(artist_id, "artist"))
         except ValueError as e:
@@ -336,7 +400,12 @@ class ArtistService:
 
             existing = self._artist_in_flight.get(inflight_key)
             if existing is not None:
-                result = await asyncio.shield(existing)
+                try:
+                    result = await asyncio.shield(existing)
+                except OptionalWorkDeferred:
+                    if is_optional_work():
+                        raise
+                    return await self.get_artist_info(artist_id, library_artist_mbids, library_album_mbids)
                 if not is_mb_source_current(source_context):
                     raise ExternalServiceError(
                         "MusicBrainz source changed during artist lookup"
@@ -377,6 +446,8 @@ class ArtistService:
         except (CircuitOpenError, ExternalServiceError, ClientDisconnectedError):
             raise
         except (ValueError, ResourceNotFoundError):
+            raise
+        except OptionalWorkDeferred:
             raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"API call failed for artist {artist_id}: {e}")
@@ -502,6 +573,7 @@ class ArtistService:
     async def get_artist_info_basic(self, artist_id: str) -> ArtistInfo:
         source_context = capture_mb_source_context()
         _artist_source_context.set(source_context)
+        self._begin_projection()
         artist_id = normalize_mb_id(validate_mbid(artist_id, "artist"))
         inflight_key = _artist_inflight_key(artist_id, source_context)
         cached = await self._get_cached_artist(artist_id, profile="basic")
@@ -529,7 +601,12 @@ class ArtistService:
 
         existing = self._artist_basic_in_flight.get(inflight_key)
         if existing is not None:
-            result = await asyncio.shield(existing)
+            try:
+                result = await asyncio.shield(existing)
+            except OptionalWorkDeferred:
+                if is_optional_work():
+                    raise
+                return await self.get_artist_info_basic(artist_id)
             if not is_mb_source_current(source_context):
                 raise ExternalServiceError(
                     "MusicBrainz source changed during basic artist lookup"
@@ -641,10 +718,25 @@ class ArtistService:
                     artist_info.musicbrainz_id
                 )
                 return
-            library_mbids, requested_mbids, artist_mbids = await asyncio.gather(
-                self._library_repo.get_library_mbids(include_release_ids=False),
-                self._library_repo.get_requested_mbids(),
-                self._library_repo.get_artist_mbids(),
+            # E3: candidate-scoped membership. The candidate queries share
+            # the full-set predicates (album credit plus indexed track), so
+            # restricting them to the displayed releases/artist preserves the
+            # flag outcome without loading the whole owned set.
+            release_ids = [
+                rg.id or ""
+                for release_list in (
+                    artist_info.albums,
+                    artist_info.singles,
+                    artist_info.eps,
+                )
+                for rg in release_list
+            ]
+            library_mbids, requested_mbids, owned_artists = await asyncio.gather(
+                self._library_repo.existing_album_mbids(release_ids),
+                self._library_repo.get_requested_mbids(release_ids),
+                self._library_repo.existing_artist_mbids(
+                    [artist_info.musicbrainz_id] if artist_info.musicbrainz_id else []
+                ),
             )
             for release_list in (
                 artist_info.albums,
@@ -658,7 +750,7 @@ class ArtistService:
                     rg.in_library = rg_id in library_mbids
                     rg.requested = rg_id in requested_mbids and not rg.in_library
             mbid_lower = artist_info.musicbrainz_id.lower()
-            artist_info.in_library = mbid_lower in artist_mbids
+            artist_info.in_library = mbid_lower in owned_artists
             artist_info.appears_in_library = False
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to refresh library flags: {e}")
@@ -668,10 +760,18 @@ class ArtistService:
     ) -> Optional[ArtistInfo]:
         artist_id = normalize_mb_id(artist_id)
         cache_key = _artist_info_cache_key(artist_id, profile)
-        cached_info = await self._cache.get(cache_key)
+        cached_info, metadata = await self._cache.get_with_metadata(
+            namespace_mb_cache_key(cache_key, _artist_source_context.get())
+        )
+        response_metadata.set(metadata)
+        if not await is_mb_metadata_current(metadata):
+            cached_info = None
         if cached_info:
             return cached_info
-        disk_data = await self._disk_cache.get_artist(artist_id, profile=profile)
+        disk_data, metadata = await self._disk_cache.get_artist_with_metadata(artist_id, profile=profile)
+        response_metadata.set(metadata)
+        if not await is_mb_metadata_current(metadata):
+            return None
         if disk_data:
             try:
                 artist_info = msgspec.convert(disk_data, ArtistInfo, strict=False)
@@ -684,6 +784,12 @@ class ArtistService:
             return artist_info
         return None
 
+    def _begin_projection(self) -> None:
+        response_metadata.set(None)
+        _artist_cache_tokens.set((
+            self._cache.capture_clear_token(), self._disk_cache.capture_clear_token()
+        ))
+
     async def _save_artist_to_cache(
         self, artist_id: str, artist_info: ArtistInfo, *, profile: str = "full"
     ) -> None:
@@ -691,26 +797,41 @@ class ArtistService:
         cache_key = _artist_info_cache_key(artist_id, profile)
         ttl = self._get_artist_ttl(artist_info.in_library)
         context = _artist_source_context.get()
+        metadata = bound_mb_metadata(get_mb_response_metadata(), time.time() + ttl)
+        if metadata is not None:
+            ttl = min(ttl, metadata.fresh_until - time.time())
+        if ttl <= 0:
+            return
+        tokens = _artist_cache_tokens.get()
+        if tokens is None:
+            return
         # B3.1: memory write stays inline - coalesced followers and the next
         # request read it. The disk mirror remains deferred, but both tiers
         # carry the captured source context so a source switch cannot admit a
         # delayed stale write.
-        published = await mb_publish_if_current(
-            context,
-            lambda: self._cache.set(cache_key, artist_info, ttl_seconds=ttl),
-        )
-        if not published:
+        memory_published = False
+        async def publish_memory() -> None:
+            nonlocal memory_published
+            if await is_mb_metadata_current(metadata):
+                memory_published = await self._cache.set_if_token(tokens[0], cache_key, artist_info, ttl_seconds=ttl, metadata=metadata)
+
+        published = await mb_publish_if_current(context, publish_memory)
+        if not published or not memory_published:
             return
 
         async def publish_disk() -> None:
+            if not await is_mb_metadata_current(metadata):
+                return
             await mb_publish_if_current(
                 context,
                 lambda: self._disk_cache.set_artist(
                     artist_id,
                     artist_info,
                     is_monitored=artist_info.in_library,
-                    ttl_seconds=ttl if not artist_info.in_library else None,
+                    ttl_seconds=ttl if not artist_info.in_library or metadata is not None else None,
                     profile=profile,
+                    metadata=metadata,
+                    cache_token=tokens[1],
                 ),
             )
 
@@ -728,11 +849,14 @@ class ArtistService:
     async def get_artist_extended_info(self, artist_id: str) -> ArtistExtendedInfo:
         source_context = capture_mb_source_context()
         _artist_source_context.set(source_context)
+        self._begin_projection()
         try:
             artist_id = normalize_mb_id(validate_mbid(artist_id, "artist"))
             cache_key = _artist_info_cache_key(artist_id, "full")
-            cached_info = await self._cache.get(cache_key)
-            if not is_mb_source_current(source_context):
+            cached_info, cached_metadata = await self._cache.get_with_metadata(
+                namespace_mb_cache_key(cache_key, source_context)
+            )
+            if not is_mb_source_current(source_context) or not await is_mb_metadata_current(cached_metadata):
                 cached_info = None
             if cached_info and cached_info.description is not None:
                 return ArtistExtendedInfo(
@@ -746,7 +870,12 @@ class ArtistService:
             inflight_key = _artist_inflight_key(artist_id, source_context)
             existing = self._artist_extended_in_flight.get(inflight_key)
             if existing is not None:
-                result = await asyncio.shield(existing)
+                try:
+                    result = await asyncio.shield(existing)
+                except OptionalWorkDeferred:
+                    if is_optional_work():
+                        raise
+                    return await self.get_artist_extended_info(artist_id)
                 if not is_mb_source_current(source_context):
                     return ArtistExtendedInfo(description=None, image=None)
                 return result
@@ -763,6 +892,7 @@ class ArtistService:
                 # (_fetch_artist_relations pins IMAGE_FETCH) - this is a
                 # cosmetic enrichment leg, not primary content.
                 mb_artist = await self._mb_repo.get_artist_relations(artist_id)
+                response_metadata.set(merge_mb_metadata(cached_metadata, get_mb_response_metadata()))
                 if not is_mb_source_current(source_context):
                     raise ExternalServiceError(
                         "MusicBrainz source changed during extended artist lookup"
@@ -793,6 +923,8 @@ class ArtistService:
                 raise
             finally:
                 self._artist_extended_in_flight.pop(inflight_key, None)
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"Error fetching extended artist info for {artist_id}: {e}")
             return ArtistExtendedInfo(description=None, image=None)
@@ -807,18 +939,15 @@ class ArtistService:
     ) -> ArtistReleases:
         source_context = capture_mb_source_context()
         _artist_source_context.set(source_context)
+        self._begin_projection()
         artist_id = normalize_mb_id(artist_id)
         try:
             await check_disconnected(is_disconnected)
+            # Ownership flags resolve inside _filter_aware_release_page once the
+            # browsed catalog is known, so both lanes check only candidates (E3)
+            # instead of preloading whole-library sets up front.
             album_mbids: set[str] = set()
             requested_mbids: set[str] = set()
-            if self._ownership is None:
-                album_mbids, requested_mbids, cache_mbids = await asyncio.gather(
-                    self._library_repo.get_library_mbids(include_release_ids=True),
-                    self._library_repo.get_requested_mbids(),
-                    self._get_library_cache_mbids(),
-                )
-                album_mbids = album_mbids | cache_mbids
 
             prefs = self._preferences_service.get_preferences()
             included_primary_types = set(t.lower() for t in prefs.primary_types)
@@ -867,6 +996,8 @@ class ArtistService:
                 )
             return result
         except ClientDisconnectedError:
+            raise
+        except OptionalWorkDeferred:
             raise
         except Exception as e:  # noqa: BLE001
             logger.error(
@@ -1001,6 +1132,10 @@ class ArtistService:
             album_mbids, requested_mbids = await self._target_release_group_flags(
                 full_list, artist_name=""
             )
+        elif full_list:
+            album_mbids, requested_mbids = await self._legacy_release_group_flags(
+                full_list
+            )
 
         albums, singles, eps = categorize_release_groups(
             {"release-group-list": full_list},
@@ -1055,6 +1190,9 @@ class ArtistService:
             limit,
             priority=priority,
             preserve_fetch_width=preserve_fetch_width,
+            # Page reads go through the L1 page entry; detection freshness
+            # is the follow poller's job (BYPASS there), not the page's.
+            cache_policy=MbCachePolicy.DISPLAY_FRESH,
         )
 
     async def _fetch_all_release_groups(
@@ -1075,7 +1213,8 @@ class ArtistService:
         """
         artist_id = normalize_mb_id(artist_id)
         cache_key = mb_artist_release_groups_key(artist_id)
-        cached = await self._cache.get(cache_key)
+        cache_token = self._cache.capture_clear_token()
+        cached = await mb_cache_get_if_current(self._cache, cache_key, source_context)
         if not is_mb_source_current(source_context):
             raise ExternalServiceError(
                 "MusicBrainz source changed during release-group cache read"
@@ -1086,11 +1225,14 @@ class ArtistService:
         state_key = _release_group_warm_state_key(cache_key, source_context)
         warm_state = self._release_group_warm_seeds.get(state_key)
         if warm_state is not None:
-            warm_context, seed_items, _total = warm_state
+            warm_context, seed_items = warm_state.context, warm_state.items
             if (
                 warm_context == source_context
                 and is_mb_source_current(warm_context)
+                and warm_state.cache_token == self._cache.capture_clear_token()
+                and (warm_state.metadata is None or warm_state.metadata.fresh_until > time.time())
             ):
+                response_metadata.set(warm_state.metadata)
                 return list(seed_items), False
             # Source switches use a monotonically increasing generation. Do
             # not let a stale task's seed block the first request on a new
@@ -1112,13 +1254,10 @@ class ArtistService:
                 "MusicBrainz source changed during release-group browse"
             )
         if total > 0 and len(page_items) >= total:
-            await mb_publish_if_current(
-                source_context,
-                lambda: self._cache.set(
-                    cache_key,
-                    page_items,
-                    ttl_seconds=self._get_artist_ttl(in_library=False),
-                ),
+            await mb_cache_set_if_current(
+                self._cache, cache_key, page_items,
+                ttl_seconds=self._get_artist_ttl(in_library=False),
+                context=source_context, cache_token=cache_token,
             )
             return page_items, True
         if not page_items and not total:
@@ -1179,6 +1318,8 @@ class ArtistService:
         task name lets a new source start its own walker while an old one
         exits safely.
         """
+        if is_optional_work():
+            return
         registry = TaskRegistry.get_instance()
         task_name = f"mb-rg-warm-{artist_id.casefold()}:{source_context.generation}"
         if registry.is_running(task_name):
@@ -1208,18 +1349,65 @@ class ArtistService:
             return
         cache_key = mb_artist_release_groups_key(normalize_mb_id(artist_id))
         state_key = _release_group_warm_state_key(cache_key, source_context)
-        self._release_group_warm_seeds[state_key] = (
-            source_context,
-            list(bounded_seed),
-            total,
+        original_seed = ReleaseGroupWarmSeed(
+            source_context, list(bounded_seed), total, get_mb_response_metadata(),
+            self._cache.capture_clear_token(),
         )
+        self._release_group_warm_seeds[state_key] = original_seed
         task.add_done_callback(
             lambda done: _clear_release_group_warm_seed(
                 done,
                 self._release_group_warm_seeds,
                 state_key,
-                source_context,
+                original_seed,
             )
+        )
+
+    def _extend_release_group_warm_seed(
+        self,
+        artist_id: str,
+        collected: dict[str, dict[str, Any]],
+        total: int,
+        metadata: MbResponseMetadata | None,
+        cache_token: tuple[object, int],
+        source_context: MbSourceContext,
+        ttl_seconds: int,
+    ) -> None:
+        """Replace the warm seed with collected items + a fresh TTL (D1).
+
+        Seeds-only: the shared complete-catalog key is never written here
+        (any shared-key hit reads as complete). Skipped unless the walker's
+        source is still current, so a stale walk can neither pin data nor
+        block the new source's walker.
+        """
+        if not is_mb_source_current(source_context):
+            return
+        now = time.time()
+        fresh_until = now + ttl_seconds
+        fresh_metadata = MbResponseMetadata(
+            origin=metadata.origin if metadata is not None else "provider",
+            fetched_at=now,
+            fresh_until=fresh_until,
+            retention_until=(
+                max(metadata.retention_until, fresh_until)
+                if metadata is not None
+                else fresh_until
+            ),
+            source_mode=source_context.source_mode,
+            source_id=source_context.source_id,
+            generation=source_context.generation,
+            clear_epoch=metadata.clear_epoch if metadata is not None else 0,
+            profile=metadata.profile if metadata is not None else "artist-rg-page-v1",
+            decoder_version=metadata.decoder_version if metadata is not None else "1",
+        )
+        cache_key = mb_artist_release_groups_key(artist_id)
+        state_key = _release_group_warm_state_key(cache_key, source_context)
+        self._release_group_warm_seeds[state_key] = ReleaseGroupWarmSeed(
+            source_context,
+            list(collected.values()),
+            total,
+            fresh_metadata,
+            cache_token,
         )
 
     async def _warm_release_group_pages(
@@ -1242,13 +1430,18 @@ class ArtistService:
         """
         artist_id = normalize_mb_id(artist_id)
         source_context = source_context or _artist_source_context.get() or capture_mb_source_context()
+        metadata = get_mb_response_metadata()
+        tokens = _artist_cache_tokens.get()
+        cache_token = tokens[0] if tokens is not None else self._cache.capture_clear_token()
         if not is_mb_source_current(source_context):
+            # The seed-extension guard would no-op on a stale source.
             return
         cache_key = mb_artist_release_groups_key(artist_id)
         pages_done = 1 if raw_offset else 0
 
         while pages_done < _MAX_RG_PAGES and raw_offset < max(total, 1):
             if not is_mb_source_current(source_context):
+                # The seed-extension guard would no-op on a stale source.
                 return
             try:
                 (
@@ -1263,10 +1456,18 @@ class ArtistService:
                 )
             except asyncio.CancelledError:
                 logger.info("Release-group warm cancelled for %s", artist_id[:8])
+                self._extend_release_group_warm_seed(
+                    artist_id, collected, total, metadata, cache_token,
+                    source_context, _RG_WARM_COOLDOWN_SECONDS,
+                )
                 return
-            except Exception:
+            except Exception:  # noqa: BLE001 - best-effort warming degrades to empty
                 logger.error(
                     "Release-group warm failed for %s", artist_id[:8], exc_info=True
+                )
+                self._extend_release_group_warm_seed(
+                    artist_id, collected, total, metadata, cache_token,
+                    source_context, _RG_WARM_COOLDOWN_SECONDS,
                 )
                 return
             if (
@@ -1274,8 +1475,13 @@ class ArtistService:
                 or response_context is not None
                 and response_context != source_context
             ):
+                self._extend_release_group_warm_seed(
+                    artist_id, collected, total, metadata, cache_token,
+                    source_context, _RG_WARM_COOLDOWN_SECONDS,
+                )
                 return
 
+            metadata = merge_mb_metadata(metadata, get_mb_response_metadata())
             total = mb_total or total
             if not release_groups:
                 break
@@ -1291,13 +1497,18 @@ class ArtistService:
 
         if total > 0 and raw_offset >= total:
             full_list = list(collected.values())
-            await mb_publish_if_current(
-                source_context,
-                lambda: self._cache.set(
-                    cache_key,
-                    full_list,
-                    ttl_seconds=self._get_artist_ttl(in_library=False),
-                ),
+            response_metadata.set(metadata)
+            await mb_cache_set_if_current(
+                self._cache, cache_key, full_list,
+                ttl_seconds=self._get_artist_ttl(in_library=False),
+                context=source_context, cache_token=cache_token,
+            )
+        elif total > 0 and raw_offset < total:
+            # Cap exit or empty-page break: keep the walked slice servable
+            # (warming) for 600 s. Seeds-only, never the shared key.
+            self._extend_release_group_warm_seed(
+                artist_id, collected, total, metadata, cache_token,
+                source_context, _RG_PARTIAL_TTL_SECONDS,
             )
 
     async def _fetch_artist_data(
@@ -1312,18 +1523,22 @@ class ArtistService:
         artist_fetch_kwargs: dict[str, Any] = {"include_releases": include_releases}
         if include_releases:
             artist_fetch_kwargs["release_group_limit"] = _MAX_RG_SEED_ITEMS
-        if library_artist_mbids is not None and library_album_mbids is not None:
-            # B3.1: cache-mbid read rides alongside the requested fetch instead
-            # of a serial tail after the main gather.
-            mb_artist = await self._mb_repo.get_artist_by_id(
-                artist_id, **artist_fetch_kwargs
+        async def fetch_artist():
+            return await capture_mb_projection(
+                self._mb_repo.get_artist_by_id(artist_id, **artist_fetch_kwargs)
             )
+        if library_artist_mbids is not None and library_album_mbids is not None:
+            # E3: requested/cache membership is candidate-scoped to the fetched
+            # release groups; the passed-in album mapping keeps its quirk
+            # (dict membership by key, union attempt preserved below).
+            mb_artist = restore_mb_projection(await fetch_artist())
             library_mbids = library_artist_mbids
             album_mbids = library_album_mbids
             try:
+                rg_ids = _release_group_ids(mb_artist)
                 requested_mbids, cache_mbids = await asyncio.gather(
-                    self._library_repo.get_requested_mbids(),
-                    self._get_library_cache_mbids(),
+                    self._library_repo.get_requested_mbids(rg_ids),
+                    self._get_library_cache_mbids(rg_ids),
                 )
                 album_mbids = album_mbids | cache_mbids
             except Exception as exc:  # noqa: BLE001
@@ -1332,12 +1547,13 @@ class ArtistService:
                 )
                 requested_mbids = set()
         elif self._ownership is not None:
-            # B3.1: cache-mbid read joins the gather (spare width).
-            mb_artist, artist_relationship, cache_mbids = await asyncio.gather(
-                self._mb_repo.get_artist_by_id(artist_id, **artist_fetch_kwargs),
+            # E3: the materialised-cache read is candidate-scoped to the
+            # fetched release groups, after the provider fetch resolves them.
+            mb_artist, artist_relationship = await asyncio.gather(
+                fetch_artist(),
                 self._ownership.provider_artist_relationship(artist_id),
-                self._get_library_cache_mbids(),
             )
+            mb_artist = restore_mb_projection(mb_artist)
             if not mb_artist:
                 raise ResourceNotFoundError("Artist not found")
             library_mbids = {artist_id.casefold()} if artist_relationship[0] else set()
@@ -1348,40 +1564,43 @@ class ArtistService:
                 )
             else:
                 album_mbids, requested_mbids = set(), set()
+            cache_mbids = await self._get_library_cache_mbids(
+                _release_group_ids(mb_artist)
+            )
             album_mbids = album_mbids | cache_mbids
         else:
-            # B3.1: cache-mbid read joins the gather (4-wide already had room;
-            # failures degrade to an empty set like the other library reads).
-            mb_artist, *library_results = await asyncio.gather(
-                self._mb_repo.get_artist_by_id(artist_id, **artist_fetch_kwargs),
-                self._library_repo.get_artist_mbids(),
-                self._library_repo.get_library_mbids(include_release_ids=True),
-                self._library_repo.get_requested_mbids(),
-                self._get_library_cache_mbids(),
+            # E3: the provider fetch resolves first so library membership is
+            # candidate-scoped to this artist and its release groups instead
+            # of preloading whole-library sets; per-source failures still
+            # degrade to empty sets like before.
+            try:
+                mb_artist = await fetch_artist()
+            except (
+                CircuitOpenError,
+                ExternalServiceError,
+                ResourceNotFoundError,
+                ClientDisconnectedError,
+                asyncio.CancelledError,
+            ):
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Error fetching artist data for %s",
+                    artist_id,
+                    exc_info=exc,
+                )
+                raise ExternalServiceError(
+                    "MusicBrainz artist metadata is temporarily unavailable."
+                ) from exc
+            mb_artist = restore_mb_projection(mb_artist)
+            rg_ids = _release_group_ids(mb_artist)
+            library_results = await asyncio.gather(
+                self._library_repo.existing_artist_mbids([artist_id]),
+                self._library_repo.existing_album_mbids(rg_ids),
+                self._library_repo.get_requested_mbids(rg_ids),
+                self._get_library_cache_mbids(rg_ids),
                 return_exceptions=True,
             )
-            if isinstance(mb_artist, BaseException):
-                if isinstance(
-                    mb_artist,
-                    (
-                        CircuitOpenError,
-                        ExternalServiceError,
-                        ResourceNotFoundError,
-                        ClientDisconnectedError,
-                        asyncio.CancelledError,
-                    ),
-                ):
-                    raise mb_artist
-                if isinstance(mb_artist, Exception):
-                    logger.error(
-                        "Error fetching artist data for %s",
-                        artist_id,
-                        exc_info=mb_artist,
-                    )
-                    raise ExternalServiceError(
-                        "MusicBrainz artist metadata is temporarily unavailable."
-                    ) from mb_artist
-                raise mb_artist
             library_failed = any(isinstance(r, BaseException) for r in library_results)
             if library_failed:
                 logger.warning(
@@ -1482,13 +1701,13 @@ class ArtistService:
             for group in seed_items:
                 gid = str(group["id"]).casefold()
                 deduped.setdefault(gid, group)
-            published = await mb_publish_if_current(
-                source_context,
-                lambda: self._cache.set(
-                    cache_key,
-                    list(deduped.values()),
-                    ttl_seconds=self._get_artist_ttl(in_library=False),
-                ),
+            tokens = _artist_cache_tokens.get()
+            if tokens is None:
+                return
+            published = await mb_cache_set_if_current(
+                self._cache, cache_key, list(deduped.values()),
+                ttl_seconds=self._get_artist_ttl(in_library=False),
+                context=source_context, cache_token=tokens[0],
             )
             if not published:
                 return
@@ -1534,6 +1753,25 @@ class ArtistService:
         requested = await self._library_repo.get_requested_mbids(ids)
         return owned, requested
 
+    async def _legacy_release_group_flags(
+        self, release_groups: list[dict[str, Any]]
+    ) -> tuple[set[str], set[str]]:
+        """Candidate-scoped legacy ownership flags (E3).
+
+        Same release-group membership outcome as the retired full-set union:
+        release-level IDs in that union could never match a release-group id,
+        and the remaining RG membership is exactly what the candidate queries
+        return. Repository failures propagate, as the old gather did; the
+        materialised-cache lookup keeps its degrade-to-empty behavior.
+        """
+        ids = [str(group["id"]) for group in release_groups if group.get("id")]
+        owned, cache_mbids, requested = await asyncio.gather(
+            self._library_repo.existing_album_mbids(ids),
+            self._get_library_cache_mbids(ids),
+            self._library_repo.get_requested_mbids(ids),
+        )
+        return owned | cache_mbids, requested
+
     def _build_external_links(self, mb_artist: dict[str, Any]) -> list[ExternalLink]:
         external_links_data = extract_external_links(mb_artist)
         return [
@@ -1577,6 +1815,9 @@ class ArtistService:
             tasks.append(asyncio.create_task(asyncio.sleep(0)))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, OptionalWorkDeferred):
+                raise result
 
         description = (
             results[0]

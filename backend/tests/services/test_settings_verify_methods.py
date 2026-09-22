@@ -20,10 +20,8 @@ def _make_service(*, preferences=None):
     prefs = preferences or MagicMock()
     cache = MagicMock()
     cache.clear_prefix = AsyncMock(return_value=0)
-    service = SettingsService(
-        preferences_service=prefs,
-        cache=cache,
-    )
+    service = SettingsService(preferences_service=prefs,
+    cache=cache, mb_response_store=AsyncMock(), follow_store=AsyncMock())
     return service
 
 

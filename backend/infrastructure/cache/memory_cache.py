@@ -8,7 +8,22 @@ from collections import OrderedDict
 
 class CacheInterface(ABC):
     @abstractmethod
+    def capture_clear_token(self) -> tuple[object, int]:
+        pass
+
+    @abstractmethod
+    async def set_if_token(
+        self, token: tuple[object, int], key: str, value: Any,
+        ttl_seconds: int | float = 60, *, metadata: Any = None,
+    ) -> bool:
+        pass
+
+    @abstractmethod
     async def get(self, key: str) -> Optional[Any]:
+        pass
+
+    @abstractmethod
+    async def get_with_metadata(self, key: str) -> tuple[Any, Any]:
         pass
 
     @abstractmethod
@@ -45,14 +60,17 @@ class CacheInterface(ABC):
 
 
 class CacheEntry:
-    __slots__ = ("value", "expires_at")
+    __slots__ = ("value", "expires_at", "metadata")
 
-    def __init__(self, value: Any, ttl_seconds: int):
+    def __init__(self, value: Any, ttl_seconds: int | float, metadata: Any = None):
         self.value = value
         self.expires_at = time.time() + ttl_seconds
+        self.metadata = metadata
+        if metadata is not None:
+            self.expires_at = min(self.expires_at, metadata.fresh_until)
 
     def is_expired(self) -> bool:
-        return time.time() > self.expires_at
+        return time.time() >= self.expires_at
 
 
 class InMemoryCache(CacheInterface):
@@ -63,6 +81,26 @@ class InMemoryCache(CacheInterface):
         self._evictions = 0
         self._hits = 0
         self._misses = 0
+        self._clear_epoch = 0
+
+    def capture_clear_token(self) -> tuple[object, int]:
+        return self, self._clear_epoch
+
+    async def set_if_token(
+        self, token: tuple[object, int], key: str, value: Any,
+        ttl_seconds: int | float = 60, *, metadata: Any = None,
+    ) -> bool:
+        key = self._source_key(key)
+        async with self._lock:
+            if token != (self, self._clear_epoch):
+                return False
+            if key not in self._cache and len(self._cache) >= self._max_entries:
+                self._cache.popitem(last=False)
+                self._evictions += 1
+            self._cache[key] = CacheEntry(value, ttl_seconds, metadata)
+            self._cache.move_to_end(key)
+            return True
+
 
     @staticmethod
     def _source_key(key: str) -> str:
@@ -74,21 +112,25 @@ class InMemoryCache(CacheInterface):
             return key
 
     async def get(self, key: str) -> Optional[Any]:
+        value, _metadata = await self.get_with_metadata(key)
+        return value
+
+    async def get_with_metadata(self, key: str) -> tuple[Any, Any]:
         key = self._source_key(key)
         async with self._lock:
             entry = self._cache.get(key)
             if entry is None:
                 self._misses += 1
-                return None
+                return None, None
 
             if entry.is_expired():
                 self._cache.pop(key, None)
                 self._misses += 1
-                return None
+                return None, None
 
             self._cache.move_to_end(key)
             self._hits += 1
-            return entry.value
+            return entry.value, entry.metadata
 
     async def peek(self, key: str) -> Optional[Any]:
         # Deliberately no move_to_end (LRU untouched) and no pop: a peek is a
@@ -117,10 +159,12 @@ class InMemoryCache(CacheInterface):
 
     async def clear(self) -> None:
         async with self._lock:
+            self._clear_epoch += 1
             self._cache.clear()
 
     async def clear_prefix(self, prefix: str) -> int:
         async with self._lock:
+            self._clear_epoch += 1
             keys_to_remove = [k for k in self._cache.keys() if k.startswith(prefix)]
             for key in keys_to_remove:
                 self._cache.pop(key, None)

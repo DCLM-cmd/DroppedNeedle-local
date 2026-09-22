@@ -3,7 +3,6 @@ snapshot row math."""
 
 import pytest
 
-from infrastructure.cache.cache_metrics import WindowedCounterMap
 from infrastructure.observability import provider_counters
 from infrastructure.queue.priority_queue import RequestPriority
 
@@ -49,13 +48,13 @@ class TestLaneLabel:
 class TestRecordAndSnapshot:
     @pytest.fixture
     def fresh_counters(self, monkeypatch):
-        counters = WindowedCounterMap()
+        counters = provider_counters.ProviderCounterMap()
         monkeypatch.setattr(provider_counters, "_counters", counters)
         return counters
 
     @pytest.mark.asyncio
     async def test_rows_carry_required_fields_and_math(
-        self, fresh_counters: WindowedCounterMap
+        self, fresh_counters: provider_counters.ProviderCounterMap
     ):
         for _ in range(5):
             provider_counters.record_provider_call(

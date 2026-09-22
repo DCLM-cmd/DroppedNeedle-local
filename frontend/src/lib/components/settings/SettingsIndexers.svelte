@@ -5,6 +5,7 @@
 		CircleX,
 		GripVertical,
 		Plus,
+		Radar,
 		Rss,
 		Trash2
 	} from 'lucide-svelte';
@@ -12,12 +13,19 @@
 	import {
 		deleteIndexerMutation,
 		getIndexersQuery,
+		getSearchBackendQuery,
 		reorderIndexersMutation,
 		saveIndexerMutation,
+		saveSearchBackendMutation,
 		testIndexerMutation
 	} from '$lib/queries/downloads/IndexerQueries.svelte';
+	import { getProwlarrConfigQuery } from '$lib/queries/downloads/ProwlarrQueries.svelte';
+	import { getPluginSourcesQuery } from '$lib/queries/plugins/PluginSourceQueries.svelte';
 	import { toastStore } from '$lib/stores/toast';
-	import type { IndexerSettings, IndexerTestResult } from '$lib/types';
+	import type { IndexerSettings, IndexerTestResult, UsenetSearchBackendName } from '$lib/types';
+
+	import SettingsProwlarr from './SettingsProwlarr.svelte';
+	import SettingsSectionCollapse from './SettingsSectionCollapse.svelte';
 
 	const INDEXER_KEY_MASK = 'indexer****';
 	// The common audio categories; 3000 (Audio) expands to all subcats on most indexers.
@@ -29,13 +37,47 @@
 	const NEW = '__new__';
 
 	const indexersQuery = getIndexersQuery();
+	const backendQuery = getSearchBackendQuery();
+	const prowlarrQuery = getProwlarrConfigQuery();
 	const save = saveIndexerMutation();
 	const remove = deleteIndexerMutation();
 	const reorder = reorderIndexersMutation();
 	const test = testIndexerMutation();
-
+	const saveBackend = saveSearchBackendMutation();
 	const indexers = $derived(indexersQuery.data ?? []);
+	const backend = $derived<UsenetSearchBackendName>(backendQuery.data?.backend ?? 'indexers');
+	const enabledCount = $derived(indexers.filter((i) => i.enabled).length);
+	const prowlarrStatus = $derived.by(() => {
+		const config = prowlarrQuery.data;
+		if (!config?.url) return 'Not configured yet';
+		return config.enabled ? 'Ready' : 'Configured but disabled';
+	});
+	// Accordion: the active backend's section opens; flipping the radio opens it.
+	let indexersOpen = $state(true);
+	let prowlarrOpen = $state(false);
+	let seededOpen = false;
+	$effect(() => {
+		const selected = backendQuery.data?.backend;
+		if (selected && !seededOpen) {
+			indexersOpen = selected === 'indexers';
+			prowlarrOpen = selected === 'prowlarr';
+			seededOpen = true;
+		}
+	});
 
+	async function selectBackend(next: UsenetSearchBackendName) {
+		if (next === backend) return;
+		try {
+			await saveBackend.mutateAsync(next);
+			indexersOpen = next === 'indexers';
+			prowlarrOpen = next === 'prowlarr';
+		} catch {
+			toastStore.show({ message: 'Could not switch search backend', type: 'error' });
+		}
+	}
+	const pluginIndexers = $derived(
+		(getPluginSourcesQuery().data?.sources ?? []).filter((source) => source.has_indexer)
+	);
 	let editingId = $state<string | null>(null);
 	let draft = $state<IndexerSettings | null>(null);
 	let showKey = $state(false);
@@ -178,145 +220,245 @@
 
 <section class="space-y-4">
 	<header class="space-y-1">
-		<h2 class="text-lg font-semibold">Indexers</h2>
+		<h2 class="text-lg font-semibold">Indexers / Prowlarr</h2>
 		<p class="max-w-prose text-sm text-base-content/70">
-			Newznab search sources for Usenet. DroppedNeedle ships none - add your own. A Prowlarr
-			"Generic Newznab" endpoint works here too. Higher in the list is searched first.
+			Usenet search sources. Pick one backend: your prioritized Newznab list, or a single Prowlarr
+			connection. The other side stays saved for later.
 		</p>
 	</header>
 
-	{#if indexers.length === 0 && editingId !== NEW}
-		<div
-			class="flex flex-col items-center rounded-box border border-dashed border-base-300 bg-base-200/40 p-10 text-center"
-		>
-			<div class="grid size-14 place-items-center rounded-2xl bg-base-300/60">
-				<Rss class="size-7 text-accent" aria-hidden="true" />
+	<div class="card border border-base-300 bg-base-200">
+		<div class="card-body gap-3 p-4">
+			<div>
+				<h3 class="font-semibold">Search via</h3>
+				<p class="text-sm text-base-content/60">Only the selected backend is searched.</p>
 			</div>
-			<p class="mt-4 font-semibold">No indexers yet</p>
-			<p class="mx-auto mt-1 max-w-md text-sm text-base-content/70">
-				Add a Newznab indexer (its URL + your API key) to search Usenet. DroppedNeedle bundles none
-				- bring your own. A Prowlarr "Generic Newznab" endpoint works here too.
-			</p>
-			<button type="button" class="btn btn-primary btn-sm mt-5" onclick={startAdd}>
-				<Plus class="size-4" aria-hidden="true" /> Add indexer
-			</button>
-		</div>
-	{:else}
-		<ul class="space-y-3">
-			{#each indexers as indexer, index (indexer.id)}
-				{@const isOpen = editingId === indexer.id}
-				{@const result = testResults[indexer.id]}
-				<li
-					class="indexer-card card border border-base-300 bg-base-200"
-					class:is-active={indexer.enabled}
-					ondragover={(e) => e.preventDefault()}
-					ondrop={() => onDrop(index)}
-					role="listitem"
+			<div class="grid gap-2 sm:grid-cols-2">
+				<label
+					class="flex cursor-pointer items-start gap-3 rounded-box border p-3"
+					class:border-accent={backend === 'indexers'}
+					class:border-base-300={backend !== 'indexers'}
 				>
+					<input
+						type="radio"
+						name="usenet-search-backend"
+						class="radio radio-sm mt-1"
+						checked={backend === 'indexers'}
+						onchange={() => selectBackend('indexers')}
+					/>
+					<span>
+						<span class="font-medium">Individual indexers</span>
+						<span class="block text-sm text-base-content/60">
+							Search the prioritized Newznab list below. {enabledCount} enabled.
+						</span>
+					</span>
+				</label>
+				<label
+					class="flex cursor-pointer items-start gap-3 rounded-box border p-3"
+					class:border-accent={backend === 'prowlarr'}
+					class:border-base-300={backend !== 'prowlarr'}
+				>
+					<input
+						type="radio"
+						name="usenet-search-backend"
+						class="radio radio-sm mt-1"
+						checked={backend === 'prowlarr'}
+						onchange={() => selectBackend('prowlarr')}
+					/>
+					<span>
+						<span class="font-medium">Prowlarr</span>
+						<span class="block text-sm text-base-content/60">
+							Search everything through one Prowlarr connection. {prowlarrStatus}.
+						</span>
+					</span>
+				</label>
+			</div>
+		</div>
+	</div>
+
+	<SettingsSectionCollapse
+		title="Individual indexers"
+		description="Your prioritized Newznab list - higher is searched first"
+		icon={Rss}
+		bind:isOpen={indexersOpen}
+		name="usenet-backend-sections"
+	>
+		{#if indexers.length === 0 && editingId !== NEW}
+			<div
+				class="flex flex-col items-center rounded-box border border-dashed border-base-300 bg-base-200/40 p-10 text-center"
+			>
+				<div class="grid size-14 place-items-center rounded-2xl bg-base-300/60">
+					<Rss class="size-7 text-accent" aria-hidden="true" />
+				</div>
+				<p class="mt-4 font-semibold">No indexers yet</p>
+				<p class="mx-auto mt-1 max-w-md text-sm text-base-content/70">
+					Add a Newznab indexer (its URL + your API key) to search Usenet. DroppedNeedle bundles
+					none - bring your own. Run Prowlarr instead? Select it above and configure it below.
+				</p>
+				<button type="button" class="btn btn-primary btn-sm mt-5" onclick={startAdd}>
+					<Plus class="size-4" aria-hidden="true" /> Add indexer
+				</button>
+			</div>
+		{:else}
+			<ul class="space-y-3">
+				{#each indexers as indexer, index (indexer.id)}
+					{@const isOpen = editingId === indexer.id}
+					{@const result = testResults[indexer.id]}
+					<li
+						class="indexer-card card border border-base-300 bg-base-200"
+						class:is-active={indexer.enabled}
+						ondragover={(e) => e.preventDefault()}
+						ondrop={() => onDrop(index)}
+						role="listitem"
+					>
+						<div class="card-body gap-0 p-0">
+							<div class="flex flex-wrap items-center gap-3 p-4">
+								<button
+									type="button"
+									class="cursor-grab text-base-content/40 hover:text-base-content"
+									aria-label="Drag to reorder"
+									draggable="true"
+									ondragstart={() => (dragId = indexer.id)}
+									ondragend={() => (dragId = null)}
+									onkeydown={(e) => {
+										if (e.key === 'ArrowUp') {
+											e.preventDefault();
+											move(index, -1);
+										} else if (e.key === 'ArrowDown') {
+											e.preventDefault();
+											move(index, 1);
+										}
+									}}
+								>
+									<GripVertical class="size-4" aria-hidden="true" />
+								</button>
+								<span class="badge badge-ghost badge-sm tabular-nums">{index + 1}</span>
+								<div class="grid size-12 place-items-center rounded-2xl bg-base-300/60">
+									<Rss class="size-6 text-accent" aria-hidden="true" />
+								</div>
+								<button
+									type="button"
+									class="min-w-0 flex-1 text-left"
+									onclick={() => startEdit(indexer)}
+									aria-expanded={isOpen}
+								>
+									<div class="flex items-center gap-2">
+										<h3 class="truncate text-lg font-bold">{indexer.name || host(indexer.url)}</h3>
+										{#if result?.valid}
+											<span class="badge badge-ghost badge-sm">
+												{result.supports_audio_search ? 'music search' : 'text search'}
+											</span>
+										{/if}
+									</div>
+									<div class="flex items-center gap-2 text-sm text-base-content/70">
+										<span
+											class="orb"
+											class:is-connected={indexer.enabled}
+											role="status"
+											aria-label={indexer.enabled ? 'Enabled' : 'Disabled'}
+										></span>
+										<span class="truncate">{host(indexer.url)}</span>
+									</div>
+								</button>
+								<label class="flex cursor-pointer items-center gap-2">
+									<span class="text-sm font-medium">{indexer.enabled ? 'Enabled' : 'Disabled'}</span
+									>
+									<input
+										type="checkbox"
+										class="toggle toggle-accent"
+										checked={indexer.enabled}
+										onchange={() => toggleEnabled(indexer)}
+										aria-label={indexer.enabled ? 'Disable indexer' : 'Enable indexer'}
+									/>
+								</label>
+								<button
+									type="button"
+									class="btn btn-ghost btn-sm btn-square"
+									onclick={() => startEdit(indexer)}
+									aria-label={isOpen ? 'Collapse' : 'Expand'}
+								>
+									<ChevronDown
+										class={isOpen
+											? 'size-5 rotate-180 transition-transform'
+											: 'size-5 transition-transform'}
+										aria-hidden="true"
+									/>
+								</button>
+							</div>
+
+							{#if isOpen && draft}
+								<div class="space-y-5 border-t border-base-300 p-5">
+									{@render editForm()}
+								</div>
+							{/if}
+						</div>
+					</li>
+				{/each}
+			</ul>
+
+			{#if editingId === NEW && draft}
+				<div class="card border border-accent/40 bg-base-200">
 					<div class="card-body gap-0 p-0">
-						<div class="flex flex-wrap items-center gap-3 p-4">
-							<button
-								type="button"
-								class="cursor-grab text-base-content/40 hover:text-base-content"
-								aria-label="Drag to reorder"
-								draggable="true"
-								ondragstart={() => (dragId = indexer.id)}
-								ondragend={() => (dragId = null)}
-								onkeydown={(e) => {
-									if (e.key === 'ArrowUp') {
-										e.preventDefault();
-										move(index, -1);
-									} else if (e.key === 'ArrowDown') {
-										e.preventDefault();
-										move(index, 1);
-									}
-								}}
-							>
-								<GripVertical class="size-4" aria-hidden="true" />
-							</button>
-							<span class="badge badge-ghost badge-sm tabular-nums">{index + 1}</span>
+						<div class="flex items-center gap-3 p-4">
 							<div class="grid size-12 place-items-center rounded-2xl bg-base-300/60">
 								<Rss class="size-6 text-accent" aria-hidden="true" />
 							</div>
-							<button
-								type="button"
-								class="min-w-0 flex-1 text-left"
-								onclick={() => startEdit(indexer)}
-								aria-expanded={isOpen}
-							>
-								<div class="flex items-center gap-2">
-									<h3 class="truncate text-lg font-bold">{indexer.name || host(indexer.url)}</h3>
-									{#if result?.valid}
-										<span class="badge badge-ghost badge-sm">
-											{result.supports_audio_search ? 'music search' : 'text search'}
-										</span>
-									{/if}
-								</div>
-								<div class="flex items-center gap-2 text-sm text-base-content/70">
-									<span
-										class="orb"
-										class:is-connected={indexer.enabled}
-										role="status"
-										aria-label={indexer.enabled ? 'Enabled' : 'Disabled'}
-									></span>
-									<span class="truncate">{host(indexer.url)}</span>
-								</div>
-							</button>
-							<label class="flex cursor-pointer items-center gap-2">
-								<span class="text-sm font-medium">{indexer.enabled ? 'Enabled' : 'Disabled'}</span>
-								<input
-									type="checkbox"
-									class="toggle toggle-accent"
-									checked={indexer.enabled}
-									onchange={() => toggleEnabled(indexer)}
-									aria-label={indexer.enabled ? 'Disable indexer' : 'Enable indexer'}
-								/>
-							</label>
-							<button
-								type="button"
-								class="btn btn-ghost btn-sm btn-square"
-								onclick={() => startEdit(indexer)}
-								aria-label={isOpen ? 'Collapse' : 'Expand'}
-							>
-								<ChevronDown
-									class={isOpen
-										? 'size-5 rotate-180 transition-transform'
-										: 'size-5 transition-transform'}
-									aria-hidden="true"
-								/>
-							</button>
+							<h3 class="text-lg font-bold">New indexer</h3>
 						</div>
-
-						{#if isOpen && draft}
-							<div class="space-y-5 border-t border-base-300 p-5">
-								{@render editForm()}
-							</div>
-						{/if}
-					</div>
-				</li>
-			{/each}
-		</ul>
-
-		{#if editingId === NEW && draft}
-			<div class="card border border-accent/40 bg-base-200">
-				<div class="card-body gap-0 p-0">
-					<div class="flex items-center gap-3 p-4">
-						<div class="grid size-12 place-items-center rounded-2xl bg-base-300/60">
-							<Rss class="size-6 text-accent" aria-hidden="true" />
+						<div class="space-y-5 border-t border-base-300 p-5">
+							{@render editForm()}
 						</div>
-						<h3 class="text-lg font-bold">New indexer</h3>
-					</div>
-					<div class="space-y-5 border-t border-base-300 p-5">
-						{@render editForm()}
 					</div>
 				</div>
-			</div>
-		{:else}
-			<button type="button" class="btn btn-sm" onclick={startAdd}>
-				<Plus class="size-4" aria-hidden="true" /> Add indexer
-			</button>
+			{:else}
+				<button type="button" class="btn btn-sm" onclick={startAdd}>
+					<Plus class="size-4" aria-hidden="true" /> Add indexer
+				</button>
+			{/if}
+			{#if pluginIndexers.length > 0}
+				<div class="rounded-box border border-base-300 bg-base-200 px-3 py-2">
+					<p class="text-xs font-semibold uppercase tracking-wide text-base-content/50">
+						Plugin indexers
+					</p>
+					<p class="mt-1 text-xs text-base-content/60">
+						Plugins provide these. Configure them under Plugins; you cannot edit them here. A plugin
+						indexer for Usenet appears with Usenet results; any other target gets its own group in
+						review.
+					</p>
+					<ul class="mt-2 space-y-1.5">
+						{#each pluginIndexers as source (source.key)}
+							<li class="flex flex-wrap items-center gap-1.5 text-sm">
+								<span class="font-medium">{source.display_name || source.key}</span>
+								<span class="badge badge-ghost badge-sm" title="Indexer target">
+									targets {source.target_source || source.key}
+								</span>
+								<span
+									class="badge badge-sm"
+									class:badge-success={source.configured}
+									class:badge-ghost={!source.configured}
+								>
+									{source.configured ? 'Configured' : 'Not configured'}
+								</span>
+								<span class="badge badge-ghost badge-sm">{source.health}</span>
+							</li>
+						{/each}
+					</ul>
+				</div>
+			{/if}
 		{/if}
-	{/if}
+	</SettingsSectionCollapse>
+
+	<SettingsSectionCollapse
+		title="Prowlarr"
+		description="One connection that searches all of its indexers at once"
+		icon={Radar}
+		bind:isOpen={prowlarrOpen}
+		name="usenet-backend-sections"
+	>
+		{#if prowlarrOpen}
+			<SettingsProwlarr />
+		{/if}
+	</SettingsSectionCollapse>
 </section>
 
 {#snippet editForm()}

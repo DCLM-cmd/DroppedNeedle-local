@@ -80,6 +80,7 @@ async def test_recall_records_deterministic_payload_reason_without_breaking(
     while the shared breaker stays closed (non-breaking contract intact)."""
     from infrastructure.degradation import clear_degradation_context, init_degradation_context
     from repositories.musicbrainz_album import MusicBrainzAlbumMixin
+    from infrastructure.cache.memory_cache import InMemoryCache
 
     monkeypatch.setattr(
         mb_base,
@@ -92,7 +93,7 @@ async def test_recall_records_deterministic_payload_reason_without_breaking(
             return SimpleNamespace(cache_ttl_search=60)
 
     repo = MusicBrainzAlbumMixin.__new__(MusicBrainzAlbumMixin)
-    repo._cache = SimpleNamespace(get=AsyncMock(return_value=None), set=AsyncMock())
+    repo._cache = InMemoryCache()
     repo._preferences_service = _StubPreferences()
 
     ctx = init_degradation_context()

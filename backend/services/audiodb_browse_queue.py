@@ -118,7 +118,7 @@ class AudioDBBrowseQueue:
                         )
 
                     processed += 1
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - failing queue item must not stall the queue
                     logger.error(
                         "audiodb.browse_queue action=item_error entity_type=%s mbid=%s error=%s",
                         item.entity_type,

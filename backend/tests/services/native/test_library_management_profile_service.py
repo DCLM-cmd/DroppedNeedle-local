@@ -6,6 +6,7 @@ import pytest
 
 from api.v1.schemas.library_management import (
     COMPLETE_LIBRARY_ORGANIZER_PROFILE_ID,
+    LEGACY_DEFAULT_SIDECAR_PATTERNS,
     LEGACY_NAMING_PROFILE_ID,
     PICARD_ORGANIZER_MULTI_DISC_NAMING_SCRIPT_ID,
     PICARD_ORGANIZER_NAMING_SCRIPT_ID,
@@ -645,4 +646,425 @@ def test_recycle_bin_cannot_overlap_library_root(tmp_path: Path, location: str) 
         service.save_settings(
             proposed,
             expected_settings_revision=current.settings_revision,
+        )
+
+
+def test_activation_health_empty_for_fresh_activation(tmp_path: Path) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    _activate(service, prefs)
+
+    assert service.activation_health().stale_root_ids == []
+
+
+def test_activation_health_flags_profile_changed_after_activation(
+    tmp_path: Path,
+) -> None:
+    """A migration-style rewrite (saved outside the gate, like #401) surfaces.
+
+    The profile change must flag the root in health AND hold the automatic
+    gate - the two share one predicate and must never drift.
+    """
+
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    _activate(service, prefs)
+    root_id = prefs.get_typed_library_settings_raw().library_roots[0].id
+
+    current = service.get_settings()
+    rewritten = prefs.get_library_management_settings_raw()
+    organizer = next(
+        profile
+        for profile in rewritten.profiles
+        if profile.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    organizer.organization.sidecar_patterns = [
+        *organizer.organization.sidecar_patterns,
+        "artwork*.jpg",
+    ]
+    prefs.save_library_management_settings_if_current(
+        rewritten,
+        expected_settings_revision=current.settings_revision,
+    )
+    policy_revision = LibraryPolicyResolver(
+        prefs.get_typed_library_settings_raw()
+    ).policy_revision
+
+    assert service.activation_health().stale_root_ids == [root_id]
+    with pytest.raises(StaleRevisionError, match="activation is stale"):
+        service.prepare_automatic_profile(
+            root_id=root_id,
+            trigger="acquisition",
+            expected_policy_revision=policy_revision,
+        )
+
+
+def test_activation_health_ignores_inactive_assignments(tmp_path: Path) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    root_id = prefs.get_typed_library_settings_raw().library_roots[0].id
+    current = service.get_settings()
+    proposed = prefs.get_library_management_settings_raw()
+    proposed.root_assignments = [
+        LibraryManagementRootAssignment(root_id=root_id, enabled=True)
+    ]
+    service.save_settings(
+        proposed,
+        expected_settings_revision=current.settings_revision,
+    )
+
+    assert service.activation_health().stale_root_ids == []
+
+
+def test_activation_health_flags_never_activated_assignment(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    root_id = prefs.get_typed_library_settings_raw().library_roots[0].id
+    current = service.get_settings()
+    proposed = prefs.get_library_management_settings_raw()
+    proposed.root_assignments = [
+        LibraryManagementRootAssignment(
+            root_id=root_id,
+            enabled=True,
+            automatic_acquisitions=True,
+        )
+    ]
+    prefs.save_library_management_settings_if_current(
+        proposed,
+        expected_settings_revision=current.settings_revision,
+    )
+
+    assert service.activation_health().stale_root_ids == [root_id]
+
+
+def test_activation_health_blocks_every_active_root_when_policy_unresolvable(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path, available=False)
+    service = _service(prefs, validate=True)
+    root_id = prefs.get_typed_library_settings_raw().library_roots[0].id
+    current = service.get_settings()
+    proposed = prefs.get_library_management_settings_raw()
+    proposed.root_assignments = [
+        LibraryManagementRootAssignment(
+            root_id=root_id,
+            enabled=True,
+            automatic_acquisitions=True,
+        )
+    ]
+    prefs.save_library_management_settings_if_current(
+        proposed,
+        expected_settings_revision=current.settings_revision,
+    )
+    policy_revision = LibraryPolicyResolver(
+        prefs.get_typed_library_settings_raw()
+    ).policy_revision
+
+    health = service.activation_health()
+    assert health.stale_root_ids == []
+    assert health.blocked_root_ids == [root_id]
+    assert health.blocked_reason is not None
+    assert "not currently available" in health.blocked_reason
+    with pytest.raises(ConfigurationError, match="not currently available"):
+        service.prepare_automatic_profile(
+            root_id=root_id,
+            trigger="acquisition",
+            expected_policy_revision=policy_revision,
+        )
+
+
+def _activate_over_legacy_sidecars(
+    service: LibraryManagementProfileService, prefs: PreferencesService
+) -> str:
+    """Forge the exact post-#401 state: new sidecars stored, legacy pin kept.
+
+    A pre-#401 activation pinned the legacy-sidecar hash, and the #401
+    load migration then rewrote the stored profiles without touching the
+    pin. Post-#401 code can no longer create that state through normal
+    reads (every load migrates first), so the pin is rewound directly to
+    what the same effective profile hashed to with legacy sidecars - a
+    construction proven against live data (it reproduces the real held
+    user's activation hash exactly).
+    """
+
+    _activate(service, prefs)
+    root_id = prefs.get_typed_library_settings_raw().library_roots[0].id
+    current = service.get_settings()
+    raw = prefs.get_library_management_settings_raw()
+    assignment = next(
+        value for value in raw.root_assignments if value.root_id == root_id
+    )
+    effective = LibraryManagementProfileService._effective_profile(raw, assignment)
+    legacy_organization = msgspec.structs.replace(
+        effective.organization,
+        sidecar_patterns=list(LEGACY_DEFAULT_SIDECAR_PATTERNS),
+    )
+    legacy_effective = msgspec.structs.replace(
+        effective, organization=legacy_organization
+    )
+    assignment.activation_profile_revision = profile_revision(legacy_effective)
+    assert assignment.activation_profile_revision != profile_revision(effective)
+    prefs.save_library_management_settings_if_current(
+        raw, expected_settings_revision=current.settings_revision
+    )
+    return root_id
+
+
+def _policy_revision_for(prefs: PreferencesService) -> str:
+    return LibraryPolicyResolver(
+        prefs.get_typed_library_settings_raw()
+    ).policy_revision
+
+
+def test_automatic_gate_carries_activation_across_default_migration(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    root_id = _activate_over_legacy_sidecars(service, prefs)
+
+    result = service.prepare_automatic_profile(
+        root_id=root_id,
+        trigger="acquisition",
+        expected_policy_revision=_policy_revision_for(prefs),
+    )
+
+    assert result is not None
+    # The carry is read-only: pins converge on the next user-confirmed dry
+    # run instead of being rewritten mid-import (which would churn the
+    # settings revision the in-flight bundle sealed).
+    carried = prefs.get_library_management_settings_raw()
+    assignment = next(
+        value for value in carried.root_assignments if value.root_id == root_id
+    )
+    effective = LibraryManagementProfileService._effective_profile(
+        carried, assignment
+    )
+    assert assignment.activation_profile_revision != profile_revision(effective)
+
+
+def test_activation_health_current_across_default_migration(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    _activate_over_legacy_sidecars(service, prefs)
+
+    health = service.activation_health()
+
+    assert health.stale_root_ids == []
+    assert health.blocked_root_ids == []
+
+
+def test_automatic_gate_still_holds_migration_plus_real_change(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    root_id = _activate_over_legacy_sidecars(service, prefs)
+    current = service.get_settings()
+    edited = prefs.get_library_management_settings_raw()
+    organizer = next(
+        profile
+        for profile in edited.profiles
+        if profile.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    organizer.organization.rename_enabled = (
+        not organizer.organization.rename_enabled
+    )
+    prefs.save_library_management_settings_if_current(
+        edited, expected_settings_revision=current.settings_revision
+    )
+
+    _assert_migration_plus_change_holds(service, prefs, root_id)
+
+
+def _assert_migration_plus_change_holds(
+    service: LibraryManagementProfileService,
+    prefs: PreferencesService,
+    root_id: str,
+) -> None:
+    with pytest.raises(StaleRevisionError, match="activation is stale"):
+        service.prepare_automatic_profile(
+            root_id=root_id,
+            trigger="acquisition",
+            expected_policy_revision=_policy_revision_for(prefs),
+        )
+    assert service.activation_health().stale_root_ids == [root_id]
+
+
+def test_automatic_gate_still_holds_migration_plus_naming_change(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    root_id = _activate_over_legacy_sidecars(service, prefs)
+    current = service.get_settings()
+    edited = prefs.get_library_management_settings_raw()
+    organizer = next(
+        profile
+        for profile in edited.profiles
+        if profile.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    organizer.organization.naming_script_id = (
+        PICARD_ORGANIZER_MULTI_DISC_NAMING_SCRIPT_ID
+    )
+    prefs.save_library_management_settings_if_current(
+        edited, expected_settings_revision=current.settings_revision
+    )
+
+    _assert_migration_plus_change_holds(service, prefs, root_id)
+
+
+def test_automatic_gate_still_holds_migration_plus_cleared_proof(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    root_id = _activate_over_legacy_sidecars(service, prefs)
+    current = service.get_settings()
+    edited = prefs.get_library_management_settings_raw()
+    assignment = next(
+        value for value in edited.root_assignments if value.root_id == root_id
+    )
+    assignment.activation_preview_token = None
+    prefs.save_library_management_settings_if_current(
+        edited, expected_settings_revision=current.settings_revision
+    )
+
+    _assert_migration_plus_change_holds(service, prefs, root_id)
+
+
+def test_automatic_gate_still_holds_migration_plus_overrides(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    root_id = _activate_over_legacy_sidecars(service, prefs)
+    current = service.get_settings()
+    edited = prefs.get_library_management_settings_raw()
+    organizer = next(
+        profile
+        for profile in edited.profiles
+        if profile.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    assignment = next(
+        value for value in edited.root_assignments if value.root_id == root_id
+    )
+    assignment.overrides = LibraryManagementRootOverrides(
+        move_enabled=not organizer.organization.move_enabled
+    )
+    prefs.save_library_management_settings_if_current(
+        edited, expected_settings_revision=current.settings_revision
+    )
+
+    _assert_migration_plus_change_holds(service, prefs, root_id)
+
+
+def test_automatic_gate_still_holds_migration_plus_policy_drift(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    root_id = _activate_over_legacy_sidecars(service, prefs)
+    current = service.get_settings()
+    edited = prefs.get_library_management_settings_raw()
+    assignment = next(
+        value for value in edited.root_assignments if value.root_id == root_id
+    )
+    assignment.activation_policy_revision = "bogus-policy-revision"
+    prefs.save_library_management_settings_if_current(
+        edited, expected_settings_revision=current.settings_revision
+    )
+
+    _assert_migration_plus_change_holds(service, prefs, root_id)
+
+
+def test_activation_health_omits_reason_when_nothing_is_blocked(
+    tmp_path: Path,
+) -> None:
+    prefs = _preferences(tmp_path)
+    service = _service(prefs, validate=True)
+    library_root = prefs.get_typed_library_settings_raw().library_roots[0].path
+    current = service.get_settings()
+    proposed = prefs.get_library_management_settings_raw()
+    proposed.recycle_bin_path = library_root
+    prefs.save_library_management_settings_if_current(
+        proposed,
+        expected_settings_revision=current.settings_revision,
+    )
+
+    health = service.activation_health()
+
+    assert health.stale_root_ids == []
+    assert health.blocked_root_ids == []
+    assert health.blocked_reason is None
+
+
+def test_activation_health_survives_one_broken_assignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "Music"
+    second = tmp_path / "Vinyl"
+    first.mkdir()
+    second.mkdir()
+    settings = Settings()
+    settings.config_file_path = tmp_path / "config.json"
+    settings.config_file_path.write_text(
+        json.dumps({"library_settings": {"library_paths": [str(first), str(second)]}}),
+        encoding="utf-8",
+    )
+    prefs = PreferencesService(settings)
+    service = LibraryManagementProfileService(prefs)
+    roots = prefs.get_typed_library_settings_raw().library_roots
+    current = service.get_settings()
+    healthy = _activation_assignment(
+        prefs,
+        settings_revision=current.settings_revision,
+    )
+    other = _activation_assignment(
+        prefs,
+        settings_revision=current.settings_revision,
+    )
+    other.root_id = roots[1].id
+    proposed = prefs.get_library_management_settings_raw()
+    proposed.root_assignments = [healthy, other]
+    prefs.save_library_management_settings_if_current(
+        proposed,
+        expected_settings_revision=current.settings_revision,
+    )
+
+    # A profile that vanishes between save and read (the bare StopIteration
+    # `_effective_profile` raises) must stain only its own root - as blocked,
+    # since a dry run would re-validate the same settings and fail too.
+    original = LibraryManagementProfileService._effective_profile
+
+    def flaky_effective(settings_value, assignment):  # noqa: ANN001, ANN202
+        if assignment.root_id == roots[1].id:
+            raise StopIteration("missing-profile")
+        return original(settings_value, assignment)
+
+    monkeypatch.setattr(
+        LibraryManagementProfileService,
+        "_effective_profile",
+        staticmethod(flaky_effective),
+    )
+
+    health = service.activation_health()
+    assert health.stale_root_ids == []
+    assert health.blocked_root_ids == [roots[1].id]
+    assert health.blocked_reason is None
+    policy_revision = LibraryPolicyResolver(
+        prefs.get_typed_library_settings_raw()
+    ).policy_revision
+    # Gate parity: the automatic path hits the same unmapped StopIteration
+    # for this root (unreachable via stored settings, which normalize
+    # forbids) while health degrades to blocked instead of failing.
+    with pytest.raises(StopIteration):
+        service.prepare_automatic_profile(
+            root_id=roots[1].id,
+            trigger="acquisition",
+            expected_policy_revision=policy_revision,
         )

@@ -11,6 +11,7 @@ import msgspec
 import pytest
 
 from infrastructure.audio.tagger import AudioTagger
+from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.persistence.library_db import LibraryDB
 from models.audio import AudioInfo, AudioTag, FingerprintResult
 from models.download_manifest import DownloadManifest, ExpectedFile, ExpectedTrack
@@ -22,6 +23,7 @@ from services.native.file_processor import (
     FileProcessor,
     VerifyStatus,
     _FolderCandidate,
+    _PlannedImport,
     _folder_names_wrong_album,
 )
 from services.native.library_manager import LibraryManager
@@ -326,6 +328,63 @@ async def test_process_one_conversion_accepts_later_recording_candidate(
     assert planned.authoritative_mapping is True
     assert planned.recording_mbid == "recording-1"
     assert planned.confidence == 1.0
+
+
+@pytest.mark.asyncio
+async def test_hold_conversion_bundle_passes_required_evidence_kwargs(
+    tmp_path: Path,
+) -> None:
+    """The conversion hold must pass record_held_import()'s required evidence
+    kwargs; omitting them raised TypeError on every verified candidate (#463).
+    The mock accepts any call, so the assertions on the recorded kwargs are
+    what pin the contract."""
+    fp, _manager, _client, _library, downloads = _make_processor(tmp_path, verify=False)
+    source = downloads / "A" / "track.flac"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"fake-audio")
+
+    download_store = AsyncMock(spec=DownloadStore)
+    download_store.get_task.return_value = MagicMock(
+        user_id="user-1", source="soulseek"
+    )
+    download_store.record_held_import.return_value = 1
+    fp._download_store = download_store
+    fp._held_dir = tmp_path / "held"
+
+    manifest = _conversion_manifest()
+    planned = _PlannedImport(
+        source=source,
+        target=tmp_path / "target.flac",
+        tag=AudioTag(
+            title="Airbag", artist="Radiohead", album="OK Computer", track_number=1
+        ),
+        info=AudioInfo(
+            duration_seconds=300.0,
+            bitrate=900,
+            sample_rate=44_100,
+            channels=2,
+            file_format="flac",
+            file_size_bytes=source.stat().st_size,
+        ),
+        release_group_mbid="rg-1",
+        release_mbid="release-1",
+        recording_mbid="recording-1",
+        release_track_mbid="release-track-1",
+        medium_position=1,
+        release_track_position=1,
+        authoritative_mapping=True,
+        confidence=0.97,
+        download_task_id="t1",
+        source_path=str(source),
+    )
+
+    await fp._hold_conversion_bundle([planned], manifest)
+
+    download_store.record_held_import.assert_awaited_once()
+    kwargs = download_store.record_held_import.await_args.kwargs
+    assert kwargs["evidence_title"] == "Airbag"
+    assert kwargs["evidence_artist"] == "Radiohead"
+    assert kwargs["evidence_score"] == 0.97
 
 
 @pytest.mark.asyncio
@@ -2129,9 +2188,19 @@ async def test_management_hold_retry_republishes_the_secured_unit_once(
         local_track_ids=("track-1",),
     )
 
-    paths = await fp.place_held_management_bundle(held)
+    events: list[tuple[str, int, int]] = []
+
+    async def record(stage: str, completed: int, total: int) -> None:
+        events.append((stage, completed, total))
+
+    paths = await fp.place_held_management_bundle(held, on_progress=record)
 
     assert paths == [expected]
+    assert events == [
+        ("planning", 1, 1),
+        ("publishing", 0, 1),
+        ("publishing", 1, 1),
+    ]
     retry_bundle = publisher.await_args.args[0]
     assert len(retry_bundle.files) == 1
     assert retry_bundle.files[0].input_path == held[0].held_path
@@ -3182,3 +3251,269 @@ async def test_subset_import_empty_setting_emits_no_partial_signal(
     assert not [
         r for r in caplog.records if r.getMessage() == "process.partial_retry"
     ]
+
+
+# --- occupied destination (#418): a bare existing file is a collision, not success ---
+
+# where the naming template places the imported flac fixture for the default manifest
+_OCCUPIED_REL = "Radiohead/OK Computer (1997)/0101 Airbag.flac"
+
+
+async def _seed_target_row(manager, target: Path, *, rg: str, recording_mbid: str):
+    """A catalog row AT the import target, as a prior publication would leave it."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(_FLAC, target)
+    tag, info = AudioTagger().read_tags(target)
+    await manager.upsert_file(
+        target,
+        tag,
+        info,
+        release_group_mbid=rg,
+        recording_mbid=recording_mbid,
+        source="download",
+    )
+
+
+@pytest.mark.asyncio
+async def test_occupied_target_without_attribution_is_collision_not_success(
+    tmp_path: Path,
+):
+    """#418 characterization: a bare file at the destination (zero publication,
+    zero catalog attribution) must fail as target_occupied - held for review with
+    the source preserved - instead of reporting a successful acquisition."""
+    from services.native.file_processor import TARGET_OCCUPIED
+
+    fp, store, manager, downloads = _held_wired_processor(tmp_path, verify=False)
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+    )
+    _place(downloads, "A/track.flac")
+    target = tmp_path / "library" / _OCCUPIED_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"a foreign file squatting at the destination")
+    manifest = _manifest(_sized(downloads, "A/track.flac"), task_id=task.id)
+
+    result = await fp.process_downloaded(manifest)
+
+    assert result.succeeded == []
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == TARGET_OCCUPIED
+    assert TARGET_OCCUPIED not in QUARANTINE_REASONS
+    assert result.publisher_bundle_ids == []  # nothing published
+    assert result.workspace_disposition == "preserve"  # source retained
+    assert (downloads / "A/track.flac").exists()
+    assert target.read_bytes() == b"a foreign file squatting at the destination"
+    assert await manager.get_imported_file(task.id, "A/track.flac") is None
+    held = await store.list_held_imports("user-a", "user")
+    assert len(held) == 1
+    assert held[0].reason == TARGET_OCCUPIED
+    assert str(target) in (held[0].reason_detail or "")
+
+
+@pytest.mark.asyncio
+async def test_occupied_target_with_covering_attribution_stays_success(
+    tmp_path: Path,
+):
+    """#418 verified-present: when the catalog proves the occupying file IS this
+    track, the import still succeeds without re-publishing (pooled success)."""
+    fp, store, manager, downloads = _held_wired_processor(tmp_path, verify=False)
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+    )
+    _place(downloads, "A/track.flac")
+    target = tmp_path / "library" / _OCCUPIED_REL
+    await _seed_target_row(manager, target, rg="rg-1", recording_mbid="rec-airbag-0001")
+    manifest = _manifest(_sized(downloads, "A/track.flac"), task_id=task.id)
+
+    result = await fp.process_downloaded(manifest)
+
+    assert result.failed == []
+    assert result.succeeded == [str(target)]
+    assert result.publisher_bundle_ids == []
+    assert (downloads / "A/track.flac").exists()  # duplicates never auto-deleted
+    assert await store.list_held_imports("user-a", "user") == []
+
+
+@pytest.mark.asyncio
+async def test_occupied_target_attributed_to_other_album_is_collision(
+    tmp_path: Path,
+):
+    """#418: an occupant the catalog attributes to a DIFFERENT release group is
+    not this track - collision, even though a row exists for the path."""
+    from services.native.file_processor import TARGET_OCCUPIED
+
+    fp, store, manager, downloads = _held_wired_processor(tmp_path, verify=False)
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+    )
+    _place(downloads, "A/track.flac")
+    target = tmp_path / "library" / _OCCUPIED_REL
+    await _seed_target_row(
+        manager, target, rg="rg-other", recording_mbid="rec-airbag-0001"
+    )
+    manifest = _manifest(_sized(downloads, "A/track.flac"), task_id=task.id)
+
+    result = await fp.process_downloaded(manifest)
+
+    assert result.succeeded == []
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == TARGET_OCCUPIED
+    assert result.publisher_bundle_ids == []
+    assert result.workspace_disposition == "preserve"
+    assert (downloads / "A/track.flac").exists()
+    held = await store.list_held_imports("user-a", "user")
+    assert len(held) == 1
+    assert held[0].reason == TARGET_OCCUPIED
+
+
+@pytest.mark.asyncio
+async def test_occupied_target_rg_match_is_case_insensitive(tmp_path: Path):
+    """#418: rows store lower-cased MBIDs, so the attribution check folds case -
+    an upper-cased request RG still verifies against its row."""
+    fp, store, manager, downloads = _held_wired_processor(tmp_path, verify=False)
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+    )
+    _place(downloads, "A/track.flac")
+    target = tmp_path / "library" / _OCCUPIED_REL
+    await _seed_target_row(manager, target, rg="rg-1", recording_mbid="rec-airbag-0001")
+    manifest = _manifest(
+        _sized(downloads, "A/track.flac"), task_id=task.id, rg="RG-1"
+    )
+
+    result = await fp.process_downloaded(manifest)
+
+    assert result.failed == []
+    assert result.succeeded == [str(target)]
+
+
+def _folder_collision_manifest(task_id: str) -> DownloadManifest:
+    return _manifest(
+        task_id=task_id,
+        expected_tracks=[
+            ExpectedTrack(
+                track_number=1,
+                disc_number=1,
+                title="Airbag",
+                duration_seconds=0.3,
+                recording_mbid="rec-airbag-0001",
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_folder_occupied_target_without_attribution_is_collision(
+    tmp_path: Path,
+):
+    """#418 folder-path equivalent: a bare occupant fails as target_occupied with
+    the source held, instead of reporting a successful acquisition."""
+    from services.native.file_processor import TARGET_OCCUPIED
+
+    fp, store, manager, _downloads = _held_wired_processor(tmp_path, verify=False)
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+    )
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    shutil.copy(_FLAC, job_dir / "track.flac")
+    target = tmp_path / "library" / _OCCUPIED_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"a foreign file squatting at the destination")
+
+    result = await fp.process_downloaded_folder(
+        _folder_collision_manifest(task.id), [job_dir / "track.flac"]
+    )
+
+    assert result.succeeded == []
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == TARGET_OCCUPIED
+    assert result.publisher_bundle_ids == []
+    assert result.workspace_disposition == "preserve"
+    assert (job_dir / "track.flac").exists()
+    assert target.read_bytes() == b"a foreign file squatting at the destination"
+    held = await store.list_held_imports("user-a", "user")
+    assert len(held) == 1
+    assert held[0].reason == TARGET_OCCUPIED
+    assert str(target) in (held[0].reason_detail or "")
+
+
+@pytest.mark.asyncio
+async def test_folder_occupied_target_with_covering_attribution_stays_success(
+    tmp_path: Path,
+):
+    """#418 folder-path equivalent: a catalog-verified occupant still succeeds
+    without re-publishing."""
+    fp, store, manager, _downloads = _held_wired_processor(tmp_path, verify=False)
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+    )
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    shutil.copy(_FLAC, job_dir / "track.flac")
+    target = tmp_path / "library" / _OCCUPIED_REL
+    await _seed_target_row(manager, target, rg="rg-1", recording_mbid="rec-airbag-0001")
+
+    result = await fp.process_downloaded_folder(
+        _folder_collision_manifest(task.id), [job_dir / "track.flac"]
+    )
+
+    assert result.failed == []
+    assert result.succeeded == [str(target)]
+    assert result.publisher_bundle_ids == []
+    assert await store.list_held_imports("user-a", "user") == []
+
+
+@pytest.mark.asyncio
+async def test_folder_occupied_target_attributed_to_other_album_is_collision(
+    tmp_path: Path,
+):
+    """#418 folder-path equivalent: an occupant attributed to another release
+    group is a collision, not this track."""
+    from services.native.file_processor import TARGET_OCCUPIED
+
+    fp, store, manager, _downloads = _held_wired_processor(tmp_path, verify=False)
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+    )
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    shutil.copy(_FLAC, job_dir / "track.flac")
+    target = tmp_path / "library" / _OCCUPIED_REL
+    await _seed_target_row(
+        manager, target, rg="rg-other", recording_mbid="rec-airbag-0001"
+    )
+
+    result = await fp.process_downloaded_folder(
+        _folder_collision_manifest(task.id), [job_dir / "track.flac"]
+    )
+
+    assert result.succeeded == []
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == TARGET_OCCUPIED
+    assert result.publisher_bundle_ids == []
+    assert result.workspace_disposition == "preserve"
+    held = await store.list_held_imports("user-a", "user")
+    assert len(held) == 1
+    assert held[0].reason == TARGET_OCCUPIED

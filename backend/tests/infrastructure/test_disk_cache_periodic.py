@@ -1,76 +1,38 @@
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from core.tasks import cleanup_disk_cache_periodically
+from infrastructure.cache.disk_cache import DiskMetadataCache
 
 
 @pytest.mark.asyncio
-async def test_periodic_cleanup_calls_both_caches():
-    disk_cache = AsyncMock()
-    cover_disk_cache = AsyncMock()
+async def test_cleanup_retries_after_cover_failure_without_skipping_cadence(tmp_path, monkeypatch):
+    clock = [2_000_000_000.0]
+    cache = DiskMetadataCache(base_path=tmp_path, clock=lambda: clock[0])
+    await cache.set_album("first", {"title": "First"}, ttl_seconds=60)
+    intervals = []
 
-    iteration_count = 0
+    async def advance(interval):
+        intervals.append(interval)
+        if len(intervals) == 3:
+            raise asyncio.CancelledError
+        clock[0] += 120
 
-    original_cleanup = cleanup_disk_cache_periodically
+    class CoverCache:
+        failed = False
 
-    async def run_one_iteration():
-        nonlocal iteration_count
-        task = asyncio.create_task(
-            original_cleanup(disk_cache, interval=0, cover_disk_cache=cover_disk_cache)
-        )
-        await asyncio.sleep(0.05)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        async def enforce_size_limit(self, *, force):
+            if not self.failed:
+                self.failed = True
+                await cache.set_album("after-error", {"title": "After error"}, ttl_seconds=60)
+                raise OSError("fixture cover cleanup failure")
 
-    await run_one_iteration()
+        def cleanup_expired(self):
+            return 0
 
-    disk_cache.cleanup_expired_recent.assert_called()
-    disk_cache.enforce_recent_size_limits.assert_called()
-    disk_cache.cleanup_expired_covers.assert_called()
-    disk_cache.enforce_cover_size_limits.assert_called()
-    cover_disk_cache.enforce_size_limit.assert_called_with(force=True)
+    monkeypatch.setattr(asyncio, "sleep", advance)
+    await cleanup_disk_cache_periodically(cache, interval=120, cover_disk_cache=CoverCache())
 
-
-@pytest.mark.asyncio
-async def test_periodic_cleanup_works_without_cover_cache():
-    disk_cache = AsyncMock()
-
-    task = asyncio.create_task(
-        cleanup_disk_cache_periodically(disk_cache, interval=0, cover_disk_cache=None)
-    )
-    await asyncio.sleep(0.05)
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-
-    disk_cache.cleanup_expired_recent.assert_called()
-    disk_cache.enforce_recent_size_limits.assert_called()
-    disk_cache.cleanup_expired_covers.assert_called()
-    disk_cache.enforce_cover_size_limits.assert_called()
-
-
-@pytest.mark.asyncio
-async def test_periodic_cleanup_continues_on_cover_cache_error():
-    disk_cache = AsyncMock()
-    cover_disk_cache = AsyncMock()
-    cover_disk_cache.enforce_size_limit.side_effect = [RuntimeError("disk full"), None]
-
-    task = asyncio.create_task(
-        cleanup_disk_cache_periodically(disk_cache, interval=0, cover_disk_cache=cover_disk_cache)
-    )
-    await asyncio.sleep(0.1)
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-
-    assert cover_disk_cache.enforce_size_limit.call_count >= 1
-    assert disk_cache.cleanup_expired_recent.call_count >= 1
+    assert intervals == [120, 120, 120]
+    assert list((tmp_path / "recent" / "albums").glob("*.json")) == []

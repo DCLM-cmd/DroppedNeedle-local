@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from infrastructure.observability.provider_counters import ProviderWorkload, provider_workload_scope
 from collections.abc import Sequence
 
 import time
@@ -31,9 +33,22 @@ from services.native.album_candidate_service import (
     AlbumCandidateService,
 )
 from services.native.album_evidence_engine import (
+    EDITION_UNCERTAIN_REASON,
     MATCHER_VERSION,
     AlbumEvidenceEngine,
     is_edition_uncertain,
+)
+from infrastructure.observability.library_metrics import LibraryMetrics
+from core.exceptions import ExternalServiceError, StaleRevisionError
+from infrastructure.queue.priority_queue import RequestPriority
+from repositories.edition_policy import (
+    AUTO_ACCEPT_EVIDENCE_REASONS,
+    auto_accept_decision,
+    evidence_key,
+)
+from repositories.protocols.musicbrainz_management import (
+    CanonicalMusicBrainzRepositoryProtocol,
+    MbManagementRelease,
 )
 from services.native.conditional_fingerprint_service import (
     FINGERPRINTER_VERSION,
@@ -47,6 +62,13 @@ from services.native.identification_revisions import (
     album_identity_revision,
     album_input_revisions,
 )
+from services.native.track_provenance import (
+    derive_album_provenance,
+    derive_title_artist_provenance,
+    parse_names_for_row,
+    resolve_provenance,
+    track_stem,
+)
 
 CacheInvalidator = Callable[[set[str]], Awaitable[None]]
 # ST1: scoped hooks also receive the local album ids whose commits triggered
@@ -59,6 +81,8 @@ PostIdentificationCallback = Callable[[str, str], Awaitable[object]]
 MAX_NEW_FINGERPRINTS_PER_ATTEMPT = 2
 
 logger = logging.getLogger(__name__)
+
+_edition_hold_metrics = LibraryMetrics.for_library_workload()
 
 
 def _valid_mbid(value: str | None) -> bool:
@@ -75,18 +99,120 @@ def _candidate_key(evidence: CandidateEvidence) -> str:
     return f"{evidence.release_group_mbid}:{evidence.release_mbid or ''}"
 
 
+# Step 2.5 (E-02): bounded canonical I/O for the identify-lane gate - only
+# the final top-N by score are ever fetched, mirroring the repair lane.
+_IDENTIFY_GATE_TOP_N = 3
+
+
+def _candidate_completely_maps(
+    indexed_ids: set[str], evidence: CandidateEvidence
+) -> bool:
+    """Service-side mirror of the store's complete-mapping precondition.
+
+    The winner must map every indexed track to a distinct release track with
+    recording + release-track MBIDs and positions (repair shape at
+    ``identity_repair_service.py:762-765`` via ``_complete_track_identity_mapping``).
+    """
+    if not evidence.release_mbid:
+        return False
+    seen: dict[str, TrackEvidence] = {}
+    release_track_ids: set[str] = set()
+    for item in evidence.track_evidence:
+        if item.local_track_id in seen:
+            return False
+        if (
+            not item.recording_mbid
+            or not item.release_track_mbid
+            or not item.candidate_disc_number
+            or not item.candidate_track_position
+            or item.release_track_mbid in release_track_ids
+        ):
+            return False
+        seen[item.local_track_id] = item
+        release_track_ids.add(item.release_track_mbid)
+    return set(seen) == set(indexed_ids)
+
+
+def _has_non_descriptive_proof(tracks: list[GroupingTrack]) -> bool:
+    """Lone-ranked accepts need provider-issued proof beyond description.
+
+    Any local recording or release-track MBID (embedded tag or stored
+    identity) counts - the same bar as the W6 lone-eligible rule.
+    """
+    return any(
+        track.recording_mbid or track.release_track_mbid for track in tracks
+    )
+
+
 def _to_grouping_track(row: dict) -> GroupingTrack:
+    relative_path = str(row["relative_path"])
+    stem = track_stem(relative_path)
+    title = str(row["title"] or "")
+    artist_name = str(row["artist_name"] or "")
+    album_title = str(row["album_title"] or "")
+    album_artist_name = str(row["album_artist_name"] or "")
+    title_provenance = resolve_provenance(
+        row.get("title_provenance"),
+        derive_title_artist_provenance(title, artist_name, stem),
+    )
+    album_title_provenance = resolve_provenance(
+        row.get("album_title_provenance"),
+        derive_album_provenance(row.get("tag_album_title"), album_title),
+    )
+    album_artist_provenance = resolve_provenance(
+        row.get("album_artist_provenance"),
+        derive_album_provenance(
+            row.get("tag_album_artist_name"), album_artist_name
+        ),
+    )
+    track_number = int(row["track_number"] or 0)
+    if (
+        not title
+        and title_provenance == "absent"
+        and album_title_provenance == "absent"
+        and album_artist_provenance == "absent"
+    ):
+        # M-01 backfill for rows with no display values at all (pre-indexer-
+        # fallback vintages and harness rows): parse against the folded
+        # parent, mirroring `_prepare_tagged`. Non-empty displays keep their
+        # derived provenance above - never re-parse those. A parse that
+        # strips nothing (title/album == stem) is not evidence, matching the
+        # indexer and the derivation heuristic.
+        parsed = parse_names_for_row(relative_path)
+        parsed_title = (
+            parsed.title
+            if parsed.title and parsed.title != stem
+            else None
+        )
+        if parsed_title:
+            title, title_provenance = parsed_title, "parsed"
+        if parsed.artist:
+            artist_name = parsed.artist
+            if title and title_provenance == "absent":
+                title_provenance = "parsed"
+        if parsed.album and parsed.album != stem and not album_title:
+            album_title, album_title_provenance = parsed.album, "parsed"
+        if not album_artist_name and parsed.artist:
+            album_artist_name, album_artist_provenance = (
+                parsed.artist,
+                "parsed",
+            )
+        if not track_number and parsed.track_number:
+            track_number = parsed.track_number
     return GroupingTrack(
         local_track_id=str(row["id"]),
         root_id=str(row["root_id"]),
-        relative_path=str(row["relative_path"]),
-        title=str(row["title"] or ""),
-        artist_name=str(row["artist_name"] or ""),
-        album_title=str(row["album_title"] or ""),
-        album_artist_name=str(row["album_artist_name"] or ""),
+        relative_path=relative_path,
+        title=title,
+        artist_name=artist_name,
+        album_title=album_title,
+        album_artist_name=album_artist_name,
+        title_provenance=title_provenance,
+        album_title_provenance=album_title_provenance,
+        album_artist_provenance=album_artist_provenance,
         artist_sort_name=row["artist_sort"],
         album_artist_sort_name=row["album_artist_sort"],
-        track_number=int(row["track_number"] or 0),
+        track_number=track_number,
         disc_number=int(row["disc_number"] or 1),
         duration_seconds=row["duration_seconds"],
         recording_mbid=row["embedded_recording_mbid"] or row.get("recording_mbid"),
@@ -239,6 +365,19 @@ def _embedded_release_decision(
             reason_code="CONFLICTING_EMBEDDED_IDS",
         )
     return None
+
+
+def _populated_releases_agree(tracks: list[GroupingTrack]) -> bool:
+    """True when every populated embedded release MBID names one release.
+
+    Blank tracks abstain (matching the release-group seed and the recall
+    gate, which both count populated claims only); genuine disagreement
+    still returns False.
+    """
+    populated = {
+        str(track.release_mbid).casefold() for track in tracks if track.release_mbid
+    }
+    return len(populated) == 1
 
 
 def _enforce_existing_album_identity(
@@ -419,6 +558,8 @@ class AlbumIdentificationService:
         invalidate: ScopedCacheInvalidator | None = None,
         on_identified: PostIdentificationCallback | None = None,
         provider_available: Callable[[], bool] | None = None,
+        canonical_provider: CanonicalMusicBrainzRepositoryProtocol | None = None,
+        edition_opt_in: Callable[[str], bool] | None = None,
     ) -> None:
         self._store = store
         self._queue = queue
@@ -428,7 +569,231 @@ class AlbumIdentificationService:
         self._invalidate = invalidate
         self._on_identified = on_identified
         self._provider_available = provider_available
+        # Step 2.5 (E-02): the same canonical handle the repair lane uses,
+        # plus the profile-level opt-in resolver. None keeps the pre-auto
+        # behavior byte-for-byte (gate off everywhere).
+        self._canonical_provider = canonical_provider
+        self._edition_opt_in = edition_opt_in
 
+    async def _evaluate_edition_gate(
+        self,
+        *,
+        job: dict,
+        worker_id: str,
+        decision: IdentificationDecision,
+        tracks: list[GroupingTrack],
+        raw_tracks: list[dict],
+        timestamp: float,
+    ) -> tuple[str, CandidateEvidence | None, list[dict[str, object]]]:
+        """Step 2.5 (E-02) identify-lane auto-accept gate (D-EDITION-AUTO).
+
+        Runs pre-persist, after both backstops and the transient-defer block.
+        Returns ``(disposition, winner, ranking)`` where disposition is
+        ``"legacy"`` (gate off or nothing exact to gate - persist as today),
+        ``"accept"`` (winner sealed via the accept tx in ``finish``), a
+        ``"veto:<reason>"`` (decision demoted in place to RG-only +
+        ``edition_to_confirm``), or ``"deferred"`` (canonical fetch failed -
+        the job was deferred under ``PROVIDER_TEMPORARILY_UNAVAILABLE``,
+        never review).
+        """
+        album_id = str(job["local_album_id"])
+        if self._edition_opt_in is None or self._canonical_provider is None:
+            logger.debug(
+                "identify edition gate: legacy (gate unwired) album=%s",
+                album_id,
+            )
+            return "legacy", None, []
+        root_ids = {track.root_id for track in tracks}
+        if len(root_ids) != 1 or not self._edition_opt_in(next(iter(root_ids))):
+            # Single-root albums only (repair :796-801): multi-root albums
+            # stay legacy even when every root opted in.
+            logger.debug(
+                "identify edition gate: legacy (opt-in off or multi-root=%s) album=%s",
+                sorted(root_ids),
+                album_id,
+            )
+            return "legacy", None, []
+        if decision.outcome != "identified" or not decision.selected_candidate_key:
+            logger.debug(
+                "identify edition gate: legacy (outcome=%s) album=%s",
+                decision.outcome,
+                album_id,
+            )
+            return "legacy", None, []
+        selected = next(
+            (
+                candidate
+                for candidate in decision.candidates
+                if _candidate_key(candidate) == decision.selected_candidate_key
+                and candidate.release_mbid
+            ),
+            None,
+        )
+        if selected is None:
+            logger.debug(
+                "identify edition gate: legacy (no selectable winner) album=%s",
+                album_id,
+            )
+            return "legacy", None, []
+        if any(
+            str(row.get("track_identity_source")) in ("manual", "legacy_import")
+            for row in raw_tracks
+        ):
+            return self._veto_edition_gate(
+                decision,
+                selected,
+                [],
+                "PROTECTED_TRACKS",
+                album_id,
+                {"reason": "manual/legacy track rows present"},
+            )
+        top = sorted(
+            decision.candidates,
+            key=lambda item: evidence_key(
+                float(item.score),
+                None,
+                item.release_date,
+                None,
+                str(item.release_mbid or ""),
+            ),
+        )[:_IDENTIFY_GATE_TOP_N]
+        indexed_ids = {str(row["id"]) for row in raw_tracks}
+        fetched: list[tuple[CandidateEvidence, MbManagementRelease]] = []
+        for candidate in top:
+            if not candidate.release_mbid:
+                continue
+            try:
+                release = await self._canonical_provider.get_canonical_release(
+                    str(candidate.release_mbid),
+                    includes=("media",),
+                    priority=RequestPriority.BACKGROUND_SYNC,
+                )
+            except (ExternalServiceError, CircuitOpenError) as error:
+                logger.debug(
+                    "identify edition gate: defer (canonical fetch failed) album=%s release=%s",
+                    album_id,
+                    candidate.release_mbid,
+                )
+                await self._queue.defer(
+                    job,
+                    worker_id,
+                    "PROVIDER_TEMPORARILY_UNAVAILABLE",
+                    now=timestamp,
+                    retry_after_seconds=getattr(error, "retry_after_seconds", None),
+                )
+                return "deferred", None, []
+            if release is None:
+                # Unfetchable candidates are skipped from auto-accept, not failed.
+                logger.debug(
+                    "identify edition gate: candidate unfetchable, skipped album=%s release=%s",
+                    album_id,
+                    candidate.release_mbid,
+                )
+                continue
+            fetched.append((candidate, release))
+        pool = [
+            (candidate, release)
+            for candidate, release in fetched
+            if candidate.reason_code in AUTO_ACCEPT_EVIDENCE_REASONS
+            and (candidate.release_group_mbid or "").casefold()
+            == (selected.release_group_mbid or "").casefold()
+            and _candidate_completely_maps(indexed_ids, candidate)
+        ]
+        ranked = sorted(
+            (
+                (
+                    evidence_key(
+                        float(candidate.score),
+                        release.status,
+                        release.date,
+                        release.country,
+                        str(candidate.release_mbid),
+                    ),
+                    float(candidate.score),
+                    candidate,
+                )
+                for candidate, release in pool
+            ),
+            key=lambda item: item[0],
+        )
+        ranking = [
+            {
+                "key": list(key),
+                "score": score,
+                "release_mbid": str(candidate.release_mbid),
+            }
+            for key, score, candidate in ranked
+        ]
+        gate_ok, gate_reason = auto_accept_decision(
+            [(key, score) for key, score, _ in ranked]
+        )
+        winner = ranked[0][2] if ranked else None
+        detail: dict[str, object] = {
+            "scores": [score for _, score, _ in ranked],
+            "releases": [str(item.release_mbid) for _, _, item in ranked],
+            "reason": gate_reason,
+        }
+        if gate_ok and winner is not None and str(
+            winner.release_mbid
+        ) != str(selected.release_mbid):
+            # The canonical tie-breaks reordered past the decided edition:
+            # never seal a different release than the decision selected.
+            gate_ok, gate_reason = False, "WINNER_MISMATCH"
+            detail["reason"] = gate_reason
+        if (
+            gate_ok
+            and len(ranked) == 1
+            and not _has_non_descriptive_proof(tracks)
+        ):
+            gate_ok, gate_reason = False, "LONE_WITHOUT_PROOF"
+            detail["reason"] = gate_reason
+        if not gate_ok or winner is None:
+            return self._veto_edition_gate(
+                decision, selected, ranking, gate_reason, album_id, detail
+            )
+        logger.debug(
+            "identify edition gate: accept album=%s release=%s scores=%s",
+            album_id,
+            winner.release_mbid,
+            detail["scores"],
+            extra={"album_id": album_id, "gate": "AUTO_ACCEPT", **detail},
+        )
+        return "accept", winner, ranking
+
+    @staticmethod
+    def _veto_edition_gate(
+        decision: IdentificationDecision,
+        selected: CandidateEvidence,
+        ranking: list[dict[str, object]],
+        reason: str,
+        album_id: str,
+        detail: dict[str, object],
+    ) -> tuple[str, None, list[dict[str, object]]]:
+        """Demote a vetoed identified decision to RG-only + edition_to_confirm.
+
+        Reuses the P2 tier persist shape: the release group pins, the exact
+        edition stays unproven, and the review row carries the ranked keys.
+        """
+        logger.debug(
+            "identify edition gate: veto album=%s reason=%s detail=%s",
+            album_id,
+            reason,
+            detail,
+            extra={"album_id": album_id, "gate": reason, **detail},
+        )
+        selected_key = f"{selected.release_group_mbid}:{selected.release_mbid or ''}"
+        decision.outcome = "edition_uncertain"
+        decision.reason_code = EDITION_UNCERTAIN_REASON
+        decision.selected_candidate_key = selected_key
+        decision.edition_uncertain = True
+        decision.release_group_mbid = selected.release_group_mbid
+        decision.ranked_edition_keys = [
+            f"{selected.release_group_mbid}:{item['release_mbid']}"
+            for item in ranking
+        ] or [selected_key]
+        return f"veto:{reason}", None, ranking
+
+    @provider_workload_scope(ProviderWorkload.IDENTITY)
     async def run_claimed_job(
         self,
         job: dict,
@@ -502,7 +867,23 @@ class AlbumIdentificationService:
             )
             release_decision = _embedded_release_decision(tracks)
             decision = _stored_track_identity_decision(raw_tracks)
-            if decision is None and release_decision is not None:
+            # Partial-unanimous embedded release tags name one release while
+            # the remaining tracks merely lack tags (no conflict): attempt
+            # the agreed release through recall instead of holding. Scoring,
+            # the lone quorum, and the edition gate still validate it.
+            # Local-metadata albums keep the hold - with no provider to
+            # fetch and check the agreed release, the gap is unresolvable.
+            attempt_partial_unanimous = (
+                not local_metadata_only
+                and release_decision is not None
+                and release_decision.reason_code == "INCOMPLETE_EMBEDDED_RELEASE_IDS"
+                and _populated_releases_agree(tracks)
+            )
+            if (
+                decision is None
+                and release_decision is not None
+                and not attempt_partial_unanimous
+            ):
                 decision = release_decision
             elif decision is None and local_metadata_only:
                 decision = _embedded_decision(tracks, raw_tracks)
@@ -542,14 +923,26 @@ class AlbumIdentificationService:
                         FINGERPRINTER_VERSION,
                     )
                     if cached is not None:
-                        cached_release_groups.extend(cached.release_group_ids)
                         cached_outcomes[track.local_track_id] = cached
+                        # 4.10b lane A: a partial decode never seeds support
+                        # or recall alone - it needs descriptive corroboration
+                        # (tags + quorum still identify; full prints flow
+                        # through unchanged below).
+                        cached_partial = bool(
+                            getattr(cached, "partial_decode", False)
+                        )
+                        if not cached_partial:
+                            cached_release_groups.extend(
+                                cached.release_group_ids
+                            )
                         if (
                             not track.recording_mbid
+                            and not track.fingerprint_recording_mbid
                             and cached.state == "matched"
                             and cached.recording_mbid
+                            and not cached_partial
                         ):
-                            track.recording_mbid = cached.recording_mbid
+                            track.fingerprint_recording_mbid = cached.recording_mbid
                 recalled = await self._candidates.recall(
                     tracks,
                     cached_fingerprint_release_groups=list(
@@ -577,9 +970,22 @@ class AlbumIdentificationService:
                             and item.recording_mbid
                         }
                         needed = (
-                            not track.recording_mbid and len(supported_recordings) != 1
+                            not (track.recording_mbid or track.fingerprint_recording_mbid)
+                            and len(supported_recordings) != 1
                         )
                         if not needed:
+                            # 4.9: route unneeded tracks through the service
+                            # so it writes/reuses the
+                            # write-once-per-stat_revision skipped row.
+                            # did_work stays False, so the budget stays free.
+                            await self._fingerprints.fingerprint_if_needed(
+                                local_track_id=track.local_track_id,
+                                path=Path(str(row["file_path"])),
+                                stat_revision=str(row["stat_revision"]),
+                                needed=False,
+                                now=timestamp,
+                                checkpoint=checkpoint,
+                            )
                             continue
                         cached = cached_outcomes.get(track.local_track_id)
                         cache_hit = cached is not None and getattr(
@@ -589,23 +995,35 @@ class AlbumIdentificationService:
                             requested >= MAX_NEW_FINGERPRINTS_PER_ATTEMPT
                         ):
                             break
-                        outcome = await self._fingerprints.fingerprint_if_needed(
-                            local_track_id=track.local_track_id,
-                            path=Path(str(row["file_path"])),
-                            stat_revision=str(row["stat_revision"]),
-                            needed=needed,
-                            now=timestamp,
-                            checkpoint=checkpoint,
+                        outcome, did_work = (
+                            await self._fingerprints.fingerprint_if_needed(
+                                local_track_id=track.local_track_id,
+                                path=Path(str(row["file_path"])),
+                                stat_revision=str(row["stat_revision"]),
+                                needed=needed,
+                                now=timestamp,
+                                checkpoint=checkpoint,
+                            )
                         )
                         # F-042: an instant terminal cache hit did no fpcalc or
                         # lookup work, so it must not consume budget slots that
-                        # later tracks need.
-                        if not cache_hit:
+                        # later tracks need. F-07: `did_work` is the only
+                        # honest no-work signal - a reused cached `failed` row
+                        # reads cache_hit=False but did no work either.
+                        if did_work:
                             requested += 1
                         if await self._queue.is_paused():
                             await self._pause(job, worker_id, "fingerprinting")
                             return "paused"
-                        if outcome is not None and outcome.state == "failed":
+                        # F-07: a reused cached failure bypasses the defer
+                        # branch - it did no new work, so the defer already
+                        # happened (if ever) on the attempt that did the work.
+                        # Fresh failures on load-bearing tracks keep deferring.
+                        if (
+                            outcome is not None
+                            and outcome.state == "failed"
+                            and did_work
+                        ):
                             # F-MATCH-04: a local fpcalc failure is NOT a
                             # provider outage. Defer under its own honest code
                             # so the row never becomes eligible for the
@@ -626,8 +1044,24 @@ class AlbumIdentificationService:
                             )
                             return "provider_deferred"
                         if outcome is not None and outcome.recording_mbid:
-                            track.recording_mbid = outcome.recording_mbid
-                            new_release_groups.extend(outcome.release_group_ids)
+                            # 4.10b lane A: partial-derived MBIDs cannot seed
+                            # supported_recordings or recall alone. Full
+                            # prints (False) keep today's behavior; short
+                            # tracks that only ever yield partials still
+                            # identify via tags + quorum.
+                            if bool(getattr(outcome, "partial_decode", False)):
+                                pass
+                            else:
+                                if (
+                                    not track.recording_mbid
+                                    and not track.fingerprint_recording_mbid
+                                ):
+                                    track.fingerprint_recording_mbid = (
+                                        outcome.recording_mbid
+                                    )
+                                new_release_groups.extend(
+                                    outcome.release_group_ids
+                                )
                     if new_release_groups:
                         recalled = await self._candidates.recall(
                             tracks,
@@ -726,9 +1160,34 @@ class AlbumIdentificationService:
                     )
                     return "provider_deferred"
             _enforce_existing_album_identity(decision, context["identity"], raw_tracks)
+            # Step 2.5 (E-02) identify-lane auto-accept gate: pre-persist,
+            # after both backstops and the transient-defer block above (gating
+            # at the first-decide site would pin decisions later flipped to
+            # contradictory or deferred). Embedded exact-tag decisions keep the
+            # legacy path: file facts need no edition gate.
+            gate_winner: CandidateEvidence | None = None
+            gate_ranking: list[dict[str, object]] = []
+            gate_reason: str | None = None
+            if decision_source == "automatic":
+                gate_disposition, gate_winner, gate_ranking = (
+                    await self._evaluate_edition_gate(
+                        job=job,
+                        worker_id=worker_id,
+                        decision=decision,
+                        tracks=tracks,
+                        raw_tracks=raw_tracks,
+                        timestamp=timestamp,
+                    )
+                )
+                if gate_disposition == "deferred":
+                    return "provider_deferred"
+                if gate_disposition.startswith("veto:"):
+                    gate_reason = gate_disposition[len("veto:") :]
+                    gate_winner = None
             # P2 tier terminal (evaluated after both backstops above): the RG pin
             # and ranked keys persist RG-only; a flipped contradictory outcome
             # clears the predicate and takes the ordinary review path instead.
+            # A gate veto demotes the decision above, so it flows through here.
             tier_terminal = is_edition_uncertain(decision)
             evidence_records = [
                 IdentificationEvidenceRecord(
@@ -762,9 +1221,23 @@ class AlbumIdentificationService:
                 candidate_count=len(decision.candidates),
                 degradation_flags=[
                     f"{source}:{status}" for source, status in sorted(degraded.items())
-                ],
+                ]
+                + ([f"auto_gate:{gate_reason}"] if gate_reason is not None else []),
                 started_at=timestamp,
                 completed_at=timestamp,
+            )
+            gate_evidence_id = (
+                next(
+                    (
+                        record.id
+                        for record in evidence_records
+                        if gate_winner is not None
+                        and record.candidate_key == _candidate_key(gate_winner)
+                    ),
+                    None,
+                )
+                if gate_winner is not None
+                else None
             )
             current_job = await self._store.get_identification_job_row(str(job["id"]))
             await self._store.finish_identification_job(
@@ -798,6 +1271,9 @@ class AlbumIdentificationService:
                 ranked_edition_keys=(
                     list(decision.ranked_edition_keys) if tier_terminal else None
                 ),
+                auto_accept_evidence=gate_winner,
+                auto_accept_evidence_id=gate_evidence_id,
+                auto_accept_ranking=gate_ranking or None,
             )
             if decision.outcome == "identified" and self._on_identified is not None:
                 try:
@@ -817,9 +1293,45 @@ class AlbumIdentificationService:
                         )
                     except Exception:  # noqa: BLE001 - never mask the original
                         logger.exception("Failed to record management_schedule_pending")
+            prior_identity = context["identity"] or {}
+            # Mirrors the store's hold branch exactly (same pre-commit inputs
+            # the tx revision-guards): tier params complete, prior sealed
+            # automatic exact, same release group. Anything less complete
+            # never reaches the tier branch, so it must not signal.
+            tier_complete = bool(
+                tier_terminal
+                and decision.release_group_mbid
+                and decision.ranked_edition_keys
+            )
+            prior_exact = bool(
+                prior_identity.get("decision_source") == "automatic"
+                and prior_identity.get("release_mbid")
+            )
+            same_group = (
+                str(prior_identity.get("release_group_mbid") or "").casefold()
+                == str(decision.release_group_mbid or "").casefold()
+            )
+            if tier_complete and prior_exact and same_group:
+                # The sealed exact survived a weak re-match. Deliberately
+                # quiet - no review row, no identified side effects; the
+                # attempt flag is the audit.
+                _edition_hold_metrics.increment("tier_hold:kept_exact")
+                logger.info(
+                    "identify edition hold: kept sealed exact album=%s release=%s",
+                    str(job["local_album_id"]),
+                    str(prior_identity["release_mbid"]),
+                )
+            elif tier_complete and prior_exact:
+                # Tier for a different group: the old exact demotes to the
+                # new group pin with a tier row for review (the contradiction
+                # stays visible by design).
+                _edition_hold_metrics.increment("tier_demotion:rg_only")
             if self._invalidate is not None:
                 # ST1: thread the local album id so the provider hook can
                 # resolve rg/artist entity ids from the committed row.
+                # Runs after the hold/demotion signal: the commit already
+                # landed, so a post-commit invalidation failure must not lose
+                # the metric for it.
                 await self._invalidate(
                     {
                         "library",
@@ -834,6 +1346,21 @@ class AlbumIdentificationService:
                     [str(job["local_album_id"])],
                 )
             return str(decision.outcome)
+        except asyncio.CancelledError:
+            # R-04: release the 60s claim so the job is immediately
+            # reclaimable instead of sitting running until lease expiry.
+            # release() is NOT idempotent (revision bumps) - called exactly
+            # once here; never defer() on the cancel path (30s floor +
+            # MAX_DEFERRALS_EXCEEDED counting). StaleRevisionError means the
+            # finish commit already landed → commit wins, swallow.
+            # (R-03: no worker-level cleanup - this job-level release runs
+            # before the cancel propagates to the worker, which must not
+            # double-release.)
+            try:
+                await self._queue.release(job, worker_id, now=timestamp)
+            except StaleRevisionError:
+                pass
+            raise
         except CircuitOpenError as exc:
             # Defer with breaker deadline, not just queue backoff, per F-PERF-01
             retry_after = getattr(exc, "retry_after_seconds", None)

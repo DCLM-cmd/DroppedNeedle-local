@@ -141,6 +141,115 @@ export function libraryWorkFacts(item: LibraryWorkItem): string[] {
 	].filter((value): value is string => value !== null);
 }
 
+export const STALE_INPUT_TERMINAL_CODE = 'STALE_INPUT';
+
+export const STALE_INPUT_HINT =
+	'Inputs moved since planning. Retry or refresh to rebuild this preview. No files were changed.';
+
+export interface TerminalOperationLike {
+	state?: string | null;
+	terminal_code?: string | null;
+}
+
+/** Pure-invalidation terminal: the job stopped only because its inputs moved. */
+export function isStaleInputTerminal(
+	operation: TerminalOperationLike | null | undefined
+): boolean {
+	if (!operation) return false;
+	return (
+		operation.state === 'failed' && operation.terminal_code === STALE_INPUT_TERMINAL_CODE
+	);
+}
+
+export interface FailedGroupSource {
+	selection?: Record<string, unknown> | null;
+}
+
+/**
+ * Group key collapsing duplicate failed cards for the same album.
+ * Only single-kind album selections group; anything else stays individual (null).
+ */
+export function selectionAlbumGroupKey(selection: unknown): string | null {
+	if (typeof selection !== 'object' || selection === null || Array.isArray(selection)) {
+		return null;
+	}
+	const record = selection as Record<string, unknown>;
+	if (record.kind !== 'albums' || !Array.isArray(record.ids) || record.ids.length === 0) {
+		return null;
+	}
+	const ids = record.ids.filter((id): id is string => typeof id === 'string' && id.length > 0);
+	if (ids.length === 0 || ids.length !== (record.ids as unknown[]).length) return null;
+	return `albums:${[...ids].sort().join(',')}`;
+}
+
+export interface FailedOperationGroup<T> {
+	key: string;
+	items: T[];
+	staleCount: number;
+	allStale: boolean;
+}
+
+function groupKeyOf(item: FailedGroupSource, index: number): { key: string; grouped: boolean } {
+	const groupKey = selectionAlbumGroupKey(item.selection ?? null);
+	if (!groupKey) return { key: `job:${index}`, grouped: false };
+	return { key: groupKey, grouped: true };
+}
+
+/** Collapse duplicate failed cards for the same album, preserving first-appearance order. */
+export function groupFailedOperationsByAlbum<T extends FailedGroupSource>(
+	items: T[],
+	isStale: (item: T) => boolean
+): Array<FailedOperationGroup<T>> {
+	const groups = new Map<string, FailedOperationGroup<T>>();
+	items.forEach((item, index) => {
+		const { key, grouped } = groupKeyOf(item, index);
+		// Ungroupable members each keep a unique key, so they never collapse.
+		const mapKey = grouped ? key : `${key}:${index}`;
+		const existing = groups.get(mapKey);
+		if (existing) {
+			existing.items.push(item);
+			if (isStale(item)) existing.staleCount += 1;
+			existing.allStale = existing.staleCount === existing.items.length;
+			return;
+		}
+		const stale = isStale(item);
+		groups.set(mapKey, {
+			key: mapKey,
+			items: [item],
+			staleCount: stale ? 1 : 0,
+			allStale: stale
+		});
+	});
+	return [...groups.values()];
+}
+
+const ACTIVE_SCAN_STATES = new Set([
+	'discovering',
+	'indexing',
+	'reconciling',
+	'running',
+	'pausing'
+]);
+
+/** True while a scan work item is actively holding the library worker. */
+export function scanIsActive(
+	items: Array<Pick<LibraryWorkItem, 'kind' | 'state'>>
+): boolean {
+	return items.some((item) => item.kind === 'scan' && ACTIVE_SCAN_STATES.has(item.state));
+}
+
+/** A queued organization preview that cannot start while the worker is busy. */
+export function isQueuedPreview(item: Pick<LibraryWorkItem, 'kind' | 'state' | 'mode'>): boolean {
+	return (
+		item.kind === 'library_management' &&
+		item.state === 'queued' &&
+		(item.mode ?? 'preview') === 'preview'
+	);
+}
+
+export const WAITING_FOR_SCAN_HINT =
+	'Waiting for scan - planning starts after the active scan finishes.';
+
 function plural(unit: LibraryWorkItem['unit'], count: number): string {
 	if (count === 1) return unit === 'releases' ? 'release' : unit.slice(0, -1);
 	return unit;

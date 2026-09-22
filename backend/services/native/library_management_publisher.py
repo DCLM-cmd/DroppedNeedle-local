@@ -72,6 +72,7 @@ from services.native.audio_write_planning_service import AudioWritePlanningServi
 from services.native.file_revision import revision_from_stat
 from services.native.library_management_profile_service import (
     LibraryManagementProfileService,
+    migration_carry_applies,
 )
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.recycle_bin import recycle
@@ -567,7 +568,12 @@ class LibraryManagementPublisher:
                 or bundle.policy_revision != record.policy_revision
             ):
                 raise ValidationError("The import recovery identity changed.")
-            if record.state in {"completed", "rolled_back", "needs_attention"}:
+            if record.state in {
+                "completed",
+                "rolled_back",
+                "needs_attention",
+                "resolved",
+            }:
                 return "skipped"
             if record.state in {"catalog_committed", "cleanup_pending"}:
                 recovered = await self._resume_import_cleanup(record, bundle)
@@ -2319,6 +2325,27 @@ class LibraryManagementPublisher:
             roots[MANAGEMENT_RECYCLE_ROOT_ID] = Path(recycle_bin_path)
         return roots
 
+    def import_destination_path(
+        self,
+        policy_revision: str,
+        destination_root_id: str,
+        destination_relative_path: str,
+    ) -> Path:
+        """Resolve a sealed import destination with the publish-time mechanism.
+
+        Uses the same root projection and safe-path rules as publication, and
+        never creates parent directories: verification must observe the
+        filesystem, not mutate it.
+        """
+
+        roots = self._root_paths(policy_revision)
+        root = roots.get(destination_root_id)
+        if root is None:
+            raise LibraryManagementPolicyChangedError(
+                "An import destination root changed."
+            )
+        return self._safe_path(root, destination_relative_path)
+
     async def _prepare_plan_item(
         self,
         snapshot,
@@ -3015,9 +3042,15 @@ class LibraryManagementPublisher:
                         "The automatic Library Management profile changed."
                     )
                 continue
+            profile_matches = (
+                assignment.activation_profile_revision == effective.revision
+                or migration_carry_applies(
+                    assignment, effective, current_pinned, policy
+                )
+            )
             if (
                 profile_changed
-                or assignment.activation_profile_revision != effective.revision
+                or not profile_matches
                 or not activation_matches
                 or assignment.activation_policy_revision != policy.policy_revision
                 or not assignment.activation_preview_token
@@ -4259,6 +4292,38 @@ class LibraryManagementPublisher:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+
+    def write_plugin_managed_file(
+        self, *, root_id: str, root: Path, rel_path: str, data: bytes
+    ) -> Path:
+        """Atomically store plugin bytes at ``rel_path`` under one library root.
+
+        Sync blocking helper: callers run it in a worker thread under their own
+        timeout/lease. ``rel_path`` is already charset-validated by the caller;
+        containment (symlink root/components, ``..``/absolute) is enforced here
+        via :meth:`_safe_path` and raises :class:`ValidationError` on escape.
+        The write is atomic (temp file in the same directory + ``os.replace``)
+        with file + directory fsyncs, mirroring the staged-publication path."""
+        if not root_id:
+            raise ValidationError("A plugin library write requires a library root.")
+        root = Path(root)
+        if not root.is_dir():
+            raise ValidationError("The library root is not available.")
+        target = self._safe_path(root, rel_path, create_parent=True)
+        if target.exists() and not target.is_file():
+            raise ValidationError("A plugin library write must target a file.")
+        temporary = target.parent / f".plugin-{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        self._fsync_directory(target)
+        return target
 
     @staticmethod
     def _hash_file(path: Path) -> str:

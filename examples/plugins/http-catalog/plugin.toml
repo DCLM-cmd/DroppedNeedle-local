@@ -1,0 +1,36 @@
+[plugin]
+name = "http-catalog"
+display_name = "HTTP Catalog (example)"
+version = "1.0.0"
+api_version = 1
+entrypoint = "plugin:HttpCatalog"
+capabilities = ["download_client", "indexer", "scheduler"]
+description = "Reference download source: searches a user-hosted JSON catalog and downloads its files."
+author = "DroppedNeedle examples"
+
+[[capability]]
+id = "download_client"
+source = "http-catalog"
+display_name = "HTTP Catalog"
+
+[[capability]]
+id = "indexer"
+target_source = "plugin:http-catalog"
+
+[schedule]
+interval_minutes = 60
+run_on_load = false
+
+[plugin_ui]
+entry = "ui/dist/panel.js"
+pages = ["panel"]
+
+[[settings]]
+key = "catalog_url"
+label = "Catalog URL"
+help = "A JSON feed you host yourself, e.g. https://example-catalog.test/feed.json"
+
+[[settings]]
+key = "downloads_dir"
+label = "Downloads directory"
+help = "Local folder completed catalog files are staged in."

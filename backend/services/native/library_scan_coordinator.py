@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import random
 import time
 import uuid
 import logging
@@ -9,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from core.exceptions import StaleRevisionError, ValidationError
+from infrastructure.observability.library_metrics import LibraryMetrics
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.library_work import (
     ScanControlResult,
@@ -32,7 +35,13 @@ PolicyResolverGetter = Callable[[], LibraryPolicyResolver]
 IndexedAlbumCallback = Callable[[str], Awaitable[object]]
 INDEXED_ALBUM_CALLBACK_BATCH_SIZE = 16
 INDEXED_ALBUM_CALLBACK_RETRY_MAX_SECONDS = 300.0
+# R-02: the settle spin below is DB-round-trip-bound, not CPU-bound, but it
+# must still stay bounded - cap stale retries, then take the stop-signal path.
+SETTLE_STALE_MAX_RETRIES = 10
+SETTLE_STALE_RETRY_BASE_SECONDS = 0.05
 logger = logging.getLogger(__name__)
+
+_scan_metrics = LibraryMetrics.for_library_workload()
 
 
 class LibraryScanCoordinator:
@@ -244,6 +253,7 @@ class LibraryScanCoordinator:
         return runs
 
     async def _settle_pending_control(self, run_id: str) -> ScanRun:
+        stale_retries = 0
         while True:
             run, _, _ = await self._store.get_scan_run(run_id)
             if run.state not in {"pausing", "stopping"}:
@@ -265,6 +275,25 @@ class LibraryScanCoordinator:
                     now=self._clock(),
                 )
             except StaleRevisionError:
+                # R-02: a racing writer keeps moving the revision under us.
+                # Sleep with jitter and retry bounded times, then take the
+                # stop-signal path: return the still-unsettled run WITHOUT
+                # discarding the pending-control entry, so checkpoint keeps
+                # returning False and the supervisor retries later. Never
+                # raise: checkpoint consumers only understand True/False.
+                stale_retries += 1
+                if stale_retries >= SETTLE_STALE_MAX_RETRIES:
+                    _scan_metrics.increment("settle_stale_retries")
+                    logger.warning(
+                        "Scan settle spin exhausted %d stale retries for run %s; "
+                        "leaving it unsettled for the supervisor to retry",
+                        stale_retries,
+                        run_id,
+                    )
+                    return run
+                await asyncio.sleep(
+                    SETTLE_STALE_RETRY_BASE_SECONDS * random.uniform(0.5, 1.5)
+                )
                 continue
             if self._events is not None:
                 await self._events.publish(settled, event="scan.transition")

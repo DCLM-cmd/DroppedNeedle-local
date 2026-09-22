@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable
 
@@ -26,6 +27,9 @@ if TYPE_CHECKING:
     from services.preferences_service import PreferencesService
 
 
+logger = logging.getLogger(__name__)
+
+
 class LibraryPolicyService:
     def __init__(
         self,
@@ -33,11 +37,27 @@ class LibraryPolicyService:
         library_db: "LibraryDB | None",
         resolver_getter: Callable[[], LibraryPolicyResolver],
         resolver_clearer: Callable[[], None],
+        *,
+        scan_wakeup: Callable[[], None] | None = None,
     ) -> None:
         self._preferences = preferences
         self._library_db = library_db
         self._resolver_getter = resolver_getter
         self._resolver_clearer = resolver_clearer
+        self._scan_wakeup = scan_wakeup
+
+    def mark_scan_scopes_dirty(self, scope_ids: list[str]) -> None:
+        """S-01 Hook B writer: record affected scopes as dirty-scan hints and
+        wake the supervisor for early consumption. Hints only - a failure
+        here never fails the settings save that already succeeded."""
+        if not scope_ids:
+            return
+        try:
+            self._preferences.mark_library_scan_dirty_scopes(scope_ids)
+            if self._scan_wakeup is not None:
+                self._scan_wakeup()
+        except Exception:  # noqa: BLE001 - dirty marks are hints; the save already succeeded
+            logger.exception("Library scan dirty-marking failed")
 
     def get_settings(self) -> LibrarySettingsResponse:
         resolver = self._resolver_getter()
@@ -58,6 +78,7 @@ class LibraryPolicyService:
             proposed.settings,
             expected_policy_revision=expected_policy_revision,
         )
+        self.mark_scan_scopes_dirty(affected)
         self._resolver_clearer()
         saved = self._resolver_getter()
         masked = self._preferences.get_typed_library_settings()

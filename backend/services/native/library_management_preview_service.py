@@ -54,7 +54,10 @@ from core.exceptions import (
     ValidationError,
 )
 from infrastructure.library_management_blob_store import LibraryManagementBlobStore
-from infrastructure.persistence.native_library_store import NativeLibraryStore
+from infrastructure.persistence.native_library_store import (
+    MANAGEMENT_PERSISTENCE_BATCH_SIZE,
+    NativeLibraryStore,
+)
 from infrastructure.audio.metadata_engine import AudioMetadataEngine
 from models.library_management import FILE_CHANGED, POLICY_CHANGED, PROFILE_CHANGED
 from models.library_management import (
@@ -66,6 +69,7 @@ from models.library_management import (
 from models.library_management_planning import (
     LibraryManagementCatalogFilter,
     LibraryManagementSelection,
+    LibraryManagementSelectionSubject,
     NormalizedLibraryManagementSelection,
     PinnedLibraryManagementProfile,
     naming_policy_revision,
@@ -95,6 +99,8 @@ def _stable_json(value: object) -> str:
 _ARTWORK_PREVIEW_MIME_TYPES = frozenset(
     {"image/gif", "image/jpeg", "image/png", "image/webp"}
 )
+
+_STALE_INPUT_SAMPLE_LIMIT = 5
 
 logger = logging.getLogger(__name__)
 
@@ -408,7 +414,9 @@ class LibraryManagementPreviewService:
             raise ValidationError(
                 "The stored Library Management preview is invalid."
             ) from error
-        stale_reasons = await self._stale_reasons(snapshot)
+        stale_reasons, stale_input_count, stale_sample_relative_paths = (
+            await self._stale_reasons(snapshot)
+        )
         external_refreshes = (
             await self._store.list_library_management_external_refreshes(job_id)
         )
@@ -455,6 +463,8 @@ class LibraryManagementPreviewService:
             expired=expired,
             stale=bool(stale_reasons),
             stale_reasons=stale_reasons,
+            stale_input_count=stale_input_count,
+            stale_sample_relative_paths=stale_sample_relative_paths,
             ready_for_confirmation=ready,
             operation_row_revision=int(operation["row_revision"]),
             operation_event_revision=int(operation["event_revision"]),
@@ -516,7 +526,7 @@ class LibraryManagementPreviewService:
         # F-079: staleness is enforced INSIDE begin_library_management_apply
         # (catalog in-transaction; settings/policy via the freshly-read
         # revisions below), so drift rejects once instead of per bundle.
-        stale_reasons = await self._stale_reasons(snapshot)
+        stale_reasons, _, _ = await self._stale_reasons(snapshot)
         if snapshot.phase == "ready" and stale_reasons:
             raise StaleRevisionError(
                 "The Library Management preview is not current and ready to apply."
@@ -573,7 +583,7 @@ class LibraryManagementPreviewService:
             )
         if snapshot.preview_expires_at is None or snapshot.preview_expires_at <= now:
             raise StaleRevisionError("The Library Management preview expired.")
-        stale_reasons = await self._stale_reasons(snapshot)
+        stale_reasons, _, _ = await self._stale_reasons(snapshot)
         if stale_reasons:
             raise StaleRevisionError(
                 "The Library Management preview is not current and ready to apply."
@@ -947,7 +957,14 @@ class LibraryManagementPreviewService:
                 "The activation preview does not match the proposed profile."
             )
 
-    async def _stale_reasons(self, snapshot: LibraryManagementJobSnapshot) -> list[str]:
+    async def _stale_reasons(
+        self, snapshot: LibraryManagementJobSnapshot
+    ) -> tuple[list[str], int, list[str]]:
+        # An unsealed preview is still planning: only a prefix of the
+        # selection has plan items, so per-input comparison would misreport
+        # FILE_CHANGED. Planning previews are never stale.
+        if snapshot.phase == "planning":
+            return [], 0, []
         reasons: list[str] = []
         current_settings_revision = settings_revision(
             self._preferences.get_library_management_settings_raw()
@@ -959,17 +976,116 @@ class LibraryManagementPreviewService:
         )
         if policy.policy_revision != snapshot.policy_revision:
             reasons.append(POLICY_CHANGED)
-        # Judged against THIS plan's own subjects, not the catalog as a whole. The
-        # global revision is bumped by every catalog write anywhere - a scan, an
-        # import, an artwork hash - so it changed between building a preview and
-        # pressing Confirm on any system that was doing anything, and applying was
-        # refused as "not current". The files this plan covers are what can actually
-        # invalidate it, and the apply path re-checks each of them per item anyway.
-        if await self._store.library_management_plan_subjects_changed(
-            snapshot.job_id
-        ):
+        moved, stale_input_count, stale_sample = await self._preview_inputs_evidence(
+            snapshot
+        )
+        if moved:
             reasons.append(FILE_CHANGED)
-        return reasons
+        return reasons, stale_input_count, stale_sample
+
+    async def _preview_inputs_moved(
+        self, snapshot: LibraryManagementJobSnapshot
+    ) -> bool:
+        moved, _, _ = await self._preview_inputs_evidence(snapshot)
+        return moved
+
+    async def _preview_inputs_evidence(
+        self, snapshot: LibraryManagementJobSnapshot
+    ) -> tuple[bool, int, list[str]]:
+        # Scoped freshness: compare the live per-input revisions of exactly
+        # the preview's own selection against the tag/file revisions captured
+        # in its plan items, so unrelated albums' scans stop invalidating a
+        # preview. No new snapshot field: the plan items already pin one
+        # expected revision set per selected track. Snapshots whose selection
+        # cannot be decoded and previews with nothing captured yet keep the
+        # historical global catalog comparison (with no input evidence).
+        try:
+            selection = msgspec.json.decode(
+                snapshot.selection_json.encode("utf-8"),
+                type=NormalizedLibraryManagementSelection,
+            )
+        except (msgspec.DecodeError, msgspec.ValidationError):
+            moved = await self._catalog_moved(snapshot)
+            return moved, 0, []
+        expected_by_track: dict[str, LibraryManagementPlanItem] = {}
+        after_ordinal = -1
+        while True:
+            items = await self._store.list_library_management_plan_items(
+                snapshot.job_id,
+                after_ordinal=after_ordinal,
+                limit=MANAGEMENT_PERSISTENCE_BATCH_SIZE,
+            )
+            for item in items:
+                if item.local_track_id is not None:
+                    expected_by_track.setdefault(item.local_track_id, item)
+            if len(items) < MANAGEMENT_PERSISTENCE_BATCH_SIZE:
+                break
+            after_ordinal = items[-1].ordinal
+        if not expected_by_track:
+            moved = await self._catalog_moved(snapshot)
+            return moved, 0, []
+        stale_count = 0
+        sample: list[str] = []
+
+        def _record(relative_path: str) -> None:
+            nonlocal stale_count
+            stale_count += 1
+            if len(sample) < _STALE_INPUT_SAMPLE_LIMIT:
+                sample.append(relative_path)
+
+        live_track_ids: set[str] = set()
+        cursor = None
+        while True:
+            page = await self._store.list_library_management_selection_page(
+                selection,
+                cursor=cursor,
+                limit=MANAGEMENT_PERSISTENCE_BATCH_SIZE,
+            )
+            for subject in page.subjects:
+                if subject.local_track_id in live_track_ids:
+                    continue
+                live_track_ids.add(subject.local_track_id)
+                expected = expected_by_track.get(subject.local_track_id)
+                if expected is None or self._subject_moved(expected, subject):
+                    _record(subject.relative_path)
+            if page.complete or not page.subjects:
+                break
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+        for track_id, expected in expected_by_track.items():
+            if track_id not in live_track_ids:
+                _record(expected.expected_relative_path)
+        return stale_count > 0, stale_count, sample
+
+    @staticmethod
+    def _subject_moved(
+        expected: LibraryManagementPlanItem,
+        subject: LibraryManagementSelectionSubject,
+    ) -> bool:
+        # A None album/track revision is not pinned, so it is not compared.
+        if (
+            expected.expected_album_revision is not None
+            and expected.expected_album_revision != subject.album_revision
+        ):
+            return True
+        if (
+            expected.expected_track_revision is not None
+            and expected.expected_track_revision != subject.track_revision
+        ):
+            return True
+        if expected.expected_stat_revision != subject.stat_revision:
+            return True
+        if expected.expected_tag_revision != subject.tag_revision:
+            return True
+        if expected.expected_root_id != subject.root_id:
+            return True
+        if expected.expected_relative_path != subject.relative_path:
+            return True
+        return False
+
+    async def _catalog_moved(self, snapshot: LibraryManagementJobSnapshot) -> bool:
+        return await self._store.get_catalog_revision() != snapshot.catalog_revision
 
     @staticmethod
     def _selection(value) -> LibraryManagementSelection:

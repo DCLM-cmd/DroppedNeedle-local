@@ -62,7 +62,7 @@ class CircuitBreaker:
 
         try:
             self._on_state_change(self, previous_state, new_state, reason)
-        except Exception:
+        except Exception:  # noqa: BLE001 - breaker callback failure must not break guarded calls
             logger.exception(
                 "Circuit breaker '%s' state change callback failed",
                 self.name,

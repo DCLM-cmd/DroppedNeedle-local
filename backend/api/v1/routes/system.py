@@ -64,6 +64,7 @@ async def get_provider_stats(_: CurrentAdminDep) -> ProviderStatsResponse:
         providers=[ProviderStatRow(**row) for row in rows],
         window_seconds=provider_counters.DEFAULT_WINDOW_SECONDS,
         counters_since=provider_counters.counters_since(),
+        process_epoch=provider_counters.counters_epoch(),
         rate_limits=[
             ProviderRateLimitStat(**row)
             for row in provider_counters.snapshot_rate_limit_rows()

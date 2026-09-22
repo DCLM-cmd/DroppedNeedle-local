@@ -84,7 +84,7 @@ beforeEach(() => {
 
 describe('LibraryRunHistory', () => {
 	it('shows retained run counts, safe reason, and phase timings', async () => {
-		render(LibraryRunHistory);
+		await render(LibraryRunHistory);
 		await expect.element(page.getByText('7 changed · 1 errors')).toBeVisible();
 		await expect.element(page.getByRole('cell', { name: '35s' })).toBeVisible();
 		await page.getByText('Details').first().click();
@@ -104,7 +104,7 @@ describe('LibraryRunHistory', () => {
 				}
 			})
 		);
-		render(LibraryRunHistory);
+		await render(LibraryRunHistory);
 		await page.getByText('Details').first().click();
 		await page.getByRole('button', { name: /Export diagnostics for run run-safe-1/ }).click();
 		await expect
@@ -120,7 +120,7 @@ describe('LibraryRunHistory', () => {
 
 	it('uses fixed user-safe copy when an export fails', async () => {
 		h.get.mockRejectedValue(new Error('/secret/path/provider-token'));
-		render(LibraryRunHistory);
+		await render(LibraryRunHistory);
 		await page.getByText('Details').first().click();
 		await page.getByRole('button', { name: /Export diagnostics/ }).click();
 		await page.getByRole('button', { name: 'Export report' }).click();
@@ -152,7 +152,7 @@ describe('LibraryRunHistory', () => {
 			isFetchingNextPage: false,
 			fetchNextPage: vi.fn()
 		};
-		render(LibraryRunHistory);
+		await render(LibraryRunHistory);
 
 		await expect.element(page.getByText('scope-3').first()).toBeVisible();
 		await expect.element(page.getByText('scope-2')).not.toBeInTheDocument();
@@ -207,7 +207,7 @@ describe('LibraryRunHistory', () => {
 			isFetchingNextPage: false,
 			fetchNextPage: vi.fn()
 		};
-		render(LibraryRunHistory);
+		await render(LibraryRunHistory);
 
 		await page.getByText('Details').first().click();
 		await expect
@@ -218,6 +218,27 @@ describe('LibraryRunHistory', () => {
 		await expect.element(page.getByText('WALK_TIMEOUT').first()).toBeVisible();
 		await page.getByRole('button', { name: 'Load more' }).click();
 		expect(h.failures.fetchNextPage).toHaveBeenCalledOnce();
+	});
+
+	it('folds the startup_resume trigger with spaces like the state cells', async () => {
+		h.history = {
+			data: {
+				pages: [
+					{
+						items: [run({ trigger: 'startup_resume' })]
+					}
+				]
+			},
+			isLoading: false,
+			isError: false,
+			hasNextPage: false,
+			isFetchingNextPage: false,
+			fetchNextPage: vi.fn()
+		};
+		await render(LibraryRunHistory);
+
+		await expect.element(page.getByText('startup resume').first()).toBeVisible();
+		expect(document.body.textContent).not.toContain('startup_resume');
 	});
 
 	it('omits the failed-paths section for clean completed runs', async () => {
@@ -235,7 +256,7 @@ describe('LibraryRunHistory', () => {
 			isFetchingNextPage: false,
 			fetchNextPage: vi.fn()
 		};
-		render(LibraryRunHistory);
+		await render(LibraryRunHistory);
 
 		await page.getByText('Details').first().click();
 		await expect.element(page.getByRole('dialog', { name: 'Run details' })).toBeVisible();

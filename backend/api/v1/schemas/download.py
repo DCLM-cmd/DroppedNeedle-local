@@ -33,6 +33,27 @@ class IndexerSavedResponse(AppStruct):
     id: str
 
 
+class UsenetSearchBackend(AppStruct):
+    """The active Usenet search backend (either/or): ``"indexers"`` for the native
+    Newznab priority list, ``"prowlarr"`` for the single Prowlarr connection.
+    Required ``Literal``: unknown values and empty bodies 422 at decode (never a
+    silent reset to ``"indexers"``)."""
+
+    backend: Literal["indexers", "prowlarr"]
+
+
+class ProwlarrTestResponse(AppStruct):
+    """Result of testing the submitted Prowlarr connection (lidarr-import shape:
+    body-carried valid/version/message, never a leaked 5xx). ``version`` and
+    ``indexer_count`` are degraded-optional until the A0 probe confirms
+    ``system/status`` - the test route must not hard-fail when it 404s."""
+
+    valid: bool
+    version: str | None = None
+    message: str = ""
+    indexer_count: int | None = None
+
+
 class SabnzbdTestResponse(AppStruct):
     """Result of testing SABnzbd: version + the category list (for the picker) + the
     SABnzbd-side completed dir (the mount hint) + the mount diagnosis (how many
@@ -70,6 +91,9 @@ class DownloadClientStatusResponse(AppStruct):
     # slskd's own configured downloads dir (its in-container path), shown as a hint so the
     # user can match it to DroppedNeedle's mount. None when slskd didn't report it.
     slskd_downloads_dir: str | None = None
+    # The actual lookup dir: the mount plus the UI subfolder. The UI shows it so a
+    # wrong subfolder reads as a wrong path instead of a mystery empty folder.
+    effective_downloads_path: str | None = None
 
 
 class SearchAlbumRequest(AppStruct):
@@ -224,6 +248,10 @@ class DownloadTaskResponse(AppStruct):
     attempt_total: int = 0
     has_next_source: bool = False
     held_for_review: bool = False
+    # Wrong-product verdict (Slice 2): when the import proved the grabbed
+    # folder is a different product. The detail names the grabbed folder.
+    wrong_product_verdict_at: float | None = None
+    wrong_product_detail: str | None = None
 
 
 class PolicySummaryResponse(AppStruct):
@@ -318,6 +346,9 @@ class HeldReevaluateResponse(AppStruct):
     imported: int
     still_held: int
     failed: int
+class HeldVerdictActionResponse(AppStruct):
+    status: str
+    files: int
 
 
 class HeldReverifyResponse(AppStruct):

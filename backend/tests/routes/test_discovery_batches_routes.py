@@ -53,7 +53,7 @@ def _service(store, **overrides) -> DiscoveryBatchService:
     library_service = MagicMock()
     library_service.remove_album = AsyncMock()
     library_db = MagicMock()
-    library_db.get_all_album_mbids = AsyncMock(return_value=set())
+    library_db.existing_library_albums = AsyncMock(return_value=set())
     download_service = MagicMock()
     download_service.purge_album_downloads = AsyncMock()
     deps = dict(
@@ -84,7 +84,9 @@ class TestServiceCreate:
     @pytest.mark.asyncio
     async def test_create_files_requests_and_records_outcomes(self, store):
         svc = _service(store)
-        svc._library_db.get_all_album_mbids = AsyncMock(return_value={"rg-0"})
+        svc._library_db.existing_library_albums = AsyncMock(
+            side_effect=lambda ids: {i for i in ids if i == "rg-0"}
+        )
         svc._history.async_get_active_mbids = AsyncMock(return_value={"rg-1"})
 
         detail = await svc.create(
@@ -109,7 +111,9 @@ class TestServiceCreate:
     @pytest.mark.asyncio
     async def test_all_skipped_rejects_batch(self, store):
         svc = _service(store)
-        svc._library_db.get_all_album_mbids = AsyncMock(return_value={"rg-0", "rg-1"})
+        svc._library_db.existing_library_albums = AsyncMock(
+            side_effect=lambda ids: {i for i in ids if i in {"rg-0", "rg-1"}}
+        )
         with pytest.raises(ValidationError):
             await svc.create(
                 _OWNER,
@@ -163,7 +167,9 @@ class TestServiceRemove:
             ],
         )
         batch_id = (await store.list_batches(_OWNER))[0]["id"]
-        svc._library_db.get_all_album_mbids = AsyncMock(return_value={"rg-0", "rg-1"})
+        svc._library_db.existing_library_albums = AsyncMock(
+            side_effect=lambda ids: {i for i in ids if i in {"rg-0", "rg-1"}}
+        )
         svc._history.async_get_record = AsyncMock(
             side_effect=lambda mbid: SimpleNamespace(status="pending", user_id=_OWNER)
             if mbid == "rg-2"

@@ -20,11 +20,19 @@ from tests.helpers import build_test_client, mock_admin_user, mock_user
 
 
 def _prefs(
-    url="http://slskd:5030", key=DOWNLOAD_CLIENT_API_KEY_MASK, library_paths=("/music",)
+    url="http://slskd:5030",
+    key=DOWNLOAD_CLIENT_API_KEY_MASK,
+    library_paths=("/music",),
+    downloads_subpath="",
 ):
     prefs = MagicMock()
     prefs.get_download_client_settings.return_value = DownloadClientConnectionSettings(
         url=url, api_key=key
+    )
+    prefs.get_download_client_settings_raw.return_value = (
+        DownloadClientConnectionSettings(
+            url=url, api_key=key, downloads_subpath=downloads_subpath
+        )
     )
     prefs.get_typed_library_settings.return_value = MagicMock(
         library_roots=[MagicMock(path=path) for path in library_paths]
@@ -266,6 +274,72 @@ def test_status_no_advisory_when_downloads_visible(tmp_path, monkeypatch):
 
     body = build_test_client(app).get("/download-client/status").json()
     assert body["mount_advisory"] is None
+
+
+def test_status_includes_effective_downloads_path(tmp_path, monkeypatch):
+    # The status names the actual lookup dir (mount + subfolder) so a wrong
+    # subfolder reads as a wrong path in the UI.
+    from api.v1.routes import download_client as dc_mod
+
+    dl = tmp_path / "dl"
+    dl.mkdir()
+    monkeypatch.setattr(
+        dc_mod, "get_settings", lambda: MagicMock(slskd_downloads_path=dl)
+    )
+    app = _app(
+        prefs=_prefs(library_paths=(str(tmp_path),), downloads_subpath="complete"),
+        client=_client(configured=False),
+    )
+    app.dependency_overrides[_get_current_user] = lambda: mock_user(role="user")
+
+    body = build_test_client(app).get("/download-client/status").json()
+    assert body["effective_downloads_path"] == str(dl / "complete")
+
+
+def test_status_effective_path_is_mount_without_subpath(tmp_path, monkeypatch):
+    from api.v1.routes import download_client as dc_mod
+
+    dl = tmp_path / "dl"
+    dl.mkdir()
+    monkeypatch.setattr(
+        dc_mod, "get_settings", lambda: MagicMock(slskd_downloads_path=dl)
+    )
+    app = _app(
+        prefs=_prefs(library_paths=(str(tmp_path),)), client=_client(configured=False)
+    )
+    app.dependency_overrides[_get_current_user] = lambda: mock_user(role="user")
+
+    body = build_test_client(app).get("/download-client/status").json()
+    assert body["effective_downloads_path"] == str(dl)
+
+
+def test_status_advisory_names_subfolder_when_subpath_set(tmp_path, monkeypatch):
+    # Base mount is right but the UI subfolder doubled it into an empty path.
+    # The advisory must name the box, not permissions.
+    from api.v1.routes import download_client as dc_mod
+    from repositories.protocols.download_client import MountDiagnosis
+
+    dl = tmp_path / "dl"
+    dl.mkdir()
+    monkeypatch.setattr(
+        dc_mod, "get_settings", lambda: MagicMock(slskd_downloads_path=dl)
+    )
+    client = _client(configured=True)
+    client.diagnose_downloads_mount = AsyncMock(
+        return_value=MountDiagnosis(
+            supported=True, completed_downloads=5, mount_has_files=False
+        )
+    )
+    app = _app(
+        prefs=_prefs(library_paths=(str(tmp_path),), downloads_subpath="complete"),
+        client=client,
+    )
+    app.dependency_overrides[_get_current_user] = lambda: mock_user(role="user")
+
+    body = build_test_client(app).get("/download-client/status").json()
+    assert "finished download" in body["mount_advisory"]
+    assert "subfolder" in body["mount_advisory"]
+    assert str(dl / "complete") in body["mount_advisory"]
 
 
 def test_test_connection_surfaces_auth_message():

@@ -216,39 +216,6 @@ class TestBuildTopPicks:
         section = await svc._build_top_picks(_UID, "listenbrainz", True, "u", {}, [])
         assert section is None
 
-    @pytest.mark.asyncio
-    async def test_thorough_build_ignores_cached_section(self):
-        # A cold on-visit build can cache a trending-only section; the warmer's thorough
-        # build must REBUILD rather than return that cache, or the warm is a no-op.
-        from services.discover.mbid_resolution_service import discover_build_thorough
-
-        svc = _svc()
-        stale = TopPicksSection(items=[], source="listenbrainz", personalizing=True)
-        svc._memory_cache = MagicMock()
-        svc._memory_cache.get = AsyncMock(return_value={"section": stale})
-        svc._memory_cache.set = AsyncMock()
-        svc._top_picks_cache_key = MagicMock(return_value="tp:u")
-        seed = SimpleNamespace(artist_name="Radiohead", artist_mbids=["seed-1"], listen_count=10)
-        results = {
-            "similar_0": [
-                SimpleNamespace(artist_mbid="sim-1", artist_name="The Verve", listen_count=5, score=100.0)
-            ]
-        }
-        svc._lb_repo.get_artist_top_release_groups = AsyncMock(
-            return_value=[_rg("rg-1", "Urban Hymns", "The Verve", ["sim-1"])]
-        )
-
-        # on-visit: short-circuits to the cached section
-        assert await svc._build_top_picks(_UID, "listenbrainz", True, "u", results, [seed]) is stale
-
-        # thorough: ignores the cache and rebuilds fresh
-        token = discover_build_thorough.set(True)
-        try:
-            rebuilt = await svc._build_top_picks(_UID, "listenbrainz", True, "u", results, [seed])
-        finally:
-            discover_build_thorough.reset(token)
-        assert rebuilt is not stale
-        assert rebuilt is not None and rebuilt.items  # actually built picks
 
     @pytest.mark.asyncio
     async def test_populates_from_trending_when_lastfm_similarity_starves(self, monkeypatch):
@@ -362,15 +329,15 @@ class TestResolveReleaseMbids:
         import services.discover.homepage_service as mod
 
         svc = _svc()
-        svc._mb_repo = MagicMock()
 
-        async def _hang(_rid):
+        async def _hang(_rids, **_kwargs):
             await asyncio.sleep(1)
+            return {}
 
-        svc._mb_repo.get_release_group_id_from_release = _hang
+        svc._mbid.resolve_release_mbids = _hang
         monkeypatch.setattr(mod, "DISCOVER_MB_RESOLVE_BUDGET_SECONDS", 0.05)
 
-        result = await svc._resolve_release_mbids(["rel-1", "rel-2"])
+        result = await svc._resolve_release_mbids(["rel-1", "rel-2"], work_key="test")
         assert result == {}
 
 

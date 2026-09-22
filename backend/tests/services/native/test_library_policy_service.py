@@ -1,6 +1,7 @@
 import sqlite3
 import threading
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -19,7 +20,7 @@ from services.native.library_policy_service import LibraryPolicyService
 from services.preferences_service import PreferencesService
 
 
-def _build(tmp_path: Path):
+def _build(tmp_path: Path, *, wakeup: Mock | None = None):
     root = tmp_path / "Music"
     root.mkdir()
     settings = Settings()
@@ -45,7 +46,9 @@ def _build(tmp_path: Path):
         nonlocal cached
         cached = None
 
-    service = LibraryPolicyService(preferences, database, get_resolver, clear_resolver)
+    service = LibraryPolicyService(
+        preferences, database, get_resolver, clear_resolver, scan_wakeup=wakeup
+    )
     return service, preferences, database, root
 
 
@@ -77,6 +80,45 @@ def test_save_returns_pending_impact_without_starting_work(tmp_path: Path) -> No
         == "local_metadata"
     )
     assert TaskRegistry.get_instance().get_all() == {}
+
+
+def test_save_with_affected_scopes_marks_dirty_and_wakes(tmp_path: Path) -> None:
+    """T16 (S-01 Hook B writer): affected scopes are marked + supervisor woken."""
+    wakeup = Mock()
+    service, preferences, _database, root = _build(tmp_path, wakeup=wakeup)
+    revision = service.get_settings().policy_revision
+    service.save_settings(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(
+                    id="root-1",
+                    path=str(root),
+                    label="Music",
+                    policy="local_metadata",
+                )
+            ]
+        ),
+        expected_policy_revision=revision,
+    )
+    assert preferences.get_library_scan_dirty_scopes().scope_ids == ["root-1"]
+    wakeup.assert_called_once_with()
+
+
+def test_save_without_affected_scopes_marks_nothing(tmp_path: Path) -> None:
+    """T16 (S-01 Hook B writer): a no-change save marks nothing."""
+    wakeup = Mock()
+    service, preferences, _database, root = _build(tmp_path, wakeup=wakeup)
+    revision = service.get_settings().policy_revision
+    service.save_settings(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(id="root-1", path=str(root), label="Music")
+            ]
+        ),
+        expected_policy_revision=revision,
+    )
+    assert preferences.get_library_scan_dirty_scopes().scope_ids == []
+    wakeup.assert_not_called()
 
 
 def test_impact_marks_stale_and_reports_exclusion(tmp_path: Path) -> None:

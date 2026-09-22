@@ -114,6 +114,9 @@ class IdentificationDecision(AppStruct):
     ranked_edition_keys: list[str] = msgspec.field(default_factory=list)
 
 
+TrackProvenance = Literal["tag", "parsed", "placeholder", "absent"]
+
+
 class GroupingTrack(AppStruct):
     local_track_id: str
     root_id: str
@@ -126,12 +129,17 @@ class GroupingTrack(AppStruct):
     # more than one. Empty means the single ``album_artist_name`` is authoritative
     # - a real name that merely contains "&"/"," stays one artist.
     album_artists: list[str] = msgspec.field(default_factory=list)
+    title_provenance: TrackProvenance = "absent"
+    album_title_provenance: TrackProvenance = "absent"
+    album_artist_provenance: TrackProvenance = "absent"
     artist_sort_name: str | None = None
     album_artist_sort_name: str | None = None
     track_number: int = 0
     disc_number: int = 1
     duration_seconds: float | None = None
     recording_mbid: str | None = None
+    # Support-only AcoustID evidence, never authoritative proof.
+    fingerprint_recording_mbid: str | None = None
     release_mbid: str | None = None
     release_group_mbid: str | None = None
     release_track_mbid: str | None = None
@@ -216,6 +224,7 @@ class FingerprintOutcome(AppStruct):
     last_attempt_at: float = 0.0
     retry_after: float | None = None
     row_revision: int = 1
+    partial_decode: bool = False
 
 
 class AlbumCoverage(AppStruct):

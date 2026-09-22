@@ -637,7 +637,7 @@ async def benchmark_target_scan(
         async def counted_fingerprint(*_args: object, **_kwargs: object):
             nonlocal fingerprint_calls
             fingerprint_calls += 1
-            return None
+            return (None, False)
 
         async def counted_external_list(*_args: object, **_kwargs: object):
             nonlocal external_calls

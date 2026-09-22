@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -44,8 +45,13 @@ from models.library_management import (
     LibraryManagementImportFile,
     LibraryManagementImportResult,
 )
-from services.native.album_matcher import LocalTrack, MBTrack, score_release
+from services.native.album_matcher import LocalTrack, MBTrack
 from services.native.file_processor import row_covers_track
+from services.native.match_scoring_core import (
+    fingerprint_hit,
+    match_accepted,
+    score_release as core_score_release,
+)
 from infrastructure.audio.metadata_engine import AUDIO_SUFFIXES
 from services.native.naming import NamingTemplateEngine
 from services.native.quality_tiers import tier_for, tier_rank
@@ -68,8 +74,19 @@ logger = logging.getLogger(__name__)
 
 # mirror the scanner's thresholds so a drop identifies exactly like a scan would
 _FINGERPRINT_SCORE_THRESHOLD = 0.70
+
+# F-01: item-detail reason when a forced (Tier-1 / single-file) path scores a
+# release but fails the acceptance gate. A plain string in the detail field -
+# no schema change - so the review UI can name the cause.
+_FORCED_MATCH_REJECTED = "FORCED_MATCH_REJECTED"
 _UNMAPPED_CONFIDENCE = 0.5
 _MAX_FILES_PER_UNIT = 60
+
+# F-02: staged review items pin disk while contributions pin none, so the
+# startup sweep hard-deletes needs_review items past this age (clocked on the
+# parent job created_at), mirroring the 90d terminal-delete the contribution
+# cleanup applies to verification-job rows.
+_REVIEW_RETENTION_DAYS = 90
 
 # archive safety rails: far above any real purchase, far below a zip bomb
 _MAX_ARCHIVE_ENTRIES = 4096
@@ -190,6 +207,7 @@ class DropImportService:
             | None
         ) = None,
         policy_revision_getter: Callable[[], str] | None = None,
+        plugin_host=None,  # noqa: ANN001 - PluginHost, optional (01b events)
     ) -> None:
         self._store = store
         self._tagger = tagger
@@ -206,7 +224,25 @@ class DropImportService:
         self._staging_root = staging_root
         self._publish_import_bundle = publish_import_bundle
         self._policy_revision_getter = policy_revision_getter
+        self._plugin_host = plugin_host
+        self._plugin_tasks: set[asyncio.Task] = set()
         self._tasks: dict[str, asyncio.Task] = {}
+
+    def _emit_plugin_event(self, kind: str, payload: object) -> None:
+        host = getattr(self, "_plugin_host", None)
+        if host is None:
+            return
+        try:
+            import uuid as _uuid
+
+            from infrastructure.plugins.protocols import PluginEvent
+
+            event = PluginEvent(kind=kind, payload=payload, causation_id=_uuid.uuid4().hex)
+            task = asyncio.create_task(host.dispatch_event(event))
+            self._plugin_tasks.add(task)
+            task.add_done_callback(self._plugin_tasks.discard)
+        except Exception:  # noqa: BLE001 - events never break imports
+            pass
 
     def incoming_dir(self) -> Path:
         """Where the route streams uploads before a job exists. Same filesystem
@@ -288,7 +324,7 @@ class DropImportService:
         if picked is None:
             raise ValidationError("Could not load that release group from MusicBrainz")
         meta, tracks = picked
-        match = score_release([self._to_local(e) for e in entries], tracks, meta)
+        match = core_score_release([self._to_local(e) for e in entries], tracks, meta)
         ident = _Identified(meta=meta, tracks=tracks, match=match)
 
         # the user's explicit choice is authoritative: full confidence, so the
@@ -319,6 +355,14 @@ class DropImportService:
         assert refreshed is not None
         return refreshed
 
+    @staticmethod
+    def _remove_staged_paths(paths: list[str]) -> None:
+        for raw in paths:
+            try:
+                Path(raw).unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove staged file %s", raw)
+
     async def discard_item(
         self, item_id: int, *, user_id: str, is_admin: bool
     ) -> DropImportItem:
@@ -326,14 +370,7 @@ class DropImportService:
         if item.status != ItemStatus.NEEDS_REVIEW:
             raise ValidationError("Only items awaiting review can be discarded")
 
-        def _remove() -> None:
-            for raw in item.staging_paths:
-                try:
-                    Path(raw).unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("Could not remove staged file %s", raw)
-
-        await asyncio.to_thread(_remove)
+        await asyncio.to_thread(self._remove_staged_paths, list(item.staging_paths))
         await self._store.update_item(
             item.id, status=ItemStatus.DISCARDED, staging_paths=[], detail="Discarded"
         )
@@ -345,11 +382,24 @@ class DropImportService:
 
     async def sweep_stale(self) -> None:
         """Startup housekeeping: jobs whose task died with the process are
-        failed, and staging directories with nothing left to review are removed."""
+        failed, ``needs_review`` items past the F-02 retention age are pruned
+        with their staged files, and staging directories with nothing left to
+        review are removed."""
         detail = "The server restarted mid-import. Drop the files in again."
         failed = await self._store.fail_stale_processing(detail)
         if failed:
             logger.info("drop_import.stale_failed", extra={"jobs": failed})
+        pruned = await self._store.prune_stale_review_items(
+            cutoff=time.time() - _REVIEW_RETENTION_DAYS * 86400
+        )
+        if pruned:
+            logger.info(
+                "drop_import.review_retention_pruned", extra={"items": len(pruned)}
+            )
+            await asyncio.to_thread(
+                self._remove_staged_paths,
+                [path for paths in pruned for path in paths],
+            )
         jobs = await self._store.list_jobs(limit=500)
 
         def _cleanup(dirs: list[str]) -> None:
@@ -377,7 +427,7 @@ class DropImportService:
     async def _run_job(self, job_id: str) -> None:
         try:
             await self._process_job(job_id)
-        except Exception:
+        except Exception:  # noqa: BLE001 - job boundary records FAILED instead of raising
             logger.exception("Drop import job %s failed", job_id)
             try:
                 await self._store.set_job_status(
@@ -419,7 +469,7 @@ class DropImportService:
         for item_id, _folder_name, paths in item_ids:
             try:
                 await self._process_item(job, item_id, paths)
-            except Exception:
+            except Exception:  # noqa: BLE001 - failing folder must not abort sibling folders
                 logger.exception("Drop import item %s failed", item_id)
                 await self._store.update_item(
                     item_id,
@@ -567,9 +617,16 @@ class DropImportService:
             )
             return
 
-        ident = await self._identify(entries)
+        ident, forced_rejected = await self._identify(entries)
         if ident is None:
-            detail = "Couldn't work out which album this is. Match it manually."
+            if forced_rejected:
+                detail = (
+                    f"{_FORCED_MATCH_REJECTED}: these files name an album they "
+                    "don't match closely enough to import on their own. "
+                    "Match it manually, or discard it."
+                )
+            else:
+                detail = "Couldn't work out which album this is. Match it manually."
             if unreadable:
                 plural = "file" if unreadable == 1 else "files"
                 detail += f" ({unreadable} unreadable {plural} ignored)"
@@ -684,6 +741,9 @@ class DropImportService:
 
     @staticmethod
     def _to_local(entry: _Entry) -> LocalTrack:
+        """Thin drop adapter (step 2.3a): project one staged ``_Entry`` onto
+        the shared core's ``LocalTrack`` so every lane-B scoring path below
+        runs on the same shape the core (and lane A, in 2.3b) scores."""
         tag, info = entry.tag, entry.info
         return LocalTrack(
             path=str(entry.path),
@@ -697,7 +757,12 @@ class DropImportService:
             recording_mbid=tag.musicbrainz_recording_id,
         )
 
-    async def _identify(self, entries: list[_Entry]) -> _Identified | None:
+    async def _identify(
+        self, entries: list[_Entry]
+    ) -> tuple[_Identified | None, bool]:
+        """Identify one unit. The flag reports a forced-match rejection (F-01):
+        a Tier-1 / single-file path scored a release that failed the gate, so
+        the caller must route review with the rejection reason."""
         locals_ = [self._to_local(e) for e in entries]
 
         # Tier 1: consistent MBID tags are authoritative (store purchases are
@@ -711,9 +776,15 @@ class DropImportService:
             e.tag.musicbrainz_release_group_id and e.tag.musicbrainz_recording_id
             for e in entries
         ):
-            forced = await self._score_against(next(iter(tagged_rgs)), locals_)
+            forced, rejected = await self._score_against(
+                next(iter(tagged_rgs)), locals_
+            )
             if forced is not None:
-                return forced
+                return forced, False
+            if rejected:
+                # Stale embedded MBIDs: the tags name a release these files no
+                # longer match, so review - never fall through and organise it.
+                return None, True
 
         if len(entries) >= 2:
             match = await self._try_identify(locals_)
@@ -723,10 +794,12 @@ class DropImportService:
                     match = await self._try_identify(enriched, seeds)
                     locals_ = enriched
             if match is not None:
-                scored = await self._score_against(match.release_group_mbid, locals_)
+                scored, _ = await self._score_against(
+                    match.release_group_mbid, locals_
+                )
                 if scored is not None:
-                    return scored
-            return None
+                    return scored, False
+            return None, False
 
         # Single file: an MBID tag wins, else the fingerprint decides.
         entry = entries[0]
@@ -738,18 +811,18 @@ class DropImportService:
             fp = await self._fingerprinter.fingerprint(entry.path)
         except Exception:  # noqa: BLE001 - no fingerprint just means needs_review
             logger.warning("Fingerprint failed for %s", entry.path)
-            return None
-        if (
-            fp is None
-            or fp.status != "pass"
-            or (fp.score or 0.0) < _FINGERPRINT_SCORE_THRESHOLD
-            or not fp.recording_id
-        ):
-            return None
-        rg = await self._mb_matcher.resolve_recording_to_release_group(fp.recording_id)
+            return None, False
+        recording_mbid = (
+            fingerprint_hit(fp, threshold=_FINGERPRINT_SCORE_THRESHOLD)
+            if fp is not None
+            else None
+        )
+        if recording_mbid is None:
+            return None, False
+        rg = await self._mb_matcher.resolve_recording_to_release_group(recording_mbid)
         if not rg:
-            return None
-        locals_ = [msgspec.structs.replace(locals_[0], recording_mbid=fp.recording_id)]
+            return None, False
+        locals_ = [msgspec.structs.replace(locals_[0], recording_mbid=recording_mbid)]
         return await self._score_against(rg, locals_)
 
     async def _try_identify(
@@ -760,17 +833,26 @@ class DropImportService:
         except Exception as exc:  # noqa: BLE001 - identification falls back to review
             logger.warning("Album identification failed: %s", exc)
             return None
-        return match if match is not None and match.accepted else None
+        # The shared core owns the accept/refuse boundary (same predicate the
+        # forced paths gate on below).
+        return match if match is not None and match_accepted(match) else None
 
     async def _score_against(
         self, release_group_mbid: str, locals_: list[LocalTrack]
-    ) -> _Identified | None:
+    ) -> tuple[_Identified | None, bool]:
+        """Rescore one release group. The flag reports a forced-match rejection
+        (F-01): a release was scored but failed the same acceptance gate tag
+        identification applies (``match.accepted``, mirroring ``_try_identify``),
+        so the caller routes review instead of organising. ``(None, False)`` is
+        a plain miss with no release to judge."""
         picked = await self._identifier.release_tracks(release_group_mbid, len(locals_))
         if picked is None:
-            return None
+            return None, False
         meta, tracks = picked
-        match = score_release(locals_, tracks, meta)
-        return _Identified(meta=meta, tracks=tracks, match=match)
+        match = core_score_release(locals_, tracks, meta)
+        if not match_accepted(match):
+            return None, True
+        return _Identified(meta=meta, tracks=tracks, match=match), False
 
     async def _fingerprint_enrich(
         self, entries: list[_Entry], locals_: list[LocalTrack]
@@ -786,16 +868,22 @@ class DropImportService:
                 fp: "FingerprintResult" = await self._fingerprinter.fingerprint(
                     entry.path
                 )
-                if (
-                    fp.status == "pass"
-                    and (fp.score or 0.0) >= _FINGERPRINT_SCORE_THRESHOLD
-                    and fp.recording_id
+                recording_mbid = fingerprint_hit(
+                    fp, threshold=_FINGERPRINT_SCORE_THRESHOLD
+                )
+                # 4.10b lane B: a partial decode never seeds an RG alone -
+                # it needs descriptive corroboration (tags + quorum still
+                # organise; full prints flow through unchanged).
+                if recording_mbid is not None and bool(
+                    getattr(fp, "partial_decode", False)
                 ):
+                    recording_mbid = None
+                if recording_mbid is not None:
                     local = msgspec.structs.replace(
-                        local, recording_mbid=fp.recording_id
+                        local, recording_mbid=recording_mbid
                     )
                     rg = await self._mb_matcher.resolve_recording_to_release_group(
-                        fp.recording_id
+                        recording_mbid
                     )
                     if rg and rg not in seen:
                         seen.add(rg)
@@ -1112,6 +1200,19 @@ class DropImportService:
 
         # F-NL-05: a partial import keeps the catalog fresh but leaves the
         # durable request and wanted watch open for normal recovery.
+        try:
+            from infrastructure.plugins.protocols import ImportEvent
+
+            self._emit_plugin_event(
+                "import_finished",
+                ImportEvent(
+                    release_group_mbid=rg,
+                    track_count=len(getattr(ident, "tracks", []) or []),
+                    source="drop",
+                ),
+            )
+        except Exception:  # noqa: BLE001 - events never break imports
+            pass
         if not fulfills_request:
             return
 
@@ -1148,6 +1249,20 @@ class DropImportService:
                 )
             except Exception as exc:  # noqa: BLE001 - notification is best-effort
                 logger.debug("request_imported publish failed: %s", exc)
+        try:
+            from infrastructure.plugins.protocols import RequestEvent
+
+            self._emit_plugin_event(
+                "request_fulfilled",
+                RequestEvent(
+                    request_id=rg,
+                    user_id=getattr(record, "user_id", None) or getattr(job, "user_id", ""),
+                    release_group_mbid=rg,
+                    status="imported",
+                ),
+            )
+        except Exception:  # noqa: BLE001 - events never break imports
+            pass
 
     async def _publish_job(self, job: DropImportJob) -> None:
         try:

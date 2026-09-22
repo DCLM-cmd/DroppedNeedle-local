@@ -33,6 +33,8 @@ from infrastructure.cover_urls import prefer_artist_cover_url
 from infrastructure.degradation import DegradationContext, init_degradation_context
 from infrastructure.persistence import DiscoverySnapshotStore, MBIDStore
 from infrastructure.serialization import clone_with_updates
+from infrastructure.validators import is_valid_mbid
+from infrastructure.observability.optional_work import OptionalWorkDeferred, optional_work_budget, optional_dispatch_guard, check_optional_dispatch
 from repositories.protocols import (
     ListenBrainzRepositoryProtocol,
     JellyfinRepositoryProtocol,
@@ -50,7 +52,7 @@ from infrastructure.persistence.user_listening_prefs_store import (
 from services.discover.integration_helpers import IntegrationHelpers
 from services.discover.mbid_resolution_service import (
     MbidResolutionService,
-    discover_build_thorough,
+    with_resolution_user,
 )
 from services.discover.queue_strategies import (
     build_similar_artist_pools,
@@ -67,10 +69,21 @@ from repositories.musicbrainz_base import (
     MbSourceContext,
     capture_mb_source_context,
     mb_publish_if_current,
+    is_mb_source_current,
 )
-from infrastructure.validators import is_valid_mbid
 
 logger = logging.getLogger(__name__)
+
+
+def _log_triggered_warm_error(task: asyncio.Task, user_id: str) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "Triggered homepage warm failed user=%s: %s", user_id, error, exc_info=error
+        )
+
 
 _discover_source_context: ContextVar[MbSourceContext | None] = ContextVar(
     "discover_source_context", default=None
@@ -80,85 +93,6 @@ if TYPE_CHECKING:
     from services.native.background_workload_gate import BackgroundWorkloadGate
 
 
-def _log_task_error(task: "asyncio.Task[None]") -> None:
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        logger.error("Discover background task failed: %s", exc, exc_info=exc)
-
-
-# Ceilings on how many covers one prewarm pass fetches, so a huge grid can't turn a warm
-# cycle into an unbounded background crawl. First-seen order (top picks, then rows top-to-
-# bottom) means the covers most likely on screen warm first.
-_PREWARM_MAX_ALBUMS = 120
-_PREWARM_MAX_ARTISTS = 60
-
-
-def _collect_cover_prewarm_mbids(
-    response: DiscoverResponse,
-) -> tuple[list[str], list[str]]:
-    """Album and artist MBIDs across every visible Discover section, de-duped in first-seen
-    (visual-priority) order. Tracks/genres carry no cover of their own and are skipped."""
-    album_mbids: list[str] = []
-    artist_mbids: list[str] = []
-    seen_albums: set[str] = set()
-    seen_artists: set[str] = set()
-
-    def add_album(mbid: str | None) -> None:
-        if is_valid_mbid(mbid) and mbid not in seen_albums:
-            seen_albums.add(mbid)
-            album_mbids.append(mbid)
-
-    def add_artist(mbid: str | None) -> None:
-        if is_valid_mbid(mbid) and mbid not in seen_artists:
-            seen_artists.add(mbid)
-            artist_mbids.append(mbid)
-
-    def walk_section(section: HomeSection | None) -> None:
-        if section is None:
-            return
-        for item in section.items:
-            if isinstance(item, HomeAlbum):
-                add_album(item.mbid)
-            elif isinstance(item, HomeArtist):
-                add_artist(item.mbid)
-
-    if response.top_picks:
-        for pick in response.top_picks.items:
-            add_album(pick.album.mbid)
-    for bylt in response.because_you_listen_to:
-        add_artist(bylt.seed_artist_mbid)
-        walk_section(bylt.section)
-    for section in (
-        response.fresh_releases,
-        response.missing_essentials,
-        response.rediscover,
-        response.artists_you_might_like,
-        response.popular_in_your_genres,
-        response.globally_trending,
-        response.lastfm_weekly_artist_chart,
-        response.lastfm_weekly_album_chart,
-        response.lastfm_recent_scrobbles,
-        response.listeners_like_you,
-        response.anniversaries,
-        response.new_from_followed,
-        response.unexplored_genres,
-        response.genre_list,
-    ):
-        walk_section(section)
-    for section in response.daily_mixes:
-        walk_section(section)
-    for section in response.radio_sections:
-        walk_section(section)
-    # Weekly Exploration is a bespoke shape (tracks, not HomeSection items) but its rows still
-    # render album + artist covers through our endpoint, so warm those too.
-    if response.weekly_exploration is not None:
-        for track in response.weekly_exploration.tracks:
-            add_album(track.release_group_mbid)
-            add_artist(track.artist_mbid)
-
-    return album_mbids[:_PREWARM_MAX_ALBUMS], artist_mbids[:_PREWARM_MAX_ARTISTS]
 
 
 DISCOVER_CACHE_TTL = 43200  # 12 hours
@@ -176,19 +110,6 @@ DISCOVER_TASK_TIMEOUT_SECONDS = 25
 # instead of the whole task being cancelled mid-resolution and vanishing.
 TOP_PICKS_SIMILARITY_BUDGET_SECONDS = 12
 DISCOVER_MB_RESOLVE_BUDGET_SECONDS = 15
-# Per-build multiplier on every section budget below. Defaults to 1.0 (on-visit builds stay
-# tightly budgeted so the page paints fast). The background warmer sets it high via a
-# ContextVar so its build runs effectively unbudgeted - the Last.fm->MusicBrainz resolution
-# gets the TIME it needs to complete and (with the incremental persist) bank exactly the
-# albums each section uses, so the next on-visit build is cheap and fully personalised. It's
-# a ContextVar (per-task), so a concurrent on-visit build on the same @singleton is unaffected.
-PREWARM_BUDGET_SCALE = 40.0
-
-
-def _scaled(base: float) -> float:
-    """A section budget, relaxed PREWARM_BUDGET_SCALE-fold during a thorough (warmer) build so
-    the rate-limited MusicBrainz resolution can complete; unchanged for on-visit builds."""
-    return base * PREWARM_BUDGET_SCALE if discover_build_thorough.get() else base
 
 
 # Per-radio-station pool budget. MUST stay under DISCOVER_TASK_TIMEOUT_SECONDS or the
@@ -339,17 +260,32 @@ class DiscoverHomepageService:
         if registry.is_running(task_name):
             return
         self._refresh_started_at.setdefault(user_id, time.time())
-        task = asyncio.create_task(self._run_triggered_warm(user_id))
+        context = capture_mb_source_context()
+        store = getattr(self, "_snapshot_store", None)
+        lease = store.user_lease(user_id) if store is not None else None
+        task = asyncio.create_task(self._run_triggered_warm(user_id, context, lease))
+        task.add_done_callback(
+            lambda t, u=user_id: _log_triggered_warm_error(t, u)
+        )
         try:
             registry.register(task_name, task)
         except RuntimeError:
             pass
 
-    async def _run_triggered_warm(self, user_id: str) -> None:
-        if self._workload_gate is None:
-            await self.warm_cache(user_id)
-            return
-        await self._workload_gate.run_warmer_unit(lambda: self.warm_cache(user_id))
+    async def _run_triggered_warm(self, user_id: str, context: MbSourceContext, lease) -> None:
+        with optional_work_budget(), optional_dispatch_guard(
+            lambda: is_mb_source_current(context) and (lease is None or lease.active)
+        ):
+            try:
+                check_optional_dispatch()
+                if self._workload_gate is None:
+                    await self.warm_cache(user_id)
+                    return
+                await self._workload_gate.run_warmer_unit(lambda: self.warm_cache(user_id))
+            except OptionalWorkDeferred:
+                return
+            finally:
+                self._refresh_started_at.pop(user_id, None)
 
     async def get_discover_data(self, user_id: str) -> DiscoverResponse:
         _discover_source_context.set(capture_mb_source_context())
@@ -504,53 +440,6 @@ class DiscoverHomepageService:
         )
         return (True, still_converging)
 
-    async def warm_cache_thorough(self, user_id: str) -> None:
-        """Background-warmer build. Runs the REAL discover build in THOROUGH mode: every section
-        budget relaxed AND all album->release-group lookups resolved (not capped at max_lookups),
-        so during a ListenBrainz-popularity outage the Last.fm->MusicBrainz resolution completes
-        and Top Picks FULLY personalises in one pass (banked durably via the incremental persist).
-        Harmless when LB is healthy (sections use LB directly and finish fast).
-
-        First it PROBES LB popularity, so the degraded gate reflects reality NOW before the section
-        builders choose their path. Without this, the first build after an idle gap (the gate's TTL
-        expired with no call to re-mark it) would take the stale LB path, 500, and cache a
-        trending-only result."""
-        if self._workload_gate is not None:
-            await self._workload_gate.wait_until_available()
-        (
-            lb_client,
-            _lfm,
-            username,
-            lfm_username,
-            lb_enabled,
-            lfm_enabled,
-            primary,
-        ) = await self._resolve_user_music(user_id, None)
-        try:
-            seeds = await self._get_seed_artists(
-                lb_enabled,
-                username,
-                self._integration.is_jellyfin_enabled(),
-                resolved_source=primary,
-                lfm_enabled=lfm_enabled,
-                lfm_username=lfm_username,
-                lb_client=lb_client,
-            )
-            seed_mbid = next(
-                (s.artist_mbids[0] for s in seeds if getattr(s, "artist_mbids", None)),
-                None,
-            )
-            if seed_mbid:
-                # side effect is the point: a 500 marks the gate degraded, a 200 heals it
-                await self._lb_repo.get_artist_top_release_groups(seed_mbid, count=1)
-        except Exception:  # noqa: BLE001 - probe is best-effort; its gate side effect already fired
-            pass
-
-        token = discover_build_thorough.set(True)
-        try:
-            await self.warm_cache(user_id)
-        finally:
-            discover_build_thorough.reset(token)
 
     async def refresh_discover_data(self, user_id: str) -> None:
         _, _, _, _, lb_enabled, lfm_enabled, _ = await self._resolve_user_music(
@@ -572,15 +461,18 @@ class DiscoverHomepageService:
             )
         self._trigger_warm(user_id)
 
-    async def warm_cache(self, user_id: str) -> None:
+    async def warm_cache(self, user_id: str) -> bool:
         _discover_source_context.set(capture_mb_source_context())
+        operation_context = self._source_context()
+        store = getattr(self, "_snapshot_store", None)
+        lease = store.user_lease(user_id) if store is not None else None
         if self._workload_gate is not None:
             await self._workload_gate.wait_until_available()
         _, _, _, _, lb_enabled, lfm_enabled, _ = await self._resolve_user_music(
             user_id, None
         )
         if user_id in self._building_keys:
-            return
+            return False
         self._building_keys.add(user_id)
         self._refresh_started_at.setdefault(user_id, time.time())
         cache_key = self._integration.get_discover_cache_key(
@@ -591,7 +483,13 @@ class DiscoverHomepageService:
         # explain an empty result
         ctx = init_degradation_context()
         try:
-            response = await self.build_discover_data(user_id)
+            with optional_dispatch_guard(
+                lambda: is_mb_source_current(operation_context)
+                and (lease is None or lease.active)
+            ):
+                response = await self.build_discover_data(user_id)
+            if lease is not None and not lease.active:
+                raise OptionalWorkDeferred()
             generated_at = time.time()
             response = clone_with_updates(
                 response,
@@ -605,6 +503,8 @@ class DiscoverHomepageService:
             )
             if self._has_meaningful_content(response):
                 async def publish() -> None:
+                    if lease is not None and not lease.active:
+                        raise OptionalWorkDeferred()
                     if self._memory_cache:
                         await self._memory_cache.set(
                             cache_key, response, DISCOVER_CACHE_TTL
@@ -617,21 +517,23 @@ class DiscoverHomepageService:
                                 msgspec.json.encode(response),
                                 generated_at,
                             )
+                        except OptionalWorkDeferred:
+                            raise
                         except Exception as exc:  # noqa: BLE001 - memory copy stays usable
                             logger.warning(
                                 "Could not persist Discover snapshot: %s", exc
                             )
 
-                published = await mb_publish_if_current(
-                    self._source_context(), publish
+                return await mb_publish_if_current(
+                    operation_context, publish
                 )
-                if published:
-                    self._spawn_cover_prewarm(user_id, response)
             else:
                 logger.warning(
                     "Discover build produced no meaningful content, keeping existing cache"
                 )
                 await self._cache_empty_build_marker(cache_key, response)
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to build discover data: {e}")
             await self._cache_empty_build_marker(
@@ -652,6 +554,7 @@ class DiscoverHomepageService:
             # the stale-while-revalidate window and the cache-miss path back off instead of
             # rebuilding on every poll - including users whose build is legitimately empty
             self._built_at[cache_key] = time.time()
+        return False
 
     async def _apply_candidate_ownership(self, response: DiscoverResponse) -> None:
         albums: list[HomeAlbum] = []
@@ -730,6 +633,8 @@ class DiscoverHomepageService:
                 owned_artists = await self._library_repo.existing_artist_mbids(
                     artist_ids
                 )
+            except OptionalWorkDeferred:
+                raise
             except Exception as exc:  # noqa: BLE001 - ownership flags are best-effort
                 logger.warning("native artist mbid lookup failed: %s", exc)
             else:
@@ -777,78 +682,6 @@ class DiscoverHomepageService:
             cache_key, response, STALE_REVALIDATE_SECONDS
         )
 
-    def _spawn_cover_prewarm(self, user_id: str, response: DiscoverResponse) -> None:
-        """Warm covers for the WHOLE Discover grid (albums + artists) so the page paints from
-        disk instead of a burst of cold, rate-limited external fetches on the user's next visit.
-        BACKGROUND_SYNC keeps live user requests ahead of it, and the proactive warmer drives
-        this ahead of the visit entirely - the single biggest lever against cold cover grids."""
-        if self._cover_repo is None:
-            return
-        album_mbids, artist_mbids = _collect_cover_prewarm_mbids(response)
-        # The Top Picks featured card renders at 500; every grid renders at 250. Warming both
-        # sizes for the picks (a handful) and 250 for the rest matches what the UI requests.
-        top_pick_mbids = (
-            [i.album.mbid for i in response.top_picks.items if i.album.mbid]
-            if response.top_picks
-            else []
-        )
-        if not album_mbids and not artist_mbids:
-            return
-        from core.task_registry import TaskRegistry
-
-        registry = TaskRegistry.get_instance()
-        # Distinct from the queue manager's "discover-cover-prewarm-{uid}" (which warms the
-        # deck): this warms the full Discover grid, and the two must not share a registry name.
-        task_name = f"discover-grid-cover-prewarm-{user_id}"
-        if registry.is_running(task_name):
-            return  # a grid prewarm for this user is already draining - don't stack another
-
-        async def _warm() -> None:
-            from infrastructure.queue.priority_queue import RequestPriority
-
-            semaphore = asyncio.Semaphore(4)
-
-            async def warm_album(mbid: str, size: str) -> None:
-                async with semaphore:
-                    if self._workload_gate is not None:
-                        await self._workload_gate.wait_until_available()
-                    try:
-                        await self._cover_repo.get_release_group_cover(
-                            mbid, size=size, priority=RequestPriority.BACKGROUND_SYNC
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug(
-                            "Discover cover prewarm (album %s) failed: %s",
-                            mbid[:8],
-                            exc,
-                        )
-
-            async def warm_artist(mbid: str) -> None:
-                async with semaphore:
-                    if self._workload_gate is not None:
-                        await self._workload_gate.wait_until_available()
-                    try:
-                        await self._cover_repo.get_artist_image(
-                            mbid, size=250, priority=RequestPriority.BACKGROUND_SYNC
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug(
-                            "Discover cover prewarm (artist %s) failed: %s",
-                            mbid[:8],
-                            exc,
-                        )
-
-            jobs = [warm_album(m, "250") for m in album_mbids]
-            jobs += [warm_album(m, "500") for m in top_pick_mbids]
-            jobs += [warm_artist(m) for m in artist_mbids]
-            await asyncio.gather(*jobs, return_exceptions=True)
-
-        task = asyncio.create_task(_warm())
-        task.add_done_callback(_log_task_error)
-        try:
-            registry.register(task_name, task)
-        except RuntimeError:
-            pass
 
     @staticmethod
     def _section_has_items(section: HomeSection | None) -> bool:
@@ -931,6 +764,7 @@ class DiscoverHomepageService:
         if self._workload_gate is not None:
             await self._workload_gate.wait_until_available()
 
+    @with_resolution_user
     async def build_discover_data(self, user_id: str) -> DiscoverResponse:
         _discover_source_context.set(capture_mb_source_context())
         (
@@ -1020,16 +854,16 @@ class DiscoverHomepageService:
             tasks["jf_most_played"] = self._jf_repo.get_most_played_artists(limit=50)
 
         if library_configured:
-            tasks["library_artists"] = self._library_repo.get_home_artists(limit=500)
             tasks["library_albums"] = self._library_repo.get_home_albums(limit=500)
 
         results = await self._execute_tasks(tasks)
         await self._wait_for_background_window()
-        library_mbids = {
-            str(artist["mbid"]).lower()
-            for artist in (results.get("library_artists") or [])
-            if artist.get("mbid")
-        }
+        # E3: no bounded artist prefetch. Builder marking starts unowned and
+        # the candidate pass below corrects it with the same ownership
+        # predicate; the retired 500-row set could only truncate large
+        # libraries, and its exclusion use compared release-group MBIDs
+        # against artist MBIDs, which never matches.
+        library_mbids = set()
         library_album_mbids = {
             album.musicbrainz_id.lower()
             for album in (results.get("library_albums") or [])
@@ -1221,6 +1055,7 @@ class DiscoverHomepageService:
         ):
             dedupe(section)
 
+    @with_resolution_user
     async def build_playlist_suggestions(
         self,
         user_id: str,
@@ -1357,6 +1192,8 @@ class DiscoverHomepageService:
                             )
                         )
                         seen_mbids.add(mbid)
+            except OptionalWorkDeferred:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to get Last.fm seed artists: %s", e)
 
@@ -1378,6 +1215,8 @@ class DiscoverHomepageService:
                         if mbid and mbid not in seen_mbids:
                             seeds.append(a)
                             seen_mbids.add(mbid)
+                except OptionalWorkDeferred:
+                    raise
                 except RateLimitedError as e:
                     # The server is refusing us, not lacking data for this window:
                     # asking about the next three can only add to what it already
@@ -1415,6 +1254,8 @@ class DiscoverHomepageService:
                                 )
                             )
                             seen_mbids.add(mbid)
+                except OptionalWorkDeferred:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to get Jellyfin seed artists: {e}")
                     continue
@@ -1523,7 +1364,7 @@ class DiscoverHomepageService:
             if self._genre_index is None:
                 return []
 
-            if self._memory_cache and not discover_build_thorough.get():
+            if self._memory_cache:
                 cache_key = self._daily_mix_cache_key(user_id, resolved_source)
                 cached = await self._memory_cache.get(cache_key)
                 if cached is not None:
@@ -1606,6 +1447,8 @@ class DiscoverHomepageService:
                     )
                     if section:
                         sections.append(section)
+                except OptionalWorkDeferred:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Daily mix cluster {i} ({genre_lower}) failed: {e}")
                     continue
@@ -1613,6 +1456,8 @@ class DiscoverHomepageService:
             await self._cache_daily_mix_result(sections, user_id, resolved_source)
             return sections
 
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Daily mix builder failed: {e}")
             return []
@@ -1684,6 +1529,8 @@ class DiscoverHomepageService:
                             image_url=f"/api/v1/covers/release-group/{item.release_group_mbid}?size=500",
                         )
                     )
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Daily mix {index}: similar artist pools failed: {e}")
 
@@ -1713,6 +1560,8 @@ class DiscoverHomepageService:
                             in_library=True,
                         )
                     )
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Daily mix {index}: library albums fetch failed: {e}")
 
@@ -1799,6 +1648,9 @@ class DiscoverHomepageService:
             ),
             return_exceptions=True,
         )
+        for outcome in album_results:
+            if isinstance(outcome, OptionalWorkDeferred):
+                raise outcome
         pairs: list[tuple[Any, list]] = []
         for (mbid, (_sim, artist_name, _seed)), albums in zip(
             sim_artist_list, album_results
@@ -1890,11 +1742,7 @@ class DiscoverHomepageService:
         already-fetched similar-artist pools plus sitewide trending; scoring is pure
         (services.discover.top_picks) and deterministic within a day."""
         try:
-            # A thorough (warmer) build must REBUILD - never short-circuit on the cached
-            # section. Otherwise a cold on-visit build that cached a trending-only result
-            # (short degraded TTL) makes the very warm meant to fix it a no-op, and it never
-            # converges. On-visit builds still read the cache for speed.
-            if self._memory_cache is not None and not discover_build_thorough.get():
+            if self._memory_cache is not None:
                 cache_key = self._top_picks_cache_key(user_id, primary)
                 cached = await self._memory_cache.get(cache_key)
                 if isinstance(cached, dict) and "section" in cached:
@@ -1909,6 +1757,8 @@ class DiscoverHomepageService:
             if self._mbid_store is not None:
                 try:
                     ignored = await self._mbid_store.get_ignored_release_mbids(user_id)
+                except OptionalWorkDeferred:
+                    raise
                 except Exception:  # noqa: BLE001
                     logger.warning("Failed to load ignored release MBIDs for top picks")
             exclude = library_album_mbids | listened | ignored
@@ -1967,8 +1817,10 @@ class DiscoverHomepageService:
                         self._add_lastfm_top_pick_candidates(
                             sim_artist_list, exclude, seen_rgs, candidates
                         ),
-                        timeout=_scaled(TOP_PICKS_SIMILARITY_BUDGET_SECONDS),
+                        timeout=TOP_PICKS_SIMILARITY_BUDGET_SECONDS,
                     )
+                except OptionalWorkDeferred:
+                    raise
                 except Exception:  # noqa: BLE001 - starved similarity, use trending only
                     logger.warning(
                         "Top Picks Last.fm similarity pool exceeded its budget; "
@@ -1983,6 +1835,9 @@ class DiscoverHomepageService:
                     ),
                     return_exceptions=True,
                 )
+                for outcome in rg_results:
+                    if isinstance(outcome, OptionalWorkDeferred):
+                        raise outcome
                 for (artist_mbid, (sim, artist_name, seed_name)), rgs in zip(
                     sim_artist_list, rg_results
                 ):
@@ -2010,6 +1865,8 @@ class DiscoverHomepageService:
                 trending = await asyncio.wait_for(
                     self._lb_repo.get_sitewide_top_release_groups(count=100), timeout=30
                 )
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
                 trending = []
             for rg in trending:
@@ -2082,6 +1939,8 @@ class DiscoverHomepageService:
                         )
                         for genres in seed_genres.values():
                             user_genres.update(genre.lower() for genre in genres)
+                    except OptionalWorkDeferred:
+                        raise
                     except Exception:  # noqa: BLE001
                         pass
             genres_by_artist: dict[str, list[str]] = {}
@@ -2091,6 +1950,8 @@ class DiscoverHomepageService:
                     genres_by_artist = await self._genre_index.get_genres_for_artists(
                         artist_mbids
                     )
+                except OptionalWorkDeferred:
+                    raise
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -2142,6 +2003,8 @@ class DiscoverHomepageService:
             await self._cache_top_picks_result(section, user_id, primary, ttl=picks_ttl)
             return section
 
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Top picks builder failed: {e}")
             return None
@@ -2184,6 +2047,8 @@ class DiscoverHomepageService:
             if self._mbid_store is not None:
                 try:
                     ignored = await self._mbid_store.get_ignored_release_mbids(user_id)
+                except OptionalWorkDeferred:
+                    raise
                 except Exception:  # noqa: BLE001
                     pass
             exclude = library_album_mbids | ignored
@@ -2197,6 +2062,9 @@ class DiscoverHomepageService:
                 ),
                 return_exceptions=True,
             )
+            for outcome in rg_lists:
+                if isinstance(outcome, OptionalWorkDeferred):
+                    raise outcome
             items: list[HomeAlbum] = []
             seen: set[str] = set()
             for rg_list in rg_lists:
@@ -2234,6 +2102,8 @@ class DiscoverHomepageService:
                 items=items,
                 source="listenbrainz",
             )
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.debug("Listeners-like-you builder failed: %s", e)
             return None
@@ -2254,6 +2124,8 @@ class DiscoverHomepageService:
                 anniversary_years=self._ANNIVERSARY_YEARS,
                 limit=12,
             )
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.debug("Anniversaries builder failed to read the library: %s", e)
             return None
@@ -2304,6 +2176,8 @@ class DiscoverHomepageService:
             releases, _total = await self._follow_service.list_new_releases(
                 user_id, 10, 0
             )
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.debug("New-from-followed builder failed: %s", e)
             return None
@@ -2362,6 +2236,8 @@ class DiscoverHomepageService:
                     items.append(
                         self._transformers.lb_release_to_home(r, library_mbids)
                     )
+            except OptionalWorkDeferred:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Skipping fresh release item: {e}")
                 continue
@@ -2379,10 +2255,9 @@ class DiscoverHomepageService:
         results: dict[str, Any],
         library_mbids: set[str],
     ) -> HomeSection | None:
-        library_artists = results.get("library_artists") or []
         library_albums = results.get("library_albums") or []
 
-        if not library_artists or not library_albums:
+        if not library_albums:
             return None
 
         from collections import Counter
@@ -2414,6 +2289,8 @@ class DiscoverHomepageService:
                     top_releases = await self._lb_repo.get_artist_top_release_groups(
                         artist_mbid, count=10
                     )
+            except OptionalWorkDeferred:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.debug(
                     f"Failed to get releases for artist {artist_mbid[:8]}: {e}"
@@ -2448,6 +2325,9 @@ class DiscoverHomepageService:
             ),
             return_exceptions=True,
         )
+        for outcome in artist_results:
+            if isinstance(outcome, OptionalWorkDeferred):
+                raise outcome
 
         all_missing: list[HomeAlbum] = []
         for result in artist_results:
@@ -2622,6 +2502,9 @@ class DiscoverHomepageService:
             ),
             return_exceptions=True,
         )
+        for outcome in tag_results:
+            if isinstance(outcome, OptionalWorkDeferred):
+                raise outcome
 
         for genre_name, tag_artists in zip(genre_names, tag_results):
             if isinstance(tag_artists, Exception):
@@ -2671,6 +2554,9 @@ class DiscoverHomepageService:
             ),
             return_exceptions=True,
         )
+        for outcome in artist_info_results:
+            if isinstance(outcome, OptionalWorkDeferred):
+                raise outcome
 
         genre_names: list[str] = []
         seen_genres: set[str] = set()
@@ -2698,6 +2584,9 @@ class DiscoverHomepageService:
             ),
             return_exceptions=True,
         )
+        for outcome in tag_top_artist_results:
+            if isinstance(outcome, OptionalWorkDeferred):
+                raise outcome
 
         all_artists: list[HomeArtist] = []
         for genre_name, tag_artists in zip(genre_names, tag_top_artist_results):
@@ -2828,6 +2717,8 @@ class DiscoverHomepageService:
                 items=genre_items,
                 source=None,
             )
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Unexplored genres builder failed: {e}")
             return None
@@ -2931,7 +2822,7 @@ class DiscoverHomepageService:
 
         release_mbids = list({a.mbid for a in albums[:20] if a.mbid})
         rg_map = (
-            await self._resolve_release_mbids(release_mbids) if release_mbids else {}
+            await self._resolve_release_mbids(release_mbids, work_key="weekly-albums") if release_mbids else {}
         )
 
         items = []
@@ -2962,7 +2853,7 @@ class DiscoverHomepageService:
 
         release_mbids = list({t.album_mbid for t in tracks[:30] if t.album_mbid})
         rg_map = (
-            await self._resolve_release_mbids(release_mbids) if release_mbids else {}
+            await self._resolve_release_mbids(release_mbids, work_key="recent-scrobbles") if release_mbids else {}
         )
 
         items = []
@@ -2990,32 +2881,21 @@ class DiscoverHomepageService:
             source="lastfm",
         )
 
-    async def _resolve_release_mbids(self, release_ids: list[str]) -> dict[str, str]:
-        if not release_ids:
-            return {}
-        unique_ids = list(dict.fromkeys(release_ids))
-        tasks = [
-            self._mb_repo.get_release_group_id_from_release(rid) for rid in unique_ids
-        ]
-        # Bound the MB resolution: during the LB-popularity outage this competes with
-        # every other section on MB's 1/s limit. On starvation return an empty map -
-        # callers fall back to the raw release mbid - instead of letting the whole
-        # section time out at the 25s task budget and vanish.
+    async def _resolve_release_mbids(
+        self, release_ids: list[str], *, work_key: str
+    ) -> dict[str, str]:
         try:
-            results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=_scaled(DISCOVER_MB_RESOLVE_BUDGET_SECONDS),
+            return await asyncio.wait_for(
+                self._mbid.resolve_release_mbids(release_ids, work_key=work_key),
+                timeout=DISCOVER_MB_RESOLVE_BUDGET_SECONDS,
             )
-        except Exception:  # noqa: BLE001 - MB starved, degrade to raw release mbids
+        except OptionalWorkDeferred:
+            raise
+        except Exception:  # noqa: BLE001
             logger.warning(
                 "Release->release-group resolution exceeded its budget; using raw mbids"
             )
             return {}
-        rg_map: dict[str, str] = {}
-        for rid, rg_id in zip(unique_ids, results):
-            if isinstance(rg_id, str) and rg_id:
-                rg_map[rid] = rg_id
-        return rg_map
 
     def _build_service_prompts(
         self, lb_enabled: bool, lfm_enabled: bool
@@ -3095,7 +2975,7 @@ class DiscoverHomepageService:
         durations: dict[str, float] = {}
         # bound each upstream call so one slow/hanging service can't stall the whole
         # build (a timeout is caught below and that section is just dropped)
-        _task_timeout = _scaled(DISCOVER_TASK_TIMEOUT_SECONDS)
+        _task_timeout = DISCOVER_TASK_TIMEOUT_SECONDS
 
         async def timed(key: str, coro: Any) -> Any:
             started = time.perf_counter()
@@ -3106,6 +2986,9 @@ class DiscoverHomepageService:
 
         coros = [timed(key, coro) for key, coro in tasks.items()]
         raw_results = await asyncio.gather(*coros, return_exceptions=True)
+        for outcome in raw_results:
+            if isinstance(outcome, OptionalWorkDeferred):
+                raise outcome
         results = {}
         self._last_failed_task_keys = set()
         for key, result in zip(keys, raw_results):
@@ -3161,7 +3044,7 @@ class DiscoverHomepageService:
                         albums_per=3,
                         lfm_enabled=lfm_enabled,
                     ),
-                    timeout=_scaled(RADIO_POOL_BUDGET_SECONDS),
+                    timeout=RADIO_POOL_BUDGET_SECONDS,
                 )
                 selected = round_robin_dedup_select(pools, count=10)
                 albums = [queue_item_to_home_album(item) for item in selected]
@@ -3176,6 +3059,8 @@ class DiscoverHomepageService:
             except asyncio.TimeoutError:
                 logger.warning("Radio section for seed %s timed out", seed_mbid[:8])
                 return None
+            except OptionalWorkDeferred:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.warning("Radio section for seed %s failed: %s", seed_mbid[:8], e)
                 return None

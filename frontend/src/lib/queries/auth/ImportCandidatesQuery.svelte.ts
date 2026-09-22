@@ -10,10 +10,11 @@ import type { ImportCandidateListResponse } from './types';
  *  fires while the picker is open. */
 export const getImportCandidatesQuery = (
 	provider: () => 'jellyfin' | 'plex',
-	enabled: () => boolean
+	enabled: () => boolean,
+	userId: () => string | null | undefined
 ) =>
 	createQuery(() => ({
-		queryKey: AuthQueryKeyFactory.importCandidates(provider()),
+		queryKey: AuthQueryKeyFactory.importCandidates(provider(), userId()),
 		enabled: enabled(),
 		queryFn: ({ signal }) =>
 			api.get<ImportCandidateListResponse>(

@@ -177,6 +177,8 @@
 		</a>
 	</div>
 {/if}
+<!-- Plugin sources (source "plugin:<name>") intentionally take the generic path:
+	no remote-queue hints below - only soulseek peers report queue telemetry. -->
 {#if source === 'soulseek' && task.status === 'downloading' && !task.held_for_review}
 	<div
 		class:source-telemetry-compact={compact}

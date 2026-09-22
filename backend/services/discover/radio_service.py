@@ -105,24 +105,25 @@ class DiscoverRadioService:
                     fallback_message=f"{resolved_source} is not enabled",
                 )
 
-        library_mbids = await self._mbid.get_library_artist_mbids(
-            self._integration.is_library_configured() if self._integration else False
-        )
-
+        # E3: no library prefetch. The retired artist-MBID set fed an
+        # exclusion comparing release-group MBIDs against artist MBIDs, which
+        # can never match, and the album path ignored it entirely; fetching
+        # it was pure overhead. The empty exclusion below preserves the exact
+        # previous output.
         count = request.count or 10
 
         match request.seed_type:
             case "artist":
                 return await self._radio_from_artist(
-                    request.seed_id, library_mbids, count, resolved_source,
+                    request.seed_id, count, resolved_source,
                 )
             case "album":
                 return await self._radio_from_album(
-                    request.seed_id, library_mbids, count, resolved_source,
+                    request.seed_id, count, resolved_source,
                 )
             case "genre":
                 return await self._radio_from_genre(
-                    request.seed_id, library_mbids, count, resolved_source,
+                    request.seed_id, count, resolved_source,
                 )
             case _:
                 raise ValueError(f"Unsupported seed_type: {request.seed_type}")
@@ -130,7 +131,6 @@ class DiscoverRadioService:
     async def _radio_from_artist(
         self,
         seed_id: str,
-        library_mbids: set[str],
         count: int,
         source: str,
     ) -> HomeSection:
@@ -155,7 +155,7 @@ class DiscoverRadioService:
         pools = await self._similar_artist_pools(
             [seed_stub],
             [normalized],
-            excluded_mbids=library_mbids,
+            excluded_mbids=set(),
             similar_limit=15,
             albums_per=3,
         )
@@ -174,7 +174,6 @@ class DiscoverRadioService:
     async def _radio_from_album(
         self,
         seed_id: str,
-        library_mbids: set[str],
         count: int,
         source: str,
     ) -> HomeSection:
@@ -246,7 +245,6 @@ class DiscoverRadioService:
     async def _radio_from_genre(
         self,
         seed_id: str,
-        library_mbids: set[str],
         count: int,
         source: str,
     ) -> HomeSection:
@@ -275,7 +273,7 @@ class DiscoverRadioService:
         pools = await self._similar_artist_pools(
             seeds,
             sampled,
-            excluded_mbids=library_mbids,
+            excluded_mbids=set(),
             similar_limit=10,
             albums_per=3,
         )

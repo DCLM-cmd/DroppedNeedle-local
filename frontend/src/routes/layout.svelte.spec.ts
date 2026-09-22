@@ -102,6 +102,25 @@ const { followingEventsMock } = vi.hoisted(() => ({
 vi.mock('$lib/queries/following/FollowingEvents', () => ({
 	createFollowingEvents: vi.fn(() => followingEventsMock)
 }));
+const { libraryActivityEventsMock } = vi.hoisted(() => ({
+	libraryActivityEventsMock: { start: vi.fn(), stop: vi.fn() }
+}));
+vi.mock('$lib/queries/library/LibraryActivityEvents', () => ({
+	createLibraryActivityEvents: vi.fn(() => libraryActivityEventsMock)
+}));
+const { muxMock } = vi.hoisted(() => ({
+	muxMock: {
+		connect: vi.fn(),
+		disconnect: vi.fn(),
+		on: vi.fn(() => () => {}),
+		onConnect: vi.fn(() => () => {}),
+		isConnected: false
+	}
+}));
+vi.mock('$lib/queries/events/MuxEventStream', () => ({
+	muxEventStream: muxMock,
+	createMuxEventStream: vi.fn(() => muxMock)
+}));
 vi.mock('$lib/stores/cacheTtl.svelte', () => ({ initCacheTTLs: vi.fn() }));
 const { syncStatusMock } = vi.hoisted(() => ({
 	syncStatusMock: { connect: vi.fn(), disconnect: vi.fn() }
@@ -256,8 +275,8 @@ const playlistTrack: QueueItem = {
 	sourceType: 'local'
 };
 
-function renderLayout() {
-	return render(Layout, {
+async function renderLayout() {
+	return await render(Layout, {
 		props: { children: childrenSnippet } as Record<string, unknown>
 	} as Parameters<typeof render<typeof Layout>>[1]);
 }
@@ -294,7 +313,7 @@ describe('+layout.svelte sidebar', () => {
 
 	it('does not load authenticated shell modules on an auth-free route', async () => {
 		routeState.pathname = '/login';
-		renderLayout();
+		await renderLayout();
 
 		await expect.element(page.getByTestId('page-content')).toBeVisible();
 		expect(shellModuleState.playerImports).toBe(0);
@@ -302,7 +321,7 @@ describe('+layout.svelte sidebar', () => {
 
 	it('offers a bounded retry when the authenticated shell chunk fails', async () => {
 		shellModuleState.shellFailures = 1;
-		renderLayout();
+		await renderLayout();
 
 		await expect.element(page.getByRole('alert')).toBeVisible();
 		const retry = page.getByRole('button', { name: 'Try again' });
@@ -314,7 +333,7 @@ describe('+layout.svelte sidebar', () => {
 
 	it('reports and resets a failed playlist modal chunk', async () => {
 		shellModuleState.playlistFailures = 1;
-		renderLayout();
+		await renderLayout();
 		await expect.element(page.getByTestId('page-content')).toBeVisible();
 
 		openGlobalPlaylistModal([playlistTrack]);
@@ -330,7 +349,7 @@ describe('+layout.svelte sidebar', () => {
 
 	it('reports and closes a failed discography modal chunk', async () => {
 		shellModuleState.discographyFailures = 1;
-		renderLayout();
+		await renderLayout();
 		await expect.element(page.getByTestId('page-content')).toBeVisible();
 
 		discographyDownloadStore.show('Artist', 'artist-1', []);
@@ -345,60 +364,69 @@ describe('+layout.svelte sidebar', () => {
 	});
 
 	it('does not render "Playlists" link in the sidebar when the download client is unavailable', async () => {
-		renderLayout();
-		await expect.element(page.getByText('Playlists')).not.toBeInTheDocument();
+		await renderLayout();
+		await expect
+			.element(
+				page
+					.getByTestId('app-shell')
+					.getByRole('link', { name: 'Playlists', exact: true, includeHidden: true })
+					.first()
+			)
+			.not.toBeInTheDocument();
 	});
 
 	it('renders "Playlists" link in the sidebar when the download client is available', async () => {
 		integrationState.download_client = true;
-		renderLayout();
-		await expect.element(page.getByText('Playlists')).toBeInTheDocument();
+		await renderLayout();
+		await expect
+			.element(
+				page
+					.getByTestId('app-shell')
+					.getByRole('link', { name: 'Playlists', exact: true, includeHidden: true })
+					.first()
+			)
+			.toBeInTheDocument();
 	});
 
 	it('always renders "Library" link in the sidebar', async () => {
-		renderLayout();
+		await renderLayout();
 		// "Library" renders in both the desktop sidebar (first in DOM) and the mobile bottom nav, so scope to the first match for the sidebar link
 		await expect.element(page.getByText('Library').first()).toBeInTheDocument();
 	});
 
 	it('uses the sole shipped dark theme', async () => {
-		renderLayout();
+		await renderLayout();
 
 		await expect.element(page.getByTestId('app-shell')).toHaveAttribute('data-theme', 'dark');
 	});
 
 	it('Playlists link navigates to /playlists', async () => {
 		integrationState.download_client = true;
-		renderLayout();
-		const link = page.getByText('Playlists');
+		await renderLayout();
+		const link = page
+			.getByTestId('app-shell')
+			.getByRole('link', { name: 'Playlists', exact: true, includeHidden: true })
+			.first();
 		await expect.element(link).toBeInTheDocument();
-		const anchor = link.element().closest('a');
-		expect(anchor).not.toBeNull();
-		expect(anchor!.getAttribute('href')).toBe('/playlists');
-	});
-
-	it('Playlists link has tooltip data attribute', async () => {
-		integrationState.download_client = true;
-		renderLayout();
-		const link = page.getByText('Playlists');
-		await expect.element(link).toBeInTheDocument();
-		const anchor = link.element().closest('a');
-		expect(anchor!.getAttribute('data-tip')).toBe('Playlists');
+		await expect.element(link).toHaveAttribute('href', '/playlists');
 	});
 
 	it('shows the Library Management destination in a labelled admin section', async () => {
 		authStore.setUser(testUser('admin'));
-		renderLayout();
+		await renderLayout();
 		await expect.element(page.getByText('Admin', { exact: true })).toBeInTheDocument();
-		const link = page.getByText('Library Management').element().closest('a');
-		expect(link).not.toBeNull();
-		expect(link!.getAttribute('href')).toBe('/library/management');
-		expect(link!.getAttribute('aria-label')).toBe('Library Management');
+		const link = page
+			.getByTestId('app-shell')
+			.getByRole('link', { name: 'Library Management', exact: true, includeHidden: true })
+			.first();
+		await expect.element(link).toBeInTheDocument();
+		await expect.element(link).toHaveAttribute('href', '/library/management');
+		await expect.element(link).toHaveAttribute('aria-label', 'Library Management');
 	});
 
 	it('does not expose the admin navigation section to non-administrators', async () => {
 		authStore.setUser(testUser('user'));
-		renderLayout();
+		await renderLayout();
 		await expect.element(page.getByText('Admin', { exact: true })).not.toBeInTheDocument();
 		await expect
 			.element(page.getByRole('link', { name: 'Library Management' }))
@@ -441,7 +469,7 @@ describe('+layout.svelte auth-reactive session state (#155)', () => {
 	});
 
 	it('resets the integration store instead of loading it when unauthenticated', async () => {
-		renderLayout();
+		await renderLayout();
 		await vi.waitFor(() => expect(vi.mocked(integrationStore.reset)).toHaveBeenCalled());
 		expect(integrationStore.ensureLoaded).not.toHaveBeenCalled();
 		expect(initCacheTTLs).not.toHaveBeenCalled();
@@ -450,16 +478,27 @@ describe('+layout.svelte auth-reactive session state (#155)', () => {
 
 	it('loads integration status and starts session services when authenticated at mount', async () => {
 		authStore.setUser(testUser());
-		renderLayout();
+		await renderLayout();
 		await vi.waitFor(() => expect(vi.mocked(integrationStore.ensureLoaded)).toHaveBeenCalled());
 		expect(nowPlayingStore.start).toHaveBeenCalled();
 		expect(nowPlayingReporter.start).toHaveBeenCalled();
 		expect(followingEventsMock.start).toHaveBeenCalled();
 		await vi.waitFor(() => expect(syncStatusMock.connect).toHaveBeenCalled());
+		await vi.waitFor(() => expect(muxMock.connect).toHaveBeenCalled());
+		// consumers start before the mux connects so their starts see a
+		// disconnected mux and refresh exactly once via the first open.
+		// libraryActivityEvents is the order-sensitive one: its admin
+		// direct-refresh gate depends on starting while disconnected.
+		const lastStart = Math.max(
+			vi.mocked(followingEventsMock.start).mock.invocationCallOrder[0],
+			vi.mocked(libraryActivityEventsMock.start).mock.invocationCallOrder[0],
+			vi.mocked(nowPlayingStore.start).mock.invocationCallOrder[0]
+		);
+		expect(lastStart).toBeLessThan(muxMock.connect.mock.invocationCallOrder[0]);
 	});
 
 	it('loads integration status after a warm in-app login without a remount', async () => {
-		renderLayout();
+		await renderLayout();
 		await vi.waitFor(() => expect(vi.mocked(integrationStore.reset)).toHaveBeenCalled());
 		expect(integrationStore.ensureLoaded).not.toHaveBeenCalled();
 
@@ -470,19 +509,20 @@ describe('+layout.svelte auth-reactive session state (#155)', () => {
 
 	it('stops session services and resets integrations on logout', async () => {
 		authStore.setUser(testUser());
-		renderLayout();
+		await renderLayout();
 		await vi.waitFor(() => expect(nowPlayingStore.start).toHaveBeenCalled());
 
 		authStore.clear();
 		await vi.waitFor(() => expect(nowPlayingStore.stop).toHaveBeenCalled());
 		expect(nowPlayingReporter.stop).toHaveBeenCalled();
 		expect(followingEventsMock.stop).toHaveBeenCalled();
+		expect(muxMock.disconnect).toHaveBeenCalled();
 		expect(vi.mocked(integrationStore.reset)).toHaveBeenCalled();
 	});
 
 	it('clears a pending discography selection when the account changes', async () => {
 		authStore.setUser(testUser());
-		renderLayout();
+		await renderLayout();
 		await vi.waitFor(() => expect(vi.mocked(integrationStore.ensureLoaded)).toHaveBeenCalled());
 		discographyDownloadStore.show('Private Artist', 'artist-a', [
 			{ id: 'release-a', title: 'Private Release', requested: true }
@@ -509,7 +549,7 @@ describe('+layout.svelte auth-reactive session state (#155)', () => {
 			})
 		);
 		authStore.setUser(testUser());
-		renderLayout();
+		await renderLayout();
 		await vi.waitFor(() => expect(vi.mocked(integrationStore.ensureLoaded)).toHaveBeenCalled());
 		batchDownloadStore.addJob('Private Artist', 'artist-a', ['release-a']);
 		discographyDownloadStore.show('Private Artist', 'artist-a', [

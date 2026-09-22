@@ -489,9 +489,17 @@ class SlskdRepository:
         track-number/title fallback (steps 8-9) runs last.  Alias lookup is
         deliberately bounded and fail-closed: it is confined to the resolved mount,
         accepts regular files only, checks a positive expected size, and returns a
-        path only when exactly one matching on-disk file exists. A single
-        normalized alias still resolves when the expected size mismatches; size
-        rejection belongs to the verifier (SIZE_MISMATCH), not the locator.
+        path only when exactly one matching on-disk file exists. When the expected
+        size is known, an exact-named hit whose bytes mismatch is a stale file
+        from another peer's folder, not this transfer: steps 1/2/4 skip it and
+        the walk fallbacks below refuse it, falling through to the
+        peer-scoped/size-aware steps (a size-only recovery under the peer's
+        folder, the size-gated whole-mount sweep) or to None. A single
+        non-exact normalized alias still resolves when the expected size
+        mismatches (search-advertised sizes are unreliable across a Unicode
+        drift); final size rejection for that case belongs to the verifier
+        (SIZE_MISMATCH), not the locator. Unknown size keeps the old
+        name-only behavior everywhere.
         """
         raw_parts = re.split(r"[\\/]", remote_filename)
         if any(part == ".." for part in raw_parts):
@@ -536,14 +544,30 @@ class SlskdRepository:
         def _name_matches(entry: Path) -> bool:
             return entry.name == basename
 
+        def _direct_hit_usable(candidate: Path) -> bool:
+            """Whether an exact-named direct hit may be this transfer (#397).
+
+            With a known expected size a byte-mismatched same-named file is a
+            stale leftover from another peer's folder, not this download: skip
+            it so lookup falls through to the peer-scoped/size-aware steps.
+            Unknown size keeps the old name-only behavior, as does an
+            unreadable size (fail open; the verifier owns that file).
+            """
+            if expected_size is None:
+                return True
+            try:
+                return candidate.stat().st_size == expected_size
+            except OSError:
+                return True
+
         # 1. slskd's common layout: {mount}/{leaf remote folder}/{filename}.
         if len(parts) >= 2:
             leaf = _find_direct_exact(mount / parts[-2])
-            if leaf is not None:
+            if leaf is not None and _direct_hit_usable(leaf):
                 return leaf
         # 2. Flat layout: {mount}/{filename}.
         flat = _find_direct_exact(mount)
-        if flat is not None:
+        if flat is not None and _direct_hit_usable(flat):
             return flat
         # 3. Peers that file by username: walk {mount}/{username}/ at any depth.
         # (covers {username}/{file} and {username}/{album}/{file}). Scoped so a
@@ -554,13 +578,15 @@ class SlskdRepository:
             if hit is not None:
                 return hit
         # 4. slskd may have sanitised the folder name - scan one level down for it.
+        # A size-mismatched hit is skipped, not returned, so a stale same-named
+        # file in one folder cannot shadow this transfer's file in another (#397).
         try:
             for child in sorted(mount.iterdir(), key=lambda path: path.name):
                 child_root = _within_mount(child)
                 if child_root is None or not child_root.is_dir():
                     continue
                 cand = _find_direct_exact(child_root)
-                if cand is not None:
+                if cand is not None and _direct_hit_usable(cand):
                     return cand
         except (OSError, RuntimeError) as exc:
             logger.warning("Could not scan downloads mount %s: %s", mount, exc)
@@ -645,7 +671,11 @@ class SlskdRepository:
             resolves (size rejection is then the verifier's job), zero stays
             not-found, several fail closed as ambiguous. No new walks, no
             extra budget entries. Every candidate stays `_within_mount` +
-            regular-file gated.
+            regular-file gated. The ungated retry keeps NON-EXACT aliases
+            only: an exact-named file whose bytes mismatch is a stale file
+            from another peer's folder (#397), never a Unicode-drift alias,
+            so with a known size it is refused outright instead of resolving
+            for the verifier to reject.
             """
             resolved_root = _within_mount(root)
             if resolved_root is None or not resolved_root.is_dir():
@@ -678,7 +708,13 @@ class SlskdRepository:
                         if expected_size is None:
                             matches.add(resolved)
                         else:
-                            ungated.add(resolved)
+                            if entry.name != basename:
+                                # A true (non-exact) alias only: search-advertised
+                                # sizes are unreliable across a Unicode drift, so
+                                # one such alias still resolves for the verifier.
+                                # An exact-named mismatch is a stale peer file
+                                # (#397) and is refused outright.
+                                ungated.add(resolved)
                             try:
                                 if resolved.stat().st_size != expected_size:
                                     continue

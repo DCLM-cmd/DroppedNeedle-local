@@ -24,6 +24,12 @@ from infrastructure.observability.provider_counters import (
 )
 from infrastructure.resilience.retry import CircuitOpenError, CircuitBreaker, with_retry
 from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
+from infrastructure.observability.optional_work import (
+    OptionalWorkDeferred,
+    OptionalWorkReservation,
+    check_optional_dispatch,
+    reserve_optional_operation,
+)
 from repositories.listenbrainz_models import (
     ListenBrainzArtist,
     ListenBrainzReleaseGroup,
@@ -543,6 +549,8 @@ class ListenBrainzRepository:
                     return
                 try:
                     token = await self._fallback_token_provider()
+                except OptionalWorkDeferred:
+                    raise
                 except Exception:  # noqa: BLE001 - a missing borrowed token means anonymous
                     token = None
                 if generation != self._fallback_generation:
@@ -586,6 +594,25 @@ class ListenBrainzRepository:
         if token and not _is_header_safe_listenbrainz_token(token):
             raise _ListenBrainzAuthenticationError("ListenBrainz credentials rejected")
 
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_data: dict[str, Any] | None = None,
+        require_auth: bool = False,
+        accepted_statuses: tuple[int, ...] = (),
+    ) -> Any:
+        reservation = reserve_optional_operation()
+        try:
+            return await self._request_attempt(
+                method, endpoint, params, json_data, require_auth, accepted_statuses,
+                reservation,
+            )
+        finally:
+            if reservation is not None:
+                reservation.refund()
+
     @with_retry(
         max_attempts=3,
         base_delay=1.0,
@@ -607,7 +634,7 @@ class ListenBrainzRepository:
             _ListenBrainzValidationOutcome,
         ),
     )
-    async def _request(
+    async def _request_attempt(
         self,
         method: str,
         endpoint: str,
@@ -615,6 +642,7 @@ class ListenBrainzRepository:
         json_data: dict[str, Any] | None = None,
         require_auth: bool = False,
         accepted_statuses: tuple[int, ...] = (),
+        reservation: OptionalWorkReservation | None = None,
     ) -> Any:
         url = f"{self._base_url}{endpoint}"
 
@@ -647,6 +675,7 @@ class ListenBrainzRepository:
             # for this semaphore while another request observes a 429 and opens
             # the shared cooldown; checking here prevents it from bypassing that
             # newly activated window.
+            check_optional_dispatch()
             cooldown_remaining, reservation_unknown = (
                 _listenbrainz_rate_limit_state._reserve_with_tracking()
             )
@@ -657,6 +686,9 @@ class ListenBrainzRepository:
                 )
 
             try:
+                check_optional_dispatch()
+                if reservation is not None:
+                    reservation.mark_dispatched()
                 response = await self._client.request(
                     method,
                     url,
@@ -674,7 +706,7 @@ class ListenBrainzRepository:
                 reservation_unknown = False
                 record_rate_limit_headers("listenbrainz", response.headers)
 
-                record_provider_call("listenbrainz", None, response.status_code)
+                record_provider_call("listenbrainz", None, response.status_code, response=response)
                 if response.status_code != 429:
                     # anything but a wire 429 heals the escalation streak
                     _listenbrainz_rate_limit_state.record_success()
@@ -847,6 +879,8 @@ class ListenBrainzRepository:
             )
         except _ListenBrainzAuthenticationError:
             return False, "ListenBrainz could not validate this username.", True
+        except OptionalWorkDeferred:
+            raise
         except self._UNREACHABLE as error:
             return False, self._unreachable_message(error), False
         except Exception:  # noqa: BLE001 - validation must not leak provider details
@@ -882,6 +916,8 @@ class ListenBrainzRepository:
             )
         except _ListenBrainzAuthenticationError:
             return False, "Token invalid or expired", True
+        except OptionalWorkDeferred:
+            raise
         except self._UNREACHABLE as error:
             return False, self._unreachable_message(error), False
         except Exception:  # noqa: BLE001 - validation must not leak provider details

@@ -10,8 +10,9 @@ import os
 import sqlite3
 import threading
 import unicodedata
+import weakref
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from infrastructure.persistence.connection_settings import (
     report_connection_settings,
@@ -338,6 +339,10 @@ class PersistenceBase(PooledSqliteStore):
     # stores that historically never issued one override this so convergence
     # does not silently pin them to a future change of the base's value.
     busy_timeout_ms: int | None = 5000
+    # Enforce foreign keys (and so ON DELETE CASCADE) on this store's
+    # connections. Declared rather than added in a _connect override so pooled
+    # connections, which are shared between stores, can apply it per operation.
+    foreign_keys: bool = False
 
     def __init__(
         self, db_path: Path, write_lock: threading.Lock | PriorityWriteLock
@@ -348,13 +353,27 @@ class PersistenceBase(PooledSqliteStore):
         with self._write_lock:
             self._ensure_tables()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+    def _open_connection(
+        self,
+        factory: type[sqlite3.Connection] = sqlite3.Connection,
+        cached_statements: int = 128,
+    ) -> sqlite3.Connection:
+        """Open a connection with the settings every store shares."""
+        conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            factory=factory,
+            cached_statements=cached_statements,
+        )
         conn.row_factory = sqlite3.Row
         # accent/case-insensitive LIKE searches (see _fold_text)
         conn.create_function("fold", 1, _fold_text, deterministic=True)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = self._open_connection()
         # (AUD-7) Uniform backstop: a writer blocked by another writer waits up to
         # 5s for the lock instead of failing immediately with "database is locked".
         # Stores that historically never set one pin busy_timeout_ms = None above.
@@ -363,6 +382,8 @@ class PersistenceBase(PooledSqliteStore):
         # (GH-293) Labeled connection-local settings telemetry (bounded, once per
         # role per process). Never inferred from a fresh probe connection.
         report_connection_settings(self.connection_label, conn)
+        if self.foreign_keys:
+            conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def _execute_background(self, operation: Any) -> Any:

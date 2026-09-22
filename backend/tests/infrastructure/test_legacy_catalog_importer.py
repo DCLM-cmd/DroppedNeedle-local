@@ -1769,3 +1769,34 @@ async def test_apply_fails_closed_when_reference_cannot_materialize(
             ("cutover-poison",),
         ).fetchone()[0]
     assert state != "completed"
+
+
+@pytest.mark.asyncio
+async def test_coherent_copy_carries_file_tag_release_type(tmp_path: Path) -> None:
+    root = tmp_path / "Music"
+    root.mkdir()
+    database = tmp_path / "library.db"
+    _create_source(database, root)
+    file_id = "99999999-9999-4999-8999-999999999997"
+    _insert_identityless_library_file(
+        database,
+        root,
+        file_id,
+        release_group_mbid="legacy-release-group",
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE library_files ADD COLUMN release_type TEXT")
+        connection.execute(
+            "UPDATE library_files SET release_type = 'EP' WHERE id = ?", (file_id,)
+        )
+    store, importer = _importer(database, root)
+
+    plan, report = await importer.prepare("release-type-carry", now=100)
+
+    assert report.state == "ready"
+    bundle = next(
+        item
+        for item in plan.bundles
+        if any(track.id == file_id for track in item.membership.tracks)
+    )
+    assert bundle.membership.tracks[0].release_type == "EP"

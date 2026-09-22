@@ -3,6 +3,7 @@ from typing import TypeVar, Awaitable, Callable, Any
 from functools import wraps
 
 from core.exceptions import ClientDisconnectedError
+from infrastructure.observability.optional_work import OptionalWorkDeferred, is_optional_work
 
 T = TypeVar("T")
 
@@ -80,6 +81,15 @@ class RequestDeduplicator:
             # Follower path: shield prevents waiter cancellation from poisoning the shared future.
             try:
                 return await asyncio.shield(future)
+            except OptionalWorkDeferred:
+                if is_optional_work():
+                    raise
+                # The optional owner has settled; foreground demand elects a
+                # new owner rather than inheriting another scope's budget.
+                async with self._lock:
+                    if self._pending.get(key) is future:
+                        self._pending.pop(key, None)
+                continue
             except asyncio.CancelledError:
                 task = asyncio.current_task()
                 if task is not None and task.cancelling() > 0:

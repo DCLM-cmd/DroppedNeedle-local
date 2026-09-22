@@ -121,6 +121,9 @@ def extract_tracks(release_data: dict) -> tuple[list[Track], int]:
             disc_number = int(medium.get("position") or medium.get("number") or 1)
         except (TypeError, ValueError):
             disc_number = 1
+        medium_format = medium.get("format")
+        if not isinstance(medium_format, str):
+            medium_format = None
         track_list = medium.get("tracks") or medium.get("track-list", [])
         for track in track_list:
             recording = track.get("recording", {})
@@ -138,9 +141,61 @@ def extract_tracks(release_data: dict) -> tuple[list[Track], int]:
                     length=int(length_ms) if length_ms else None,
                     recording_id=recording.get("id"),
                     release_track_id=track.get("id"),
+                    media_format=medium_format,
                 )
             )
     return tracks, total_length
+
+
+# MusicBrainz medium-format vocabulary names video carriers explicitly ("DVD",
+# "DVD-Video", "Blu-ray", ...); DVD-Audio discs are labeled "DVD-Audio" and stay.
+# Live-verified 2026-09-06: release 0b683a6a (Tom Jones DE 2006 Greatest Hits)
+# returns media formats "CD" (16 tracks) + "DVD" (14 tracks).
+_VIDEO_MEDIUM_FORMATS = frozenset(
+    {
+        "dvd",
+        "dvd-video",
+        "blu-ray",
+        "hd-dvd",
+        "hdv",
+        "vhs",
+        "betamax",
+        "video cd",
+        "video-cd",
+        "vcd",
+        "svcd",
+        "laserdisc",
+    }
+)
+
+
+def is_audio_medium(medium_format: str | None) -> bool:
+    """Whether a MusicBrainz medium carries downloadable audio.
+
+    Anything unrecognized - or missing, as on local-library tracklists and old
+    cache blobs - reads as audio: acquisition must fail open, never strand.
+    """
+    if not medium_format:
+        return True
+    return medium_format.strip().casefold() not in _VIDEO_MEDIUM_FORMATS
+
+
+def audio_tracks(tracks: list) -> list:  # noqa: ANN001 - Track shape, duck-typed
+    """The canonical audio-only acquisition target set (Slices 4+5).
+
+    Every Soulseek/Usenet acquisition denominator - request-time
+    ``track_count``, the enqueue manifest, the completion coverage gate, the
+    wanted watcher's satisfaction check - filters through this one helper so
+    request targets and coverage can never measure different editions (the
+    CD+DVD 16-vs-30 split). Display paths (album page) keep the full list, as
+    do explicit per-track requests and the Free Music backend's soft
+    count-matching signal.
+    """
+    return [
+        track
+        for track in tracks
+        if is_audio_medium(getattr(track, "media_format", None))
+    ]
 
 
 def extract_label(release_data: dict) -> Optional[str]:

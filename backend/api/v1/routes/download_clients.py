@@ -41,14 +41,17 @@ def _clear_download_client_cache() -> None:
     # Both the SABnzbd connection and the shared policy feed the scorers, file processor,
     # orchestrator and service - clear the whole chain so a save takes effect at once.
     from core.dependencies import (
+        get_acquisition_dispatcher,
         get_album_preflight_scorer,
         get_download_orchestrator,
         get_download_service,
         get_file_processor,
         get_newznab_indexer,
         get_newznab_release_scorer,
+        get_prowlarr_indexer,
         get_sabnzbd_client,
         get_sabnzbd_download_client,
+        get_target_acquisition_dispatcher,
         get_track_matcher,
         get_target_download_orchestrator,
         get_target_download_service,
@@ -63,9 +66,14 @@ def _clear_download_client_cache() -> None:
         get_newznab_release_scorer,
         # the indexer derives its search-cache TTL from the policy's auto-retry interval
         get_newznab_indexer,
+        # same TTL discipline for the Prowlarr member - else SABnzbd/policy saves
+        # leave a stale Prowlarr search cache behind
+        get_prowlarr_indexer,
         get_file_processor,
         get_download_orchestrator,
         get_download_service,
+        get_acquisition_dispatcher,
+        get_target_acquisition_dispatcher,
         get_target_file_processor,
         get_target_download_orchestrator,
         get_target_download_service,
@@ -181,6 +189,17 @@ async def update_source_priority(
     body: SourcePriority = MsgSpecBody(SourcePriority),
     preferences=Depends(get_preferences_service),
 ):
+    from core.dependencies import get_plugin_source_registry
+    from core.exceptions import ValidationError
+
+    for source in body.order:
+        if isinstance(source, str) and source.startswith("plugin:"):
+            try:
+                known = get_plugin_source_registry().spec_for(source) is not None
+            except Exception:  # noqa: BLE001 - registry absence reads as unknown
+                known = False
+            if not known:
+                raise ValidationError(f"Unknown download source: {source!r}")
     preferences.save_source_priority(body.order)
     _clear_download_client_cache()
     return SourcePriority(order=preferences.get_source_priority())

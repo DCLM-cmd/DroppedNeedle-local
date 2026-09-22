@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CircleCheck, CircleX, DownloadCloud } from 'lucide-svelte';
+	import { CircleCheck, CircleX, CloudDownload } from 'lucide-svelte';
 
 	import { getLidarrImportConfigQuery } from '$lib/queries/lidarr-import/LidarrImportQueries.svelte';
 	import {
@@ -8,6 +8,7 @@
 	} from '$lib/queries/lidarr-import/LidarrImportMutations.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import type { LidarrImportConnection, LidarrTestResult } from '$lib/queries/lidarr-import/types';
+	import LidarrImportSyncCard from './LidarrImportSyncCard.svelte';
 
 	const API_KEY_MASK = 'lidarr****';
 
@@ -20,6 +21,13 @@
 	let testResult = $state<LidarrTestResult | null>(null);
 	let saveError = $state<string | null>(null);
 	let seeded = false;
+
+	// Locked until a connection is saved. The masked config getter returns ''
+	// api_key when nothing is stored, so a non-empty pair means configured.
+	// The save mutation invalidates the config query, so this flips live after Save.
+	const unlocked = $derived(
+		(configQuery.data?.url ?? '').trim() !== '' && (configQuery.data?.api_key ?? '') !== ''
+	);
 
 	// Seed the form once from the masked config, then let the user edit freely.
 	$effect(() => {
@@ -59,9 +67,8 @@
 	<header class="space-y-1">
 		<h2 class="text-lg font-semibold">Lidarr Import</h2>
 		<p class="max-w-prose text-sm text-base-content/70">
-			One-time import of your monitored Lidarr artists as follows, so you don't have to re-follow
-			them by hand. Lidarr stays independent - this reads your monitored list once, it doesn't
-			manage anything.
+			Sync your monitored Lidarr artists into your follows, so you don't have to re-follow them by
+			hand. Lidarr stays independent - this reads your monitored list, it doesn't manage anything.
 		</p>
 	</header>
 
@@ -69,12 +76,12 @@
 		<div class="card-body gap-0 p-0">
 			<div class="flex items-center gap-3 p-4">
 				<div class="grid size-12 place-items-center rounded-2xl bg-base-300/60">
-					<DownloadCloud class="size-6 text-accent" aria-hidden="true" />
+					<CloudDownload class="size-6 text-accent" aria-hidden="true" />
 				</div>
 				<div>
 					<h3 class="text-lg font-bold">Connection</h3>
 					<p class="text-sm text-base-content/60">
-						Anyone can then import from Following → Your Artists.
+						Save your Lidarr address and API key to unlock artist sync below.
 					</p>
 				</div>
 			</div>
@@ -151,4 +158,6 @@
 			</div>
 		</div>
 	</div>
+
+	<LidarrImportSyncCard {unlocked} />
 </section>

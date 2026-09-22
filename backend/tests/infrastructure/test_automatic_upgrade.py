@@ -23,6 +23,11 @@ from unittest.mock import AsyncMock, MagicMock
 import maintenance.automatic_upgrade as automatic_upgrade
 
 from core.config import Settings
+from infrastructure.network import (
+    BIND_HOST_ENV,
+    dual_stack_supported,
+    resolve_bind_host,
+)
 from maintenance.automatic_upgrade import (
     AutomaticUpgradeError,
     UPGRADE_ID,
@@ -800,15 +805,18 @@ def test_docker_image_runs_automatic_upgrade_before_target_application() -> None
     # TLS proxy in front of it depends on.
     assert command[command.index("--workers") + 1] == "1"
     assert "--proxy-headers" in command
+    assert command[command.index("--host") + 1] == resolve_bind_host()
 
 
 def test_upgrade_health_endpoint_keeps_existing_orchestrators_waiting() -> None:
     port = _free_port()
+    hosts = ["127.0.0.1", "[::1]"] if dual_stack_supported() else ["127.0.0.1"]
 
     with _upgrade_health_server(port, ""):
-        with urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
-            assert response.status == 200
-            assert json.loads(response.read()) == {"status": "upgrading"}
+        for host in hosts:
+            with urlopen(f"http://{host}:{port}/health", timeout=2) as response:
+                assert response.status == 200
+                assert json.loads(response.read()) == {"status": "upgrading"}
         with pytest.raises(HTTPError) as error:
             urlopen(f"http://127.0.0.1:{port}/api/v1/library", timeout=2)
 
@@ -829,7 +837,7 @@ def test_upgrade_health_endpoint_serves_only_prefixed_health_under_base_path() -
 
 
 @contextmanager
-def _operational_target(port: int, base_path: str):
+def _operational_target(port: int, base_path: str, host: str = "127.0.0.1"):
     """Serve an ok health payload exactly where the operational app would."""
     health_path = f"{base_path}/health"
 
@@ -846,7 +854,7 @@ def _operational_target(port: int, base_path: str):
         def log_message(self, _format: str, *args: object) -> None:
             return
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), OperationalHandler)
+    server = ThreadingHTTPServer((host, port), OperationalHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -866,6 +874,18 @@ def test_target_ready_requires_normalized_base_health(
     with _operational_target(port, base_path):
         assert _target_ready(port, base_path)
         assert not _target_ready(port, other)
+
+
+def test_target_ready_follows_a_pinned_bind_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _free_port()
+
+    with _operational_target(port, "", host="127.0.0.2"):
+        monkeypatch.setenv(BIND_HOST_ENV, "127.0.0.2")
+        assert _target_ready(port, "")
+        monkeypatch.delenv(BIND_HOST_ENV)
+        assert not _target_ready(port, "")
 
 
 def test_copy_upgrade_promotes_only_after_the_working_database_passes(

@@ -319,6 +319,18 @@ def get_library_policy_resolver() -> "LibraryPolicyResolver":
 
 
 @singleton
+def get_library_scan_wakeup() -> Callable[[], None]:
+    """S-01 Hook B early wakeup: notify the scan supervisor after dirty-marking."""
+
+    def _wake() -> None:
+        from .cache_providers import get_native_library_store
+
+        get_native_library_store().work_wakeups.notify("scan")
+
+    return _wake
+
+
+@singleton
 def get_library_policy_service() -> "LibraryPolicyService":
     from services.native.library_policy_service import LibraryPolicyService
 
@@ -327,6 +339,7 @@ def get_library_policy_service() -> "LibraryPolicyService":
         library_db=get_library_db(),
         resolver_getter=get_library_policy_resolver,
         resolver_clearer=get_library_policy_resolver.cache_clear,
+        scan_wakeup=get_library_scan_wakeup(),
     )
 
 
@@ -474,6 +487,7 @@ def get_target_library_policy_service() -> "TargetLibraryPolicyService":
             library_db=None,
             resolver_getter=get_library_policy_resolver,
             resolver_clearer=get_library_policy_resolver.cache_clear,
+            scan_wakeup=get_library_scan_wakeup(),
         ),
         get_target_library_policy_reconciliation_service(),
         get_native_library_store(),
@@ -613,19 +627,8 @@ def get_mb_provider_availability() -> Callable[[], bool]:
     return lambda: not get_mb_provider_circuit_breaker().is_open()
 
 
-@singleton
-def get_target_album_identification_service() -> "AlbumIdentificationService":
-    from services.native.album_candidate_service import AlbumCandidateService
-    from services.native.album_evidence_engine import AlbumEvidenceEngine
-    from services.native.album_identification_service import AlbumIdentificationService
-    from services.native.conditional_fingerprint_service import (
-        ConditionalFingerprintService,
-    )
-
-    from .cache_providers import get_native_library_store
-
-    store = get_native_library_store()
-    cache = get_cache()
+def _build_commit_invalidator(store, cache):
+    """Scoped post-commit invalidation shared by identification and repair."""
 
     async def invalidate(
         domains: set[str], local_album_ids: Sequence[str] | None = None
@@ -669,6 +672,24 @@ def get_target_album_identification_service() -> "AlbumIdentificationService":
             )
         await get_discovery_snapshot_store().mark_discover_stale()
 
+    return invalidate
+
+
+@singleton
+def get_target_album_identification_service() -> "AlbumIdentificationService":
+    from services.native.album_candidate_service import AlbumCandidateService
+    from services.native.album_evidence_engine import AlbumEvidenceEngine
+    from services.native.album_identification_service import AlbumIdentificationService
+    from services.native.conditional_fingerprint_service import (
+        ConditionalFingerprintService,
+    )
+
+    from .cache_providers import get_native_library_store
+
+    store = get_native_library_store()
+    cache = get_cache()
+    invalidate = _build_commit_invalidator(store, cache)
+
     return AlbumIdentificationService(
         store,
         get_target_identification_queue(),
@@ -678,6 +699,12 @@ def get_target_album_identification_service() -> "AlbumIdentificationService":
         invalidate,
         _schedule_identified_album_work,
         provider_available=get_mb_provider_availability(),
+        # Step 2.5 (E-02): same canonical handle + opt-in resolver as the
+        # repair lane (get_target_identity_repair_service below).
+        canonical_provider=get_musicbrainz_repository(),
+        edition_opt_in=(
+            get_library_management_profile_service().automatic_edition_acceptance_enabled
+        ),
     )
 
 
@@ -801,6 +828,9 @@ def get_target_identity_repair_service() -> "IdentityRepairService":
         # D-EDITION-AUTO S-3: profile-level opt-in with per-root override.
         edition_opt_in=(
             get_library_management_profile_service().automatic_edition_acceptance_enabled
+        ),
+        invalidate=_build_commit_invalidator(
+            get_native_library_store(), get_cache()
         ),
     )
 
@@ -1361,6 +1391,25 @@ def get_plugin_host() -> "PluginHost":
         preferences_service=get_preferences_service(),
     )
 
+@singleton
+def get_plugin_source_registry() -> "PluginSourceRegistry":
+    from services.plugin_sources import PluginSourceRegistry
+
+    try:
+        host = get_plugin_host()
+    except Exception:  # noqa: BLE001 - absence reads as no plugins
+        host = None
+    return PluginSourceRegistry(host)
+
+
+@singleton
+def get_plugin_release_scorer() -> "PluginReleaseScorer":
+    from services.native.plugin_release_scorer import PluginReleaseScorer  # type: ignore
+
+    from .repo_providers import get_download_store
+
+    return PluginReleaseScorer(get_download_store())
+
 
 def _build_free_music_service(drop_import, file_processor) -> "FreeMusicService":
     from services.native.free_music_service import FreeMusicService
@@ -1490,6 +1539,7 @@ def _build_drop_import_service(
         staging_root=get_settings().cache_dir / "imports",
         publish_import_bundle=publish_import_bundle,
         policy_revision_getter=policy_revision_getter,
+        plugin_host=get_plugin_host(),
     )
 
 
@@ -1691,6 +1741,7 @@ def _build_wanted_watcher_service(
         sse_publisher=get_sse_publisher(),
         preferences=get_preferences_service(),
         provider_available=get_mb_provider_availability(),
+        plugin_host=get_plugin_host(),
     )
 
 
@@ -1910,6 +1961,7 @@ def _build_request_service(
         ownership_service=ownership_service,
         album_service=album_service,
         mbid_store=get_mbid_store(),
+        plugin_host=get_plugin_host(),
     )
 
 
@@ -2068,6 +2120,7 @@ def _build_requests_page_service(
         get_download_service=download_service_getter,
         download_store=get_download_store(),
         acquisition=acquisition,
+        plugin_host=get_plugin_host(),
     )
 
 
@@ -2197,6 +2250,7 @@ def _build_home_service(
         ownership_service=ownership_service,
         genre_artwork_service=genre_artwork_service,
         workload_gate=get_background_workload_gate(),
+        snapshot_store=get_discovery_snapshot_store(),
     )
 
 
@@ -2309,6 +2363,8 @@ def get_target_wrapped_service() -> "WrappedService":
 @singleton
 def get_settings_service() -> "SettingsService":
     from services.settings_service import SettingsService
+    from core.dependencies.cache_providers import get_mb_response_store
+    from core.dependencies.repo_providers import get_follow_store
 
     preferences_service = get_preferences_service()
     cache = get_cache()
@@ -2317,12 +2373,16 @@ def get_settings_service() -> "SettingsService":
         cache,
         discovery_snapshot_store=get_discovery_snapshot_store(),
         disk_cache=get_disk_cache(),
+        mb_response_store=get_mb_response_store(),
+        follow_store=get_follow_store(),
     )
 
 
 @singleton
 def get_target_settings_service() -> "SettingsService":
     from services.settings_service import SettingsService
+    from core.dependencies.cache_providers import get_mb_response_store
+    from core.dependencies.repo_providers import get_follow_store
 
     return SettingsService(
         get_preferences_service(),
@@ -2331,6 +2391,25 @@ def get_target_settings_service() -> "SettingsService":
         plex_library_getter=get_target_plex_library_service,
         discovery_snapshot_store=get_discovery_snapshot_store(),
         disk_cache=get_disk_cache(),
+        mb_response_store=get_mb_response_store(),
+        follow_store=get_follow_store(),
+    )
+
+
+@singleton
+def get_discovery_demand_service():
+    from services.discover.demand_service import DiscoveryDemandService
+    from core.dependencies.auth_providers import get_auth_store
+    from core.dependencies.cache_providers import get_discovery_snapshot_store
+
+    return DiscoveryDemandService(
+        get_discovery_snapshot_store(),
+        get_target_discover_service,
+        get_target_home_service,
+        get_target_discover_queue_manager,
+        get_target_artist_discovery_service,
+        get_auth_store,
+        workload_gate=get_background_workload_gate(),
     )
 
 
@@ -2338,7 +2417,6 @@ def _build_artist_discovery_service(
     library_repo, library_db
 ) -> "ArtistDiscoveryService":
     from services.artist_discovery_service import ArtistDiscoveryService
-    from core.dependencies.auth_providers import get_auth_store
 
     listenbrainz_repo = get_listenbrainz_repository()
     musicbrainz_repo = get_musicbrainz_repository()
@@ -2354,7 +2432,6 @@ def _build_artist_discovery_service(
         lastfm_repo=lastfm_repo,
         preferences_service=preferences_service,
         client_factory=get_per_user_client_factory(),
-        auth_store=get_auth_store(),
         workload_gate=get_background_workload_gate(),
     )
 
@@ -2438,7 +2515,9 @@ def get_search_enrichment_service() -> "SearchEnrichmentService":
     lb_repo = get_listenbrainz_repository()
     preferences_service = get_preferences_service()
     lastfm_repo = get_lastfm_repository()
-    return SearchEnrichmentService(lb_repo, preferences_service, lastfm_repo)
+    return SearchEnrichmentService(
+        lb_repo, preferences_service, lastfm_repo, plugin_host=get_plugin_host()
+    )
 
 
 @singleton
@@ -2484,6 +2563,7 @@ def get_spotify_import_service() -> "SpotifyImportService":
         playlist_repo=get_playlist_repository(),
         mb_repo=get_musicbrainz_repository(),
         playlist_service=get_playlist_service(),
+        cache=get_cache(),
         cover_fetcher=cover_fetcher_for(get_spotify_cover_http_client()),
     )
 
@@ -2503,6 +2583,7 @@ def get_target_spotify_import_service() -> "SpotifyImportService":
         playlist_repo=None,
         mb_repo=get_musicbrainz_repository(),
         playlist_service=target.playlists,
+        cache=get_cache(),
         async_playlist_repo=target.playlist_repository,
         cover_fetcher=cover_fetcher_for(get_spotify_cover_http_client()),
     )
@@ -2900,10 +2981,20 @@ def get_acquisition_cleanup_service() -> "AcquisitionCleanupService":
     from .cache_providers import get_native_library_store
     from .repo_providers import get_download_client_for_source, get_download_store
 
+    def _client_for_source(source: str):
+        if source and source.startswith("plugin:"):
+            try:
+                client = get_plugin_source_registry().client_for(source)
+            except Exception:  # noqa: BLE001 - fallback to bundled resolver
+                client = None
+            if client is not None:
+                return client
+        return get_download_client_for_source(source)
+
     return AcquisitionCleanupService(
         get_download_store(),
         get_native_library_store(),
-        get_download_client_for_source,
+        _client_for_source,
         lambda: Path(
             get_preferences_service().get_sabnzbd_connection_raw().downloads_mount
         ),
@@ -2911,6 +3002,61 @@ def get_acquisition_cleanup_service() -> "AcquisitionCleanupService":
             get_preferences_service().get_sabnzbd_connection_raw().category
         ),
     )
+
+
+def _select_usenet_primary(selector: str, newznab, prowlarr):
+    """Either/or primary selection (pure, unit-tested): the selected backend is
+    the composite primary and the other side is excluded entirely (no union, no
+    cross-side duplicates). The unselected side sits untouched so switching back
+    restores it. Unknown selectors collapse to ``"indexers"``."""
+    if selector == "prowlarr":
+        return prowlarr
+    return newznab
+
+
+def _build_usenet_indexer():
+    """The pooled ``usenet`` indexer: the SELECTED backend as primary plus any
+    usenet-targeting plugin indexers as extras (either/or - the unselected side
+    never searches, so Prowlarr and native rows can't duplicate each other).
+
+    Shared by the orchestrator and service builders so both pool identically;
+    any construction failure degrades to Newznab-only (composite never blocks
+    bundled sources)."""
+    from services.native.acquisition.composite_indexer import CompositeIndexer
+
+    from .repo_providers import (
+        get_newznab_indexer,
+        get_preferences_service,
+        get_prowlarr_indexer,
+    )
+
+    registry = get_plugin_source_registry()
+    try:
+        base_indexer = get_newznab_indexer()
+        try:
+            prowlarr_indexer = get_prowlarr_indexer()
+        except Exception:  # noqa: BLE001 - absence reads as no Prowlarr member
+            prowlarr_indexer = None
+        try:
+            plugin_usenet = registry.indexers_for_target("usenet")
+        except Exception:  # noqa: BLE001 - absence reads as no pooled indexers
+            plugin_usenet = []
+        selector = get_preferences_service().get_usenet_search_backend()
+        primary = _select_usenet_primary(selector, base_indexer, prowlarr_indexer)
+        if primary is None:
+            if selector == "prowlarr":
+                # Provider failed while Prowlarr is selected: stay on an
+                # unconfigured Prowlarr primary (searches []) so behavior
+                # matches readiness (False) instead of silently searching
+                # the unselected Newznab side.
+                from repositories.prowlarr.prowlarr_indexer import ProwlarrIndexer
+
+                primary = ProwlarrIndexer(None, enabled=False)
+            else:
+                primary = base_indexer
+        return CompositeIndexer(primary, plugin_usenet)
+    except Exception:  # noqa: BLE001 - composite never blocks bundled sources
+        return get_newznab_indexer()
 
 
 def _build_download_orchestrator(
@@ -2924,12 +3070,10 @@ def _build_download_orchestrator(
     from .repo_providers import (
         get_download_client_repository,
         get_download_store,
-        get_newznab_indexer,
         get_sabnzbd_download_client,
         get_slskd_indexer,
         get_wanted_store,
     )
-
     prefs = get_preferences_service()
     lib = prefs.get_typed_library_settings_raw()
     policy = prefs.get_download_policy()
@@ -2943,6 +3087,8 @@ def _build_download_orchestrator(
         if lib.staging_path
         else Path(get_settings().cache_dir) / "download-staging"
     )
+    registry = get_plugin_source_registry()
+    usenet_indexer = _build_usenet_indexer()
     return DownloadOrchestrator(
         spec_policy_extras=lambda: _build_spec_policy(
             get_preferences_service().get_download_policy()
@@ -2971,7 +3117,7 @@ def _build_download_orchestrator(
         auto_retry_base_interval_minutes=policy.auto_retry_base_interval_minutes,
         request_history=get_request_history_store(),
         on_import_callback=on_import_callback,
-        usenet_indexer=get_newznab_indexer(),
+        usenet_indexer=usenet_indexer,
         usenet_client=get_sabnzbd_download_client(),
         usenet_scorer=get_newznab_release_scorer(),
         usenet_enabled=usenet_enabled,
@@ -2988,6 +3134,8 @@ def _build_download_orchestrator(
         get_download_policy=lambda: get_preferences_service().get_download_policy(),
         wanted_store=get_wanted_store(),
         cleanup_service=get_acquisition_cleanup_service(),
+        plugin_sources=registry,
+        plugin_host=get_plugin_host(),
     )
 
 
@@ -3034,7 +3182,6 @@ def _build_download_service(
         get_album_release_pin_store,
         get_download_client_repository,
         get_download_store,
-        get_newznab_indexer,
         get_slskd_indexer,
     )
 
@@ -3042,8 +3189,17 @@ def _build_download_service(
     dc = prefs.get_download_client_settings_raw()
     policy = prefs.get_download_policy()
     usenet_enabled = prefs.is_usenet_ready()
-    # The service is "enabled" if ANY source can act (slskd OR usenet), so a Usenet-only
-    # install isn't blocked by the slskd-disabled guard.
+    registry = get_plugin_source_registry()
+    usenet_indexer = _build_usenet_indexer()
+    try:
+        plugin_scorer = get_plugin_release_scorer()
+    except Exception:  # noqa: BLE001 - absence reads as no plugin scorer
+        plugin_scorer = None
+    try:
+        plugin_ready = bool(registry.is_any_source_ready())
+    except Exception:  # noqa: BLE001 - absence reads as not ready
+        plugin_ready = False
+    # The service is "enabled" if ANY source can act (slskd OR usenet OR plugins).
     return DownloadService(
         snapshot_factory=_acquisition_snapshot_factory(),
         download_client=get_download_client_repository(),
@@ -3060,8 +3216,8 @@ def _build_download_service(
         track_matcher=get_track_matcher(),
         auto_accept_threshold=policy.preflight_score_auto_accept,
         manual_threshold=policy.preflight_score_manual_min,
-        enabled=dc.enabled or usenet_enabled,
-        usenet_indexer=get_newznab_indexer(),
+        enabled=dc.enabled or usenet_enabled or plugin_ready,
+        usenet_indexer=usenet_indexer,
         usenet_scorer=get_newznab_release_scorer(),
         usenet_enabled=usenet_enabled,
         soulseek_enabled=dc.enabled,
@@ -3072,6 +3228,8 @@ def _build_download_service(
         ownership_service=ownership_service,
         native_library_store=get_native_library_store(),
         library_reconciler=library_reconciler,
+        plugin_sources=registry,
+        plugin_scorer=plugin_scorer,
     )
 
 

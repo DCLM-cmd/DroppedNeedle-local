@@ -5,7 +5,7 @@ import { playerStore } from '$lib/stores/player.svelte';
 import type { QueueItem } from '$lib/player/types';
 import type { MenuItem } from '$lib/components/ContextMenu.svelte';
 import { ListPlus, ListStart, ListMusic, Download } from 'lucide-svelte';
-import { downloadFile } from '$lib/utils/downloadHelper';
+import { downloadAlbumArchive } from '$lib/utils/downloadActions';
 import { API } from '$lib/constants';
 import type { LocalAlbumSummary } from '$lib/types';
 
@@ -364,11 +364,14 @@ export function createLibraryController<TAlbum>(
 		];
 		if (adapter.sourceType === 'local') {
 			const localAlbum = album as LocalAlbumSummary;
-			items.push({
-				label: 'Download Album',
-				icon: Download,
-				onclick: () => downloadFile(API.download.localAlbumByMbid(localAlbum.musicbrainz_id))
-			});
+			if (localAlbum.download_allowed !== false) {
+				items.push({
+					label: 'Download Album',
+					icon: Download,
+					onclick: () =>
+						void downloadAlbumArchive(API.download.localAlbumByMbid(localAlbum.musicbrainz_id))
+				});
+			}
 		}
 		return items;
 	}

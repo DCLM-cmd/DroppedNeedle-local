@@ -1,9 +1,9 @@
-import { getApiUrl } from '$lib/api/api-utils';
-import { API } from '$lib/constants';
-
-import { subscribeShared, type SharedEventSourceSubscription } from '../sharedEventSource';
-
 import { invalidateLibraryManagementSurfaces } from './LibraryManagementInvalidation';
+import {
+	muxEventStream,
+	type MuxEventStream,
+	type MuxUnsubscribe
+} from '$lib/queries/events/MuxEventStream';
 
 export interface LibraryManagementActivityEvent {
 	id: string;
@@ -41,8 +41,8 @@ export function parseLibraryManagementActivityEvent(
 	return { id: record.id, revisions };
 }
 
-export function createLibraryManagementEvents() {
-	let subscription: SharedEventSourceSubscription | null = null;
+export function createLibraryManagementEvents(mux: MuxEventStream = muxEventStream) {
+	let unsubs: MuxUnsubscribe[] = [];
 	const seenIds = new Set<string>();
 	const seenOrder: string[] = [];
 
@@ -72,18 +72,15 @@ export function createLibraryManagementEvents() {
 
 	function start(): void {
 		stop();
-		// Shared: the app shell already holds this stream open for admins, and up to
-		// four management components mount this helper. Each own connection spent one
-		// of the browser's six per-origin slots on identical data.
-		subscription = subscribeShared(API.library.operationsStream(), {
-			open: refresh,
-			'activity.changed': handleActivity
-		});
+		unsubs = [mux.on('activity.changed', handleActivity), mux.onConnect(refresh)];
+		// Refresh directly only when already connected; otherwise the imminent
+		// first open fires refresh and a direct call would double it.
+		if (mux.isConnected) refresh();
 	}
 
 	function stop(): void {
-		subscription?.close();
-		subscription = null;
+		for (const unsub of unsubs) unsub();
+		unsubs = [];
 	}
 
 	return { start, stop };

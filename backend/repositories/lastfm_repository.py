@@ -22,6 +22,11 @@ from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.resilience.rate_limiter import TokenBucketRateLimiter
 from infrastructure.resilience.retry import CircuitBreaker, with_retry
 from infrastructure.observability.provider_counters import record_provider_call
+from infrastructure.observability.optional_work import (
+    OptionalWorkReservation,
+    check_optional_dispatch,
+    reserve_optional_operation,
+)
 from repositories.lastfm_models import (
     ALLOWED_LASTFM_PERIOD,
     LastFmAlbum,
@@ -176,6 +181,20 @@ class LastFmRepository:
         logger.warning("Last.fm error code=%d message=%s", error_code, error_message)
         raise ExternalServiceError(f"Last.fm error ({error_code}): {error_message}")
 
+    async def _request(
+        self,
+        method: str,
+        params: dict[str, str] | None = None,
+        signed: bool = False,
+        http_method: str = "GET",
+    ) -> dict[str, Any]:
+        reservation = reserve_optional_operation()
+        try:
+            return await self._request_attempt(method, params, signed, http_method, reservation)
+        finally:
+            if reservation is not None:
+                reservation.refund()
+
     @with_retry(
         max_attempts=3,
         base_delay=1.0,
@@ -183,12 +202,13 @@ class LastFmRepository:
         circuit_breaker=_lastfm_circuit_breaker,
         retriable_exceptions=(httpx.HTTPError, ExternalServiceError),
     )
-    async def _request(
+    async def _request_attempt(
         self,
         method: str,
         params: dict[str, str] | None = None,
         signed: bool = False,
         http_method: str = "GET",
+        reservation: OptionalWorkReservation | None = None,
     ) -> dict[str, Any]:
         if not self._api_key:
             raise ConfigurationError("Last.fm API key is not configured")
@@ -213,6 +233,9 @@ class LastFmRepository:
             request_params["api_sig"] = self._build_api_sig(request_params)
 
         try:
+            check_optional_dispatch()
+            if reservation is not None:
+                reservation.mark_dispatched()
             if http_method == "POST":
                 response = await self._client.post(
                     LASTFM_API_URL,
@@ -229,7 +252,7 @@ class LastFmRepository:
             # QW9 Part 3: one increment per wire attempt; Last.fm reports
             # application errors as HTTP 200 bodies, which stay "ok" here by
             # design (classification is status-based). Unlaned funnel.
-            record_provider_call("lastfm", None, response.status_code)
+            record_provider_call("lastfm", None, response.status_code, response=response)
 
             if response.status_code != 200:
                 raise ExternalServiceError(

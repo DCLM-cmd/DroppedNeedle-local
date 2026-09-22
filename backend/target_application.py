@@ -38,6 +38,7 @@ from api.v1.routes import (
     discover,
     downloads,
     downloads_search,
+    events,
     following,
     free_music,
     home,
@@ -62,6 +63,7 @@ from api.v1.routes import (
     plex_library,
     plugins,
     profile,
+    prowlarr,
     quarantine,
     requests,
     requests_page,
@@ -154,6 +156,7 @@ from core.dependencies import (
     init_app_state,
     get_target_album_identification_service,
     get_target_identification_queue,
+    get_sse_publisher,
     get_library_contribution_verification_worker,
     get_background_workload_gate,
     get_library_policy_resolver,
@@ -172,6 +175,7 @@ from core.exception_handlers import (
     general_exception_handler,
     http_exception_handler,
     permission_denied_handler,
+    rate_limited_error_handler,
     request_validation_error_handler,
     resource_not_found_handler,
     revision_overflow_error_handler,
@@ -188,6 +192,7 @@ from core.exceptions import (
     AutomaticManagementHoldError,
     ExternalServiceError,
     PermissionDeniedError,
+    RateLimitedError,
     ResourceNotFoundError,
     RevisionOverflowError,
     SourceResolutionError,
@@ -209,8 +214,14 @@ from middleware import (
     DegradationMiddleware,
     HSTSMiddleware,
     PerformanceMiddleware,
+    PerUserRateLimitMiddleware,
     RateLimitMiddleware,
 )
+from services.native.library_filesystem_watcher import (
+    WATCHER_TASK_NAME,
+    start_library_filesystem_watcher,
+)
+from services.native.library_revision_poller import start_library_revision_poller
 from services.native.library_scan_supervisor import (
     SUPERVISOR_TASK_NAME,
     start_target_scan_supervisor,
@@ -433,6 +444,7 @@ def _include_complete_target_routes(app: FastAPI) -> None:
         system.router,
         spotify.router,
         now_playing.router,
+        events.router,
         profile.router,
         playlists.router,
         version.router,
@@ -441,6 +453,7 @@ def _include_complete_target_routes(app: FastAPI) -> None:
         download_client.router,
         download_clients.router,
         indexers.router,
+        prowlarr.router,
         lidarr_import.router,
         import_drop.router,
         free_music.router,
@@ -695,6 +708,12 @@ async def production_target_lifespan(app: FastAPI):
                 scheduler_getter=get_target_library_scan_scheduler,
                 resolver_getter=get_library_policy_resolver,
                 schedule_settings_getter=schedule_settings,
+                dirty_scopes_getter=lambda: get_preferences_service()
+                .get_library_scan_dirty_scopes()
+                .scope_ids,
+                dirty_scopes_clearer=(
+                    get_preferences_service().clear_library_scan_dirty_scopes
+                ),
             )
 
         def mb_provider_state() -> CircuitState:
@@ -739,11 +758,24 @@ async def production_target_lifespan(app: FastAPI):
                 work_wakeups,
             )
 
+        def start_filesystem_watcher() -> asyncio.Task[None]:
+            return start_library_filesystem_watcher(
+                get_target_library_scan_coordinator,
+                root_paths,
+                work_wakeups,
+                scheduler_getter=get_target_library_scan_scheduler,
+                resolver_getter=get_library_policy_resolver,
+                watcher_settings_getter=(
+                    get_preferences_service().get_library_scan_filesystem_watcher
+                ),
+            )
+
         worker_starters = {
             SUPERVISOR_TASK_NAME: start_scan_supervisor,
             IDENTIFICATION_WORKER_TASK_NAME: start_identification_worker,
             OPERATION_WORKER_TASK_NAME: start_operation_worker,
             CONTRIBUTION_VERIFICATION_WORKER_TASK_NAME: start_contribution_worker,
+            WATCHER_TASK_NAME: start_filesystem_watcher,
         }
         for start_worker in worker_starters.values():
             start_worker()
@@ -753,6 +785,11 @@ async def production_target_lifespan(app: FastAPI):
         from core.dependencies.service_providers import get_wal_checkpoint_service
 
         start_target_wal_checkpoint_task(get_wal_checkpoint_service())
+        # Single process-wide library-revision poll feeding the mux SSE stream;
+        # replaces the per-connection poll loop in the old activity streams.
+        start_library_revision_poller(
+            get_target_identification_queue, get_sse_publisher
+        )
         await start_target_operational_runtime(
             settings=settings,
             preferences=preferences,
@@ -807,6 +844,7 @@ def create_production_target_application() -> FastAPI:
     for exception, handler in (
         (ClientDisconnectedError, client_disconnected_handler),
         (ResourceNotFoundError, resource_not_found_handler),
+        (RateLimitedError, rate_limited_error_handler),
         (ExternalServiceError, external_service_error_handler),
         (SourceResolutionError, source_resolution_error_handler),
         (ValidationError, validation_error_handler),
@@ -828,6 +866,11 @@ def create_production_target_application() -> FastAPI:
     app.add_middleware(DegradationMiddleware)
     app.add_middleware(PerformanceMiddleware)
     app.add_middleware(CompressibleGZipMiddleware, minimum_size=1000, compresslevel=6)
+    # Per-user buckets run after auth (last-added executes first): the global
+    # limiter below stays as the pre-auth backstop against unauthenticated
+    # floods and caps aggregate traffic, while authenticated users additionally
+    # get their own burst budgets.
+    app.add_middleware(PerUserRateLimitMiddleware)
     app.add_middleware(AuthMiddleware)
     app.add_middleware(
         RateLimitMiddleware,
@@ -863,10 +906,13 @@ def create_production_target_application() -> FastAPI:
             allow_origins=[
                 "http://localhost:5173",
                 "http://127.0.0.1:5173",
+                "http://[::1]:5173",
                 "http://localhost:4173",
                 "http://127.0.0.1:4173",
+                "http://[::1]:4173",
                 "http://localhost:3000",
                 "http://127.0.0.1:3000",
+                "http://[::1]:3000",
             ],
             allow_credentials=True,
             allow_methods=["*"],
@@ -875,7 +921,7 @@ def create_production_target_application() -> FastAPI:
     app.add_middleware(CompatCORSMiddleware)
 
     @app.get("/health")
-    def health_check():
+    async def health_check():
         return {"status": "ok", "message": "DroppedNeedle backend running"}
 
     _include_complete_target_routes(app)

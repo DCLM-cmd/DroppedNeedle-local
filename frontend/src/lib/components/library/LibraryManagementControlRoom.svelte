@@ -4,7 +4,7 @@
 	import { onMount } from 'svelte';
 	import { SvelteURL } from 'svelte/reactivity';
 	import {
-		AlertTriangle,
+		TriangleAlert,
 		ArrowRight,
 		CirclePause,
 		CirclePlay,
@@ -18,14 +18,28 @@
 	import LibraryManagementDiscardPreview from './LibraryManagementDiscardPreview.svelte';
 	import LibraryManagementIdentityReadiness from './LibraryManagementIdentityReadiness.svelte';
 	import LibraryRepairPanel from './LibraryRepairPanel.svelte';
+	import { toastStore } from '$lib/stores/toast';
+	import { invalidateLibraryManagementSurfaces } from '$lib/queries/library-management/LibraryManagementInvalidation';
+	import {
+		STALE_INPUT_HINT,
+		groupFailedOperationsByAlbum,
+		isStaleInputTerminal
+	} from './LibraryWorkPresentation';
 	import { getTargetLibrarySettingsQuery } from '$lib/queries/library/LibraryPolicyQueries.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { createLibraryManagementEvents } from '$lib/queries/library-management/LibraryManagementEvents';
 	import { withBasePath } from '$lib/utils/basePath';
 	import {
 		acknowledgeLibraryManagementRecoveryMutation,
-		controlLibraryManagementOperationMutation
+		controlLibraryManagementOperationMutation,
+		discardLibraryManagementPreviewMutation,
+		reissueLibraryManagementPreviewMutation,
+		resolveLibraryManagementImportBundleMutation
 	} from '$lib/queries/library-management/LibraryManagementMutations.svelte';
+	import {
+		forgetLibraryManagementPreviewToken,
+		rememberLibraryManagementPreviewToken
+	} from '$lib/queries/library-management/LibraryManagementPreviewTokens';
 	import {
 		getLibraryManagementOperationsQuery,
 		getLibraryManagementRecoveryQuery,
@@ -48,6 +62,10 @@
 	const acknowledgeRecovery = acknowledgeLibraryManagementRecoveryMutation();
 	const pauseOperation = controlLibraryManagementOperationMutation('pause');
 	const resumeOperation = controlLibraryManagementOperationMutation('resume');
+	const reissuePreview = reissueLibraryManagementPreviewMutation();
+	const discardPreview = discardLibraryManagementPreviewMutation();
+	const resolveImportBundle = resolveLibraryManagementImportBundleMutation();
+	let resolvingBundleId = $state<string | null>(null);
 	type RunnerMode = 'manage' | 'baseline_restore';
 
 	let runnerMode = $state<RunnerMode | null>(runnerModeFromUrl());
@@ -72,6 +90,15 @@
 			.slice(0, 3)
 	);
 	const recent = $derived(history.filter((item) => item.operation.state !== 'ready').slice(0, 5));
+	const recentRunning = $derived(recent.filter((item) => item.operation.state !== 'failed'));
+	const recentFailed = $derived(recent.filter((item) => item.operation.state === 'failed'));
+	const failedGroups = $derived(
+		groupFailedOperationsByAlbum(recentFailed, (item) =>
+			isStaleInputTerminal(item.operation)
+		)
+	);
+	let bulkPending = $state(false);
+	let bulkSummary = $state<string | null>(null);
 	const activeAssignments = $derived(
 		(settingsQuery.data?.root_assignments ?? []).filter(
 			(assignment) =>
@@ -84,9 +111,13 @@
 	const attentionCount = $derived(
 		(recoveryQuery.data?.needs_attention_count ?? 0) +
 			(recoveryQuery.data?.cleanup_pending_count ?? 0) +
-			history.filter((item) => item.operation.state === 'failed').length
+			history.filter(
+				(item) =>
+					item.operation.state === 'failed' && !isStaleInputTerminal(item.operation)
+			).length
 	);
 	const recoveryUnavailable = $derived(recoveryQuery.isError);
+	const needsAttentionBundles = $derived(recoveryQuery.data?.needs_attention_bundles ?? []);
 
 	onMount(() => {
 		const events = createLibraryManagementEvents();
@@ -137,6 +168,91 @@
 
 	function date(value: number): string {
 		return new Date(value * 1000).toLocaleString();
+	}
+
+	type StaleGroupItems = Array<(typeof failedGroups)[number]['items'][number]>;
+
+	function staleMembers(items: StaleGroupItems): StaleGroupItems {
+		return items.filter((item) => isStaleInputTerminal(item.operation));
+	}
+
+	async function bulkRetryStale(items: StaleGroupItems): Promise<void> {
+		const targets = staleMembers(items);
+		if (!authStore.isAdmin || bulkPending || targets.length === 0) return;
+		bulkPending = true;
+		bulkSummary = null;
+		let succeeded = 0;
+		let failed = 0;
+		for (const item of targets) {
+			try {
+				const handle = await reissuePreview.mutateAsync({ jobId: item.operation.id, silent: true });
+				rememberLibraryManagementPreviewToken(handle.job_id, handle.preview_token);
+				succeeded += 1;
+			} catch {
+				failed += 1;
+			}
+		}
+		await invalidateLibraryManagementSurfaces().catch(() => undefined);
+		bulkPending = false;
+		const summary =
+			`Retried ${succeeded} of ${targets.length} stale ${targets.length === 1 ? 'preview' : 'previews'}` +
+			(failed ? ` (${failed} failed)` : '') +
+			'.';
+		bulkSummary = summary;
+		toastStore.show({ message: summary, type: failed ? 'error' : 'success' });
+	}
+
+	async function resolveNeedsAttentionBundle(bundleId: string): Promise<void> {
+		if (!authStore.isAdmin || resolvingBundleId) return;
+		resolvingBundleId = bundleId;
+		try {
+			const result = await resolveImportBundle.mutateAsync({ bundleId });
+			await invalidateLibraryManagementSurfaces().catch(() => undefined);
+			toastStore.show({
+				message: `Import bundle marked as handled (${result.verified_files}/${result.total_files} files verified).`,
+				type: 'success'
+			});
+		} catch (error) {
+			toastStore.show({
+				message:
+					error instanceof Error && error.message
+						? error.message
+						: 'Could not mark this import bundle as handled',
+				type: 'error'
+			});
+		} finally {
+			resolvingBundleId = null;
+		}
+	}
+
+	async function bulkDismissStale(items: StaleGroupItems): Promise<void> {
+		const targets = staleMembers(items);
+		if (!authStore.isAdmin || bulkPending || targets.length === 0) return;
+		bulkPending = true;
+		bulkSummary = null;
+		let succeeded = 0;
+		let failed = 0;
+		for (const item of targets) {
+			try {
+				await discardPreview.mutateAsync({
+					jobId: item.operation.id,
+					request: { expected_operation_row_revision: item.operation.row_revision },
+					silent: true
+				});
+				forgetLibraryManagementPreviewToken(item.operation.id);
+				succeeded += 1;
+			} catch {
+				failed += 1;
+			}
+		}
+		await invalidateLibraryManagementSurfaces().catch(() => undefined);
+		bulkPending = false;
+		const summary =
+			`Dismissed ${succeeded} of ${targets.length} stale ${targets.length === 1 ? 'preview' : 'previews'}` +
+			(failed ? ` (${failed} failed)` : '') +
+			'.';
+		bulkSummary = summary;
+		toastStore.show({ message: summary, type: failed ? 'error' : 'success' });
 	}
 </script>
 
@@ -312,7 +428,8 @@
 						<p class="management-step">Audit trail</p>
 						<h3 id="recent-management-work" class="font-semibold">Recent management work</h3>
 					</div>
-					{#if recent}{#each recent as item (item.operation.id)}<a
+					{#if recent.length > 0}
+						{#each recentRunning as item (item.operation.id)}<a
 								href={operationHref(
 									item.operation.id,
 									item.operation.state,
@@ -337,11 +454,132 @@
 											>{/if}</span
 									></span
 								><ArrowRight class="h-4 w-4" /></a
-							>{/each}{:else}<div
+							>{/each}
+						{#each failedGroups as group (group.key)}
+							{#if group.items.length > 1}
+								<article
+									class="management-history-row"
+									aria-label={`${group.items[0].profile_name}: ${group.items.length} failed attempts for the same album`}
+								>
+									<History class="h-4 w-4 shrink-0 text-base-content/45" />
+									<div class="min-w-0 flex-1">
+										<div class="flex flex-wrap items-center gap-2">
+											<strong>{group.items[0].profile_name}</strong>
+											<span class="badge badge-outline badge-sm"
+												>{group.items.length} failed attempts · same album</span
+											>
+											{#if group.allStale}
+												<span class="badge badge-neutral badge-sm">Superseded</span>
+											{:else}
+												<span class="badge badge-error badge-sm">Needs attention</span>
+											{/if}
+										</div>
+										{#if group.allStale}
+											<p class="mt-1 text-xs text-base-content/55">{STALE_INPUT_HINT}</p>
+										{:else if group.staleCount > 0}
+											<p class="mt-1 text-xs text-base-content/55">
+												{group.staleCount} of {group.items.length} attempts only found moved
+												inputs and can be retried; the rest failed for other reasons.
+											</p>
+										{/if}
+										<ul class="mt-2 space-y-1">
+											{#each group.items as member (member.operation.id)}
+												<li
+													class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs {isStaleInputTerminal(
+														member.operation
+													)
+														? 'text-base-content/55'
+														: 'text-error'}"
+												>
+													<span
+														>{title(member.mode)} · {isStaleInputTerminal(member.operation)
+															? 'Superseded · inputs moved'
+															: `${title(member.operation.state)}${member.operation.terminal_code ? ` · ${title(member.operation.terminal_code)}` : ''}`} · {date(
+															member.operation.updated_at
+														)}</span
+													>
+													<a
+														class="link link-hover font-semibold"
+														href={operationHref(
+															member.operation.id,
+															member.operation.state,
+															member.operation.terminal_code,
+															member.mode
+														)}>Open details</a
+													>
+												</li>
+											{/each}
+										</ul>
+										{#if authStore.isAdmin && group.staleCount > 0}
+											<div class="mt-2 flex flex-wrap gap-2">
+												<button
+													type="button"
+													class="btn btn-outline btn-sm"
+													disabled={bulkPending}
+													onclick={() => void bulkRetryStale(group.items)}
+													>Retry {group.staleCount} stale</button
+												>
+												<button
+													type="button"
+													class="btn btn-ghost btn-sm text-error"
+													disabled={bulkPending}
+													onclick={() => void bulkDismissStale(group.items)}
+													>Dismiss {group.staleCount} stale</button
+												>
+											</div>
+										{/if}
+									</div>
+								</article>
+							{:else}
+								{@const single = group.items[0]}
+								{@const singleStale = isStaleInputTerminal(single.operation)}
+								<a
+									href={operationHref(
+										single.operation.id,
+										single.operation.state,
+										single.operation.terminal_code,
+										single.mode
+									)}
+									class="management-history-row"
+									><History class="h-4 w-4 text-base-content/45" /><span class="min-w-0 flex-1"
+										><strong>{single.profile_name}</strong><small
+											>{title(single.mode)} · {singleStale
+												? 'Superseded · inputs moved'
+												: title(single.operation.state)} · {date(single.operation.updated_at)}</small
+										>
+										{#if singleStale}
+											<span class="mt-1 block text-xs text-base-content/55"
+												>{STALE_INPUT_HINT}</span
+											>
+										{/if}
+										<span class="mt-1 flex flex-wrap gap-1"
+											>{#if single.operation.succeeded_count}<span
+													class="badge badge-success badge-sm"
+													>{single.operation.succeeded_count} succeeded</span
+												>{/if}{#if single.operation.failed_count}<span
+													class="badge {singleStale
+														? 'badge-ghost'
+														: 'badge-error'} badge-sm"
+													>{single.operation.failed_count} failed</span
+												>{/if}{#if single.operation.skipped_count}<span
+													class="badge badge-warning badge-sm"
+													>{single.operation.skipped_count} skipped</span
+												>{/if}</span
+										></span
+									><ArrowRight class="h-4 w-4" /></a
+								>
+							{/if}
+						{/each}
+						{#if bulkSummary}
+							<p class="text-sm text-base-content/60" role="status">{bulkSummary}</p>
+						{/if}
+					{:else}
+						<div
 							class="rounded-xl border border-dashed border-base-content/15 p-4 text-sm text-base-content/45"
 						>
 							No organization work has run yet.
-						</div>{/if}
+						</div>
+					{/if}
 				</div>
 			</section>
 
@@ -351,7 +589,7 @@
 			{#if recoveryQuery.data && recoveryQuery.data.needs_attention_count}<div
 					class="alert alert-warning items-start"
 				>
-					<AlertTriangle class="mt-0.5 h-5 w-5" /><span class="flex-1"
+					<TriangleAlert class="mt-0.5 h-5 w-5" /><span
 						><strong>Recovery needs attention</strong><br />{recoveryQuery.data
 							.needs_attention_count} bundles need review; {recoveryQuery.data
 							.cleanup_pending_count} have safe cleanup pending. No uncertain file is deleted automatically.
@@ -361,15 +599,28 @@
 								record and clears the alert.</span
 							>{/if}</span
 					>
-					{#if recoveryQuery.data.needs_attention_count}<button
-							type="button"
-							class="btn btn-sm"
-							disabled={acknowledgeRecovery.isPending}
-							onclick={() => acknowledgeRecovery.mutate()}
-							>{acknowledgeRecovery.isPending ? 'Dismissing...' : 'Dismiss'}</button
-						>{/if}
+					{#if authStore.isAdmin && needsAttentionBundles.length > 0}<div
+							class="flex w-full flex-wrap gap-2"
+						>
+							{#each needsAttentionBundles as bundle (bundle.bundle_id)}<button
+									type="button"
+									class="btn btn-warning btn-sm"
+									disabled={resolvingBundleId !== null}
+									onclick={() => void resolveNeedsAttentionBundle(bundle.bundle_id)}
+									>Mark {bundle.bundle_id} as handled</button
+								>{/each}
+							<!-- Fork fallback: clears alerts even when destination+backup are both
+								gone, which the on-disk-verifying resolve above cannot. -->
+							<button
+								type="button"
+								class="btn btn-sm"
+								disabled={acknowledgeRecovery.isPending}
+								onclick={() => acknowledgeRecovery.mutate()}
+								>{acknowledgeRecovery.isPending ? 'Dismissing...' : 'Dismiss all'}</button
+							>
+						</div>{/if}
 				</div>{:else if recoveryUnavailable}<div class="alert alert-error items-start" role="alert">
-					<AlertTriangle class="mt-0.5 h-5 w-5" /><span
+					<TriangleAlert class="mt-0.5 h-5 w-5" /><span
 						><strong>Recovery status is unavailable</strong><br />Do not start new file writes until
 						diagnostics load successfully. Refresh this page or check the server logs.</span
 					>

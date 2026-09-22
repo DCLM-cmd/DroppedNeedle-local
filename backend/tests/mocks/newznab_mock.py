@@ -251,6 +251,17 @@ def audionix_broken_music_handler(request: httpx.Request) -> httpx.Response:
     return _xml(_free_text_feed(_record(request), _AX_MUSIC))
 
 
+def caps_dead_handler(request: httpx.Request) -> httpx.Response:
+    """t=caps 500s (indexer hiccup), but t=search serves the valid feed - the
+    indexer must stay enabled on permissive defaults and take the t=search path."""
+    t = request.url.params.get("t")
+    if t == "caps":
+        return httpx.Response(500, text="caps exploded")
+    if t == "search":
+        return _xml(_free_text_feed(_record(request), _DS_SEARCH))
+    return _xml(_DS_MUSIC_ERROR)
+
+
 def auth_error_handler(request: httpx.Request) -> httpx.Response:
     return _xml(_AUTH_ERROR)
 

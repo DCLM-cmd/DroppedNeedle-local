@@ -1,5 +1,6 @@
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+import threading
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -10,71 +11,134 @@ def _make_service() -> CacheService:
     cache = MagicMock()
     cache.size.return_value = 10
     cache.estimate_memory_bytes.return_value = 1024
-    lib_cache = AsyncMock()
-    lib_cache.get_stats = AsyncMock(return_value={
-        "db_size_bytes": 0,
+    library = AsyncMock()
+    library.get_cache_stats.return_value = {
         "artist_count": 0,
         "album_count": 0,
-    })
-    disk_cache = MagicMock()
-    disk_cache.get_stats.return_value = {
+        "db_size_bytes": 4096,
+    }
+    disk = MagicMock()
+    disk.get_stats.return_value = {
         "total_count": 0,
         "album_count": 0,
         "artist_count": 0,
-        "audiodb_artist_count": 0,
-        "audiodb_album_count": 0,
+        "total_size_bytes": 128,
     }
-    return CacheService(cache=cache, library_db=lib_cache, disk_cache=disk_cache)
+    responses = MagicMock()
+    responses.stats.return_value = {
+        "response_entries": 3,
+        "response_logical_bytes": 2048,
+        "database_allocated_bytes": 4096,
+        "database_wal_bytes": 512,
+        "response_hits": 0,
+        "response_evictions": 0,
+        "response_speculative_used": 0,
+    }
+    return CacheService(cache, library, disk, responses)
 
 
-class TestCacheStatsNonblocking:
-    @pytest.mark.asyncio
-    async def test_get_stats_uses_to_thread(self):
-        """subprocess.run calls should be wrapped with asyncio.to_thread."""
-        svc = _make_service()
+@pytest.mark.asyncio
+async def test_slow_metadata_inventory_keeps_loop_responsive_and_coalesces(
+    monkeypatch, tmp_path
+):
+    service = _make_service()
+    monkeypatch.setattr("services.cache_service.get_covers_cache_dir", lambda: tmp_path)
+    (tmp_path / "cover.jpg").write_bytes(b"cover")
+    entered = threading.Event()
+    release = threading.Event()
+    inventory = service._disk_cache.get_stats.return_value
+    scans = 0
+    loop_thread = threading.get_ident()
+    worker_threads = []
 
-        fake_du = MagicMock()
-        fake_du.returncode = 0
-        fake_du.stdout = "12345\t/app/cache/covers"
+    def slow_stats():
+        nonlocal scans
+        scans += 1
+        worker_threads.append(threading.get_ident())
+        entered.set()
+        if not release.wait(timeout=2):
+            raise TimeoutError("event loop failed to release inventory")
+        return inventory
 
-        fake_find = MagicMock()
-        fake_find.returncode = 0
-        fake_find.stdout = "file1.jpg\nfile2.jpg"
+    service._disk_cache.get_stats.side_effect = slow_stats
+    callers = [asyncio.create_task(service.get_stats()) for _ in range(8)]
+    try:
+        async with asyncio.timeout(1):
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
+        # Cancellation of one request must not cancel the shared inventory.
+        callers[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await callers[0]
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+    results = await asyncio.gather(*callers[1:])
+    assert scans == 1
+    assert worker_threads[0] != loop_thread
+    assert all(result.disk_cover_count == 1 for result in results)
+    assert all(result.disk_cover_size_bytes == 5 for result in results)
+    stats = await service.get_stats()
+    assert scans == 1
+    assert stats.response_entries == 3
+    assert stats.response_logical_bytes == 2048
+    assert stats.database_allocated_bytes == 4096
+    assert stats.database_wal_bytes == 512
+    assert stats.total_size_bytes == 1024 + 128 + 5 + 4096 + 512
+    assert stats.memory_accounting == "shallow"
 
-        call_count = 0
 
-        async def mock_to_thread(fn, *args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return fake_du
-            return fake_find
+@pytest.mark.asyncio
+async def test_clear_during_inventory_discards_preclear_snapshot(monkeypatch, tmp_path):
+    service = _make_service()
+    service._cache.clear = AsyncMock()
+    monkeypatch.setattr("services.cache_service.get_covers_cache_dir", lambda: tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    original = service._disk_cache.get_stats.return_value
+    scans = 0
 
-        with patch("services.cache_service.get_covers_cache_dir") as mock_get_dir, \
-             patch("services.cache_service.shutil.which", return_value="/usr/bin/du"), \
-             patch("services.cache_service.asyncio.to_thread", side_effect=mock_to_thread) as mock_tt:
-            mock_dir = MagicMock()
-            mock_dir.exists.return_value = True
-            mock_dir.__str__ = lambda s: "/app/cache/covers"
-            mock_get_dir.return_value = mock_dir
+    def slow_first_stats():
+        nonlocal scans
+        scans += 1
+        if scans == 1:
+            entered.set()
+            if not release.wait(timeout=2):
+                raise TimeoutError("inventory was not released")
+        return original
 
-            stats = await svc.get_stats()
+    service._disk_cache.get_stats.side_effect = slow_first_stats
+    first = asyncio.create_task(service.get_stats())
+    try:
+        async with asyncio.timeout(1):
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
+        await service.clear_memory_cache()
+        service._cache.size.return_value = 0
+        second = asyncio.create_task(service.get_stats())
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+    before, after = await asyncio.gather(first, second)
+    assert before.memory_entries == after.memory_entries == 0
+    assert scans == 2
 
-            assert mock_tt.call_count == 2
-            assert stats.disk_cover_count == 2
-            assert stats.disk_cover_size_bytes == 12345
 
-    @pytest.mark.asyncio
-    async def test_get_stats_cached_response(self):
-        """Second call within TTL returns cached stats without subprocess."""
-        svc = _make_service()
+def test_cover_scan_does_not_follow_symlinks_and_deletes_only_cache(tmp_path):
+    covers = tmp_path / "covers"
+    covers.mkdir()
+    nested = covers / "nested"
+    nested.mkdir()
+    (nested / "cover.jpg").write_bytes(b"cover")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    protected = outside / "keep.jpg"
+    protected.write_bytes(b"keep")
+    (covers / "external").symlink_to(outside, target_is_directory=True)
 
-        with patch("services.cache_service.get_covers_cache_dir") as mock_get_dir:
-            mock_dir = MagicMock()
-            mock_dir.exists.return_value = False
-            mock_get_dir.return_value = mock_dir
+    count, _ = CacheService._scan_covers(covers, delete=True)
 
-            stats1 = await svc.get_stats()
-            stats2 = await svc.get_stats()
-
-            assert stats1 is stats2
+    assert count == 2
+    assert protected.read_bytes() == b"keep"
+    assert not (nested / "cover.jpg").exists()
+    assert CacheService._scan_covers(covers) == (0, 0)

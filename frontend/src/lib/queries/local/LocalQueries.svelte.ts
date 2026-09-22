@@ -5,6 +5,7 @@ import { api } from '$lib/api/client';
 import type {
 	CrateResponse,
 	DecadesResponse,
+	DownloadAccessResponse,
 	LocalAlbumSummary,
 	LocalPaginatedResponse,
 	LocalSearchResponse,
@@ -18,7 +19,11 @@ export const LOCAL_KEYS = {
 	suggestions: (decade: number | null) => ['local', 'suggestions', decade] as const,
 	search: (q: string) => ['local', 'search', q] as const,
 	decades: () => ['local', 'decades'] as const,
-	stats: () => ['local', 'stats'] as const
+	stats: () => ['local', 'stats'] as const,
+	// The bit is per-viewer (setting + role), so the key carries the userId to
+	// avoid leaking one user's permission to the next on a shared browser.
+	downloadAccess: (userId: string | undefined) =>
+		['local', 'download-access', userId ?? 'anonymous'] as const
 };
 
 export const getLocalRecentQuery = () =>
@@ -96,3 +101,20 @@ export const getLocalStatsQuery = (enabled: () => boolean = () => true) =>
 			queryFn: ({ signal }) => api.global.get<LocalStorageStats>(API.local.stats(), { signal })
 		})
 	);
+
+export const getDownloadAccessQueryOptions = (userId: string | undefined) =>
+	queryOptions({
+		queryKey: LOCAL_KEYS.downloadAccess(userId),
+		queryFn: ({ signal }) =>
+			api.global.get<DownloadAccessResponse>(API.download.access(), { signal }),
+		// The admin can flip the setting at any time: never serve a stale
+		// persisted bit (same reasoning as the admin user-quota query).
+		staleTime: 0,
+		refetchOnMount: 'always' as const
+	});
+
+export const getDownloadAccessQuery = (getUserId: Getter<string | undefined>) =>
+	createQuery(() => ({
+		...getDownloadAccessQueryOptions(getUserId()),
+		enabled: Boolean(getUserId())
+	}));

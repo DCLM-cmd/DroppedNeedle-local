@@ -250,15 +250,14 @@ class AudioFingerprinter:
             key = FingerprintMemo.content_key(path)
         except OSError:
             # Unreadable/ephemeral paths: skip the memo, let fpcalc surface
-            # the real failure as before.
-            fingerprint, duration = await self._run_fpcalc(path)
-            return fingerprint, duration, False
+            # the real failure as before - but still carry the tolerance
+            # flag so a partial decode is never silently laundered to full.
+            fingerprint, duration, partial = await self._run_fpcalc(path)
+            return fingerprint, duration, partial
         cached = fingerprint_memo.get(key)
         if cached is not None:
             return cached
-        fingerprint, duration = await self._run_fpcalc(path)
-        partial = getattr(self, "_last_generation_partial", False)
-        self._last_generation_partial = False
+        fingerprint, duration, partial = await self._run_fpcalc(path)
         fingerprint_memo.put(key, (fingerprint, duration, partial))
         return fingerprint, duration, partial
 
@@ -372,7 +371,14 @@ class AudioFingerprinter:
             )
         return response.json()
 
-    async def _run_fpcalc(self, path: Path) -> tuple[str, int]:
+    async def generate_tracked(self, path: Path) -> tuple[str, int, bool]:
+        """Public tracked generation: fingerprint, duration, and the fpcalc
+        tolerance flag (True when the fingerprint came from a tolerated
+        PARTIAL decode). Cross-module callers use this, never the private
+        ``_generate_tracked`` alias below."""
+        return await self._generate_tracked(path)
+
+    async def _run_fpcalc(self, path: Path) -> tuple[str, int, bool]:
         async with self._fpcalc_semaphore:
             # NOT ``-raw``: AcoustID's /v2/lookup expects the COMPRESSED (base64) Chromaprint
             # fingerprint that plain fpcalc emits. ``-raw`` emits comma-separated integers,
@@ -414,9 +420,14 @@ class AudioFingerprinter:
                     stderr_text or "<empty>",
                 )
                 # F-044: mark the result chain so confident matches from a
-                # PARTIAL decode can be corroborated downstream.
-                self._last_generation_partial = True
-            return self._parse_fpcalc_output(output)
+                # PARTIAL decode can be corroborated downstream. Returned
+                # per-call (never instance state) so concurrent fpcalc runs
+                # cannot steal or lose each other's flag.
+                partial = True
+            else:
+                partial = False
+            fingerprint, duration = self._parse_fpcalc_output(output)
+            return fingerprint, duration, partial
 
     @staticmethod
     def _parse_fpcalc_output(output: str) -> tuple[str, int]:

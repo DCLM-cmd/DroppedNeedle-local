@@ -2,15 +2,17 @@
 	import { Play } from 'lucide-svelte';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { buildDiscoveryQueueFromLocal } from '$lib/player/queueHelpers';
-	import { formatDurationSec } from '$lib/utils/formatting';
+	import { formatBytes, formatDurationSec } from '$lib/utils/formatting';
 	import type { NativeTrackListItem } from '$lib/types';
 	import { artistHref } from '$lib/utils/entityRoutes';
+	import ContextMenu, { type MenuItem } from '$lib/components/ContextMenu.svelte';
 
 	interface Props {
 		tracks: NativeTrackListItem[];
+		getTrackMenuItems?: (track: NativeTrackListItem) => MenuItem[];
 	}
 
-	let { tracks }: Props = $props();
+	let { tracks, getTrackMenuItems }: Props = $props();
 </script>
 
 <ol
@@ -40,6 +42,14 @@
 			<span class="text-xs tabular-nums text-base-content/45"
 				>{formatDurationSec(track.duration_seconds)}</span
 			>
+			<span class="w-16 shrink-0 text-right text-xs tabular-nums text-base-content/40"
+				>{track.file_size_bytes > 0 ? formatBytes(track.file_size_bytes) : '—'}</span
+			>
+			{#if getTrackMenuItems}
+				<div>
+					<ContextMenu items={getTrackMenuItems(track)} position="end" size="xs" />
+				</div>
+			{/if}
 		</li>
 	{/each}
 </ol>

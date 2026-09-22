@@ -55,6 +55,8 @@ class LibraryAlbumSummary(AppStruct):
     quality_format: str | None = None
     year: int | None = None
     is_compilation: bool = False
+    release_type: str | None = None
+    total_duration_seconds: float | None = None
     cover_url: str | None = None
     last_imported_at: float | None = None
     album_artist_mbid: str | None = None
@@ -712,6 +714,7 @@ class LibraryManager:
             "release_group_mbid": release_group_mbid,
             "release_mbid": release_mbid,
             "recording_mbid": recording_mbid,
+            "embedded_release_mbid": tag.musicbrainz_release_id,
             "disc_number": tag.disc_number,
             "track_number": tag.track_number,
             "track_title": tag.title,
@@ -728,6 +731,7 @@ class LibraryManager:
             "album_sort_name": tag.album_sort,
             "album_artist_sort_name": tag.album_artist_sort,
             "disc_subtitle": tag.disc_subtitle,
+            "release_type": tag.release_type,
             "original_release_date": tag.original_release_date,
             "replaygain_track_gain": tag.replaygain_track_gain,
             "replaygain_album_gain": tag.replaygain_album_gain,
@@ -772,6 +776,12 @@ class LibraryManager:
             quality_format=row.get("file_format"),
             year=row.get("year"),
             is_compilation=bool(row.get("is_compilation")),
+            release_type=row.get("release_type"),
+            total_duration_seconds=(
+                float(row["total_duration_seconds"])
+                if row.get("total_duration_seconds")
+                else None
+            ),
             cover_url=row.get("cover_url"),
             last_imported_at=row.get("last_imported_at"),
             album_artist_mbid=row.get("album_artist_mbid"),

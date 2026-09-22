@@ -40,6 +40,7 @@ from core.exceptions import (
     SubsonicError,
 )
 from infrastructure.msgspec_fastapi import MsgSpecRoute
+from infrastructure.observability.provider_counters import route_scope
 
 logger = logging.getLogger(__name__)
 
@@ -275,7 +276,10 @@ async def _dispatch(
             services=services,
             transcode_hint=_transcode_hint(settings),
         )
-        return await handler(ctx)
+        # Override the MsgSpecRoute stamp with the normalized endpoint name
+        # (casefolded, single .view suffix stripped).
+        with route_scope(f"subsonic:{name}"):
+            return await handler(ctx)
     except Exception as exc:  # noqa: BLE001 - boundary: nothing reaches global handlers
         if not isinstance(exc, DroppedNeedleException):
             logger.exception("Unhandled error in Subsonic endpoint %s", name)
@@ -345,6 +349,7 @@ async def _extensions(c: Ctx) -> Response:
         m.SOpenSubsonicExtension(name="apiKeyAuthentication", versions=[1]),
         m.SOpenSubsonicExtension(name="formPost", versions=[1]),
         m.SOpenSubsonicExtension(name="transcodeOffset", versions=[1]),
+        m.SOpenSubsonicExtension(name="transcoding", versions=[1]),
     ]
     return c.render("openSubsonicExtensions", exts)
 
@@ -802,47 +807,69 @@ async def _serve_file(
             media_type=headers.get("Content-Type", "application/octet-stream"),
             background=BackgroundTask(lease.release),
         )
-    except BaseException:
+    except BaseException:  # noqa: BLE001 - lease must release on any failure before re-raise
         await lease.release()
         raise
 
 
+async def _plugin_stream_fallback(c: Ctx, mbid: str, *, requested_format: str | None, max_bitrate: int | None, start_seconds: float, force_original: bool, estimate: bool) -> Response | None:
+    user_id = getattr(getattr(c, "user", None), "id", None)
+    if not user_id or not isinstance(user_id, str):
+        return None
+    if not mbid or not isinstance(mbid, str):
+        return None
+    try:
+        from services.compat.plugin_stream_service import get_plugin_stream_service, stream_plugin_ref_response
+    except Exception:  # noqa: BLE001 - missing plugin service falls back to local stream
+        return None
+    try:
+        svc = get_plugin_stream_service()
+        ref = await svc.resolve(str(mbid), str(user_id))
+    except Exception:  # noqa: BLE001 - plugin resolve failure falls back to local stream
+        return None
+    if ref is None:
+        return None
+    try:
+        settings = c.services.preferences.get_connect_apps_settings()
+    except Exception:  # noqa: BLE001 - settings read failure falls back to local stream
+        return None
+    try:
+        return await stream_plugin_ref_response(service=svc, ref=ref, recording_mbid=str(mbid), user_id=str(user_id), requested_format=requested_format, max_bitrate_kbps=max_bitrate, force_original=force_original, start_seconds=start_seconds, settings=settings, concurrency=c.services.stream_concurrency, transcode=c.services.transcode, range_header=c.request.headers.get("Range"), is_disconnected=c.request.is_disconnected, estimate=estimate)
+    except Exception:  # noqa: BLE001 - plugin stream failure falls back to local handling
+        return None
+
+
 @endpoint("stream")
 async def _stream(c: Ctx) -> Response:
+    from core.exceptions import ResourceNotFoundError
     from services.compat.stream_concurrency import StreamCapacityError
     from services.compat.transcode_service import decide, ffmpeg_available
-
     fid = _decode_expect(c.p("id") or "", "track")
     fmt = c.decoded.enum("format", {"raw", "mp3", "opus"})
     max_bitrate = c.pint("maxBitRate", minimum=0, maximum=1_000_000)
     time_offset = c.pfloat("timeOffset", 0.0, minimum=0, maximum=604_800) or 0.0
     estimate = c.pbool("estimateContentLength", False)
-    if fmt == "raw":  # force original, skip the track lookup
-        return await _serve_file(c, fid)
+    if fmt == "raw":
+        try:
+            return await _serve_file(c, fid)
+        except ResourceNotFoundError:
+            plugin_resp = await _plugin_stream_fallback(c, fid, requested_format=None, max_bitrate=max_bitrate, start_seconds=0.0, force_original=True, estimate=estimate)
+            if plugin_resp is not None:
+                return plugin_resp
+            raise
     track = await c.services.view.get_track(fid)
     if track is None:
+        plugin_resp = await _plugin_stream_fallback(c, fid, requested_format=fmt, max_bitrate=max_bitrate, start_seconds=time_offset, force_original=False, estimate=estimate)
+        if plugin_resp is not None:
+            return plugin_resp
         raise SubsonicError(70, "Song not found")
     settings = c.services.preferences.get_connect_apps_settings()
-    plan = decide(
-        track,
-        requested_format=fmt,
-        max_bitrate_kbps=max_bitrate,
-        force_original=False,
-        start_seconds=time_offset,
-        settings=settings,
-        ffmpeg_available=ffmpeg_available(),
-    )
+    plan = decide(track, requested_format=fmt, max_bitrate_kbps=max_bitrate, force_original=False, start_seconds=time_offset, settings=settings, ffmpeg_available=ffmpeg_available())
     if not plan.transcode:
         return await _serve_file(c, fid)
     path = await c.services.local_files.resolve_validated_path(fid)
     try:
-        return await c.services.transcode.stream(
-            str(path),
-            plan,
-            principal=c.user.id,
-            is_disconnected=c.request.is_disconnected,
-            estimate=estimate,
-        )
+        return await c.services.transcode.stream(str(path), plan, principal=c.user.id, is_disconnected=c.request.is_disconnected, estimate=estimate)
     except StreamCapacityError:
         return Response(status_code=429, headers={"Retry-After": "1"})
 
@@ -852,6 +879,19 @@ async def _download(c: Ctx) -> Response:
     fid = _decode_expect(c.p("id") or "", "track")
     track = await c.services.view.get_track(fid, user=c.user)
     if track is None:
+        # Local miss: same plugin-stream fallback as _stream (original bytes),
+        # and the same 70 mapping when no plugin claims the track.
+        plugin_resp = await _plugin_stream_fallback(
+            c,
+            fid,
+            requested_format=None,
+            max_bitrate=None,
+            start_seconds=0.0,
+            force_original=True,
+            estimate=False,
+        )
+        if plugin_resp is not None:
+            return plugin_resp
         raise SubsonicError(70, "Song not found")
     suffix = re.sub(r"[^a-z0-9]", "", (track.file_format or "").lower()) or "bin"
     stem = re.sub(r"[^A-Za-z0-9._ -]", "_", track.title).strip(" .") or "track"

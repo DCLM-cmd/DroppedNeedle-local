@@ -125,3 +125,56 @@ def test_indexer_create_over_wire_encrypts_and_masks(tmp_path):
     listed = client.get("/indexers")
     assert listed.json()[0]["api_key"] == INDEXER_API_KEY_MASK
     assert _REAL_KEY not in listed.text
+
+
+# --- Prowlarr key - the single-section masking case ----------------------------
+
+
+def _prowlarr_app(prefs: PreferencesService) -> FastAPI:
+    from api.v1.routes import prowlarr
+
+    app = FastAPI()
+    app.include_router(prowlarr.router)
+    app.dependency_overrides[get_preferences_service] = lambda: prefs
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    return app
+
+
+def test_prowlarr_config_masks_key_and_never_leaks_plaintext(tmp_path):
+    from api.v1.schemas.settings import PROWLARR_API_KEY_MASK, ProwlarrConnectionSettings
+
+    prefs = _prefs(tmp_path)
+    prefs.save_prowlarr_connection(
+        ProwlarrConnectionSettings(
+            enabled=True, url="http://prowlarr:9696", api_key=_REAL_KEY
+        )
+    )
+    response = build_test_client(_prowlarr_app(prefs)).get("/prowlarr/config")
+    assert response.status_code == 200
+    assert response.json()["api_key"] == PROWLARR_API_KEY_MASK
+    assert _REAL_KEY not in response.text
+
+
+def test_prowlarr_masked_put_preserves_key(tmp_path):
+    from api.v1.schemas.settings import PROWLARR_API_KEY_MASK, ProwlarrConnectionSettings
+
+    prefs = _prefs(tmp_path)
+    prefs.save_prowlarr_connection(
+        ProwlarrConnectionSettings(
+            enabled=True, url="http://prowlarr:9696", api_key=_REAL_KEY
+        )
+    )
+    client = build_test_client(_prowlarr_app(prefs))
+    updated = client.put(
+        "/prowlarr/config",
+        json={
+            "enabled": False,
+            "url": "http://prowlarr:9696",
+            "api_key": PROWLARR_API_KEY_MASK,
+        },
+    )
+    assert updated.status_code == 200
+    raw = prefs.get_prowlarr_connection_raw()
+    assert raw.api_key == _REAL_KEY  # preserved
+    assert raw.enabled is False  # updated
+    assert _REAL_KEY not in updated.text

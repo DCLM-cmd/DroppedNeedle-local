@@ -8,6 +8,7 @@
  * humanizer instead of breaking the panel.
  */
 import type { ProviderStatsRow, QueueStatsRow } from '$lib/queries/diagnostics/types';
+import { formatBytes } from '$lib/utils/formatting';
 
 export const PROVIDER_LABELS: Readonly<Record<string, string>> = {
 	musicbrainz: 'MusicBrainz',
@@ -103,6 +104,13 @@ export function buildQueueLanes(stats: QueueStatsRow): QueueLaneView[] {
 }
 
 export interface ProviderRowView {
+	key: string;
+	workloadText: string;
+	profileText: string;
+	sourceText: string;
+	downloadedText: string;
+	decodedText: string;
+	unknownBodyAttempts: number;
 	lane: string;
 	outcome: string;
 	laneText: string;
@@ -140,6 +148,28 @@ export function groupProviderRows(rows: readonly ProviderStatsRow[]): ProviderGr
 			byProvider[row.provider] = group;
 		}
 		group.rows.push({
+			key: JSON.stringify([
+				row.provider,
+				row.priority,
+				row.outcome,
+				row.source_mode,
+				row.source_id,
+				row.source_generation,
+				row.request_category,
+				row.include_profile,
+				row.workload,
+				row.overflow
+			]),
+			workloadText: humanizeWireValue(row.workload ?? 'other'),
+			profileText: `${row.request_category ?? 'other'} / ${row.include_profile ?? 'other'}`,
+			sourceText: row.overflow
+				? 'Mixed overflow'
+				: row.source_mode
+					? `${row.source_mode} / ${row.source_generation}`
+					: '',
+			downloadedText: formatBytes(row.downloaded_body_bytes_total ?? 0),
+			decodedText: formatBytes(row.decoded_body_bytes_total ?? 0),
+			unknownBodyAttempts: row.unknown_body_attempts_total ?? 0,
 			lane: row.priority,
 			outcome: row.outcome,
 			laneText: laneLabel(row.priority),
