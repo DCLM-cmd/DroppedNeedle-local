@@ -300,6 +300,22 @@ async def test_legacy_check_migration_preserves_rows_and_admits_resolved(
     assert record.row_revision == 2
     journals = await store.list_library_management_import_journals("bundle-1")
     assert [journal.state for journal in journals] == ["needs_attention"]
+
+    # Regression: the resolved-state rebuild once recreated the bundles table
+    # without the fork's acknowledged_at column, so recovery diagnostics
+    # crashed with "no such column: acknowledged_at" (the "Recovery Status is
+    # unavailable" prod failure). The rebuild must carry the column through.
+    with sqlite3.connect(db_path) as connection:
+        bundle_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(library_management_import_bundles)"
+            )
+        }
+    assert "acknowledged_at" in bundle_columns
+    diagnostics = await store.library_management_recovery_diagnostics()
+    assert diagnostics["needs_attention_count"] == 1
+
     resolved = await store.resolve_library_management_import_bundle(
         "bundle-1", updated_at=3.0
     )

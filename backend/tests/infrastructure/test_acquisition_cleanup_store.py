@@ -350,3 +350,55 @@ async def test_cleanup_debt_query_blocks_until_every_owned_row_completes(
     assert not await store.has_download_cleanup_debt(
         source="usenet", task_id="f" * 32, job_name=f"droppedneedle-{'f' * 32}-0"
     )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_debt_ignores_legacy_unknown_task_marker(tmp_path: Path):
+    # The orphan reconciler stamps a needs_attention row with error_code
+    # legacy_unknown_task when the owning task was already pruned. Its ownership
+    # claim is vacuous, so it must not permanently block the reconciler from
+    # ever reclaiming the folder (the prod source-cleanup wedge).
+    store = _store(tmp_path)
+    task_id = "c" * 32
+    job_name = f"droppedneedle-{task_id}-0"
+    await store.ensure_legacy_download_attempt(
+        attempt_id="attempt-legacy",
+        task_id=task_id,
+        candidate_index=0,
+        job_name=job_name,
+        mount_root="/storage/downloads/usenet/music",
+        workspace_path=f"/storage/downloads/usenet/music/{job_name}",
+        state="needs_attention",
+        disposition="preserve",
+        error_code="legacy_unknown_task",
+        now=1.0,
+    )
+
+    # Without the ignore it reads as live debt and blocks reconciliation forever.
+    assert await store.has_download_cleanup_debt(
+        source="usenet", task_id=task_id, job_name=job_name
+    )
+    # Ignoring the marker lets the reconciler's own safety gate decide the folder.
+    assert not await store.has_download_cleanup_debt(
+        source="usenet",
+        task_id=task_id,
+        job_name=job_name,
+        ignore_error_codes=("legacy_unknown_task",),
+    )
+
+    # A real non-terminal row under the same task is never ignored away.
+    live = await store.create_download_attempt(
+        task_id=task_id,
+        source="usenet",
+        candidate_index=1,
+        job_name=f"droppedneedle-{task_id}-1",
+        handle=TaskHandle(source="usenet", job_name=f"droppedneedle-{task_id}-1"),
+        now=2.0,
+    )
+    assert live.error_code is None
+    assert await store.has_download_cleanup_debt(
+        source="usenet",
+        task_id=task_id,
+        job_name=job_name,
+        ignore_error_codes=("legacy_unknown_task",),
+    )
