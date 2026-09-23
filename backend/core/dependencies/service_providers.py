@@ -2976,6 +2976,7 @@ def get_download_manifest_codec() -> "ManifestCodec":
 def get_acquisition_cleanup_service() -> "AcquisitionCleanupService":
     from pathlib import Path
 
+    from core.config import get_settings
     from services.native.acquisition_cleanup_service import AcquisitionCleanupService
 
     from .cache_providers import get_native_library_store
@@ -3001,6 +3002,7 @@ def get_acquisition_cleanup_service() -> "AcquisitionCleanupService":
         sab_category_getter=lambda: (
             get_preferences_service().get_sabnzbd_connection_raw().category
         ),
+        slskd_mount_getter=lambda: Path(get_settings().slskd_downloads_path),
     )
 
 

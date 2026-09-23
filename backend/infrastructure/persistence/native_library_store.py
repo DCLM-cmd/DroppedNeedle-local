@@ -26040,6 +26040,42 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def committed_import_source_fingerprints(
+        self, fingerprints: Iterable[str]
+    ) -> set[str]:
+        """Return the subset of ``fingerprints`` a committed import journal owns.
+
+        A ``source_fingerprint`` recorded on a journal row that reached a
+        catalog-committed state (``catalog_committed``/``cleanup_pending``/
+        ``completed``) proves a byte-identical file was imported into the library
+        and the catalog kept it. An untracked download copy carrying that exact
+        content is therefore redundant debris that the slskd orphan reconciler may
+        remove. Rolled-back or still-in-flight rows never count, so a download that
+        was never successfully imported can never match. Fail-closed by design: an
+        unknown fingerprint is simply absent from the result.
+        """
+        unique = {value for value in fingerprints if value}
+        if not unique:
+            return set()
+
+        def operation(connection: sqlite3.Connection) -> set[str]:
+            found: set[str] = set()
+            ordered = list(unique)
+            for start in range(0, len(ordered), 500):
+                chunk = ordered[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    "SELECT DISTINCT source_fingerprint "
+                    "FROM library_management_import_journal "
+                    "WHERE state IN ('catalog_committed','cleanup_pending','completed') "
+                    f"AND source_fingerprint IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchall()
+                found.update(str(row[0]) for row in rows)
+            return found
+
+        return await self._read(operation)
+
     async def set_library_management_import_baseline(
         self,
         bundle_id: str,

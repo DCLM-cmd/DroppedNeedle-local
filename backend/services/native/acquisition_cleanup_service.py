@@ -11,6 +11,7 @@ import stat
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 import msgspec
 
@@ -55,6 +56,21 @@ _RECONCILE_INTERVAL_SECONDS = 6 * 3600.0
 ORPHAN_MIN_AGE_SECONDS = 6 * 3600
 
 
+class SlskdOrphanReconcileResult(NamedTuple):
+    """Outcome of one verified slskd orphan sweep.
+
+    ``removed`` are folders deleted (or, in dry-run, the folders that would be).
+    ``kept`` pairs a folder path with why it survived (unimported audio still
+    inside, or something too recently modified to be safe). ``scanned_folders``
+    counts every directory that held audio, so callers can gauge coverage.
+    """
+
+    removed: list[str]
+    kept: list[tuple[str, str]]
+    scanned_folders: int
+    dry_run: bool
+
+
 class _RetryableCleanup(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -78,6 +94,7 @@ class AcquisitionCleanupService:
         sab_mount_getter: Callable[[], Path],
         *,
         sab_category_getter: Callable[[], str] = lambda: "*",
+        slskd_mount_getter: Callable[[], Path] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._store = download_store
@@ -85,6 +102,7 @@ class AcquisitionCleanupService:
         self._client_getter = client_getter
         self._sab_mount_getter = sab_mount_getter
         self._sab_category_getter = sab_category_getter
+        self._slskd_mount_getter = slskd_mount_getter
         self._clock = clock
 
     async def run_once(self, worker_id: str) -> int:
@@ -765,6 +783,120 @@ class AcquisitionCleanupService:
         )
         return True
 
+    async def reconcile_slskd_orphans(
+        self, *, dry_run: bool = False
+    ) -> SlskdOrphanReconcileResult:
+        """Delete slskd download folders whose every track is already in the library.
+
+        slskd names its download folders after the peer, not after a DroppedNeedle
+        job, so the DN-name orphan reconciler never touches them and a completed
+        download whose import row was pruned lingers forever. This sweep verifies
+        by content instead of by name: it hashes every audio file under the slskd
+        downloads mount and only removes a folder once *every* track it contains
+        (at any depth) matches the ``source_fingerprint`` of a committed import
+        journal - proof a byte-identical file was imported and the catalog kept it.
+
+        Fail-closed throughout: a single unhashable, too-new, or unmatched track
+        keeps its whole folder, an unhealthy or unsafe mount is skipped, and
+        ``dry_run`` computes the same verdicts without deleting anything.
+        """
+        if self._slskd_mount_getter is None:
+            return SlskdOrphanReconcileResult([], [], 0, dry_run)
+        mount = self._slskd_mount_getter()
+        if not mount.is_absolute() or mount == Path(mount.anchor):
+            logger.warning("Skipped slskd orphan reconciliation for unsafe mount")
+            return SlskdOrphanReconcileResult([], [], 0, dry_run)
+        if not await asyncio.to_thread(_mount_healthy, mount):
+            return SlskdOrphanReconcileResult([], [], 0, dry_run)
+
+        audio_by_dir, subdirs_by_dir = await asyncio.to_thread(
+            _collect_slskd_audio_tree, mount
+        )
+        all_fingerprints = {
+            digest
+            for audios in audio_by_dir.values()
+            for _path, digest, _mtime in audios
+            if digest is not None
+        }
+        committed = await self._library_store.committed_import_source_fingerprints(
+            all_fingerprints
+        )
+
+        now = self._clock()
+        mount_key = str(mount)
+        fully: dict[str, bool] = {}
+        kept: list[tuple[str, str]] = []
+        scanned = 0
+
+        def evaluate(directory: str) -> bool:
+            """Post-order: True when the directory's whole subtree is removable."""
+            nonlocal scanned
+            audios = audio_by_dir.get(directory, [])
+            subtree_has_audio = False
+            removable = True
+            if audios:
+                scanned += 1
+                reason: str | None = None
+                for _path, digest, mtime in audios:
+                    subtree_has_audio = True
+                    if digest is None or digest not in committed:
+                        removable = False
+                        reason = "unimported_audio"
+                    elif now - mtime < ORPHAN_MIN_AGE_SECONDS:
+                        removable = False
+                        reason = reason or "recently_modified"
+                if reason is not None:
+                    kept.append((directory, reason))
+            for child in subdirs_by_dir.get(directory, []):
+                child_removable = evaluate(child)
+                child_has_audio = fully.get(child) is not None
+                if child_has_audio:
+                    subtree_has_audio = True
+                if child_has_audio and not child_removable:
+                    removable = False
+            result = subtree_has_audio and removable
+            if subtree_has_audio:
+                fully[directory] = result
+            return result
+
+        evaluate(mount_key)
+
+        def parent_of(path: str) -> str:
+            return str(Path(path).parent)
+
+        # Remove the top-most fully-removable folder in each branch, but never the
+        # mount itself; a child of a fully-removable mount is still removed on its
+        # own so the mount directory survives empty.
+        to_remove = [
+            path
+            for path, is_full in fully.items()
+            if is_full
+            and path != mount_key
+            and (
+                parent_of(path) == mount_key or not fully.get(parent_of(path), False)
+            )
+        ]
+        to_remove.sort()
+
+        removed: list[str] = []
+        for path in to_remove:
+            if dry_run:
+                removed.append(path)
+                continue
+            try:
+                await asyncio.to_thread(_remove_workspace_safely, mount, Path(path))
+            except (OSError, _UnsafeCleanup) as error:
+                logger.warning(
+                    "slskd orphan reconcile could not remove %s: %s", path, error
+                )
+                continue
+            logger.info(
+                "slskd orphan reconcile removed %s (verified imported)", path
+            )
+            removed.append(path)
+
+        return SlskdOrphanReconcileResult(removed, kept, scanned, dry_run)
+
     async def reconcile_legacy_mount(
         self, *, limit: int = _RECONCILIATION_BATCH
     ) -> int:
@@ -1245,3 +1377,87 @@ def _directory_entries(path: Path) -> list[tuple[str, bool, bool]]:
         logger.debug("Acquisition cleanup directory vanished: %s", path)
         return []
     return sorted(result, key=lambda value: value[0])
+
+
+# Audio containers a completed music download can leave behind. Non-audio sidecars
+# (cover art, .nfo, .cue, .m3u) never gate a folder: once every track is verified
+# imported they are debris and ride the folder's removal.
+_AUDIO_SUFFIXES = frozenset(
+    {
+        ".flac",
+        ".mp3",
+        ".m4a",
+        ".m4b",
+        ".aac",
+        ".ogg",
+        ".oga",
+        ".opus",
+        ".wav",
+        ".aiff",
+        ".aif",
+        ".aifc",
+        ".wma",
+        ".alac",
+        ".ape",
+        ".wv",
+        ".mpc",
+        ".dsf",
+        ".dff",
+        ".shn",
+    }
+)
+
+
+def _is_audio(name: str) -> bool:
+    dot = name.rfind(".")
+    return dot > 0 and name[dot:].lower() in _AUDIO_SUFFIXES
+
+
+def _collect_slskd_audio_tree(
+    mount: Path,
+) -> tuple[
+    dict[str, list[tuple[str, str | None, float]]],
+    dict[str, list[str]],
+]:
+    """Walk ``mount`` once, returning per-directory audio files and subdirectories.
+
+    Each audio entry is ``(absolute_path, sha256_or_None, mtime)``: the digest is
+    ``None`` when the file could not be safely hashed (symlink, non-regular, or
+    vanished mid-walk), which fail-closed keeps its folder. Symlinked directories
+    are never descended and the walk is bounded so a pathological tree can't stall
+    the sweep.
+    """
+
+    audio_by_dir: dict[str, list[tuple[str, str | None, float]]] = {}
+    subdirs_by_dir: dict[str, list[str]] = {}
+    budget = [_MAX_TREE_ENTRIES]
+
+    def walk(directory: Path) -> None:
+        subdirs: list[str] = []
+        audios: list[tuple[str, str | None, float]] = []
+        for name, is_directory, is_symlink in _directory_entries(directory):
+            if budget[0] <= 0:
+                break
+            budget[0] -= 1
+            child = directory / name
+            if is_symlink:
+                continue
+            if is_directory:
+                subdirs.append(str(child))
+                walk(child)
+            elif _is_audio(name):
+                try:
+                    mtime = child.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    audios.append((str(child), None, 0.0))
+                    continue
+                try:
+                    digest = _fingerprint_file_safely(mount, child)
+                except (_UnsafeCleanup, OSError):
+                    digest = None
+                audios.append((str(child), digest, mtime))
+        subdirs_by_dir[str(directory)] = subdirs
+        audio_by_dir[str(directory)] = audios
+
+    walk(mount)
+    return audio_by_dir, subdirs_by_dir
