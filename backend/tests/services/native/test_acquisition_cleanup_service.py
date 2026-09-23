@@ -1410,3 +1410,63 @@ async def test_slskd_reconcile_noop_without_mount_getter(tmp_path: Path):
     result = await service.reconcile_slskd_orphans()
 
     assert result == ([], [], 0, False)
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_prunes_old_empty_folder(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    empty = mount / "Leftover Skeleton"
+    empty.mkdir(parents=True)
+    _age_folder(empty)
+    service = _slskd_service(_store(tmp_path), _LibraryStore(), mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == [str(empty)]
+    assert not empty.exists()
+    assert mount.exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_keeps_fresh_empty_folder(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    empty = mount / "In Progress"
+    empty.mkdir(parents=True)  # fresh mtime: could be a download about to land
+    service = _slskd_service(_store(tmp_path), _LibraryStore(), mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == []
+    assert empty.exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_keeps_folder_with_only_non_audio(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    folder = mount / "Just Artwork"
+    folder.mkdir(parents=True)
+    (folder / "cover.jpg").write_bytes(b"art")
+    _age_folder(folder / "cover.jpg")
+    _age_folder(folder)
+    service = _slskd_service(_store(tmp_path), _LibraryStore(), mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == []
+    assert folder.exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_prunes_nested_empty_tree(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    nested = mount / "Peer" / "Album" / "Disc 1"
+    nested.mkdir(parents=True)
+    for path in (nested, nested.parent, nested.parent.parent):
+        _age_folder(path)
+    service = _slskd_service(_store(tmp_path), _LibraryStore(), mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    # The whole empty branch collapses to a single top-level removal.
+    assert result.removed == [str(mount / "Peer")]
+    assert not (mount / "Peer").exists()

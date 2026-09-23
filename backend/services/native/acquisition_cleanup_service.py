@@ -792,13 +792,19 @@ class AcquisitionCleanupService:
         job, so the DN-name orphan reconciler never touches them and a completed
         download whose import row was pruned lingers forever. This sweep verifies
         by content instead of by name: it hashes every audio file under the slskd
-        downloads mount and only removes a folder once *every* track it contains
-        (at any depth) matches the ``source_fingerprint`` of a committed import
-        journal - proof a byte-identical file was imported and the catalog kept it.
+        downloads mount and removes a folder once *every* track it contains (at any
+        depth) matches the ``source_fingerprint`` of a committed import journal -
+        proof a byte-identical file was imported and the catalog kept it. Old,
+        wholly empty leftover directories (a completed transfer's skeleton) are
+        pruned too. Non-audio sidecars (cover art, ``.nfo``) ride along with a
+        verified folder but, on their own, keep a folder alive.
 
         Fail-closed throughout: a single unhashable, too-new, or unmatched track
-        keeps its whole folder, an unhealthy or unsafe mount is skipped, and
-        ``dry_run`` computes the same verdicts without deleting anything.
+        keeps its whole folder; a stray non-audio file keeps an otherwise-empty
+        folder; the age floor protects in-flight downloads; symlinks are never
+        followed; the mount root itself is never removed; an unhealthy or unsafe
+        mount is skipped; and ``dry_run`` computes the same verdicts without
+        deleting anything.
         """
         if self._slskd_mount_getter is None:
             return SlskdOrphanReconcileResult([], [], 0, dry_run)
@@ -809,7 +815,7 @@ class AcquisitionCleanupService:
         if not await asyncio.to_thread(_mount_healthy, mount):
             return SlskdOrphanReconcileResult([], [], 0, dry_run)
 
-        audio_by_dir, subdirs_by_dir = await asyncio.to_thread(
+        audio_by_dir, subdirs_by_dir, meta_by_dir = await asyncio.to_thread(
             _collect_slskd_audio_tree, mount
         )
         all_fingerprints = {
@@ -824,7 +830,9 @@ class AcquisitionCleanupService:
 
         now = self._clock()
         mount_key = str(mount)
-        fully: dict[str, bool] = {}
+        removable_map: dict[str, bool] = {}
+        has_audio_map: dict[str, bool] = {}
+        has_file_map: dict[str, bool] = {}
         kept: list[tuple[str, str]] = []
         scanned = 0
 
@@ -832,48 +840,65 @@ class AcquisitionCleanupService:
             """Post-order: True when the directory's whole subtree is removable."""
             nonlocal scanned
             audios = audio_by_dir.get(directory, [])
-            subtree_has_audio = False
-            removable = True
+            has_non_audio, dir_mtime = meta_by_dir.get(directory, (False, now))
+
+            direct_audio_ok = True
+            reason: str | None = None
             if audios:
                 scanned += 1
-                reason: str | None = None
                 for _path, digest, mtime in audios:
-                    subtree_has_audio = True
                     if digest is None or digest not in committed:
-                        removable = False
+                        direct_audio_ok = False
                         reason = "unimported_audio"
                     elif now - mtime < ORPHAN_MIN_AGE_SECONDS:
-                        removable = False
+                        direct_audio_ok = False
                         reason = reason or "recently_modified"
-                if reason is not None:
-                    kept.append((directory, reason))
+
+            has_audio = bool(audios)
+            has_file = bool(audios) or has_non_audio
+            children_removable = True
             for child in subdirs_by_dir.get(directory, []):
                 child_removable = evaluate(child)
-                child_has_audio = fully.get(child) is not None
-                if child_has_audio:
-                    subtree_has_audio = True
-                if child_has_audio and not child_removable:
-                    removable = False
-            result = subtree_has_audio and removable
-            if subtree_has_audio:
-                fully[directory] = result
-            return result
+                has_audio = has_audio or has_audio_map.get(child, False)
+                has_file = has_file or has_file_map.get(child, False)
+                if not child_removable:
+                    children_removable = False
+
+            if has_audio:
+                # Verified-audio folder: sidecars ride along; a bad track keeps it.
+                removable = children_removable and direct_audio_ok
+                if reason is not None:
+                    kept.append((directory, reason))
+            elif has_file:
+                # Only stray non-audio files: never our debris to delete.
+                removable = False
+            else:
+                # Wholly empty subtree: prune once past the in-flight age floor.
+                removable = children_removable and (
+                    now - dir_mtime >= ORPHAN_MIN_AGE_SECONDS
+                )
+
+            removable_map[directory] = removable
+            has_audio_map[directory] = has_audio
+            has_file_map[directory] = has_file
+            return removable
 
         evaluate(mount_key)
 
         def parent_of(path: str) -> str:
             return str(Path(path).parent)
 
-        # Remove the top-most fully-removable folder in each branch, but never the
-        # mount itself; a child of a fully-removable mount is still removed on its
-        # own so the mount directory survives empty.
+        # Remove the top-most removable folder in each branch, but never the mount
+        # itself; a child of a removable mount is still removed on its own so the
+        # mount directory survives.
         to_remove = [
             path
-            for path, is_full in fully.items()
-            if is_full
+            for path, is_removable in removable_map.items()
+            if is_removable
             and path != mount_key
             and (
-                parent_of(path) == mount_key or not fully.get(parent_of(path), False)
+                parent_of(path) == mount_key
+                or not removable_map.get(parent_of(path), False)
             )
         ]
         to_remove.sort()
@@ -891,7 +916,9 @@ class AcquisitionCleanupService:
                 )
                 continue
             logger.info(
-                "slskd orphan reconcile removed %s (verified imported)", path
+                "slskd orphan reconcile removed %s (%s)",
+                path,
+                "verified imported" if has_audio_map.get(path) else "empty leftover",
             )
             removed.append(path)
 
@@ -1418,29 +1445,37 @@ def _collect_slskd_audio_tree(
 ) -> tuple[
     dict[str, list[tuple[str, str | None, float]]],
     dict[str, list[str]],
+    dict[str, tuple[bool, float]],
 ]:
-    """Walk ``mount`` once, returning per-directory audio files and subdirectories.
+    """Walk ``mount`` once, returning per-directory audio files, subdirectories, and
+    per-directory ``(has_non_audio_file, mtime)`` metadata.
 
     Each audio entry is ``(absolute_path, sha256_or_None, mtime)``: the digest is
     ``None`` when the file could not be safely hashed (symlink, non-regular, or
-    vanished mid-walk), which fail-closed keeps its folder. Symlinked directories
-    are never descended and the walk is bounded so a pathological tree can't stall
-    the sweep.
+    vanished mid-walk), which fail-closed keeps its folder. A directory that holds
+    any non-audio file (or a symlink of any kind) is flagged so the reconciler
+    never treats it as empty debris. Symlinked directories are never descended and
+    the walk is bounded so a pathological tree can't stall the sweep.
     """
 
     audio_by_dir: dict[str, list[tuple[str, str | None, float]]] = {}
     subdirs_by_dir: dict[str, list[str]] = {}
+    meta_by_dir: dict[str, tuple[bool, float]] = {}
     budget = [_MAX_TREE_ENTRIES]
 
     def walk(directory: Path) -> None:
         subdirs: list[str] = []
         audios: list[tuple[str, str | None, float]] = []
+        has_non_audio = False
         for name, is_directory, is_symlink in _directory_entries(directory):
             if budget[0] <= 0:
                 break
             budget[0] -= 1
             child = directory / name
             if is_symlink:
+                # A symlink is neither hashable audio nor prunable emptiness; its
+                # presence pins the folder (never removed as "empty").
+                has_non_audio = True
                 continue
             if is_directory:
                 subdirs.append(str(child))
@@ -1456,8 +1491,15 @@ def _collect_slskd_audio_tree(
                 except (_UnsafeCleanup, OSError):
                     digest = None
                 audios.append((str(child), digest, mtime))
+            else:
+                has_non_audio = True
+        try:
+            dir_mtime = directory.stat(follow_symlinks=False).st_mtime
+        except OSError:
+            dir_mtime = time.time()  # unknown age -> treat as fresh, keep it
         subdirs_by_dir[str(directory)] = subdirs
         audio_by_dir[str(directory)] = audios
+        meta_by_dir[str(directory)] = (has_non_audio, dir_mtime)
 
     walk(mount)
-    return audio_by_dir, subdirs_by_dir
+    return audio_by_dir, subdirs_by_dir, meta_by_dir
