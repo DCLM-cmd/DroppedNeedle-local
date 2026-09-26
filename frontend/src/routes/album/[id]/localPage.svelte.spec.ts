@@ -223,6 +223,11 @@ vi.mock('$lib/queries/library/EditionConversionQueries.svelte', () => {
 vi.mock('$lib/queries/libraryContributions/LibraryContributionMutations.svelte', () => ({
 	createLibraryContributionMutation: () => ({ isPending: false, mutate: vi.fn() })
 }));
+// The admin "Blacklist source" action; the rest of the module stays real.
+vi.mock('$lib/queries/downloads/DownloadMutations.svelte', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/queries/downloads/DownloadMutations.svelte')>()),
+	blacklistSource: () => ({ isPending: false, mutate: vi.fn() })
+}));
 
 const blob = vi.hoisted(() => ({ download: vi.fn() }));
 vi.mock('$lib/utils/blobDownload', () => ({ downloadBlob: blob.download }));
