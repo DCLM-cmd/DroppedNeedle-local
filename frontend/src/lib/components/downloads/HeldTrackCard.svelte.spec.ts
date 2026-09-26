@@ -14,8 +14,12 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	// HeldTrackReview reads the occupied-destination details off a failed import.
+	occupiedDestination: () => null,
 	importHeldTrack: () => ({
 		mutate: h.importMut,
+		// the fork's card awaits the import so it can ask about an occupied destination
+		mutateAsync: (...args: unknown[]) => Promise.resolve(h.importMut(...args)),
 		isPending: false,
 		get error() {
 			return h.importError;
@@ -96,10 +100,11 @@ describe('HeldTrackCard', () => {
 	it('imports the held track on "Import anyway"', async () => {
 		await renderCard(held());
 		await page.getByRole('button', { name: /Import anyway/ }).click();
-		expect(h.importMut).toHaveBeenCalledWith(
-			{ id: 7, release_group_mbid: 'rg-1' },
-			expect.objectContaining({ onSuccess: expect.any(Function) })
-		);
+		expect(h.importMut).toHaveBeenCalledWith({
+			id: 7,
+			release_group_mbid: 'rg-1',
+			replaceExisting: false
+		});
 		expect(h.discardMut).not.toHaveBeenCalled();
 	});
 

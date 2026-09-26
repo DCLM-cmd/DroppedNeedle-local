@@ -5,6 +5,8 @@ import { render } from 'vitest-browser-svelte';
 // keep the Request button real; stub only its mutation hook so it renders without a QueryClient
 const downloadMutations = vi.hoisted(() => ({ requestMutate: vi.fn() }));
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	// HeldTrackReview reads the occupied-destination details off a failed import.
+	occupiedDestination: () => null,
 	requestTrack: () => ({ mutate: downloadMutations.requestMutate, isPending: false }),
 	importHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),
 	discardHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),

@@ -160,6 +160,10 @@ vi.mock('$lib/queries/downloads/DownloadQueries.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	// HeldTrackReview reads the occupied-destination details off a failed import.
+	occupiedDestination: () => null,
+	// the admin "Blacklist source" action on the local album page
+	blacklistSource: () => ({ mutate: vi.fn(), isPending: false }),
 	tryNextSource: () => ({ mutate: vi.fn(), isPending: false }),
 	cancelDownload: () => ({ mutate: vi.fn(), isPending: false }),
 	retryDownload: () => ({ mutate: vi.fn(), isPending: false }),

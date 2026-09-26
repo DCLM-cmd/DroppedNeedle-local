@@ -25,6 +25,8 @@ vi.mock('$lib/stores/authStore.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	// HeldTrackReview reads the occupied-destination details off a failed import.
+	occupiedDestination: () => null,
 	retryHeldManagementUnit: () => ({
 		mutate: (...args: unknown[]) => h.retry(...args),
 		reset: h.reset,

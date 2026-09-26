@@ -13,6 +13,8 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	// HeldTrackReview reads the occupied-destination details off a failed import.
+	occupiedDestination: () => null,
 	discardHeldVerdict: () => ({ mutate: h.discardVerdict, isPending: false }),
 	retryDownload: () => ({ mutate: h.retry, isPending: false }),
 	importHeldTrack: () => ({ mutate: h.importMut, isPending: false, error: null }),
