@@ -47,7 +47,7 @@ describe('DeleteAlbumModal', () => {
 
 		await page.getByRole('button', { name: 'Remove' }).click();
 
-		expect(mutateAsync).toHaveBeenCalledWith({ mbid: 'rg-1', stopWanted: true });
+		expect(mutateAsync).toHaveBeenCalledWith({ mbid: 'rg-1', stopWanted: true, blacklist: false });
 		await vi.waitFor(() => expect(ondeleted).toHaveBeenCalledOnce());
 	});
 
@@ -59,7 +59,7 @@ describe('DeleteAlbumModal', () => {
 		await checkbox.click();
 		await page.getByRole('button', { name: 'Remove' }).click();
 
-		expect(mutateAsync).toHaveBeenCalledWith({ mbid: 'rg-1', stopWanted: false });
+		expect(mutateAsync).toHaveBeenCalledWith({ mbid: 'rg-1', stopWanted: false, blacklist: false });
 	});
 
 	it('keeps the confirmation open when removal fails', async () => {
