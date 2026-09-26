@@ -6,6 +6,28 @@ group, consumed at both evaluation moments of NEW-DECISION-02
 metadata only - no evidence score exists yet) and evidence time (scored
 candidates). Pure functions only: no I/O, no provider calls, no
 dependencies beyond the standard library.
+
+Pin wiring (LibraryFindings-All E-03) - this module ranks; pins live elsewhere:
+
+- Legacy ``AlbumService`` (``get_album_service``): ``self._release_pins`` is
+  the release-group-keyed ``AlbumReleasePinStore``.
+- Target ``AlbumService`` (``get_target_album_service``): ``self._release_pins``
+  is the ``TargetAlbumReleasePinStore`` adapter over the native library store,
+  which resolves a release-group MBID to the single local album carrying it
+  and raises ``ConflictError`` when several indexed copies share it.
+- ``DownloadService`` (``get_target_download_service``): ``self._pins`` is the
+  same target adapter.
+
+Method table: ``_effective_release_id``/``_pinned_release_id`` read
+``self._release_pins``; the per-copy ``get/set/clear_edition_pin_for_local_album``
+methods hit the native store direct (``get/set/clear_target_album_release_pin``).
+No-cross-read rule: a per-album pin never influences ``_effective_release_id``,
+and an RG pin never influences the per-copy methods.
+
+D2 ruling (FINAL 2026-09-07, recorded in LibraryAudit DECISIONS-LIVE.md):
+the display lane (``get_ranked_releases``) keeps its XW-first ordering and
+is NOT migrated to ``recall_key`` - display often lacks a target track
+count, so the proximity term has nothing to rank against.
 """
 
 import re
@@ -53,6 +75,37 @@ def edition_date_key(date_str: str | None) -> tuple[int, int, int]:
     return (year, month, day)
 
 
+def evidence_key(
+    score: float,
+    status: str | None,
+    date: str | None,
+    country: str | None,
+    mbid: str | None,
+) -> tuple[float, int, tuple[int, int, int], int, str]:
+    """Evidence-time ranking key for sibling editions in one release group.
+
+    The signed NEW-DECISION-02 order in full: evidence score -> Official
+    status -> parsed date with explicit precision -> XW country
+    preference -> release MBID. Callers pass what they carry: the repair
+    lane fills status/country from the canonical provider, while
+    ``decide()`` passes None for terms its candidates do not carry (tied
+    terms fall through to date/MBID). Missing/unparsable dates sort last
+    via ``edition_date_key``; a missing MBID sorts as ``""``.
+    """
+    return (
+        -float(score),
+        0 if status == "Official" else 1,
+        edition_date_key(date),
+        0 if country == "XW" else 1,
+        mbid or "",
+    )
+
+
+# D4 ruling (F-04, FINAL 2026-09-07, recorded in LibraryAudit
+# DECISIONS-LIVE.md): proximity-first recall is accepted gloss
+# (EditionsEtc/PLAN.md:24, test-pinned); NEW-DECISION-02 governs
+# evidence-time only. Do not widen or drop the proximity lead without
+# an owner decision.
 def recall_key(release: dict, target_track_count: int) -> tuple | None:
     """Recall-time ranking key for sibling editions in one release group.
 

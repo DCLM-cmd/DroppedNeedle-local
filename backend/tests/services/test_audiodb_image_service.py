@@ -612,7 +612,10 @@ class TestClearAudioDBService:
         mem_cache = AsyncMock()
         mem_cache.clear_prefix = AsyncMock(return_value=4)
         library_db = MagicMock()
-        svc = CacheService(cache=mem_cache, library_db=library_db, disk_cache=disk_cache)
+        svc = CacheService(
+            cache=mem_cache, library_db=library_db, disk_cache=disk_cache,
+            mb_response_store=MagicMock(),
+        )
 
         result = await svc.clear_audiodb()
         assert result.success is True
@@ -634,7 +637,10 @@ class TestClearAudioDBService:
         mem_cache = AsyncMock()
         mem_cache.clear_prefix = AsyncMock(return_value=0)
         library_db = MagicMock()
-        svc = CacheService(cache=mem_cache, library_db=library_db, disk_cache=disk_cache)
+        svc = CacheService(
+            cache=mem_cache, library_db=library_db, disk_cache=disk_cache,
+            mb_response_store=MagicMock(),
+        )
         svc._cached_stats = {"some": "stats"}
 
         await svc.clear_audiodb()

@@ -38,10 +38,10 @@ class LibraryAutomaticScanScheduler:
         )
         if remaining is None or remaining > 0:
             return False
-        scopes = self._scheduled_scopes(resolver)
+        scopes = self.scheduled_scopes(resolver)
         if not scopes:
             return False
-        await coordinator.request_run(
+        result = await coordinator.request_run(
             ScanRequest(
                 kind="incremental",
                 trigger="automatic",
@@ -49,10 +49,14 @@ class LibraryAutomaticScanScheduler:
                 scopes=scopes,
             )
         )
-        return True
+        # S-05: the supervisor is the only caller and wants a bool.
+        # started/queued/coalesced/expanded all mean work will run (True);
+        # only conflict means "leave the queued follow-up alone" (False -
+        # no wakeup, retried next iteration as today).
+        return result.disposition != "conflict"
 
     @staticmethod
-    def _scheduled_scopes(resolver: LibraryPolicyResolver) -> list[ScanScope]:
+    def scheduled_scopes(resolver: LibraryPolicyResolver) -> list[ScanScope]:
         scopes: list[ScanScope] = []
         for root in resolver.settings.library_roots:
             if root.policy != "excluded":
@@ -86,3 +90,7 @@ class LibraryAutomaticScanScheduler:
                     )
                 )
         return scopes
+
+    # Back-compat alias: tests and the filesystem watcher resolve scopes
+    # through the historical private name; new callers use scheduled_scopes.
+    _scheduled_scopes = scheduled_scopes

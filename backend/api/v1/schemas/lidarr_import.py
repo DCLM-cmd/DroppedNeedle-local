@@ -17,13 +17,6 @@ class LidarrTestResponse(AppStruct):
     message: str = ""
 
 
-class LidarrImportStatusResponse(AppStruct):
-    """The non-admin gate for the Following-page import button. Carries ONLY the boolean -
-    never the url or api_key (config-leak guard)."""
-
-    configured: bool
-
-
 class LidarrArtistCandidate(AppStruct):
     """One monitored Lidarr artist annotated for the requesting user."""
 

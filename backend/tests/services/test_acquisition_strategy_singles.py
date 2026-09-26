@@ -19,6 +19,7 @@ from models.download_identity import soulseek_identity
 from models.download_manifest import DownloadManifest, ExpectedFile, ManifestCodec
 from repositories.protocols.download_client import DownloadSearchResult, TaskHandle
 from services.native.acquisition.strategy import SoulseekStrategy
+from services.native.acquisition.errors import OrchestrationError
 from services.native.acquisition.quality import build_snapshot
 from services.native.file_processor import FileFailure, ProcessResult
 
@@ -293,3 +294,34 @@ async def test_tag_mismatch_keeps_failure_reason_and_uses_verify_quarantine(
         reason="verify_failed",
         release_group_mbid="rg-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_enqueue_with_no_serving_files_raises_before_side_effects(
+    tmp_path: Path,
+):
+    """#388: a failover candidate whose files serve none of the remaining
+    positions is skipped via OrchestrationError before any store, manifest,
+    or client side effect - never enqueued as an empty file list."""
+    strategy, _indexer, _scorer, _track_matcher = _strategy(tmp_path)
+    task = _single_task(
+        track_count=12, track_title=None, recording_mbid=None,
+        track_duration_seconds=None,
+    )
+    candidate = ScoredCandidate(
+        username="peer",
+        parent_directory="peer",
+        files=[_search_result(username="peer", filename="peer/zzz.flac", duration=9999.0)],
+        coherence=0.9,
+        file_confidence=0.9,
+        final_score=0.9,
+        tier="manual",
+    )
+    with pytest.raises(OrchestrationError, match="no files serving"):
+        await strategy.enqueue(
+            task, candidate, strict_track_duration=False,
+            remaining_positions=frozenset({(1, 5)}),
+        )
+    strategy._client.enqueue.assert_not_awaited()
+    strategy._store.update_status.assert_not_awaited()
+    strategy._store.create_download_attempt.assert_not_awaited()

@@ -471,7 +471,7 @@ class CoverArtRepository:
             # client; record them so http_error does not undercount.
             record_provider_call("coverart", priority, None)
             raise
-        record_provider_call("coverart", priority, response.status_code)
+        record_provider_call("coverart", priority, response.status_code, response=response)
         return response
 
     @with_retry(
@@ -742,12 +742,12 @@ class CoverArtRepository:
         priority_mgr = get_priority_queue()
         semaphore = await priority_mgr.acquire_slot(priority)
         async with semaphore:
+            response = None
+            total = 0
+            failed = False
             try:
                 async with self._client.stream("GET", url) as response:
                     self._raise_retryable_status(response, "coverart", url)
-                    # QW9 Part 3: record once the status is known; 429/5xx
-                    # raise above and land in the except below instead.
-                    record_provider_call("coverart", priority, response.status_code)
                     content_type = response.headers.get("Content-Type")
                     if content_type is not None:
                         content_type = (
@@ -766,7 +766,6 @@ class CoverArtRepository:
                                 "Artwork download exceeds the byte safety limit."
                             )
                     chunks: list[bytes] = []
-                    total = 0
                     async for chunk in response.aiter_bytes():
                         total += len(chunk)
                         if total > maximum_bytes:
@@ -776,8 +775,14 @@ class CoverArtRepository:
                         chunks.append(chunk)
                     return response.status_code, b"".join(chunks), content_type
             except (httpx.HTTPError, ExternalServiceError, RateLimitedError):
-                record_provider_call("coverart", priority, None)
+                failed = True
                 raise
+            finally:
+                record_provider_call(
+                    "coverart", priority,
+                    None if failed or response is None else response.status_code,
+                    response=response, decoded_body_bytes=total,
+                )
 
     async def _blurhash_of_cached(self, identifier: str, suffix: str) -> Optional[str]:
         """The blurhash of an already-cached image, or None if it is not on disk.

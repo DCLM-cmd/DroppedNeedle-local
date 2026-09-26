@@ -197,6 +197,27 @@ class IdentificationQueueService:
             now=timestamp,
         )
 
+    async def release(
+        self,
+        job: dict,
+        worker_id: str,
+        *,
+        now: float | None = None,
+    ) -> int:
+        """R-04: release a cancelled run's claim with NO backoff.
+
+        Cancel-path primitive - never defer() here (30s floor +
+        MAX_DEFERRALS_EXCEEDED counting). NOT idempotent: call exactly once
+        per cancel; StaleRevisionError means the finish commit already landed
+        (commit wins) and the caller swallows it.
+        """
+        return await self._store.release_identification_claim(
+            str(job["id"]),
+            worker_id=worker_id,
+            expected_job_revision=int(job["row_revision"]),
+            now=time.time() if now is None else now,
+        )
+
     async def fail(
         self,
         job: dict,
@@ -286,9 +307,4 @@ class IdentificationQueueService:
         )
 
     async def stream_revisions(self) -> dict[str, int]:
-        revisions = {
-            kind: await self._store.get_stream_revision(kind)
-            for kind in ("scan", "identification", "operation")
-        }
-        revisions["catalog"] = await self._store.get_catalog_revision()
-        return revisions
+        return await self._store.get_library_revisions()

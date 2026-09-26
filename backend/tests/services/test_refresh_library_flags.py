@@ -12,9 +12,9 @@ from services.artist_service import ArtistService
 def mock_library_repo():
     repo = AsyncMock()
     repo.is_configured = MagicMock(return_value=True)
-    repo.get_library_mbids.return_value = set()
+    repo.existing_album_mbids.return_value = set()
     repo.get_requested_mbids.return_value = set()
-    repo.get_artist_mbids.return_value = set()
+    repo.existing_artist_mbids.return_value = set()
     repo.get_artist_details.return_value = None
     return repo
 
@@ -45,19 +45,22 @@ def _make_artist(
 class TestRefreshLibraryFlagsLibraryTransition:
     @pytest.mark.asyncio
     async def test_transition_sets_in_library(self, artist_service, mock_library_repo):
-        mock_library_repo.get_artist_mbids.return_value = {"aaa-bbb"}
+        mock_library_repo.existing_artist_mbids.return_value = {"aaa-bbb"}
         artist = _make_artist(in_library=False)
 
         await artist_service._refresh_library_flags(artist)
 
         assert artist.in_library is True
         assert artist.auto_download is False
+        mock_library_repo.existing_artist_mbids.assert_awaited_once_with(["aaa-bbb"])
+        mock_library_repo.get_library_mbids.assert_not_awaited()
+        mock_library_repo.get_artist_mbids.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_already_in_library_preserves_auto_download(
         self, artist_service, mock_library_repo
     ):
-        mock_library_repo.get_artist_mbids.return_value = {"aaa-bbb"}
+        mock_library_repo.existing_artist_mbids.return_value = {"aaa-bbb"}
         artist = _make_artist(in_library=True, auto_download=True)
 
         await artist_service._refresh_library_flags(artist)
@@ -69,7 +72,7 @@ class TestRefreshLibraryFlagsLibraryTransition:
     async def test_removed_from_artist_mbids_clears_in_library(
         self, artist_service, mock_library_repo
     ):
-        mock_library_repo.get_artist_mbids.return_value = set()
+        mock_library_repo.existing_artist_mbids.return_value = set()
         artist = _make_artist(in_library=True, auto_download=True)
 
         await artist_service._refresh_library_flags(artist)
@@ -85,15 +88,15 @@ class TestRefreshLibraryFlagsLibraryTransition:
         await artist_service._refresh_library_flags(artist)
 
         assert artist.in_library is False
-        mock_library_repo.get_artist_mbids.assert_not_awaited()
+        mock_library_repo.existing_artist_mbids.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_release_in_library_flags_still_refreshed(
         self, artist_service, mock_library_repo
     ):
-        mock_library_repo.get_library_mbids.return_value = {"album-1"}
+        mock_library_repo.existing_album_mbids.return_value = {"album-1"}
         mock_library_repo.get_requested_mbids.return_value = {"album-2"}
-        mock_library_repo.get_artist_mbids.return_value = set()
+        mock_library_repo.existing_artist_mbids.return_value = set()
 
         from models.artist import ReleaseItem
 
@@ -115,6 +118,14 @@ class TestRefreshLibraryFlagsLibraryTransition:
         assert artist.albums[1].requested is True
         assert artist.albums[2].in_library is False
         assert artist.albums[2].requested is False
+        mock_library_repo.existing_album_mbids.assert_awaited_once_with(
+            ["album-1", "album-2", "album-3"]
+        )
+        mock_library_repo.get_requested_mbids.assert_awaited_once_with(
+            ["album-1", "album-2", "album-3"]
+        )
+        mock_library_repo.get_library_mbids.assert_not_awaited()
+        mock_library_repo.get_artist_mbids.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_target_refresh_uses_candidate_bounded_ownership(

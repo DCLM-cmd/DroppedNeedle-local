@@ -1,17 +1,20 @@
 """Shared SQLite infrastructure for all persistence stores."""
 
 import asyncio
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import contextvars
 import functools
+from dataclasses import dataclass
 import json
 import os
 import sqlite3
 import threading
 import unicodedata
+import weakref
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from infrastructure.persistence.connection_settings import (
     report_connection_settings,
@@ -20,37 +23,17 @@ from infrastructure.persistence.connection_settings import (
 T = TypeVar("T")
 
 
-# Database work gets its own threads, separate from ``asyncio.to_thread``.
-#
-# ``asyncio.to_thread`` runs on the event loop's DEFAULT executor, which is only
-# ``min(32, cpu_count + 4)`` threads - 8 on the 4-core server. That pool is shared
-# with every heavy filesystem job in the app: hashing whole audio files, copying
-# FLACs, walking the library tree, waiting on fpcalc. Those hold a thread for
-# seconds at a time, and there are only eight, so a scan or an Organizer run could
-# occupy all of them. Every API request needs the database - the auth check alone
-# is a query - so requests then sat waiting for a thread rather than for data, and
-# the UI showed a spinner that never resolved even though nothing was actually
-# slow. Isolating database work means a busy library can no longer starve it.
-#
-# Sized independently of the heavy pool: these queries are short and sqlite3
-# releases the GIL around them, so threads here are mostly idle. The pool also
-# bounds the connection cache, which is per (thread, store).
-_DB_EXECUTOR_WORKERS = min(12, (os.cpu_count() or 2) * 3)
-_db_executor = ThreadPoolExecutor(
-    max_workers=_DB_EXECUTOR_WORKERS, thread_name_prefix="droppedneedle-db"
-)
-
-
 async def _run_in_db_thread(function: Any, /, *args: Any, **kwargs: Any) -> Any:
-    """``asyncio.to_thread``, but on the database pool.
+    """``asyncio.to_thread``, but on the dedicated ``_DB_EXECUTOR`` pool.
 
     Copies the current context exactly as ``to_thread`` does, so anything reading a
-    ContextVar (the degradation recorder, request-scoped flags) behaves the same.
+    ContextVar (the degradation recorder, request-scoped flags) behaves the same -
+    a bare ``run_in_executor`` would run the operation with an empty context.
     """
     loop = asyncio.get_running_loop()
     context = contextvars.copy_context()
     call = functools.partial(context.run, function, *args, **kwargs)
-    return await loop.run_in_executor(_db_executor, call)
+    return await loop.run_in_executor(_DB_EXECUTOR, call)
 
 
 class PriorityWriteLock:
@@ -175,155 +158,155 @@ def _safe_alter(conn: sqlite3.Connection, sql: str) -> bool:
         return False
 
 
-class _ConnectionPool(threading.local):
-    """Per-thread SQLite connections, reused across queries.
+# GH-265: every store's reads and writes previously dispatched through
+# asyncio.to_thread(), which runs on the event loop's implicit default
+# executor (min(32, os.cpu_count() + 4) workers - as few as 5 on a
+# single-CPU container). That pool is effectively the process-wide SQLite
+# dispatch queue, so a burst of background work (a scan, the identification
+# queue) could exhaust it and leave quick, latency-sensitive reads - the
+# polled /library/activity and /home endpoints among them - queued for a
+# free thread instead of actually running, surfacing as random multi-second
+# "Slow request" warnings unrelated to the query itself. Dispatching through
+# a dedicated pool sized independently of cpu_count keeps SQLite access off
+# the loop's shared executor entirely, the same isolation
+# library_management_planner.py's _SOURCE_INSPECTION_EXECUTOR already
+# applies to its own blocking reads for the same reason.
+_DB_EXECUTOR = ThreadPoolExecutor(max_workers=32, thread_name_prefix="persistence-db")
 
-    Opening a connection is not free: it opens the database file, maps the WAL
-    index, replays PRAGMAs and re-registers ``fold()``. Measured against the
-    production library.db (55 MB data / 21 MB WAL) that is ~6.6 ms per query,
-    against ~0.002 ms for a query on an already-open connection. Every store
-    call used to pay it, so a page issuing a few dozen queries burned hundreds
-    of milliseconds before touching a single row.
 
-    Connections are per-thread (store work runs on the dedicated database pool of
-    long-lived worker threads) and per (store class, db_path), so the
-    subclass PRAGMAs applied in ``_connect`` - notably ``foreign_keys=ON``, which
-    is a per-connection setting - stay attached to the connection they were set on.
+# Every store operation used to open a brand-new connection and close it again.
+# A new connection has to read and parse the entire schema before its first
+# statement, and the target schema (hundreds of tables, indexes and triggers)
+# makes that about 20ms of CPU against 0.02ms for the query itself. Worse, the
+# parse runs with the GIL released, so parallel requests contend on SQLite's
+# internal mutexes: on a 2-core container a burst of 32 concurrent reads cost
+# ~1.2s of CPU each, mostly system time, pinning the process for the whole
+# burst. Reads - every authenticated request's session lookup, and nearly all
+# of a page load - therefore reuse one connection per (thread, database).
+# PlaylistRepository already uses thread-local connections for the same reason.
+#
+# Writes keep a fresh connection per operation: they are serialised by the
+# write lock, so they never contend with each other, and bulk writes (scans,
+# imports) keep the driver's full per-connection statement cache.
+#
+# Pooled connections are shared by every store on a thread, so everything a
+# store can vary per connection is applied on checkout and everything an
+# operation can leave behind is undone on check-in (see
+# PersistenceBase._checkout_pooled_connection and _return_pooled_connection).
+# The pool is bounded per thread so processes that touch many database files
+# (the test suite) do not accumulate open files.
+_POOLED_CONNECTIONS_PER_THREAD = 4
+
+
+class _TrackedConnection(sqlite3.Connection):
+    """A pooled connection that remembers the cursors it hands out.
+
+    A cursor that outlives its operation part-way through a result set keeps
+    its statement active, and with it a WAL read snapshot, so every later read
+    on the connection would see stale data. Per-operation connections never
+    had that problem because the next operation opened a new one; a pooled
+    connection is therefore retired whenever one of its cursors is still alive
+    after the operation returns.
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._handed_out: list[weakref.ref[sqlite3.Cursor]] = []
+
+    def _track(self, cursor: sqlite3.Cursor) -> sqlite3.Cursor:
+        handed_out = self._handed_out
+        if len(handed_out) >= 256:
+            handed_out[:] = [ref for ref in handed_out if ref() is not None]
+        handed_out.append(weakref.ref(cursor))
+        return cursor
+
+    # Connection.execute* create their cursors in C without calling cursor(),
+    # so each entry point is wrapped.
+    def cursor(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        return self._track(super().cursor(*args, **kwargs))
+
+    def execute(self, *args: Any) -> sqlite3.Cursor:
+        return self._track(super().execute(*args))
+
+    def executemany(self, *args: Any) -> sqlite3.Cursor:
+        return self._track(super().executemany(*args))
+
+    def executescript(self, *args: Any) -> sqlite3.Cursor:
+        return self._track(super().executescript(*args))
+
+    def forget_cursors(self) -> None:
+        self._handed_out.clear()
+
+    def has_live_cursors(self) -> bool:
+        return any(ref() is not None for ref in self._handed_out)
+
+
+@dataclass(eq=False)
+class _PooledConnection:
+    connection: _TrackedConnection
+    # (st_dev, st_ino) of the file the connection opened; a replaced or
+    # recreated database at the same path must not be served by a stale handle.
+    file_identity: tuple[int, int]
+    # Connection-local defaults captured at open: the busy timeout is restored
+    # on every checkout, mmap_size on every check-in.
+    default_busy_timeout_ms: int
+    default_mmap_size: int
+    # whether sqlite_stmt can report what the statement cache is holding
+    measures_statement_memory: bool
+    in_use: bool = False
+
+
+class _ThreadConnections(threading.local):
     def __init__(self) -> None:
-        self.connections: dict[tuple[int, str], sqlite3.Connection] = {}
-        self.generation = 0
+        self.by_path: OrderedDict[str, _PooledConnection] = OrderedDict()
 
 
-_pool = _ConnectionPool()
+_thread_connections = _ThreadConnections()
 
-# Bumped to invalidate every thread's pooled connections. A thread-local cannot be
-# cleared from outside the thread that owns it, so instead each thread notices the
-# generation moved and reopens on its next use.
-_pool_generation = 0
+# A cached statement keeps its compiled program and SQLite's copy of its last
+# bound values alive for as long as the connection lives, which close() used to
+# bound: a large parameter, or many shapes of a long IN list, would otherwise stay
+# resident on every executor thread. Pooled connections keep a statement cache,
+# so bulk reads that repeat a statement do not re-prepare it, and are retired on
+# check-in when SQLite reports that the cache holds more than the budget. The
+# app's own statements measure 3KiB at the median and 45KiB at most, so the
+# budget is only reached by large bound values. Where sqlite_stmt is not compiled
+# in, pooled connections run without a statement cache instead.
+_POOLED_STATEMENT_CACHE_SIZE = 64
+_POOLED_STATEMENT_MEMORY_BUDGET_BYTES = 2 * 1024 * 1024
+_statement_memory_measurable: bool | None = None
 
 
-def close_pooled_connections() -> None:
-    """Close every pooled connection owned by the calling thread."""
-    for conn in _pool.connections.values():
+def _can_measure_statement_memory() -> bool:
+    global _statement_memory_measurable
+    if _statement_memory_measurable is None:
+        probe = sqlite3.connect(":memory:")
         try:
-            conn.close()
-        except sqlite3.Error:  # noqa: PERF203 - closing must never raise
-            pass
-    _pool.connections.clear()
+            probe.execute("SELECT mem FROM sqlite_stmt LIMIT 1").fetchall()
+            _statement_memory_measurable = True
+        except sqlite3.Error:
+            _statement_memory_measurable = False
+        finally:
+            probe.close()
+    return _statement_memory_measurable
 
 
-def reset_connection_pool() -> None:
-    """Make every thread reopen its connections the next time it needs one.
-
-    For tests that swap out ``_connect`` (to trace statements, say) and need the
-    replacement to actually be used rather than a connection opened earlier.
-    """
-    global _pool_generation
-    _pool_generation += 1
+def _file_identity(path: str) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino
 
 
-class PooledSqliteStore:
-    """Connection reuse and transaction hygiene for a SQLite-backed store.
-
-    Subclasses supply ``db_path``, ``_write_lock`` and a ``_connect`` that builds a
-    fresh connection with whatever PRAGMAs they need; everything else here is
-    shared. ``PersistenceBase`` builds on this, and the older hand-rolled stores
-    (auth, favorites, play history, ...) inherit it directly so they stop paying
-    connection setup on every query too.
-    """
-
-    db_path: Path
-    _write_lock: "threading.Lock | PriorityWriteLock"
-
-    def _connect(self) -> sqlite3.Connection:
-        raise NotImplementedError
-
-    @property
-    def _pool_key(self) -> tuple[int, str]:
-        """This store INSTANCE's slot in the per-thread connection cache.
-
-        Keyed per instance, not per class: two stores of the same class over the same
-        file each layer their own PRAGMAs (and a test may wrap ``_connect`` to trace
-        statements), so sharing one connection between them silently hands the second
-        the first one's connection and discards whatever it configured. Production
-        builds each store once, so per-instance keying pools exactly as widely in
-        practice while removing that trap.
-
-        The token is created per instance and lives as long as it, so ``id()`` cannot
-        be recycled underneath a live entry the way ``id(self)`` could.
-        """
-        token = getattr(self, "_pool_token", None)
-        if token is None:
-            token = object()
-            object.__setattr__(self, "_pool_token", token)
-        return (id(token), str(self.db_path))
-
-    def _pooled_connection(self) -> sqlite3.Connection:
-        """Borrow this thread's connection for this store, opening it on first use.
-
-        ``_connect`` stays the "make me a fresh connection" hook so subclasses can
-        keep layering PRAGMAs onto it and so ``_ensure_tables`` can own a private
-        connection it is free to close.
-        """
-        if _pool.generation != _pool_generation:
-            close_pooled_connections()
-            _pool.generation = _pool_generation
-        key = self._pool_key
-        conn = _pool.connections.get(key)
-        if conn is None:
-            conn = self._connect()
-            _pool.connections[key] = conn
-        return conn
-
-    def _discard_pooled_connection(self) -> None:
-        conn = _pool.connections.pop(self._pool_key, None)
-        if conn is not None:
-            try:
-                conn.close()
-            except sqlite3.Error:
-                pass
-
-    def _run(self, operation: Any, *, commit: bool) -> Any:
-        """Run one operation on the pooled connection, leaving it reusable.
-
-        A pooled connection outlives the call, so it must never be handed back
-        mid-transaction: a failed write is rolled back, and a read that turned out
-        to write is rolled back too rather than holding a WAL snapshot open for
-        the life of the thread. Anything that leaves the connection itself
-        unusable retires it so the next call opens a healthy one.
-        """
-        conn = self._pooled_connection()
-        try:
-            result = operation(conn)
-            if commit:
-                conn.commit()
-            elif conn.in_transaction:
-                conn.rollback()
-            return result
-        except Exception:
-            try:
-                if conn.in_transaction:
-                    conn.rollback()
-            except sqlite3.Error:
-                self._discard_pooled_connection()
-            raise
-
-    def _execute(self, operation: Any, write: bool) -> Any:
-        if write:
-            with self._write_lock:
-                return self._run(operation, commit=True)
-        return self._run(operation, commit=False)
-
-    async def _read(self, operation: Any) -> Any:
-        return await _run_in_db_thread(self._execute, operation, False)
-
-    async def _write(self, operation: Any) -> Any:
-        return await _run_in_db_thread(self._execute, operation, True)
+def _close_quietly(connection: sqlite3.Connection) -> None:
+    try:
+        connection.close()
+    except Exception:  # noqa: BLE001 - discarding a connection must not mask the original error
+        pass
 
 
-class PersistenceBase(PooledSqliteStore):
+class PersistenceBase:
     """Shared base for all domain-specific SQLite stores.
 
     All stores receive the *same* ``db_path`` and ``write_lock`` so they
@@ -338,6 +321,10 @@ class PersistenceBase(PooledSqliteStore):
     # stores that historically never issued one override this so convergence
     # does not silently pin them to a future change of the base's value.
     busy_timeout_ms: int | None = 5000
+    # Enforce foreign keys (and so ON DELETE CASCADE) on this store's
+    # connections. Declared rather than added in a _connect override so pooled
+    # connections, which are shared between stores, can apply it per operation.
+    foreign_keys: bool = False
 
     def __init__(
         self, db_path: Path, write_lock: threading.Lock | PriorityWriteLock
@@ -348,13 +335,27 @@ class PersistenceBase(PooledSqliteStore):
         with self._write_lock:
             self._ensure_tables()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+    def _open_connection(
+        self,
+        factory: type[sqlite3.Connection] = sqlite3.Connection,
+        cached_statements: int = 128,
+    ) -> sqlite3.Connection:
+        """Open a connection with the settings every store shares."""
+        conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            factory=factory,
+            cached_statements=cached_statements,
+        )
         conn.row_factory = sqlite3.Row
         # accent/case-insensitive LIKE searches (see _fold_text)
         conn.create_function("fold", 1, _fold_text, deterministic=True)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = self._open_connection()
         # (AUD-7) Uniform backstop: a writer blocked by another writer waits up to
         # 5s for the lock instead of failing immediately with "database is locked".
         # Stores that historically never set one pin busy_timeout_ms = None above.
@@ -363,13 +364,188 @@ class PersistenceBase(PooledSqliteStore):
         # (GH-293) Labeled connection-local settings telemetry (bounded, once per
         # role per process). Never inferred from a fresh probe connection.
         report_connection_settings(self.connection_label, conn)
+        if self.foreign_keys:
+            conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def _uses_pooled_connections(self) -> bool:
+        # A store (or a test) that customises _connect keeps a fresh connection
+        # per operation, so whatever the override installs is never bypassed.
+        return (
+            "_connect" not in vars(self)
+            and type(self)._connect is PersistenceBase._connect
+        )
+
+    def _checkout_pooled_connection(self) -> _PooledConnection | None:
+        """Borrow this thread's connection to ``db_path``, or None to open a fresh one."""
+        path = str(self.db_path)
+        identity = _file_identity(path)
+        if identity is None:
+            # Missing database: the fresh path creates it exactly as before.
+            return None
+        pool = _thread_connections.by_path
+        pooled = pool.get(path)
+        if pooled is not None and pooled.in_use:
+            # Re-entrant use on this thread (an operation calling into another
+            # store). Sharing the connection would let the inner operation
+            # commit or roll back the outer one's transaction.
+            return None
+        if pooled is not None and pooled.file_identity != identity:
+            del pool[path]
+            _close_quietly(pooled.connection)
+            pooled = None
+        if pooled is None:
+            measures_statement_memory = _can_measure_statement_memory()
+            conn = cast(
+                _TrackedConnection,
+                self._open_connection(
+                    factory=_TrackedConnection,
+                    cached_statements=(
+                        _POOLED_STATEMENT_CACHE_SIZE if measures_statement_memory else 0
+                    ),
+                ),
+            )
+            try:
+                pooled = _PooledConnection(
+                    connection=conn,
+                    file_identity=identity,
+                    default_busy_timeout_ms=int(
+                        conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                    ),
+                    default_mmap_size=int(
+                        conn.execute("PRAGMA mmap_size").fetchone()[0]
+                    ),
+                    measures_statement_memory=measures_statement_memory,
+                )
+            except BaseException:
+                _close_quietly(conn)
+                raise
+            pool[path] = pooled
+            self._evict_idle_pooled_connections(pool)
+        else:
+            pool.move_to_end(path)
+        pooled.in_use = True
+        try:
+            self._apply_store_settings(pooled)
+        except Exception:  # noqa: BLE001 - an unusable cached connection falls back to a fresh one
+            self._discard_pooled_connection(pooled)
+            return None
+        pooled.connection.forget_cursors()
+        return pooled
+
+    @staticmethod
+    def _evict_idle_pooled_connections(
+        pool: OrderedDict[str, _PooledConnection],
+    ) -> None:
+        for path in list(pool):
+            if len(pool) <= _POOLED_CONNECTIONS_PER_THREAD:
+                return
+            if not pool[path].in_use:
+                _close_quietly(pool.pop(path).connection)
+
+    def _apply_store_settings(self, pooled: _PooledConnection) -> None:
+        """Give a shared connection the settings this store's ``_connect`` applies.
+
+        The busy timeout (or the driver default for stores that never set one)
+        and foreign-key enforcement differ between stores.
+        """
+        conn = pooled.connection
+        busy_timeout_ms = (
+            self.busy_timeout_ms
+            if self.busy_timeout_ms is not None
+            else pooled.default_busy_timeout_ms
+        )
+        # Only assign what differs: assigning foreign_keys, even to its current
+        # value, expires every prepared statement in the connection's cache.
+        if conn.execute("PRAGMA busy_timeout").fetchone()[0] != busy_timeout_ms:
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        if bool(conn.execute("PRAGMA foreign_keys").fetchone()[0]) != self.foreign_keys:
+            conn.execute(f"PRAGMA foreign_keys={'ON' if self.foreign_keys else 'OFF'}")
+        report_connection_settings(self.connection_label, conn)
+
+    def _return_pooled_connection(self, pooled: _PooledConnection) -> None:
+        """Undo what an operation can leave on a connection, or retire it.
+
+        Closing a fresh connection used to do all of this implicitly.
+        """
+        conn = pooled.connection
+        if conn.has_live_cursors():
+            # A cursor escaped the operation and may pin a read snapshot.
+            self._discard_pooled_connection(pooled)
+            return
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+            # The catalog integrity check raises mmap_size for its own scan.
+            conn.execute(f"PRAGMA mmap_size={pooled.default_mmap_size}")
+            # Release cached pages so idle connections across the whole
+            # executor hold little more than their parsed schema, which is
+            # what reuse is for.
+            conn.execute("PRAGMA shrink_memory")
+            if pooled.measures_statement_memory:
+                statement_bytes = conn.execute(
+                    "SELECT coalesce(sum(mem), 0) FROM sqlite_stmt"
+                ).fetchone()[0]
+                if statement_bytes > _POOLED_STATEMENT_MEMORY_BUDGET_BYTES:
+                    self._discard_pooled_connection(pooled)
+                    return
+        except Exception:  # noqa: BLE001 - a connection that cannot be reset is not reused
+            self._discard_pooled_connection(pooled)
+            return
+        pooled.in_use = False
+
+    @staticmethod
+    def _discard_pooled_connection(pooled: _PooledConnection) -> None:
+        pool = _thread_connections.by_path
+        for path, candidate in list(pool.items()):
+            if candidate is pooled:
+                del pool[path]
+        _close_quietly(pooled.connection)
+
+    def _run_operation(self, operation: Any, commit: bool) -> Any:
+        pooled = (
+            self._checkout_pooled_connection()
+            if not commit and self._uses_pooled_connections()
+            else None
+        )
+        if pooled is None:
+            conn = self._connect()
+            try:
+                result = operation(conn)
+                if commit:
+                    conn.commit()
+                return result
+            finally:
+                conn.close()
+
+        try:
+            result = operation(pooled.connection)
+        except BaseException:
+            # Same outcome as closing a fresh connection: the open transaction
+            # is discarded, and nothing half-finished is handed to the next
+            # operation on this thread.
+            self._discard_pooled_connection(pooled)
+            raise
+        self._return_pooled_connection(pooled)
+        return result
+
+    def _execute(self, operation: Any, write: bool) -> Any:
+        if write:
+            with self._write_lock:
+                return self._run_operation(operation, commit=True)
+        return self._run_operation(operation, commit=False)
+
+    async def _read(self, operation: Any) -> Any:
+        return await _run_in_db_thread(self._execute, operation, False)
+
+    async def _write(self, operation: Any) -> Any:
+        return await _run_in_db_thread(self._execute, operation, True)
 
     def _execute_background(self, operation: Any) -> Any:
         background = getattr(self._write_lock, "background", None)
         lock_context = background() if background is not None else self._write_lock
         with lock_context:
-            return self._run(operation, commit=True)
+            return self._run_operation(operation, commit=True)
 
     async def _background_write(self, operation: Any) -> Any:
         return await _run_in_db_thread(self._execute_background, operation)

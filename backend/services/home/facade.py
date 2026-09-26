@@ -42,10 +42,15 @@ from infrastructure.cache.cache_keys import (
 )
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.http.deduplication import deduplicate
+from infrastructure.observability.optional_work import (
+    OptionalWorkDeferred, optional_work_budget, optional_dispatch_guard, check_optional_dispatch,
+)
+from services.discover.mbid_resolution_service import with_resolution_user
 from repositories.musicbrainz_base import (
     MbSourceContext,
     capture_mb_source_context,
     mb_publish_if_current,
+    is_mb_source_current,
 )
 from infrastructure.serialization import clone_with_updates
 
@@ -63,6 +68,7 @@ if TYPE_CHECKING:
     from services.native.library_ownership_service import LibraryOwnershipService
     from services.home.genre_artwork_service import GenreArtworkService
     from services.native.background_workload_gate import BackgroundWorkloadGate
+    from services.plugin_sources import PluginSourceRegistry
 
 # full cache entries live long; freshness is governed by the SWR window below so an
 # expired-but-present copy is still served instantly while a rebuild runs behind it
@@ -99,6 +105,8 @@ class HomeService:
         ownership_service: "LibraryOwnershipService | None" = None,
         genre_artwork_service: "GenreArtworkService | None" = None,
         workload_gate: "BackgroundWorkloadGate | None" = None,
+        plugin_sources: "PluginSourceRegistry | None" = None,
+        snapshot_store=None,
     ):
         self._lb_repo = listenbrainz_repo
         self._jf_repo = jellyfin_repo
@@ -114,9 +122,10 @@ class HomeService:
         self._ownership = ownership_service
         self._genre_artwork = genre_artwork_service
         self._workload_gate = workload_gate
+        self._snapshot_store = snapshot_store
         self._transformers = HomeDataTransformers(jellyfin_repo)
 
-        self._helpers = HomeIntegrationHelpers(preferences_service)
+        self._helpers = HomeIntegrationHelpers(preferences_service, plugin_sources)
         # SWR bookkeeping: per-user in-flight guard. Last-attempt times live in a
         # cache sidecar swept with the payload (see _home_built_sidecar_key) so
         # freshness bookkeeping shares fate with the data it describes.
@@ -171,6 +180,8 @@ class HomeService:
             return
         try:
             owned = await self._library_repo.existing_artist_mbids(candidate_ids)
+        except OptionalWorkDeferred:
+            raise
         except Exception as exc:  # noqa: BLE001 - ownership flags are best-effort
             logger.warning("native artist mbid lookup failed: %s", exc)
             return
@@ -249,15 +260,19 @@ class HomeService:
             return False
         return time.time() - float(at) <= HOME_STALE_REVALIDATE_SECONDS
 
-    async def warm_cache(self, user_id: str) -> None:
+    @with_resolution_user
+    async def warm_cache(self, user_id: str) -> bool:
         _home_source_context.set(capture_mb_source_context())
+        context = _home_source_context.get()
+        lease = self._snapshot_store.user_lease(user_id) if self._snapshot_store is not None else None
         if self._workload_gate is not None:
             await self._workload_gate.wait_until_available()
         if user_id in self._building:
-            return
+            return False
         self._building.add(user_id)
         cache_key: str | None = None
         built_ok = False
+        deferred = False
         try:
             # resolve INSIDE the try: a transient token-decrypt or locked-SQLite read
             # here must still clear the building flag, or the user is stranded in a
@@ -266,15 +281,24 @@ class HomeService:
             cache_key = self._get_home_cache_key(
                 user_id, music.lb_enabled, music.lfm_enabled
             )
-            response = await self._build_full(user_id, music)
+            with optional_dispatch_guard(
+                lambda: is_mb_source_current(context) and (lease is None or lease.active)
+            ):
+                check_optional_dispatch()
+                response = await self._build_full(user_id, music)
+            if lease is not None and not lease.active:
+                raise OptionalWorkDeferred()
             if self._memory_cache:
-                await mb_publish_if_current(
-                    _home_source_context.get(),
-                    lambda: self._memory_cache.set(
-                        cache_key, response, HOME_CACHE_TTL
-                    ),
-                )
-            built_ok = True
+                async def publish() -> None:
+                    if lease is not None and not lease.active:
+                        raise OptionalWorkDeferred()
+                    await self._memory_cache.set(cache_key, response, HOME_CACHE_TTL)
+                built_ok = await mb_publish_if_current(context, publish)
+            else:
+                built_ok = is_mb_source_current(context)
+        except OptionalWorkDeferred:
+            deferred = True
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to build home data: {e}")
         finally:
@@ -282,15 +306,16 @@ class HomeService:
             # record every completed attempt (success or failure) in the sidecar
             # so the miss path backs off after a doomed build, while sweeps of
             # the payload take the bookkeeping with them (sweep-coherent SWR)
-            if cache_key is not None and self._memory_cache:
+            if cache_key is not None and self._memory_cache and not deferred and (lease is None or lease.active):
                 await mb_publish_if_current(
-                    _home_source_context.get(),
+                    context,
                     lambda: self._memory_cache.set(
                         self._home_built_sidecar_key(cache_key),
                         {"at": time.time(), "ok": built_ok},
                         HOME_CACHE_TTL,
                     ),
                 )
+        return built_ok
 
     async def _resolve_user_music(
         self, user_id: str, source: str | None
@@ -361,17 +386,26 @@ class HomeService:
         task_name = f"home-warm-{user_id}"
         if registry.is_running(task_name):
             return
-        task = asyncio.create_task(self._run_triggered_warm(user_id))
+        context = capture_mb_source_context()
+        lease = self._snapshot_store.user_lease(user_id) if self._snapshot_store is not None else None
+        task = asyncio.create_task(self._run_triggered_warm(user_id, context, lease))
         try:
             registry.register(task_name, task)
         except RuntimeError:
             pass
 
-    async def _run_triggered_warm(self, user_id: str) -> None:
-        if self._workload_gate is None:
-            await self.warm_cache(user_id)
-            return
-        await self._workload_gate.run_warmer_unit(lambda: self.warm_cache(user_id))
+    async def _run_triggered_warm(self, user_id: str, context: MbSourceContext, lease) -> None:
+        with optional_work_budget(), optional_dispatch_guard(
+            lambda: is_mb_source_current(context) and (lease is None or lease.active)
+        ):
+            try:
+                check_optional_dispatch()
+                if self._workload_gate is None:
+                    await self.warm_cache(user_id)
+                    return
+                await self._workload_gate.run_warmer_unit(lambda: self.warm_cache(user_id))
+            except OptionalWorkDeferred:
+                return
 
     @deduplicate(lambda self, user_id: f"{HOME_RESPONSE_PREFIX}dedup:{user_id}")
     async def get_home_data(self, user_id: str) -> HomeResponse:
@@ -638,20 +672,8 @@ class HomeService:
                 seed_artist_mbid=first.seed_artist_mbid,
                 items=preview_items,
             )
+        except OptionalWorkDeferred:
+            raise
         except Exception:  # noqa: BLE001
             return None
 
-    async def _resolve_release_mbids(self, release_ids: list[str]) -> dict[str, str]:
-        if not release_ids:
-            return {}
-        import asyncio as _asyncio
-
-        tasks = [
-            self._mb_repo.get_release_group_id_from_release(rid) for rid in release_ids
-        ]
-        results = await _asyncio.gather(*tasks, return_exceptions=True)
-        rg_map: dict[str, str] = {}
-        for rid, rg_id in zip(release_ids, results):
-            if isinstance(rg_id, str) and rg_id:
-                rg_map[rid] = rg_id
-        return rg_map

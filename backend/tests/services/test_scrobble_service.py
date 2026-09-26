@@ -311,12 +311,16 @@ class TestPluginDispatch:
     @pytest.mark.asyncio
     async def test_accepted_scrobble_fans_out_to_plugins(self):
         """01b scrobbler capability: an accepted play dispatches to the plugin
-        host fire-and-forget, without blocking the response."""
+        host fire-and-forget, without blocking the response. The ``scrobble``
+        kind goes through ``dispatch_event`` ONLY (the host fans it to v0
+        scrobblers exactly once); a direct ``dispatch_scrobble`` call here as
+        well would fire ``on_scrobble`` twice."""
         import asyncio
         from unittest.mock import AsyncMock, MagicMock
 
         service, *_ = _make_service()
         host = MagicMock()
+        host.dispatch_event = AsyncMock()
         host.dispatch_scrobble = AsyncMock()
         service._plugin_host = host
 
@@ -324,9 +328,14 @@ class TestPluginDispatch:
         assert result.accepted is True
         await asyncio.gather(*service._plugin_tasks)
 
-        host.dispatch_scrobble.assert_awaited_once()
-        event = host.dispatch_scrobble.await_args.args[0]
-        assert event.track == _scrobble_req().track_name
+        host.dispatch_scrobble.assert_not_awaited()
+        kinds = [call.args[0].kind for call in host.dispatch_event.await_args_list]
+        assert "scrobble" in kinds and "playback_started" in kinds
+        scrobble_event = next(
+            call.args[0] for call in host.dispatch_event.await_args_list
+            if call.args[0].kind == "scrobble"
+        )
+        assert scrobble_event.payload.track == _scrobble_req().track_name
 
     @pytest.mark.asyncio
     async def test_short_tracks_do_not_reach_plugins(self):
@@ -335,10 +344,12 @@ class TestPluginDispatch:
 
         service, *_ = _make_service()
         host = MagicMock()
+        host.dispatch_event = AsyncMock()
         host.dispatch_scrobble = AsyncMock()
         service._plugin_host = host
 
         await service.submit_scrobble(_scrobble_req(duration_ms=5_000), user_id="u")
         await asyncio.gather(*service._plugin_tasks)
 
+        host.dispatch_event.assert_not_awaited()
         host.dispatch_scrobble.assert_not_awaited()

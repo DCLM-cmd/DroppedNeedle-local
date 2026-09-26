@@ -1,0 +1,24 @@
+[plugin]
+name = "local-folder-client"
+display_name = "Local Folder (example)"
+version = "1.0.0"
+api_version = 1
+entrypoint = "plugin:LocalFolderClient"
+capabilities = ["download_client"]
+description = "Reference folder-mode client: stages files from a local source folder for import."
+author = "DroppedNeedle examples"
+
+[[capability]]
+id = "download_client"
+source = "local-folder-client"
+display_name = "Local Folder"
+
+[[settings]]
+key = "source_dir"
+label = "Source directory"
+help = "Folder the paired local-folder-indexer scans; enqueue payloads point inside it."
+
+[[settings]]
+key = "downloads_dir"
+label = "Downloads directory"
+help = "Local folder staged copies are written to, keyed by task id."

@@ -151,12 +151,29 @@ class InstrumentedCache(CacheInterface):
         self._counters = WindowedCounterMap()
         self._since = int(time.time())
 
+    def capture_clear_token(self) -> tuple[object, int]:
+        return self._inner.capture_clear_token()
+
+    async def set_if_token(
+        self, token: tuple[object, int], key: str, value: Any,
+        ttl_seconds: int | float = 60, *, metadata: Any = None,
+    ) -> bool:
+        published = await self._inner.set_if_token(token, key, value, ttl_seconds, metadata=metadata)
+        if published:
+            self._counters.increment((prefix_label(key), "set"))
+        return published
+
     async def get(self, key: str) -> Any | None:
         value = await self._inner.get(key)
         self._counters.increment(
             (prefix_label(key), "hit" if value is not None else "miss")
         )
         return value
+
+    async def get_with_metadata(self, key: str) -> tuple[Any, Any]:
+        value, metadata = await self._inner.get_with_metadata(key)
+        self._counters.increment((prefix_label(key), "hit" if value is not None else "miss"))
+        return value, metadata
 
     async def set(self, key: str, value: Any, ttl_seconds: int = 60) -> None:
         self._counters.increment((prefix_label(key), "set"))

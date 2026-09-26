@@ -134,7 +134,11 @@ class NewznabClient:
                 self._base_url, params=merged, timeout=timeout
             )
         except httpx.HTTPError as exc:
-            raise NewznabApiError(f"newznab request failed: {exc}") from exc
+            # httpx timeouts stringify to '' (e.g. ReadTimeout('')), which
+            # collapsed the failure to "newznab request failed: " (#389). The
+            # class name carries no hosts/paths/keys, so it is safe to surface.
+            detail = str(exc) or type(exc).__name__
+            raise NewznabApiError(f"newznab request failed: {detail}") from exc
         if response.status_code == 429:
             retry_after = _retry_after(response)
             raise RateLimitedError(

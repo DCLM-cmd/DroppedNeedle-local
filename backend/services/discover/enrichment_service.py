@@ -3,7 +3,8 @@ import logging
 from typing import Any
 from urllib.parse import quote_plus
 
-from api.v1.schemas.discover import DiscoverQueueEnrichment
+from api.v1.schemas.discover import DiscoverQueueEnrichment, DiscoverQueuePreview
+from infrastructure.observability.optional_work import OptionalWorkDeferred
 from infrastructure.cache.cache_keys import DISCOVER_QUEUE_ENRICH_PREFIX
 from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.queue.priority_queue import RequestPriority
@@ -17,10 +18,13 @@ from repositories.musicbrainz_base import (
     MbSourceContext,
     capture_mb_source_context,
     is_mb_source_current,
-    mb_publish_if_current,
     normalize_mb_id,
+    mb_cache_set_if_current, mb_cache_get_if_current,
 )
 from services.discover.integration_helpers import IntegrationHelpers
+from repositories.musicbrainz_response_cache import (
+    get_mb_response_metadata, merge_mb_metadata, response_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +68,7 @@ class QueueEnrichmentService:
         release_group_mbid = normalize_mb_id(release_group_mbid)
         cache_key = f"{DISCOVER_QUEUE_ENRICH_PREFIX}{release_group_mbid}"
         if self._memory_cache:
-            cached = await self._memory_cache.get(cache_key)
+            cached = await mb_cache_get_if_current(self._memory_cache, cache_key, source_context)
             if (
                 is_mb_source_current(source_context)
                 and cached is not None
@@ -107,6 +111,8 @@ class QueueEnrichmentService:
         source_context: MbSourceContext | None = None,
     ) -> DiscoverQueueEnrichment:
         source_context = source_context or capture_mb_source_context()
+        response_metadata.set(None)
+        cache_token = self._memory_cache.capture_clear_token() if self._memory_cache else None
         enrichment = DiscoverQueueEnrichment()
 
         rg_data = await self._mb_repo.get_release_group_by_id(
@@ -114,10 +120,11 @@ class QueueEnrichmentService:
             includes=["artist-credits", "releases", "tags", "url-rels"],
             priority=priority,
         )
+        rg_metadata = get_mb_response_metadata()
+        artist_metadata = None
 
         artist_mbid = ""
         youtube_url = None
-        first_release_id: str | None = None
 
         if rg_data:
             tags_raw = rg_data.get("tags", [])
@@ -141,7 +148,6 @@ class QueueEnrichmentService:
             if releases:
                 first_release = releases[0]
                 enrichment.release_date = first_release.get("date")
-                first_release_id = first_release.get("id")
 
         album_name = rg_data.get("title", "") if rg_data else ""
         artist_name_for_search = ""
@@ -153,58 +159,16 @@ class QueueEnrichmentService:
                     artist_name_for_search = a["name"]
                     break
 
-        async def _hunt_youtube() -> str | None:
-            """A2 part 2: release -> <=3 recordings YouTube hunt. Runs
-            concurrently with the enrichment legs instead of stacking after
-            them."""
-            if not first_release_id or youtube_url:
-                return None
-            release_data = await self._mb_repo.get_release_by_id(
-                first_release_id,
-                includes=["recordings", "url-rels"],
-                priority=priority,
-            )
-            if not release_data:
-                return None
-            yt_raw = self._mb_repo.extract_youtube_url_from_relations(release_data)
-            if yt_raw:
-                return self._mb_repo.youtube_url_to_embed(yt_raw)
-
-            tracks = release_data.get("media") or release_data.get("medium-list", [])
-            rec_ids: list[str] = []
-            for medium in tracks:
-                for track in medium.get("tracks") or medium.get("track-list", []):
-                    rec_id = track.get("recording", {}).get("id")
-                    if rec_id:
-                        rec_ids.append(rec_id)
-                    if len(rec_ids) >= 3:
-                        break
-                if len(rec_ids) >= 3:
-                    break
-            if not rec_ids:
-                return None
-            rec_results = await asyncio.gather(
-                *[
-                    self._mb_repo.get_recording_by_id(rid, includes=["url-rels"])
-                    for rid in rec_ids
-                ],
-                return_exceptions=True,
-            )
-            for rec_data in rec_results:
-                if isinstance(rec_data, Exception) or not rec_data:
-                    continue
-                yt_raw = self._mb_repo.extract_youtube_url_from_relations(rec_data)
-                if yt_raw:
-                    return self._mb_repo.youtube_url_to_embed(yt_raw)
-            return None
 
         async def _get_artist_and_bio():
+            nonlocal artist_metadata
             if not artist_mbid:
                 return
             try:
-                mb_artist = await self._mb_repo.get_artist_by_id(
+                mb_artist = await self._mb_repo.get_artist_core(
                     artist_mbid, priority=priority
                 )
+                artist_metadata = get_mb_response_metadata()
                 if mb_artist:
                     enrichment.country = mb_artist.get("country") or mb_artist.get(
                         "area", {}
@@ -227,6 +191,8 @@ class QueueEnrichmentService:
                             )
                             if bio:
                                 enrichment.artist_description = bio
+            except OptionalWorkDeferred:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to get artist MB data: {e}")
 
@@ -241,6 +207,8 @@ class QueueEnrichmentService:
                 if count is not None:
                     enrichment.listen_count = count
             except asyncio.CancelledError:
+                raise
+            except OptionalWorkDeferred:
                 raise
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to get listen count: {e}")
@@ -265,6 +233,8 @@ class QueueEnrichmentService:
                         cleaned_summary = clean_lastfm_bio(album_info.summary)
                         if cleaned_summary:
                             enrichment.artist_description = cleaned_summary
+            except OptionalWorkDeferred:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.debug("Failed Last.fm album fallback for discover queue: %s", e)
 
@@ -288,30 +258,21 @@ class QueueEnrichmentService:
                     cleaned_bio = clean_lastfm_bio(artist_info.bio_summary)
                     if cleaned_bio:
                         enrichment.artist_description = cleaned_bio
+            except OptionalWorkDeferred:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.debug("Failed Last.fm artist fallback for discover queue: %s", e)
 
         async def _bio_then_lastfm():
-            # A2 part 2 deviation (documented): the Last.fm fallback keeps its
-            # fill-the-gaps precedence by sequencing AFTER the wiki bio, while
-            # still overlapping the MB-artist RTT with the YouTube hunt and
-            # the LB POST. Guarantees order-stable results under overlap.
             await _get_artist_and_bio()
             await _apply_lastfm_fallback()
 
-        # A2 part 2: overlap the independent workstreams. Every task writes
-        # disjoint fields (except the sequenced bio->lastfm pair above), and
-        # the finally-cancel below leaves no orphan futures.
         tasks: list[asyncio.Task[Any]] = [
-            asyncio.create_task(_hunt_youtube()),
             asyncio.create_task(_get_listen_count()),
             asyncio.create_task(_bio_then_lastfm()),
         ]
         try:
-            results = await asyncio.gather(*tasks)
-            hunted = results[0]
-            if hunted:
-                youtube_url = hunted
+            await asyncio.gather(*tasks)
         finally:
             for task in tasks:
                 if not task.done():
@@ -326,16 +287,89 @@ class QueueEnrichmentService:
             )
 
         enrichment.youtube_url = youtube_url
+        response_metadata.set(merge_mb_metadata(rg_metadata, artist_metadata))
         enrichment.youtube_search_url = f"https://www.youtube.com/results?search_query={quote_plus(f'{artist_name_for_search} {album_name}')}"
 
         if self._memory_cache:
             enrich_ttl = self._integration.get_queue_settings().enrich_ttl
-            await mb_publish_if_current(
-                source_context,
-                lambda: self._memory_cache.set(cache_key, enrichment, enrich_ttl),
+            await mb_cache_set_if_current(
+                self._memory_cache, cache_key, enrichment,
+                ttl_seconds=enrich_ttl, context=source_context, cache_token=cache_token,
             )
 
         return enrichment
+
+    async def preview_queue_item(self, release_group_mbid: str, youtube_repo) -> DiscoverQueuePreview:
+        from core.exceptions import ConfigurationError, RateLimitedError, ValidationError
+        from infrastructure.validators import is_valid_mbid
+        from infrastructure.observability.provider_counters import ProviderWorkload, provider_workload
+
+        if not is_valid_mbid(release_group_mbid):
+            raise ValidationError("Invalid release group MBID")
+        with provider_workload(ProviderWorkload.QUEUE):
+            rg = await self._mb_repo.get_release_group_by_id(
+                release_group_mbid, includes=["artist-credits", "releases", "url-rels"],
+                priority=RequestPriority.USER_INITIATED,
+            )
+            if not rg:
+                return DiscoverQueuePreview(status="not_found")
+            artist = next((credit["artist"].get("name", "") for credit in rg.get("artist-credit", [])
+                           if isinstance(credit, dict) and isinstance(credit.get("artist"), dict)), "")
+            album = rg.get("title", "")
+            search_url = f"https://www.youtube.com/results?search_query={quote_plus(f'{artist} {album}')}"
+
+            def available(data):
+                direct = self._mb_repo.extract_youtube_url_from_relations(data)
+                embed = self._mb_repo.youtube_url_to_embed(direct) if direct else None
+                if embed:
+                    return DiscoverQueuePreview(status="available", youtube_url=embed,
+                                                youtube_search_url=search_url)
+                return None
+
+            if result := available(rg):
+                return result
+            releases = rg.get("releases") or rg.get("release-list", [])
+            release_id = releases[0].get("id") if releases else None
+            if release_id:
+                # Sequential by design: url-rels first so the recordings
+                # payload is only fetched when no direct embed resolved.
+                release = await self._mb_repo.get_release_by_id(
+                    release_id, includes=["url-rels"], priority=RequestPriority.USER_INITIATED,
+                )
+                if release and (result := available(release)):
+                    return result
+                release = await self._mb_repo.get_release_by_id(
+                    release_id, includes=["recordings"], priority=RequestPriority.USER_INITIATED,
+                )
+                recording_ids = []
+                for medium in (release or {}).get("media") or (release or {}).get("medium-list", []):
+                    for track in medium.get("tracks") or medium.get("track-list", []):
+                        recording_id = track.get("recording", {}).get("id")
+                        if recording_id and recording_id not in recording_ids:
+                            recording_ids.append(recording_id)
+                        if len(recording_ids) == 3:
+                            break
+                    if len(recording_ids) == 3:
+                        break
+                for recording_id in recording_ids:
+                    recording = await self._mb_repo.get_recording_by_id(recording_id, includes=["url-rels"])
+                    if recording and (result := available(recording)):
+                        return result
+            if not youtube_repo or not artist or not album:
+                return DiscoverQueuePreview(status="unavailable", youtube_search_url=search_url)
+            try:
+                video_id = await youtube_repo.search_video(artist, album)
+            except ConfigurationError:
+                return DiscoverQueuePreview(status="unavailable", youtube_search_url=search_url)
+            except RateLimitedError as exc:
+                if (exc.details or {}).get("reason") != "youtube_daily_quota":
+                    raise
+                return DiscoverQueuePreview(status="unavailable", youtube_search_url=search_url)
+            return DiscoverQueuePreview(
+                status="available" if video_id else "not_found",
+                youtube_url=f"https://www.youtube.com/embed/{video_id}" if video_id else None,
+                youtube_search_url=search_url,
+            )
 
     # A2 part 3: LB popularity batch coalescer.
     #

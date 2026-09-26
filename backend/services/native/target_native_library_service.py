@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -148,6 +149,57 @@ class TargetNativeLibraryService:
         )
         return [self._album(row) for row in rows]
 
+    @staticmethod
+    def _display_pick(
+        identity: dict[str, Any] | None,
+        tracks: list[dict[str, Any]],
+        pin: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Best-fit display pick: per-copy pin, owned identity, unanimous tags.
+
+        Display only - the result must never feed identity or management
+        gates. Unanimous embedded tags require full coverage: every indexed
+        track must carry the same valid release MBID. Unlike the provider
+        album lane there is no file-count/ranked fallback here (no cached
+        provider data on this path), so unproven albums without tags get
+        no pick rather than a ranked guess.
+        """
+        if pin:
+            # Pins validate as MBIDs at set time, but a stale row must never
+            # render as a confident pick: fall through to owned/tags instead.
+            try:
+                uuid.UUID(str(pin))
+            except ValueError:
+                pass
+            else:
+                return str(pin), "pin"
+        if identity is not None and identity.get("release_mbid"):
+            owned = str(identity["release_mbid"])
+            try:
+                uuid.UUID(owned)
+            except ValueError:
+                pass
+            else:
+                return owned, "owned"
+        if tracks:
+            embedded = {
+                str(track["embedded_release_mbid"]).casefold(): str(
+                    track["embedded_release_mbid"]
+                )
+                for track in tracks
+                if track.get("embedded_release_mbid")
+            }
+            if len(embedded) == 1 and all(
+                track.get("embedded_release_mbid") for track in tracks
+            ):
+                candidate = next(iter(embedded.values()))
+                try:
+                    uuid.UUID(candidate)
+                except ValueError:
+                    return None, None
+                return candidate, "embedded_tags"
+        return None, None
+
     async def album_detail(self, album_id: str) -> TargetNativeAlbumDetail | None:
         album = await self.album(album_id)
         if album is None:
@@ -160,12 +212,25 @@ class TargetNativeLibraryService:
         tracks = [
             track for track in context["tracks"] if track["availability"] == "indexed"
         ]
-        contribution, custom, exclusion, conversion = await asyncio.gather(
-            self._store.get_active_album_contribution(album.id),
-            self._store.get_custom_edition_state(album.id),
-            self._store.get_management_exclusion(album.id),
-            self._store.get_active_edition_conversion(album.id),
+        contribution, custom, exclusion, conversion, (pin, pin_group) = (
+            await asyncio.gather(
+                self._store.get_active_album_contribution(album.id),
+                self._store.get_custom_edition_state(album.id),
+                self._store.get_management_exclusion(album.id),
+                self._store.get_active_edition_conversion(album.id),
+                self._store.get_target_album_release_pin_with_group(album.id),
+            )
         )
+        if pin is not None and (
+            pin_group is None
+            or pin_group.casefold()
+            != str((identity or {}).get("release_group_mbid") or "").casefold()
+        ):
+            # Pinned under another group (or identity since detached): a
+            # well-formed UUID for the wrong album must not render as a
+            # confident pick. The row stays for re-pinning; display falls
+            # through to owned/tags.
+            pin = None
         if (
             identity is not None
             and review is not None
@@ -188,8 +253,15 @@ class TargetNativeLibraryService:
         if custom is not None:
             album_values["album_identity_state"] = "custom_edition"
             album_values["musicbrainz_release_id"] = None
+        display_release_mbid, pick_basis = (
+            (None, None)
+            if custom is not None
+            else self._display_pick(identity, tracks, pin)
+        )
         return TargetNativeAlbumDetail(
             **album_values,
+            display_release_mbid=display_release_mbid,
+            pick_basis=pick_basis,
             row_revision=int(context["album"]["row_revision"]),
             input_revision=":".join(album_input_revisions(tracks)),
             identification_status=status,

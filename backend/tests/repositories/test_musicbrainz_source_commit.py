@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import asyncio
 import pytest
@@ -19,11 +19,11 @@ class _BlockingCache(InMemoryCache):
         self.release = release
         self.events = events
 
-    async def set(self, key, value, *, ttl_seconds):
+    async def set_if_token(self, token, key, value, ttl_seconds=60, *, metadata=None):
         self.started.set()
         await self.release.wait()
         self.events.append(("cache", mb_base.get_mb_api_base()))
-        await super().set(key, value, ttl_seconds=ttl_seconds)
+        return await super().set_if_token(token, key, value, ttl_seconds=ttl_seconds, metadata=metadata)
 
 
 class _BlockingStore:
@@ -120,7 +120,7 @@ async def test_cache_publication_commits_before_source_switch(
     release = asyncio.Event()
     events = []
     cache = _BlockingCache(started, release, events)
-    service = SettingsService(preferences_service=None, cache=cache)
+    service = SettingsService(preferences_service=None, cache=cache, mb_response_store=AsyncMock(), follow_store=AsyncMock())
     source_events = []
     original_set = mb_base.set_mb_api_base
 
@@ -136,6 +136,7 @@ async def test_cache_publication_commits_before_source_switch(
             "old",
             ttl_seconds=60,
             context=old_context,
+            cache_token=mb_base.capture_mb_cache_token(cache),
         )
     )
     await started.wait()
@@ -179,7 +180,7 @@ async def test_durable_publication_commits_before_source_switch(
     repo = _Repo(cache)
     store = _BlockingStore(started, release, events)
     repo._mb_canonical_store = store
-    service = SettingsService(preferences_service=None, cache=cache)
+    service = SettingsService(preferences_service=None, cache=cache, mb_response_store=AsyncMock(), follow_store=AsyncMock())
     source_events = []
     original_set = mb_base.set_mb_api_base
 
@@ -196,7 +197,9 @@ async def test_durable_publication_commits_before_source_switch(
     monkeypatch.setattr(mb_album, "mb_api_get", provider)
     lookup = asyncio.create_task(
         repo._fetch_release_group_id_from_release(
-            "rel-fence", "mb:release_to_rg:rel-fence"
+            "44444444-4444-4444-8444-444444444444",
+            "mb:release_to_rg:44444444-4444-4444-8444-444444444444",
+            cache_token=mb_base.capture_mb_cache_token(cache),
         )
     )
     await started.wait()
@@ -212,8 +215,15 @@ async def test_durable_publication_commits_before_source_switch(
 
     assert events == [("store", old_source)]
     assert source_events == [("source", new_source)]
-    assert store.saved == [({"rel-fence": "rg-old"}, "https://old.example")]
-    assert await cache.get("mb:release_to_rg:rel-fence") is None
+    assert store.saved == [
+        ({"44444444-4444-4444-8444-444444444444": "rg-old"}, "https://old.example")
+    ]
+    assert (
+        await cache.get(
+            "mb:release_to_rg:44444444-4444-4444-8444-444444444444"
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -238,7 +248,7 @@ async def test_cancelled_durable_publication_settles_before_releasing_source_loc
     release = asyncio.Event()
     events = []
     store = _BlockingStore(started, release, events)
-    service = SettingsService(preferences_service=None, cache=InMemoryCache())
+    service = SettingsService(preferences_service=None, cache=InMemoryCache(), mb_response_store=AsyncMock(), follow_store=AsyncMock())
 
     publication = asyncio.create_task(
         store.save_release_to_rg(

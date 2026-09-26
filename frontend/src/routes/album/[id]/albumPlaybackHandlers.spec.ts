@@ -19,9 +19,17 @@ vi.mock('$lib/stores/player.svelte', () => ({
 		playMultipleNext: mocks.playMultipleNext
 	}
 }));
-vi.mock('$lib/utils/downloadHelper', () => ({ downloadFile: vi.fn() }));
+const blob = vi.hoisted(() => ({ download: vi.fn() }));
+vi.mock('$lib/utils/blobDownload', () => ({ downloadBlob: blob.download }));
+const toast = vi.hoisted(() => ({ show: vi.fn() }));
+vi.mock('$lib/stores/toast', () => ({ toastStore: { show: toast.show } }));
 
-import { buildSourceCallbacks, playSourceTrack } from './albumPlaybackHandlers';
+import {
+	buildLocalAlbumDownloadCallback,
+	buildSourceCallbacks,
+	getTrackContextMenuItems,
+	playSourceTrack
+} from './albumPlaybackHandlers';
 
 const album: AlbumBasicInfo = {
 	title: 'Avalon',
@@ -133,5 +141,148 @@ describe('album playback canonical titles', () => {
 		expect(queued[1].trackName).toBe('The Fisherman Will Be Bewildered');
 		expect(next[1].trackName).toBe('The Fisherman Will Be Bewildered');
 		expect(playlist[1].trackName).toBe('The Fisherman Will Be Bewildered');
+	});
+});
+
+describe('track context menu Download item', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		blob.download.mockResolvedValue(undefined);
+	});
+
+	function itemsFor(file: LocalTrackInfo | null) {
+		return getTrackContextMenuItems(
+			{ position: 1, disc_number: 1, title: 'She Loves Me So' },
+			album,
+			file,
+			null,
+			null,
+			null,
+			null
+		);
+	}
+
+	it('downloads the local file via blob with a success toast', async () => {
+		const download = itemsFor(localTracks[0]).find((item) => item.label === 'Download');
+		expect(download).toBeDefined();
+
+		download!.onclick();
+		await vi.waitFor(() => {
+			expect(blob.download).toHaveBeenCalledWith('/api/v1/download/local/track/file-1');
+		});
+		expect(toast.show).toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+	});
+
+	it('toasts a user-safe error when the blob download fails', async () => {
+		blob.download.mockRejectedValueOnce(new Error('gone'));
+		const download = itemsFor(localTracks[0]).find((item) => item.label === 'Download');
+
+		download!.onclick();
+		await vi.waitFor(() => {
+			expect(toast.show).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+		});
+		const messages = toast.show.mock.calls.map((call) => String(call[0].message));
+		expect(messages.every((message) => !message.includes('/api/v1/download'))).toBe(true);
+	});
+
+	it('omits the Download item when no local file is resolved', () => {
+		const labels = itemsFor(null).map((item) => item.label);
+		expect(labels).toEqual(['Add to Queue', 'Play Next', 'Add to Playlist']);
+	});
+
+	it('omits the Download item when downloads are restricted', () => {
+		const items = getTrackContextMenuItems(
+			{ position: 1, disc_number: 1, title: 'She Loves Me So' },
+			album,
+			localTracks[0],
+			null,
+			null,
+			null,
+			null,
+			false
+		);
+		expect(items.map((item) => item.label)).toEqual([
+			'Add to Queue',
+			'Play Next',
+			'Add to Playlist'
+		]);
+	});
+});
+
+describe('track context menu Remove file item', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+	});
+
+	function itemsFor(onRemoveLocalFile?: (fileId: string) => void) {
+		return getTrackContextMenuItems(
+			{ position: 1, disc_number: 1, title: 'She Loves Me So' },
+			album,
+			localTracks[0],
+			null,
+			null,
+			null,
+			null,
+			true,
+			onRemoveLocalFile
+		);
+	}
+
+	it('omits the Remove file item when no callback is supplied (viewer not trusted)', () => {
+		expect(itemsFor().map((item) => item.label)).not.toContain('Remove file');
+	});
+
+	it('omits the Remove file item when no local file is resolved', () => {
+		const items = getTrackContextMenuItems(
+			{ position: 1, disc_number: 1, title: 'She Loves Me So' },
+			album,
+			null,
+			null,
+			null,
+			null,
+			null,
+			true,
+			vi.fn()
+		);
+		expect(items.map((item) => item.label)).not.toContain('Remove file');
+	});
+
+	it('opens the confirm dialog for the resolved local file', () => {
+		const onRemoveLocalFile = vi.fn();
+		const remove = itemsFor(onRemoveLocalFile).find((item) => item.label === 'Remove file');
+		expect(remove).toBeDefined();
+
+		remove!.onclick();
+
+		expect(onRemoveLocalFile).toHaveBeenCalledWith('file-1');
+	});
+});
+
+describe('buildLocalAlbumDownloadCallback', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		blob.download.mockResolvedValue(undefined);
+	});
+
+	it('returns undefined without a local match MBID', () => {
+		expect.assertions(2);
+		expect(buildLocalAlbumDownloadCallback(null, true)).toBeUndefined();
+		expect(buildLocalAlbumDownloadCallback(undefined, true)).toBeUndefined();
+	});
+
+	it('returns undefined when downloads are restricted', () => {
+		expect.assertions(1);
+		expect(buildLocalAlbumDownloadCallback('mbid-1', false)).toBeUndefined();
+	});
+
+	it('downloads the album zip by MBID', async () => {
+		expect.assertions(2);
+		const callback = buildLocalAlbumDownloadCallback('mbid-1', true);
+		expect(callback).toBeDefined();
+
+		callback!();
+		await vi.waitFor(() => {
+			expect(blob.download).toHaveBeenCalledWith('/api/v1/download/local/album/mbid/mbid-1');
+		});
 	});
 });

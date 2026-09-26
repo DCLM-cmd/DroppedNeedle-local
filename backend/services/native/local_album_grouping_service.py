@@ -18,10 +18,18 @@ from models.identification import (
 from services.native.identification_queue_service import IdentificationQueueService
 from services.native.identification_revisions import album_input_revisions
 from services.native.local_album_grouper import (
+    CONTINUITY_COMPONENT_EDGE_LIMIT,
+    PROVISIONAL_PARSED_GROUP,
     LocalAlbumGrouper,
     _hungarian_min,
     grouping_directory,
     normalize_group_value,
+)
+from services.native.track_provenance import (
+    derive_album_provenance,
+    derive_title_artist_provenance,
+    resolve_provenance,
+    track_stem,
 )
 
 _GROUPING_NAMESPACE = uuid.UUID("296d6087-edf2-4861-8c72-7eae22654aef")
@@ -29,7 +37,8 @@ ARTIST_RESOLUTION_BATCH_SIZE = 256
 QUEUE_BATCH_SIZE = 256
 STAGING_BATCH_SIZE = 500
 STAGED_GROUPING_THRESHOLD = 512
-CONTINUITY_COMPONENT_EDGE_LIMIT = 512
+# CONTINUITY_COMPONENT_EDGE_LIMIT lives in local_album_grouper (imported
+# above) so the small-path and staged-path continuity caps stay identical.
 
 
 def _album_artists_from_row(row: dict) -> list[str]:
@@ -45,14 +54,44 @@ def _album_artists_from_row(row: dict) -> list[str]:
 
 
 def grouping_track_from_row(row: dict) -> GroupingTrack:
+    relative_path = str(row["relative_path"])
+    stem = track_stem(relative_path)
+    raw_album_title = str(row.get("tag_album_title") or "")
+    raw_album_artist_name = str(row.get("tag_album_artist_name") or "")
+    title = str(row["title"] or "")
+    artist_name = str(row["artist_name"] or "")
+    display_album_title = str(row.get("album_title") or "")
+    display_album_artist_name = str(row.get("album_artist_name") or "")
+    album_title_provenance = resolve_provenance(
+        row.get("album_title_provenance"),
+        derive_album_provenance(raw_album_title, display_album_title),
+    )
+    album_artist_provenance = resolve_provenance(
+        row.get("album_artist_provenance"),
+        derive_album_provenance(raw_album_artist_name, display_album_artist_name),
+    )
     return GroupingTrack(
         local_track_id=str(row["id"]),
         root_id=str(row["root_id"]),
-        relative_path=str(row["relative_path"]),
-        title=str(row["title"] or ""),
-        artist_name=str(row["artist_name"] or ""),
-        album_title=str(row["tag_album_title"] or ""),
-        album_artist_name=str(row["tag_album_artist_name"] or ""),
+        relative_path=relative_path,
+        title=title,
+        artist_name=artist_name,
+        album_title=(
+            display_album_title
+            if not raw_album_title and album_title_provenance == "parsed"
+            else raw_album_title
+        ),
+        album_artist_name=(
+            display_album_artist_name
+            if not raw_album_artist_name and album_artist_provenance == "parsed"
+            else raw_album_artist_name
+        ),
+        title_provenance=resolve_provenance(
+            row.get("title_provenance"),
+            derive_title_artist_provenance(title, artist_name, stem),
+        ),
+        album_title_provenance=album_title_provenance,
+        album_artist_provenance=album_artist_provenance,
         album_artists=_album_artists_from_row(row),
         artist_sort_name=row["artist_sort"],
         album_artist_sort_name=row["album_artist_sort"],
@@ -490,9 +529,48 @@ class LocalAlbumGroupingService:
         track_id = str(row["id"])
         album_title = str(row["tag_album_title"] or "")
         album_artist = str(row["tag_album_artist_name"] or "")
+        display_album_title = str(row.get("album_title") or "")
+        display_album_artist = str(row.get("album_artist_name") or "")
+        # Values exposed to the store fold logic (title_normalized below):
+        # raw tag values, except parsed-keyed rows expose their display
+        # (parsed) values so they sit inside the fold they keyed into.
+        key_title = album_title
+        key_artist = album_artist
         if bool(row["membership_locked"]):
             preliminary_key = f"manual:{row['local_album_id']}"
             reason = "MANUAL_MEMBERSHIP_RESTORED"
+        elif (
+            not album_title.strip()
+            and resolve_provenance(
+                row.get("album_title_provenance"),
+                derive_album_provenance(album_title, display_album_title),
+            )
+            == "parsed"
+            and display_album_title.strip()
+        ):
+            # M-05 staged mirror of the small-path untagged-merge widening
+            # (LocalAlbumGrouper expanded block): parsed rows keyed "missing"
+            # here because only raw tag columns fed the key. Key them as
+            # tagged-or-parsed groups off their display (parsed) values with
+            # the provisional reason, so the unchanged store SQL merges
+            # agreeing parses exactly like the small path does - no store,
+            # SQL, or schema change. Absent/placeholder rows keep "missing"
+            # (strict numbered/no-collision absorb, unchanged), and
+            # conflicting parses land on different folds and stay split. A
+            # mixed tag+parsed group still reports the tagged reason: the
+            # summary picks the alphabetical-min reason value.
+            artist_partition = (
+                ""
+                if bool(row["is_compilation"])
+                else normalize_group_value(display_album_artist)
+            )
+            preliminary_key = (
+                f"tagged:{normalize_group_value(display_album_title)}:"
+                f"{artist_partition}"
+            )
+            reason = PROVISIONAL_PARSED_GROUP
+            key_title = display_album_title
+            key_artist = display_album_artist
         elif album_title.strip():
             artist_partition = "" if bool(row["is_compilation"]) else (
                 normalize_group_value(album_artist)
@@ -512,10 +590,10 @@ class LocalAlbumGroupingService:
         return {
             "local_track_id": track_id,
             "preliminary_key": preliminary_key,
-            "title": album_title,
-            "title_normalized": normalize_group_value(album_title),
-            "album_artist_name": album_artist,
-            "album_artist_normalized": normalize_group_value(album_artist),
+            "title": key_title,
+            "title_normalized": normalize_group_value(key_title),
+            "album_artist_name": key_artist,
+            "album_artist_normalized": normalize_group_value(key_artist),
             "track_number": int(row["track_number"] or 0),
             "old_album_id": str(row["local_album_id"]),
             "album_created_at": float(row["album_created_at"]),

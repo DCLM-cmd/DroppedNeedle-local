@@ -24,6 +24,7 @@ class LibraryAdministrativeWorkService:
             failed_after=now - _RECENT_FAILURE_SECONDS,
         )
         items = [self._operation_item(row) for row in rows]
+        items = await self._group_maintenance_items(items)
         recovery = await self._store.library_management_recovery_diagnostics()
         # Only genuine attention counts. A bundle in ``cleanup_pending`` HAS published -
         # its files are organized - and only the staged-source tidy-up is outstanding,
@@ -53,6 +54,64 @@ class LibraryAdministrativeWorkService:
         return sorted(
             items, key=lambda item: (item.priority, -item.updated_at, item.id)
         )
+
+    async def _group_maintenance_items(
+        self, items: list[LibraryWorkItem]
+    ) -> list[LibraryWorkItem]:
+        """Collapse non-failed maintenance cards into one summed card (#345).
+
+        Per-album repair rows (one or two per identified album) otherwise flood
+        the panel with identical single-album cards capped at 20. Failed rows
+        stay individual: they carry attention state, dismiss keys, and detail
+        links. Totals come from the uncapped summary so a capped feed still
+        sums honestly; a lone row keeps its own identity.
+        """
+        groupable = [
+            item
+            for item in items
+            if item.kind == "maintenance" and item.state != "failed"
+        ]
+        if not groupable:
+            return items
+        summary = await self._store.summarize_active_maintenance_work()
+        if int(summary["jobs"] or 0) <= 1:
+            return items
+        phases = {item.phase for item in groupable}
+        total = int(summary["total"] or 0)
+        return [
+            item
+            for item in items
+            if not (item.kind == "maintenance" and item.state != "failed")
+        ] + [
+            LibraryWorkItem(
+                id="maintenance:grouped",
+                kind="maintenance",
+                state=(
+                    "running"
+                    if summary["running"]
+                    else "paused"
+                    if summary["paused"]
+                    else "queued"
+                ),
+                phase=phases.pop() if len(phases) == 1 else "working",
+                effect="catalog_only",
+                processed=int(summary["processed"] or 0),
+                total=total,
+                unit="albums",
+                indeterminate=total <= 0,
+                started_at=(
+                    float(summary["started_at"])
+                    if summary["started_at"] is not None
+                    else None
+                ),
+                updated_at=float(summary["updated_at"]),
+                succeeded_count=int(summary["succeeded"] or 0),
+                failed_count=int(summary["failed"] or 0),
+                skipped_count=int(summary["skipped"] or 0),
+                priority=min(item.priority for item in groupable),
+                synthetic=True,
+            )
+        ]
 
     @staticmethod
     def _is_superseded(row: dict[str, Any]) -> bool:

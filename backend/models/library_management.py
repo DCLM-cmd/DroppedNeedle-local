@@ -32,6 +32,7 @@ LibraryManagementImportJournalState = Literal[
     "rollback_pending",
     "rolled_back",
     "needs_attention",
+    "resolved",
 ]
 
 
@@ -123,6 +124,7 @@ class LibraryManagementImportBundleRecord(AppStruct):
         "completed",
         "rolled_back",
         "needs_attention",
+        "resolved",
     ]
     result_json: str = "{}"
     created_at: float = 0.0

@@ -413,7 +413,7 @@ async def _http_smoke(
             headers=bearer,
         )
         provider_cover.raise_for_status()
-        secret_status = await json_get("/api/v1/lidarr-import/status", headers=bearer)
+        secret_config = await json_get("/api/v1/lidarr-import/config", headers=bearer)
 
         subsonic_albums = await json_get(
             "/subsonic/rest/getAlbumList2",
@@ -668,7 +668,8 @@ async def _http_smoke(
             for response in (provider_cover, subsonic_cover, jellyfin_cover)
         )
         and playlist_cover.content.startswith(b"\xff\xd8\xff"),
-        "paired_secret_loaded_by_application": secret_status.get("configured") is True,
+        "paired_secret_loaded_by_application": bool(secret_config.get("url"))
+        and bool(secret_config.get("api_key")),
     }
 
 

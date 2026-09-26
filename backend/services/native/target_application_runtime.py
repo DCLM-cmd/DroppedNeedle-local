@@ -99,6 +99,11 @@ async def run_target_identification_worker(
                     if job is not None:
                         await service_getter().run_claimed_job(job, owner)
                         processed = True
+        except asyncio.CancelledError:
+            # R-03: no worker-level cleanup here - claim release lives at
+            # the job level (run_claimed_job), which runs before the cancel
+            # propagates here; deferring here would double-release.
+            break
         except CircuitOpenError as exc:
             logger.exception(
                 "Target identification worker iteration failed%s",
@@ -192,6 +197,11 @@ async def run_target_identification_worker(
             )
         except asyncio.CancelledError:
             break
+        except Exception:  # noqa: BLE001 - a failed wait must not kill the worker
+            # R-03: mirror the supervisor pattern - log with exc_info and take
+            # one error-retry sleep as this iteration's sleep, then continue.
+            logger.exception("Target identification worker wait failed")
+            await asyncio.sleep(ERROR_RETRY_INTERVAL_SECONDS)
 
 
 async def run_target_operation_worker(
@@ -215,6 +225,11 @@ async def run_target_operation_worker(
                 if recovery_getter is not None:
                     await recovery_getter().recover_once()
                 processed = await supervisor.run_once(owner) is not None
+        except asyncio.CancelledError:
+            # R-03: no worker-level cleanup here - claim release lives at the
+            # job level (run_once dispatch), which runs before the cancel
+            # propagates here; releasing here would double-release.
+            break
         except Exception:  # noqa: BLE001 - a durable worker must survive one failed item
             logger.exception("Target operation worker iteration failed")
             wait_seconds = ERROR_RETRY_INTERVAL_SECONDS
@@ -228,6 +243,11 @@ async def run_target_operation_worker(
             )
         except asyncio.CancelledError:
             break
+        except Exception:  # noqa: BLE001 - a failed wait must not kill the worker
+            # R-03: mirror the supervisor pattern - log with exc_info and take
+            # one error-retry sleep as this iteration's sleep, then continue.
+            logger.exception("Target operation worker wait failed")
+            await asyncio.sleep(ERROR_RETRY_INTERVAL_SECONDS)
 
 
 async def run_library_contribution_verification_worker(
@@ -263,6 +283,11 @@ async def run_library_contribution_verification_worker(
             )
         except asyncio.CancelledError:
             break
+        except Exception:  # noqa: BLE001 - a failed wait must not kill the worker
+            # R-03: mirror the supervisor pattern - log with exc_info and take
+            # one error-retry sleep as this iteration's sleep, then continue.
+            logger.exception("Library contribution verification worker wait failed")
+            await asyncio.sleep(ERROR_RETRY_INTERVAL_SECONDS)
 
 
 async def run_target_worker_watchdog(
@@ -275,9 +300,18 @@ async def run_target_worker_watchdog(
     while True:
         try:
             for name, starter in starters.items():
-                if not registry.is_running(name):
-                    logger.warning("Restarting stopped target worker %s", name)
-                    starter()
+                # R-01: each starter is isolated - one throwing starter (or a
+                # throwing is_running check) must not skip the rest of the
+                # sweep. except Exception never catches CancelledError, so a
+                # cancel still reaches the outer break below.
+                try:
+                    if not registry.is_running(name):
+                        logger.warning("Restarting stopped target worker %s", name)
+                        starter()
+                except Exception:  # noqa: BLE001 - one bad starter must not skip the sweep
+                    logger.exception(
+                        "Target worker watchdog starter failed for %s", name
+                    )
         except asyncio.CancelledError:
             break
         except Exception:  # noqa: BLE001 - the supervisor must survive a failed restart

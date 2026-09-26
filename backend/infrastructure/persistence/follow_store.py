@@ -1,6 +1,6 @@
 """Per-user Follow + auto-download persistence.
 
-``PRAGMA foreign_keys=ON`` in ``_connect`` is what makes the
+``foreign_keys = True`` (``PRAGMA foreign_keys=ON``) is what makes the
 ``ON DELETE CASCADE`` to ``auth_users(id)`` fire when a user is deleted.
 
 Per DD1, follow state lives here and never as a column on ``library_artists`` /
@@ -8,6 +8,8 @@ Per DD1, follow state lives here and never as a column on ``library_artists`` /
 """
 
 import logging
+import hashlib
+import json
 import sqlite3
 import threading
 import time
@@ -15,9 +17,13 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import msgspec
+import uuid
 
 from infrastructure.persistence._database import PersistenceBase, _safe_alter
 
+
+class InventoryInvalidated(Exception):
+    """Enrollment changed before the atomic detection hand-off."""
 logger = logging.getLogger(__name__)
 
 _LEGACY_OWNED_RELEASE_GROUPS_SQL = """
@@ -131,10 +137,7 @@ class FollowStore(PersistenceBase):
     def __init__(self, db_path: Path, write_lock: threading.Lock | None = None):
         super().__init__(db_path, write_lock or threading.Lock())
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = super()._connect()
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+    foreign_keys = True
 
     def _ensure_tables(self) -> None:
         conn = self._connect()
@@ -236,9 +239,205 @@ class FollowStore(PersistenceBase):
                 "ON artist_known_releases(artist_mbid_lower, auto_policy_revision) "
                 "WHERE auto_policy_revision IS NOT NULL"
             )
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS follow_due (
+                    artist_mbid_lower TEXT PRIMARY KEY,
+                    due_at REAL NOT NULL DEFAULT 0,
+                    failures INTEGER NOT NULL DEFAULT 0,
+                    last_serviced REAL NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_follow_due
+                    ON follow_due(due_at, last_serviced, artist_mbid_lower);
+                CREATE TABLE IF NOT EXISTS follow_inventory (
+                    artist_mbid_lower TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    policy INTEGER NOT NULL,
+                    phase TEXT NOT NULL DEFAULT 'collecting',
+                    offset INTEGER NOT NULL DEFAULT 0,
+                    total INTEGER,
+                    process TEXT NOT NULL,
+                    inflight INTEGER NOT NULL DEFAULT 0,
+                    progressed_at REAL NOT NULL,
+                    diverge_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS follow_inventory_rows (
+                    artist_mbid_lower TEXT NOT NULL REFERENCES follow_inventory
+                        ON DELETE CASCADE,
+                    phase TEXT NOT NULL,
+                    rg TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY(artist_mbid_lower, phase, rg)
+                );
+                CREATE TABLE IF NOT EXISTS follow_inventory_pages (
+                    artist_mbid_lower TEXT NOT NULL REFERENCES follow_inventory
+                        ON DELETE CASCADE,
+                    phase TEXT NOT NULL,
+                    offset INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    PRIMARY KEY(artist_mbid_lower, phase, offset)
+                );
+                INSERT OR IGNORE INTO follow_due(artist_mbid_lower, due_at)
+                    SELECT f.artist_mbid_lower,
+                        CASE WHEN c.last_status = 'ok' AND c.last_checked_at IS NOT NULL
+                             THEN c.last_checked_at + 86400 ELSE 0 END
+                    FROM user_followed_artists f LEFT JOIN artist_release_check c
+                        USING(artist_mbid_lower);
+                CREATE TRIGGER IF NOT EXISTS follow_enroll_insert
+                AFTER INSERT ON user_followed_artists BEGIN
+                    INSERT INTO follow_due(artist_mbid_lower) VALUES(NEW.artist_mbid_lower)
+                    ON CONFLICT(artist_mbid_lower) DO UPDATE SET due_at=0, failures=0;
+                END;
+                CREATE TRIGGER IF NOT EXISTS follow_enroll_update
+                AFTER UPDATE ON user_followed_artists BEGIN
+                    INSERT INTO follow_due(artist_mbid_lower) VALUES(NEW.artist_mbid_lower)
+                    ON CONFLICT(artist_mbid_lower) DO UPDATE SET due_at=0, failures=0;
+                END;
+                CREATE TRIGGER IF NOT EXISTS follow_success_insert
+                AFTER INSERT ON artist_release_check WHEN NEW.last_status='ok' BEGIN
+                    INSERT INTO follow_due(artist_mbid_lower,due_at)
+                    VALUES(NEW.artist_mbid_lower,NEW.last_checked_at+86400)
+                    ON CONFLICT(artist_mbid_lower) DO UPDATE SET
+                        due_at=excluded.due_at,failures=0;
+                    DELETE FROM follow_inventory WHERE artist_mbid_lower=NEW.artist_mbid_lower;
+                END;
+                CREATE TRIGGER IF NOT EXISTS follow_success_update
+                AFTER UPDATE ON artist_release_check WHEN NEW.last_status='ok' BEGIN
+                    INSERT INTO follow_due(artist_mbid_lower,due_at)
+                    VALUES(NEW.artist_mbid_lower,NEW.last_checked_at+86400)
+                    ON CONFLICT(artist_mbid_lower) DO UPDATE SET
+                        due_at=excluded.due_at,failures=0;
+                    DELETE FROM follow_inventory WHERE artist_mbid_lower=NEW.artist_mbid_lower;
+                END;
+                CREATE TRIGGER IF NOT EXISTS follow_inventory_insert_fence
+                AFTER INSERT ON user_followed_artists BEGIN
+                    DELETE FROM follow_inventory WHERE artist_mbid_lower=NEW.artist_mbid_lower;
+                END;
+                CREATE TRIGGER IF NOT EXISTS follow_inventory_update_fence
+                AFTER UPDATE ON user_followed_artists BEGIN
+                    DELETE FROM follow_inventory WHERE artist_mbid_lower=NEW.artist_mbid_lower;
+                END;
+                CREATE TRIGGER IF NOT EXISTS follow_inventory_delete_fence
+                AFTER DELETE ON user_followed_artists BEGIN
+                    DELETE FROM follow_inventory WHERE artist_mbid_lower=OLD.artist_mbid_lower;
+                    UPDATE follow_due SET due_at=0,failures=0 WHERE artist_mbid_lower=OLD.artist_mbid_lower;
+                END;
+                CREATE TRIGGER IF NOT EXISTS follow_approval_insert_due
+                AFTER INSERT ON auto_download_approvals BEGIN
+                    UPDATE follow_due SET due_at=0,failures=0 WHERE artist_mbid_lower=NEW.artist_mbid_lower;
+                    DELETE FROM follow_inventory WHERE artist_mbid_lower=NEW.artist_mbid_lower;
+                END;
+                CREATE TRIGGER IF NOT EXISTS follow_approval_update_due
+                AFTER UPDATE ON auto_download_approvals BEGIN
+                    UPDATE follow_due SET due_at=0,failures=0 WHERE artist_mbid_lower=NEW.artist_mbid_lower;
+                    DELETE FROM follow_inventory WHERE artist_mbid_lower=NEW.artist_mbid_lower;
+                END;
+            """)
+            _safe_alter(conn, "ALTER TABLE follow_inventory ADD COLUMN observation TEXT")
+            _safe_alter(conn, "ALTER TABLE follow_inventory ADD COLUMN diverge_count INTEGER NOT NULL DEFAULT 0")
             conn.commit()
         finally:
             conn.close()
+
+    async def enqueue_due_all(self) -> None:
+        def operation(conn):
+            conn.execute("UPDATE follow_due SET due_at=0, failures=0")
+            conn.execute("DELETE FROM follow_inventory")
+        await self._write(operation)
+
+    async def list_due_artists(self, now: float, limit: int = 10) -> list[DistinctFollowedArtist]:
+        def operation(conn):
+            return conn.execute("""
+                SELECT f.artist_mbid, d.artist_mbid_lower, f.artist_name
+                FROM follow_due d JOIN user_followed_artists f
+                    ON f.rowid=(SELECT rowid FROM user_followed_artists
+                        WHERE artist_mbid_lower=d.artist_mbid_lower ORDER BY user_id LIMIT 1)
+                WHERE d.due_at <= ?
+                ORDER BY d.last_serviced, d.artist_mbid_lower LIMIT ?
+            """, (now, limit)).fetchall()
+        return [DistinctFollowedArtist(**dict(row)) for row in await self._read(operation)]
+
+    async def fail_inventory(self, state: dict, error: str, retry_after: float = 0, *, min_delay: float = 0) -> bool:
+        artist = state["artist_mbid_lower"]
+        now = time.time()
+        def operation(conn):
+            current = conn.execute("SELECT * FROM follow_inventory WHERE artist_mbid_lower=?", (artist,)).fetchone()
+            if current is None or any(current[key] != state[key] for key in ("source", "policy", "observation")):
+                return False
+            row = conn.execute("SELECT failures FROM follow_due WHERE artist_mbid_lower=?", (artist,)).fetchone()
+            if row is None:
+                return False
+            delay = max(min(900 * 2 ** min(row["failures"], 5), 21600), retry_after, min_delay)
+            conn.execute("UPDATE follow_due SET failures=failures+1,due_at=?,last_serviced=? WHERE artist_mbid_lower=?",
+                         (now+delay, now, artist))
+            conn.execute("UPDATE artist_release_check SET last_status='error',last_error=? WHERE artist_mbid_lower=?", (error, artist))
+            return True
+        return await self._write(operation)
+
+    async def prepare_inventory(self, artist: str, source: str, policy: int, process: str) -> dict:
+        now = time.time()
+        def operation(conn):
+            row = conn.execute("SELECT * FROM follow_inventory WHERE artist_mbid_lower=?", (artist,)).fetchone()
+            if row and (row["source"] != source or row["policy"] != policy or row["progressed_at"] < now-604800):
+                conn.execute("DELETE FROM follow_inventory WHERE artist_mbid_lower=?", (artist,))
+                row = None
+            if row is None:
+                conn.execute("INSERT INTO follow_inventory(artist_mbid_lower,source,policy,process,progressed_at) VALUES(?,?,?,?,?)",
+                             (artist, source, policy, process, now))
+            elif (row["process"] != process or row["inflight"]) and row["phase"] == "verifying":
+                conn.execute("DELETE FROM follow_inventory_rows WHERE artist_mbid_lower=? AND phase='verifying'", (artist,))
+                conn.execute("DELETE FROM follow_inventory_pages WHERE artist_mbid_lower=? AND phase='verifying'", (artist,))
+                conn.execute("UPDATE follow_inventory SET offset=0,total=NULL,diverge_count=0 WHERE artist_mbid_lower=?", (artist,))
+            conn.execute("UPDATE follow_inventory SET process=?,inflight=1,observation=? WHERE artist_mbid_lower=?", (process, uuid.uuid4().hex, artist))
+            return dict(conn.execute("SELECT * FROM follow_inventory WHERE artist_mbid_lower=?", (artist,)).fetchone())
+        return await self._write(operation)
+
+    async def stage_inventory_page(self, state: dict, rows: list[dict], total: int) -> list[dict] | None:
+        artist, phase = state["artist_mbid_lower"], state["phase"]
+        now = time.time()
+        payloads = [(row["id"].casefold(), json.dumps(row, sort_keys=True, separators=(",", ":"))) for row in rows]
+        fingerprint = hashlib.sha256(json.dumps(payloads).encode()).hexdigest()
+        def operation(conn):
+            current = conn.execute("SELECT * FROM follow_inventory WHERE artist_mbid_lower=?", (artist,)).fetchone()
+            if current is None or any(current[key] != state[key] for key in ("source", "policy", "process", "phase", "offset", "observation")):
+                return None
+            conn.execute("UPDATE follow_due SET last_serviced=? WHERE artist_mbid_lower=?", (now, artist))
+            prior_diverges = current["diverge_count"] or 0
+            if total < 0 or (not rows and state["offset"] < total) or (state["total"] is not None and state["total"] != total):
+                if prior_diverges + 1 >= 2:
+                    conn.execute("DELETE FROM follow_inventory WHERE artist_mbid_lower=?", (artist,))
+                    return None
+                conn.execute("UPDATE follow_inventory SET diverge_count=?,inflight=0 WHERE artist_mbid_lower=?", (prior_diverges + 1, artist))
+                return None
+            conn.executemany("INSERT INTO follow_inventory_rows VALUES(?,?,?,?) ON CONFLICT(artist_mbid_lower,phase,rg) DO UPDATE SET payload=excluded.payload",
+                             [(artist, phase, rg, payload) for rg,payload in payloads])
+            conn.execute("INSERT OR REPLACE INTO follow_inventory_pages VALUES(?,?,?,?)", (artist,phase,state["offset"],fingerprint))
+            offset = state["offset"]+len(rows)
+            conn.execute("UPDATE follow_inventory SET offset=?,total=?,progressed_at=?,inflight=0,diverge_count=0 WHERE artist_mbid_lower=?", (offset,total,now,artist))
+            if offset < total:
+                return None
+            count = conn.execute("SELECT COUNT(*) FROM follow_inventory_rows WHERE artist_mbid_lower=? AND phase=?", (artist,phase)).fetchone()[0]
+            if count != total:
+                if prior_diverges + 1 >= 2:
+                    conn.execute("DELETE FROM follow_inventory WHERE artist_mbid_lower=?", (artist,))
+                    return None
+                conn.execute("UPDATE follow_inventory SET diverge_count=? WHERE artist_mbid_lower=?", (prior_diverges + 1, artist))
+                return None
+            if phase == "verifying":
+                mismatch = conn.execute("""
+                    SELECT rg,payload FROM follow_inventory_rows WHERE artist_mbid_lower=? AND phase='collecting'
+                    EXCEPT SELECT rg,payload FROM follow_inventory_rows WHERE artist_mbid_lower=? AND phase='verifying'
+                """, (artist,artist)).fetchone()
+                old_count = conn.execute("SELECT COUNT(*) FROM follow_inventory_rows WHERE artist_mbid_lower=? AND phase='collecting'", (artist,)).fetchone()[0]
+                if mismatch is None and old_count == count:
+                    conn.execute("UPDATE follow_inventory SET inflight=1 WHERE artist_mbid_lower=?", (artist,))
+                    return [json.loads(row[0]) for row in conn.execute("SELECT payload FROM follow_inventory_rows WHERE artist_mbid_lower=? AND phase='verifying' ORDER BY rg", (artist,))]
+                conn.execute("DELETE FROM follow_inventory_rows WHERE artist_mbid_lower=? AND phase='collecting'", (artist,))
+                conn.execute("DELETE FROM follow_inventory_pages WHERE artist_mbid_lower=? AND phase='collecting'", (artist,))
+                conn.execute("UPDATE follow_inventory_rows SET phase='collecting' WHERE artist_mbid_lower=?", (artist,))
+                conn.execute("UPDATE follow_inventory_pages SET phase='collecting' WHERE artist_mbid_lower=?", (artist,))
+            conn.execute("UPDATE follow_inventory SET phase='verifying',offset=0,total=NULL WHERE artist_mbid_lower=?", (artist,))
+            return None
+        return await self._write(operation)
 
     @staticmethod
     def _derive_state(intent: bool, approval_state: str | None) -> str:
@@ -761,6 +960,8 @@ class FollowStore(PersistenceBase):
         artist_mbid_lower: str,
         rg_mbids_lower: list[str],
         policy_revision: int | None = None,
+        *,
+        inventory_source: str | None = None,
     ) -> None:
         # The only method that creates a cursor row. A policy baseline records every
         # observed release-group ID but emits no feed row or acquisition work.
@@ -770,6 +971,11 @@ class FollowStore(PersistenceBase):
         )
 
         def operation(conn: sqlite3.Connection) -> None:
+            if inventory_source is not None and conn.execute(
+                "SELECT 1 FROM follow_inventory WHERE artist_mbid_lower=? AND source=? AND policy=?",
+                (artist_mbid_lower, inventory_source, policy_revision),
+            ).fetchone() is None:
+                raise InventoryInvalidated()
             conn.execute(
                 "UPDATE artist_known_releases SET auto_policy_revision = NULL "
                 "WHERE artist_mbid_lower = ?",
@@ -844,6 +1050,7 @@ class FollowStore(PersistenceBase):
         observed_rg_lowers: list[str] | None = None,
         pending_rg_lowers: list[str] | None = None,
         policy_revision: int | None = None,
+        inventory_source: str | None = None,
     ) -> None:
         """Persist one successful poll's observations atomically.
 
@@ -873,6 +1080,11 @@ class FollowStore(PersistenceBase):
         now = time.time()
 
         def operation(conn: sqlite3.Connection) -> None:
+            if inventory_source is not None and conn.execute(
+                "SELECT 1 FROM follow_inventory WHERE artist_mbid_lower=? AND source=? AND policy=?",
+                (artist_mbid_lower, inventory_source, policy_revision),
+            ).fetchone() is None:
+                raise InventoryInvalidated()
             if known:
                 conn.executemany(
                     "INSERT OR IGNORE INTO artist_known_releases "

@@ -811,7 +811,7 @@ class TestBorrowedReadToken:
     def _list_response(self, items):
         resp = MagicMock()
         resp.status_code = 200
-        resp.content = None
+        resp.content = b""
         resp.json.return_value = items
         resp.text = ""
         return resp

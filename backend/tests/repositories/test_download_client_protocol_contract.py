@@ -84,6 +84,12 @@ def _make_newznab_indexer():
     return NewznabIndexer([])  # no configured indexers needed for signature conformance
 
 
+def _make_prowlarr_indexer():
+    from repositories.prowlarr.prowlarr_indexer import ProwlarrIndexer
+
+    return ProwlarrIndexer(None)  # unconfigured is fine for signature conformance
+
+
 @pytest.mark.parametrize(
     "factory", [_make_slskd_repo, _make_fake_client, _make_sabnzbd_client]
 )
@@ -106,7 +112,13 @@ def test_impl_conforms_to_protocol(factory):
 
 
 @pytest.mark.parametrize(
-    "factory", [_make_slskd_indexer, _make_fake_indexer, _make_newznab_indexer]
+    "factory",
+    [
+        _make_slskd_indexer,
+        _make_fake_indexer,
+        _make_newznab_indexer,
+        _make_prowlarr_indexer,
+    ],
 )
 def test_impl_conforms_to_indexer_protocol(factory):
     impl = factory()

@@ -24,12 +24,21 @@ def _make_service() -> ArtistService:
     library_repo.is_configured.return_value = False
     wikidata = AsyncMock()
     prefs = MagicMock()
+    advanced = MagicMock()
+    advanced.cache_ttl_artist_library = 3600
+    advanced.cache_ttl_artist_non_library = 600
+    prefs.get_advanced_settings.return_value = advanced
     mem_cache = AsyncMock()
     mem_cache.get = AsyncMock(return_value=None)
     mem_cache.set = AsyncMock()
+    mem_cache.get_with_metadata = AsyncMock(return_value=(None, None))
+    mem_cache.set_if_token = AsyncMock(return_value=True)
+    mem_cache.capture_clear_token = MagicMock(return_value=(object(), 0))
     disk_cache = MagicMock()
     disk_cache.get_artist = AsyncMock(return_value=None)
     disk_cache.set_artist = AsyncMock()
+    disk_cache.get_artist_with_metadata = AsyncMock(return_value=(None, None))
+    disk_cache.capture_clear_token = MagicMock(return_value=(object(), 0))
     audiodb_img = MagicMock()
     audiodb_img.fetch_and_cache_artist_images = AsyncMock(return_value=None)
 
@@ -171,7 +180,7 @@ class TestArtistSingleflight:
         """Cache hit should skip the fetch entirely."""
         svc = _make_service()
         fake = _fake_artist_info()
-        svc._cache.get = AsyncMock(return_value=fake)
+        svc._cache.get_with_metadata = AsyncMock(return_value=(fake, None))
         call_count = 0
 
         async def should_not_run(*args, **kwargs):

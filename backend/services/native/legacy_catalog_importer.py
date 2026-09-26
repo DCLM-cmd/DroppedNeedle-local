@@ -130,6 +130,14 @@ def _local_only_grouping_values(
 def _group_local_only_rows(
     rows: list[tuple[dict[str, object], str, str]],
 ) -> dict[str, list[dict[str, object]]]:
+    # M-05 divergence (Phase 1 step 1.8, sanctioned fallback - NO behavior
+    # change here): legacy snapshot rows carry a single album_title column
+    # with no raw/tag split and no provenance, so the small-path widening
+    # (tagged-or-parsed merge targets, provisional reason for parsed-only
+    # anchors in LocalAlbumGrouper) is impossible to apply identically -
+    # parsed evidence is indistinguishable from tagged evidence in this
+    # shape. The tagged-only rule below stands; LocalAlbumGrouper is the
+    # authority for the widened rule.
     groups: dict[str, list[dict[str, object]]] = defaultdict(list)
     tagged_by_directory: dict[tuple[str, str], set[str]] = defaultdict(set)
     untagged_by_directory: dict[
@@ -691,6 +699,9 @@ class LegacyCatalogImporter:
                     else None,
                     disc_subtitle=str(row.get("disc_subtitle"))
                     if row.get("disc_subtitle")
+                    else None,
+                    release_type=str(row.get("release_type"))
+                    if row.get("release_type")
                     else None,
                     is_compilation=is_compilation,
                     duration_seconds=_as_float(row.get("duration_seconds")) or None,

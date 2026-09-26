@@ -19,14 +19,14 @@ from repositories.musicbrainz_contribution_models import (
 )
 from repositories.musicbrainz_repository import MusicBrainzRepository
 from repositories.protocols.musicbrainz import MusicBrainzRepositoryProtocol
+from infrastructure.cache.memory_cache import InMemoryCache
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "musicbrainz"
 
 
 class _Repo(MusicBrainzAlbumMixin):
     def __init__(self) -> None:
-        self._cache = AsyncMock()
-        self._cache.get.return_value = None
+        self._cache = InMemoryCache()
 
 
 def _decoded(name: str, model_type: type):
@@ -237,7 +237,7 @@ async def test_verification_raises_typed_payload_error_records_degradation_no_ca
         "MusicBrainz release verification returned an unmappable payload: "
         "unexpected payload shape"
     ]
-    repo._cache.set.assert_not_awaited()
+    assert repo._cache.size() == 0
 
 
 @pytest.mark.asyncio

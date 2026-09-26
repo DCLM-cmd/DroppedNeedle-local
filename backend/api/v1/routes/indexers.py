@@ -18,6 +18,7 @@ from api.v1.schemas.download import (
     IndexerSavedResponse,
     IndexerTestResponse,
     OperationResult,
+    UsenetSearchBackend,
 )
 from api.v1.schemas.settings import INDEXER_API_KEY_MASK, NewznabIndexerSettings
 from core.dependencies import build_newznab_client, get_preferences_service
@@ -38,12 +39,14 @@ def _clear_indexer_cache() -> None:
         get_download_service,
         get_newznab_indexer,
         get_newznab_release_scorer,
+        get_prowlarr_indexer,
         get_target_download_orchestrator,
         get_target_download_service,
     )
 
     for provider in (
         get_newznab_indexer,
+        get_prowlarr_indexer,
         get_newznab_release_scorer,
         get_download_orchestrator,
         get_download_service,
@@ -91,6 +94,27 @@ async def create_indexer(
     indexer_id = preferences.save_indexer(settings)
     _clear_indexer_cache()
     return IndexerSavedResponse(id=indexer_id)
+
+
+# Named routes must register BEFORE /{indexer_id} or the parameter swallows them.
+@router.get("/search-backend", response_model=UsenetSearchBackend)
+async def get_search_backend(
+    _: CurrentAdminDep, preferences=Depends(get_preferences_service)
+):
+    return UsenetSearchBackend(backend=preferences.get_usenet_search_backend())
+
+
+@router.put("/search-backend", response_model=OperationResult)
+async def update_search_backend(
+    _: CurrentAdminDep,
+    body: UsenetSearchBackend = MsgSpecBody(UsenetSearchBackend),
+    preferences=Depends(get_preferences_service),
+):
+    # The Literal rejects unknown values and empty bodies at decode (422);
+    # prefs.save_* additionally guards direct (non-HTTP) callers.
+    preferences.save_usenet_search_backend(body.backend)
+    _clear_indexer_cache()
+    return OperationResult(success=True)
 
 
 @router.put("/{indexer_id}", response_model=IndexerSavedResponse)

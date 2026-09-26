@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -12,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock
 import msgspec
 import pytest
 
+from core.exceptions import ExternalServiceError, StaleRevisionError
 from infrastructure.audio.fingerprinter import FingerprintStatus
+from repositories.musicbrainz_management_models import MbManagementRelease
 from infrastructure.degradation import try_get_degradation_context
 from infrastructure.integration_result import IntegrationResult
 from infrastructure.persistence.native_library_store import NativeLibraryStore
@@ -22,6 +25,7 @@ from models.identification import (
     AlbumCandidate,
     CandidateEvidence,
     CandidateTrack,
+    FingerprintOutcome,
     GroupingApplication,
     GroupingTrack,
     IdentificationAttempt,
@@ -54,10 +58,14 @@ from services.native.album_evidence_engine import (
 from services.native.album_identification_service import (
     MAX_NEW_FINGERPRINTS_PER_ATTEMPT,
     AlbumIdentificationService,
+    _edition_hold_metrics,
 )
 from services.native.conditional_fingerprint_service import (
     FINGERPRINTER_VERSION,
     ConditionalFingerprintService,
+)
+from services.native.explicit_reidentification_worker import (
+    ExplicitReidentificationWorker,
 )
 from services.native.identification_evidence_projector import (
     IdentificationEvidenceProjector,
@@ -66,6 +74,7 @@ from services.native.identification_queue_service import (
     LEASE_SECONDS,
     MAX_BACKOFF_SECONDS,
     MAX_DEFERRAL_ATTEMPTS,
+    SUBJECT_NOT_AVAILABLE_GRACE_SECONDS,
     IdentificationQueueService,
 )
 from services.native.identification_revisions import (
@@ -242,6 +251,7 @@ def _candidate(
     group: str = "rg-1",
     title: str = "Album",
     recording: str = "recording-1",
+    release_track: str | None = None,
 ) -> AlbumCandidate:
     return AlbumCandidate(
         release_group_mbid=group,
@@ -256,6 +266,7 @@ def _candidate(
                 absolute_position=1,
                 duration_seconds=180,
                 recording_mbid=recording,
+                release_track_mbid=release_track,
             )
         ],
     )
@@ -307,6 +318,9 @@ async def _seed_album(
         artist_name="Artist",
         album_title="Album",
         album_artist_name="Artist",
+        title_provenance="tag",
+        album_title_provenance="tag",
+        album_artist_provenance="tag",
         track_number=1,
         duration_seconds=180,
         file_format="flac",
@@ -379,6 +393,8 @@ def _service(
     invalidate: AsyncMock | None = None,
     on_identified: AsyncMock | None = None,
     provider_available: Callable[[], bool] | None = None,
+    canonical_provider: object | None = None,
+    edition_opt_in: Callable[[str], bool] | None = None,
 ) -> AlbumIdentificationService:
     queue = IdentificationQueueService(store)
     return AlbumIdentificationService(
@@ -390,6 +406,8 @@ def _service(
         invalidate,
         on_identified,
         provider_available=provider_available,
+        canonical_provider=canonical_provider,  # type: ignore[arg-type]
+        edition_opt_in=edition_opt_in,
     )
 
 
@@ -410,6 +428,9 @@ async def test_candidate_recall_is_bounded_and_uses_honest_priorities() -> None:
             artist_name="Artist",
             album_title="Album",
             album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
         )
     ]
     automatic = await service.recall(local)
@@ -439,6 +460,9 @@ async def test_candidate_recall_uses_only_a_complete_unanimous_exact_release() -
             artist_name="Artist",
             album_title="Album",
             album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
             release_group_mbid="rg-1",
             release_mbid="release-rg-1",
         )
@@ -453,16 +477,7 @@ async def test_candidate_recall_uses_only_a_complete_unanimous_exact_release() -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "releases",
-    [
-        ("release-rg-1", None),
-        ("release-rg-1", "release-rg-2"),
-    ],
-)
-async def test_candidate_recall_does_not_search_around_partial_or_mixed_release_ids(
-    releases: tuple[str | None, str | None],
-) -> None:
+async def test_candidate_recall_does_not_search_around_mixed_release_ids() -> None:
     provider = FakeProvider([_candidate(group="rg-1"), _candidate(group="rg-2")])
     service = AlbumCandidateService(provider)
     from models.identification import GroupingTrack
@@ -476,8 +491,11 @@ async def test_candidate_recall_does_not_search_around_partial_or_mixed_release_
             artist_name="Artist",
             album_title="Album",
             album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
             release_group_mbid="rg-1",
-            release_mbid=releases[index],
+            release_mbid=["release-rg-1", "release-rg-2"][index],
         )
         for index in range(2)
     ]
@@ -488,9 +506,12 @@ async def test_candidate_recall_does_not_search_around_partial_or_mixed_release_
 
 
 @pytest.mark.asyncio
-async def test_candidate_recall_requires_all_26_tracks_to_own_the_exact_release() -> (
-    None
-):
+@pytest.mark.parametrize("track_count", [2, 26])
+async def test_candidate_recall_attempts_a_partial_unanimous_exact_release(
+    track_count: int,
+) -> None:
+    """Blanks abstain: populated tags that agree on one release take the
+    exact-release path even when sibling tracks lack tags entirely."""
     provider = FakeProvider([_candidate(group="rg-1")])
     service = AlbumCandidateService(provider)
     from models.identification import GroupingTrack
@@ -504,14 +525,20 @@ async def test_candidate_recall_requires_all_26_tracks_to_own_the_exact_release(
             artist_name="Artist",
             album_title="Album",
             album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
             release_group_mbid="rg-1",
             release_mbid="release-rg-1" if index == 0 else None,
         )
-        for index in range(26)
+        for index in range(track_count)
     ]
 
-    assert await service.recall(tracks, explicit=True) == []
-    assert provider.exact_releases == []
+    candidates = await service.recall(tracks, explicit=True)
+
+    assert [candidate.release_mbid for candidate in candidates] == ["release-rg-1"]
+    assert candidates[0].source_kinds == ["embedded_exact_release"]
+    assert provider.exact_releases == [("release-rg-1", RequestPriority.USER_INITIATED)]
     assert provider.calls == []
 
 
@@ -532,6 +559,9 @@ async def test_candidate_recall_derives_a_missing_group_from_the_exact_release()
             artist_name="Artist",
             album_title="Album",
             album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
             release_mbid="release-rg-1",
         )
         for index in range(2)
@@ -560,6 +590,9 @@ async def test_candidate_recall_keeps_an_exact_release_when_its_provider_group_d
             artist_name="Artist",
             album_title="Album",
             album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
             release_group_mbid="different-rg",
             release_mbid="release-rg-1",
         )
@@ -586,6 +619,9 @@ async def test_candidate_recall_deduplicates_provider_canonical_aliases() -> Non
             artist_name="Artist",
             album_title="Album",
             album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
         )
     ]
 
@@ -645,6 +681,9 @@ def _single_album_tracks() -> list[GroupingTrack]:
             artist_name="Artist",
             album_title="Album",
             album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
         )
     ]
 
@@ -826,7 +865,9 @@ async def test_local_metadata_embedded_identity_uses_zero_provider_calls_and_att
 async def test_identified_album_schedules_scan_management_after_identity_commit(
     store: NativeLibraryStore,
 ) -> None:
-    await _seed_album(store)
+    # Step 2.6 (N-01): the lone-eligible quorum needs provider proof for a
+    # single present track, so the seed carries the candidate's recording.
+    await _seed_album(store, embedded_recording=EMBEDDED_RECORDING)
     context = await store.get_album_identification_context("album-1")
     assert context is not None
     expected_policy_revision = album_input_revisions(context["tracks"])[2]
@@ -835,7 +876,7 @@ async def test_identified_album_schedules_scan_management_after_identity_commit(
 
     outcome = await _service(
         store,
-        FakeProvider([_candidate()]),
+        FakeProvider([_candidate(recording=EMBEDDED_RECORDING)]),
         FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
         on_identified=callback,
     ).run_claimed_job(job, "worker", now=3)
@@ -929,6 +970,97 @@ async def test_conflicting_embedded_ids_create_review_without_search(
                 "SELECT reason_code FROM library_identification_reviews"
             ).fetchone()[0]
             == "CONFLICTING_EMBEDDED_IDS"
+        )
+
+
+@pytest.mark.asyncio
+async def test_partial_unanimous_embedded_release_attempts_the_agreed_release(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Beets-style partial tags (one track names the release, the sibling
+    merely lacks tags) attempt the agreed release instead of holding: the
+    fetched edition still has to earn SUPPORTED through track evidence."""
+    await _seed_album(
+        store,
+        embedded_group=EMBEDDED_GROUP,
+        embedded_release=EMBEDDED_RELEASE,
+        second_embedded_group=EMBEDDED_GROUP,
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET embedded_release_mbid=NULL, "
+            "embedded_recording_mbid=NULL WHERE id='track-1-2'"
+        )
+    candidate = AlbumCandidate(
+        release_group_mbid=EMBEDDED_GROUP,
+        release_mbid=EMBEDDED_RELEASE,
+        album_title="Album",
+        album_artist_name="Artist",
+        tracks=[
+            CandidateTrack(
+                title="Track",
+                position=1,
+                absolute_position=1,
+                duration_seconds=180,
+            ),
+            CandidateTrack(
+                title="Track 2",
+                position=2,
+                absolute_position=2,
+                duration_seconds=180,
+            ),
+        ],
+    )
+    job = await _claimed_job(store)
+    provider = FakeProvider([candidate])
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    assert provider.exact_releases == [(EMBEDDED_RELEASE, RequestPriority.BACKGROUND_SYNC)]
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_local_metadata_partial_embedded_release_keeps_the_hold(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Local-metadata albums cannot fetch and check the agreed release, so
+    partial tags keep the incomplete hold instead of attempting it."""
+    await _seed_album(
+        store,
+        embedded_group=EMBEDDED_GROUP,
+        embedded_release=EMBEDDED_RELEASE,
+        second_embedded_group=EMBEDDED_GROUP,
+        policy="local_metadata",
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET embedded_release_mbid=NULL, "
+            "embedded_recording_mbid=NULL WHERE id='track-1-2'"
+        )
+    job = await _claimed_job(store, kind="post_processing")
+    provider = FakeProvider()
+
+    outcome = await _service(
+        store,
+        provider,
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "insufficient_evidence"
+    assert provider.exact_releases == []
+    assert provider.calls == []
+    with sqlite3.connect(db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT reason_code FROM library_identification_reviews"
+            ).fetchone()[0]
+            == "INCOMPLETE_EMBEDDED_RELEASE_IDS"
         )
 
 
@@ -1147,14 +1279,14 @@ async def test_fingerprint_terminal_outcomes_are_reused_without_repeat(
     await _seed_album(store)
     fake = FakeFingerprinter(result, enabled=result.status != "disabled")
     service = ConditionalFingerprintService(store, fake)
-    first = await service.fingerprint_if_needed(
+    first, first_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
         needed=True,
         now=1,
     )
-    second = await service.fingerprint_if_needed(
+    second, second_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
@@ -1163,15 +1295,18 @@ async def test_fingerprint_terminal_outcomes_are_reused_without_repeat(
     )
     assert first is not None and first.state == expected_state
     assert second is not None and second.state == expected_state
+    assert first_work is True
+    assert second_work is False
     assert fake.generate_calls <= 1
     assert fake.lookup_calls <= 1
-    changed = await service.fingerprint_if_needed(
+    changed, changed_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-2",
         needed=True,
         now=3,
     )
+    assert changed_work is True
     assert changed is not None
     if result.status != "disabled":
         assert fake.generate_calls == 2
@@ -1184,7 +1319,7 @@ async def test_fingerprint_is_persisted_before_lookup_and_transient_failure_reus
     await _seed_album(store)
     fake = FakeFingerprinter(FingerprintResult(status="error"))
     service = ConditionalFingerprintService(store, fake)
-    first = await service.fingerprint_if_needed(
+    first, first_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
@@ -1193,13 +1328,15 @@ async def test_fingerprint_is_persisted_before_lookup_and_transient_failure_reus
     )
     assert first is not None and first.state == "failed"
     assert first.fingerprint == "fingerprint"
-    await service.fingerprint_if_needed(
+    assert first_work is True
+    _, second_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
         needed=True,
         now=62,
     )
+    assert second_work is True
     assert fake.generate_calls == 1
     assert fake.lookup_calls == 2
 
@@ -1589,6 +1726,213 @@ async def test_empty_subject_defers_until_grace_sweep_terminates(
     assert row[1] == "SUBJECT_NOT_AVAILABLE"
     assert row[2] == 3 + 25 * 3600
 
+    # The sweep surfaces a review row so the failed album leaves the stuck
+    # attention state and becomes dismissable in the review queue.
+    with sqlite3.connect(db_path) as connection:
+        review = connection.execute(
+            "SELECT local_album_id, state, reason_code, attempt_id, input_revision "
+            "FROM library_identification_reviews"
+        ).fetchone()
+    assert review == (
+        "album-1",
+        "needs_review",
+        "SUBJECT_NOT_AVAILABLE",
+        None,
+        "revision",
+    )
+    snapshot = await store.get_identification_activity_snapshot(now=3 + 25 * 3600)
+    assert snapshot["attention_count"] == 1
+    assert snapshot["needs_review_count"] == 1
+
+    # A repeat sweep fails nothing new and never duplicates the review row.
+    assert (
+        await store.gc_stale_identification_jobs(
+            now=3 + 26 * 3600, grace_seconds=SUBJECT_NOT_AVAILABLE_GRACE_SECONDS
+        )
+        == 0
+    )
+    with sqlite3.connect(db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM library_identification_reviews"
+        ).fetchone()[0]
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_grace_sweep_review_dismiss_clears_attention(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store)
+    job = await _claimed_job(store)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET availability = 'missing' WHERE id = 'track-1'"
+        )
+    outcome = await _service(
+        store,
+        FakeProvider(),
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+    assert outcome == "provider_deferred"
+    queue = IdentificationQueueService(store)
+    await queue.recover(now=3 + 25 * 3600)
+    assert (await store.get_identification_activity_snapshot(now=3 + 25 * 3600))[
+        "attention_count"
+    ] == 1
+
+    with sqlite3.connect(db_path) as connection:
+        review_id = connection.execute(
+            "SELECT id FROM library_identification_reviews "
+            "WHERE local_album_id = 'album-1'"
+        ).fetchone()[0]
+    catalog_revision = await store.get_catalog_revision()
+    result = await store.apply_review_decision(
+        str(review_id),
+        action="dismiss",
+        actor_user_id="admin",
+        expected_review_revision=1,
+        expected_catalog_revision=catalog_revision,
+        expected_identity_revision=None,
+        action_id="action-dismiss-gc-sna",
+        idempotency_key=None,
+        now=3 + 25 * 3600 + 1,
+    )
+    assert result["review"]["state"] == "resolved"
+    assert result["review"]["reason_code"] == "DISMISS"
+    with sqlite3.connect(db_path) as connection:
+        capped = connection.execute(
+            "SELECT state, last_failure_code, attention_cause "
+            "FROM library_identification_jobs WHERE id = 'job-album-1'"
+        ).fetchone()
+    assert capped == ("failed", None, None)
+    snapshot = await store.get_identification_activity_snapshot(
+        now=3 + 25 * 3600 + 1
+    )
+    assert snapshot["attention_count"] == 0
+    assert snapshot["needs_review_count"] == 0
+
+    # Later sweeps must not resurrect attention for the dismissed album.
+    assert (
+        await store.gc_stale_identification_jobs(
+            now=3 + 26 * 3600, grace_seconds=SUBJECT_NOT_AVAILABLE_GRACE_SECONDS
+        )
+        == 0
+    )
+    with sqlite3.connect(db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM library_identification_reviews"
+        ).fetchone()[0]
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_grace_sweep_heals_pre_existing_stuck_rows(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store)
+    await _seed_album(store, "2")
+    queue = IdentificationQueueService(store)
+    await queue.enqueue_album("album-1", input_revision="revision", now=1)
+    await queue.enqueue_album("album-2", input_revision="revision", now=1)
+    # Simulate pre-fix sweep damage: failed attention jobs with no review row.
+    sweep_now = 3 + 25 * 3600
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_identification_jobs SET state = 'failed', "
+            "last_failure_code = 'SUBJECT_NOT_AVAILABLE', "
+            "attention_cause = 'SUBJECT_NOT_AVAILABLE', terminal_at = ? "
+            "WHERE local_album_id = 'album-1'",
+            (sweep_now,),
+        )
+        connection.execute(
+            "UPDATE library_identification_jobs SET state = 'failed', "
+            "last_failure_code = 'MAX_DEFERRALS_EXCEEDED', "
+            "attention_cause = 'MAX_DEFERRALS_EXCEEDED', terminal_at = ? "
+            "WHERE local_album_id = 'album-2'",
+            (sweep_now,),
+        )
+
+    before = await store.get_stream_revision("identification")
+    assert (
+        await store.gc_stale_identification_jobs(
+            now=sweep_now, grace_seconds=SUBJECT_NOT_AVAILABLE_GRACE_SECONDS
+        )
+        == 0
+    )
+    assert await store.get_stream_revision("identification") > before
+    with sqlite3.connect(db_path) as connection:
+        reviews = connection.execute(
+            "SELECT local_album_id, state, reason_code, attempt_id, input_revision "
+            "FROM library_identification_reviews ORDER BY local_album_id"
+        ).fetchall()
+    assert reviews == [
+        ("album-1", "needs_review", "SUBJECT_NOT_AVAILABLE", None, "revision"),
+        ("album-2", "needs_review", "MAX_DEFERRALS_EXCEEDED", None, "revision"),
+    ]
+    snapshot = await store.get_identification_activity_snapshot(now=sweep_now)
+    assert snapshot["attention_count"] == 2
+    assert snapshot["needs_review_count"] == 2
+
+    # Healing is idempotent: a repeat sweep changes nothing.
+    healed_revision = await store.get_stream_revision("identification")
+    assert (
+        await store.gc_stale_identification_jobs(
+            now=sweep_now + 1, grace_seconds=SUBJECT_NOT_AVAILABLE_GRACE_SECONDS
+        )
+        == 0
+    )
+    assert await store.get_stream_revision("identification") == healed_revision
+    with sqlite3.connect(db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM library_identification_reviews"
+        ).fetchone()[0]
+    assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_grace_sweep_clears_superseded_attention_without_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+    await queue.enqueue_album("album-1", input_revision="revision", now=1)
+    sweep_now = 3 + 25 * 3600
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_identification_jobs SET state = 'failed', "
+            "last_failure_code = 'SUBJECT_NOT_AVAILABLE', "
+            "attention_cause = 'SUBJECT_NOT_AVAILABLE', terminal_at = ? "
+            "WHERE local_album_id = 'album-1'",
+            (sweep_now,),
+        )
+        # A later successful identification supersedes the stale failure.
+        connection.execute(
+            "INSERT INTO local_album_external_identities "
+            "(local_album_id, provider, release_group_mbid, decision_source, selected_at) "
+            "VALUES ('album-1', 'musicbrainz', 'rg-1', 'automatic', ?)",
+            (sweep_now,),
+        )
+
+    assert (
+        await store.gc_stale_identification_jobs(
+            now=sweep_now, grace_seconds=SUBJECT_NOT_AVAILABLE_GRACE_SECONDS
+        )
+        == 0
+    )
+    with sqlite3.connect(db_path) as connection:
+        capped = connection.execute(
+            "SELECT state, last_failure_code, attention_cause "
+            "FROM library_identification_jobs WHERE local_album_id = 'album-1'"
+        ).fetchone()
+        count = connection.execute(
+            "SELECT COUNT(*) FROM library_identification_reviews"
+        ).fetchone()[0]
+    assert capped == ("failed", None, None)
+    assert count == 0
+    snapshot = await store.get_identification_activity_snapshot(now=sweep_now)
+    assert snapshot["attention_count"] == 0
+    assert snapshot["needs_review_count"] == 0
+
 
 @pytest.mark.asyncio
 async def test_reset_provider_deferrals_clears_backoff_and_leaves_other_reasons(
@@ -1716,7 +2060,11 @@ async def test_sibling_trial_identifies_when_true_edition_shares_the_release_gro
     cannot support the album; ONE bounded retry including ranked siblings
     surfaces the true edition from the same release group, so the album
     identifies instead of landing in review."""
-    await _seed_album(store)
+    # Step 2.6 (N-01): the lone-eligible quorum needs provider proof for a
+    # single present track - the shared recording rides both editions, so the
+    # promo stays RELEASE_TYPE-blocked (not contradictory) and the trial still
+    # fires for it.
+    await _seed_album(store, embedded_recording=EMBEDDED_RECORDING)
 
     class PromoFirstProvider(FakeProvider):
         def __init__(
@@ -1740,11 +2088,11 @@ async def test_sibling_trial_identifies_when_true_edition_shares_the_release_gro
             return [self.candidates[0], self._true_edition]
 
     promo = msgspec.structs.replace(
-        _candidate(group="rg-real"),
+        _candidate(group="rg-real", recording=EMBEDDED_RECORDING),
         secondary_types=["live"],
     )
     true_edition = msgspec.structs.replace(
-        _candidate(group="rg-real", recording="recording-official"),
+        _candidate(group="rg-real", recording=EMBEDDED_RECORDING),
         release_mbid="release-rg-real-official",
     )
     provider = PromoFirstProvider("rg-real", promo, true_edition)
@@ -1771,8 +2119,11 @@ async def test_sibling_trial_identifies_when_true_edition_shares_the_release_gro
 async def test_sibling_trial_never_fires_for_identified_outcome(
     store: NativeLibraryStore,
 ) -> None:
-    await _seed_album(store)
-    provider = FakeProvider([_candidate()])
+    # Step 2.6 (N-01): the lone-eligible quorum needs provider proof for a
+    # single present track (mirrors the contradictory sibling below, which
+    # pins the proof-mismatch pole with a different recording).
+    await _seed_album(store, embedded_recording=EMBEDDED_RECORDING)
+    provider = FakeProvider([_candidate(recording=EMBEDDED_RECORDING)])
     job = await _claimed_job(store)
 
     outcome = await _service(
@@ -1880,7 +2231,9 @@ async def test_sibling_trial_respects_queue_pause_between_fetches(
 async def test_manual_and_legacy_identity_revalidation_never_silently_detaches(
     store: NativeLibraryStore, db_path: Path
 ) -> None:
-    await _seed_album(store)
+    # Step 2.6 (N-01): the lone-eligible quorum needs provider proof before
+    # the backstop has a selected candidate to flip to contradictory.
+    await _seed_album(store, embedded_recording=EMBEDDED_RECORDING)
     await store.attach_album_identity(
         LocalAlbumExternalIdentity(
             local_album_id="album-1",
@@ -1892,7 +2245,9 @@ async def test_manual_and_legacy_identity_revalidation_never_silently_detaches(
         expected_album_revision=1,
     )
     job = await _claimed_job(store)
-    provider = FakeProvider([_candidate(group="different-rg")])
+    provider = FakeProvider(
+        [_candidate(group="different-rg", recording=EMBEDDED_RECORDING)]
+    )
     outcome = await _service(
         store,
         provider,
@@ -1931,7 +2286,9 @@ async def test_existing_exact_release_conflict_never_silently_changes_edition(
     db_path: Path,
     decision_source: str,
 ) -> None:
-    await _seed_album(store)
+    # Step 2.6 (N-01): the lone-eligible quorum needs provider proof before
+    # the backstop has a selected candidate to flip to contradictory.
+    await _seed_album(store, embedded_recording=EMBEDDED_RECORDING)
     job = await _claimed_job(store)
     with sqlite3.connect(db_path) as connection:
         connection.execute(
@@ -1944,7 +2301,7 @@ async def test_existing_exact_release_conflict_never_silently_changes_edition(
 
     outcome = await _service(
         store,
-        FakeProvider([_candidate(group="rg-1")]),
+        FakeProvider([_candidate(group="rg-1", recording=EMBEDDED_RECORDING)]),
         FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
     ).run_claimed_job(job, "worker", now=3)
 
@@ -2497,6 +2854,310 @@ async def test_grouping_keeps_a_single_valued_name_with_an_ampersand_as_one_arti
     assert credits == [(0, "Ćelo & Abdï")]
 
 
+def _m03_equiv_specs(kind: str) -> tuple[str, list[dict]]:
+    """Shared M-03 parametrized cases run against both grouping paths.
+
+    Same disc regex + same top-level rule on the small path
+    (grouping_track_from_row + LocalAlbumGrouper.group) and the staged path
+    (regroup_run with a low STAGED_GROUPING_THRESHOLD): spelling variants
+    fold, top-level disc folders join root siblings sharing album tags, and
+    disc dirs holding different albums stay split.
+    """
+    if kind == "spellings":
+        parent = "m03spell"
+        return parent, [
+            {
+                "relative_path": f"{parent}/Disc(1)/01.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 1,
+            },
+            {
+                "relative_path": f"{parent}/Disc(1)/02.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 2,
+            },
+            {
+                "relative_path": f"{parent}/(CD1)/03.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 3,
+            },
+            {
+                "relative_path": f"{parent}/Volume 2/01.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 1,
+            },
+        ]
+    if kind == "top_level":
+        return ".", [
+            {
+                "relative_path": "CD1/01.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 1,
+            },
+            {
+                "relative_path": "CD2/01.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 1,
+            },
+            {
+                "relative_path": "03.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 3,
+            },
+        ]
+    if kind == "split":
+        parent = "m03split"
+        return parent, [
+            {
+                "relative_path": f"{parent}/CD1/01.flac",
+                "tag_album_title": "First",
+                "tag_album_artist_name": "Artist",
+                "track_number": 1,
+            },
+            {
+                "relative_path": f"{parent}/CD1/02.flac",
+                "tag_album_title": "Second",
+                "tag_album_artist_name": "Artist",
+                "track_number": 2,
+            },
+        ]
+    raise AssertionError(f"unknown M-03 equivalence kind: {kind}")
+
+
+def _m03_small_path_group_count(specs: list[dict]) -> int:
+    """Run specs through the small path (producer + grouper) and count."""
+    from services.native.local_album_grouper import LocalAlbumGrouper
+    from services.native.local_album_grouping_service import grouping_track_from_row
+
+    tracks = [
+        grouping_track_from_row(
+            {
+                "id": f"m03-track-{index:02}",
+                "root_id": "root",
+                "relative_path": spec["relative_path"],
+                "title": f"Track {index}",
+                "artist_name": "Artist",
+                "album_title": spec["tag_album_title"],
+                "album_artist_name": spec["tag_album_artist_name"],
+                "tag_album_title": spec["tag_album_title"],
+                "tag_album_artist_name": spec["tag_album_artist_name"],
+                "artist_sort": None,
+                "album_artist_sort": None,
+                "track_number": spec["track_number"],
+                "disc_number": 1,
+                "duration_seconds": 180.0,
+                "embedded_recording_mbid": None,
+                "embedded_release_mbid": None,
+                "embedded_release_group_mbid": None,
+                "is_compilation": False,
+                "metadata_incomplete": False,
+                "membership_locked": False,
+                "local_album_id": "m03-old-album",
+            }
+        )
+        for index, spec in enumerate(specs, start=1)
+    ]
+    return len(LocalAlbumGrouper().group(tracks))
+
+
+async def _m03_seed_tracks(
+    store: NativeLibraryStore, slug: str, specs: list[dict]
+) -> None:
+    """Seed specs once under one old album; runs regroup the same rows."""
+    artist = LocalArtist(
+        id=f"m03-artist-{slug}",
+        display_name="Artist",
+        folded_name="artist",
+        normalized_name="artist",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id=f"m03-old-album-{slug}",
+        root_id="root",
+        grouping_key=f"m03-old-{slug}",
+        title="Before",
+        album_artist_id=artist.id,
+        album_artist_name=artist.display_name,
+        created_at=1,
+        updated_at=1,
+    )
+    tracks = [
+        LocalTrack(
+            id=f"m03-track-{slug}-{index:02}",
+            local_album_id=album.id,
+            root_id="root",
+            file_path=f"/music/{spec['relative_path']}",
+            relative_path=spec["relative_path"],
+            path_hash=f"m03-hash-{slug}-{index:02}",
+            file_size_bytes=100,
+            file_mtime_ns=1,
+            stat_revision=f"100:{index}",
+            tag_revision=f"tag-{index}",
+            title=f"Track {index}",
+            artist_name=artist.display_name,
+            album_title=spec["tag_album_title"],
+            album_artist_name=spec["tag_album_artist_name"],
+            tag_album_title=spec["tag_album_title"],
+            tag_album_artist_name=spec["tag_album_artist_name"],
+            track_number=spec["track_number"],
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+            applied_policy="automatic",
+            applied_policy_revision="policy-1",
+        )
+        for index, spec in enumerate(specs, start=1)
+    ]
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=tracks,
+            album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+            track_credits={
+                track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]
+                for track in tracks
+            },
+        )
+    )
+
+
+async def _m03_regroup_and_count(
+    store: NativeLibraryStore,
+    db_path: Path,
+    run_id: str,
+    context: str,
+    specs: list[dict],
+    now: float,
+) -> int:
+    """Regroup one context for one run, count distinct track albums.
+
+    Album unity (not staging rows) is the path-independent signal: the
+    staged path writes library_scan_grouping_groups rows while the small
+    path applies contexts directly, but both land tracks in the same
+    local albums.
+    """
+    await store.create_scan_run(
+        ScanRun(id=run_id, kind="incremental", trigger="manual", queued_at=1)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id,root_id,relative_directory) VALUES (?,?,?)",
+            (run_id, "root", context),
+        )
+    await LocalAlbumGroupingService(
+        store, IdentificationQueueService(store)
+    ).regroup_run(run_id, now=now, frozen_policy_revision="policy-1")
+    paths = [spec["relative_path"] for spec in specs]
+    with sqlite3.connect(db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(DISTINCT local_album_id) FROM local_tracks WHERE "
+            f"relative_path IN ({','.join('?' * len(paths))})",
+            paths,
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE library_scan_runs SET state='completed' WHERE id=?", (run_id,)
+        )
+    return count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "expected_groups"),
+    [("spellings", 1), ("top_level", 1), ("split", 2)],
+)
+async def test_disc_grouping_small_path_and_staged_agree(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    expected_groups: int,
+) -> None:
+    """M-03 equivalence: spelling variants fold, top-level disc folders join
+    root siblings sharing album tags, and disc dirs holding different albums
+    stay split - identically on the small and staged paths."""
+    context, specs = _m03_equiv_specs(kind)
+    assert _m03_small_path_group_count(specs) == expected_groups
+    await _m03_seed_tracks(store, kind, specs)
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD", 1
+    )
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGING_BATCH_SIZE", 2
+    )
+    staged = await _m03_regroup_and_count(
+        store, db_path, f"m03-staged-{kind}", context, specs, now=2
+    )
+    assert staged == expected_groups
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD", 50
+    )
+    small = await _m03_regroup_and_count(
+        store, db_path, f"m03-small-{kind}", context, specs, now=3
+    )
+    assert small == expected_groups
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("slug", "first_number", "second_number", "expected_groups"),
+    [
+        ("avmerge", 0, 0, 1),
+        ("avsplit", 1, 1, 2),
+    ],
+)
+async def test_artist_variance_unknown_numbers_merge_small_path(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slug: str,
+    first_number: int,
+    second_number: int,
+    expected_groups: int,
+) -> None:
+    """M-02 follow-up (small path): same directory + same album fold with
+    distinct non-empty artists merges when both track numbers are unknown
+    (0), and stays split on a known-number collision. Staged-path parity
+    lives in the store SQL collision check, outside this slice, so only
+    the small path is asserted here."""
+    parent = f"m02-{slug}"
+    specs = [
+        {
+            "relative_path": f"{parent}/one.flac",
+            "tag_album_title": "Greatest Hits",
+            "tag_album_artist_name": "One",
+            "track_number": first_number,
+        },
+        {
+            "relative_path": f"{parent}/two.flac",
+            "tag_album_title": "Greatest Hits",
+            "tag_album_artist_name": "Two",
+            "track_number": second_number,
+        },
+    ]
+    assert _m03_small_path_group_count(specs) == expected_groups
+    await _m03_seed_tracks(store, slug, specs)
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD", 50
+    )
+    assert (
+        await _m03_regroup_and_count(
+            store, db_path, f"m02-small-{slug}", parent, specs, now=2
+        )
+        == expected_groups
+    )
+
+
 @pytest.mark.asyncio
 async def test_grouping_context_track_read_excludes_deeper_descendants(
     store: NativeLibraryStore, db_path: Path
@@ -2951,9 +3612,11 @@ async def test_grouping_catalog_application_is_split_into_bounded_transactions(
 async def test_provider_artist_identity_proposes_merge_without_replacing_local_artist_ids(
     store: NativeLibraryStore, db_path: Path
 ) -> None:
-    await _seed_album(store, "1")
-    await _seed_album(store, "2")
-    provider = FakeProvider([_candidate()])
+    # Step 2.6 (N-01): the lone-eligible quorum needs provider proof for a
+    # single present track, so both seeds carry the candidate's recording.
+    await _seed_album(store, "1", embedded_recording=EMBEDDED_RECORDING)
+    await _seed_album(store, "2", embedded_recording=EMBEDDED_RECORDING)
+    provider = FakeProvider([_candidate(recording=EMBEDDED_RECORDING)])
     for suffix in ("1", "2"):
         job = await _claimed_job(store, f"album-{suffix}")
         outcome = await _service(
@@ -3138,7 +3801,7 @@ async def test_album_identification_circuit_open_defers_with_retry_after(store: 
     candidates = AlbumCandidateService(provider)  # type: ignore[arg-type]
     evidence_engine = AlbumEvidenceEngine()
     fingerprints = MagicMock()
-    fingerprints.fingerprint_if_needed = AsyncMock(return_value=None)
+    fingerprints.fingerprint_if_needed = AsyncMock(return_value=(None, False))
     service = AlbumIdentificationService(store, queue, candidates, evidence_engine, fingerprints)
     now = time.time() + 5
     await store.enqueue_identification_job(
@@ -3449,6 +4112,9 @@ def _recall_tracks() -> list[GroupingTrack]:
             artist_name="Artist",
             album_title="Noisy Tags",
             album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
             track_number=index + 1,
             disc_number=1,
             duration_seconds=180.0,
@@ -3579,6 +4245,66 @@ async def test_embedded_and_exact_branches_keep_their_priority_contracts() -> No
     assert candidates[0].source_kinds == ["embedded", "album_tags"]
 
 
+@pytest.mark.asyncio
+async def test_stale_embedded_release_falls_through_to_full_recall() -> None:
+    """A unanimous embedded release that no longer exists (merged/deleted
+    upstream) must not orphan the album: recall falls through to full
+    recall instead of returning no candidates."""
+    provider = _OrderingProvider(album_ids=["rg-fallback"], recording_ids=[])
+    provider.candidates = []
+    tracks = _recall_tracks()
+    for track in tracks:
+        track.release_mbid = "release-stale"
+        track.release_group_mbid = "rg-fallback"
+
+    candidates = await AlbumCandidateService(provider).recall(tracks)
+
+    assert provider.exact_releases == [
+        ("release-stale", RequestPriority.BACKGROUND_SYNC)
+    ]
+    assert provider.calls != []  # entered bounded full recall
+    assert [c.release_group_mbid for c in candidates] == ["rg-fallback"]
+    assert all(c.release_mbid != "release-stale" for c in candidates)
+
+
+@pytest.mark.asyncio
+async def test_mixed_case_embedded_release_counts_as_unanimous() -> None:
+    """Tag MBIDs keep their verbatim case: mixed-case unanimous tags take
+    the exact-release path (then fall through when stale), not the orphan
+    branch. The provider lookup uses the original string."""
+    provider = _OrderingProvider(album_ids=["rg-fallback"], recording_ids=[])
+    provider.candidates = []
+    tracks = _recall_tracks()
+    tracks[0].release_mbid = "RELEASE-STALE"
+    tracks[1].release_mbid = "release-stale"
+    tracks[0].release_group_mbid = "RG-FALLBACK"
+    tracks[1].release_group_mbid = "rg-fallback"
+
+    candidates = await AlbumCandidateService(provider).recall(tracks)
+
+    assert provider.exact_releases == [
+        ("RELEASE-STALE", RequestPriority.BACKGROUND_SYNC)
+    ]
+    assert provider.calls != []  # entered bounded full recall
+    assert [c.release_group_mbid for c in candidates] == ["rg-fallback"]
+    assert candidates[0].source_kinds == ["embedded", "album_tags"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_exact_release_still_returns_empty_on_miss() -> None:
+    """Unlike stale tags, an administrator demanding one exact release must
+    never silently get another: an exact miss returns no candidates."""
+    provider = _OrderingProvider(album_ids=["rg-fallback"], recording_ids=[])
+    provider.candidates = []
+
+    candidates = await AlbumCandidateService(provider).recall(
+        _recall_tracks(), exact_release_mbid="release-missing"
+    )
+
+    assert candidates == []
+    assert provider.calls == []  # never enters bounded recall
+
+
 def test_target_seed_order_matches_album_identifier_reference() -> None:
     """Plan step 6 comparison fixture: the target ordering rule (deduped seeds
     first, then text ids) matches ``AlbumIdentifier._candidate_release_groups``'s
@@ -3639,20 +4365,21 @@ async def test_local_fingerprint_failure_gets_bounded_retry_deadline(
     fake = _LocalFailureThenRecoveringFingerprinter()
     service = ConditionalFingerprintService(store, fake)
 
-    failed = await service.fingerprint_if_needed(
+    failed, failed_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
         needed=True,
         now=100.0,
     )
+    assert failed_work is True
     assert failed.state == "failed"
     assert failed.failure_code == "FINGERPRINT_LOCAL_FAILURE"
     assert failed.retry_after == pytest.approx(100.0 + TRANSIENT_RETRY_SECONDS)
     assert failed.attempt_count == 1
 
     # Before the deadline: cached failure reused, no regeneration.
-    before = await service.fingerprint_if_needed(
+    before, before_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
@@ -3662,9 +4389,10 @@ async def test_local_fingerprint_failure_gets_bounded_retry_deadline(
     assert fake.generate_calls == 1
     assert before.state == "failed"
     assert before.retry_after == failed.retry_after
+    assert before_work is False
 
     # At the deadline: generation retried and lookup succeeds normally.
-    recovered = await service.fingerprint_if_needed(
+    recovered, recovered_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
@@ -3676,9 +4404,10 @@ async def test_local_fingerprint_failure_gets_bounded_retry_deadline(
     assert recovered.recording_mbid == "rec-local"
     assert recovered.stat_revision == "stat-1"
     assert recovered.fingerprinter_version == "fpcalc-acoustid-v1"
+    assert recovered_work is True
 
     # A different stat_revision is never blocked by the old revision's failure.
-    changed = await service.fingerprint_if_needed(
+    changed, _ = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-2",
@@ -3758,6 +4487,322 @@ async def test_automatic_worker_defers_local_fingerprint_failure_honestly(
         )
         == 0
     )
+
+
+class _AmbiguousTwoGroupProvider(FakeProvider):
+    """Two plausible one-track groups: the ordinary decision lands ambiguous
+    so the worker enters the conditional fingerprint branch with needed=True
+    for the track."""
+
+    async def search_album_candidate_ids(
+        self, artist: str, title: str, limit: int, priority: RequestPriority
+    ) -> list[str]:
+        return ["rg-a", "rg-b"]
+
+    async def get_album_candidate(
+        self,
+        release_group_mbid: str,
+        target_track_count: int,
+        priority: RequestPriority,
+    ) -> AlbumCandidate | None:
+        return AlbumCandidate(
+            release_group_mbid=release_group_mbid,
+            release_mbid=f"release-{release_group_mbid}",
+            album_title="Album",
+            album_artist_name="Artist",
+            tracks=[
+                CandidateTrack(
+                    title="Track 1",
+                    position=1,
+                    absolute_position=1,
+                    duration_seconds=180.0,
+                    recording_mbid=f"recording-{release_group_mbid}",
+                    release_track_mbid=f"release-track-{release_group_mbid}",
+                )
+            ],
+            release_type="album",
+        )
+
+
+class _NoFpcalcBinaryFingerprinter(FakeFingerprinter):
+    """F-06: the fpcalc binary is absent - every generation raises
+    FileNotFoundError, exactly like a no-fpcalc host."""
+
+    def __init__(self) -> None:
+        super().__init__(FingerprintResult(status="error"))
+
+    async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+        self.generate_calls += 1
+        raise FileNotFoundError("fpcalc")
+
+
+class _ToggleableFpcalcFingerprinter(FakeFingerprinter):
+    """F-06: binary absent until `binary_present` flips, modelling a
+    mid-process fpcalc install."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            FingerprintResult(status="pass", recording_id="rec-1", score=0.9)
+        )
+        self.binary_present = False
+
+    async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+        self.generate_calls += 1
+        if not self.binary_present:
+            raise FileNotFoundError("fpcalc")
+        return ("fp-hash", 180)
+
+
+class _CrashingFpcalcFingerprinter(FakeFingerprinter):
+    """F-06: fpcalc starts mid-run then crashes (genuine failure, not an
+    absent binary)."""
+
+    def __init__(self) -> None:
+        super().__init__(FingerprintResult(status="error"))
+
+    async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+        self.generate_calls += 1
+        raise subprocess.CalledProcessError(1, "fpcalc")
+
+
+class _AlwaysLocalFailureFingerprinter(FakeFingerprinter):
+    """F-07: fpcalc generation always fails transiently (never recovers)."""
+
+    def __init__(self) -> None:
+        super().__init__(FingerprintResult(status="error"))
+
+    async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+        self.generate_calls += 1
+        raise OSError("fpcalc transiently blocked")
+
+
+def _spied_identification_service(
+    store: NativeLibraryStore,
+    provider: FakeProvider,
+    fingerprinter: FakeFingerprinter,
+) -> tuple[
+    IdentificationQueueService,
+    AlbumIdentificationService,
+    list[tuple[FingerprintOutcome | None, bool]],
+]:
+    """Build the identification service like `_service` but record every raw
+    `(outcome, did_work)` tuple `fingerprint_if_needed` returns."""
+    queue = IdentificationQueueService(store)
+    fingerprints = ConditionalFingerprintService(store, fingerprinter)
+    service = AlbumIdentificationService(
+        store,
+        queue,
+        AlbumCandidateService(provider),
+        AlbumEvidenceEngine(),
+        fingerprints,
+    )
+    seen: list[tuple[FingerprintOutcome | None, bool]] = []
+    original = fingerprints.fingerprint_if_needed
+
+    async def spy(**kwargs: object) -> tuple[FingerprintOutcome | None, bool]:
+        result = await original(**kwargs)  # type: ignore[arg-type]
+        seen.append(result)
+        return result
+
+    fingerprints.fingerprint_if_needed = spy  # type: ignore[method-assign]
+    return queue, service, seen
+
+
+@pytest.mark.asyncio
+async def test_missing_fpcalc_binary_maps_to_disabled_and_recovers(
+    store: NativeLibraryStore,
+) -> None:
+    """F-06 unit: FileNotFoundError maps to disabled/FPCALC_BINARY_ABSENT
+    (fresh work); a later-installed binary re-runs fpcalc - the absence is
+    recorded for evidence but never reused."""
+    await _seed_album(store)
+    fake = _ToggleableFpcalcFingerprinter()
+    service = ConditionalFingerprintService(store, fake)
+    outcome, did_work = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=1,
+    )
+    assert did_work is True
+    assert outcome is not None and outcome.state == "disabled"
+    assert outcome.failure_code == "FPCALC_BINARY_ABSENT"
+    fake.binary_present = True
+    recovered, recovered_work = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=2,
+    )
+    assert recovered_work is True
+    assert recovered is not None and recovered.state == "matched"
+    assert recovered.recording_mbid == "rec-1"
+    assert fake.generate_calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("fpcalc transiently blocked"),
+        subprocess.CalledProcessError(1, "fpcalc"),
+        TimeoutError("fpcalc timed out"),
+        ValueError("cannot parse fpcalc output"),
+    ],
+)
+async def test_fpcalc_transient_errors_stay_failed(
+    store: NativeLibraryStore, error: Exception
+) -> None:
+    """F-06 unit: non-FileNotFoundError OSErrors, mid-run crashes, timeouts,
+    and parse errors stay failed (defer path) - nothing transient is masked
+    as an absent binary."""
+
+    class _RaisingFingerprinter(FakeFingerprinter):
+        async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+            self.generate_calls += 1
+            raise error
+
+    await _seed_album(store)
+    service = ConditionalFingerprintService(
+        store, _RaisingFingerprinter(FingerprintResult(status="error"))
+    )
+    outcome, did_work = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=1,
+    )
+    assert did_work is True
+    assert outcome is not None and outcome.state == "failed"
+    assert outcome.failure_code == "FINGERPRINT_LOCAL_FAILURE"
+
+
+@pytest.mark.asyncio
+async def test_missing_fpcalc_binary_proceeds_tag_only_to_decision(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-06: on a no-fpcalc host the ambiguous album proceeds tag-only to a
+    terminal decision - no defer, no fpcalc-attention loop."""
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+    service = AlbumIdentificationService(
+        store,
+        queue,
+        AlbumCandidateService(_AmbiguousTwoGroupProvider()),
+        AlbumEvidenceEngine(),
+        ConditionalFingerprintService(store, _NoFpcalcBinaryFingerprinter()),
+    )
+    job = await _claimed_job(store)
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+    assert outcome == "ambiguous"
+    fp = await store.get_fingerprint_outcome(
+        "track-1", "stat-1", FINGERPRINTER_VERSION
+    )
+    assert fp is not None and fp.state == "disabled"
+    assert fp.failure_code == "FPCALC_BINARY_ABSENT"
+    with sqlite3.connect(db_path) as connection:
+        state, failure = connection.execute(
+            "SELECT state, last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert state == "needs_review"
+    assert failure is None
+
+
+@pytest.mark.asyncio
+async def test_fpcalc_crash_still_defers_with_fresh_work(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-06: a genuine mid-run fpcalc crash stays failed and defers under
+    FINGERPRINT_LOCAL_FAILURE - and the fresh attempt reports did_work."""
+    await _seed_album(store)
+    queue, service, seen = _spied_identification_service(
+        store, _AmbiguousTwoGroupProvider(), _CrashingFpcalcFingerprinter()
+    )
+    job = await _claimed_job(store)
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+    assert outcome == "provider_deferred"
+    assert len(seen) == 1
+    assert seen[0][0] is not None and seen[0][0].state == "failed"
+    assert seen[0][0].failure_code == "FINGERPRINT_LOCAL_FAILURE"
+    assert seen[0][1] is True
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert row[0] == "FINGERPRINT_LOCAL_FAILURE"
+
+
+@pytest.mark.asyncio
+async def test_cached_fingerprint_failure_proceeds_to_decision(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-07: a fresh local failure defers; the retry inside the 60s window
+    reuses the unchanged cached failed row (no new work) and proceeds to a
+    terminal decision instead of deferring again."""
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+    fingerprinter = _AlwaysLocalFailureFingerprinter()
+    service = AlbumIdentificationService(
+        store,
+        queue,
+        AlbumCandidateService(_AmbiguousTwoGroupProvider()),
+        AlbumEvidenceEngine(),
+        ConditionalFingerprintService(store, fingerprinter),
+    )
+    await queue.enqueue_album("album-1", input_revision="revision", now=1)
+    first = await queue.claim("worker", now=2)
+    assert first is not None
+    assert await service.run_claimed_job(first, "worker", now=3) == (
+        "provider_deferred"
+    )
+    assert fingerprinter.generate_calls == 1
+    # After the 30s queue backoff but inside the 60s fingerprint retry
+    # window: the cached failure is reused, so no new fpcalc work happens.
+    second = await queue.claim("worker", now=34)
+    assert second is not None
+    assert await service.run_claimed_job(second, "worker", now=34) == "ambiguous"
+    assert fingerprinter.generate_calls == 1
+    with sqlite3.connect(db_path) as connection:
+        state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (second["id"],),
+        ).fetchone()
+    assert state[0] == "needs_review"
+
+
+@pytest.mark.asyncio
+async def test_fresh_fingerprint_failure_still_defers(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """F-07: a fresh failure on a load-bearing track keeps deferring - and
+    the fresh attempt reports did_work."""
+    await _seed_album(store)
+    queue, service, seen = _spied_identification_service(
+        store, _AmbiguousTwoGroupProvider(), _AlwaysLocalFailureFingerprinter()
+    )
+    await queue.enqueue_album("album-1", input_revision="revision", now=1)
+    claimed = await queue.claim("worker", now=2)
+    assert claimed is not None
+    assert await service.run_claimed_job(claimed, "worker", now=3) == (
+        "provider_deferred"
+    )
+    assert len(seen) == 1
+    assert seen[0][0] is not None and seen[0][0].state == "failed"
+    assert seen[0][1] is True
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (claimed["id"],),
+        ).fetchone()
+    assert row[0] == "FINGERPRINT_LOCAL_FAILURE"
 
 
 @pytest.mark.asyncio
@@ -4216,7 +5261,7 @@ async def test_disabled_outcome_recovers_once_acoustid_enabled(
         enabled=True,
     )
     service = ConditionalFingerprintService(store, disabled_fake)
-    first = await service.fingerprint_if_needed(
+    first, first_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
@@ -4224,9 +5269,10 @@ async def test_disabled_outcome_recovers_once_acoustid_enabled(
         now=1,
     )
     assert first is not None and first.state == "disabled"
+    assert first_work is True
 
     upgraded = ConditionalFingerprintService(store, enabled_fake)
-    second = await upgraded.fingerprint_if_needed(
+    second, second_work = await upgraded.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
@@ -4234,6 +5280,7 @@ async def test_disabled_outcome_recovers_once_acoustid_enabled(
         now=2,
     )
     assert second is not None and second.state == "matched"
+    assert second_work is True
     assert enabled_fake.generate_calls == 1
 
 
@@ -4265,13 +5312,14 @@ async def test_seeded_deferred_outcome_skips_generation_on_resume(
         FingerprintResult(status="pass", recording_id="rec-known", score=0.95)
     )
     service = ConditionalFingerprintService(store, fake)
-    outcome = await service.fingerprint_if_needed(
+    outcome, did_work = await service.fingerprint_if_needed(
         local_track_id="track-1",
         path=Path("/music/1.flac"),
         stat_revision="stat-1",
         needed=True,
         now=5,
     )
+    assert did_work is True
 
     assert outcome is not None and outcome.state == "matched"
     assert outcome.recording_mbid == "rec-known"
@@ -4284,8 +5332,10 @@ async def test_heartbeat_renews_lease_on_phase_checkpoints(
     store: NativeLibraryStore,
 ) -> None:
     """F-057: the dormant lease heartbeat fires during a run."""
-    await _seed_album(store)
-    provider = FakeProvider([_candidate()])
+    # Step 2.6 (N-01): the lone-eligible quorum needs provider proof for a
+    # single present track so the run reaches the identified terminal.
+    await _seed_album(store, embedded_recording=EMBEDDED_RECORDING)
+    provider = FakeProvider([_candidate(recording=EMBEDDED_RECORDING)])
     heartbeat_calls: list[tuple[str, str]] = []
     original = store.heartbeat_identification_job
 
@@ -4364,3 +5414,2593 @@ class _RecallSpyProvider(FakeProvider):
         return await inner_search(self, artist, title, limit, priority)
 
 
+@pytest.mark.asyncio
+async def test_cached_off_release_fingerprint_no_longer_vetoes_identification(
+    store: NativeLibraryStore,
+) -> None:
+    """#392: a cached matched fingerprint outcome carrying an off-release
+    recording ID lands in the support-only slot - the album still identifies
+    and the track is never reconsidered for fingerprinting."""
+    from models.identification import FingerprintOutcome
+
+    # Step 2.6 (N-01): the lone-eligible quorum rides the release-track leg
+    # here - a recording seed would break the `recording_mbid is None`
+    # support-slot assertion below, while the release track still proves.
+    await _seed_album(store, embedded_release_track=EMBEDDED_RELEASE_TRACK)
+    await store.record_fingerprint_outcome(
+        FingerprintOutcome(
+            id="seed-off-release",
+            local_track_id="track-1",
+            stat_revision="stat-1",
+            fingerprinter_version=FINGERPRINTER_VERSION,
+            state="matched",
+            recording_mbid="off-release-recording",
+            release_group_ids=["rg-1"],
+            first_attempt_at=1,
+            last_attempt_at=1,
+        )
+    )
+    seen: list[GroupingTrack] = []
+
+    class _SpyEngine(AlbumEvidenceEngine):
+        def decide(self, local_tracks, candidates, full_recall=False):  # type: ignore[no-untyped-def]
+            seen.extend(local_tracks)
+            return super().decide(local_tracks, candidates, full_recall=full_recall)
+
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+    queue = IdentificationQueueService(store)
+    service = AlbumIdentificationService(
+        store,
+        queue,
+        AlbumCandidateService(
+            FakeProvider([_candidate(release_track=EMBEDDED_RELEASE_TRACK)])
+        ),
+        _SpyEngine(),
+        ConditionalFingerprintService(store, fake),
+    )
+    job = await _claimed_job(store)
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    assert outcome == "identified"
+    assert len(seen) == 1
+    assert seen[0].recording_mbid is None
+    assert seen[0].fingerprint_recording_mbid == "off-release-recording"
+    assert fake.generate_calls == 0
+
+
+
+
+# ---------------------------------------------------------------------------
+# Phase-0 staged-threshold mirrors (LibraryFindings-All X-04 step 0.2).
+# The M-02/M-03/M-05 goldens above run through the staged large-context path
+# here (STAGED_GROUPING_THRESHOLD override style); F-03 locks pin staged
+# parity with the small path. Expectations match the golden JSON one-group
+# pins; the same fixing step flips both the small-path golden test and its
+# staged mirror here.
+# ---------------------------------------------------------------------------
+
+
+async def _run_staged_grouping_case(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    slug: str,
+    dirname: str,
+    specs: list[dict],
+    threshold: int = 3,
+) -> set[str]:
+    """Seed one catalog album of tagged/untagged rows, regroup one context
+    through the staged large-context path, and return the distinct
+    local_album_ids covering the seeded tracks."""
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD",
+        threshold,
+    )
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGING_BATCH_SIZE", 2
+    )
+    artist = LocalArtist(
+        id=f"{slug}-artist",
+        display_name="Artist",
+        folded_name="artist",
+        normalized_name="artist",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id=f"{slug}-old-album",
+        root_id="root",
+        grouping_key=f"{slug}-old",
+        title="Album",
+        album_artist_id=artist.id,
+        album_artist_name=artist.display_name,
+        created_at=1,
+        updated_at=1,
+    )
+    tracks = [
+        LocalTrack(
+            id=f"{slug}-track-{index:02}",
+            local_album_id=album.id,
+            root_id="root",
+            file_path=f"/music/{spec['relative_path']}",
+            relative_path=spec["relative_path"],
+            path_hash=f"{slug}-hash-{index:02}",
+            file_size_bytes=100,
+            file_mtime_ns=1,
+            stat_revision=f"100:{index}",
+            tag_revision=f"tag-{index}",
+            title=spec.get("title", f"Track {index}"),
+            artist_name=spec.get("artist_name", "Artist"),
+            album_title=spec.get("album_title", "Album"),
+            album_artist_name=spec.get("album_artist_name", "Artist"),
+            tag_album_title=spec.get("tag_album_title", "Album"),
+            tag_album_artist_name=spec.get("tag_album_artist_name", "Artist"),
+            title_provenance=spec.get("title_provenance", "absent"),
+            album_title_provenance=spec.get("album_title_provenance", "absent"),
+            album_artist_provenance=spec.get("album_artist_provenance", "absent"),
+            track_number=spec.get("track_number", index),
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+            applied_policy="automatic",
+            applied_policy_revision="policy-1",
+            is_compilation=spec.get("is_compilation", False),
+            metadata_incomplete=spec.get("metadata_incomplete", False),
+        )
+        for index, spec in enumerate(specs, start=1)
+    ]
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=tracks,
+            album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+            track_credits={
+                track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]
+                for track in tracks
+            },
+        )
+    )
+    run_id = f"{slug}-staged-run"
+    await store.create_scan_run(
+        ScanRun(id=run_id, kind="incremental", trigger="manual", queued_at=1)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id,root_id,relative_directory) VALUES (?,?,?)",
+            (run_id, "root", dirname),
+        )
+    await LocalAlbumGroupingService(
+        store, IdentificationQueueService(store)
+    ).regroup_run(run_id, now=2, frozen_policy_revision="policy-1")
+    with sqlite3.connect(db_path) as connection:
+        staged_rows = connection.execute(
+            "SELECT COUNT(*) FROM library_scan_grouping_groups WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0]
+        album_ids = {
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT local_album_id FROM local_tracks "
+                "WHERE relative_path LIKE ?",
+                (f"{dirname}/%",),
+            ).fetchall()
+        }
+    # The staged large-context path must have run (not a vacuous pass), and
+    # every seeded track must still be assigned.
+    assert staged_rows >= 1
+    assert len(album_ids) >= 1
+    total = 0
+    with sqlite3.connect(db_path) as connection:
+        total = connection.execute(
+            "SELECT COUNT(*) FROM local_tracks WHERE relative_path LIKE ?",
+            (f"{dirname}/%",),
+        ).fetchone()[0]
+    assert total == len(specs)
+    return {str(album_id) for album_id in album_ids}
+
+
+@pytest.mark.asyncio
+async def test_staged_mixed_albumartist_merges_to_one_group(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M-02 staged mirror of golden mixed_albumartist_single_group."""
+    album_ids = await _run_staged_grouping_case(
+        store,
+        db_path,
+        monkeypatch,
+        slug="m02",
+        dirname="m02",
+        specs=[
+            {
+                "relative_path": f"m02/{index:02}.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist" if index < 4 else "Other",
+                "track_number": index,
+            }
+            for index in range(1, 5)
+        ],
+    )
+    assert len(album_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_staged_dense_continuity_component_uses_sparse_fallback(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-14 staged mirror of the small-path dense-component cap test.
+
+    Same synthetic 2-old-x-2-new component (4 overlap edges, cap pinned to
+    3): the staged loader must decline the dense matrix and drain the
+    component through sparse single picks, yielding the identical retained
+    mapping as the small path (X keeps cap-old-a, Y keeps cap-old-b)."""
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.STAGED_GROUPING_THRESHOLD", 3
+    )
+    monkeypatch.setattr(
+        "services.native.local_album_grouping_service.CONTINUITY_COMPONENT_EDGE_LIMIT",
+        3,
+    )
+    sparse_calls: list[bool] = []
+    real_sparse = store.apply_next_sparse_grouping_continuity
+
+    async def _counting_sparse(
+        run_id: str, root_id: str, relative_directory: str
+    ) -> bool:
+        sparse_calls.append(True)
+        return await real_sparse(run_id, root_id, relative_directory)
+
+    monkeypatch.setattr(
+        store, "apply_next_sparse_grouping_continuity", _counting_sparse
+    )
+    specs = [
+        ("cap-t1", "cap-old-a", "X", 1),
+        ("cap-t2", "cap-old-a", "X", 2),
+        ("cap-t3", "cap-old-a", "Y", 3),
+        ("cap-t4", "cap-old-b", "X", 4),
+        ("cap-t5", "cap-old-b", "Y", 5),
+        ("cap-t6", "cap-old-b", "Y", 6),
+    ]
+    for suffix, album_id in (("a", "cap-old-a"), ("b", "cap-old-b")):
+        album_tracks = [
+            LocalTrack(
+                id=track_id,
+                local_album_id=album_id,
+                root_id="root",
+                file_path=f"/music/cap/{track_id}.flac",
+                relative_path=f"cap/{track_id}.flac",
+                path_hash=f"cap-hash-{track_id}",
+                file_size_bytes=100,
+                file_mtime_ns=1,
+                stat_revision=f"100:{track_id}",
+                tag_revision=f"tag-{track_id}",
+                title=f"Track {track_id}",
+                artist_name="Artist",
+                album_title=new_title,
+                album_artist_name="Artist",
+                tag_album_title=new_title,
+                tag_album_artist_name="Artist",
+                track_number=number,
+                duration_seconds=180,
+                file_format="flac",
+                imported_at=1,
+                applied_policy="automatic",
+                applied_policy_revision="policy-1",
+                is_compilation=False,
+                metadata_incomplete=False,
+            )
+            for track_id, owner, new_title, number in specs
+            if owner == album_id
+        ]
+        artist = LocalArtist(
+            id=f"cap-artist-{suffix}",
+            display_name="Artist",
+            folded_name="artist",
+            normalized_name="artist",
+            kind="group",
+            created_at=1,
+            updated_at=1,
+        )
+        await store.create_catalog_membership(
+            CatalogMembership(
+                album=LocalAlbum(
+                    id=album_id,
+                    root_id="root",
+                    grouping_key=album_id,
+                    title=f"Before {suffix}",
+                    album_artist_id=artist.id,
+                    album_artist_name=artist.display_name,
+                    created_at=1 if suffix == "a" else 2,
+                    updated_at=1 if suffix == "a" else 2,
+                ),
+                artists=[artist],
+                tracks=album_tracks,
+                album_credits=[
+                    LocalArtistCredit(local_artist_id=artist.id, position=0)
+                ],
+                track_credits={
+                    track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]
+                    for track in album_tracks
+                },
+            )
+        )
+    await store.create_scan_run(
+        ScanRun(id="cap-sparse", kind="incremental", trigger="manual", queued_at=1)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO library_scan_grouping_contexts "
+            "(run_id,root_id,relative_directory) VALUES ('cap-sparse','root','cap')"
+        )
+    await LocalAlbumGroupingService(
+        store, IdentificationQueueService(store)
+    ).regroup_run("cap-sparse", now=2, frozen_policy_revision="policy-1")
+
+    assert len(sparse_calls) >= 1
+    with sqlite3.connect(db_path) as connection:
+        retained = {
+            str(row[0]): (str(row[1]), str(row[2]))
+            for row in connection.execute(
+                "SELECT title, retained_album_id, continuity_reason_code "
+                "FROM library_scan_grouping_groups WHERE run_id='cap-sparse'"
+            ).fetchall()
+        }
+    assert retained["X"] == ("cap-old-a", "MAXIMUM_TRACK_OVERLAP")
+    assert retained["Y"] == ("cap-old-b", "MAXIMUM_TRACK_OVERLAP")
+
+
+@pytest.mark.asyncio
+async def test_staged_disc_spelling_variants_fold_to_one_group(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M-03 staged mirror of golden disc_spelling_variants_fold.
+
+    Pre-fix the staged large-context path is blind here: evidence only
+    covers rows whose ``grouping_directory`` equals the context dir, and the
+    current disc regex does not fold ``Disc(1)``/``(CD1)``/``Volume N`` -
+    so a parent context stages zero tracks (no group rows at all). Step 2.1
+    folds the spellings, the evidence flows, and this flips with the
+    small-path golden test."""
+    album_ids = await _run_staged_grouping_case(
+        store,
+        db_path,
+        monkeypatch,
+        slug="m03",
+        dirname="m03",
+        specs=[
+            {
+                "relative_path": "m03/Disc(1)/01.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 1,
+            },
+            {
+                "relative_path": "m03/Disc(1)/02.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 2,
+            },
+            {
+                "relative_path": "m03/(CD1)/03.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 3,
+            },
+            {
+                "relative_path": "m03/Volume 2/01.flac",
+                "tag_album_title": "Album",
+                "tag_album_artist_name": "Artist",
+                "track_number": 1,
+            },
+        ],
+    )
+    assert len(album_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_staged_parsed_sharing_untagged_dir_provisional_group(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M-05 staged mirror of golden parsed_sharing_untagged_dir: rows carry
+    parsed display values + parsed provenance with empty raw tags
+    (simulating indexer fallback output); the staged path keys them as one
+    tagged-or-parsed group via _grouping_evidence, mirroring the small
+    path (same pinned values as the small-path golden)."""
+    album_ids = await _run_staged_grouping_case(
+        store,
+        db_path,
+        monkeypatch,
+        slug="m05",
+        dirname="m05",
+        specs=[
+            {
+                "relative_path": f"m05/{index:02} - Title {index}.flac",
+                "title": f"Title {index}",
+                "artist_name": "Pink Floyd",
+                "album_title": "Wish You Were Here",
+                "album_artist_name": "Pink Floyd",
+                "tag_album_title": "",
+                "tag_album_artist_name": "",
+                "title_provenance": "parsed",
+                "album_title_provenance": "parsed",
+                "album_artist_provenance": "parsed",
+                "track_number": index,
+                "metadata_incomplete": True,
+            }
+            for index in range(1, 5)
+        ],
+    )
+    assert len(album_ids) == 1
+
+
+def _m05_equiv_specs(kind: str, dirname: str) -> list[dict]:
+    """Shared M-05 parametrized cases run against both grouping paths."""
+    if kind == "agree":
+        return [
+            {
+                "relative_path": f"{dirname}/{index:02} - Title {index}.flac",
+                "title": f"Title {index}",
+                "artist_name": "Pink Floyd",
+                "album_title": "Wish You Were Here",
+                "album_artist_name": "Pink Floyd",
+                "tag_album_title": "",
+                "tag_album_artist_name": "",
+                "title_provenance": "parsed",
+                "album_title_provenance": "parsed",
+                "album_artist_provenance": "parsed",
+                "track_number": index,
+                "metadata_incomplete": True,
+            }
+            for index in range(1, 4)
+        ]
+    if kind == "conflict":
+        return [
+            {
+                "relative_path": f"{dirname}/{index:02} - Title {index}.flac",
+                "title": f"Title {index}",
+                "artist_name": artist,
+                "album_title": album,
+                "album_artist_name": artist,
+                "tag_album_title": "",
+                "tag_album_artist_name": "",
+                "title_provenance": "parsed",
+                "album_title_provenance": "parsed",
+                "album_artist_provenance": "parsed",
+                "track_number": 1,
+                "metadata_incomplete": True,
+            }
+            for index, (album, artist) in enumerate(
+                [("First", "One"), ("Second", "Two")], start=1
+            )
+        ]
+    if kind == "mixed":
+        tagged = {
+            "relative_path": f"{dirname}/01 - Tagged.flac",
+            "title": "Tagged",
+            "artist_name": "Pink Floyd",
+            "album_title": "Wish You Were Here",
+            "album_artist_name": "Pink Floyd",
+            "tag_album_title": "Wish You Were Here",
+            "tag_album_artist_name": "Pink Floyd",
+            "title_provenance": "tag",
+            "album_title_provenance": "tag",
+            "album_artist_provenance": "tag",
+            "track_number": 1,
+        }
+        return [tagged] + [
+            {
+                "relative_path": f"{dirname}/{index:02} - Title {index}.flac",
+                "title": f"Title {index}",
+                "artist_name": "Pink Floyd",
+                "album_title": "Wish You Were Here",
+                "album_artist_name": "Pink Floyd",
+                "tag_album_title": "",
+                "tag_album_artist_name": "",
+                "title_provenance": "parsed",
+                "album_title_provenance": "parsed",
+                "album_artist_provenance": "parsed",
+                "track_number": index,
+                "metadata_incomplete": True,
+            }
+            for index in range(2, 4)
+        ]
+    if kind == "collision":
+        return [
+            {
+                "relative_path": f"{dirname}/take-{index}.flac",
+                "title": f"take-{index}",
+                "artist_name": "Unknown Artist",
+                "album_title": dirname,
+                "album_artist_name": "Unknown Artist",
+                "tag_album_title": "",
+                "tag_album_artist_name": "",
+                "track_number": 1,
+                "metadata_incomplete": True,
+            }
+            for index in range(1, 3)
+        ]
+    raise AssertionError(f"unknown M-05 equivalence kind: {kind}")
+
+
+def _small_path_group_count(specs: list[dict]) -> int:
+    """Run specs through the small path (producer + grouper) and count."""
+    from services.native.local_album_grouper import LocalAlbumGrouper
+    from services.native.local_album_grouping_service import grouping_track_from_row
+
+    tracks = [
+        grouping_track_from_row(
+            {
+                "id": f"equiv-track-{index:02}",
+                "root_id": "root",
+                "relative_path": spec["relative_path"],
+                "title": spec.get("title", f"Track {index}"),
+                "artist_name": spec.get("artist_name", "Artist"),
+                "album_title": spec.get("album_title", "Album"),
+                "album_artist_name": spec.get("album_artist_name", "Artist"),
+                "tag_album_title": spec.get("tag_album_title", "Album"),
+                "tag_album_artist_name": spec.get("tag_album_artist_name", "Artist"),
+                "title_provenance": spec.get("title_provenance", "absent"),
+                "album_title_provenance": spec.get(
+                    "album_title_provenance", "absent"
+                ),
+                "album_artist_provenance": spec.get(
+                    "album_artist_provenance", "absent"
+                ),
+                "artist_sort": None,
+                "album_artist_sort": None,
+                "track_number": spec.get("track_number", index),
+                "disc_number": 1,
+                "duration_seconds": 180.0,
+                "embedded_recording_mbid": None,
+                "embedded_release_mbid": None,
+                "embedded_release_group_mbid": None,
+                "is_compilation": spec.get("is_compilation", False),
+                "metadata_incomplete": spec.get("metadata_incomplete", False),
+                "membership_locked": False,
+                "local_album_id": "equiv-album",
+            }
+        )
+        for index, spec in enumerate(specs, start=1)
+    ]
+    return len(LocalAlbumGrouper().group(tracks))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "expected_groups"),
+    [
+        ("agree", 1),
+        ("conflict", 2),
+        ("mixed", 1),
+        ("collision", 2),
+    ],
+)
+async def test_parsed_grouping_small_path_and_staged_agree(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    expected_groups: int,
+) -> None:
+    """M-05 equivalence: agreeing parses merge (provisional), conflicting
+    parses split, a genuinely-tagged anchor absorbs agreeing parses, and
+    same-number untagged rows stay split - identically on both paths."""
+    slug = f"m05eq-{kind}"
+    specs = _m05_equiv_specs(kind, slug)
+    assert _small_path_group_count(specs) == expected_groups
+    album_ids = await _run_staged_grouping_case(
+        store, db_path, monkeypatch, slug=slug, dirname=slug, specs=specs,
+        threshold=1,
+    )
+    assert len(album_ids) == expected_groups
+
+
+@pytest.mark.asyncio
+async def test_staged_soundtrack_tagged_album_is_one_group(
+    store: NativeLibraryStore,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-03 staged lock: soundtrack album tags group like any album tags."""
+    album_ids = await _run_staged_grouping_case(
+        store,
+        db_path,
+        monkeypatch,
+        slug="f03",
+        dirname="f03",
+        specs=[
+            {
+                "relative_path": f"f03/{index:02}.flac",
+                "album_title": "Film OST",
+                "album_artist_name": "Covers",
+                "tag_album_title": "Film OST",
+                "tag_album_artist_name": "Covers",
+                "track_number": index,
+            }
+            for index in range(1, 5)
+        ],
+    )
+    assert len(album_ids) == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase-1 provenance threading (LibraryFindings-All step 1.4b, M-06/T4):
+# persisted column values win when non-`absent`, else producers derive.
+# ---------------------------------------------------------------------------
+
+
+def _provenance_row(**overrides: object) -> dict:
+    row: dict = {
+        "id": "track-1",
+        "root_id": "root",
+        "relative_path": "Artist/Album/01 - Title.flac",
+        "title": "Title",
+        "artist_name": "Artist",
+        "album_title": "Album",
+        "album_artist_name": "Artist",
+        "tag_album_title": "Album",
+        "tag_album_artist_name": "Artist",
+        "artist_sort": None,
+        "album_artist_sort": None,
+        "track_number": 1,
+        "disc_number": 1,
+        "duration_seconds": 180.0,
+        "embedded_recording_mbid": None,
+        "embedded_release_mbid": None,
+        "embedded_release_group_mbid": None,
+        "embedded_release_track_mbid": None,
+        "is_compilation": False,
+        "metadata_incomplete": False,
+        "membership_locked": False,
+        "local_album_id": "album-1",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_provenance_threading_persisted_values_win_over_derivation() -> None:
+    """1.4b: a row with persisted `parsed` provenance round-trips through
+    both producers with the same values and provenance."""
+    from services.native.album_identification_service import _to_grouping_track
+    from services.native.local_album_grouping_service import grouping_track_from_row
+
+    row = _provenance_row(
+        tag_album_title="",
+        tag_album_artist_name="",
+        album_title="Parsed Album",
+        album_artist_name="Parsed Artist",
+        title="Parsed Title",
+        artist_name="Parsed Artist",
+        title_provenance="parsed",
+        album_title_provenance="parsed",
+        album_artist_provenance="parsed",
+    )
+    grouped = grouping_track_from_row(row)
+    assert grouped.title_provenance == "parsed"
+    assert grouped.album_title_provenance == "parsed"
+    assert grouped.album_artist_provenance == "parsed"
+    identified = _to_grouping_track(row)
+    assert identified.title == grouped.title == "Parsed Title"
+    assert identified.album_title == "Parsed Album"
+    assert identified.album_artist_name == "Parsed Artist"
+    assert identified.title_provenance == "parsed"
+    assert identified.album_title_provenance == "parsed"
+    assert identified.album_artist_provenance == "parsed"
+
+
+def test_provenance_threading_derives_tag_for_genuine_tag_values() -> None:
+    """1.4b: untagged-provenance rows with real tag values derive `tag`."""
+    from services.native.album_identification_service import _to_grouping_track
+    from services.native.local_album_grouping_service import grouping_track_from_row
+
+    grouped = grouping_track_from_row(_provenance_row())
+    assert grouped.album_title == "Album"
+    assert grouped.album_artist_name == "Artist"
+    assert grouped.title_provenance == "tag"
+    assert grouped.album_title_provenance == "tag"
+    assert grouped.album_artist_provenance == "tag"
+    identified = _to_grouping_track(_provenance_row())
+    assert identified.title_provenance == "tag"
+    assert identified.album_title_provenance == "tag"
+    assert identified.album_artist_provenance == "tag"
+
+
+def test_provenance_threading_derives_placeholder_for_substitutes() -> None:
+    """1.4b: stem-matching titles, `"Unknown Artist"`, and substituted album
+    display values derive `placeholder`."""
+    from services.native.local_album_grouping_service import grouping_track_from_row
+
+    track = grouping_track_from_row(
+        _provenance_row(
+            title="01 - Title",
+            artist_name="Unknown Artist",
+            tag_album_title="",
+            tag_album_artist_name="",
+            album_title="Album",
+            album_artist_name="Unknown Artist",
+        )
+    )
+    assert track.title_provenance == "placeholder"
+    assert track.album_title_provenance == "placeholder"
+    assert track.album_artist_provenance == "placeholder"
+    # Derivation never changes grouping values: raw stays the key signal.
+    assert track.album_title == ""
+    assert track.album_artist_name == ""
+
+
+def test_provenance_threading_absent_for_empty_values() -> None:
+    """1.4b: rows with no display values carry `absent`, never a guess (an
+    unparseable bare filename backfills nothing either)."""
+    from services.native.album_identification_service import _to_grouping_track
+    from services.native.local_album_grouping_service import grouping_track_from_row
+
+    row = _provenance_row(
+        relative_path="track.flac",
+        title="",
+        artist_name="",
+        album_title="",
+        album_artist_name="",
+        tag_album_title="",
+        tag_album_artist_name="",
+    )
+    grouped = grouping_track_from_row(row)
+    assert grouped.title_provenance == "absent"
+    assert grouped.album_title_provenance == "absent"
+    assert grouped.album_artist_provenance == "absent"
+    identified = _to_grouping_track(row)
+    assert identified.title_provenance == "absent"
+    assert identified.album_title_provenance == "absent"
+    assert identified.album_artist_provenance == "absent"
+
+
+def _prepare_tagged_write(
+    store: NativeLibraryStore, relative_path: str, tag, local_track_id: str
+):
+    """Drive the indexer's `_prepare_tagged` without any tag-reader IO."""
+    from models.audio import AudioInfo
+    from services.native.library_indexer import LibraryIndexer
+
+    class _StubReader:
+        def read_tags(self, path: Path):
+            raise NotImplementedError
+
+    indexer = LibraryIndexer(store, _StubReader())
+    return indexer._prepare_tagged(
+        "run-1",
+        {
+            "root_id": "root",
+            "relative_path": relative_path,
+            "absolute_path": f"/music/{relative_path}",
+            "local_track_id": local_track_id,
+            "file_size_bytes": 100,
+            "file_mtime_ns": 200,
+            "stat_revision": "stat-1",
+            "policy_revision": "policy-1",
+            "effective_policy": "automatic",
+            "comparison_result": "new",
+        },
+        tag,
+        AudioInfo(
+            duration_seconds=200.0,
+            bitrate=800,
+            sample_rate=44100,
+            channels=2,
+            file_format="flac",
+            file_size_bytes=100,
+        ),
+        now=1.0,
+    )
+
+
+def test_indexer_fallback_writes_parsed_display_with_explicit_provenance(
+    tmp_path: Path,
+) -> None:
+    """1.5: missing tags fall back to filename parses for DISPLAY columns
+    (raw `tag_*` stay empty) with explicit provenance on every touched row,
+    including `tag` for fully-tagged rows."""
+    import threading
+
+    from models.audio import AudioTag
+
+    store = NativeLibraryStore(tmp_path / "library.db", threading.Lock())
+    write = _prepare_tagged_write(
+        store,
+        "Pink Floyd/Wish You Were Here/01 - Shine On You Crazy Diamond.flac",
+        AudioTag(title="", artist="", album="", track_number=0),
+        "track-1",
+    )
+    track = write.track
+    assert track.title == "Shine On You Crazy Diamond"
+    assert track.title_provenance == "parsed"
+    assert track.album_title == "Wish You Were Here"
+    assert track.album_title_provenance == "parsed"
+    assert track.album_artist_name == "Pink Floyd"
+    assert track.album_artist_provenance == "parsed"
+    assert track.artist_name == "Pink Floyd"
+    assert track.track_number == 1
+    assert track.tag_album_title == ""
+    assert track.tag_album_artist_name == ""
+
+    tagged = _prepare_tagged_write(
+        store,
+        "Pink Floyd/Wish You Were Here/01 - Shine On You Crazy Diamond.flac",
+        AudioTag(
+            title="Shine On You Crazy Diamond",
+            artist="Pink Floyd",
+            album="Wish You Were Here",
+            track_number=1,
+            album_artist="Pink Floyd",
+        ),
+        "track-2",
+    ).track
+    assert tagged.title_provenance == "tag"
+    assert tagged.album_title_provenance == "tag"
+    assert tagged.album_artist_provenance == "tag"
+    assert tagged.tag_album_title == "Wish You Were Here"
+    assert tagged.tag_album_artist_name == "Pink Floyd"
+
+    # Unparseable paths keep today's stem/`"Unknown Artist"` placeholders.
+    bare = _prepare_tagged_write(
+        store,
+        "track.flac",
+        AudioTag(title="", artist="", album="", track_number=0),
+        "track-3",
+    ).track
+    assert bare.title == "track"
+    assert bare.title_provenance == "placeholder"
+    assert bare.album_title == "track"
+    assert bare.album_title_provenance == "placeholder"
+    assert bare.album_artist_name == "Unknown Artist"
+    assert bare.album_artist_provenance == "placeholder"
+    assert bare.track_number == 0
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_tracks_beyond_the_fingerprint_cap_degrade_to_tag_evidence(
+    store: NativeLibraryStore,
+) -> None:
+    """1.6 tuning (M-06/T5): with five ambiguous tracks and no-match
+    fingerprints, only `MAX_NEW_FINGERPRINTS_PER_ATTEMPT` generations run -
+    tracks 3+ provably degrade to tag-evidence and the decision completes
+    instead of hanging."""
+    from models.local_catalog import CatalogMembership
+
+    artist = LocalArtist(
+        id="artist-budget",
+        display_name="Budget Artist",
+        folded_name="budget artist",
+        normalized_name="budget artist",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id="album-budget",
+        root_id="root",
+        grouping_key="group-budget",
+        title="Budget Album",
+        album_artist_id=artist.id,
+        album_artist_name="Budget Artist",
+        created_at=1,
+        updated_at=1,
+    )
+    tracks = [
+        LocalTrack(
+            id=f"track-budget-{index}",
+            local_album_id=album.id,
+            root_id="root",
+            file_path=f"/music/budget-{index}.flac",
+            relative_path=f"Budget/{index:02}.flac",
+            path_hash=f"hash-budget-{index}",
+            file_size_bytes=100,
+            file_mtime_ns=1,
+            stat_revision=f"stat-budget-{index}",
+            tag_revision=f"tag-budget-{index}",
+            title="Alpha" if index == 1 else ("Beta" if index == 2 else f"{index:02}"),
+            artist_name="Budget Artist"
+            if index <= 2
+            else "Unknown Artist",
+            album_title="Budget Album",
+            album_artist_name="Budget Artist",
+            title_provenance="tag" if index <= 2 else "placeholder",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
+            track_number=index,
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+        )
+        for index in range(1, 6)
+    ]
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=tracks,
+            album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+            track_credits={
+                track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]
+                for track in tracks
+            },
+        )
+    )
+    candidate = _candidate(group="budget-rg")
+    # Deliberately wrong titles: the tag tracks mismatch (soft), the
+    # placeholder tracks abstain - insufficient, never contradictory.
+    candidate = msgspec.structs.replace(
+        candidate,
+        album_title="Budget Album",
+        album_artist_name="Budget Artist",
+        tracks=[
+            CandidateTrack(
+                title=f"Gamma {index}",
+                position=index,
+                absolute_position=index,
+                duration_seconds=180.0,
+            )
+            for index in range(1, 6)
+        ],
+    )
+    fingerprinter = FakeFingerprinter(FingerprintResult(status="skip"))
+    job = await _claimed_job(store, album_id="album-budget")
+    outcome = await _service(
+        store, FakeProvider([candidate]), fingerprinter
+    ).run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "insufficient_evidence"
+    assert fingerprinter.generate_calls == MAX_NEW_FINGERPRINTS_PER_ATTEMPT
+
+
+def test_parsed_sharing_untagged_tracks_group_together(tmp_path: Path) -> None:
+    """1.5: untagged rows with agreeing parses key as tagged through
+    `grouping_track_from_row`, so one organized directory is one group."""
+    import threading
+
+    from models.audio import AudioTag
+    from services.native.local_album_grouper import LocalAlbumGrouper
+    from services.native.local_album_grouping_service import grouping_track_from_row
+
+    store = NativeLibraryStore(tmp_path / "library.db", threading.Lock())
+    titles = ["Shine On You Crazy Diamond", "Welcome to the Machine"]
+    tracks = []
+    for index, title in enumerate(titles, start=1):
+        write = _prepare_tagged_write(
+            store,
+            f"Pink Floyd/Wish You Were Here/0{index} - {title}.flac",
+            AudioTag(title="", artist="", album="", track_number=0),
+            f"track-{index}",
+        )
+        stored = write.track
+        tracks.append(
+            grouping_track_from_row(
+                {
+                    "id": stored.id,
+                    "root_id": stored.root_id,
+                    "relative_path": stored.relative_path,
+                    "title": stored.title,
+                    "artist_name": stored.artist_name,
+                    "album_title": stored.album_title,
+                    "album_artist_name": stored.album_artist_name,
+                    "tag_album_title": stored.tag_album_title,
+                    "tag_album_artist_name": stored.tag_album_artist_name,
+                    "title_provenance": stored.title_provenance,
+                    "album_title_provenance": stored.album_title_provenance,
+                    "album_artist_provenance": stored.album_artist_provenance,
+                    "artist_sort": None,
+                    "album_artist_sort": None,
+                    "track_number": stored.track_number,
+                    "disc_number": stored.disc_number,
+                    "duration_seconds": stored.duration_seconds,
+                    "embedded_recording_mbid": None,
+                    "embedded_release_mbid": None,
+                    "embedded_release_group_mbid": None,
+                    "is_compilation": False,
+                    "metadata_incomplete": True,
+                    "membership_locked": False,
+                    "local_album_id": stored.local_album_id,
+                }
+            )
+        )
+    assert [track.album_title for track in tracks] == [
+        "Wish You Were Here",
+        "Wish You Were Here",
+    ]
+    groups = LocalAlbumGrouper().group(tracks)
+    assert len(groups) == 1
+    assert sorted(groups[0].track_ids) == ["track-1", "track-2"]
+
+
+# Step 2.5 (E-02) T12: identify-lane auto-accept gate tests.
+
+# Valid UUIDs: embedded values are UUID-validated up front, so gate fixtures
+# cannot use readable placeholders here.
+GATE_RECORDING = "88888888-8888-4888-8888-888888888888"
+GATE_RELEASE_TRACK = "99999999-9999-4999-8999-999999999999"
+GATE_MULTI_RECORDING = {
+    1: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    2: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+}
+GATE_MULTI_RELEASE_TRACK = {
+    1: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1",
+    2: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+}
+
+
+class FakeCanonicalProvider:
+    """Minimal canonical-release stub: serves one release (or fails) and logs calls."""
+
+    def __init__(
+        self,
+        release: MbManagementRelease | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.release = release
+        self.error = error
+        self.calls: list[tuple[str, tuple[str, ...], RequestPriority]] = []
+
+    async def get_canonical_release(
+        self,
+        release_mbid: str,
+        *,
+        includes: tuple[str, ...] = (),
+        priority: RequestPriority = RequestPriority.USER_INITIATED,
+        **_kwargs: object,
+    ) -> MbManagementRelease | None:
+        self.calls.append((release_mbid, includes, priority))
+        if self.error is not None:
+            raise self.error
+        return self.release
+
+
+def _official_release(
+    *, release_mbid: str = "release-rg-1", title: str = "Album"
+) -> MbManagementRelease:
+    return MbManagementRelease(
+        id=release_mbid,
+        title=title,
+        status="Official",
+        date="2024-01-31",
+        country="XW",
+    )
+
+
+def _disabled_fingerprinter() -> FakeFingerprinter:
+    return FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False)
+
+
+@pytest.mark.asyncio
+async def test_identify_gate_accepts_exact_edition_behind_flag(
+    store: NativeLibraryStore, db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unanimous opt-in + lone >=0.95 + local MBID proof seals the exact edition
+    with an undo snapshot and an automatic_exact_edition audit row."""
+    await _seed_album(
+        store,
+        embedded_recording=GATE_RECORDING,
+        embedded_release_track=GATE_RELEASE_TRACK,
+    )
+    provider = FakeProvider([_candidate(recording=GATE_RECORDING, release_track=GATE_RELEASE_TRACK)])
+    canonical = FakeCanonicalProvider(_official_release())
+    job = await _claimed_job(store)
+    service = _service(
+        store,
+        provider,
+        _disabled_fingerprinter(),
+        canonical_provider=canonical,
+        edition_opt_in=lambda _root_id: True,
+    )
+    caplog.set_level("DEBUG")
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    # Bounded I/O: the final top-3 by score only, repair-lane call shape.
+    assert canonical.calls == [
+        ("release-rg-1", ("media",), RequestPriority.BACKGROUND_SYNC)
+    ]
+    with sqlite3.connect(db_path) as connection:
+        album_identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid, decision_source "
+            "FROM local_album_external_identities"
+        ).fetchone()
+        track_identity = connection.execute(
+            "SELECT recording_mbid, release_mbid, release_track_mbid, decision_source "
+            "FROM local_track_external_identities"
+        ).fetchone()
+        audit = connection.execute(
+            "SELECT action_kind, reason_code, after_json FROM library_catalog_actions "
+            "WHERE action_kind = 'automatic_exact_edition'"
+        ).fetchone()
+        undo = connection.execute(
+            "SELECT local_album_id FROM library_automatic_edition_undo"
+        ).fetchone()
+    assert tuple(album_identity) == ("rg-1", "release-rg-1", "automatic")
+    assert tuple(track_identity) == (
+        GATE_RECORDING,
+        "release-rg-1",
+        GATE_RELEASE_TRACK,
+        "automatic",
+    )
+    assert audit is not None
+    assert tuple(audit[:2]) == ("automatic_exact_edition", "SUPPORTED")
+    after = json.loads(audit[2])
+    assert after["gate_reason"] == "AUTO_ACCEPT"
+    assert after["actor"] == "system"
+    assert after["ranking_inputs"][0]["release_mbid"] == "release-rg-1"
+    assert tuple(undo) == ("album-1",)
+    assert any(
+        "identify edition gate: accept" in record.message for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_identify_gate_veto_routes_lone_candidate_to_edition_to_confirm(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A lone >=0.95 candidate without local MBID proof pins the RG only and
+    files an edition_to_confirm review instead of sealing the exact edition."""
+    # Step 2.6 (N-01): the lone-eligible quorum is met by two present-claim
+    # tracks with no proof anywhere, so decide still selects and the gate's
+    # own LONE_WITHOUT_PROOF veto stays the reason the exact edition never
+    # seals.
+    artist = LocalArtist(
+        id="artist-lv",
+        display_name="Artist",
+        folded_name="artist",
+        normalized_name="artist",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id="album-1",
+        root_id="root",
+        grouping_key="group-lv",
+        title="Album",
+        album_artist_id=artist.id,
+        album_artist_name="Artist",
+        created_at=1,
+        updated_at=1,
+    )
+    tracks = [
+        LocalTrack(
+            id=f"track-lv-{index}",
+            local_album_id=album.id,
+            root_id="root",
+            file_path=f"/music/lv-{index}.flac",
+            relative_path=f"lv-{index}.flac",
+            path_hash=f"hash-lv-{index}",
+            file_size_bytes=100,
+            file_mtime_ns=index,
+            stat_revision=f"stat-lv-{index}",
+            tag_revision=f"tag-lv-{index}",
+            title=f"Track {index}",
+            artist_name="Artist",
+            album_title="Album",
+            album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
+            track_number=index,
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+            applied_policy="automatic",
+            applied_policy_revision="policy-1",
+        )
+        for index in (1, 2)
+    ]
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=tracks,
+            album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+            track_credits={
+                track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]
+                for track in tracks
+            },
+        )
+    )
+    provider = FakeProvider(
+        [
+            AlbumCandidate(
+                release_group_mbid="rg-1",
+                release_mbid="release-rg-1",
+                album_title="Album",
+                album_artist_name="Artist",
+                artist_mbid="artist-mbid",
+                tracks=[
+                    CandidateTrack(
+                        title=f"Track {index}",
+                        position=index,
+                        absolute_position=index,
+                        duration_seconds=180,
+                        recording_mbid=GATE_MULTI_RECORDING[index],
+                        release_track_mbid=GATE_MULTI_RELEASE_TRACK[index],
+                    )
+                    for index in (1, 2)
+                ],
+            )
+        ]
+    )
+    canonical = FakeCanonicalProvider(_official_release())
+    job = await _claimed_job(store)
+    service = _service(
+        store,
+        provider,
+        _disabled_fingerprinter(),
+        canonical_provider=canonical,
+        edition_opt_in=lambda _root_id: True,
+    )
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "edition_uncertain"
+    assert canonical.calls != []
+    with sqlite3.connect(db_path) as connection:
+        album_identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid, decision_source "
+            "FROM local_album_external_identities"
+        ).fetchone()
+        review = connection.execute(
+            "SELECT state, reason_code, ranked_edition_keys_json "
+            "FROM library_identification_reviews WHERE local_album_id = 'album-1'"
+        ).fetchone()
+        audit_count = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE action_kind = 'automatic_exact_edition'"
+        ).fetchone()[0]
+        undo_count = connection.execute(
+            "SELECT COUNT(*) FROM library_automatic_edition_undo"
+        ).fetchone()[0]
+        attempt_flags = connection.execute(
+            "SELECT degradation_flags_json FROM library_identification_attempts "
+            "WHERE local_album_id = 'album-1'"
+        ).fetchone()[0]
+    assert tuple(album_identity) == ("rg-1", None, "automatic")
+    assert tuple(review[:2]) == ("edition_to_confirm", "EDITION_UNCERTAIN")
+    assert json.loads(review[2]) == ["rg-1:release-rg-1"]
+    assert audit_count == 0
+    assert undo_count == 0
+    assert "auto_gate:LONE_WITHOUT_PROOF" in attempt_flags
+
+
+async def _seed_plain_two_track_album(store: NativeLibraryStore) -> None:
+    """Two present-claim tracks with no embedded tags (lone quorum met)."""
+    artist = LocalArtist(
+        id="artist-hold",
+        display_name="Artist",
+        folded_name="artist",
+        normalized_name="artist",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id="album-1",
+        root_id="root",
+        grouping_key="group-hold",
+        title="Album",
+        album_artist_id=artist.id,
+        album_artist_name="Artist",
+        created_at=1,
+        updated_at=1,
+    )
+    tracks = [
+        LocalTrack(
+            id=f"track-hold-{index}",
+            local_album_id=album.id,
+            root_id="root",
+            file_path=f"/music/hold-{index}.flac",
+            relative_path=f"hold-{index}.flac",
+            path_hash=f"hash-hold-{index}",
+            file_size_bytes=100,
+            file_mtime_ns=index,
+            stat_revision=f"stat-hold-{index}",
+            tag_revision=f"tag-hold-{index}",
+            title=f"Track {index}",
+            artist_name="Artist",
+            album_title="Album",
+            album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
+            track_number=index,
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+            applied_policy="automatic",
+            applied_policy_revision="policy-1",
+        )
+        for index in (1, 2)
+    ]
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=tracks,
+            album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+            track_credits={
+                track.id: [LocalArtistCredit(local_artist_id=artist.id, position=0)]
+                for track in tracks
+            },
+        )
+    )
+
+
+def _lone_gate_candidate() -> AlbumCandidate:
+    return AlbumCandidate(
+        release_group_mbid="rg-1",
+        release_mbid="release-rg-1",
+        album_title="Album",
+        album_artist_name="Artist",
+        artist_mbid="artist-mbid",
+        tracks=[
+            CandidateTrack(
+                title=f"Track {index}",
+                position=index,
+                absolute_position=index,
+                duration_seconds=180,
+                recording_mbid=GATE_MULTI_RECORDING[index],
+                release_track_mbid=GATE_MULTI_RELEASE_TRACK[index],
+            )
+            for index in (1, 2)
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier_outcome_holds_sealed_automatic_exact(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A gate veto on merely weaker evidence keeps the sealed automatic
+    exact (no demotion), files no new review row, and flags the attempt +
+    hold metric."""
+    await _seed_plain_two_track_album(store)
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id="album-1",
+            release_group_mbid="rg-1",
+            release_mbid="release-rg-1",
+            decision_source="automatic",
+            matcher_version=MATCHER_VERSION,
+        ),
+        expected_album_revision=1,
+    )
+    provider = FakeProvider([_lone_gate_candidate()])
+    canonical = FakeCanonicalProvider(_official_release())
+    job = await _claimed_job(store)
+    service = _service(
+        store,
+        provider,
+        _disabled_fingerprinter(),
+        canonical_provider=canonical,
+        edition_opt_in=lambda _root_id: True,
+    )
+    before = dict(_edition_hold_metrics.snapshot().counters)
+
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "edition_uncertain"
+    with sqlite3.connect(db_path) as connection:
+        identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid, decision_source "
+            "FROM local_album_external_identities"
+        ).fetchone()
+        tier_rows = connection.execute(
+            "SELECT COUNT(*) FROM library_identification_reviews "
+            "WHERE local_album_id = 'album-1' AND state = 'edition_to_confirm'"
+        ).fetchone()[0]
+        attempt_flags = connection.execute(
+            "SELECT degradation_flags_json FROM library_identification_attempts "
+            "WHERE local_album_id = 'album-1'"
+        ).fetchone()[0]
+    assert tuple(identity) == ("rg-1", "release-rg-1", "automatic")
+    assert tier_rows == 0
+    assert "edition_hold:kept_exact" in attempt_flags
+    after = _edition_hold_metrics.snapshot().counters
+    assert after.get("tier_hold:kept_exact", 0) == (
+        before.get("tier_hold:kept_exact", 0) + 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier_outcome_demotes_automatic_exact_on_group_change(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """The hold is same-group only: a tier for a *different* release group
+    demotes the old sealed exact to the new group pin, files the tier row
+    (the contradiction stays visible), and bumps the demotion counter."""
+    await _seed_plain_two_track_album(store)
+    await store.attach_album_identity(
+        LocalAlbumExternalIdentity(
+            local_album_id="album-1",
+            release_group_mbid="rg-old",
+            release_mbid="release-old",
+            decision_source="automatic",
+            matcher_version=MATCHER_VERSION,
+        ),
+        expected_album_revision=1,
+    )
+    provider = FakeProvider([_lone_gate_candidate()])
+    canonical = FakeCanonicalProvider(_official_release())
+    job = await _claimed_job(store)
+    service = _service(
+        store,
+        provider,
+        _disabled_fingerprinter(),
+        canonical_provider=canonical,
+        edition_opt_in=lambda _root_id: True,
+    )
+    before = dict(_edition_hold_metrics.snapshot().counters)
+
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "edition_uncertain"
+    with sqlite3.connect(db_path) as connection:
+        identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid, decision_source "
+            "FROM local_album_external_identities"
+        ).fetchone()
+        tier_rows = connection.execute(
+            "SELECT COUNT(*) FROM library_identification_reviews "
+            "WHERE local_album_id = 'album-1' AND state = 'edition_to_confirm'"
+        ).fetchone()[0]
+        attempt_flags = connection.execute(
+            "SELECT degradation_flags_json FROM library_identification_attempts "
+            "WHERE local_album_id = 'album-1'"
+        ).fetchone()[0]
+    assert tuple(identity) == ("rg-1", None, "automatic")
+    assert tier_rows == 1
+    assert "edition_hold:kept_exact" not in attempt_flags
+    after = _edition_hold_metrics.snapshot().counters
+    assert after.get("tier_demotion:rg_only", 0) == (
+        before.get("tier_demotion:rg_only", 0) + 1
+    )
+    assert after.get("tier_hold:kept_exact", 0) == before.get(
+        "tier_hold:kept_exact", 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_below_quorum_single_track_files_soft_review_row(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """2.6 (N-01/T13) end to end: a lone descriptive track with no provider
+    proof stays below the lone-eligible quorum, so the run terminalizes
+    `insufficient_evidence` - the job still terminalizes `needs_review`
+    (mapping unchanged) while the review row carries the soft
+    `edition_to_confirm` state."""
+    await _seed_album(store)
+    job = await _claimed_job(store)
+    outcome = await _service(
+        store,
+        FakeProvider([_candidate()]),
+        FakeFingerprinter(FingerprintResult(status="disabled"), enabled=False),
+    ).run_claimed_job(job, "worker", now=3)
+    assert outcome == "insufficient_evidence"
+    with sqlite3.connect(db_path) as connection:
+        review = connection.execute(
+            "SELECT state, reason_code FROM library_identification_reviews "
+            "WHERE local_album_id = 'album-1'"
+        ).fetchone()
+        job_state = connection.execute(
+            "SELECT state FROM library_identification_jobs WHERE id = ?",
+            (job["id"],),
+        ).fetchone()[0]
+    assert tuple(review) == ("edition_to_confirm", "INSUFFICIENT_METADATA")
+    assert job_state == "needs_review"
+
+
+@pytest.mark.asyncio
+async def test_identify_gate_off_by_default_keeps_legacy_exact_write(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Flag None/unset means pre-auto behavior byte-for-byte: the exact edition
+    still seals (legacy path) but with no gate I/O, audit, or undo rows."""
+    await _seed_album(
+        store,
+        embedded_recording=GATE_RECORDING,
+        embedded_release_track=GATE_RELEASE_TRACK,
+    )
+    provider = FakeProvider([_candidate(recording=GATE_RECORDING, release_track=GATE_RELEASE_TRACK)])
+    job = await _claimed_job(store)
+    service = _service(store, provider, _disabled_fingerprinter())
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    assert provider.calls != []
+    with sqlite3.connect(db_path) as connection:
+        album_identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid, decision_source "
+            "FROM local_album_external_identities"
+        ).fetchone()
+        audit_count = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE action_kind = 'automatic_exact_edition'"
+        ).fetchone()[0]
+        undo_count = connection.execute(
+            "SELECT COUNT(*) FROM library_automatic_edition_undo"
+        ).fetchone()[0]
+    assert tuple(album_identity) == ("rg-1", "release-rg-1", "automatic")
+    assert audit_count == 0
+    assert undo_count == 0
+
+
+@pytest.mark.asyncio
+async def test_identify_gate_never_downgrades_manual_rg_identity(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """A curator's manual RG-only pick is never auto-refined: a gate-accepting
+    decision resolves reviews but leaves the manual row byte-identical."""
+    await _seed_album(
+        store,
+        embedded_recording=GATE_RECORDING,
+        embedded_release_track=GATE_RELEASE_TRACK,
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_album_external_identities "
+            "(local_album_id, provider, release_group_mbid, release_mbid, "
+            "decision_source, matcher_version, attempt_id, selected_at) "
+            "VALUES ('album-1', 'musicbrainz', 'rg-1', NULL, 'manual', 'test', NULL, 1.0)"
+        )
+        connection.commit()
+        before = connection.execute(
+            "SELECT * FROM local_album_external_identities WHERE local_album_id = 'album-1'"
+        ).fetchone()
+    provider = FakeProvider([_candidate(recording=GATE_RECORDING, release_track=GATE_RELEASE_TRACK)])
+    canonical = FakeCanonicalProvider(_official_release())
+    job = await _claimed_job(store)
+    service = _service(
+        store,
+        provider,
+        _disabled_fingerprinter(),
+        canonical_provider=canonical,
+        edition_opt_in=lambda _root_id: True,
+    )
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    with sqlite3.connect(db_path) as connection:
+        after = connection.execute(
+            "SELECT * FROM local_album_external_identities WHERE local_album_id = 'album-1'"
+        ).fetchone()
+        audit_count = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE action_kind = 'automatic_exact_edition'"
+        ).fetchone()[0]
+        undo_count = connection.execute(
+            "SELECT COUNT(*) FROM library_automatic_edition_undo"
+        ).fetchone()[0]
+    assert tuple(after) == tuple(before)
+    assert audit_count == 0
+    assert undo_count == 0
+
+
+@pytest.mark.asyncio
+async def test_identify_gate_fetch_failure_defers_without_review(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Canonical fetch failure maps to PROVIDER_TEMPORARILY_UNAVAILABLE defer -
+    same provider-unavailable semantics, never review."""
+    # Step 2.6 (N-01): the lone-eligible quorum needs the seeded proof so the
+    # run reaches the gate whose fetch then fails.
+    await _seed_album(
+        store,
+        embedded_recording=GATE_RECORDING,
+        embedded_release_track=GATE_RELEASE_TRACK,
+    )
+    provider = FakeProvider([_candidate(recording=GATE_RECORDING, release_track=GATE_RELEASE_TRACK)])
+    canonical = FakeCanonicalProvider(
+        _official_release(), error=ExternalServiceError("MusicBrainz is down")
+    )
+    job = await _claimed_job(store)
+    service = _service(
+        store,
+        provider,
+        _disabled_fingerprinter(),
+        canonical_provider=canonical,
+        edition_opt_in=lambda _root_id: True,
+    )
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "provider_deferred"
+    assert canonical.calls != []
+    with sqlite3.connect(db_path) as connection:
+        failure_code = connection.execute(
+            "SELECT last_failure_code FROM library_identification_jobs WHERE id = 'job-album-1'"
+        ).fetchone()[0]
+        identity_count = connection.execute(
+            "SELECT COUNT(*) FROM local_album_external_identities"
+        ).fetchone()[0]
+        review_count = connection.execute(
+            "SELECT COUNT(*) FROM library_identification_reviews "
+            "WHERE local_album_id = 'album-1'"
+        ).fetchone()[0]
+    assert failure_code == "PROVIDER_TEMPORARILY_UNAVAILABLE"
+    assert identity_count == 0
+    assert review_count == 0
+
+
+@pytest.mark.asyncio
+async def test_identify_gate_multi_root_album_requires_unanimous_opt_in(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Tracks spanning two opted-in roots still take the legacy path: no gate
+    I/O, exact seals without audit or undo rows."""
+    from models.local_catalog import (
+        CatalogMembership,
+        LocalAlbum,
+        LocalArtist,
+        LocalArtistCredit,
+        LocalTrack,
+    )
+
+    artist = LocalArtist(
+        id="artist-mr",
+        display_name="Artist",
+        folded_name="artist",
+        normalized_name="artist",
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+    album = LocalAlbum(
+        id="album-mr",
+        root_id="root-a",
+        grouping_key="group-mr",
+        title="Album",
+        album_artist_id=artist.id,
+        album_artist_name="Artist",
+        created_at=1,
+        updated_at=1,
+    )
+    tracks = []
+    credits = {}
+    for index in (1, 2):
+        track = LocalTrack(
+            id=f"track-mr-{index}",
+            local_album_id=album.id,
+            root_id="root-a",
+            file_path=f"/music/mr-{index}.flac",
+            relative_path=f"mr-{index}.flac",
+            path_hash=f"hash-mr-{index}",
+            file_size_bytes=100,
+            file_mtime_ns=index,
+            stat_revision=f"stat-mr-{index}",
+            tag_revision=f"tag-mr-{index}",
+            title=f"Track {index}",
+            artist_name="Artist",
+            album_title="Album",
+            album_artist_name="Artist",
+            title_provenance="tag",
+            album_title_provenance="tag",
+            album_artist_provenance="tag",
+            track_number=index,
+            duration_seconds=180,
+            file_format="flac",
+            imported_at=1,
+            applied_policy="automatic",
+            applied_policy_revision="policy-1",
+            embedded_recording_mbid=GATE_MULTI_RECORDING[index],
+            embedded_release_track_mbid=GATE_MULTI_RELEASE_TRACK[index],
+        )
+        tracks.append(track)
+        credits[track.id] = [LocalArtistCredit(local_artist_id=artist.id, position=0)]
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=album,
+            artists=[artist],
+            tracks=tracks,
+            album_credits=[LocalArtistCredit(local_artist_id=artist.id, position=0)],
+            track_credits=credits,
+        )
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET root_id = 'root-b' WHERE id = 'track-mr-2'"
+        )
+        connection.commit()
+    candidate = AlbumCandidate(
+        release_group_mbid="rg-mr",
+        release_mbid="release-mr",
+        album_title="Album",
+        album_artist_name="Artist",
+        artist_mbid="artist-mbid",
+        tracks=[
+            CandidateTrack(
+                title=f"Track {index}",
+                position=index,
+                absolute_position=index,
+                duration_seconds=180,
+                recording_mbid=GATE_MULTI_RECORDING[index],
+                release_track_mbid=GATE_MULTI_RELEASE_TRACK[index],
+            )
+            for index in (1, 2)
+        ],
+    )
+    canonical = FakeCanonicalProvider(
+        _official_release(release_mbid="release-mr")
+    )
+    job = await _claimed_job(store, "album-mr")
+    service = _service(
+        store,
+        FakeProvider([candidate]),
+        _disabled_fingerprinter(),
+        canonical_provider=canonical,
+        edition_opt_in=lambda _root_id: True,
+    )
+    outcome = await service.run_claimed_job(job, "worker", now=3)
+
+    assert outcome == "identified"
+    assert canonical.calls == []
+    with sqlite3.connect(db_path) as connection:
+        album_identity = connection.execute(
+            "SELECT release_group_mbid, release_mbid, decision_source "
+            "FROM local_album_external_identities WHERE local_album_id = 'album-mr'"
+        ).fetchone()
+        audit_count = connection.execute(
+            "SELECT COUNT(*) FROM library_catalog_actions "
+            "WHERE action_kind = 'automatic_exact_edition'"
+        ).fetchone()[0]
+    assert tuple(album_identity) == ("rg-mr", "release-mr", "automatic")
+    assert audit_count == 0
+
+
+@pytest.mark.asyncio
+async def test_apply_suggested_edition_tx_refuses_automatic_refine_of_manual_identity(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """The accept tx's decision_source pre-check (identify-lane flag): an
+    automatic accept over a manual/legacy row skips without touching it; the
+    repair lane default still auto-refines (signed D-EDITION-AUTO behavior);
+    a manual accept still seals under either setting."""
+    from infrastructure.persistence.native_library_store import _album_input_revision
+
+    await _seed_album(store)
+
+    def _set_manual_rg_only() -> None:
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "DELETE FROM local_album_external_identities WHERE local_album_id = 'album-1'"
+            )
+            connection.execute(
+                "INSERT INTO local_album_external_identities "
+                "(local_album_id, provider, release_group_mbid, release_mbid, "
+                "decision_source, matcher_version, attempt_id, selected_at) "
+                "VALUES ('album-1', 'musicbrainz', 'rg-1', NULL, 'manual', 'test', NULL, 1.0)"
+            )
+            connection.commit()
+
+    _set_manual_rg_only()
+    evidence = CandidateEvidence(
+        release_group_mbid="rg-1",
+        release_mbid="release-rg-1",
+        score=1.0,
+        reason_code="SUPPORTED",
+        matcher_version="test",
+        track_evidence=[
+            TrackEvidence(
+                local_track_id="track-1",
+                classification="supported",
+                recording_mbid=GATE_RECORDING,
+                release_track_mbid=GATE_RELEASE_TRACK,
+                candidate_disc_number=1,
+                candidate_track_position=1,
+            )
+        ],
+    )
+
+    async def _seal(
+        *, decision_source: str, protect_manual_identity: bool = False
+    ) -> tuple[str, str | None]:
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            album_rev = connection.execute(
+                "SELECT row_revision FROM local_albums WHERE id = 'album-1'"
+            ).fetchone()[0]
+            identity = connection.execute(
+                "SELECT * FROM local_album_external_identities "
+                "WHERE local_album_id = 'album-1'"
+            ).fetchone()
+            track_rows = connection.execute(
+                "SELECT t.*, NULL AS recording_mbid, NULL AS identity_release_mbid, "
+                "NULL AS release_track_mbid, NULL AS medium_position, "
+                "NULL AS release_track_position FROM local_tracks t "
+                "WHERE t.local_album_id = 'album-1' AND t.availability = 'indexed' "
+                "ORDER BY t.id"
+            ).fetchall()
+            tag_rev, file_rev, policy_rev = _album_input_revision(track_rows).split(":")
+
+            def operation(
+                write_connection: sqlite3.Connection,
+            ) -> tuple[str, str | None]:
+                return store._apply_suggested_edition_tx(
+                    write_connection,
+                    work=None,
+                    finding=None,
+                    local_album_id="album-1",
+                    expected_album_revision=int(album_rev),
+                    expected_identity_revision=int(identity["row_revision"]),
+                    evidence_id="ev-1",
+                    album={"row_revision": int(album_rev)},
+                    identity=dict(identity),
+                    evidence_row={
+                        "evidence_json": bytes(msgspec.json.encode(evidence)),
+                        # No attempt row exists in this harness; the column is
+                        # nullable and the pipeline path passes the real id.
+                        "attempt_id": None,
+                        "compacted": 0,
+                        "input_tag_revision": tag_rev,
+                        "input_file_revision": file_rev,
+                        "input_policy_revision": policy_rev,
+                    },
+                    track_rows=list(track_rows),
+                    evidence=evidence,
+                    job_id=None,
+                    actor_user_id=None,
+                    now=3.0,
+                    decision_source=decision_source,
+                    ranking_inputs=[{"release_mbid": "release-rg-1"}],
+                    protect_manual_identity=protect_manual_identity,
+                )
+
+            return await store._write(operation)
+
+    with sqlite3.connect(db_path) as connection:
+        before = connection.execute(
+            "SELECT * FROM local_album_external_identities WHERE local_album_id = 'album-1'"
+        ).fetchone()
+    # Identify-lane flag: the automatic accept skips, leaving the row and
+    # writing no audit.
+    assert await _seal(
+        decision_source="automatic", protect_manual_identity=True
+    ) == ("skipped", "PROTECTED_IDENTITY")
+    with sqlite3.connect(db_path) as connection:
+        assert tuple(
+            connection.execute(
+                "SELECT * FROM local_album_external_identities WHERE local_album_id = 'album-1'"
+            ).fetchone()
+        ) == tuple(before)
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM library_catalog_actions"
+            ).fetchone()[0]
+            == 0
+        )
+    # Repair-lane default (flag off): the same automatic accept seals, pinning
+    # the signed D-EDITION-AUTO refine-with-undo behavior at unit level.
+    assert await _seal(decision_source="automatic") == ("succeeded", None)
+    with sqlite3.connect(db_path) as connection:
+        refined = connection.execute(
+            "SELECT release_mbid, decision_source FROM local_album_external_identities "
+            "WHERE local_album_id = 'album-1'"
+        ).fetchone()
+        auto_audit = connection.execute(
+            "SELECT action_kind FROM library_catalog_actions"
+        ).fetchone()
+    assert tuple(refined) == ("release-rg-1", "automatic")
+    assert tuple(auto_audit) == ("automatic_exact_edition",)
+    # Curator authority is unaffected: reset to manual RG-only and seal with a
+    # manual source (flag on or off).
+    _set_manual_rg_only()
+    assert await _seal(
+        decision_source="manual", protect_manual_identity=True
+    ) == ("succeeded", None)
+    with sqlite3.connect(db_path) as connection:
+        sealed = connection.execute(
+            "SELECT release_mbid, decision_source FROM local_album_external_identities "
+            "WHERE local_album_id = 'album-1'"
+        ).fetchone()
+        kinds = connection.execute(
+            "SELECT action_kind FROM library_catalog_actions ORDER BY rowid"
+        ).fetchall()
+    assert tuple(sealed) == ("release-rg-1", "manual")
+    assert [row[0] for row in kinds] == [
+        "automatic_exact_edition",
+        "accept_suggested_edition",
+    ]
+
+
+class _CancellingProvider(FakeProvider):
+    """R-04: raises CancelledError mid-recall like a shutdown arriving mid-job."""
+
+    async def search_album_candidate_ids(
+        self, artist: str, title: str, limit: int, priority: RequestPriority
+    ) -> list[str]:
+        raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_release_identification_claim_requeues_without_backoff(
+    store: NativeLibraryStore,
+) -> None:
+    """R-04 (3.4a/T20a): the cancel-path release primitive re-queues with NO
+    backoff - the job is claimable at once, never via recover()."""
+    await _seed_album(store)
+    queue = IdentificationQueueService(store)
+    job = await _claimed_job(store)
+    claimed_revision = int(job["row_revision"])
+    attempts_before = int(job["attempt_count"])
+
+    released_revision = await queue.release(job, "worker", now=10.0)
+
+    assert released_revision == claimed_revision + 1
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute(
+            "SELECT state, lease_owner, lease_expires_at, not_before, "
+            "attempt_count, last_failure_code FROM library_identification_jobs "
+            "WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert row[0] == "queued"
+    assert row[1] is None
+    assert row[2] is None
+    assert float(row[3]) <= 10.0
+    assert int(row[4]) == attempts_before
+    assert row[5] is None
+    # Immediate reclaim with no wait and no recover().
+    reclaimed = await store.claim_identification_job(
+        "worker-2", now=10.0, lease_seconds=60
+    )
+    assert reclaimed is not None
+    assert reclaimed["id"] == job["id"]
+    # NOT idempotent: the same expected revision no longer matches, and a
+    # foreign owner never matches either.
+    with pytest.raises(StaleRevisionError):
+        await store.release_identification_claim(
+            str(job["id"]),
+            worker_id="intruder",
+            expected_job_revision=released_revision + 1,
+            now=10.0,
+        )
+    with pytest.raises(StaleRevisionError):
+        await store.release_identification_claim(
+            str(job["id"]),
+            worker_id="worker-2",
+            expected_job_revision=claimed_revision,
+            now=10.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_identification_job_releases_for_immediate_reclaim(
+    store: NativeLibraryStore,
+) -> None:
+    """R-04 (3.4a/T20a): cancelling mid-job releases the claim exactly once -
+    the next claim succeeds at once (no 60s lease wait, no recover(), no
+    defer backoff)."""
+    await _seed_album(store)
+    service = _service(
+        store,
+        _CancellingProvider([_candidate()]),
+        FakeFingerprinter(FingerprintResult(status="skip")),
+    )
+    job = await _claimed_job(store)
+    attempts_before = int(job["attempt_count"])
+    release_calls = {"n": 0}
+    original = store.release_identification_claim
+
+    async def spy(
+        job_id: str, *, worker_id: str, expected_job_revision: int, now: float
+    ) -> int:
+        release_calls["n"] += 1
+        return await original(
+            job_id,
+            worker_id=worker_id,
+            expected_job_revision=expected_job_revision,
+            now=now,
+        )
+
+    store.release_identification_claim = spy  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.run_claimed_job(dict(job), "worker", now=100.0)
+
+    assert release_calls["n"] == 1
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute(
+            "SELECT state, lease_owner, not_before, attempt_count "
+            "FROM library_identification_jobs WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+    assert row[0] == "queued"
+    assert row[1] is None
+    assert float(row[2]) <= 100.0
+    assert int(row[3]) == attempts_before
+    reclaimed = await store.claim_identification_job(
+        "worker-2", now=100.0, lease_seconds=60
+    )
+    assert reclaimed is not None
+    assert reclaimed["id"] == job["id"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_identification_commit_swallows_stale_release(
+    store: NativeLibraryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-04 (3.4a/T20a): StaleRevisionError from the release means the finish
+    commit already landed → swallowed (commit wins), CancelledError still
+    propagates."""
+    await _seed_album(store)
+    service = _service(
+        store,
+        _CancellingProvider([_candidate()]),
+        FakeFingerprinter(FingerprintResult(status="skip")),
+    )
+    job = await _claimed_job(store)
+
+    async def _stale_release(
+        self: IdentificationQueueService,
+        job: dict,
+        worker_id: str,
+        *,
+        now: float | None = None,
+    ) -> int:
+        raise StaleRevisionError(
+            "The identification job changed before its claim could be released."
+        )
+
+    monkeypatch.setattr(IdentificationQueueService, "release", _stale_release)
+    with pytest.raises(asyncio.CancelledError):
+        await service.run_claimed_job(dict(job), "worker", now=100.0)
+
+
+# Slice C (4.9 + 4.10): skipped emit, partial plumbing, dual-lane corroboration.
+
+
+@pytest.mark.asyncio
+async def test_not_needed_writes_skipped_row_without_budget_charge(
+    store: NativeLibraryStore,
+) -> None:
+    """4.9: needed==False writes a skipped row (not None) and never charges
+    budget - fails pre-fix where the path returned None with no row."""
+    await _seed_album(store)
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+    service = ConditionalFingerprintService(store, fake)
+
+    outcome, did_work = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=False,
+        now=1,
+    )
+
+    assert did_work is False
+    assert outcome is not None and outcome.state == "skipped"
+    stored = await store.get_fingerprint_outcome(
+        "track-1", "stat-1", FINGERPRINTER_VERSION
+    )
+    assert stored is not None and stored.state == "skipped"
+
+    # Write once per stat_revision: a second unneeded call reuses the row
+    # without attempt_count noise and without work.
+    again, again_work = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=False,
+        now=2,
+    )
+    assert again_work is False
+    assert again is not None and again.state == "skipped"
+    assert again.attempt_count == stored.attempt_count
+    assert fake.generate_calls == 0
+    assert fake.lookup_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_skipped_cache_hit_does_not_starve_later_tracks(
+    store: NativeLibraryStore,
+) -> None:
+    """4.9 budget: a skipped row on track 1 is terminal-free like F-042 -
+    tracks 2 and 3 still get fresh generations in the same attempt."""
+    await _seed_multi_track_album(store, 3)
+    # Track 1 was deemed unneeded on a prior attempt: skipped row exists.
+    skipped_service = ConditionalFingerprintService(
+        store, FakeFingerprinter(FingerprintResult(status="skip"))
+    )
+    skipped, skipped_work = await skipped_service.fingerprint_if_needed(
+        local_track_id="track-multi-1",
+        path=Path("/music/multi-1.flac"),
+        stat_revision="stat-multi-1",
+        needed=False,
+        now=1,
+    )
+    assert skipped is not None and skipped.state == "skipped"
+    assert skipped_work is False
+
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+    provider = FakeProvider(
+        [
+            _multi_track_candidate(
+                group="rg-a",
+                release="release-a",
+                recording_prefix="recording-a",
+                count=3,
+            ),
+            _multi_track_candidate(
+                group="rg-b",
+                release="release-b",
+                recording_prefix="recording-b",
+                count=3,
+            ),
+        ]
+    )
+    service = _service(store, provider, fake)
+    job = await _claimed_job(store, "album-multi")
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    assert outcome == "ambiguous"
+    # Only tracks 2+3 needed fresh work; the skipped hit was free.
+    assert fake.generate_calls == 2
+    first = await store.get_fingerprint_outcome(
+        "track-multi-1", "stat-multi-1", FINGERPRINTER_VERSION
+    )
+    assert first is not None and first.state == "skipped"
+
+
+class _TrackedPartialFake(FakeFingerprinter):
+    """Fake speaking the tracked generation seam with a fixed partial flag."""
+
+    def __init__(self, result: FingerprintResult, *, partial: bool) -> None:
+        super().__init__(result)
+        self._partial = partial
+
+    async def _generate_tracked(self, path: Path) -> tuple[str, int, bool]:
+        self.generate_calls += 1
+        return ("fingerprint-partial", 180, self._partial)
+
+
+@pytest.mark.asyncio
+async def test_tracked_partial_decode_persists_on_matched_outcome(
+    store: NativeLibraryStore,
+) -> None:
+    """4.10a: a partial generation threads into FingerprintOutcome."""
+    await _seed_album(store)
+    fake = _TrackedPartialFake(
+        FingerprintResult(
+            status="pass", recording_id="rec-1", score=0.95,
+            release_group_ids=["rg-1"],
+        ),
+        partial=True,
+    )
+    service = ConditionalFingerprintService(store, fake)
+    outcome, did_work = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=1,
+    )
+
+    assert did_work is True
+    assert outcome is not None and outcome.state == "matched"
+    assert outcome.partial_decode is True
+    assert outcome.recording_mbid == "rec-1"
+
+
+@pytest.mark.asyncio
+async def test_full_decode_persists_false_unchanged(
+    store: NativeLibraryStore,
+) -> None:
+    """4.10a: full prints keep today's behavior (flag False)."""
+    await _seed_album(store)
+    fake = _TrackedPartialFake(
+        FingerprintResult(
+            status="pass", recording_id="rec-1", score=0.95,
+            release_group_ids=["rg-1"],
+        ),
+        partial=False,
+    )
+    service = ConditionalFingerprintService(store, fake)
+    outcome, did_work = await service.fingerprint_if_needed(
+        local_track_id="track-1",
+        path=Path("/music/1.flac"),
+        stat_revision="stat-1",
+        needed=True,
+        now=1,
+    )
+
+    assert did_work is True
+    assert outcome is not None and outcome.state == "matched"
+    assert outcome.partial_decode is False
+
+
+class _PerTrackPartialFake:
+    """Two-track fake mapping each file to its own recording + partial flag."""
+
+    def __init__(self, *, partial: bool) -> None:
+        self.partial = partial
+        self.generate_calls = 0
+        self.lookup_calls = 0
+
+    def is_enabled(self) -> bool:
+        return True
+
+    async def generate_fingerprint(self, path: Path) -> tuple[str, int]:
+        self.generate_calls += 1
+        return (f"fp-{Path(path).name}", 180)
+
+    async def _generate_tracked(self, path: Path) -> tuple[str, int, bool]:
+        self.generate_calls += 1
+        return (f"fp-{Path(path).name}", 180, self.partial)
+
+    async def lookup_fingerprint(
+        self, fingerprint: str, duration: int
+    ) -> FingerprintResult:
+        self.lookup_calls += 1
+        if "multi-1" in fingerprint:
+            recording = "recording-a-1"
+        elif "multi-2" in fingerprint:
+            recording = "recording-a-2"
+        else:
+            recording = "recording-a-1"
+        return FingerprintResult(
+            status="pass",
+            recording_id=recording,
+            score=0.95,
+            release_group_ids=["rg-a"],
+        )
+
+
+def _mismatched_two_track_candidate() -> AlbumCandidate:
+    """One candidate whose track titles never match the seeded 'Track'
+    descriptives, so only fingerprint support can carry it."""
+    return AlbumCandidate(
+        release_group_mbid="rg-a",
+        release_mbid="release-a",
+        album_title="Album",
+        album_artist_name="Artist",
+        artist_mbid="artist-mbid",
+        tracks=[
+            CandidateTrack(
+                title="Zebra One",
+                position=1,
+                absolute_position=1,
+                duration_seconds=180,
+                recording_mbid="recording-a-1",
+            ),
+            CandidateTrack(
+                title="Zebra Two",
+                position=2,
+                absolute_position=2,
+                duration_seconds=180,
+                recording_mbid="recording-a-2",
+            ),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_only_evidence_never_identifies_alone(
+    store: NativeLibraryStore,
+) -> None:
+    """4.10b lane A: partial-derived MBIDs never seed support/recall alone."""
+    await _seed_multi_track_album(store, 2)
+    provider = FakeProvider([_mismatched_two_track_candidate()])
+    service = _service(store, provider, _PerTrackPartialFake(partial=True))
+    job = await _claimed_job(store, "album-multi")
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    assert outcome != "identified"
+    # The partial outcomes persist with the flag for evidence.
+    first = await store.get_fingerprint_outcome(
+        "track-multi-1", "stat-multi-1", FINGERPRINTER_VERSION
+    )
+    assert first is not None and first.partial_decode is True
+
+
+@pytest.mark.asyncio
+async def test_full_print_behavior_unchanged_identifies(
+    store: NativeLibraryStore,
+) -> None:
+    """4.10b lane A: the same evidence with full prints keeps identifying."""
+    await _seed_multi_track_album(store, 2)
+    provider = FakeProvider([_mismatched_two_track_candidate()])
+    service = _service(store, provider, _PerTrackPartialFake(partial=False))
+    job = await _claimed_job(store, "album-multi")
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    assert outcome == "identified"
+
+
+# Slice R1 (4.9 + 4.10b lane B): re-identification caller guards.
+
+
+def _recording_less_twins(count: int) -> list[AlbumCandidate]:
+    """Twin candidates without recording MBIDs, so tag support ties and the
+    fingerprint lane decides - with no recording conflicts either way."""
+    twins = []
+    for group, release in (("rg-a", "release-a"), ("rg-b", "release-b")):
+        twins.append(
+            AlbumCandidate(
+                release_group_mbid=group,
+                release_mbid=release,
+                album_title="Album",
+                album_artist_name="Artist",
+                artist_mbid="artist-mbid",
+                tracks=[
+                    CandidateTrack(
+                        title="Track",
+                        position=index,
+                        absolute_position=index,
+                        duration_seconds=180,
+                    )
+                    for index in range(1, count + 1)
+                ],
+            )
+        )
+    return twins
+
+
+async def _run_reidentification(
+    store: NativeLibraryStore,
+    provider: FakeProvider,
+    fingerprinter: object,
+    *,
+    idempotency_key: str,
+    now: float = 1,
+) -> str:
+    """Run one explicit re-identification evaluation and return the snapshot
+    decision outcome (the re-id `run_claimed` returns the job row, not the
+    outcome string the automatic lane returns)."""
+    worker = ExplicitReidentificationWorker(
+        store,
+        AlbumCandidateService(provider),
+        AlbumEvidenceEngine(),
+        ConditionalFingerprintService(store, fingerprinter),  # type: ignore[arg-type]
+    )
+    created = await ReidentificationService(store).create_or_coalesce(
+        "album-multi", "admin", idempotency_key=idempotency_key, now=now
+    )
+    claimed = await store.claim_operation_job(
+        "worker", now=now + 1, lease_seconds=60, kind="explicit_reidentification"
+    )
+    assert claimed is not None
+    await worker.run_claimed(claimed, "worker", now=now + 2)
+    snapshot = await store.get_operation_snapshot(str(created["id"]))
+    assert snapshot is not None and snapshot["snapshot"] is not None
+    return str(json.loads(snapshot["snapshot"]["result_json"])["outcome"])
+
+
+@pytest.mark.asyncio
+async def test_reidentification_cached_partial_never_seeds_alone(
+    store: NativeLibraryStore,
+) -> None:
+    """4.10b lane B (cached): cached partial decodes never seed support or
+    recall alone - fails pre-fix where the worker extended release groups
+    and fingerprint MBIDs from partial rows and identified."""
+    await _seed_multi_track_album(store, 2)
+    for index in (1, 2):
+        await store.record_fingerprint_outcome(
+            FingerprintOutcome(
+                id=f"seed-partial-{index}",
+                local_track_id=f"track-multi-{index}",
+                stat_revision=f"stat-multi-{index}",
+                fingerprinter_version=FINGERPRINTER_VERSION,
+                state="matched",
+                recording_mbid=f"recording-a-{index}",
+                release_group_ids=["rg-a"],
+                first_attempt_at=1,
+                last_attempt_at=1,
+                partial_decode=True,
+            )
+        )
+    provider = FakeProvider([_mismatched_two_track_candidate()])
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+
+    outcome = await _run_reidentification(
+        store, provider, fake, idempotency_key="r1-cached-partial"
+    )
+
+    assert outcome != "identified"
+    # The partial outcomes persist with the flag for evidence.
+    first = await store.get_fingerprint_outcome(
+        "track-multi-1", "stat-multi-1", FINGERPRINTER_VERSION
+    )
+    assert first is not None and first.partial_decode is True
+    assert fake.generate_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_reidentification_cached_full_print_seeds_unchanged(
+    store: NativeLibraryStore,
+) -> None:
+    """4.10b lane B (cached): the same cached evidence with full prints keeps
+    seeding support/recall and identifying - the control for the partial
+    test above (passes pre- and post-fix)."""
+    await _seed_multi_track_album(store, 2)
+    for index in (1, 2):
+        await store.record_fingerprint_outcome(
+            FingerprintOutcome(
+                id=f"seed-full-{index}",
+                local_track_id=f"track-multi-{index}",
+                stat_revision=f"stat-multi-{index}",
+                fingerprinter_version=FINGERPRINTER_VERSION,
+                state="matched",
+                recording_mbid=f"recording-a-{index}",
+                release_group_ids=["rg-a"],
+                first_attempt_at=1,
+                last_attempt_at=1,
+                partial_decode=False,
+            )
+        )
+    provider = FakeProvider([_mismatched_two_track_candidate()])
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+
+    outcome = await _run_reidentification(
+        store, provider, fake, idempotency_key="r1-cached-full"
+    )
+
+    assert outcome == "identified"
+
+
+@pytest.mark.asyncio
+async def test_reidentification_fresh_partial_never_seeds_alone(
+    store: NativeLibraryStore,
+) -> None:
+    """4.10b lane B (fresh): fresh partial decodes never seed support or
+    recall alone - fails pre-fix where the worker assigned partial-derived
+    MBIDs and extended release groups, then identified on re-recall."""
+    await _seed_multi_track_album(store, 2)
+    provider = FakeProvider([_mismatched_two_track_candidate()])
+
+    outcome = await _run_reidentification(
+        store,
+        provider,
+        _PerTrackPartialFake(partial=True),
+        idempotency_key="r1-fresh-partial",
+    )
+
+    assert outcome != "identified"
+    # The partial outcomes persist with the flag for evidence.
+    first = await store.get_fingerprint_outcome(
+        "track-multi-1", "stat-multi-1", FINGERPRINTER_VERSION
+    )
+    assert first is not None and first.partial_decode is True
+
+
+@pytest.mark.asyncio
+async def test_reidentification_fresh_full_print_seeds_unchanged(
+    store: NativeLibraryStore,
+) -> None:
+    """4.10b lane B (fresh): the same evidence with full prints keeps
+    identifying - the control for the partial test above (passes pre- and
+    post-fix)."""
+    await _seed_multi_track_album(store, 2)
+    provider = FakeProvider([_mismatched_two_track_candidate()])
+
+    outcome = await _run_reidentification(
+        store,
+        provider,
+        _PerTrackPartialFake(partial=False),
+        idempotency_key="r1-fresh-full",
+    )
+
+    assert outcome == "identified"
+
+
+@pytest.mark.asyncio
+async def test_identify_lane_unneeded_track_writes_skipped_row(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """4.9 identify lane: a not-needed track still calls fingerprint_if_needed
+    with needed=False (skipped row, no work, no budget charge) - fails
+    pre-fix where the bare `continue` never called the service, so no call
+    and no row exist. Track 1 carries an embedded recording (needed False);
+    tracks 2+3 need fresh work and must not starve."""
+    await _seed_multi_track_album(store, 3)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET embedded_recording_mbid=? WHERE id=?",
+            ("11111111-1111-4111-8111-111111111111", "track-multi-1"),
+        )
+        connection.commit()
+    provider = FakeProvider(_recording_less_twins(3))
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+    queue = IdentificationQueueService(store)
+    fingerprints = ConditionalFingerprintService(store, fake)
+    service = AlbumIdentificationService(
+        store,
+        queue,
+        AlbumCandidateService(provider),
+        AlbumEvidenceEngine(),
+        fingerprints,
+    )
+    calls: list[dict] = []
+    original = fingerprints.fingerprint_if_needed
+
+    async def spy(**kwargs: object) -> tuple[FingerprintOutcome | None, bool]:
+        calls.append(dict(kwargs))
+        return await original(**kwargs)  # type: ignore[arg-type]
+
+    fingerprints.fingerprint_if_needed = spy  # type: ignore[method-assign]
+    job = await _claimed_job(store, "album-multi")
+
+    outcome = await service.run_claimed_job(job, "worker")
+
+    assert outcome in ("ambiguous", "insufficient_evidence")
+    unneeded = [call for call in calls if call.get("needed") is False]
+    assert [call["local_track_id"] for call in unneeded] == ["track-multi-1"]
+    skipped = await store.get_fingerprint_outcome(
+        "track-multi-1", "stat-multi-1", FINGERPRINTER_VERSION
+    )
+    assert skipped is not None and skipped.state == "skipped"
+    # Both needed tracks did fresh work: the skipped call charged no budget.
+    assert fake.generate_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reidentification_lane_unneeded_track_writes_skipped_row(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """4.9 re-id lane: a not-needed track still calls fingerprint_if_needed
+    with needed=False (skipped row, no work, no budget charge) - fails
+    pre-fix where the bare `continue` never called the service, so no call
+    and no row exist. Same mixed-need shape as the identify-lane test."""
+    await _seed_multi_track_album(store, 3)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET embedded_recording_mbid=? WHERE id=?",
+            ("11111111-1111-4111-8111-111111111111", "track-multi-1"),
+        )
+        connection.commit()
+    provider = FakeProvider(_recording_less_twins(3))
+    fake = FakeFingerprinter(FingerprintResult(status="skip"))
+    fingerprints = ConditionalFingerprintService(store, fake)
+    calls: list[dict] = []
+    original = fingerprints.fingerprint_if_needed
+
+    async def spy(**kwargs: object) -> tuple[FingerprintOutcome | None, bool]:
+        calls.append(dict(kwargs))
+        return await original(**kwargs)  # type: ignore[arg-type]
+
+    fingerprints.fingerprint_if_needed = spy  # type: ignore[method-assign]
+    worker = ExplicitReidentificationWorker(
+        store,
+        AlbumCandidateService(provider),
+        AlbumEvidenceEngine(),
+        fingerprints,
+    )
+    created = await ReidentificationService(store).create_or_coalesce(
+        "album-multi", "admin", idempotency_key="r1-skipped", now=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker", now=2, lease_seconds=60, kind="explicit_reidentification"
+    )
+    assert claimed is not None
+
+    await worker.run_claimed(claimed, "worker", now=3)
+
+    snapshot = await store.get_operation_snapshot(str(created["id"]))
+    assert snapshot is not None and snapshot["snapshot"] is not None
+    assert (
+        str(json.loads(snapshot["snapshot"]["result_json"])["outcome"])
+        != "identified"
+    )
+    unneeded = [call for call in calls if call.get("needed") is False]
+    assert [call["local_track_id"] for call in unneeded] == ["track-multi-1"]
+    skipped = await store.get_fingerprint_outcome(
+        "track-multi-1", "stat-multi-1", FINGERPRINTER_VERSION
+    )
+    assert skipped is not None and skipped.state == "skipped"
+    # Both needed tracks did fresh work: the skipped call charged no budget.
+    assert fake.generate_calls == 2

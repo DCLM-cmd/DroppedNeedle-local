@@ -142,6 +142,13 @@ async def test_password_protected_release_parses_nonzero():
 
 
 @pytest.mark.asyncio
+async def test_unknown_password_release_preserves_negative_sentinel():
+    cap = _Capture(body=_PW_FEED.replace('value="2"', 'value="-1"'))
+    [rel], _ = await _client(cap).search("q", [3040])
+    assert rel.password == -1  # Negative values represent an unknown password status.
+
+
+@pytest.mark.asyncio
 async def test_music_search_sends_year_when_provided():
     cap = _Capture()
     client = _client(cap, indexer_id="ax", name="AX")
@@ -182,6 +189,37 @@ async def test_auth_error_raises_newznab_auth_error():
 async def test_rate_limit_error_raises_rate_limited():
     with pytest.raises(RateLimitedError):
         await _client(newznab_mock.rate_limit_handler).search("q", [3000])
+
+
+def _timeout_handler(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("")
+
+
+@pytest.mark.asyncio
+async def test_transport_timeout_names_the_cause():
+    # httpx timeouts stringify to '' - the error must still name it (#389).
+    assert str(httpx.ReadTimeout("")) == ""
+    with pytest.raises(NewznabApiError) as exc:
+        await _client(_timeout_handler).search("Metallica", [3000, 3010, 3040])
+    assert "ReadTimeout" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_transport_error_message_preserved_when_present():
+    def _boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    with pytest.raises(NewznabApiError) as exc:
+        await _client(_boom).search("Metallica", [3000, 3010, 3040])
+    assert str(exc.value) == "newznab request failed: boom"
+
+
+@pytest.mark.asyncio
+async def test_fan_out_timeout_warning_names_the_cause(caplog):
+    idx = NewznabIndexer([_entry(_timeout_handler, indexer_id="t", name="Slow")])
+    with caplog.at_level(logging.WARNING):
+        assert await idx.search_album("Metallica", "Master of Puppets") == []
+    assert "ReadTimeout" in caplog.text
 
 
 # --- indexer: query strategy ----------------------------------------------------
@@ -439,6 +477,18 @@ async def test_health_check_ok_when_reachable_and_error_when_not():
     bad = await NewznabIndexer([_entry(newznab_mock.auth_error_handler, indexer_id="b", name="B")]).health_check()
     # auth-error caps still parses to an <error> -> caps() raises -> unreachable.
     assert bad.status == "error"
+
+
+@pytest.mark.asyncio
+async def test_caps_fetch_failure_keeps_indexer_enabled_on_t_search():
+    # B1: a dead t=caps must not disable the indexer (permissive Lidarr/Prowlarr
+    # defaults) - search proceeds down the free-text path and returns results.
+    indexer = NewznabIndexer(
+        [_entry(newznab_mock.caps_dead_handler, indexer_id="ds", name="DS")]
+    )
+    results = await indexer.search_album("Radiohead", "In Rainbows")
+    assert len(results) >= 1
+    assert all(r.source == "usenet" and r.usenet is not None for r in results)
 
 
 def test_is_configured_reflects_enabled_entries():

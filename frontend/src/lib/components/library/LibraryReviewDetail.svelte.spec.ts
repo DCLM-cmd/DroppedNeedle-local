@@ -1,6 +1,7 @@
 import { page } from '@vitest/browser/context';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
+import type { ReviewHistoryItem } from '$lib/queries/library/LibraryOperationsTypes';
 
 const h = vi.hoisted(() => ({
 	query: { data: undefined, isLoading: false, isError: false } as Record<string, unknown>,
@@ -191,7 +192,7 @@ function detail(identity = false) {
 		],
 		unknown: [],
 		contradictory: [],
-		history: [],
+		history: [] as ReviewHistoryItem[],
 		available_actions: identity
 			? ['detach_keep_tagged', 'retry', 'exclude', 'accept_candidate']
 			: ['keep_tagged', 'retry', 'exclude', 'accept_candidate'],
@@ -220,7 +221,7 @@ describe('LibraryReviewDetail', () => {
 	}
 
 	it('shows stable local links, compilation credit, evidence, and safe/manual candidate actions', async () => {
-		render(LibraryReviewDetail, {
+		await render(LibraryReviewDetail, {
 			props: { reviewId: 'review-1', onclose: vi.fn() }
 		} as unknown as Parameters<typeof render>[1]);
 		await expect.element(page.getByRole('heading', { name: 'The Local Album' })).toBeVisible();
@@ -234,7 +235,7 @@ describe('LibraryReviewDetail', () => {
 	});
 
 	it('offers plain Keep only without an external identity', async () => {
-		render(LibraryReviewDetail, {
+		await render(LibraryReviewDetail, {
 			props: { reviewId: 'review-1', onclose: vi.fn() }
 		} as unknown as Parameters<typeof render>[1]);
 		await expect.element(page.getByRole('button', { name: 'Keep as tagged' })).toBeVisible();
@@ -245,7 +246,7 @@ describe('LibraryReviewDetail', () => {
 
 	it('requires the explicit detach preview when an identity exists', async () => {
 		h.query = { data: detail(true), isLoading: false, isError: false };
-		render(LibraryReviewDetail, {
+		await render(LibraryReviewDetail, {
 			props: { reviewId: 'review-1', onclose: vi.fn() }
 		} as unknown as Parameters<typeof render>[1]);
 		await expect
@@ -291,7 +292,7 @@ describe('LibraryReviewDetail', () => {
 	});
 
 	it('requires confirmation before accepting a conflicting candidate', async () => {
-		render(LibraryReviewDetail, {
+		await render(LibraryReviewDetail, {
 			props: { reviewId: 'review-1', onclose: vi.fn() }
 		} as unknown as Parameters<typeof render>[1]);
 
@@ -332,7 +333,7 @@ describe('LibraryReviewDetail', () => {
 		window.addEventListener('unhandledrejection', recordUnhandled);
 		try {
 			h.retry.mockRejectedValueOnce(new TypeError('Failed to fetch'));
-			render(LibraryReviewDetail, {
+			await render(LibraryReviewDetail, {
 				props: { reviewId: 'review-1', onclose: vi.fn() }
 			} as unknown as Parameters<typeof render>[1]);
 			await page.getByRole('button', { name: 'Retry identification' }).first().click();
@@ -362,7 +363,7 @@ describe('LibraryReviewDetail', () => {
 		data.available_actions = ['dismiss', 'exclude', 'retry', 'keep_tagged'];
 		h.query = { data, isLoading: false, isError: false };
 		h.dismiss.mockResolvedValue(undefined);
-		render(LibraryReviewDetail, {
+		await render(LibraryReviewDetail, {
 			props: { reviewId: 'review-1', onclose: vi.fn() }
 		} as unknown as Parameters<typeof render>[1]);
 
@@ -383,5 +384,63 @@ describe('LibraryReviewDetail', () => {
 		await expect
 			.element(page.getByRole('heading', { name: 'Dismiss review?' }))
 			.not.toBeInTheDocument();
+	});
+
+	it('marks automatic and manual history entries', async () => {
+		const data = detail(false);
+		data.history = [
+			{
+				id: 'history-auto',
+				kind: 'decision',
+				state: 'edition_to_confirm',
+				reason_code: 'EDITION_UNCERTAIN',
+				created_at: 3,
+				actor_user_id: null
+			},
+			{
+				id: 'history-manual',
+				kind: 'action',
+				state: 'needs_review',
+				reason_code: '',
+				created_at: 4,
+				actor_user_id: 'admin-1'
+			}
+		];
+		h.query = { data, isLoading: false, isError: false };
+		await render(LibraryReviewDetail, {
+			props: { reviewId: 'review-1', onclose: vi.fn() }
+		} as unknown as Parameters<typeof render>[1]);
+
+		await expect.element(page.getByText('Automatic', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('Manual', { exact: true })).toBeVisible();
+		await expect
+			.element(page.getByText('Automatic', { exact: true }))
+			.toHaveAttribute('title', 'Decided automatically; use Retry identification to reopen it.');
+		await expect
+			.element(page.getByText('Manual', { exact: true }))
+			.toHaveAttribute('title', 'Decided by a user.');
+	});
+
+	it('omits the retry hint when retry is not offered', async () => {
+		const data = detail(false);
+		data.available_actions = ['keep_tagged', 'exclude'];
+		data.history = [
+			{
+				id: 'history-auto',
+				kind: 'decision',
+				state: 'edition_to_confirm',
+				reason_code: 'EDITION_UNCERTAIN',
+				created_at: 3,
+				actor_user_id: null
+			}
+		];
+		h.query = { data, isLoading: false, isError: false };
+		await render(LibraryReviewDetail, {
+			props: { reviewId: 'review-1', onclose: vi.fn() }
+		} as unknown as Parameters<typeof render>[1]);
+
+		await expect
+			.element(page.getByText('Automatic', { exact: true }))
+			.toHaveAttribute('title', 'Decided automatically.');
 	});
 });

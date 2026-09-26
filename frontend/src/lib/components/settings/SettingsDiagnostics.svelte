@@ -32,7 +32,7 @@
 	const providerTableRows = $derived(
 		providerGroups.flatMap((group) =>
 			group.rows.map((row, index) => ({
-				key: `${group.provider}:${row.lane}:${row.outcome}`,
+				...row,
 				providerCell: index === 0 ? group.label : '',
 				laneText: row.laneText,
 				outcomeText: row.outcomeText,
@@ -129,6 +129,10 @@
 								<th scope="col">Outcome</th>
 								<th scope="col" class="text-right">Calls</th>
 								<th scope="col" class="text-right">Calls/min</th>
+								<th scope="col">Workload / profile</th>
+								<th scope="col">Source</th>
+								<th scope="col" class="text-right">Downloaded body</th>
+								<th scope="col" class="text-right">Decoded body</th>
 							</tr>
 						</thead>
 						<tbody>
@@ -139,11 +143,30 @@
 									<td>{row.outcomeText}</td>
 									<td class="text-right tabular-nums">{formatCount(row.countTotal)}</td>
 									<td class="text-right tabular-nums">{row.ratePerMinText}</td>
+									<td
+										>{row.workloadText}<span class="block text-xs text-base-content/60"
+											>{row.profileText}</span
+										></td
+									>
+									<td>{row.sourceText}</td>
+									<td class="text-right tabular-nums">
+										{row.downloadedText}
+										{#if row.unknownBodyAttempts}
+											<span class="block text-xs text-base-content/60"
+												>{formatCount(row.unknownBodyAttempts)} attempts with unknown size</span
+											>
+										{/if}
+									</td>
+									<td class="text-right tabular-nums">{row.decodedText}</td>
 								</tr>
 							{/each}
 						</tbody>
 					</table>
 				</div>
+				<p class="text-xs text-base-content/60">
+					Body bytes exclude headers and TLS. Counters reset on process restart. Detailed series are
+					capped; overflow combines sources.
+				</p>
 			{/if}
 		</section>
 	</div>

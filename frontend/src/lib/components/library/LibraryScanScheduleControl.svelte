@@ -64,7 +64,7 @@
 <div class="space-y-3">
 	<div class="flex flex-wrap items-end gap-3">
 		<label class="form-control">
-			<div class="label py-1"><span class="label-text">Automatic scan frequency</span></div>
+			<div class="label py-1"><span class="label-text">Scheduled scan frequency</span></div>
 			<select class="select select-bordered" bind:value={frequency} aria-label="Scan frequency">
 				{#each options as opt (opt.value)}
 					<option value={opt.value}>{opt.label}{opt.legacy ? ' (legacy)' : ''}</option>

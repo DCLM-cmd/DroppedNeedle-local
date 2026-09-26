@@ -402,6 +402,7 @@ class TargetImportLibraryService:
             album_sort=tag.album_sort,
             album_artist_sort=tag.album_artist_sort,
             disc_subtitle=tag.disc_subtitle,
+            release_type=tag.release_type,
             is_compilation=tag.compilation,
             embedded_release_group_mbid=(
                 release_group_mbid or tag.musicbrainz_release_group_id
@@ -690,6 +691,7 @@ class TargetImportLibraryService:
             album_sort=tag.album_sort,
             album_artist_sort=tag.album_artist_sort,
             disc_subtitle=tag.disc_subtitle,
+            release_type=tag.release_type,
             is_compilation=tag.compilation,
             embedded_release_group_mbid=(
                 release_group_mbid or tag.musicbrainz_release_group_id

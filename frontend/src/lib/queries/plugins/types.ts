@@ -22,6 +22,11 @@ export interface PluginInfo {
 	error: string | null;
 	settings_fields: PluginSettingFieldInfo[];
 	settings_values: Record<string, string>;
+	ui_entry: string;
+	ui_pages: string[];
+	ui_external_url: string;
+	sources: string[];
+	targets: string[];
 }
 
 export interface PluginListResponse {

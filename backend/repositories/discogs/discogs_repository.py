@@ -285,7 +285,7 @@ class DiscogsRepository:
                 record_provider_call("discogs", priority, None)
                 raise
         # QW9 Part 3: one increment per wire attempt, classified from status
-        record_provider_call("discogs", priority, response.status_code)
+        record_provider_call("discogs", priority, response.status_code, response=response)
         if response.status_code == 404:
             return None
         if response.status_code == 429:

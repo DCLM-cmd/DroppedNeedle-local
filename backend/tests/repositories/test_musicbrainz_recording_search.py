@@ -15,12 +15,11 @@ from repositories.musicbrainz_album import (
     _pick_best_release_group,
 )
 from repositories.musicbrainz_base import MbSourceContext
+from infrastructure.cache.memory_cache import InMemoryCache
 
 class _Repo(MusicBrainzAlbumMixin):
     def __init__(self) -> None:
-        self._cache = AsyncMock()
-        self._cache.get = AsyncMock(return_value=None)
-        self._cache.set = AsyncMock()
+        self._cache = InMemoryCache()
         self._preferences_service = SimpleNamespace(
             get_advanced_settings=lambda: SimpleNamespace(cache_ttl_search=3600)
         )
@@ -212,14 +211,14 @@ async def test_search_recordings_failure_is_not_cached_and_retries():
     assert first == second == []
     assert [match.recording_mbid for match in retry] == ["rec-sad", "rec-sad-2"]
     assert mock_get.await_count == 2
-    repo._cache.set.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_recording_detail_concurrent_misses_share_one_wire_call():
     started = asyncio.Event()
     release = asyncio.Event()
-    payload = {"id": "recording-id", "title": "Title"}
+    recording_id = "d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3"
+    payload = {"id": recording_id, "title": "Title"}
 
     async def slow_get(*_args, **_kwargs):
         started.set()
@@ -230,9 +229,9 @@ async def test_recording_detail_concurrent_misses_share_one_wire_call():
     with patch(
         "repositories.musicbrainz_album.mb_api_get", side_effect=slow_get
     ) as mock_get:
-        first = asyncio.create_task(repo.get_recording_by_id("RECORDING-ID"))
+        first = asyncio.create_task(repo.get_recording_by_id(recording_id.upper()))
         await started.wait()
-        second = asyncio.create_task(repo.get_recording_by_id("recording-id"))
+        second = asyncio.create_task(repo.get_recording_by_id(recording_id))
         await asyncio.sleep(0)
         release.set()
         results = await asyncio.gather(first, second)
@@ -289,7 +288,8 @@ async def test_recording_detail_generation_separates_inflight_leaders(monkeypatc
     started = asyncio.Event()
     release = asyncio.Event()
     calls = 0
-    payload = {"id": "recording-id", "title": "Title"}
+    recording_id = "e4e4e4e4-e4e4-4e4e-8e4e-e4e4e4e4e4e4"
+    payload = {"id": recording_id, "title": "Title"}
 
     monkeypatch.setattr(
         album_module,
@@ -307,10 +307,10 @@ async def test_recording_detail_generation_separates_inflight_leaders(monkeypatc
 
     repo = _Repo()
     with patch("repositories.musicbrainz_album.mb_api_get", side_effect=slow_get):
-        old_task = asyncio.create_task(repo.get_recording_by_id("recording-id"))
+        old_task = asyncio.create_task(repo.get_recording_by_id(recording_id))
         await started.wait()
         generation["value"] = 1
-        new_task = asyncio.create_task(repo.get_recording_by_id("recording-id"))
+        new_task = asyncio.create_task(repo.get_recording_by_id(recording_id))
         await asyncio.sleep(0)
         release.set()
         old_result, new_result = await asyncio.gather(old_task, new_task)
@@ -338,17 +338,22 @@ async def test_recording_detail_failure_is_not_cached_and_retries():
     with patch(
         "repositories.musicbrainz_album.mb_api_get", side_effect=fail
     ) as mock_get:
-        first_task = asyncio.create_task(repo.get_recording_by_id("recording-id"))
+        first_task = asyncio.create_task(
+            repo.get_recording_by_id("f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5")
+        )
         await started.wait()
-        second_task = asyncio.create_task(repo.get_recording_by_id("recording-id"))
+        second_task = asyncio.create_task(
+            repo.get_recording_by_id("f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5")
+        )
         await asyncio.sleep(0)
         release.set()
         first, second = await asyncio.gather(first_task, second_task)
-        retry = await repo.get_recording_by_id("recording-id")
+        retry = await repo.get_recording_by_id(
+            "f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5"
+        )
 
     assert first is None and second is None and retry is None
     assert mock_get.await_count == 2
-    repo._cache.set.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -368,7 +373,7 @@ async def test_search_recordings_uses_cache_when_present():
             recording_mbid="r", title="t", artist="a", score=1, release_groups=[]
         )
     ]
-    repo._cache.get = AsyncMock(return_value=cached)
+    repo._cache.get_with_metadata = AsyncMock(return_value=(cached, None))
     with patch("repositories.musicbrainz_album.mb_api_get", AsyncMock()) as mock_get:
         assert await repo.search_recordings("Artist", "Title") is cached
     mock_get.assert_not_awaited()

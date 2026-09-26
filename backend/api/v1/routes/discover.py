@@ -1,6 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from api.v1.schemas.discover import (
     DiscoverResponse,
+    DiscoverActivityRequest,
+    DiscoverActivityResponse,
+    DiscoverQueuePreview,
     DiscoverQueueResponse,
     DiscoverQueueEnrichment,
     DiscoverIgnoredRelease,
@@ -44,8 +47,32 @@ from repositories.youtube import YouTubeRepository
 from services.discover_service import DiscoverService
 from services.discover_queue_manager import DiscoverQueueManager
 from services.section_catalog import apply_section_prefs
+from core.dependencies.service_providers import get_discovery_demand_service
+from services.discover.demand_service import DiscoveryDemandService
 
 router = APIRouter(route_class=MsgSpecRoute, prefix="/discover", tags=["discover"])
+
+
+@router.post("/activity", response_model=DiscoverActivityResponse)
+async def record_discover_activity(
+    current_user: CurrentUserDep,
+    body: DiscoverActivityRequest = MsgSpecBody(DiscoverActivityRequest),
+    discover_service: DiscoverService = Depends(get_discover_service),
+    demand_service: DiscoveryDemandService = Depends(get_discovery_demand_service),
+):
+    response = await discover_service.record_activity(current_user.id, body)
+    demand_service.trigger_user(current_user.id)
+    return response
+
+
+@router.post("/queue/preview/{release_group_mbid}", response_model=DiscoverQueuePreview)
+async def preview_queue_item(
+    release_group_mbid: str,
+    current_user: CurrentUserDep,
+    discover_service: DiscoverService = Depends(get_discover_service),
+    yt_repo: YouTubeRepository = Depends(get_youtube_repo),
+):
+    return await discover_service.preview_queue_item(release_group_mbid, yt_repo)
 
 
 @router.get("", response_model=DiscoverResponse)
@@ -112,7 +139,7 @@ async def get_discover_queue(
     if cached:
         return cached
     effective_count = min(count, 20) if count is not None else None
-    return await queue_manager.build_hydrated_queue(current_user.id, effective_count)
+    return await queue_manager.build_lightweight_queue(current_user.id, effective_count)
 
 
 @router.get("/queue/status", response_model=DiscoverQueueStatusResponse)
@@ -136,6 +163,7 @@ async def generate_queue(
 @router.get("/queue/enrich/{release_group_mbid}", response_model=DiscoverQueueEnrichment)
 async def enrich_queue_item(
     release_group_mbid: str,
+    current_user: CurrentUserDep,
     discover_service: DiscoverService = Depends(get_discover_service),
 ):
     return await discover_service.enrich_queue_item(release_group_mbid)
@@ -174,16 +202,10 @@ async def validate_queue(
 
 @router.get("/queue/youtube-search", response_model=YouTubeSearchResponse)
 async def youtube_search(
-    artist: str = Query(..., description="Artist name"),
-    album: str = Query(..., description="Album name"),
+    artist: str = Query(..., min_length=1, max_length=200, description="Artist name"),
+    album: str = Query(..., min_length=1, max_length=200, description="Album name"),
     yt_repo: YouTubeRepository = Depends(get_youtube_repo),
 ):
-    if not yt_repo or not yt_repo.is_configured:
-        return YouTubeSearchResponse(error="not_configured")
-
-    if yt_repo.quota_remaining <= 0 and not yt_repo.is_cached(artist, album):
-        return YouTubeSearchResponse(error="quota_exceeded")
-
     was_cached = yt_repo.is_cached(artist, album)
     video_id = await yt_repo.search_video(artist, album)
     if video_id:
@@ -197,17 +219,11 @@ async def youtube_search(
 
 @router.get("/queue/youtube-track-search", response_model=YouTubeSearchResponse)
 async def youtube_track_search(
-    artist: str = Query(..., description="Artist name"),
-    track: str = Query(..., description="Track name"),
+    artist: str = Query(..., min_length=1, max_length=200, description="Artist name"),
+    track: str = Query(..., min_length=1, max_length=200, description="Track name"),
     yt_repo: YouTubeRepository = Depends(get_youtube_repo),
 ):
-    if not yt_repo or not yt_repo.is_configured:
-        return YouTubeSearchResponse(error="not_configured")
-
-    if yt_repo.quota_remaining <= 0 and not yt_repo.is_cached(artist, track):
-        return YouTubeSearchResponse(error="quota_exceeded")
-
-    was_cached = yt_repo.is_cached(artist, track)
+    was_cached = yt_repo.is_cached(artist, track, kind="track")
     video_id = await yt_repo.search_track(artist, track)
     if video_id:
         return YouTubeSearchResponse(

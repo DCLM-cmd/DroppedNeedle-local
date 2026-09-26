@@ -1,8 +1,9 @@
 """Read-only Lidarr importer routes (LidarrImport).
 
-Admin-only connection config + Test; any authenticated user can read the monitored-artist
-candidates and import them into *their own* follows (D4). The old Lidarr *management*
-integration stays deleted (D8) - these are the only sanctioned ``/lidarr-import`` paths.
+Admin-only connection config + Test; candidates and import are admin-only as well
+(D4 any-user rule SUPERSEDED by owner decision 2026-09-07: admin-only import into
+the admin's own follows). The old Lidarr *management* integration stays deleted
+(D8) - these are the only sanctioned ``/lidarr-import`` paths.
 """
 
 import logging
@@ -13,7 +14,6 @@ from api.v1.schemas.lidarr_import import (
     LidarrArtistListResponse,
     LidarrImportRequest,
     LidarrImportResponse,
-    LidarrImportStatusResponse,
     LidarrTestResponse,
 )
 from api.v1.schemas.settings import (
@@ -28,7 +28,7 @@ from core.dependencies import (
 from core.exceptions import LidarrImportError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from infrastructure.resilience.retry import CircuitOpenError
-from middleware import CurrentAdminDep, CurrentUserDep
+from middleware import CurrentAdminDep
 
 logger = logging.getLogger(__name__)
 
@@ -89,16 +89,9 @@ async def test_connection(
     )
 
 
-@router.get("/status", response_model=LidarrImportStatusResponse)
-async def get_status(_: CurrentUserDep, preferences=Depends(get_preferences_service)):
-    """The non-admin gate for the import button. Returns ONLY ``{configured}`` - never the
-    url or api_key (config-leak guard)."""
-    return LidarrImportStatusResponse(configured=preferences.is_lidarr_import_configured())
-
-
 @router.get("/artists", response_model=LidarrArtistListResponse)
 async def list_candidates(
-    current_user: CurrentUserDep,
+    current_user: CurrentAdminDep,
     service=Depends(get_lidarr_import_service),
 ):
     return await service.list_import_candidates(current_user.id)
@@ -106,7 +99,7 @@ async def list_candidates(
 
 @router.post("/import", response_model=LidarrImportResponse)
 async def import_artists(
-    current_user: CurrentUserDep,
+    current_user: CurrentAdminDep,
     body: LidarrImportRequest = MsgSpecBody(LidarrImportRequest),
     service=Depends(get_lidarr_import_service),
 ):

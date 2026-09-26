@@ -144,7 +144,7 @@ async def test_changed_types_flush_only_search_cache(monkeypatch):
     from services.settings_service import SettingsService
 
     cache = InMemoryCache(max_entries=100)
-    service = SettingsService(preferences_service=None, cache=cache)
+    service = SettingsService(preferences_service=None, cache=cache, mb_response_store=AsyncMock(), follow_store=AsyncMock())
     await service._cache.set("musicbrainz:artist:x", "keep")
 
     flushed = {"n": 0}

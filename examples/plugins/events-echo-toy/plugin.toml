@@ -1,0 +1,25 @@
+[plugin]
+name = "events-echo-toy"
+display_name = "Events Echo (example)"
+version = "1.0.0"
+api_version = 1
+entrypoint = "plugin:EventsEcho"
+capabilities = ["subscriber", "publisher"]
+description = "Logs download events and re-publishes a note through a guarded route."
+author = "DroppedNeedle examples"
+
+[[capability]]
+id = "subscriber"
+
+[[capability]]
+id = "publisher"
+
+[[route]]
+path = "status"
+method = "GET"
+auth = "user"
+
+[[route]]
+path = "note"
+method = "POST"
+auth = "user"

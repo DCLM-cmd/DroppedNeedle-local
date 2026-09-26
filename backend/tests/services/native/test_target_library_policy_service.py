@@ -19,6 +19,7 @@ from api.v1.schemas.library_policies import (
     LibrarySettingsResponse,
     TypedLibrarySettings,
 )
+from core.config import Settings
 from core.exceptions import ValidationError
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.library_work import ScanRequest, ScanScope
@@ -28,6 +29,7 @@ from services.native.library_policy_reconciliation_service import (
 )
 from services.native.target_library_policy_service import TargetLibraryPolicyService
 from services.native.library_policy_resolver import LibraryPolicyResolver
+from services.preferences_service import PreferencesService
 
 
 @pytest.mark.asyncio
@@ -875,3 +877,108 @@ async def test_restored_root_labels_avoid_collisions() -> None:
         "kept": "music",
         "removed": "music (2)",
     }
+
+
+def _dirty_base(
+    tmp_path: Path, root: Path, *, wakeup: Mock
+) -> tuple[LibraryPolicyService, PreferencesService]:
+    settings = Settings()
+    settings.config_file_path = tmp_path / "config.json"
+    preferences = PreferencesService(settings)
+    preferences.save_typed_library_settings(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(
+                    id="root-a", path=str(root), label="Music", policy="automatic"
+                )
+            ]
+        )
+    )
+    cached: dict[str, LibraryPolicyResolver] = {}
+
+    def get_resolver() -> LibraryPolicyResolver:
+        if "resolver" not in cached:
+            cached["resolver"] = LibraryPolicyResolver(
+                preferences.get_typed_library_settings()
+            )
+        return cached["resolver"]
+
+    def clear_resolver() -> None:
+        cached.pop("resolver", None)
+
+    base = LibraryPolicyService(
+        preferences, None, get_resolver, clear_resolver, scan_wakeup=wakeup
+    )
+    return base, preferences
+
+
+def _dirty_store(tmp_path: Path) -> NativeLibraryStore:
+    path = tmp_path / "target.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+    return NativeLibraryStore(path, threading.Lock())
+
+
+def _dirty_reconciliation() -> AsyncMock:
+    reconciliation = AsyncMock()
+    reconciliation.prepare_boundary.return_value = None
+    reconciliation.commit_boundary.return_value = {"changed": 0, "cancelled": 0}
+    return reconciliation
+
+
+@pytest.mark.asyncio
+async def test_target_save_marks_affected_scopes_dirty(tmp_path: Path) -> None:
+    """T16 (S-01 Hook B writer): the target save entry point marks + wakes."""
+    root = tmp_path / "music"
+    root.mkdir()
+    wakeup = Mock()
+    base, preferences = _dirty_base(tmp_path, root, wakeup=wakeup)
+    service = TargetLibraryPolicyService(
+        base, _dirty_reconciliation(), _dirty_store(tmp_path)
+    )
+    revision = (await service.get_settings()).policy_revision
+    await service.save_settings(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(
+                    id="root-a",
+                    path=str(root),
+                    label="Music",
+                    policy="local_metadata",
+                )
+            ]
+        ),
+        expected_policy_revision=revision,
+    )
+    assert preferences.get_library_scan_dirty_scopes().scope_ids == ["root-a"]
+    wakeup.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_target_restore_roots_marks_restored_scopes_dirty(
+    tmp_path: Path,
+) -> None:
+    """T16 (S-01 Hook B writer): the restore path funnels through the mark."""
+    root_a = tmp_path / "music-a"
+    root_a.mkdir()
+    root_b = tmp_path / "music-b"
+    root_b.mkdir()
+    wakeup = Mock()
+    base, preferences = _dirty_base(tmp_path, root_a, wakeup=wakeup)
+    store = _dirty_store(tmp_path)
+    with sqlite3.connect(tmp_path / "target.db") as connection:
+        connection.execute(
+            "INSERT INTO library_migration_provenance "
+            "(source_kind, source_key, target_kind, target_id, "
+            "source_revision, imported_at, migration_run_id) "
+            "VALUES ('root', 'root-b', 'library_root', 'root-b', 'rev', 1.0, NULL)"
+        )
+    service = TargetLibraryPolicyService(base, _dirty_reconciliation(), store)
+    revision = (await service.get_settings()).policy_revision
+    await service.restore_roots(
+        LibraryRestoreRootsRequest(
+            expected_policy_revision=revision, paths={"root-b": str(root_b)}
+        )
+    )
+    assert preferences.get_library_scan_dirty_scopes().scope_ids == ["root-b"]
+    wakeup.assert_called_once_with()

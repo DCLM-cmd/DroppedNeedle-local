@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 
+import msgspec.structs
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from starlette.datastructures import URL
@@ -342,6 +343,7 @@ async def get_target_album(
     album_id: str,
     _user: CurrentUserDep,
     service: TargetNativeLibraryServiceDep,
+    preferences: PreferencesServiceDep,
 ) -> TargetNativeAlbumDetail | RedirectResponse:
     canonical = await service.canonical_id("album", album_id)
     if canonical is not None and canonical != album_id:
@@ -354,7 +356,10 @@ async def get_target_album(
     album = await service.album_detail(album_id)
     if album is None:
         raise ResourceNotFoundError("Library album not found.")
-    return album
+    return msgspec.structs.replace(
+        album,
+        download_allowed=preferences.is_library_download_allowed(_user.role),
+    )
 
 
 @router.post(

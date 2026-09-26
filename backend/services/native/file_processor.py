@@ -28,6 +28,7 @@ from rapidfuzz import fuzz
 from core.exceptions import (
     AutomaticManagementHoldError,
     ConfigurationError,
+    ConflictError,
     ValidationError,
 )
 from infrastructure.msgspec_fastapi import AppStruct
@@ -112,6 +113,10 @@ UPGRADE_NEEDS_RECYCLE_BIN = (
 # The shortfall is local (a partial write / stale copy), never proof the peer is
 # bad - so it must fail without blacklisting the source.
 SIZE_MISMATCH = "size_mismatch"
+# not a quarantine reason: the destination path is already occupied by a file the
+# catalog cannot prove IS this track. The source verified fine; the fault is local
+# (a stray/foreign file at the target), so it is held for review, never blacklisted.
+TARGET_OCCUPIED = "target_occupied"
 
 
 class VerifyStatus:
@@ -186,6 +191,7 @@ def _workspace_disposition(failures: list[FileFailure]) -> str:
         IMPORT_FAILED,
         SOURCE_FILE_MISSING,
         SIZE_MISMATCH,
+        TARGET_OCCUPIED,
     }
     return (
         "preserve"
@@ -827,6 +833,7 @@ class FileProcessor:
         library_paths: list[Path] | None = None,
         client: "DownloadClientProtocol | None" = None,
         slskd_downloads_path: Path | None = None,
+        client_resolver: "Callable[[str], DownloadClientProtocol | None] | None" = None,
         fingerprinter: "AudioFingerprinter | None" = None,
         verify_downloads: bool = True,
         download_store: "DownloadStore | None" = None,
@@ -850,6 +857,7 @@ class FileProcessor:
         self._slskd_downloads_path = (
             Path(slskd_downloads_path) if slskd_downloads_path else None
         )
+        self._client_resolver = client_resolver
         self._fingerprinter = fingerprinter
         self._verify_downloads = verify_downloads
         # When both are wired, a verify-rejected file is copied here and recorded for an
@@ -863,6 +871,31 @@ class FileProcessor:
         self._library_root_ids = library_root_ids or []
         self._publish_import_bundle = publish_import_bundle
         self._policy_revision_getter = policy_revision_getter
+
+    def _resolve_client(self, source: str | None) -> "DownloadClientProtocol | None":
+        """Client owning ``source``. Soulseek (None/empty/"soulseek") always uses the
+        legacy injected client; any other key goes through ``client_resolver`` and
+        never falls back to slskd, so an unknown plugin key returns None (fail
+        closed) instead of misrouting to the wrong backend."""
+        if not source or source == "soulseek":
+            return self._client
+        if self._client_resolver is None:
+            return None
+        return self._client_resolver(source)
+
+    def _client_for_manifest(self, manifest: DownloadManifest) -> "DownloadClientProtocol | None":
+        """Resolve the client for one manifest via its handle source."""
+        handle = getattr(manifest, "handle", None)
+        source = getattr(handle, "source", None) if handle is not None else None
+        return self._resolve_client(source)
+
+    def _downloads_root_for(self, client: "DownloadClientProtocol | None") -> Path | None:
+        """Mount root guarding ``client``'s files. Only the legacy slskd client has a
+        configured downloads mount; plugin clients resolve to None so the slskd
+        mount never gates (or fails) another backend's files."""
+        if client is None or client is not self._client:
+            return None
+        return self._slskd_downloads_path
 
     def _target_location(self, path: Path) -> tuple[str, str]:
         resolved = path.resolve(strict=False)
@@ -997,7 +1030,7 @@ class FileProcessor:
         manifest: DownloadManifest,
         only_filenames: set[str] | None = None,
     ) -> ProcessResult:
-        """Import each expected file from slskd's download dir into the library.
+        """Import each expected file from the owning download client's dir into the library.
 
         Continue-on-failure: a bad file is recorded and skipped, the rest still
         import. The orchestrator quarantines each failure and derives
@@ -1012,7 +1045,7 @@ class FileProcessor:
             self._naming is None
             or self._library is None
             or not self._library_paths
-            or self._client is None
+            or (self._client is None and self._client_resolver is None)
         ):
             # Production injects every dependency through the target provider.
             raise RuntimeError("FileProcessor is not configured for downloads")
@@ -1155,15 +1188,17 @@ class FileProcessor:
     async def process_downloaded_folder(
         self, manifest: DownloadManifest, files: list[Path]
     ) -> ProcessResult:
-        """Import an UNPACKED Usenet folder (D18). Unlike the slskd path, the filenames
-        are unknown up front (often obfuscated) and the per-track tags may be ENTIRELY
-        ABSENT (verified against a real rip: only ``album`` was set), so this matches
-        each on-disk file to the manifest's expected MusicBrainz tracklist by
-        **duration** (the one always-available signal), with tagged track/title/MBID and
-        the filename track number as tie-breakers. Only files that match a tracklist
-        position import; the rest (bonus tracks not in MB, scene samples, a merged-track
-        file) are dropped (owner Q1). The matched MB track supplies the metadata stamped
-        onto the file, since the file's own tags can't be trusted."""
+        """Import an UNPACKED Usenet folder (D18) or a plugin folder-mode release.
+        Unlike the slskd path, the filenames are unknown up front (often obfuscated)
+        and the per-track tags may be ENTIRELY ABSENT (verified against a real rip:
+        only ``album`` was set), so this matches each on-disk file to the manifest's
+        expected MusicBrainz tracklist by **duration** (the one always-available
+        signal), with tagged track/title/MBID and the filename track number as
+        tie-breakers. Only files that match a tracklist position import; the rest
+        (bonus tracks not in MB, scene samples, a merged-track file) are dropped
+        (owner Q1). The matched MB track supplies the metadata stamped onto the
+        file, since the file's own tags can't be trusted. Source-agnostic: the caller
+        enumerates ``files`` via its own download client."""
         if self._naming is None or self._library is None or not self._library_paths:
             raise RuntimeError("FileProcessor is not configured for downloads")
 
@@ -1454,11 +1489,9 @@ class FileProcessor:
                     original_filename=value.source.name,
                     file_format=value.info.file_format,
                     duration_seconds=value.info.duration_seconds,
-                    # A conversion hold is already verified against the target
-                    # edition, so it carries no fingerprint evidence of its own.
-                    evidence_title=None,
-                    evidence_artist=None,
-                    evidence_score=None,
+                    evidence_title=value.tag.title,
+                    evidence_artist=value.tag.artist,
+                    evidence_score=value.confidence,
                     naming_template=manifest.naming_template,
                 )
                 if held_id is None:
@@ -1605,15 +1638,49 @@ class FileProcessor:
             fp=fp,
         )
         if target_path.exists() and replacement is None:
-            if not await self._same_path_upgrade_applies(
+            # An occupied destination only stands as a success when the catalog
+            # proves it IS this track (#418): a bare file (zero publication, zero
+            # attribution) is a collision, never an acquisition.
+            replace_ready = False
+            if await self._same_path_upgrade_applies(
                 manifest.origin, target_path, info
             ):
-                return target_path
-            replacement = (
-                await self._library.get_attributions_for_paths([str(target_path)])
-            ).get(str(target_path))
-            if replacement is None or self._recycle_bin is None:
-                return target_path
+                replacement = (
+                    await self._library.get_attributions_for_paths([str(target_path)])
+                ).get(str(target_path))
+                replace_ready = (
+                    replacement is not None and self._recycle_bin is not None
+                )
+            if not replace_ready:
+                if await self._target_attribution_covers(
+                    target_path,
+                    release_group_mbid=manifest.release_group_mbid,
+                    recording_mbid=track.recording_mbid,
+                    title=track.title,
+                    duration_seconds=track.duration_seconds,
+                ):
+                    return target_path
+                await self._hold_for_review(
+                    source=source,
+                    manifest=manifest,
+                    reason=TARGET_OCCUPIED,
+                    reason_detail=str(target_path),
+                    evidence_title=tag.title,
+                    evidence_artist=tag.artist,
+                    evidence_score=None,
+                    track_number=track.track_number,
+                    disc_number=track.disc_number or 1,
+                    track_title=track.title,
+                    recording_mbid=track.recording_mbid,
+                    duration_seconds=info.duration_seconds,
+                    expected_duration_seconds=track.duration_seconds,
+                    file_format=info.file_format,
+                )
+                raise VerificationFailed(
+                    f"Target already occupied: {target_path.name}",
+                    reason=TARGET_OCCUPIED,
+                    filename=source.name,
+                )
         return _PlannedImport(
             source=source,
             target=target_path,
@@ -1705,6 +1772,37 @@ class FileProcessor:
             return False
         existing_tier = await self._existing_tier_at(target_path)
         return existing_tier is not None and _is_strict_upgrade(existing_tier, info)
+
+    async def _target_attribution_covers(
+        self,
+        target_path: Path,
+        *,
+        release_group_mbid: str | None,
+        recording_mbid: str | None,
+        title: str | None,
+        duration_seconds: float | None,
+    ) -> bool:
+        """Whether the catalog proves the file already at ``target_path`` IS the
+        expected track (#418): an attribution row exists for the path, its release
+        group matches (rows store lower-cased MBIDs), and the row covers the expected
+        recording (P4 ``row_covers_track``). A bare on-disk file with no row never
+        covers - returning it as success would report an acquisition with zero
+        publication and zero catalog attribution."""
+        rows = await self._library.get_attributions_for_paths([str(target_path)])
+        row = rows.get(str(target_path))
+        if row is None:
+            return False
+        expected_rg = (release_group_mbid or "").strip().lower()
+        if not expected_rg:
+            return False
+        if (row.get("release_group_mbid") or "").strip().lower() != expected_rg:
+            return False
+        return row_covers_track(
+            row,
+            recording_mbid=recording_mbid,
+            title=title,
+            duration_seconds=duration_seconds,
+        )
 
     async def _hold_for_review(
         self,
@@ -1801,13 +1899,18 @@ class FileProcessor:
         return self._library_paths[0]
 
     async def place_held_management_bundle(
-        self, held_files: list["HeldImport"]
+        self,
+        held_files: list["HeldImport"],
+        *,
+        on_progress: Callable[[str, int, int], Awaitable[None]] | None = None,
     ) -> list[Path]:
         """Retry one complete automatic-management hold through the staged publisher.
 
         The held copies already passed acquisition matching and verification. They are
         prepared again against the current profile, then published as one all-or-nothing
-        unit. No per-track escape hatch is allowed on this path.
+        unit. No per-track escape hatch is allowed on this path. ``on_progress`` is an
+        optional ``(stage, files_completed, files_total)`` reporter the caller forwards
+        to progress subscribers; it never changes what is planned or published.
         """
 
         if not held_files:
@@ -1822,15 +1925,16 @@ class FileProcessor:
         if any(not value.reason.startswith("management:") for value in held_files):
             raise ValidationError("Only Library Management holds can use this retry.")
 
-        planned: list[_PlannedImport] = []
-        for held in sorted(
+        ordered = sorted(
             held_files,
             key=lambda value: (
                 value.disc_number or 1,
                 value.track_number or 0,
                 value.id,
             ),
-        ):
+        )
+        planned: list[_PlannedImport] = []
+        for position, held in enumerate(ordered, start=1):
             source = Path(held.held_path)
             if not source.exists():
                 raise FileNotFoundError(held.held_path)
@@ -1907,19 +2011,27 @@ class FileProcessor:
                     replacement=replacement,
                 )
             )
+            if on_progress is not None:
+                await on_progress("planning", position, len(ordered))
 
         task_id = next(iter(task_ids))
+        if on_progress is not None:
+            await on_progress("publishing", 0, len(ordered))
         published = await self._publish_planned_imports(
             planned,
             idempotency_key=f"acquisition:management-held:{task_id}",
         )
+        if on_progress is not None:
+            await on_progress("publishing", len(ordered), len(ordered))
         return [Path(value) for value in published.paths]
 
     async def place_held_file(self, held: "HeldImport") -> Path:
         """Force-import a held file under the track it was matched to, WITHOUT the AcoustID
         identity check (a human has judged it correct). Stamps the album's MBIDs onto the file
         so a later rescan trusts it (tag tier) and never re-rejects. Raises ``FileNotFoundError``
-        if the held file is gone, or on import I/O error - the caller maps that to a 4xx."""
+        if the held file is gone, or on import I/O error - the caller maps that to a 4xx.
+        Raises ``ConflictError`` when the destination is occupied by a file the catalog
+        cannot prove is this track (the held source is kept, the row stays held)."""
         source = Path(held.held_path)
         if not source.exists():
             raise FileNotFoundError(held.held_path)
@@ -1976,19 +2088,32 @@ class FileProcessor:
                     return Path(present["file_path"])
                 replacement = present
         if target_path.exists() and replacement is None:
-            if not await self._same_path_upgrade_applies(origin, target_path, info):
-                # F-INDEXREC-04: validated redundant no-op - consume the held
-                # source off the event loop before reporting success.
-                await asyncio.to_thread(source.unlink, True)
-                return target_path
-            replacement = (
-                await self._library.get_attributions_for_paths([str(target_path)])
-            ).get(str(target_path))
-            if replacement is None or self._recycle_bin is None:
-                # F-INDEXREC-04: no safe replace is possible, so the held source
-                # is a validated redundant no-op - consume it off the event loop.
-                await asyncio.to_thread(source.unlink, True)
-                return target_path
+            # An occupied destination is only a validated redundant no-op when the
+            # catalog proves it IS this track (#418) - otherwise the held source
+            # is kept and the collision surfaces as a 409, never a silent success.
+            replace_ready = False
+            if await self._same_path_upgrade_applies(origin, target_path, info):
+                replacement = (
+                    await self._library.get_attributions_for_paths([str(target_path)])
+                ).get(str(target_path))
+                replace_ready = (
+                    replacement is not None and self._recycle_bin is not None
+                )
+            if not replace_ready:
+                if await self._target_attribution_covers(
+                    target_path,
+                    release_group_mbid=held.release_group_mbid,
+                    recording_mbid=target_tag.musicbrainz_recording_id,
+                    title=target_tag.title,
+                    duration_seconds=held.expected_duration_seconds,
+                ):
+                    # F-INDEXREC-04: validated redundant no-op - consume the held
+                    # source off the event loop before reporting success.
+                    await asyncio.to_thread(source.unlink, True)
+                    return target_path
+                raise ConflictError(
+                    f"The library destination '{target_path.name}' is already occupied."
+                )
         published = await self._publish_planned_imports(
             [
                 _PlannedImport(
@@ -2095,7 +2220,7 @@ class FileProcessor:
         separate method so ``get_file_path`` stays byte-identical); other
         clients simply have no partial fallback.
         """
-        locate = getattr(self._client, "locate_partial", None)
+        locate = getattr(self._client_for_manifest(manifest), "locate_partial", None)
         if locate is None:
             return None
         try:
@@ -2112,15 +2237,22 @@ class FileProcessor:
     ) -> Path | _PlannedImport:
         """Verify and plan one file for the shared bundle publisher. Raises ``VerificationFailed``
         (per-file) or ``AlreadyImported`` (crash-idempotency)."""
-        source = await self._client.get_file_path(
+        client = self._client_for_manifest(manifest)
+        if client is None:
+            raise VerificationFailed(
+                f"Missing file: {expected.filename}",
+                reason=SOURCE_FILE_MISSING,
+                filename=expected.filename,
+            )
+        source = await client.get_file_path(
             manifest.handle, expected.filename, expected.size
         )
 
         # distinguish a bad downloads mount (environment fault) from a single missing
         # file: a bad mount fails this file with a sanitized reason but never
         # quarantines (not the source's fault)
-        downloads_root = self._slskd_downloads_path
-        if (
+        downloads_root = self._downloads_root_for(client)
+        if client is self._client and (
             downloads_root is None
             or not downloads_root.is_dir()
             or not os.access(downloads_root, os.R_OK)
@@ -2476,15 +2608,71 @@ class FileProcessor:
             fp=fp,
         )
         if target_path.exists() and replacement is None:
-            if not await self._same_path_upgrade_applies(
+            # An occupied destination only stands as a success when the catalog
+            # proves it IS this track (#418): a bare file (zero publication, zero
+            # attribution) is a collision, never an acquisition.
+            replace_ready = False
+            if await self._same_path_upgrade_applies(
                 manifest.origin, target_path, info
             ):
-                return target_path
-            replacement = (
-                await self._library.get_attributions_for_paths([str(target_path)])
-            ).get(str(target_path))
-            if replacement is None or self._recycle_bin is None:
-                return target_path
+                replacement = (
+                    await self._library.get_attributions_for_paths([str(target_path)])
+                ).get(str(target_path))
+                replace_ready = (
+                    replacement is not None and self._recycle_bin is not None
+                )
+            if not replace_ready:
+                if await self._target_attribution_covers(
+                    target_path,
+                    release_group_mbid=manifest.release_group_mbid,
+                    recording_mbid=(
+                        expected_track.recording_mbid
+                        if expected_track is not None
+                        else tag.musicbrainz_recording_id
+                    ),
+                    title=(
+                        expected_track.title
+                        if expected_track is not None
+                        else tag.title
+                    ),
+                    duration_seconds=(
+                        expected_track.duration_seconds
+                        if expected_track is not None
+                        else expected.duration
+                    ),
+                ):
+                    return target_path
+                await self._hold_for_review(
+                    source=source,
+                    manifest=manifest,
+                    reason=TARGET_OCCUPIED,
+                    reason_detail=str(target_path),
+                    evidence_title=tag.title,
+                    evidence_artist=tag.artist,
+                    evidence_score=None,
+                    track_number=tag.track_number,
+                    disc_number=tag.disc_number or 1,
+                    track_title=(
+                        expected_track.title if expected_track else tag.title
+                    ),
+                    recording_mbid=(
+                        expected_track.recording_mbid
+                        if expected_track
+                        else tag.musicbrainz_recording_id
+                    ),
+                    duration_seconds=info.duration_seconds,
+                    expected_duration_seconds=(
+                        expected_track.duration_seconds
+                        if expected_track is not None
+                        else expected.duration
+                    ),
+                    file_format=info.file_format,
+                )
+                raise VerificationFailed(
+                    f"Target already occupied: {target_path.name}",
+                    reason=TARGET_OCCUPIED,
+                    filename=expected.filename,
+                )
         return _PlannedImport(
             source=source,
             target=target_path,

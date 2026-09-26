@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import errno
 import os
+import stat
 import threading
 import time
+import unicodedata
 import logging
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path, PurePosixPath
@@ -31,6 +33,11 @@ from services.native.file_revision import revision_from_stat
 
 INVENTORY_QUEUE_SIZE = 256
 INVENTORY_BATCH_SIZE = 256
+# F-12: reap horizon for wedged detached walkers as a multiple of the walk
+# deadline. The base knob (``walk_deadline_seconds``) and this multiplier are
+# deliberately separate from the tag-read pair, which they only
+# coincidentally equal (both default to 30.0s / 3x).
+DETACHED_WALKER_REAP_MULTIPLIER = 3.0
 
 Checkpoint = Callable[[str, str], Awaitable[bool]]
 DirectoryWalker = Callable[..., Iterator[tuple[str, list[str], list[str]]]]
@@ -103,6 +110,8 @@ class LibraryInventoryScanner:
         max_detached_walkers: int = 4,
         probe_executor_max_workers: int = 1,
         clock: Callable[[], float] = time.time,
+        detached_walker_reap_multiplier: float = DETACHED_WALKER_REAP_MULTIPLIER,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store = store
         self._directory_walker = directory_walker
@@ -112,6 +121,12 @@ class LibraryInventoryScanner:
         self._directory_probe = directory_probe
         self._max_detached_walkers = max_detached_walkers
         self._detached_walkers: set[asyncio.Task[None]] = set()
+        self._detached_walker_reap_multiplier = detached_walker_reap_multiplier
+        self._monotonic_clock = monotonic_clock
+        # F-12: detach timestamps for the in-flight set above; entries older
+        # than the reap horizon are evicted lazily on refusal and on
+        # completion, never by a periodic task.
+        self._detached_walker_started: dict[asyncio.Task[None], float] = {}
         self._probe_max_workers = probe_executor_max_workers
         self._probe_lock = threading.Lock()
         self._pending_probes: set[asyncio.Future[bool]] = set()
@@ -134,9 +149,38 @@ class LibraryInventoryScanner:
         return self._leaked_walkers
 
     def _finish_detached_walker(self, task: asyncio.Task[None]) -> None:
+        # A late finish of an already-evicted walker is a safe noop: the
+        # discard/pop tolerate the missing entry and the exception is still
+        # consumed so no "never retrieved" warning escapes.
         self._detached_walkers.discard(task)
+        self._detached_walker_started.pop(task, None)
         if not task.cancelled():
             task.exception()
+        # F-12: opportunistically forget other wedged entries on completion
+        # (past the horizon by design so scans keep moving; concurrency is
+        # bounded by max-detached plus refusal/completion reaps).
+        self._reap_stale_detached_walkers()
+
+    def _reap_stale_detached_walkers(self) -> int:
+        """Forget detached walkers older than the reap horizon.
+
+        Evicted entries leave tracking entirely (cap freed, timestamp map
+        cleaned): wedged entries are forgotten past the horizon by design so
+        scans keep moving, and concurrency is bounded by max-detached plus
+        refusal/completion reaps. A late finish of an evicted entry stays a
+        safe noop via its still-attached done-callback.
+        """
+        horizon = self._walk_deadline_seconds * self._detached_walker_reap_multiplier
+        now = self._monotonic_clock()
+        stale = [
+            task
+            for task, started in self._detached_walker_started.items()
+            if now - started > horizon
+        ]
+        for task in stale:
+            self._detached_walkers.discard(task)
+            self._detached_walker_started.pop(task, None)
+        return len(stale)
 
     def _detach_walker(self, task: asyncio.Task[None]) -> bool:
         """Detach a wedged producer so it cannot wedge the scan worker.
@@ -145,20 +189,29 @@ class LibraryInventoryScanner:
         wedged walkers the task is refused (and counted as leaked) instead of
         being tracked silently; the caller fails the run with
         WALKER_UNAVAILABLE, mirroring the tag-read capacity contract.
+        F-12: entries past the reap horizon drain first, so only a
+        still-fresh full set refuses.
         """
         if task.done():
             return True
         if len(self._detached_walkers) >= self._max_detached_walkers:
-            self._leaked_walkers += 1
-            logger.warning(
-                "library_scan event=detached_walker_cap_exceeded count=%s max=%s "
-                "leaked_total=%s",
-                len(self._detached_walkers) + 1,
-                self._max_detached_walkers,
-                self._leaked_walkers,
-            )
-            return False
+            # F-12: wedged entries past the horizon are forgotten (drained,
+            # cap freed) by design so scans keep moving; concurrency is
+            # bounded by max-detached plus refusal/completion reaps. Only a
+            # still-fresh full set refuses.
+            self._reap_stale_detached_walkers()
+            if len(self._detached_walkers) >= self._max_detached_walkers:
+                self._leaked_walkers += 1
+                logger.warning(
+                    "library_scan event=detached_walker_cap_exceeded count=%s max=%s "
+                    "leaked_total=%s",
+                    len(self._detached_walkers) + 1,
+                    self._max_detached_walkers,
+                    self._leaked_walkers,
+                )
+                return False
         self._detached_walkers.add(task)
+        self._detached_walker_started[task] = self._monotonic_clock()
         task.add_done_callback(self._finish_detached_walker)
         return True
 
@@ -240,6 +293,29 @@ class LibraryInventoryScanner:
         except ValueError:
             relative = path
         return LibraryInventoryScanner._text_safe_posix(relative)
+
+    @staticmethod
+    def _inventory_key(path: Path, root: Path) -> str:
+        """NFC-normalized inventory key for one in-root path (step 4.13).
+
+        macOS writes NFD bytes while the walk historically stored whatever
+        the filesystem produced, so an NFC<->NFD rename of an unchanged
+        file must classify as a move (same key) instead of a delete+new
+        pair. Only the key is normalized: display strings such as
+        absolute_path keep their on-disk form, _relativize (failure and
+        heartbeat paths) is untouched, non-UTF-8 names still take the
+        WALK_NAME_ENCODING skip upstream, and case-only variants are
+        unaffected (NFC never folds case).
+
+        One-time churn: rows persisted before this normalization keep
+        their raw key, so a pre-existing NFD row first re-presents as NFC
+        (new key plus a missing old key) and settles on the next run. No
+        stored-key migration: the rename is one honest move, not a silent
+        history rewrite.
+        """
+        return unicodedata.normalize(
+            "NFC", PurePosixPath(*path.relative_to(root).parts).as_posix()
+        )
 
     @staticmethod
     def _walk_failure_detail(exc: BaseException) -> str:
@@ -586,6 +662,43 @@ class LibraryInventoryScanner:
                     checkpoint,
                     discovery_generation,
                 )
+                # GH-444: a transient mid-walk stall (contended disk, a wedged
+                # syscall that clears) must not fail the whole run. Re-walk
+                # the scope boundedly, sharing the F-030 restart budget (worst
+                # case 3 walks + 2 inter-retry sleeps before honest terminal
+                # failure); a still-wedged producer fails honestly after the
+                # cap, and a coordinator pause/stop/supersede (or failed
+                # checkpoint) wins over retry. Only the exact WALK_TIMEOUT
+                # code retries - never WALKER_UNAVAILABLE, permission codes,
+                # or control exits.
+                if not completed and walk_failure_code == "WALK_TIMEOUT":
+                    current = (await self._store.get_scan_run(run.id))[0]
+                    if (
+                        restarts < 2
+                        and current.state == "discovering"
+                        and await checkpoint(run.id, scope.policy_revision)
+                    ):
+                        restarts += 1
+                        await asyncio.sleep(self._walk_deadline_seconds)
+                        current = (await self._store.get_scan_run(run.id))[0]
+                        if current.state != "discovering" or not await checkpoint(
+                            run.id, scope.policy_revision
+                        ):
+                            break
+                        logger.warning(
+                            "library_scan event=walk_timeout_retry run_id=%s "
+                            "root_id=%s path=%s attempt=%d",
+                            run.id,
+                            scope.root_id,
+                            scope.relative_path,
+                            restarts,
+                        )
+                        await self._store.restart_scan_scope_discovery(
+                            run.id, scope.root_id, scope.relative_path
+                        )
+                        current = (await self._store.get_scan_run(run.id))[0]
+                        await self._store.cleanup_stale_scan_inventory(run.id)
+                        continue
                 if not completed or self._filesystem is None:
                     break
                 async with self._filesystem.read(scope.root_id):
@@ -778,11 +891,27 @@ class LibraryInventoryScanner:
                             )
                             continue
                         try:
-                            inspected.append((resolved, resolved.stat()))
+                            file_stat = resolved.stat()
                         except FileNotFoundError:
                             continue
                         except OSError as exc:
                             inspected.append(exc)
+                            continue
+                        if not stat.S_ISREG(file_stat.st_mode):
+                            # F-13: FIFOs/sockets/devices with an audio suffix
+                            # would wedge a tag reader in open(); skip them in
+                            # the inventory phase without touching the
+                            # tag-reader budget.
+                            skips.append(
+                                (
+                                    LibraryInventoryScanner._text_safe_posix(
+                                        path.relative_to(root)
+                                    ),
+                                    "NON_REGULAR_FILE",
+                                )
+                            )
+                            continue
+                        inspected.append((resolved, file_stat))
                     if skips:
                         asyncio.run_coroutine_threadsafe(
                             queue.put(skips), loop
@@ -893,18 +1022,28 @@ class LibraryInventoryScanner:
                     # F-020/F-021 skip records: escape-out symlinks and
                     # non-UTF-8 names become auditable failure rows.
                     for relative_path, failure_code in item:
+                        if failure_code == "SYMLINK_ESCAPE_OUT":
+                            failure_detail = (
+                                "A symbolic link resolves outside its library "
+                                "root; it was not followed."
+                            )
+                        elif failure_code == "NON_REGULAR_FILE":
+                            failure_detail = (
+                                "The path is not a regular file (FIFO, socket, "
+                                "or device node); it was skipped without "
+                                "reading tags."
+                            )
+                        else:
+                            failure_detail = (
+                                "A filename is not valid UTF-8; the file "
+                                "was skipped."
+                            )
                         await self._record_failure(
                             run.id,
                             scope,
                             relative_path=relative_path,
                             failure_code=failure_code,
-                            failure_detail=(
-                                "A symbolic link resolves outside its library "
-                                "root; it was not followed."
-                                if failure_code == "SYMLINK_ESCAPE_OUT"
-                                else "A filename is not valid UTF-8; the file "
-                                "was skipped."
-                            ),
+                            failure_detail=failure_detail,
                         )
                     continue
                 if isinstance(item, BaseException):
@@ -943,10 +1082,31 @@ class LibraryInventoryScanner:
                 # Resolved path, resolved root: the producer yields fully resolved
                 # paths, so measuring them against the raw root fails outright wherever
                 # the root is reached through a symlink.
-                relative_key = PurePosixPath(
-                    *resolved_path.relative_to(resolved_root).parts
-                ).as_posix()
+                relative_key = LibraryInventoryScanner._inventory_key(
+                    resolved_path, resolved_root
+                )
                 if relative_key in seen_relative_paths:
+                    # Load-bearing collision rule: on Linux an NFC name and
+                    # its NFD twin are two distinct files normalizing to one
+                    # inventory key (the PK is run_id/root_id/relative_path).
+                    # First wins; the loser gets an inventory-phase
+                    # (discovering) failure row like SYMLINK_ESCAPE_OUT so a
+                    # twin never surfaces as a UNIQUE violation run error.
+                    # The row names the loser's own on-disk form and leaves
+                    # degraded_code alone, so the run stays green.
+                    await self._record_failure(
+                        run.id,
+                        scope,
+                        relative_path=PurePosixPath(
+                            *resolved_path.relative_to(resolved_root).parts
+                        ).as_posix(),
+                        failure_code="NFC_TWIN_COLLISION",
+                        failure_detail=(
+                            "Two on-disk names normalize to the same "
+                            "inventory key; the first file won and this "
+                            "twin was skipped."
+                        ),
+                    )
                     continue
                 seen_relative_paths.add(relative_key)
                 batch.append(item)
@@ -1062,8 +1222,29 @@ class LibraryInventoryScanner:
         # The batch holds FULLY RESOLVED paths (the walk resolves in-root aliases onto
         # their target), so the root it is measured against has to be resolved too.
         resolved_root = root.resolve(strict=False)
+        seen_keys: set[str] = set()
         for path, stat in batch:
-            relative = PurePosixPath(*path.relative_to(resolved_root).parts).as_posix()
+            relative = LibraryInventoryScanner._inventory_key(path, resolved_root)
+            if relative in seen_keys:
+                # Same twin rule as the walk-time dedup above: _persist_batch
+                # is also reachable without the walk, so it first-wins with a
+                # loser row here too instead of letting one key reach the
+                # (run_id, root_id, relative_path) PK twice.
+                await self._record_failure(
+                    run.id,
+                    scope,
+                    relative_path=PurePosixPath(
+                        *path.relative_to(resolved_root).parts
+                    ).as_posix(),
+                    failure_code="NFC_TWIN_COLLISION",
+                    failure_detail=(
+                        "Two on-disk names normalize to the same "
+                        "inventory key; the first file won and this "
+                        "twin was skipped."
+                    ),
+                )
+                continue
+            seen_keys.add(relative)
             raw.append((path, relative, stat, revision_from_stat(stat)))
         comparisons = await self._store.classify_scan_paths(
             scope.root_id,
@@ -1071,6 +1252,10 @@ class LibraryInventoryScanner:
                 (relative, stat.st_size, stat.st_mtime_ns, stat.st_mtime, revision)
                 for _, relative, stat, revision in raw
             ],
+            # F-15/4.12 skew wiring: the store records beyond-band wall/FS
+            # drift as MTIME_SKEW evidence only when the run id is passed
+            # (it defaults to verdicts-only for its pre-existing caller).
+            run_id=run.id,
         )
         items: list[ScanInventoryItem] = []
         for path, relative, stat, revision in raw:

@@ -128,7 +128,7 @@ class TestPrewarmLogContract:
 
 class TestCacheStatsAudioDBWiring:
     @pytest.mark.asyncio
-    async def test_get_stats_includes_audiodb_counts(self):
+    async def test_get_stats_includes_audiodb_counts(self, tmp_path):
         from services.cache_service import CacheService
 
         disk_cache = MagicMock()
@@ -138,6 +138,7 @@ class TestCacheStatsAudioDBWiring:
             "artist_count": 40,
             "audiodb_artist_count": 15,
             "audiodb_album_count": 25,
+            "total_size_bytes": 0,
         }
 
         mem_cache = MagicMock()
@@ -145,23 +146,32 @@ class TestCacheStatsAudioDBWiring:
         mem_cache.estimate_memory_bytes.return_value = 2048
 
         library_db = AsyncMock()
-        library_db.get_stats = AsyncMock(return_value={
+        library_db.get_cache_stats = AsyncMock(return_value={
             "artist_count": 5,
             "album_count": 8,
             "db_size_bytes": 4096,
         })
 
+        response_store = MagicMock()
+        response_store.stats.return_value = {
+            "response_entries": 0,
+            "response_logical_bytes": 0,
+            "database_allocated_bytes": 4096,
+            "database_wal_bytes": 0,
+            "response_hits": 0,
+            "response_evictions": 0,
+            "response_speculative_used": 0,
+        }
         svc = CacheService(
             cache=mem_cache,
             library_db=library_db,
             disk_cache=disk_cache,
+            mb_response_store=response_store,
         )
         svc._stats_cache_ttl = 0
 
         with patch("services.cache_service.get_covers_cache_dir") as mock_get_dir:
-            mock_dir = MagicMock()
-            mock_dir.exists.return_value = False
-            mock_get_dir.return_value = mock_dir
+            mock_get_dir.return_value = tmp_path / "covers"
             stats = await svc.get_stats()
 
         assert stats.disk_audiodb_artist_count == 15

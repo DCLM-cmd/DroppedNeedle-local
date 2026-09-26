@@ -165,6 +165,9 @@ export const API = {
 			return `/api/v1/artists/${id}/purchase-options?${params.toString()}`;
 		}
 	},
+	events: {
+		stream: () => '/api/v1/events/stream'
+	},
 	following: {
 		artists: () => '/api/v1/following/artists',
 		newReleases: (limit: number, offset: number) =>
@@ -173,7 +176,6 @@ export const API = {
 			`/api/v1/following/new-releases/recent?days=${days}&limit=${limit}&include_owned=${includeOwned}`,
 		newReleasesUnseenCount: () => '/api/v1/following/new-releases/unseen-count',
 		markNewReleasesSeen: () => '/api/v1/following/new-releases/seen',
-		events: () => '/api/v1/following/events',
 		concerts: () => '/api/v1/following/concerts',
 		concertCities: () => '/api/v1/following/concerts/cities',
 		concertCitySearch: (q: string) =>
@@ -288,8 +290,6 @@ export const API = {
 		trackTags: (fileId: string) => `/api/v1/library/tracks/${fileId}/tags`,
 		removeTrack: (fileId: string) => `/api/v1/library/tracks/${fileId}`,
 		activity: () => '/api/v1/library/activity',
-		activityStream: () => '/api/v1/library/activity/stream',
-		operationsStream: () => '/api/v1/library/operations/stream',
 		pauseIdentification: () => '/api/v1/library/identification/pause',
 		resumeIdentification: () => '/api/v1/library/identification/resume',
 		scanRuns: (limit?: number, cursor?: string) => {
@@ -492,6 +492,7 @@ export const API = {
 		activationPreview: (jobId: string) =>
 			`/api/v1/settings/library-management/activation-previews/${encodeURIComponent(jobId)}`,
 		activationConfirmations: () => '/api/v1/settings/library-management/activation-confirmations',
+		activationHealth: () => '/api/v1/settings/library-management/activation-health',
 		previews: () => '/api/v1/library/management/previews',
 		tagEditor: (trackId: string) =>
 			`/api/v1/library/management/tracks/${encodeURIComponent(trackId)}/tag-editor`,
@@ -502,6 +503,8 @@ export const API = {
 		purgeBaselines: () => '/api/v1/library/management/baselines/purge',
 		recoveryDiagnostics: () => '/api/v1/library/management/recovery/diagnostics',
 		acknowledgeRecovery: () => '/api/v1/library/management/recovery/acknowledge',
+		resolveImportBundle: (bundleId: string) =>
+			`/api/v1/library/management/recovery/import-bundles/${encodeURIComponent(bundleId)}/resolve`,
 		preview: (jobId: string) => `/api/v1/library/management/previews/${encodeURIComponent(jobId)}`,
 		applyPreview: (jobId: string) =>
 			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/apply`,
@@ -597,6 +600,10 @@ export const API = {
 		queueStats: () => '/api/v1/system/queue-stats',
 		providerStats: () => '/api/v1/system/provider-stats'
 	},
+	cacheSync: {
+		status: () => '/api/v1/cache/sync/status',
+		cancel: () => '/api/v1/cache/sync/cancel'
+	},
 	home: () => '/api/v1/home',
 	homeGenre: (genre: string, limit = 50, artistOffset = 0, albumOffset = 0) => {
 		const params = new URLSearchParams({
@@ -609,6 +616,8 @@ export const API = {
 	homeIntegrationStatus: () => '/api/v1/home/integration-status',
 	discover: () => '/api/v1/discover',
 	discoverRefresh: () => '/api/v1/discover/refresh',
+	discoverActivity: () => '/api/v1/discover/activity',
+	discoverQueuePreview: (mbid: string) => `/api/v1/discover/queue/preview/${mbid}`,
 	discoverQueue: () => '/api/v1/discover/queue',
 	discoverQueueStatus: () => '/api/v1/discover/queue/status',
 	discoverQueueGenerate: () => '/api/v1/discover/queue/generate',
@@ -702,8 +711,7 @@ export const API = {
 		submit: () => '/api/v1/scrobble/submit'
 	},
 	nowPlaying: {
-		report: () => '/api/v1/now-playing',
-		events: () => '/api/v1/now-playing/events'
+		report: () => '/api/v1/now-playing'
 	},
 	playlists: {
 		list: () => '/api/v1/playlists',
@@ -741,8 +749,9 @@ export const API = {
 	},
 	download: {
 		localTrack: (trackId: string) => `/api/v1/download/local/track/${trackId}`,
-		localAlbum: (albumId: number) => `/api/v1/download/local/album/${albumId}`,
-		localAlbumByMbid: (mbid: string) => `/api/v1/download/local/album/mbid/${mbid}`
+		localAlbum: (albumId: string) => `/api/v1/download/local/album/${albumId}`,
+		localAlbumByMbid: (mbid: string) => `/api/v1/download/local/album/mbid/${mbid}`,
+		access: () => '/api/v1/download/access'
 	},
 	downloadClient: {
 		config: () => '/api/v1/download-client/config',
@@ -755,12 +764,16 @@ export const API = {
 		update: (id: string) => `/api/v1/indexers/${id}`,
 		remove: (id: string) => `/api/v1/indexers/${id}`,
 		reorder: () => '/api/v1/indexers/reorder',
-		test: () => '/api/v1/indexers/test'
+		test: () => '/api/v1/indexers/test',
+		searchBackend: () => '/api/v1/indexers/search-backend'
+	},
+	prowlarr: {
+		config: () => '/api/v1/prowlarr/config',
+		test: () => '/api/v1/prowlarr/test'
 	},
 	lidarrImport: {
 		config: () => '/api/v1/lidarr-import/config',
 		test: () => '/api/v1/lidarr-import/test',
-		status: () => '/api/v1/lidarr-import/status',
 		artists: () => '/api/v1/lidarr-import/artists',
 		import: () => '/api/v1/lidarr-import/import'
 	},
@@ -775,8 +788,12 @@ export const API = {
 	plugins: {
 		list: () => '/api/v1/plugins',
 		install: () => '/api/v1/plugins/install',
-		update: (name: string) => `/api/v1/plugins/${name}`,
-		uninstall: (name: string) => `/api/v1/plugins/${name}`
+		sources: () => '/api/v1/plugins/sources',
+		ext: (name: string, subpath: string) =>
+			`/api/v1/plugins/ext/${encodeURIComponent(name)}/${subpath.replace(/^\/+/, '')}`,
+		uiBundle: (name: string) => `/api/v1/plugins/${encodeURIComponent(name)}/ui/panel.js`,
+		update: (name: string) => `/api/v1/plugins/${encodeURIComponent(name)}`,
+		uninstall: (name: string) => `/api/v1/plugins/${encodeURIComponent(name)}`
 	},
 	dropImport: {
 		uploads: () => '/api/v1/import/uploads',
@@ -846,6 +863,7 @@ export const API = {
 		heldManagementRetry: (taskId: string) => `/api/v1/downloads/held/management/${taskId}/retry`,
 		heldManagementDiscard: (taskId: string) =>
 			`/api/v1/downloads/held/management/${taskId}/discard`,
+		heldVerdictDiscard: (taskId: string) => `/api/v1/downloads/held/verdict/${taskId}/discard`,
 		heldAudio: (id: number) => `/api/v1/downloads/held/${id}/audio`,
 		reimport: (taskId: string) => `/api/v1/downloads/${taskId}/reimport`,
 		cutoffUnmet: () => '/api/v1/downloads/cutoff-unmet',
@@ -1107,3 +1125,7 @@ export const API = {
 		decades: () => '/api/v1/local/decades'
 	}
 } as const;
+
+// URL builder for the admin-only plugin UI bundle; kept beside API so the
+// Settings -> Plugins panel mount stays a pure URL (no fetching here).
+export const getPluginUiBundleUrl = (name: string): string => API.plugins.uiBundle(name);

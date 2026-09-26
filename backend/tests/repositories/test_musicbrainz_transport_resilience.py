@@ -1,4 +1,6 @@
 import asyncio
+import sqlite3
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
@@ -8,6 +10,7 @@ import pytest
 import infrastructure.http.brainzmash_transport as brainzmash_transport
 import infrastructure.resilience.retry as retry_module
 import repositories.musicbrainz_base as mb_base
+from infrastructure.persistence.mb_canonical_store import MbCanonicalStore
 from core.exceptions import (
     ConfigurationError,
     ExternalServiceError,
@@ -179,7 +182,7 @@ async def test_settings_probe_uses_isolated_client_path_and_telemetry(monkeypatc
     monkeypatch.setattr(
         mb_base,
         "record_provider_call",
-        lambda *args: calls.append(args),
+        lambda *args, **kwargs: calls.append(args),
     )
     monkeypatch.setattr(
         mb_base,
@@ -593,6 +596,153 @@ async def test_brainzmash_3xx_is_rejected_without_following_redirects(monkeypatc
 
     assert client.calls == 1
     assert limiter.acquire.await_count == client.calls
+
+
+class _RedirectClient:
+    def __init__(self, statuses: list[int], locations: list[str | None]) -> None:
+        self.statuses = list(statuses)
+        self.locations = list(locations)
+        self.urls: list[str] = []
+
+    async def get(self, url: str, params=None):
+        self.urls.append(url)
+        status = self.statuses.pop(0) if self.statuses else 200
+        headers = {}
+        location = self.locations.pop(0) if self.locations else None
+        if location is not None:
+            headers["location"] = location
+        return httpx.Response(
+            status,
+            json={"artist": []},
+            headers=headers,
+            request=httpx.Request("GET", url),
+        )
+
+
+def _brainzmash_source(source_id: str):
+    before = mb_base.capture_mb_source_context()
+    mb_base.set_mb_api_base(
+        brainzmash_transport.BRAINZMASH_ENDPOINT.rstrip("/"),
+        source_mode="brainzmash",
+        source_id=source_id,
+        generation=before.generation + 1,
+        brainzmash_binding_valid=True,
+    )
+    return before
+
+
+MERGED_RELEASE = "77a698a8-98da-401d-a59b-1ae4bc28df56"
+SURVIVING_RELEASE = "9cb4af06-32db-4985-9bb2-4f8793428869"
+
+
+def _instrument_before_dispatch(monkeypatch) -> list[int]:
+    dispatched: list[int] = []
+    real_before_dispatch = mb_base.mb_singleflight.Owner.before_dispatch
+
+    def counting_before_dispatch(self):
+        dispatched.append(1)
+        return real_before_dispatch(self)
+
+    monkeypatch.setattr(
+        mb_base.mb_singleflight.Owner, "before_dispatch", counting_before_dispatch
+    )
+    return dispatched
+
+
+@pytest.mark.asyncio
+async def test_brainzmash_follows_same_origin_merged_redirect(monkeypatch):
+    client = _RedirectClient(
+        [301, 200],
+        [f"https://api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}?fmt=json", None],
+    )
+    limiter = SimpleNamespace(acquire=AsyncMock())
+    dispatched = _instrument_before_dispatch(monkeypatch)
+    monkeypatch.setattr(mb_base, "_brainzmash_http_client", client)
+    monkeypatch.setattr(mb_base, "brainzmash_rate_limiter", limiter)
+    before = _brainzmash_source("brainzmash-redirect-follow")
+    try:
+        assert await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}") == {"artist": []}
+    finally:
+        _restore_source(before)
+
+    assert client.urls == [
+        f"https://api.brainzmash.cc/ws/2/release/{MERGED_RELEASE}",
+        f"https://api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}",
+    ]
+    assert limiter.acquire.await_count == 2
+    assert len(dispatched) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location",
+    [
+        f"/ws/2/release/{SURVIVING_RELEASE}",
+        f"//api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}",
+    ],
+)
+async def test_brainzmash_resolves_relative_redirect_locations(monkeypatch, location):
+    client = _RedirectClient([301, 200], [location, None])
+    limiter = SimpleNamespace(acquire=AsyncMock())
+    dispatched = _instrument_before_dispatch(monkeypatch)
+    monkeypatch.setattr(mb_base, "_brainzmash_http_client", client)
+    monkeypatch.setattr(mb_base, "brainzmash_rate_limiter", limiter)
+    before = _brainzmash_source("brainzmash-redirect-relative")
+    try:
+        assert await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}") == {"artist": []}
+    finally:
+        _restore_source(before)
+
+    assert client.urls == [
+        f"https://api.brainzmash.cc/ws/2/release/{MERGED_RELEASE}",
+        f"https://api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}",
+    ]
+    assert limiter.acquire.await_count == 2
+    assert len(dispatched) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location",
+    [
+        f"https://evil.example/ws/2/release/{SURVIVING_RELEASE}",
+        f"http://api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}",
+        f"https://api.brainzmash.cc:8443/ws/2/release/{SURVIVING_RELEASE}",
+        f"https://api.brainzmash.cc/ws/2/{MERGED_RELEASE}",
+    ],
+)
+async def test_brainzmash_rejects_unsafe_redirect_targets(monkeypatch, location):
+    client = _RedirectClient([301, 200], [location, None])
+    limiter = SimpleNamespace(acquire=AsyncMock())
+    monkeypatch.setattr(mb_base, "_brainzmash_http_client", client)
+    monkeypatch.setattr(mb_base, "brainzmash_rate_limiter", limiter)
+    before = _brainzmash_source("brainzmash-redirect-reject")
+    try:
+        with pytest.raises(NonRetriableExternalServiceError, match="redirect rejected"):
+            await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}")
+    finally:
+        _restore_source(before)
+
+    assert len(client.urls) == 1
+    assert limiter.acquire.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_brainzmash_bounds_redirect_hops(monkeypatch):
+    location = f"https://api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}"
+    client = _RedirectClient([301] * 5, [location] * 5)
+    limiter = SimpleNamespace(acquire=AsyncMock())
+    monkeypatch.setattr(mb_base, "_brainzmash_http_client", client)
+    monkeypatch.setattr(mb_base, "brainzmash_rate_limiter", limiter)
+    before = _brainzmash_source("brainzmash-redirect-bound")
+    try:
+        with pytest.raises(NonRetriableExternalServiceError, match="redirect rejected"):
+            await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}")
+    finally:
+        _restore_source(before)
+
+    assert len(client.urls) == 1 + mb_base._BRAINZMASH_MAX_REDIRECTS
+    assert limiter.acquire.await_count == len(client.urls)
 
 
 @pytest.mark.asyncio
@@ -1035,3 +1185,297 @@ async def test_brainzmash_payload_error_is_source_only(monkeypatch):
     assert "secret" not in message
     assert "private-body" not in message
     assert "api.brainzmash.cc" not in message
+
+
+SECOND_RELEASE = "b9a3c4d5-6e7f-4890-a1b2-c3d4e5f60718"
+VARIOUS_ARTISTS = "89ad4ac3-39f7-470e-963a-56509c546377"
+
+
+@pytest.fixture
+def canonical_store(tmp_path, monkeypatch):
+    store = MbCanonicalStore(
+        db_path=tmp_path / "canonical.sqlite", write_lock=threading.Lock()
+    )
+    monkeypatch.setattr(mb_base, "_mb_canonical_store", store)
+    return store
+
+
+def _use_brainzmash_redirect_client(monkeypatch, statuses, locations, source_id):
+    client = _RedirectClient(statuses, locations)
+    limiter = SimpleNamespace(acquire=AsyncMock())
+    monkeypatch.setattr(mb_base, "_brainzmash_http_client", client)
+    monkeypatch.setattr(mb_base, "brainzmash_rate_limiter", limiter)
+    before = _brainzmash_source(source_id)
+    return client, limiter, before, mb_base.capture_mb_source_context()
+
+
+def _use_official_client(monkeypatch, client, source_id):
+    monkeypatch.setattr(mb_base, "_http_client", client)
+    before = mb_base.capture_mb_source_context()
+    mb_base.set_mb_api_base(
+        "https://musicbrainz.org/ws/2",
+        source_mode="official",
+        source_id=source_id,
+        generation=before.generation + 1,
+    )
+    return before, mb_base.capture_mb_source_context()
+
+
+def _canonical_row_count(store) -> int:
+    conn = sqlite3.connect(str(store.db_path))
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM canonical_redirect").fetchone()
+    finally:
+        conn.close()
+    return int(row[0])
+
+
+def _canonical_sources(store) -> list[str]:
+    conn = sqlite3.connect(str(store.db_path))
+    try:
+        rows = conn.execute("SELECT DISTINCT source FROM canonical_redirect").fetchall()
+    finally:
+        conn.close()
+    return sorted(str(row[0]) for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_brainzmash_redirect_hop_is_persisted(monkeypatch, canonical_store):
+    client, _limiter, before, ctx = _use_brainzmash_redirect_client(
+        monkeypatch,
+        [301, 200],
+        [
+            f"https://api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}?fmt=json",
+            None,
+        ],
+        "brainzmash-redirect-record",
+    )
+    try:
+        assert await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}") == {"artist": []}
+    finally:
+        _restore_source(before)
+
+    assert len(client.urls) == 2
+    assert await canonical_store.get_canonical_redirect(
+        "release", [MERGED_RELEASE], source_context=ctx
+    ) == {MERGED_RELEASE: SURVIVING_RELEASE}
+    assert _canonical_sources(canonical_store) == ["mb-redirect-follow"]
+    # Source-gated: a foreign generation reads nothing back.
+    foreign = mb_base.capture_mb_source_context()
+    assert await canonical_store.get_canonical_redirect(
+        "release", [MERGED_RELEASE], source_context=foreign
+    ) == {}
+
+
+@pytest.mark.asyncio
+async def test_brainzmash_redirect_chain_persists_every_hop(
+    monkeypatch, canonical_store
+):
+    client, _limiter, before, ctx = _use_brainzmash_redirect_client(
+        monkeypatch,
+        [301, 301, 200],
+        [
+            f"https://api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}",
+            f"https://api.brainzmash.cc/ws/2/release/{SECOND_RELEASE}",
+            None,
+        ],
+        "brainzmash-redirect-chain",
+    )
+    try:
+        assert await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}") == {"artist": []}
+    finally:
+        _restore_source(before)
+
+    assert len(client.urls) == 3
+    assert await canonical_store.get_canonical_redirect(
+        "release", [MERGED_RELEASE, SURVIVING_RELEASE], source_context=ctx
+    ) == {
+        MERGED_RELEASE: SURVIVING_RELEASE,
+        SURVIVING_RELEASE: SECOND_RELEASE,
+    }
+
+
+@pytest.mark.asyncio
+async def test_brainzmash_redirect_to_404_persists_hop_and_returns_empty(
+    monkeypatch, canonical_store
+):
+    client, _limiter, before, ctx = _use_brainzmash_redirect_client(
+        monkeypatch,
+        [301, 404],
+        [f"https://api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}", None],
+        "brainzmash-redirect-404",
+    )
+    try:
+        assert await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}") == {}
+    finally:
+        _restore_source(before)
+
+    assert len(client.urls) == 2
+    assert await canonical_store.get_canonical_redirect(
+        "release", [MERGED_RELEASE], source_context=ctx
+    ) == {MERGED_RELEASE: SURVIVING_RELEASE}
+
+
+@pytest.mark.asyncio
+async def test_brainzmash_redirect_budget_exhaustion_still_persists_followed_hops(
+    monkeypatch, canonical_store
+):
+    client, _limiter, before, ctx = _use_brainzmash_redirect_client(
+        monkeypatch,
+        [301, 301, 301],
+        [
+            f"https://api.brainzmash.cc/ws/2/release/{SURVIVING_RELEASE}",
+            f"https://api.brainzmash.cc/ws/2/release/{SECOND_RELEASE}",
+            f"https://api.brainzmash.cc/ws/2/release/{MERGED_RELEASE}",
+        ],
+        "brainzmash-redirect-budget",
+    )
+    try:
+        with pytest.raises(NonRetriableExternalServiceError, match="redirect rejected"):
+            await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}")
+    finally:
+        _restore_source(before)
+
+    assert len(client.urls) == 1 + mb_base._BRAINZMASH_MAX_REDIRECTS
+    assert await canonical_store.get_canonical_redirect(
+        "release", [MERGED_RELEASE, SURVIVING_RELEASE], source_context=ctx
+    ) == {
+        MERGED_RELEASE: SURVIVING_RELEASE,
+        SURVIVING_RELEASE: SECOND_RELEASE,
+    }
+    # The unfollowed terminal hop is not evidence: nothing maps out of it.
+    assert await canonical_store.get_canonical_redirect(
+        "release", [SECOND_RELEASE], source_context=ctx
+    ) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relative", [False, True])
+async def test_official_301_raises_non_retriable_and_persists_mapping(
+    monkeypatch, canonical_store, relative
+):
+    location = (
+        f"/ws/2/release/{SURVIVING_RELEASE}"
+        if relative
+        else f"https://musicbrainz.org/ws/2/release/{SURVIVING_RELEASE}"
+    )
+    client = _RedirectClient([301], [location])
+    before, ctx = _use_official_client(
+        monkeypatch, client, "official-redirect-record"
+    )
+    try:
+        with pytest.raises(NonRetriableExternalServiceError, match="redirect") as raised:
+            await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}")
+    finally:
+        _restore_source(before)
+
+    assert type(raised.value) is NonRetriableExternalServiceError
+    assert len(client.urls) == 1
+    assert await canonical_store.get_canonical_redirect(
+        "release", [MERGED_RELEASE], source_context=ctx
+    ) == {MERGED_RELEASE: SURVIVING_RELEASE}
+
+
+@pytest.mark.asyncio
+async def test_official_400_is_single_attempt_non_retriable(
+    reset_musicbrainz_transport, monkeypatch
+) -> None:
+    client = _StatusClient(400)
+    before, _ctx = _use_official_client(monkeypatch, client, "official-400-test")
+    try:
+        with pytest.raises(NonRetriableExternalServiceError, match="rejected") as raised:
+            await mb_base.mb_api_get("/artist")
+    finally:
+        _restore_source(before)
+
+    assert type(raised.value) is NonRetriableExternalServiceError
+    assert client.calls == 1
+    assert mb_base.mb_circuit_breaker.failure_count == 1
+    retry_module.asyncio.sleep.assert_not_awaited()
+    reset_musicbrainz_transport.acquire.assert_awaited_once_with(
+        priority=int(RequestPriority.USER_INITIATED)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [502, 504])
+async def test_502_and_504_are_retried_within_budget(
+    reset_musicbrainz_transport, monkeypatch, status
+) -> None:
+    client = _StatusClient(status)
+    before, _ctx = _use_official_client(monkeypatch, client, f"official-{status}-test")
+    try:
+        with pytest.raises(ExternalServiceError) as raised:
+            await mb_base.mb_api_get("/artist")
+    finally:
+        _restore_source(before)
+
+    assert type(raised.value) is ExternalServiceError
+    assert 1 < client.calls <= 3
+    assert mb_base.mb_circuit_breaker.failure_count == 1
+
+
+@pytest.mark.asyncio
+async def test_redirect_with_non_mbid_location_persists_nothing(
+    monkeypatch, canonical_store
+):
+    client = _RedirectClient(
+        [301], ["https://musicbrainz.org/ws/2/release/0"]
+    )
+    before, _ctx = _use_official_client(
+        monkeypatch, client, "official-redirect-non-mbid"
+    )
+    try:
+        with pytest.raises(NonRetriableExternalServiceError, match="redirect"):
+            await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}")
+    finally:
+        _restore_source(before)
+
+    assert len(client.urls) == 1
+    assert _canonical_row_count(canonical_store) == 0
+
+
+@pytest.mark.asyncio
+async def test_browse_path_301_is_not_persisted(monkeypatch, canonical_store):
+    client, _limiter, before, _ctx = _use_brainzmash_redirect_client(
+        monkeypatch,
+        [301, 200],
+        [f"https://api.brainzmash.cc/ws/2/release-group/{SURVIVING_RELEASE}", None],
+        "brainzmash-browse-redirect-skip",
+    )
+    try:
+        result = await mb_base.mb_api_get(
+            "/release-group", params={"artist": VARIOUS_ARTISTS}
+        )
+    finally:
+        _restore_source(before)
+
+    assert result == {"artist": []}
+    assert len(client.urls) == 2
+    assert _canonical_row_count(canonical_store) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location",
+    [
+        "not a url",
+        f"https://evil.example/ws/2/release/{SURVIVING_RELEASE}",
+        None,
+    ],
+)
+async def test_official_garbage_location_persists_nothing(
+    monkeypatch, canonical_store, location
+):
+    client = _RedirectClient([301], [location])
+    before, _ctx = _use_official_client(
+        monkeypatch, client, "official-redirect-garbage"
+    )
+    try:
+        with pytest.raises(NonRetriableExternalServiceError, match="redirect"):
+            await mb_base.mb_api_get(f"/release/{MERGED_RELEASE}")
+    finally:
+        _restore_source(before)
+
+    assert len(client.urls) == 1
+    assert _canonical_row_count(canonical_store) == 0

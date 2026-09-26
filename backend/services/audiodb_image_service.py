@@ -5,6 +5,7 @@ import msgspec
 
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.cache.memory_cache import CacheInterface
+from infrastructure.observability.optional_work import OptionalWorkDeferred
 from repositories.audiodb_models import (
     AudioDBArtistImages,
     AudioDBAlbumImages,
@@ -133,6 +134,8 @@ class AudioDBImageService:
         if not cached_negative_mbid:
             try:
                 resp = await self._repo.get_artist_by_mbid(mbid)
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
                 logger.warning("audiodb.cache action=fetch_error entity_type=artist mbid=%s lookup_source=mbid", mbid, exc_info=True)
                 return None
@@ -157,6 +160,8 @@ class AudioDBImageService:
         if name and name.strip() and (is_monitored or settings.audiodb_name_search_fallback):
             try:
                 name_resp = await self._repo.search_artist_by_name(name.strip())
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
                 logger.warning("audiodb.cache action=fetch_error entity_type=artist mbid=%s lookup_source=name name=%s", mbid, name, exc_info=True)
                 return negative
@@ -215,6 +220,8 @@ class AudioDBImageService:
         if not cached_negative_mbid:
             try:
                 resp = await self._repo.get_album_by_mbid(mbid)
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
                 logger.warning("audiodb.cache action=fetch_error entity_type=album mbid=%s lookup_source=mbid", mbid, exc_info=True)
                 return None
@@ -246,6 +253,8 @@ class AudioDBImageService:
                 name_resp = await self._repo.search_album_by_name(
                     artist_name.strip(), album_name.strip()
                 )
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "audiodb.cache action=fetch_error entity_type=album mbid=%s lookup_source=name artist=%s album=%s",

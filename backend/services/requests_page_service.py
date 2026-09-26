@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import math
 import time as _time
+import uuid
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
@@ -56,6 +58,7 @@ class RequestsPageService:
         get_download_service: Optional[Callable[[], "DownloadService"]] = None,
         download_store=None,  # DownloadStore | None - native reconciler source of truth
         acquisition=None,  # noqa: ANN001 - AcquisitionDispatcher | None
+        plugin_host=None,  # noqa: ANN001 - PluginHost, optional (01b events)
     ):
         self._library_repo = library_repo
         self._request_history = request_history
@@ -68,8 +71,35 @@ class RequestsPageService:
         self._download_store = download_store
         # picks the download client or Free Music per approve/retry dispatch
         self._acquisition = acquisition
+        self._plugin_host = plugin_host
+        self._plugin_tasks: set[asyncio.Task] = set()
         self._library_mbids_cache: set[str] | None = None
         self._library_mbids_cache_time: float = 0
+
+    def _emit_request_fulfilled(
+        self, *, request_id: str, user_id: str | None, release_group_mbid: str
+    ) -> None:
+        host = getattr(self, "_plugin_host", None)
+        if host is None:
+            return
+        try:
+            from infrastructure.plugins.protocols import PluginEvent, RequestEvent
+
+            event = PluginEvent(
+                kind="request_fulfilled",
+                payload=RequestEvent(
+                    request_id=request_id,
+                    user_id=user_id or "",
+                    release_group_mbid=release_group_mbid,
+                    status="imported",
+                ),
+                causation_id=uuid.uuid4().hex,
+            )
+            task = asyncio.create_task(host.dispatch_event(event))
+            self._plugin_tasks.add(task)
+            task.add_done_callback(self._plugin_tasks.discard)
+        except Exception:  # noqa: BLE001 - events never break requests
+            pass
 
     async def get_active_requests(
         self,
@@ -276,6 +306,11 @@ class RequestsPageService:
                 kwargs["expected_generation"] = generation
             await self._request_history.async_update_status(
                 musicbrainz_id, "imported", **kwargs
+            )
+            self._emit_request_fulfilled(
+                request_id=musicbrainz_id,
+                user_id=getattr(record, "user_id", None),
+                release_group_mbid=musicbrainz_id if request_kind == "album" else getattr(record, "track_release_group_mbid", None) or "",
             )
         elif task_id is not None:
             kwargs = {"request_kind": request_kind}
@@ -597,6 +632,11 @@ class RequestsPageService:
                 kwargs["expected_generation"] = generation
             await self._request_history.async_update_status(
                 musicbrainz_id, "imported", **kwargs
+            )
+            self._emit_request_fulfilled(
+                request_id=musicbrainz_id,
+                user_id=getattr(record, "user_id", None),
+                release_group_mbid=musicbrainz_id if request_kind == "album" else getattr(record, "track_release_group_mbid", None) or "",
             )
         else:
             kwargs = {"request_kind": request_kind}

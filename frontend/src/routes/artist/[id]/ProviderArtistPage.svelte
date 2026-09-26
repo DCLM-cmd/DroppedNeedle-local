@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { ApiError } from '$lib/api/client';
+	import { useDiscoverActivity } from '$lib/queries/discover/DiscoverDemand.svelte';
 	import { colors } from '$lib/colors';
 	import ArtistHeaderSkeleton from '$lib/components/ArtistHeaderSkeleton.svelte';
 	import AlbumGridSkeleton from '$lib/components/AlbumGridSkeleton.svelte';
@@ -85,6 +86,45 @@
 		return linkedSources.includes('listenbrainz') ? 'listenbrainz' : 'lastfm';
 	});
 	const discoveryEnabled = $derived(connectionsSettled);
+	let albumsDemandEl = $state<HTMLElement>();
+	let songsDemandEl = $state<HTMLElement>();
+	let similarDemandEl = $state<HTMLElement>();
+	useDiscoverActivity(
+		() =>
+			discoveryEnabled
+				? {
+						feature: 'artist',
+						artist_mbid: data.artistId,
+						section: 'top_albums',
+						provider: resolvedSource
+					}
+				: null,
+		() => albumsDemandEl
+	);
+	useDiscoverActivity(
+		() =>
+			discoveryEnabled
+				? {
+						feature: 'artist',
+						artist_mbid: data.artistId,
+						section: 'top_songs',
+						provider: resolvedSource
+					}
+				: null,
+		() => songsDemandEl
+	);
+	useDiscoverActivity(
+		() =>
+			discoveryEnabled
+				? {
+						feature: 'artist',
+						artist_mbid: data.artistId,
+						section: 'similar',
+						provider: resolvedSource
+					}
+				: null,
+		() => similarDemandEl
+	);
 
 	$effect(() => {
 		if (!connectionsUsable || linkedSources.length === 0) return;
@@ -423,7 +463,7 @@
 				{/if}
 
 				<div class="flex flex-col md:flex-row gap-6 md:items-stretch">
-					<div class="flex-1 min-w-0">
+					<div bind:this={albumsDemandEl} class="flex-1 min-w-0">
 						<TopAlbumsList
 							albums={topAlbums?.albums || []}
 							loading={loadingTopAlbums}
@@ -435,7 +475,7 @@
 						class="shrink-0 bg-base-content/25 h-px w-full md:w-px md:h-auto md:self-stretch"
 						aria-hidden="true"
 					></div>
-					<div class="flex-1 min-w-0">
+					<div bind:this={songsDemandEl} class="flex-1 min-w-0">
 						<TopSongsList
 							songs={topSongs?.songs || []}
 							loading={loadingTopSongs}
@@ -445,7 +485,7 @@
 					</div>
 				</div>
 
-				<section id="section-similar" class="mt-8 scroll-mt-24">
+				<section bind:this={similarDemandEl} id="section-similar" class="mt-8 scroll-mt-24">
 					<SimilarArtistsCarousel
 						artists={similarArtists?.similar_artists || []}
 						loading={loadingSimilar}

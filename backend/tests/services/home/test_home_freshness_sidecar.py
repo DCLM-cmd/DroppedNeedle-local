@@ -18,6 +18,8 @@ from api.v1.schemas.settings import (
     PrimaryMusicSourceSettings,
 )
 from services.home_service import HomeService
+from infrastructure.observability.optional_work import OptionalWorkDeferred
+from api.v1.schemas.home import HomeResponse
 
 
 def _make_prefs(
@@ -199,12 +201,12 @@ async def test_warm_failure_then_success_updates_sidecar_ok_flag():
     built_key = service._home_built_sidecar_key(key)
 
     service._build_full = AsyncMock(side_effect=RuntimeError("cold failure"))
-    await service.warm_cache("u1")
+    assert await service.warm_cache("u1") is False
     assert store[built_key]["ok"] is False
 
     fast = await service._build_fast("u1", music, refreshing=False)
     service._build_full = AsyncMock(return_value=fast)  # type: ignore[method-assign]
-    await service.warm_cache("u1")
+    assert await service.warm_cache("u1") is True
     assert store[built_key]["ok"] is True
 
 
@@ -221,3 +223,29 @@ async def test_concurrent_cold_polls_coalesce_into_one_leader():
     assert len({id(result) for result in results}) == 1
     assert triggered == ["u1"]
     lb_repo.get_sitewide_top_artists.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deferred_home_refresh_keeps_payload_and_success_sidecar():
+    service, _lb_repo, store = _make_service()
+    music = await service._resolve_user_music("u1", None)
+    key = service._get_home_cache_key("u1", music.lb_enabled, music.lfm_enabled)
+    built_key = service._home_built_sidecar_key(key)
+    good = HomeResponse(integration_status=service.get_integration_status())
+    previous = {"at": 123.0, "ok": True}
+    store[key] = good
+    store[built_key] = previous
+    service._build_full = AsyncMock(side_effect=OptionalWorkDeferred())
+    with pytest.raises(OptionalWorkDeferred):
+        await service.warm_cache("u1")
+    assert store[key] is good
+    assert store[built_key] is previous
+    assert "u1" not in service._building
+
+
+@pytest.mark.asyncio
+async def test_home_executor_does_not_fold_deferred_into_empty_results():
+    service, _lb_repo, _store = _make_service()
+    deferred = AsyncMock(side_effect=OptionalWorkDeferred())
+    with pytest.raises(OptionalWorkDeferred):
+        await service._helpers.execute_tasks({"lb_trending": deferred()})

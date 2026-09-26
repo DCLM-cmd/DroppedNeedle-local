@@ -4,7 +4,6 @@
 from fastapi import FastAPI, HTTPException
 
 from api.v1.routes import system as system_routes
-from infrastructure.cache.cache_metrics import WindowedCounterMap
 from infrastructure.observability import provider_counters
 from infrastructure.observability.provider_counters import RateLimitGauge
 from repositories.musicbrainz_base import MbSourceContext
@@ -66,7 +65,7 @@ class TestProviderStatsAuthMatrix:
         assert response.status_code == 403
 
     def test_admin_gets_envelope_shape(self, monkeypatch):
-        monkeypatch.setattr(provider_counters, "_counters", WindowedCounterMap())
+        monkeypatch.setattr(provider_counters, "_counters", provider_counters.ProviderCounterMap())
         monkeypatch.setattr(provider_counters, "_rate_limit_gauge", RateLimitGauge())
 
         response = build_test_client(_app(mock_admin_user)).get(
@@ -115,9 +114,10 @@ class TestProviderStatsAuthMatrix:
 
 class TestProviderStatsRows:
     def test_rows_render_recorded_calls(self, monkeypatch):
-        fresh = WindowedCounterMap()
-        fresh.increment(("listenbrainz", "unlaned", "ok"), 12)
+        fresh = provider_counters.ProviderCounterMap()
         monkeypatch.setattr(provider_counters, "_counters", fresh)
+        for _ in range(12):
+            provider_counters.record_provider_call("listenbrainz", None, 200)
 
         response = build_test_client(_app(mock_admin_user)).get(
             "/system/provider-stats"
@@ -132,11 +132,12 @@ class TestProviderStatsRows:
                 "outcome": "ok",
                 "count_total": 12,
                 "rate_per_min_window": round(12 / 60, 2),
+                "unknown_body_attempts_total": 12,
             }
         ]
 
     def test_admin_gets_source_dimensions_on_musicbrainz_rows(self, monkeypatch):
-        fresh = WindowedCounterMap()
+        fresh = provider_counters.ProviderCounterMap()
         monkeypatch.setattr(provider_counters, "_counters", fresh)
         provider_counters.record_provider_call(
             "musicbrainz",
@@ -165,5 +166,6 @@ class TestProviderStatsRows:
                 "source_mode": "mirror",
                 "source_id": "mirror-4",
                 "source_generation": 4,
+                "unknown_body_attempts_total": 1,
             }
         ]

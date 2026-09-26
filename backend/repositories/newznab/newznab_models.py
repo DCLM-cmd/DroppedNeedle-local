@@ -61,8 +61,10 @@ class NewznabCaps(AppStruct):
 
 class NewznabApiLimits(AppStruct):
     """``<newznab:apilimits>`` from a search response - the indexer's daily usage
-    counters (DrunkenSlug emits ``apiCurrent``/``grabCurrent``). Used to back off
-    before hitting a free tier's daily cap. ``*_max`` are often absent."""
+    counters (DrunkenSlug emits ``apiCurrent``/``grabCurrent``). Parsed and
+    returned but not currently consumed for proactive backoff (``*_max`` are
+    often absent, so no reliable threshold exists); the enforced mechanism is
+    the 429 / "limit reached" backoff in ``NewznabIndexer._search_one``."""
 
     api_current: int | None = None
     api_max: int | None = None

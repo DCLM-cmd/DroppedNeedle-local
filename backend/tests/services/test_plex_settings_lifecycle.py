@@ -19,10 +19,8 @@ def _make_settings_service() -> tuple[SettingsService, MagicMock, MagicMock]:
     cache.clear_prefix = AsyncMock()
     prefs = MagicMock()
 
-    service = SettingsService(
-        preferences_service=prefs,
-        cache=cache,
-    )
+    service = SettingsService(preferences_service=prefs,
+    cache=cache, mb_response_store=AsyncMock(), follow_store=AsyncMock())
     return service, cache, prefs
 
 

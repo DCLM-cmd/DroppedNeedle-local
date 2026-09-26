@@ -54,6 +54,14 @@ def get_library_repository() -> "LibraryRepositoryProtocol":
 @singleton
 def get_musicbrainz_repository() -> "MusicBrainzRepository":
     from repositories.musicbrainz_repository import MusicBrainzRepository
+    from repositories.musicbrainz_base import (
+        set_mb_canonical_store,
+        set_mb_response_store,
+    )
+    from .cache_providers import get_mb_response_store
+
+    set_mb_response_store(get_mb_response_store())
+    set_mb_canonical_store(get_mb_canonical_store())
 
     cache = get_cache()
     preferences_service = get_preferences_service()
@@ -265,6 +273,7 @@ def get_youtube_repo() -> "YouTubeRepository":
         http_client=http_client,
         api_key=api_key,
         daily_quota_limit=yt_settings.daily_quota_limit,
+        settings_getter=preferences_service.get_youtube_connection,
     )
 
 
@@ -725,6 +734,53 @@ def build_newznab_client(url: str, api_key: str) -> "NewznabClient":
         name="newznab-verify", timeout=30.0, connect_timeout=5.0
     )
     return NewznabClient(http, url, api_key, indexer_name=url)
+
+
+# Audio categories sent on Prowlarr searches (the single connection carries no
+# per-row categories). Mirrors the NewznabIndexerSettings default
+# ([3000, 3010, 3040]); category acceptance verified live on Prowlarr 2.3.5.5327.
+_PROWLARR_DEFAULT_CATEGORIES = [3000, 3010, 3040]
+
+
+@singleton
+def get_prowlarr_indexer() -> "ProwlarrIndexer":
+    """The Prowlarr search member: one ``IndexerProtocol`` over the single
+    configured Prowlarr connection. Unconfigured (no client) until the admin
+    saves a connection; pooled only when the ``usenet_search_backend`` selector
+    picks ``"prowlarr"`` (see ``_build_usenet_indexer``)."""
+    from repositories.prowlarr.prowlarr_client import ProwlarrClient
+    from repositories.prowlarr.prowlarr_indexer import ProwlarrIndexer
+
+    prefs = get_preferences_service()
+    raw = prefs.get_prowlarr_connection_raw()
+    if not (raw.enabled and raw.url and raw.api_key):
+        return ProwlarrIndexer(None, enabled=False)
+    http = HttpClientFactory.get_client(
+        name="prowlarr", timeout=30.0, connect_timeout=5.0
+    )
+    client = ProwlarrClient(http, raw.url, raw.api_key)
+    # Same TTL discipline as Newznab (below the auto-retry interval) so a
+    # delayed re-search re-hits instead of serving a stale result.
+    retry_interval_s = (
+        prefs.get_download_policy().auto_retry_base_interval_minutes * 60.0
+    )
+    search_cache_ttl = max(30.0, min(300.0, retry_interval_s * 0.5))
+    return ProwlarrIndexer(
+        client,
+        categories=list(_PROWLARR_DEFAULT_CATEGORIES),
+        search_cache_ttl=search_cache_ttl,
+    )
+
+
+def build_prowlarr_client(url: str, api_key: str) -> "ProwlarrClient":
+    """Transient (not cached) client from caller-supplied credentials, for the
+    Prowlarr Test-connection route - validates what the admin typed before saving."""
+    from repositories.prowlarr.prowlarr_client import ProwlarrClient
+
+    http = HttpClientFactory.get_client(
+        name="prowlarr-verify", timeout=30.0, connect_timeout=5.0
+    )
+    return ProwlarrClient(http, url, api_key, indexer_name=url)
 
 def build_slskd_repository(url: str, api_key: str) -> "SlskdRepository":
     """Transient (not cached) repo from caller-supplied credentials.

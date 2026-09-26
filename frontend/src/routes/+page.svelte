@@ -27,6 +27,9 @@
 	import HomeEntryCards from '$lib/components/HomeEntryCards.svelte';
 	import DiscoverTeaserBand from '$lib/components/discover/DiscoverTeaserBand.svelte';
 	import { getHomeQuery } from '$lib/queries/HomeQuery.svelte';
+	import { useDiscoverActivity } from '$lib/queries/discover/DiscoverDemand.svelte';
+
+	useDiscoverActivity(() => ({ feature: 'home' }));
 
 	const homeQuery = getHomeQuery();
 	const homeData = $derived(homeQuery.data);

@@ -33,6 +33,13 @@ class ProviderStatRow(AppStruct, omit_defaults=True):
     source_mode: str | None = None
     source_id: str | None = None
     source_generation: int | None = None
+    request_category: str = "other"
+    include_profile: str = "other"
+    workload: str = "other"
+    downloaded_body_bytes_total: int = 0
+    decoded_body_bytes_total: int = 0
+    unknown_body_attempts_total: int = 0
+    overflow: bool = False
 
 
 class ProviderRateLimitStat(AppStruct):
@@ -55,3 +62,6 @@ class ProviderStatsResponse(AppStruct):
     window_seconds: int = 3600
     counters_since: int | None = None
     rate_limits: list[ProviderRateLimitStat] = []
+    body_byte_scope: str = "HTTP response bodies; excludes headers and TLS"
+    detailed_series_limit: int = 1024
+    process_epoch: str = ""

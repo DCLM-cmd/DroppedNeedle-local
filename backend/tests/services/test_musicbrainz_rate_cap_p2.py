@@ -93,7 +93,11 @@ class TestLimiterSentinelBypass:
         acquire_spy = AsyncMock(wraps=mb_rate_limiter.acquire)
         monkeypatch.setattr(mb_rate_limiter, "acquire", acquire_spy)
         payload = SimpleNamespace(
-            status_code=200, content=b"{}", json=lambda: {}, headers={}
+            status_code=200,
+            content=b"{}",
+            json=lambda: {},
+            headers={},
+            num_bytes_downloaded=2,
         )
         client = SimpleNamespace(get=AsyncMock(return_value=payload))
         monkeypatch.setattr(mb_base, "_http_client", client)
@@ -144,6 +148,8 @@ class TestOnSettingsChangedSentinel:
 
         service = SettingsService.__new__(SettingsService)
         service._disk_cache = None
+        service._mb_response_store = AsyncMock()
+        service._follow_store = AsyncMock()
         return service
 
     @pytest.fixture(autouse=True)

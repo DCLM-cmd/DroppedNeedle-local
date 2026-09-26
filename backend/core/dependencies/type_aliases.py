@@ -124,6 +124,7 @@ from services.scrobble_service import ScrobbleService
 from services.cache_status_service import CacheStatusService
 from services.version_service import VersionService
 from services.home.cached_local_artwork_service import CachedLocalArtworkService
+from services.plugin_sources import PluginSourceRegistry
 
 from .cache_providers import (
     get_cache,
@@ -218,6 +219,8 @@ from .service_providers import (
     get_plex_library_service,
     get_plex_playback_service,
     get_version_service,
+    get_plugin_host,
+    get_plugin_source_registry,
 )
 from .compat_providers import get_native_lyrics_service
 
@@ -443,3 +446,6 @@ PlexPlaybackServiceDep = Annotated[
 CacheStatusServiceDep = Annotated[CacheStatusService, Depends(get_cache_status_service)]
 GitHubRepositoryDep = Annotated[GitHubRepository, Depends(get_github_repository)]
 VersionServiceDep = Annotated[VersionService, Depends(get_version_service)]
+PluginSourceRegistryDep = Annotated[
+    PluginSourceRegistry, Depends(get_plugin_source_registry)
+]

@@ -200,7 +200,8 @@ export interface IdentificationControlResponse {
 	row_revision: number;
 }
 
-export type ReviewState = 'needs_review' | 'edition_to_confirm' | 'keep_tagged' | 'excluded' | 'resolved';
+export type ReviewState =
+	'needs_review' | 'edition_to_confirm' | 'keep_tagged' | 'excluded' | 'resolved';
 
 export const EDITION_UNCERTAIN_REASON = 'EDITION_UNCERTAIN';
 
@@ -248,6 +249,7 @@ export interface ReviewListResponse {
 	counts_by_state: Record<string, number>;
 	counts_by_reason: Record<string, number>;
 	counts_by_reason_filtered?: Record<string, number>;
+	counts_by_state_filtered?: Record<string, number>;
 	catalog_revision: number;
 }
 
@@ -380,14 +382,7 @@ export interface BulkReviewPreviewResponse {
 }
 
 export type OperationState =
-	| 'queued'
-	| 'running'
-	| 'paused'
-	| 'ready'
-	| 'succeeded'
-	| 'failed'
-	| 'cancelled'
-	| 'stopped';
+	'queued' | 'running' | 'paused' | 'ready' | 'succeeded' | 'failed' | 'cancelled' | 'stopped';
 
 export interface OperationWorkResult {
 	ordinal: number;

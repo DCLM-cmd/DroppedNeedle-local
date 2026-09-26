@@ -363,3 +363,134 @@ async def test_lastfm_open_breaker_marks_source_deferred() -> None:
     assert projection.names == ("Existing Genre",)
     assert projection.preserved_existing is True
     assert projection.deferred_sources == ("lastfm",)
+
+
+@pytest.mark.asyncio
+async def test_listenbrainz_throttled_falls_back_to_existing_over_degraded_musicbrainz() -> (
+    None
+):
+    # Pre-fix behavior: the degraded musicbrainz-only selection was returned
+    # (names == ("rock",) with preserved_existing False) while still reporting
+    # deferred_sources == ("listenbrainz",), so previews showed local
+    # MusicBrainz tags only with a warning on every item.
+    listenbrainz = AsyncMock()
+    listenbrainz.get_release_group_genres_batch.side_effect = RateLimitedError(
+        "429 throttled"
+    )
+    release = _release(
+        release_genres=(
+            CanonicalGenre(display_name="Rock", provider_entity="release", count=3),
+        )
+    )
+    settings = GenreManagementSettings(
+        sources=["musicbrainz", "listenbrainz"],
+        mode="replace",
+        maximum_count=2,
+    )
+    projection = await GenreProjectionService(
+        GenreNormalizer(), listenbrainz=listenbrainz
+    ).project(
+        settings=settings,
+        canonical_release=release,
+        existing_genres=["Existing Genre A", "Existing Genre B", "Existing Genre C"],
+    )
+    assert projection.names == ("Existing Genre A", "Existing Genre B")
+    assert projection.preserved_existing is True
+    assert projection.deferred_sources == ("listenbrainz",)
+
+
+@pytest.mark.asyncio
+async def test_deferred_musicbrainz_only_selection_in_merge_keeps_merged_genres() -> (
+    None
+):
+    # The upstream-defer existing-tag fallback is replace-mode only: merge
+    # still returns the degraded musicbrainz selection with existing tags
+    # appended (capped), instead of falling back to existing tags alone.
+    listenbrainz = AsyncMock()
+    listenbrainz.get_release_group_genres_batch.side_effect = RateLimitedError(
+        "429 throttled"
+    )
+    release = _release(
+        release_genres=(
+            CanonicalGenre(display_name="Rock", provider_entity="release", count=3),
+        )
+    )
+    settings = GenreManagementSettings(
+        sources=["musicbrainz", "listenbrainz"],
+        mode="merge",
+        maximum_count=2,
+    )
+    projection = await GenreProjectionService(
+        GenreNormalizer(), listenbrainz=listenbrainz
+    ).project(
+        settings=settings,
+        canonical_release=release,
+        existing_genres=["Existing Genre A", "Existing Genre B", "Existing Genre C"],
+    )
+    assert projection.names == ("rock", "Existing Genre A")
+    assert projection.preserved_existing is False
+    assert projection.deferred_sources == ("listenbrainz",)
+
+
+@pytest.mark.asyncio
+async def test_deferred_with_surviving_remote_enrichment_keeps_merged_selection() -> (
+    None
+):
+    # Pre-fix behavior: identical (no fallback). When a healthy remote source
+    # still contributes, the merged selection is kept even though another
+    # remote source deferred. This pins the "only musicbrainz" boundary.
+    listenbrainz = AsyncMock()
+    listenbrainz.get_release_group_genres_batch.side_effect = RateLimitedError(
+        "429 throttled"
+    )
+    lastfm = AsyncMock()
+    lastfm.get_album_top_genres.return_value = (
+        _lastfm_candidate("Rock", 100, "album"),
+    )
+    lastfm.get_artist_top_genres.return_value = ()
+    release = _release(
+        release_genres=(
+            CanonicalGenre(
+                display_name="Classical", provider_entity="release", count=3
+            ),
+        )
+    )
+    settings = GenreManagementSettings(
+        sources=["musicbrainz", "listenbrainz", "lastfm"], mode="replace"
+    )
+    projection = await GenreProjectionService(
+        GenreNormalizer(), listenbrainz=listenbrainz, lastfm=lastfm
+    ).project(
+        settings=settings,
+        canonical_release=release,
+        existing_genres=["Existing Genre"],
+    )
+    assert projection.names == ("classical", "rock")
+    assert projection.preserved_existing is False
+    assert projection.deferred_sources == ("listenbrainz",)
+
+
+@pytest.mark.asyncio
+async def test_all_remote_deferred_without_existing_tags_returns_empty() -> None:
+    # Pre-fix behavior: identical. With no existing file tags there is nothing
+    # to fall back to, so the selection stays empty and deferral is reported.
+    listenbrainz = AsyncMock()
+    listenbrainz.get_release_group_genres_batch.side_effect = RateLimitedError(
+        "429 throttled"
+    )
+    lastfm = AsyncMock()
+    lastfm.get_album_top_genres.side_effect = ExternalServiceError("offline")
+    settings = GenreManagementSettings(
+        sources=["listenbrainz", "lastfm"], mode="replace"
+    )
+    projection = await GenreProjectionService(
+        GenreNormalizer(), listenbrainz=listenbrainz, lastfm=lastfm
+    ).project(
+        settings=settings,
+        canonical_release=_release(),
+        existing_genres=[],
+    )
+    assert projection.names == ()
+    assert projection.genres == ()
+    assert projection.preserved_existing is False
+    assert projection.deferred_sources == ("listenbrainz", "lastfm")

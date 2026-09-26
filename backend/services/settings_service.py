@@ -37,6 +37,8 @@ from infrastructure.cache.memory_cache import InMemoryCache, CacheInterface
 from infrastructure.http.client import get_http_client
 from repositories.jellyfin_models import JellyfinUser
 from models.release_type_policy import normalize_release_type_filters
+from infrastructure.persistence.follow_store import FollowStore
+from infrastructure.persistence.mb_response_store import MbResponseStore
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,8 @@ class SettingsService:
         preferences_service,
         cache: CacheInterface,
         *,
+        mb_response_store: MbResponseStore,
+        follow_store: FollowStore,
         navidrome_library_getter=None,
         plex_library_getter=None,
         discovery_snapshot_store=None,
@@ -98,6 +102,8 @@ class SettingsService:
         self._plex_library_getter = plex_library_getter
         self._discovery_snapshot_store = discovery_snapshot_store
         self._disk_cache = disk_cache
+        self._mb_response_store = mb_response_store
+        self._follow_store = follow_store
         self._musicbrainz_coordinator_lock = asyncio.Lock()
 
     async def verify_jellyfin(
@@ -207,6 +213,7 @@ class SettingsService:
         from services.search_service import SearchService
 
         SearchService.clear_cached_results()
+        await self._follow_store.enqueue_due_all()
         logger.info("Preference types changed; search cache flushed (no prefix sweeps)")
         return 0
 
@@ -952,6 +959,8 @@ class SettingsService:
                 # clear leaves all live source/transport state untouched, so
                 # retrying the persisted settings remains actionable. Control
                 # changes intentionally retain provider results.
+                await self._mb_response_store.clear()
+                await self._follow_store.enqueue_due_all()
                 for prefix in musicbrainz_prefixes():
                     total += await self._cache.clear_prefix(prefix)
                 if self._disk_cache is not None:

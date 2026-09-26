@@ -14,6 +14,7 @@ import pytest
 
 from core.exceptions import ConfigurationError, ExternalServiceError
 from infrastructure.queue.priority_queue import RequestPriority
+from infrastructure.cache.memory_cache import InMemoryCache
 import repositories.musicbrainz_base as mb_base
 from repositories.musicbrainz_album import (
     MusicBrainzAlbumMixin,
@@ -34,9 +35,7 @@ from repositories.musicbrainz_release_search_models import (
 
 class _Repo(MusicBrainzAlbumMixin):
     def __init__(self) -> None:
-        self._cache = AsyncMock()
-        self._cache.get = AsyncMock(return_value=None)
-        self._cache.set = AsyncMock()
+        self._cache = InMemoryCache()
         self._preferences_service = SimpleNamespace(
             get_advanced_settings=lambda: SimpleNamespace(cache_ttl_search=3600)
         )
@@ -177,7 +176,6 @@ async def test_release_edition_search_uses_dedicated_cache():
         AsyncMock(return_value=MbReleaseSearchResponse()),
     ):
         cached = await repo.search_release_editions("Album", "Artist")
-    repo._cache.get.return_value = cached
 
     with patch("repositories.musicbrainz_album.mb_api_get", AsyncMock()) as mock_get:
         repeated = await repo.search_release_editions("Album", "Artist")

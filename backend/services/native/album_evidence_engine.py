@@ -17,10 +17,19 @@ from models.identification import (
     IdentificationDecision,
     TrackEvidence,
 )
+from repositories.edition_policy import evidence_key
 from services.native.edition_suffix import strip_edition_suffix
 from services.native.local_album_grouper import _hungarian_min
+from services.native.match_scoring_core import (
+    WINNER_MARGIN_FLOOR,
+    LocalTrack,
+    MBTrack,
+    _ReleaseMeta,
+    _runner_up_supported,
+    score_release,
+)
 
-MATCHER_VERSION = "feedback-fixes-v2"
+MATCHER_VERSION = "quiet-reconfirm-v1"
 PAIR_COST_CEILING = 0.40
 ALBUM_DISTANCE_CEILING = 0.35
 CANDIDATE_MARGIN_FLOOR = 0.05
@@ -40,6 +49,25 @@ HARD_CONFLICT_KINDS = frozenset(
         "ambiguous_release_track_identity",
     }
 )
+# M-06: filename-parsed claims count at half strength. Pair and album costs
+# from `parsed` tracks are doubled, so exact parses still identify while
+# tag-vs-parsed ties always favor tags. Tuned per the 1.6 procedure (start
+# 0.5); pinned by `_PINNED_PARSED_DAMPENING` in
+# tests/services/native/test_album_evidence_engine.py.
+PARSED_DAMPENING = 0.5
+_PRESENT_PROVENANCE = ("tag", "parsed")
+
+
+def _dampen_parsed_cost(cost: float, provenance: str) -> float:
+    """Scale a `parsed` cost contribution by the dampening factor (2.0 is the
+    hard-conflict scale, so dampened costs never outrank a veto signal). The
+    minimum-uncertainty floor keeps even an exact parse weaker than an exact
+    tag, so tag-vs-parsed ties always favor tags."""
+    if provenance != "parsed":
+        return cost
+    return min(
+        2.0, max(cost / PARSED_DAMPENING, (1.0 - PARSED_DAMPENING) * 0.25)
+    )
 
 # P2 RG edition-uncertain tier (plan 6.1): consensus epsilon and score floor
 # for pinning a release GROUP while the exact edition stays unclaimed. The
@@ -112,9 +140,19 @@ def _pair(
         if local.recording_mbid != candidate.recording_mbid:
             return _Pair(2.0, True, ["recording_mbid_conflict"])
         identity_kinds.append("recording_mbid")
+    elif (
+        not local.recording_mbid
+        and local.fingerprint_recording_mbid
+        and candidate.recording_mbid
+        and local.fingerprint_recording_mbid == candidate.recording_mbid
+    ):
+        identity_kinds.append("fingerprint_recording_mbid")
     if identity_kinds:
         if (
-            "recording_mbid" in identity_kinds
+            (
+                "recording_mbid" in identity_kinds
+                or "fingerprint_recording_mbid" in identity_kinds
+            )
             and "release_track_mbid" not in identity_kinds
             and recording_occurrences > 1
         ):
@@ -137,6 +175,11 @@ def _descriptive_pair(
     local: GroupingTrack,
     candidate: CandidateTrack,
 ) -> _Pair:
+    if local.title_provenance in ("placeholder", "absent"):
+        # M-06: placeholder/absent titles abstain on descriptive grounds -
+        # never support, never contradict. (MBID identity in `_pair` above
+        # still applies: provider proof is independent of title strength.)
+        return _Pair(1.0, False, ["incomparable"])
     title_cost = _distance(local.title, candidate.title) if local.title else 1.0
     duration_difference = _duration_difference(local, candidate)
     if (
@@ -174,6 +217,7 @@ def _descriptive_pair(
         + 0.10 * position_cost
         + 0.05 * disc_cost
     )
+    cost = _dampen_parsed_cost(cost, local.title_provenance)
     sufficient = (
         (exact_title and "compatible_duration" in kinds)
         or (exact_title and "compatible_position" in kinds)
@@ -186,6 +230,94 @@ def _album_metadata_class(local: str, candidate: str) -> str:
     if not local.strip():
         return "unknown"
     return "supported" if _distance(local, candidate) <= 0.20 else "contradictory"
+
+
+# Quiet-reconfirm: collaboration separators for the artist subset rule below.
+# Word separators need boundaries so e.g. "Withers" never splits; single
+# characters split anywhere (they cannot appear inside a folded token).
+_ARTIST_WORD_SEPARATOR = re.compile(r"\b(?:feat|ft|featuring|with|vs)\b\.?", re.IGNORECASE)
+_ARTIST_CHAR_SEPARATORS = frozenset({";", "×", "&", "+", ",", "/"})
+# Authoritative per-track proof for the subset rule: embedded/stored MBIDs
+# only. Fingerprint agreement emits its own kind in _pair and stays
+# support-only, never authoritative proof.
+_IDENTITY_TRACK_KINDS = frozenset({"release_track_mbid", "recording_mbid"})
+
+
+def _artist_name_tokens(value: str) -> frozenset[str]:
+    """Split a credit string into folded artist tokens (empty set when blank)."""
+    cleaned = _ARTIST_WORD_SEPARATOR.sub(";", value)
+    tokens = set()
+    current: list[str] = []
+    for character in cleaned:
+        if character in _ARTIST_CHAR_SEPARATORS:
+            tokens.add(_fold("".join(current)))
+            current = []
+        else:
+            current.append(character)
+    tokens.add(_fold("".join(current)))
+    tokens.discard("")
+    return frozenset(tokens)
+
+
+def _artist_subset_match(local: str, candidate: str) -> bool:
+    """True when one credit's artist set contains the other's.
+
+    Catches "Bad Omens; Poppy" vs "Bad Omens" (and reversed/order variants)
+    while disjoint credits ("Tribute Band" vs "Michael Jackson") fail.
+    """
+    local_tokens = _artist_name_tokens(local)
+    candidate_tokens = _artist_name_tokens(candidate)
+    if not local_tokens or not candidate_tokens:
+        return False
+    return local_tokens <= candidate_tokens or candidate_tokens <= local_tokens
+
+
+def _has_full_track_mbid_proof(
+    track_evidence: list[TrackEvidence], local_tracks: list[GroupingTrack]
+) -> bool:
+    """True when every present-claim track is MBID-supported.
+
+    Present-claim-only like the other quorums: placeholder/absent tracks
+    abstain instead of failing the gate.
+    """
+    present = [
+        item
+        for item, track in zip(track_evidence, local_tracks, strict=True)
+        if track.title_provenance in _PRESENT_PROVENANCE
+    ]
+    if not present:
+        return False
+    return all(
+        item.classification == "supported"
+        and bool(_IDENTITY_TRACK_KINDS.intersection(item.evidence_kinds))
+        for item in present
+    )
+
+
+def _album_artist_class(
+    local: str,
+    candidate: str,
+    *,
+    track_evidence: list[TrackEvidence],
+    local_tracks: list[GroupingTrack],
+) -> str:
+    """Artist gate: hard distance check with a proof-gated subset escape.
+
+    The 0.20 veto stays for genuinely different artists (tribute/wrong-artist
+    noise). The escape fires only when the credits are subset-related AND
+    every present track already carries MBID proof of these tracks - the
+    provider proof outranks the credit-string difference. Recording-level
+    proof can match across editions of the same recordings; any residual
+    edition ambiguity is still policed by the margin and RG-tier rules.
+    """
+    base = _album_metadata_class(local, candidate)
+    if base != "contradictory":
+        return base
+    if not _artist_subset_match(local, candidate):
+        return "contradictory"
+    if not _has_full_track_mbid_proof(track_evidence, local_tracks):
+        return "contradictory"
+    return "supported"
 
 
 def _album_title_class(local: str, candidate: str) -> str:
@@ -205,19 +337,25 @@ def _otherwise_supported(
     local_tracks: list[GroupingTrack], evidence: CandidateEvidence
 ) -> bool:
     """True when evaluate_candidate() would have said SUPPORTED without the release-type gate."""
-    supported = sum(
-        item.classification == "supported" for item in evidence.track_evidence
-    )
-    comparable = sum(
-        item.classification != "unknown" for item in evidence.track_evidence
-    )
-    contradictions = sum(
-        item.classification == "contradictory" for item in evidence.track_evidence
-    )
-    unknown = len(evidence.track_evidence) - comparable
+    # M-06: the quorum counts present (`tag`/`parsed`) claims only -
+    # abstaining tracks are excluded from the totals, never misses.
+    present_ids = {
+        track.local_track_id
+        for track in local_tracks
+        if track.title_provenance in _PRESENT_PROVENANCE
+    }
+    items = [
+        item
+        for item in evidence.track_evidence
+        if item.local_track_id in present_ids
+    ]
+    supported = sum(item.classification == "supported" for item in items)
+    comparable = sum(item.classification != "unknown" for item in items)
+    contradictions = sum(item.classification == "contradictory" for item in items)
+    unknown = len(items) - comparable
     unknown_limit = (
         ORDINARY_UNKNOWN_LIMIT
-        if len(local_tracks) <= ORDINARY_ALBUM_MAX_FILES
+        if len(present_ids) <= ORDINARY_ALBUM_MAX_FILES
         else LARGE_UNKNOWN_LIMIT
     )
     return (
@@ -230,6 +368,34 @@ def _otherwise_supported(
         and supported == comparable
         and evidence.score >= 1.0 - ALBUM_DISTANCE_CEILING
     )
+
+def _lone_eligible_supported(
+    local_tracks: list[GroupingTrack], best: CandidateEvidence
+) -> bool:
+    """Step 2.6 (N-01) lone-eligible rule: a sole eligible candidate identifies
+    only on a present-claim quorum (>=2 present `tag`/`parsed` supporting
+    tracks) or non-descriptive proof (any local recording/release-track MBID,
+    the same bar as the 2.5 identify-gate `_has_non_descriptive_proof`).
+
+    `placeholder`/`absent` tracks never count toward the two: they abstain
+    from descriptive support, so a lone descriptive track plus stems must not
+    reach the margin-1.0 default identify below.
+    """
+    present_ids = {
+        track.local_track_id
+        for track in local_tracks
+        if track.title_provenance in _PRESENT_PROVENANCE
+    }
+    present_supported = sum(
+        1
+        for item in best.track_evidence
+        if item.classification == "supported"
+        and item.local_track_id in present_ids
+    )
+    if present_supported >= 2:
+        return True
+    return _has_local_track_mbid(local_tracks)
+
 
 def _near_miss_supported(
     *,
@@ -245,8 +411,9 @@ def _near_miss_supported(
     Only descriptive misses (e.g. no_acceptable_candidate_track from a guest
     suffix or edition bonus-track delta) qualify. Provider-proof conflicts
     (MBID/duration/ambiguous) never reach here: the caller keeps those on the
-    CONFLICTING_TRACK_EVIDENCE veto. Album title/artist stay hard gates so
-    tribute-album noise (wrong artist) still vetoes above.
+    CONFLICTING_TRACK_EVIDENCE veto. Album title stays a hard gate and the
+    artist gate keeps its proof-gated subset escape narrow, so tribute-album
+    noise (wrong artist) still vetoes above.
     """
     if title_class != "supported" or artist_class != "supported":
         return False
@@ -294,6 +461,102 @@ def is_edition_uncertain(decision: IdentificationDecision) -> bool:
         decision.outcome == "edition_uncertain"
         and decision.reason_code == EDITION_UNCERTAIN_REASON
     )
+
+
+# Step 2.3b (M-04 lane-A migration): thin scan adapter. Projects the scan
+# lane's GroupingTrack/CandidateTrack rows onto the shared core's
+# LocalTrack/MBTrack shapes so lane-A margin checks run on the same geometry
+# lane B scores (mirrors drop_import_service._to_local). Fields the scan lane
+# never carries (year) stay None and the core skips them; only the embedded
+# recording MBID projects (fingerprint MBIDs are support-only in lane A, never
+# authoritative proof, so the shared margin answers the descriptive question
+# both lanes price). Consumes the core - never restructures it.
+_VARIOUS_ARTIST_NAMES = frozenset({"various artists", "various", "va"})
+
+
+def _scan_track_to_core(track: GroupingTrack) -> LocalTrack:
+    return LocalTrack(
+        path=track.local_track_id,
+        title=track.title or "",
+        artist=track.artist_name or track.album_artist_name or "",
+        album=track.album_title or "",
+        track_number=track.track_number or 0,
+        disc_number=track.disc_number or 1,
+        duration_seconds=track.duration_seconds,
+        recording_mbid=track.recording_mbid,
+    )
+
+
+def _scan_release_year(release_date: str | None) -> int | None:
+    if not release_date:
+        return None
+    try:
+        prefix = release_date[:4]
+    except TypeError:
+        return None
+    if not isinstance(prefix, str) or len(prefix) != 4 or not prefix.isdigit():
+        return None
+    return int(prefix)
+
+
+def _scan_candidate_to_core(
+    local_tracks: list[GroupingTrack], candidate: AlbumCandidate
+) -> tuple[_ReleaseMeta, list[MBTrack]]:
+    artist = candidate.album_artist_name or ""
+    return _ReleaseMeta(
+        release_group_mbid=candidate.release_group_mbid,
+        release_mbid=candidate.release_mbid or "",
+        album_title=candidate.album_title or "",
+        artist=artist,
+        is_various=any(track.is_compilation for track in local_tracks)
+        or artist.strip().lower() in _VARIOUS_ARTIST_NAMES,
+        artist_mbid=candidate.artist_mbid,
+        year=_scan_release_year(candidate.release_date),
+        primary_type=(candidate.release_type or "").lower() or None,
+        secondary_types=frozenset(
+            secondary.lower() for secondary in candidate.secondary_types
+        ),
+    ), [
+        MBTrack(
+            title=track.title or "",
+            position=track.position or 0,
+            disc=track.disc_number or 1,
+            absolute_position=track.absolute_position or track.position or 0,
+            length_ms=int(track.duration_seconds * 1000)
+            if track.duration_seconds
+            else None,
+            recording_mbid=track.recording_mbid,
+            release_track_mbid=track.release_track_mbid,
+        )
+        for track in candidate.tracks
+    ]
+
+
+def _shared_margin_decisive(
+    local_tracks: list[GroupingTrack],
+    eligible: list[tuple[AlbumCandidate, CandidateEvidence]],
+) -> bool:
+    """The shared winner-margin rule over the scan-eligible set: the best core
+    distance wins outright only with an exclusive-below 0.05 gap AND every
+    runner-up mapped pair supported (title <= 0.35, pair <= 0.40 - the scan
+    lane's own pair-sufficiency values, so both lanes mean the same thing by
+    "supported"). Mirrors select_decisive_winner; the acceptance gate is
+    deliberately NOT reused here (SUPPORTED stays the lane-A gate) - only the
+    margin question is shared, which is what the lane-equivalence oracle pins.
+    """
+    locals_ = [_scan_track_to_core(track) for track in local_tracks]
+    scored = []
+    for candidate, _evidence in eligible:
+        meta, mb_tracks = _scan_candidate_to_core(local_tracks, candidate)
+        scored.append((meta, mb_tracks, score_release(locals_, mb_tracks, meta)))
+    scored.sort(key=lambda entry: entry[2].distance)
+    if len(scored) == 1:
+        return True
+    best = scored[0][2]
+    runner_tracks, runner = scored[1][1], scored[1][2]
+    if runner.distance - best.distance < WINNER_MARGIN_FLOOR:
+        return False
+    return _runner_up_supported(locals_, runner_tracks)
 
 
 class AlbumEvidenceEngine:
@@ -460,11 +723,23 @@ class AlbumEvidenceEngine:
                     )
                 )
                 continue
+            # M-06: contradiction requires two present claims. Title,
+            # track-number, and duration comparison need a present
+            # (`tag`/`parsed`) title; embedded MBIDs are provider proof and
+            # always count.
+            descriptive_present = (
+                local.title_provenance in _PRESENT_PROVENANCE
+            )
             comparable = bool(
                 local.recording_mbid
-                or local.title.strip()
-                or local.track_number > 0
-                or local.duration_seconds is not None
+                or (
+                    descriptive_present
+                    and (
+                        local.title.strip()
+                        or local.track_number > 0
+                        or local.duration_seconds is not None
+                    )
+                )
             )
             candidate_recordings = {
                 candidate_track.recording_mbid
@@ -559,29 +834,50 @@ class AlbumEvidenceEngine:
             for index, track in enumerate(candidate.tracks)
             if index not in used_candidates
         ]
-        album_title = next(
-            (track.album_title for track in local_tracks if track.album_title.strip()),
-            "",
-        )
-        album_artist = next(
+        # M-06: `placeholder`/`absent` album claims abstain from the
+        # first-non-blank selection, and the quorum below counts present
+        # claims only.
+        album_title, album_title_provenance = next(
             (
-                track.album_artist_name
+                (track.album_title, track.album_title_provenance)
+                for track in local_tracks
+                if track.album_title.strip()
+                and track.album_title_provenance in _PRESENT_PROVENANCE
+            ),
+            ("", "absent"),
+        )
+        album_artist, album_artist_provenance = next(
+            (
+                (track.album_artist_name, track.album_artist_provenance)
                 for track in local_tracks
                 if track.album_artist_name.strip()
+                and track.album_artist_provenance in _PRESENT_PROVENANCE
             ),
-            "",
+            ("", "absent"),
         )
         title_class = _album_title_class(album_title, candidate.album_title)
-        artist_class = _album_metadata_class(album_artist, candidate.album_artist_name)
-        supported = sum(item.classification == "supported" for item in track_evidence)
-        comparable = sum(item.classification != "unknown" for item in track_evidence)
-        contradictions = sum(
-            item.classification == "contradictory" for item in track_evidence
+        artist_class = _album_artist_class(
+            album_artist,
+            candidate.album_artist_name,
+            track_evidence=track_evidence,
+            local_tracks=local_tracks,
         )
-        unknown = len(track_evidence) - comparable
+        present_evidence = [
+            item
+            for item, track in zip(track_evidence, local_tracks, strict=True)
+            if track.title_provenance in _PRESENT_PROVENANCE
+        ]
+        supported = sum(item.classification == "supported" for item in present_evidence)
+        comparable = sum(
+            item.classification != "unknown" for item in present_evidence
+        )
+        contradictions = sum(
+            item.classification == "contradictory" for item in present_evidence
+        )
+        unknown = len(present_evidence) - comparable
         unknown_limit = (
             ORDINARY_UNKNOWN_LIMIT
-            if len(local_tracks) <= ORDINARY_ALBUM_MAX_FILES
+            if len(present_evidence) <= ORDINARY_ALBUM_MAX_FILES
             else LARGE_UNKNOWN_LIMIT
         )
         local_compilation = any(track.is_compilation for track in local_tracks)
@@ -603,10 +899,18 @@ class AlbumEvidenceEngine:
             )
         )
         album_costs = [
-            _distance(album_title, candidate.album_title) if album_title else 0.25,
-            _distance(album_artist, candidate.album_artist_name)
-            if album_artist
-            else 0.25,
+            _dampen_parsed_cost(
+                _distance(album_title, candidate.album_title)
+                if album_title
+                else 0.25,
+                album_title_provenance,
+            ),
+            _dampen_parsed_cost(
+                _distance(album_artist, candidate.album_artist_name)
+                if album_artist
+                else 0.25,
+                album_artist_provenance,
+            ),
         ]
         mean_pair_cost = sum(pair_costs) / len(pair_costs) if pair_costs else 1.0
         distance = 0.65 * mean_pair_cost + 0.20 * album_costs[0] + 0.15 * album_costs[1]
@@ -636,7 +940,7 @@ class AlbumEvidenceEngine:
                 artist_class=artist_class,
                 supported=supported,
                 soft_contradictions=soft_contradictions,
-                total=len(track_evidence),
+                total=len(present_evidence),
                 distance=distance,
             ):
                 reason = "SUPPORTED"
@@ -669,19 +973,28 @@ class AlbumEvidenceEngine:
         local_tracks: list[GroupingTrack],
         candidates: list[AlbumCandidate],
         full_recall: bool = False,
+        require_lone_quorum: bool = True,
     ) -> IdentificationDecision:
-        evidence = [
-            self.evaluate_candidate(local_tracks, candidate)
+        paired = [
+            (candidate, self.evaluate_candidate(local_tracks, candidate))
             for candidate in candidates[:MAX_CANDIDATES]
         ]
-        eligible = sorted(
-            (item for item in evidence if item.reason_code == "SUPPORTED"),
-            key=lambda item: (
-                -item.score,
-                item.release_group_mbid,
-                item.release_mbid or "",
+        evidence = [item for _, item in paired]
+        eligible_pairs = sorted(
+            (pair for pair in paired if pair[1].reason_code == "SUPPORTED"),
+            # Step 2.4 (E-01/E-04): the signed evidence-time order
+            # (score -> Official -> date -> XW -> MBID). Scored candidates
+            # carry no status/country, so those terms tie and date/MBID
+            # decide; margin/tier behavior below is unchanged.
+            key=lambda pair: evidence_key(
+                pair[1].score,
+                None,
+                pair[1].release_date,
+                None,
+                pair[1].release_mbid,
             ),
         )
+        eligible = [item for _, item in eligible_pairs]
         if not evidence:
             return IdentificationDecision(
                 outcome="no_candidate",
@@ -714,7 +1027,15 @@ class AlbumEvidenceEngine:
         best = eligible[0]
         margin = best.score - eligible[1].score if len(eligible) > 1 else 1.0
         best.margin = margin
-        if len(eligible) > 1 and margin < CANDIDATE_MARGIN_FLOOR:
+        # Step 2.3b (M-04): the shared margin adopts the core's winner rule
+        # (exclusive-below 0.05 floor + fully-supported runner-up) alongside
+        # the score margin, so both lanes refuse the same near-ties. The
+        # release-type gate and the RG-consensus tier below stay lane-A-only
+        # until proven in lane B - they are NOT ported to the shared core.
+        if len(eligible) > 1 and (
+            margin < CANDIDATE_MARGIN_FLOOR
+            or not _shared_margin_decisive(local_tracks, eligible_pairs)
+        ):
             tier = self._rg_consensus_tier(
                 local_tracks, evidence, candidates, full_recall=full_recall
             )
@@ -723,6 +1044,22 @@ class AlbumEvidenceEngine:
             return IdentificationDecision(
                 outcome="ambiguous",
                 reason_code="MULTIPLE_LIKELY_RELEASES",
+                candidates=evidence,
+            )
+        # Step 2.6 (N-01): the margin-1.0 default above is otherwise reachable
+        # by a single present-claim track, so a sole eligible candidate must
+        # additionally clear the lone-eligible quorum (present support or
+        # provider proof) or the album stays below quorum. Human-verified
+        # callers (contribution attachment) opt out: the curator supplies
+        # sufficiency and the engine keeps only contradiction detection.
+        if (
+            require_lone_quorum
+            and len(eligible) == 1
+            and not _lone_eligible_supported(local_tracks, best)
+        ):
+            return IdentificationDecision(
+                outcome="insufficient_evidence",
+                reason_code="INSUFFICIENT_METADATA",
                 candidates=evidence,
             )
         return IdentificationDecision(
@@ -763,10 +1100,16 @@ class AlbumEvidenceEngine:
             return None
         ranked = sorted(
             pool,
-            key=lambda item: (
-                -item.score,
-                item.release_group_mbid,
-                item.release_mbid or "",
+            # Step 2.4 (E-01/E-04): within-cohort ranking follows the signed
+            # evidence-time order (score -> Official -> date -> XW -> MBID).
+            # Group-pinning is untouched: pool, cohort membership, and the
+            # RG-unanimity/floor/full_recall rules below are unchanged.
+            key=lambda item: evidence_key(
+                item.score,
+                None,
+                item.release_date,
+                None,
+                item.release_mbid,
             ),
         )
         best = ranked[0]

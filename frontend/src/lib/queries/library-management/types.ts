@@ -380,6 +380,8 @@ export interface LibraryManagementPreviewDetailResponse {
 	expired: boolean;
 	stale: boolean;
 	stale_reasons: string[];
+	stale_input_count: number;
+	stale_sample_relative_paths: string[];
 	ready_for_confirmation: boolean;
 	operation_row_revision: number;
 	operation_event_revision: number;
@@ -444,6 +446,12 @@ export interface LibraryManagementActivationProof {
 	root_id: string;
 	job_id: string;
 	preview_token: string;
+}
+
+export interface LibraryManagementActivationHealthResponse {
+	stale_root_ids: string[];
+	blocked_root_ids: string[];
+	blocked_reason: string | null;
 }
 
 export interface LibraryManagementSettingsUpdateRequest {
@@ -662,6 +670,18 @@ export interface LibraryManagementRecoveryDiagnosticsResponse {
 	cleanup_pending_count: number;
 	oldest_updated_at: number | null;
 	state_counts: Record<string, number>;
+	needs_attention_bundles?: LibraryManagementNeedsAttentionBundle[];
+}
+
+export interface LibraryManagementNeedsAttentionBundle {
+	bundle_id: string;
+}
+
+export interface LibraryManagementImportBundleResolveResponse {
+	bundle_id: string;
+	state: string;
+	verified_files: number;
+	total_files: number;
 }
 
 export interface LibraryManagementHistoryParams {

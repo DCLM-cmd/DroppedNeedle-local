@@ -114,7 +114,8 @@ def app() -> FastAPI:
     application.dependency_overrides[get_preferences_service] = lambda: SimpleNamespace(
         get_download_policy=lambda: SimpleNamespace(
             quality_cutoff="lossless", upgrade_allowed=True
-        )
+        ),
+        is_library_download_allowed=lambda role: True,
     )
     return application
 
@@ -274,6 +275,41 @@ def test_album_detail_exposes_current_management_identity_readiness(
     assert response.json()["management_identity_readiness"] == (
         "track_mapping_required"
     )
+
+
+@pytest.mark.parametrize(
+    ("role", "allowed", "expected"),
+    [
+        ("user", True, True),
+        ("user", False, False),
+        ("admin", False, False),
+    ],
+)
+def test_album_detail_piggybacks_download_allowed(
+    app: FastAPI, role: str, allowed: bool, expected: bool
+) -> None:
+    override_user_auth(app, role=role)
+    native = app.dependency_overrides[get_target_native_library_service]()
+    native.album_detail.return_value = TargetNativeAlbumDetail(
+        id="album-1",
+        title="Album",
+        artist_name="Artist",
+        artist_id="artist-1",
+    )
+    seen: list[str] = []
+
+    def _check(caller_role: str) -> bool:
+        seen.append(caller_role)
+        return allowed
+
+    prefs = SimpleNamespace(is_library_download_allowed=_check)
+    app.dependency_overrides[get_preferences_service] = lambda: prefs
+
+    response = build_test_client(app).get("/library/albums/album-1")
+
+    assert response.status_code == 200
+    assert response.json()["download_allowed"] is expected
+    assert seen == [role]
 
 
 def test_admin_can_search_exact_releases_with_canonical_metadata(app: FastAPI) -> None:
@@ -647,6 +683,8 @@ def test_target_library_route_inventory_is_complete() -> None:
         ("POST", "/library/resolve-tracks"),
         ("GET", "/library/albums/{album_id}/tracks"),
         ("GET", "/library/albums/{album_id}/status"),
+        ("GET", "/library/albums/{local_album_id}/edition"),
+        ("DELETE", "/library/albums/{local_album_id}/edition"),
         ("DELETE", "/library/album/{album_id}"),
         ("DELETE", "/library/tracks/{track_id}"),
         ("GET", "/library/tracks/{track_id}/tags"),

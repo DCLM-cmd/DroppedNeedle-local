@@ -69,6 +69,53 @@ MAX_GENRE_RULES = 500
 MAX_PRESERVE_FIELDS = 100
 MAX_MANAGEMENT_NAME_LENGTH = 120
 
+LEGACY_DEFAULT_SIDECAR_PATTERNS: list[str] = [
+    "cover.jpg",
+    "cover.jpeg",
+    "cover.png",
+    "cover.webp",
+    "folder.jpg",
+    "folder.jpeg",
+    "folder.png",
+    "front.jpg",
+    "front.png",
+    "*.cue",
+    "*.log",
+    "*.lrc",
+    "*.m3u",
+    "*.m3u8",
+    "*.pls",
+]
+DEFAULT_SIDECAR_PATTERNS: list[str] = [
+    "cover.jpg",
+    "cover.jpeg",
+    "cover.png",
+    "cover.webp",
+    "folder.jpg",
+    "folder.jpeg",
+    "folder.png",
+    "front.jpg",
+    "front.png",
+    "back.jpg",
+    "back.jpeg",
+    "back.png",
+    "back.webp",
+    "booklet*.jpg",
+    "booklet*.jpeg",
+    "booklet*.png",
+    "booklet*.webp",
+    "medium*.jpg",
+    "medium*.jpeg",
+    "medium*.png",
+    "medium*.webp",
+    "*.cue",
+    "*.log",
+    "*.lrc",
+    "*.m3u",
+    "*.m3u8",
+    "*.pls",
+]
+
 FieldMode = Literal["disabled", "replace", "fill_missing", "merge", "preserve"]
 GenreMode = Literal["replace", "merge", "fill_missing"]
 GenreSource = Literal["musicbrainz", "listenbrainz", "lastfm", "existing_local"]
@@ -352,23 +399,7 @@ class OrganizationManagementSettings(AppStruct):
     )
     move_sidecars: bool = True
     sidecar_patterns: list[str] = msgspec.field(
-        default_factory=lambda: [
-            "cover.jpg",
-            "cover.jpeg",
-            "cover.png",
-            "cover.webp",
-            "folder.jpg",
-            "folder.jpeg",
-            "folder.png",
-            "front.jpg",
-            "front.png",
-            "*.cue",
-            "*.log",
-            "*.lrc",
-            "*.m3u",
-            "*.m3u8",
-            "*.pls",
-        ]
+        default_factory=lambda: list(DEFAULT_SIDECAR_PATTERNS)
     )
     source_cleanup: SourceCleanupMode = "remove_after_confirmed_move"
     remove_empty_directories: bool = True
@@ -547,6 +578,25 @@ class LibraryManagementChangeImpact(AppStruct):
     preview_required: bool = False
     affected_root_ids: list[str] = msgspec.field(default_factory=list)
     reasons: list[str] = msgspec.field(default_factory=list)
+
+
+class LibraryManagementActivationHealthResponse(AppStruct):
+    """Dry-run activation health for active automatic roots.
+
+    A root is stale when its saved activation no longer matches the
+    current effective profile, naming policy, or library policy - for
+    example after a default migration rewrote the profile - and needs a
+    fresh dry run. A root is blocked when no dry run could help: either
+    the whole library policy is unresolvable (unknown root, unavailable
+    path, recycle-bin overlap), in which case every active root is
+    blocked and `blocked_reason` carries the policy error, or that one
+    root's effective profile fails to resolve (no reason is attached).
+    `blocked_reason` is only set alongside a non-empty `blocked_root_ids`.
+    """
+
+    stale_root_ids: list[str] = msgspec.field(default_factory=list)
+    blocked_root_ids: list[str] = msgspec.field(default_factory=list)
+    blocked_reason: str | None = None
 
 
 class LibraryManagementPresetDiff(AppStruct):
@@ -1401,6 +1451,13 @@ def migrate_library_management_presets(
     settings: LibraryManagementSettings,
 ) -> LibraryManagementSettings:
     """Ratchet inert built-in presets without adopting customized organization."""
+
+    # Issue #401: pre-fix stored defaults missed back/booklet/medium artwork.
+    # Runs first: pristine v1/v2/v3 profiles persist the legacy list, so the
+    # known-organization check below only matches after this swap.
+    for profile in settings.profiles:
+        if profile.organization.sidecar_patterns == LEGACY_DEFAULT_SIDECAR_PATTERNS:
+            profile.organization.sidecar_patterns = list(DEFAULT_SIDECAR_PATTERNS)
 
     picard_profile = next(
         (

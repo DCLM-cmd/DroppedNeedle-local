@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import Any, Protocol
 
 from repositories.plex_models import (
     PlexAlbum,
@@ -11,10 +9,8 @@ from repositories.plex_models import (
     PlexPlaylist,
     PlexSession,
     PlexTrack,
+    StreamProxyResult,
 )
-
-if TYPE_CHECKING:
-    from repositories.plex_models import StreamProxyResult
 
 
 class PlexRepositoryProtocol(Protocol):
@@ -35,7 +31,7 @@ class PlexRepositoryProtocol(Protocol):
         ...
 
     async def get_artists(
-        self, section_id: str, size: int = 100, offset: int = 0
+        self, section_id: str, size: int = 100, offset: int = 0, search: str = ""
     ) -> list[PlexArtist]:
         ...
 

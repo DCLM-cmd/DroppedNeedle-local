@@ -30,6 +30,7 @@ import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 import { discoverQueueDeck } from '$lib/stores/discoverQueueDeck.svelte';
 import { toastStore } from '$lib/stores/toast';
 import { getIgnoreDiscoveryMutation } from './DiscoverMutations.svelte';
+import { DiscoverQueryKeyFactory } from './DiscoverQueryKeyFactory';
 
 describe('getIgnoreDiscoveryMutation', () => {
 	beforeEach(() => vi.clearAllMocks());
@@ -62,7 +63,7 @@ describe('getIgnoreDiscoveryMutation', () => {
 		});
 		expect(discoverQueueDeck.removeByMbid).toHaveBeenCalledWith('rg-1');
 		expect(invalidateQueriesWithPersister).toHaveBeenCalledWith({
-			queryKey: ['discover', 'u1']
+			queryKey: DiscoverQueryKeyFactory.discover('u1')
 		});
 	});
 });

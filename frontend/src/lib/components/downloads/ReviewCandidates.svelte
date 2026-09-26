@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { Radar } from 'lucide-svelte';
+	import { SvelteMap } from 'svelte/reactivity';
 
 	import { cancelDownload } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import {
@@ -7,6 +8,7 @@
 		getSearchJobQuery,
 		pickSearchCandidate
 	} from '$lib/queries/downloads/SearchQueries.svelte';
+	import { getPluginSourcesQuery } from '$lib/queries/plugins/PluginSourceQueries.svelte';
 	import type { DownloadTask } from '$lib/types';
 
 	import SearchResultCard from './SearchResultCard.svelte';
@@ -43,21 +45,44 @@
 		}))
 	);
 	// Source-grouped (D16): Soulseek and Usenet scores aren't commensurable, so they show
-	// in separate labelled groups, ranked within each - never interleaved.
-	const groups = $derived(
-		[
-			{
-				key: 'soulseek',
-				label: 'Soulseek',
-				items: indexed.filter((c) => (c.candidate.source ?? 'soulseek') === 'soulseek')
-			},
-			{
-				key: 'usenet',
-				label: 'Usenet',
-				items: indexed.filter((c) => c.candidate.source === 'usenet')
-			}
-		].filter((g) => g.items.length > 0)
+	// in separate labelled groups, ranked within each - never interleaved. Plugin
+	// sources each get their own group, labelled from the sources query (a key with
+	// no matching source falls back to the raw key).
+	const sourcesQuery = getPluginSourcesQuery();
+	const sourceLabels = $derived(
+		Object.fromEntries(
+			(sourcesQuery.data?.sources ?? []).map((source) => [
+				source.key,
+				source.display_name || source.key
+			])
+		)
 	);
+	const groups = $derived.by(() => {
+		const soulseek = {
+			key: 'soulseek',
+			label: 'Soulseek',
+			items: indexed.filter((c) => (c.candidate.source ?? 'soulseek') === 'soulseek')
+		};
+		const usenet = {
+			key: 'usenet',
+			label: 'Usenet',
+			items: indexed.filter((c) => c.candidate.source === 'usenet')
+		};
+		const pluginItems = new SvelteMap<string, typeof indexed>();
+		for (const item of indexed) {
+			const source = item.candidate.source ?? 'soulseek';
+			if (source === 'soulseek' || source === 'usenet') continue;
+			const bucket = pluginItems.get(source);
+			if (bucket) bucket.push(item);
+			else pluginItems.set(source, [item]);
+		}
+		const plugins = [...pluginItems].map(([key, items]) => ({
+			key,
+			label: sourceLabels[key] ?? key,
+			items
+		}));
+		return [soulseek, usenet, ...plugins].filter((g) => g.items.length > 0);
+	});
 	const isTrack = $derived(task.download_type === 'track');
 	const qualityRejectionSummary = $derived.by(() => {
 		const counts = jobQuery.data?.quality_rejections;
@@ -126,8 +151,8 @@
 			<p class="text-sm text-base-content/60">No candidates available to review.</p>
 		{:else}
 			<p class="text-xs text-base-content/40">
-				Not sure? Picking is safe - every file is verified before it reaches your library, and
-				anything that can't be verified is held for you to listen to first.
+				Not sure? Picking is safe: every file is verified before it reaches your library, and
+				anything that can't be verified waits for you to listen first.
 			</p>
 			{#each groups as group (group.key)}
 				{@const recommended = group.items.filter((item) => item.candidate.tier !== 'rejected')}
@@ -163,7 +188,7 @@
 						class="btn btn-ghost btn-xs text-info"
 						onclick={handleDismiss}
 						disabled={dismissed || picked || dismiss.isPending}
-						title="Reject all of these and put the album on the watchlist - it'll be re-checked on a schedule"
+						title="Reject all of these and put the album on the watchlist. It will be re-checked on a schedule"
 					>
 						<Radar class="h-3.5 w-3.5" />
 						{dismissed ? 'On the watchlist' : 'None of these - keep watching'}
@@ -172,7 +197,7 @@
 						class="btn btn-ghost btn-xs text-error"
 						onclick={() => cancel.mutate(task.id)}
 						disabled={dismissed || cancel.isPending}
-						title="Give up on this album entirely - it won't be watched"
+						title="Give up on this album entirely. It won't be watched"
 					>
 						Cancel request
 					</button>

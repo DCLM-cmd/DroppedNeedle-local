@@ -152,7 +152,7 @@
 								><span class="badge badge-ghost badge-sm">{run.state.replaceAll('_', ' ')}</span
 								></td
 							>
-							<td>{run.trigger}</td><td>{run.aggregate_scope}</td><td
+							<td>{run.trigger.replaceAll('_', ' ')}</td><td>{run.aggregate_scope}</td><td
 								>{formatTime(run.started_at)}</td
 							><td>{formatTime(run.terminal_at)}</td><td class="text-xs"
 								>{(run.counters.changed_count ?? 0).toLocaleString()} changed · {(
@@ -176,7 +176,9 @@
 					<strong>{run.state.replaceAll('_', ' ')}</strong><span class="text-right"
 						>{duration(run)}</span
 					>
-					<span class="text-base-content/55">{run.trigger} · {run.aggregate_scope}</span>
+					<span class="text-base-content/55"
+						>{run.trigger.replaceAll('_', ' ')} · {run.aggregate_scope}</span
+					>
 					<span class="text-right text-xs"
 						>{(run.counters.changed_count ?? 0).toLocaleString()} changed</span
 					>
@@ -233,7 +235,9 @@
 						Run details
 					</h2>
 					<p class="mt-1 text-sm text-base-content/60">
-						{detailRun.trigger} · {detailRun.aggregate_scope} · {duration(detailRun)}
+						{detailRun.trigger.replaceAll('_', ' ')} · {detailRun.aggregate_scope} · {duration(
+							detailRun
+						)}
 					</p>
 				</div>
 				<span class="badge badge-ghost badge-sm">{detailRun.state.replaceAll('_', ' ')}</span>

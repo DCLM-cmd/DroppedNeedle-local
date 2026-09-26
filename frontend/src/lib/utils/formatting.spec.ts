@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatListenCount } from './formatting';
+import { formatBytes, formatListenCount } from './formatting';
 
 describe('formatListenCount', () => {
 	it('returns empty string for null', () => {
@@ -50,5 +50,20 @@ describe('formatListenCount', () => {
 	it('formats billions compact', () => {
 		expect.assertions(1);
 		expect(formatListenCount(3596400000, true)).toBe('3.6B');
+	});
+});
+
+describe('formatBytes', () => {
+	it('returns "0 B" for zero, null, and undefined (callers map these to "—")', () => {
+		expect.assertions(3);
+		expect(formatBytes(0)).toBe('0 B');
+		expect(formatBytes(null)).toBe('0 B');
+		expect(formatBytes(undefined)).toBe('0 B');
+	});
+
+	it('formats byte counts with one decimal below 10 units', () => {
+		expect.assertions(2);
+		expect(formatBytes(10485760)).toBe('10 MB');
+		expect(formatBytes(15728640)).toBe('15 MB');
 	});
 });

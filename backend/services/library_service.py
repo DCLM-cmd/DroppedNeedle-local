@@ -351,7 +351,8 @@ class LibraryService:
             raise ExternalServiceError(f"Failed to fetch recently added: {e}")
 
     async def sync_library(
-        self, is_manual: bool = False, force_full: bool = False
+        self, is_manual: bool = False, force_full: bool = False,
+        *, initiating_user_id: str | None = None,
     ) -> SyncLibraryResponse:
         if not self._library_repo.is_configured():
             raise ExternalServiceError(
@@ -465,7 +466,8 @@ class LibraryService:
 
                 task = asyncio.create_task(
                     self._precache_service.precache_library_resources(
-                        artists, albums, resume=resume
+                        artists, albums, resume=resume,
+                        initiating_user_id=initiating_user_id if is_manual else None,
                     )
                 )
 

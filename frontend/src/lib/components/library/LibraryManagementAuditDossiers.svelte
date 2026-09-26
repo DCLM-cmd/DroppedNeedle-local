@@ -7,7 +7,7 @@
 		ChevronRight,
 		FolderCog,
 		Image,
-		Layers3,
+		Layers,
 		Tags
 	} from 'lucide-svelte';
 
@@ -245,7 +245,7 @@
 								{/if}
 								{#if changeCount(dossier, 'sidecars')}
 									<span
-										><Layers3 class="h-3 w-3" /> {changeCount(dossier, 'sidecars')} sidecars</span
+										><Layers class="h-3 w-3" /> {changeCount(dossier, 'sidecars')} sidecars</span
 									>
 								{/if}
 							</div>
@@ -255,7 +255,9 @@
 										Held by a blocked file in this release (Release {dossier.bundleOrdinal + 1}) · {top.label}
 										({top.count.toLocaleString()})
 									{:else}
-										Top reason: {top.label} ({top.count.toLocaleString()})
+										Top reason: {top.code === 'OPTIONAL_ENRICHMENT_DEFERRED'
+											? 'Optional enrichment deferred · still applicable with warnings'
+											: top.label} ({top.count.toLocaleString()})
 									{/if}
 								</p>
 							{/if}
@@ -329,7 +331,7 @@
 														class="h-3 w-3"
 													/>{:else if change === 'artwork'}<Image
 														class="h-3 w-3"
-													/>{:else if change === 'path'}<FolderCog class="h-3 w-3" />{:else}<Layers3
+													/>{:else if change === 'path'}<FolderCog class="h-3 w-3" />{:else}<Layers
 														class="h-3 w-3"
 													/>{/if}
 												<span>{changeLabel(change)}</span>

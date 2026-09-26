@@ -14,6 +14,7 @@ const h = vi.hoisted(() => ({
 		not_importable: 0,
 		needs_review: 0
 	} as QualityRejectionSummary,
+	pluginSources: [] as { key: string; display_name: string }[],
 	pick: vi.fn(),
 	cancel: vi.fn(),
 	dismiss: vi.fn()
@@ -43,10 +44,14 @@ vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
 	cancelDownload: () => ({ mutate: h.cancel, isPending: false })
 }));
 
+vi.mock('$lib/queries/plugins/PluginSourceQueries.svelte', () => ({
+	getPluginSourcesQuery: () => ({ data: { sources: h.pluginSources }, isLoading: false })
+}));
+
 import ReviewCandidates from './ReviewCandidates.svelte';
 
-function renderReview(task: DownloadTask) {
-	return render(ReviewCandidates, { props: { task } } as unknown as Parameters<
+async function renderReview(task: DownloadTask) {
+	return await render(ReviewCandidates, { props: { task } } as unknown as Parameters<
 		typeof render<typeof ReviewCandidates>
 	>[1]);
 }
@@ -94,12 +99,13 @@ describe('ReviewCandidates.svelte', () => {
 		h.pick = vi.fn();
 		h.cancel = vi.fn();
 		h.dismiss = vi.fn();
+		h.pluginSources = [];
 	});
 	it('renders the authoritative snapshot summary and documented aggregates', async () => {
 		h.summary = 'Lossless preferred; lossy 320 kbps fallback.';
 		h.candidateCount = 3;
 		h.topScore = 0.81;
-		renderReview(makeTask());
+		await renderReview(makeTask());
 		await expect
 			.element(page.getByTestId('quality-snapshot-summary'))
 			.toHaveTextContent('Lossless preferred; lossy 320 kbps fallback.');
@@ -113,7 +119,7 @@ describe('ReviewCandidates.svelte', () => {
 			not_importable: 0,
 			needs_review: 1
 		};
-		renderReview(makeTask());
+		await renderReview(makeTask());
 
 		const summary = page.getByTestId('quality-rejection-summary');
 		await expect
@@ -130,7 +136,7 @@ describe('ReviewCandidates.svelte', () => {
 			not_importable: 2,
 			needs_review: 3
 		};
-		renderReview(makeTask());
+		await renderReview(makeTask());
 
 		const summary = page.getByTestId('quality-rejection-summary');
 		await expect
@@ -142,19 +148,19 @@ describe('ReviewCandidates.svelte', () => {
 	});
 
 	it('offers "None of these - keep watching" next to Cancel', async () => {
-		renderReview(makeTask());
+		await renderReview(makeTask());
 		await expect.element(page.getByText('None of these - keep watching')).toBeVisible();
 		await expect.element(page.getByText('Cancel request')).toBeVisible();
 	});
 
 	it('explains the safe-pick flow (verification + held listen)', async () => {
-		renderReview(makeTask());
+		await renderReview(makeTask());
 		await expect.element(page.getByText(/Picking is safe/)).toBeVisible();
 	});
 
 	it('keeps rejected results out of the default shortlist', async () => {
 		h.candidates = [candidate('recommended'), candidate('weak-match', 'rejected', 0.49)];
-		renderReview(makeTask());
+		await renderReview(makeTask());
 
 		await expect.element(page.getByText('recommended')).toBeVisible();
 		await expect.element(page.getByText('weak-match')).not.toBeInTheDocument();
@@ -165,7 +171,7 @@ describe('ReviewCandidates.svelte', () => {
 
 	it('picks the preserved index after an older review is reranked', async () => {
 		h.candidates = [candidate('best-current-match', 'manual', 0.68, 7)];
-		renderReview(makeTask());
+		await renderReview(makeTask());
 
 		await page.getByRole('button', { name: 'Pick candidate from best-current-match' }).click();
 
@@ -174,7 +180,7 @@ describe('ReviewCandidates.svelte', () => {
 	});
 	it('locks every pick while a pick mutation is pending', async () => {
 		h.candidates = [candidate('first-peer'), candidate('second-peer')];
-		renderReview(makeTask());
+		await renderReview(makeTask());
 
 		const first = page.getByRole('button', { name: 'Pick candidate from first-peer' });
 		const second = page.getByRole('button', { name: 'Pick candidate from second-peer' });
@@ -185,7 +191,7 @@ describe('ReviewCandidates.svelte', () => {
 	});
 
 	it('dismissing rejects the whole review into the watchlist', async () => {
-		renderReview(makeTask());
+		await renderReview(makeTask());
 		await page.getByText('None of these - keep watching').click();
 		expect(h.dismiss).toHaveBeenCalledOnce();
 		expect(h.dismiss.mock.calls[0][0]).toBe('job-1');
@@ -193,7 +199,7 @@ describe('ReviewCandidates.svelte', () => {
 
 	it('locks to "On the watchlist" after a successful dismiss', async () => {
 		h.dismiss = vi.fn((_jobId: string, opts?: { onSuccess?: () => void }) => opts?.onSuccess?.());
-		renderReview(makeTask());
+		await renderReview(makeTask());
 		await page.getByText('None of these - keep watching').click();
 		await expect.element(page.getByText('On the watchlist')).toBeVisible();
 		await expect.element(page.getByText('Cancel request')).toBeDisabled();
@@ -204,7 +210,7 @@ describe('ReviewCandidates.svelte', () => {
 			candidate('solid-pick', 'auto', 0.81),
 			candidate('policy-reject', 'rejected', 0.32)
 		];
-		renderReview(makeTask());
+		await renderReview(makeTask());
 
 		await expect.element(page.getByText('Within policy', { exact: true })).toBeVisible();
 		await expect
@@ -217,5 +223,29 @@ describe('ReviewCandidates.svelte', () => {
 			name: /Blocked: outside the accepted quality policy/
 		});
 		await expect.element(blocked).toBeDisabled();
+	});
+
+	it('groups plugin candidates under the source display name', async () => {
+		h.pluginSources = [{ key: 'plugin:bandcamp', display_name: 'Bandcamp' }];
+		h.candidates = [
+			{
+				...candidate('peer-a', 'manual', 0.6, 0),
+				source: 'plugin:bandcamp',
+				plugin_release: {
+					title: 'bc-exclusive-master',
+					size_bytes: 400_000_000,
+					score: 0.9,
+					quality_tier: 'hi-res',
+					files: [],
+					payload: 'opaque-token'
+				}
+			}
+		];
+		await renderReview(makeTask());
+
+		await expect.element(page.getByText('Bandcamp', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('hi-res')).toBeVisible();
+		await expect.element(page.getByText('381 MB')).toBeVisible();
+		await expect.element(page.getByText('plugin score 90%')).toBeVisible();
 	});
 });

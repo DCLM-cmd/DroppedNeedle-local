@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { BadgeCheck, Disc3, Download, Files, Library, Signal } from 'lucide-svelte';
+	import { BadgeCheck, Disc3, Download, Files, Library, Puzzle, Signal } from 'lucide-svelte';
 
 	import { BLOCKED_PICK_REASON, candidateQualityLabel } from '$lib/utils/acquisitionLabels';
 	import type { ScoredCandidate } from '$lib/types';
@@ -31,8 +31,22 @@
 	const RING_R = 26;
 	const RING_C = 2 * Math.PI * RING_R;
 
-	const isUsenet = $derived(candidate.source === 'usenet' && Boolean(candidate.usenet_release));
+	const isPlugin = $derived(candidate.plugin_release != null);
+	const isUsenet = $derived(
+		!isPlugin && candidate.source === 'usenet' && Boolean(candidate.usenet_release)
+	);
 	const percent = $derived(Math.round(candidate.final_score * 100));
+	const pluginRel = $derived(candidate.plugin_release);
+	const pluginSizeLabel = $derived.by(() => {
+		const b = pluginRel?.size_bytes ?? 0;
+		if (b >= 1024 ** 3) return `${(b / 1024 ** 3).toFixed(1)} GB`;
+		if (b >= 1024 ** 2) return `${Math.round(b / 1024 ** 2)} MB`;
+		return `${Math.max(0, Math.round(b / 1024))} KB`;
+	});
+	const pluginFileCount = $derived(pluginRel?.files.length ?? 0);
+	const pluginTierLabel = $derived(
+		pluginRel?.quality_tier ? pluginRel.quality_tier : 'unknown tier'
+	);
 
 	// --- soulseek signals ---
 	const fileCount = $derived(candidate.files.length);
@@ -127,19 +141,30 @@
 	);
 
 	const breakdown = $derived(
-		isUsenet
-			? `${rel?.indexer_name ?? 'Usenet'} · ${usenetFormat} · ${sizeLabel}` +
+		isPlugin
+			? `${pluginRel?.title ?? 'Plugin release'} · ${pluginSizeLabel} · ` +
+					`score ${Math.round((pluginRel?.score ?? 0) * 100)}% · ` +
+					`${pluginFileCount} ${pluginFileCount === 1 ? 'file' : 'files'}`
+			: isUsenet
+				? `${rel?.indexer_name ?? 'Usenet'} · ${usenetFormat} · ${sizeLabel}` +
 					`${rel?.grabs ? ` · ${rel.grabs} grabs` : ''}${ageLabel ? ` · ${ageLabel}` : ''}`
-			: `Coherence ${Math.round(candidate.coherence * 100)}% · ` +
-					`File confidence ${Math.round(candidate.file_confidence * 100)}% · ` +
-					`${freeSlot ? 'Free slot' : 'Queued'}${uploadSpeed ? ` · ${Math.round(uploadSpeed / 1000)} KB/s` : ''}`
+				: `Coherence ${Math.round(candidate.coherence * 100)}% · ` +
+					`File confidence ${Math.round(candidate.file_confidence * 100)}%` +
+					(candidate.track_overlap != null
+						? ` · Track match ${Math.round(candidate.track_overlap * 100)}%`
+						: '') +
+					` · ${freeSlot ? 'Free slot' : 'Queued'}${uploadSpeed ? ` · ${Math.round(uploadSpeed / 1000)} KB/s` : ''}`
 	);
 	const heading = $derived(
-		isUsenet
-			? albumTitle || rel?.title || 'Unknown'
-			: candidate.parent_directory || 'Unknown folder'
+		isPlugin
+			? albumTitle || pluginRel?.title || 'Unknown'
+			: isUsenet
+				? albumTitle || rel?.title || 'Unknown'
+				: candidate.parent_directory || 'Unknown folder'
 	);
-	const subtitle = $derived(isUsenet ? (rel?.title ?? '') : candidate.username);
+	const subtitle = $derived(
+		isPlugin ? (candidate.source ?? '') : isUsenet ? (rel?.title ?? '') : candidate.username
+	);
 
 	const dashoffset = $derived(RING_C * (1 - Math.max(0, Math.min(1, candidate.final_score))));
 </script>
@@ -149,7 +174,9 @@
 		class="sleeve grid size-14 shrink-0 place-items-center rounded-md bg-base-300"
 		aria-hidden="true"
 	>
-		{#if isUsenet}
+		{#if isPlugin}
+			<Puzzle class="size-7 text-base-content/60" />
+		{:else if isUsenet}
 			<Download class="size-7 text-base-content/60" />
 		{:else}
 			<Disc3 class="size-7 text-base-content/60" />
@@ -177,7 +204,20 @@
 			{#if dispositionLabel}
 				<span class="badge badge-ghost badge-sm">{dispositionLabel}</span>
 			{/if}
-			{#if isUsenet}
+			{#if isPlugin}
+				<span class="badge badge-sm" class:badge-success={!hardBlocked}>{pluginTierLabel}</span>
+				<span class="badge badge-ghost badge-sm">{pluginSizeLabel}</span>
+				<span class="badge badge-ghost badge-sm gap-1">
+					<Files class="size-3" aria-hidden="true" />{pluginFileCount}
+					{pluginFileCount === 1 ? 'file' : 'files'}
+				</span>
+				<span
+					class="badge badge-ghost badge-sm"
+					title="Plugin-reported confidence for this release"
+				>
+					plugin score {Math.round((pluginRel?.score ?? 0) * 100)}%
+				</span>
+			{:else if isUsenet}
 				<span class="badge badge-ghost badge-sm gap-1">
 					<Library class="size-3" aria-hidden="true" />{rel?.indexer_name}
 				</span>
@@ -255,9 +295,11 @@
 		onclick={onPick}
 		disabled={hardBlocked || picking || disabled}
 		title={blockedReason}
-		aria-label={isUsenet
-			? `Pick candidate from ${rel?.indexer_name}${hardBlocked ? ` - ${blockedReason}` : ''}`
-			: `Pick candidate from ${candidate.username}${hardBlocked ? ` - ${blockedReason}` : ''}`}
+		aria-label={isPlugin
+			? `Pick candidate from ${pluginRel?.title ?? candidate.source}${hardBlocked ? ` - ${blockedReason}` : ''}`
+			: isUsenet
+				? `Pick candidate from ${rel?.indexer_name}${hardBlocked ? ` - ${blockedReason}` : ''}`
+				: `Pick candidate from ${candidate.username}${hardBlocked ? ` - ${blockedReason}` : ''}`}
 	>
 		{#if picking}<span class="loading loading-spinner loading-xs"></span>{/if}
 		{#if hardBlocked}

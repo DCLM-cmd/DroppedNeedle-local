@@ -15,26 +15,36 @@ manifest.json``; the audio itself is written by slskd into its own download dir
 
 import asyncio
 import logging
+from infrastructure.observability.provider_counters import ProviderWorkload, provider_workload_scope
 import shutil
 import time
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import msgspec
 
 from core.exceptions import (
     ConflictError,
     PermissionDeniedError,
     ResourceNotFoundError,
+    SlskdApiError,
+    SlskdAuthError,
     ValidationError,
 )
 from core.task_registry import TaskRegistry
 from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.queue.priority_queue import RequestPriority
+from infrastructure.resilience.retry import CircuitOpenError
 from infrastructure.sse_publisher import SSEPublisher
 from models.acquisition_quality import AcquisitionQualitySnapshot
+from models.download_identity import SOURCE_SOULSEEK, soulseek_folder_identity
 from services.native.acquisition import quality as acq_quality
+from services.native.acquisition.scoring_core import (
+    artist_words,
+    normalize_folder_identity,
+)
 from models.download_manifest import (
     DownloadManifest,
     ExpectedFile,
@@ -45,6 +55,7 @@ from repositories.protocols.download_client import (
     DownloadClientProtocol,
 )
 from repositories.protocols.indexer import IndexerProtocol
+from services.album_utils import audio_tracks
 from services.native.acquisition.errors import OrchestrationError
 from services.native.acquisition.status import DownloadStatus
 from services.native.acquisition.strategy import (
@@ -69,7 +80,9 @@ from services.native.quality_tiers import (
 from services.native.file_processor import (
     DOWNLOADS_MOUNT_UNAVAILABLE,
     IMPORT_FAILED,
+    SIZE_MISMATCH,
     SOURCE_FILE_MISSING,
+    TARGET_OCCUPIED,
     FileProcessor,
     ProcessResult,
 )
@@ -82,6 +95,30 @@ logger = logging.getLogger(__name__)
 
 # Fixed v1 source -> client_type map (the DownloadTask.download_client value).
 _CLIENT_FOR_SOURCE = {"soulseek": "slskd", "usenet": "sabnzbd"}
+
+class _EmptyPluginIndexer:
+    """Search stub for a plugin client with no indexer: always empty, never configured."""
+
+    def __init__(self, key: str) -> None:
+        self._key = key
+
+    @property
+    def indexer_name(self) -> str:
+        return self._key
+
+    def is_configured(self) -> bool:
+        return False
+
+    async def health_check(self):  # noqa: ANN201
+        from models.common import ServiceStatus
+
+        return ServiceStatus(status="error", message="No indexer configured")
+
+    async def search_album(self, *args, **kwargs):  # noqa: ANN001, ANN201
+        return []
+
+    async def search_track(self, *args, **kwargs):  # noqa: ANN001, ANN201
+        return []
 
 # 6-hour ceiling on a single download's poll loop (absolute backstop; the
 # minutes-scale stall/queued watchdogs normally resolve a stuck transfer long
@@ -150,6 +187,18 @@ _FILES_NOT_FOUND_MSG = (
     "the slskd downloads path points to where slskd saves completed files"
 )
 _TAG_MISMATCH_MSG = "Files downloaded and found, but their embedded tags did not match the requested music"
+# Per-file failure reasons that prove CONTENT is wrong (not transfers, mounts, or
+# local faults): the album-identity exclusion (Slice 3) only learns from these.
+# "corrupt" is deliberately absent - an unreadable file is ambiguous evidence.
+_CONTENT_PROOF_FAILURES = frozenset(
+    {
+        "tag_mismatch",
+        "fingerprint_mismatch",
+        "fingerprint_unverified",
+        "duration_mismatch",
+        "wrong_track",
+    }
+)
 # slskd delivered the files and we found them, but writing them into the library failed
 # (perms, disk full, a cross-mount copy the filesystem rejected). Local fault, not the
 # peer's - blaming Soulseek sends users chasing the wrong problem.
@@ -190,6 +239,15 @@ _REASON_MESSAGES = {
         "for a genuinely higher-quality one."
     ),
 }
+# slskd delivered verified files but the library path is occupied by a file this
+# release does not own: a local collision, never a bad peer or a missing release.
+# It must NOT prefix-match the Wanted availability constants
+# (_NO_SOURCE_MSG/_NO_MATCH_MSG/_TAG_MISMATCH_MSG) - re-searching cannot fix local
+# bytes blocking the path, so a collision never enrols in Wanted.
+_TARGET_OCCUPIED_MSG = (
+    "Files downloaded, but the library path is occupied by a file this release "
+    "does not own - held for review instead of overwriting it"
+)
 _MANAGEMENT_HELD_MSG = "Download complete. The files are secured while Library Management waits for attention."
 _MANAGEMENT_HOLD_STORAGE_MSG = (
     "Download complete, but DroppedNeedle could not secure its Library Management "
@@ -229,6 +287,69 @@ def _user_error_message(exc: Exception) -> str:
     if isinstance(exc, OrchestrationError):
         return str(exc)
     return "download failed"
+
+
+def _is_download_client_outage(exc: Exception) -> bool:
+    """True when ``exc`` means the download client is briefly unreachable (#399).
+
+    A short slskd outage (restart/rescan: connection refused, timeouts, reset
+    connections - or the 'slskd' circuit breaker standing open) must pause the
+    poll/enqueue/abort waits, never fail the task. ``SlskdAuthError`` (wrong API
+    key: deterministic misconfiguration) is excluded so it keeps failing fast,
+    as is any non-connection ``SlskdApiError`` (e.g. an HTTP 500 with no
+    transport cause). ``SabnzbdApiError`` is deliberately excluded too:
+    ``services/native`` must not import ``repositories/sabnzbd``, and that
+    client already absorbs blips with internal retries.
+    """
+    if isinstance(exc, CircuitOpenError):
+        return True
+    if isinstance(exc, SlskdAuthError):
+        return False
+    if not isinstance(exc, SlskdApiError):
+        return False
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(
+            current,
+            (
+                httpx.ConnectError,
+                httpx.TimeoutException,
+                httpx.RemoteProtocolError,
+            ),
+        ):
+            return True
+        for chained in (current.__cause__, current.__context__):
+            if isinstance(chained, BaseException) and id(chained) not in seen:
+                pending.append(chained)
+    return False
+
+
+def _has_outage_cause(exc: Exception) -> bool:
+    """True when ``exc`` or anything in its ``__cause__``/``__context__`` chain is
+    a download-client outage (see ``_is_download_client_outage``).
+
+    The enqueue path needs this: ``SoulseekStrategy.enqueue`` converts every
+    client failure into ``OrchestrationError("enqueue failed")`` chained from the
+    original, so the outage evidence sits one link down the chain instead of on
+    the raised error."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, Exception) and _is_download_client_outage(current):
+            return True
+        for chained in (current.__cause__, current.__context__):
+            if isinstance(chained, BaseException) and id(chained) not in seen:
+                pending.append(chained)
+    return False
 
 
 def _log_task_exception(task: "asyncio.Task") -> None:
@@ -315,6 +436,8 @@ class DownloadOrchestrator:
         probe_tagger=None,  # AudioTagger for the pre-publication quality probe
         wanted_store=None,  # WantedStore | None
         cleanup_service: AcquisitionCleanupService | None = None,
+        plugin_sources=None,  # PluginSourceRegistry | None - live per-call, never cached
+        plugin_host=None,  # noqa: ANN001 - PluginHost, optional (01b events)
     ) -> None:
         self._client = client
         self._naming_template = naming_template
@@ -362,6 +485,11 @@ class DownloadOrchestrator:
         self._wanted_store = wanted_store
         self._cleanup = cleanup_service
         self._usenet_scorer = usenet_scorer  # for the Usenet re-gate tier (Phase 2)
+        self._plugin_sources = plugin_sources
+        self._plugin_host = plugin_host
+        self._plugin_tasks: set[asyncio.Task] = set()
+        self._file_processor = file_processor
+        self._track_matcher = track_matcher
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._operation_locks: dict[str, asyncio.Lock] = {}
 
@@ -411,6 +539,174 @@ class DownloadOrchestrator:
                 policy_extras=self._spec_policy_extras,
                 probe_tagger=probe_tagger,
             )
+        self._build_plugin_strategies()
+
+    def _build_plugin_strategies(self) -> None:
+        """Build one PluginSourceStrategy per registry spec with a client."""
+        registry = self._plugin_sources
+        if registry is None:
+            return
+        try:
+            specs = registry.specs
+        except Exception:  # noqa: BLE001 - absence reads as no plugins
+            return
+        if not specs:
+            return
+        try:
+            from services.native.acquisition.plugin_strategy import (  # type: ignore
+                PluginSourceStrategy as _PluginStrategy,
+            )
+        except ImportError:
+            try:
+                from services.native.acquisition.plugin_strategy import (  # type: ignore
+                    PluginStrategy as _PluginStrategy,
+                )
+            except ImportError:
+                logger.warning("plugin strategy unavailable, skipping plugin sources")
+                return
+        try:
+            from services.native.plugin_release_scorer import (  # type: ignore
+                PluginReleaseScorer as _PluginScorer,
+            )
+        except ImportError:
+            logger.warning("plugin scorer unavailable, skipping plugin sources")
+            return
+        try:
+            scorer = _PluginScorer(self._store)
+        except Exception:  # noqa: BLE001 - a bad store never blocks bundled sources
+            logger.warning("plugin scorer init failed, skipping plugin sources")
+            return
+        for spec in specs:
+            try:
+                key = spec.key
+            except AttributeError:
+                continue
+            if key in self._strategies:
+                continue
+            if getattr(spec, "target_source", key) != key:
+                # Indexer-only / foreign-target specs pool via CompositeIndexer
+                # (usenet) and never get a direct strategy; same gate as
+                # _source_enabled. Only client-owning specs build one here.
+                continue
+            try:
+                client = registry.client_for(key)
+            except Exception:  # noqa: BLE001 - one bad plugin never blocks
+                continue
+            if client is None:
+                continue
+            try:
+                indexers = registry.indexers_for_target(key)
+            except Exception:  # noqa: BLE001 - absence reads as no indexer
+                indexers = []
+            indexer = indexers[0] if indexers else _EmptyPluginIndexer(key)
+            try:
+                strategy = _PluginStrategy(
+                    indexer=indexer,
+                    scorer=scorer,
+                    track_matcher=self._track_matcher,
+                    client=client,
+                    store=self._store,
+                    file_processor=self._file_processor,
+                    staging=self._staging,
+                    manifest_codec=self._manifest_codec,
+                    naming_template=self._naming_template,
+                    album_service=self._album_service,
+                    library=self._library,
+                    policy_extras=self._spec_policy_extras,
+                    probe_tagger=self._probe_tagger,
+                    source_key=key,
+                    display_name=getattr(spec, "display_name", None) or key,
+                )
+            except Exception:  # noqa: BLE001 - one bad plugin never blocks bundled
+                logger.warning("plugin strategy build failed for %s", key)
+                continue
+            self._strategies[key] = strategy
+
+    def _ensure_plugin_strategy(self, source: str):  # noqa: ANN201
+        """Build the strategy for a plugin source appearing after construction."""
+        if source in self._strategies:
+            return self._strategies[source]
+        registry = self._plugin_sources
+        if registry is None:
+            return None
+        try:
+            spec = registry.spec_for(source)
+        except Exception:  # noqa: BLE001 - absence reads as unknown
+            return None
+        if spec is None:
+            return None
+        before = set(self._strategies)
+        self._build_plugin_strategies()
+        if source in self._strategies and source not in before:
+            return self._strategies[source]
+        return self._strategies.get(source)
+
+    def _emit_plugin_event(self, kind: str, payload: object) -> None:
+        host = getattr(self, "_plugin_host", None)
+        if host is None:
+            return
+        try:
+            import uuid as _uuid
+
+            from infrastructure.plugins.protocols import PluginEvent
+
+            event = PluginEvent(kind=kind, payload=payload, causation_id=_uuid.uuid4().hex)
+            task = asyncio.create_task(host.dispatch_event(event))
+            self._plugin_tasks.add(task)
+            task.add_done_callback(self._plugin_tasks.discard)
+        except Exception:  # noqa: BLE001 - events never break downloads
+            pass
+
+    def _emit_download(self, *, task_id: str, user_id: str = "", release_group_mbid: str = "", source: str = "", outcome: str) -> None:
+        kind = "download_failed" if outcome == "failed" else ("download_completed" if outcome in ("completed", "partial") else "download_started")
+        if kind not in ("download_started", "download_completed", "download_failed"):
+            return
+        try:
+            from infrastructure.plugins.protocols import DownloadTaskEvent
+
+            self._emit_plugin_event(
+                kind,
+                DownloadTaskEvent(
+                    task_id=task_id,
+                    user_id=user_id or "",
+                    release_group_mbid=release_group_mbid or "",
+                    source=source or "",
+                    outcome=outcome,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - events never break downloads
+            pass
+
+    def _emit_request_fulfilled(self, *, request_id: str, user_id: str = "", release_group_mbid: str = "") -> None:
+        try:
+            from infrastructure.plugins.protocols import RequestEvent
+
+            self._emit_plugin_event(
+                "request_fulfilled",
+                RequestEvent(
+                    request_id=request_id,
+                    user_id=user_id or "",
+                    release_group_mbid=release_group_mbid or "",
+                    status="imported",
+                ),
+            )
+        except Exception:  # noqa: BLE001 - events never break downloads
+            pass
+
+    def _emit_import_finished(self, *, release_group_mbid: str, track_count: int = 0, source: str = "") -> None:
+        try:
+            from infrastructure.plugins.protocols import ImportEvent
+
+            self._emit_plugin_event(
+                "import_finished",
+                ImportEvent(
+                    release_group_mbid=release_group_mbid,
+                    track_count=track_count,
+                    source=source or "",
+                ),
+            )
+        except Exception:  # noqa: BLE001 - events never break downloads
+            pass
 
     def dispatch(self, task_id: str) -> "asyncio.Task":
         """Run ``process_task`` for ``task_id`` in the background (AUD-3): wrapped in
@@ -464,9 +760,11 @@ class DownloadOrchestrator:
                     "complete",
                     {"status": DownloadStatus.FAILED, "error": user_msg},
                 )
+                self._emit_download(task_id=task_id, outcome="failed")
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to mark task %s failed after error", task_id)
 
+    @provider_workload_scope(ProviderWorkload.ACQUISITION)
     async def process_task(self, task_id: str) -> None:
         """Main lifecycle. Two entry shapes converge here: a direct request (no
         candidate linked -> search/score/auto-pick first) and a manual pick (a
@@ -475,7 +773,6 @@ class DownloadOrchestrator:
         if task is None:
             logger.error("Download task %s not found", task_id)
             return
-
         logger.info(
             "download.started",
             extra={
@@ -485,11 +782,16 @@ class DownloadOrchestrator:
                 "release_group_mbid": task.release_group_mbid,
             },
         )
+        self._emit_download(
+            task_id=task.id,
+            user_id=getattr(task, "user_id", ""),
+            release_group_mbid=getattr(task, "release_group_mbid", "") or "",
+            source=getattr(task, "source", "") or "",
+            outcome="started",
+        )
 
         try:
-            if not self._source_enabled("soulseek") and not self._source_enabled(
-                "usenet"
-            ):
+            if not self._any_source_enabled():
                 # Disabled-but-configured slskd shouldn't read as "not configured".
                 if self._client.is_configured():
                     raise OrchestrationError(
@@ -518,6 +820,13 @@ class DownloadOrchestrator:
                 f"download:{task_id}",
                 "complete",
                 {"status": DownloadStatus.FAILED, "error": user_msg},
+            )
+            self._emit_download(
+                task_id=task_id,
+                user_id=getattr(task, "user_id", ""),
+                release_group_mbid=getattr(task, "release_group_mbid", "") or "",
+                source=getattr(task, "source", "") or "",
+                outcome="failed",
             )
             await self._sync_request_on_terminal(task, DownloadStatus.FAILED)
 
@@ -559,16 +868,80 @@ class DownloadOrchestrator:
             return self._soulseek_enabled and self._client.is_configured()
         if source == "usenet":
             return self._usenet_enabled
+        if source and source.startswith("plugin:"):
+            registry = self._plugin_sources
+            if registry is None:
+                return False
+            try:
+                spec = registry.spec_for(source)
+            except Exception:  # noqa: BLE001 - absence reads as disabled
+                return False
+            if spec is None or not getattr(spec, "has_client", False):
+                return False
+            if getattr(spec, "target_source", spec.key) != spec.key:
+                return False
+            try:
+                client = registry.client_for(source)
+            except Exception:  # noqa: BLE001 - absence reads as disabled
+                return False
+            if client is None:
+                return False
+            try:
+                return bool(client.is_configured())
+            except Exception:  # noqa: BLE001 - absence, not failure
+                return False
         return False
+
+    def _any_source_enabled(self) -> bool:
+        if self._source_enabled("soulseek") or self._source_enabled("usenet"):
+            return True
+        registry = self._plugin_sources
+        if registry is None:
+            return False
+        try:
+            specs = registry.specs
+        except Exception:  # noqa: BLE001 - absence reads as disabled
+            return False
+        return any(self._source_enabled(spec.key) for spec in specs)
+
+    def _ordered_enabled_sources(self) -> list[str]:
+        # Persisted positions win (bundled + plugin keys in stored order); only
+        # newly installed plugin specs append after, never a bundled reset.
+        ordered: list[str] = []
+        for s in self._source_priority:
+            if s and s not in ordered and self._source_enabled(s):
+                ordered.append(s)
+        registry = self._plugin_sources
+        if registry is not None:
+            try:
+                specs = registry.specs
+            except Exception:  # noqa: BLE001 - absence reads as no plugins
+                specs = []
+            for spec in specs:
+                key = getattr(spec, "key", "")
+                if key and key not in self._source_priority and key not in ordered:
+                    if self._source_enabled(key):
+                        ordered.append(key)
+        return ordered
 
     def _enabled_source_names(self) -> list[str]:
         """Display names of the sources actually searched - so failure messages name what
         was tried, never a source that's switched off."""
-        return [
+        names = [
             name
             for source, name in (("soulseek", "Soulseek"), ("usenet", "Usenet"))
             if self._source_enabled(source)
         ]
+        registry = self._plugin_sources
+        if registry is not None:
+            try:
+                specs = registry.specs
+            except Exception:  # noqa: BLE001 - absence reads as no plugins
+                specs = []
+            for spec in specs:
+                if self._source_enabled(spec.key):
+                    names.append(spec.display_name or spec.plugin)
+        return names
 
     def _no_source_message(self) -> str:
         """The 'nothing usable came back' message, naming the sources that were actually
@@ -592,7 +965,7 @@ class DownloadOrchestrator:
         if snapshot is None:
             snapshot = await self._task_quality_snapshot(task)
         timeout = 30.0 + 15.0 * min(task.retry_count, 4)
-        return await self._strategies[source].search_and_score(
+        return await self._strategy(source).search_and_score(
             task,
             timeout=timeout,
             auto=self._auto,
@@ -636,7 +1009,7 @@ class DownloadOrchestrator:
         or slow source never erases another's candidates."""
         if snapshot is None:
             snapshot = await self._task_quality_snapshot(task)
-        enabled = [s for s in self._source_priority if self._source_enabled(s)]
+        enabled = self._ordered_enabled_sources()
 
         async def run_one(source):
             try:
@@ -719,6 +1092,13 @@ class DownloadOrchestrator:
             "complete",
             {"status": DownloadStatus.FAILED, "error": "no match"},
         )
+        self._emit_download(
+            task_id=task.id,
+            user_id=getattr(task, "user_id", ""),
+            release_group_mbid=getattr(task, "release_group_mbid", "") or "",
+            source=getattr(task, "source", "") or "",
+            outcome="failed",
+        )
 
     async def _search_score_autopick(self, task) -> bool:  # noqa: ANN001 - DownloadTask
         """Route the automatic path across ``source_priority``. DEFAULT
@@ -746,9 +1126,8 @@ class DownloadOrchestrator:
         remembered: list[list] = []
         if self._source_selection_mode(snapshot) == "quality_first":
             by_source = await self._concurrent_search_and_score(task, snapshot=snapshot)
-            for source in self._source_priority:
-                if self._source_enabled(source):
-                    remembered.append(by_source.get(source, []))
+            for source in self._ordered_enabled_sources():
+                remembered.append(by_source.get(source, []))
             pooled_flat = [c for group in remembered for c in group]
             await self._store.set_search_job_candidates(job.id, pooled_flat)
             picked = self._global_preference_pick(
@@ -766,7 +1145,7 @@ class DownloadOrchestrator:
                     source_directory=selected.parent_directory,
                     preflight_score=selected.final_score,
                     source=selected.source,
-                    download_client=_CLIENT_FOR_SOURCE.get(selected.source, "slskd"),
+                    download_client=self._client_for_source(selected.source),
                     quality_preference_step=(
                         selected_decision.preference_step
                         if selected_decision is not None
@@ -796,9 +1175,7 @@ class DownloadOrchestrator:
             await self._finish_no_candidates(job.id, task)
             return False
 
-        for source in self._source_priority:
-            if not self._source_enabled(source):
-                continue
+        for source in self._ordered_enabled_sources():
             candidates = await self._search_and_score(task, source, snapshot=snapshot)
             remembered.append(candidates)
             logger.info(
@@ -833,7 +1210,7 @@ class DownloadOrchestrator:
                     source_directory=selected.parent_directory,
                     preflight_score=selected.final_score,
                     source=selected.source,
-                    download_client=_CLIENT_FOR_SOURCE.get(selected.source, "slskd"),
+                    download_client=self._client_for_source(selected.source),
                     quality_preference_step=(
                         selected_decision.preference_step
                         if selected_decision is not None
@@ -867,16 +1244,40 @@ class DownloadOrchestrator:
         await self._finish_no_candidates(job.id, task)
         return False
 
+    def _client_for_source(self, source: str) -> str:
+        if source in _CLIENT_FOR_SOURCE:
+            return _CLIENT_FOR_SOURCE[source]
+        if source and source.startswith("plugin:"):
+            registry = self._plugin_sources
+            if registry is not None:
+                try:
+                    spec = registry.spec_for(source)
+                except Exception:  # noqa: BLE001 - absence reads as unknown
+                    spec = None
+                if spec is not None:
+                    return source
+            raise OrchestrationError(f"Unknown source {source}")
+        if not source:
+            raise OrchestrationError(self._no_source_message())
+        raise OrchestrationError(f"Unknown source {source}")
+
     def _strategy(self, source: str) -> SourceStrategy:
-        """The strategy for a source, falling back to Soulseek for an unknown/disabled
-        source. This preserves the old ``_download_client_for`` fallback (a Usenet task with
-        no SABnzbd client resolved to the slskd client): the Usenet strategy exists iff a
-        SABnzbd client exists, so a missing one falls through to Soulseek's client here."""
-        return self._strategies.get(source) or self._strategies["soulseek"]
+        """The strategy for a source. Unknown/None raises instead of falling back."""
+        if not source:
+            raise OrchestrationError(self._no_source_message())
+        strat = self._strategies.get(source)
+        if strat is not None:
+            return strat
+        ensured = self._ensure_plugin_strategy(source)
+        if ensured is not None:
+            return ensured
+        raise OrchestrationError(f"Unknown source {source}")
 
     def _candidate_source_identity(self, candidate) -> str:  # noqa: ANN001
         """Return the source-owned identity used to skip a failed candidate."""
-        source = getattr(candidate, "source", "soulseek") or "soulseek"
+        source = getattr(candidate, "source", None) or None
+        if not source:
+            raise OrchestrationError(self._no_source_message())
         return self._strategy(source).candidate_identity(candidate)
 
     def _download_client_for(self, task) -> "DownloadClientProtocol":  # noqa: ANN001
@@ -931,13 +1332,59 @@ class DownloadOrchestrator:
         if task.candidate_index is None or task.candidate_index >= len(candidates):
             raise OrchestrationError("candidate no longer available")
         candidate = candidates[task.candidate_index]
-        await self._strategies[task.source].enqueue(
-            task,
-            candidate,
-            strict_track_duration=strict_track_duration,
-            hold_on_wrong_track=hold_on_wrong_track,
-            remaining_positions=remaining_positions,
-        )
+        strategy = self._strategy(task.source)
+        # A down slskd cannot enqueue, and failing over to another slskd peer is
+        # pointless (#399): wait through a client outage and retry the SAME
+        # candidate instead of failing or failing over.
+        outage_active = False
+        outage_started_at = 0.0
+        outage_client = getattr(strategy.client, "client_name", None) or task.source
+        while True:
+            try:
+                await strategy.enqueue(
+                    task,
+                    candidate,
+                    strict_track_duration=strict_track_duration,
+                    hold_on_wrong_track=hold_on_wrong_track,
+                    remaining_positions=remaining_positions,
+                )
+            except OrchestrationError as exc:
+                if not _has_outage_cause(exc):
+                    raise
+                if not outage_active:
+                    outage_active = True
+                    outage_started_at = asyncio.get_running_loop().time()
+                    logger.warning(
+                        "download.client_outage",
+                        extra={"task_id": task.id, "client": outage_client},
+                    )
+                    await self._bus.publish(
+                        f"download:{task.id}",
+                        "client_outage",
+                        {
+                            "client": outage_client,
+                            "message": (
+                                "Download client unavailable - "
+                                "waiting for it to recover"
+                            ),
+                        },
+                    )
+                await asyncio.sleep(self._poll_interval)
+                current = await self._store.get_task(task.id)
+                if current is not None and current.status == DownloadStatus.CANCELLED:
+                    raise _Cancelled()
+                continue
+            if outage_active:
+                logger.info(
+                    "download.client_recovered",
+                    extra={
+                        "task_id": task.id,
+                        "client": outage_client,
+                        "outage_seconds": asyncio.get_running_loop().time()
+                        - outage_started_at,
+                    },
+                )
+            return
 
     async def _poll_until_done(self, task, *, expect_materialization: bool = False):  # noqa: ANN001, ANN201
         """Poll slskd until the transfer terminates, stalls, or hits the ceiling.
@@ -961,15 +1408,88 @@ class DownloadOrchestrator:
         last_status = None
         slot_held = False
         preferred_deadline = task.preferred_quality_fallback_at
+        # A brief download-client outage (slskd restart/rescan, #399) pauses this
+        # loop instead of failing the task: the watchdog is frozen, the 6h ceiling
+        # is extended by the outage, and one bus event marks the stretch.
+        outage_active = False
+        outage_started_at = 0.0
+        outage_client = getattr(client, "client_name", None) or task.source
         try:
-            while loop.time() < deadline:
+            while True:
+                if loop.time() >= deadline:
+                    if last_status is None:
+                        # The ceiling expired without one reachable poll (a client
+                        # outage covered the window, #399): extend the ceiling and
+                        # keep waiting instead of failing on the last read.
+                        try:
+                            last_status = await client.get_status(handle)
+                        except Exception as exc:  # noqa: BLE001 - outage probe inspects any client failure
+                            if not _is_download_client_outage(exc):
+                                raise
+                            last_progress_time = loop.time()
+                            deadline += self._poll_interval
+                            await asyncio.sleep(self._poll_interval)
+                            current = await self._store.get_task(task.id)
+                            if (
+                                current is not None
+                                and current.status == DownloadStatus.CANCELLED
+                            ):
+                                raise _Cancelled()
+                            continue
+                    return _OUT_DEADLINE, last_status
                 # An out-of-band cancel (cancel_task) may have set status='cancelled'
                 # since this loop started - stop before processing so the import can't
                 # proceed against an explicit cancel.
                 current = await self._store.get_task(task.id)
                 if current is not None and current.status == DownloadStatus.CANCELLED:
                     raise _Cancelled()
-                status = await client.get_status(handle)
+                try:
+                    status = await client.get_status(handle)
+                except Exception as exc:  # noqa: BLE001 - outage probe inspects any client failure
+                    if not _is_download_client_outage(exc):
+                        raise
+                    # Skip this poll: freeze the watchdog so outage idle never trips
+                    # the stall/queued timeouts, then wait out the blip.
+                    last_progress_time = loop.time()
+                    if not outage_active:
+                        outage_active = True
+                        outage_started_at = last_progress_time
+                        logger.warning(
+                            "download.client_outage",
+                            extra={"task_id": task.id, "client": outage_client},
+                        )
+                        await self._bus.publish(
+                            f"download:{task.id}",
+                            "client_outage",
+                            {
+                                "client": outage_client,
+                                "message": (
+                                    "Download client unavailable - "
+                                    "waiting for it to recover"
+                                ),
+                            },
+                        )
+                    pause_started = loop.time()
+                    await asyncio.sleep(self._poll_interval)
+                    # Outage time never consumes the 6h transfer budget.
+                    deadline += loop.time() - pause_started
+                    current = await self._store.get_task(task.id)
+                    if (
+                        current is not None
+                        and current.status == DownloadStatus.CANCELLED
+                    ):
+                        raise _Cancelled()
+                    continue
+                if outage_active:
+                    outage_active = False
+                    logger.info(
+                        "download.client_recovered",
+                        extra={
+                            "task_id": task.id,
+                            "client": outage_client,
+                            "outage_seconds": loop.time() - outage_started_at,
+                        },
+                    )
                 last_status = status
                 # Concurrency cap: take a slot the moment this transfer is actively
                 # moving bytes, and hold it until the loop exits. A purely queued
@@ -1066,9 +1586,6 @@ class DownloadOrchestrator:
                     ):
                         return _OUT_QUEUED, status
                 await asyncio.sleep(self._poll_interval)
-            if last_status is None:
-                last_status = await client.get_status(handle)
-            return _OUT_DEADLINE, last_status
         finally:
             if slot_held:
                 self._download_slots.release()
@@ -1084,12 +1601,56 @@ class DownloadOrchestrator:
         if task.source != "soulseek":
             return
         manifest = self._read_manifest(task.id)
-        try:
-            aborted = await self._download_client_for(task).abort(manifest.handle)
-        except Exception as exc:  # noqa: BLE001 - repository errors stay internal
-            raise OrchestrationError("could not switch sources safely") from exc
-        if not aborted:
-            raise OrchestrationError("could not switch sources safely")
+        client = self._download_client_for(task)
+        # Aborting needs a live slskd (#399): wait through a client outage and
+        # retry the SAME abort instead of failing the switch.
+        outage_active = False
+        outage_started_at = 0.0
+        outage_client = getattr(client, "client_name", None) or task.source
+        while True:
+            try:
+                aborted = await client.abort(manifest.handle)
+            except Exception as exc:  # noqa: BLE001 - outage probe inspects any client failure
+                if not _is_download_client_outage(exc):
+                    raise OrchestrationError(
+                        "could not switch sources safely"
+                    ) from exc
+                if not outage_active:
+                    outage_active = True
+                    outage_started_at = asyncio.get_running_loop().time()
+                    logger.warning(
+                        "download.client_outage",
+                        extra={"task_id": task.id, "client": outage_client},
+                    )
+                    await self._bus.publish(
+                        f"download:{task.id}",
+                        "client_outage",
+                        {
+                            "client": outage_client,
+                            "message": (
+                                "Download client unavailable - "
+                                "waiting for it to recover"
+                            ),
+                        },
+                    )
+                await asyncio.sleep(self._poll_interval)
+                current = await self._store.get_task(task.id)
+                if current is not None and current.status == DownloadStatus.CANCELLED:
+                    raise _Cancelled()
+                continue
+            if outage_active:
+                logger.info(
+                    "download.client_recovered",
+                    extra={
+                        "task_id": task.id,
+                        "client": outage_client,
+                        "outage_seconds": asyncio.get_running_loop().time()
+                        - outage_started_at,
+                    },
+                )
+            if not aborted:
+                raise OrchestrationError("could not switch sources safely")
+            return
 
     async def _run_with_failover(self, task, *, resume: bool = False) -> None:  # noqa: ANN001
         """Drive a task through enqueue -> poll -> harvest, failing over to the next
@@ -1100,6 +1661,7 @@ class DownloadOrchestrator:
         from services.native.file_processor import (
             DOWNLOADS_MOUNT_UNAVAILABLE,
             IMPORT_FAILED,
+            SIZE_MISMATCH,
             SOURCE_FILE_MISSING,
             WRONG_TRACK,
         )
@@ -1112,6 +1674,7 @@ class DownloadOrchestrator:
         source_missing = False
         import_failed = False
         tag_mismatch = False
+        target_occupied = False
         # Per-file failover (#292): (disc, track) positions still missing after the
         # last attempt; consumed by the next iteration's enqueue so the following
         # candidate is asked for ONLY the missing tracks instead of the whole album.
@@ -1244,8 +1807,25 @@ class DownloadOrchestrator:
                 attempt_mount = not result.succeeded and any(
                     f.reason == DOWNLOADS_MOUNT_UNAVAILABLE for f in result.failed
                 )
+                # SIZE_MISMATCH joins the local-fault family (#397): the bytes
+                # on disk don't match what slskd advertised - a stale copy or
+                # partial write on our mount, never proof the peer is bad
+                # (file_processor already treats it as non-quarantine local
+                # fault). Skipping the release-blame block never stops
+                # failover: the loop below still advances to the next
+                # candidate, so a genuinely wrong-size delivery from the
+                # delivering peer fails over instead of looping here.
+                # TARGET_OCCUPIED joins the local-fault family (#418): the peer
+                # delivered a verified file and the occupying bytes are ours, so
+                # the source must not be blocklisted for the collision.
                 attempt_import_fault = any(
-                    f.reason in (IMPORT_FAILED, SOURCE_FILE_MISSING)
+                    f.reason
+                    in (
+                        IMPORT_FAILED,
+                        SOURCE_FILE_MISSING,
+                        SIZE_MISMATCH,
+                        TARGET_OCCUPIED,
+                    )
                     for f in result.failed
                 )
                 if any(f.reason == WRONG_TRACK for f in result.failed):
@@ -1254,6 +1834,8 @@ class DownloadOrchestrator:
                     source_missing = True
                 if any(f.reason == IMPORT_FAILED for f in result.failed):
                     import_failed = True
+                if any(f.reason == TARGET_OCCUPIED for f in result.failed):
+                    target_occupied = True
                 if any(f.reason == "tag_mismatch" for f in result.failed):
                     tag_mismatch = True
                 if result.management_hold_reason_code is not None:
@@ -1426,6 +2008,7 @@ class DownloadOrchestrator:
                     imported_any,
                     source_missing=source_missing,
                     import_failed=import_failed,
+                    target_occupied=target_occupied,
                     tag_mismatch=tag_mismatch,
                     process_result=attempt_result,
                 )
@@ -1522,7 +2105,7 @@ class DownloadOrchestrator:
             cand.parent_directory,
             cand.final_score,
             source=cand.source,
-            download_client=_CLIENT_FOR_SOURCE.get(cand.source, "slskd"),
+            download_client=self._client_for_source(cand.source),
             quality_preference_step=(
                 decision.preference_step if decision is not None else None
             ),
@@ -1586,8 +2169,79 @@ class DownloadOrchestrator:
             if manifest_override is not None
             else self._read_manifest(task.id)
         )
-        return await self._strategies[task.source].import_files(
+        result, enumerated = await self._strategy(task.source).import_files(
             task, manifest, only_filenames=only_filenames, completed=completed
+        )
+        await self._maybe_record_wrong_product_verdict(task, result)
+        await self._maybe_record_folder_exclusion(task, result)
+        return result, enumerated
+
+    async def _maybe_record_folder_exclusion(self, task, result) -> None:  # noqa: ANN001, ANN201
+        """Slice 3: when an album import proves a Soulseek folder's CONTENT
+        wrong (nothing imported, every failure content-proof), exclude the
+        folder's normalized album identity so failover and future searches
+        stop re-grabbing the same wrong product from other peers. RG-scoped
+        by construction (the RG is in the key), TTL-bounded, and cleared by
+        manual retry/re-request. Usenet needs none of this: per-file rows
+        already name the NZB release identity."""
+        if getattr(task, "source", None) != SOURCE_SOULSEEK:
+            return
+        if getattr(task, "download_type", "album") != "album":
+            return
+        if result.succeeded or len(result.failed) < 2:
+            return
+        if any(
+            failure.reason not in _CONTENT_PROOF_FAILURES for failure in result.failed
+        ):
+            return
+        if not task.release_group_mbid or not task.source_directory:
+            return
+        normalized = normalize_folder_identity(
+            task.source_directory,
+            artist_words=artist_words(task.artist_name),
+        )
+        if not normalized:
+            return
+        await self._store.record_quarantine(
+            source=SOURCE_SOULSEEK,
+            identity=soulseek_folder_identity(task.release_group_mbid, normalized),
+            reason="verify_failed",
+            release_group_mbid=task.release_group_mbid,
+        )
+        logger.info(
+            "download.folder_excluded",
+            extra={
+                "task_id": task.id,
+                "folder": normalized,
+                "files": len(result.failed),
+            },
+        )
+
+    async def _maybe_record_wrong_product_verdict(self, task, result) -> None:  # noqa: ANN001, ANN201
+        """Slice 2: collapse a uniformly tag-failed album import into one
+        wrong-product verdict (first one wins; the store guards the write).
+        Gated to album tasks with nothing imported and at least two processed
+        files, so single-file held tracks and partial grace-period imports
+        keep the normal per-track path. ``files_completed`` reads the passed
+        task object (possibly mid-loop stale); a stale zero only ever adds an
+        actionable card, and discard-verdict never touches library rows."""
+        if getattr(task, "download_type", "album") != "album":
+            return
+        if result.succeeded or len(result.failed) < 2:
+            return
+        if getattr(task, "files_completed", 0):
+            return
+        if any(failure.reason != "tag_mismatch" for failure in result.failed):
+            return
+        detail = task.source_directory or task.source_username
+        await self._store.record_wrong_product_verdict(task.id, detail)
+        logger.info(
+            "download.wrong_product_verdict",
+            extra={
+                "task_id": task.id,
+                "files": len(result.failed),
+                "grabbed": detail,
+            },
         )
 
     async def _schedule_attempt_cleanup(
@@ -1811,11 +2465,33 @@ class DownloadOrchestrator:
             return None
         candidates = await self._store.get_search_job_candidates(task.search_job_id)
 
+        # Wrong-product exclusions (Slice 3): consulted fresh per call because a
+        # just-failed attempt records its folder between failover steps. Ranked
+        # candidates predate the exclusion, so the rank-time consult cannot help.
+        # Loaded for any task with an album identity, not only Soulseek tasks: the
+        # cross-source pass below can move a Usenet task onto a Soulseek folder.
+        folder_blocked: set[tuple[str, str]] | None = None
+        folder_artist: frozenset[str] = frozenset()
+        if getattr(task, "release_group_mbid", None):
+            folder_blocked = await self._store.load_quarantine_set()
+            folder_artist = artist_words(getattr(task, "artist_name", ""))
+
         # Async because the quality re-gate reads the task's STORED snapshot; the
         # closure keeps the two candidate walks below to one eligibility rule.
         async def eligible(cand) -> bool:  # noqa: ANN001 - ScoredCandidate
             if self._candidate_source_identity(cand) in tried_usernames:
                 return False
+            if folder_blocked is not None and cand.source == SOURCE_SOULSEEK:
+                normalized = normalize_folder_identity(
+                    cand.parent_directory, artist_words=folder_artist
+                )
+                if normalized and (
+                    SOURCE_SOULSEEK,
+                    soulseek_folder_identity(
+                        task.release_group_mbid, normalized
+                    ),
+                ) in folder_blocked:
+                    return False
             # re-gate: failover must not fall through to a now out-of-policy candidate (D2)
             if not await self._candidate_passes_quality(task, cand):
                 return False
@@ -1949,7 +2625,7 @@ class DownloadOrchestrator:
             candidate.parent_directory,
             candidate.final_score,
             source=candidate.source,
-            download_client=_CLIENT_FOR_SOURCE.get(candidate.source, "slskd"),
+            download_client=self._client_for_source(candidate.source),
             quality_preference_step=(
                 decision.preference_step if decision is not None else None
             ),
@@ -2096,19 +2772,31 @@ class DownloadOrchestrator:
         self, task, *, context: str
     ) -> "tuple[int, int, list[str]] | None":  # noqa: ANN001
         """``(covered, expected_total, orphan_row_ids)`` for an album task, measured
-        against the requested release's MusicBrainz tracklist - or ``None`` when the
-        tracklist is unavailable (MB down, no album service wired, empty/free-text
-        release group), falling the caller back to the count check. Each expected
-        track is covered by at most one library row (recording MBID -> position +
-        duration -> containment title, via ``row_covers_track``); rows covering
-        nothing are the ORPHANS the ``download.coverage`` event surfaces (P4/P5).
-        Fail-open by design: coverage is an upgrade over counting, never a blocker."""
+        against the task's PINNED edition - or ``None`` when the tracklist is
+        unavailable (MB down, no album service wired, empty/free-text release
+        group), falling the caller back to the count check. The pinned edition
+        (never the local-preferring release-group resolver) is the denominator:
+        measuring against the library's own tracklist lets one imported row
+        satisfy the gate. Each expected track is covered by at most one library
+        row (recording MBID -> position + duration -> containment title, via
+        ``row_covers_track``); rows covering nothing are the ORPHANS the
+        ``download.coverage`` event surfaces (P4/P5). Fail-open by design:
+        coverage is an upgrade over counting, never a blocker."""
         if self._album_service is None or not task.release_group_mbid:
             return None
         try:
-            info = await self._album_service.get_album_tracks_info(
-                task.release_group_mbid, priority=RequestPriority.BACKGROUND_SYNC
-            )
+            if task.release_mbid:
+                info = await self._album_service.get_exact_edition_tracks_info(
+                    task.release_group_mbid,
+                    task.release_mbid,
+                    priority=RequestPriority.BACKGROUND_SYNC,
+                )
+            else:
+                # Legacy task with no pinned edition: the release-group resolver
+                # as before.
+                info = await self._album_service.get_album_tracks_info(
+                    task.release_group_mbid, priority=RequestPriority.BACKGROUND_SYNC
+                )
         except Exception:  # noqa: BLE001 - MB failure must never block completion
             logger.warning(
                 "coverage.tracklist_unavailable",
@@ -2118,7 +2806,7 @@ class DownloadOrchestrator:
                 },
             )
             return None
-        tracks = list(info.tracks or [])
+        tracks = audio_tracks(list(info.tracks or []))
         if not tracks:
             return None
         try:
@@ -2133,6 +2821,7 @@ class DownloadOrchestrator:
             extra={
                 "task_id": task.id,
                 "context": context,
+                "release_mbid": task.release_mbid,
                 "expected": len(tracks),
                 "covered": covered,
                 "orphan_row_ids": orphans,
@@ -2173,7 +2862,11 @@ class DownloadOrchestrator:
         family, 2026-08): a CLEAN full delivery of the attempt's whole manifest while
         the requested release-group has ZERO library rows means the rows were stamped
         under a different RG (import-time identity drift) - holding that against the
-        download loops failover + whole-album re-downloads forever. Rows PRESENT but
+        download loops failover + whole-album re-downloads forever. Bonus extras
+        don't veto it (#397): with the exact-edition map present every success
+        consumes a distinct expected position at import, so succeeded >= the
+        requested count means every requested track verified and the leftover
+        failures are non-requested extras, not under-delivery. Rows PRESENT but
         short or mismatched keep the full P4 veto: a wrong file at a covered position
         must never satisfy a request (the 2026-07-05 wrong-single incident), and an
         edition tracklist with bonus tracks keeps failing over for a fuller source.
@@ -2199,7 +2892,6 @@ class DownloadOrchestrator:
                 covered == 0
                 and result is not None
                 and result.succeeded
-                and not result.failed
                 and result.management_hold_reason_code is None
             ):
                 try:
@@ -2207,8 +2899,10 @@ class DownloadOrchestrator:
                     # NZBs are opaque: Usenet manifests carry no target_files, so
                     # fall back to the exact-edition tracklist for the asked count.
                     asked = len(manifest.target_files) or len(manifest.expected_tracks)
+                    requested = len(manifest.expected_tracks)
                 except OrchestrationError:
                     asked = None
+                    requested = 0
                 rows = []
                 if asked is not None:
                     try:
@@ -2220,10 +2914,27 @@ class DownloadOrchestrator:
                 # A candidate folder smaller than the requested tracklist UNDER-
                 # DELIVERED even when it published cleanly: 'everything asked of THIS
                 # source' is not 'everything requested' (whole-album-repull guard).
+                # Bonus extras (#397) are the mirror case: a folder holding MORE
+                # than the requested edition verifies every requested track and
+                # fails only its non-requested extras. Each success consumes a
+                # distinct expected position at import, so succeeded >= the
+                # requested count proves the request whole - the extra failures
+                # alone must not force failover.
+                full_request_verified = bool(requested) and len(
+                    result.succeeded
+                ) >= requested
                 if (
                     asked is not None
                     and not rows
-                    and len(result.succeeded) >= asked
+                    and (
+                        (not result.failed and len(result.succeeded) >= asked)
+                        or (
+                            full_request_verified
+                            and not (
+                                task.track_count and requested < task.track_count
+                            )
+                        )
+                    )
                     and not (task.track_count and asked < task.track_count)
                 ):
                     logger.info(
@@ -2254,6 +2965,7 @@ class DownloadOrchestrator:
         *,
         source_missing: bool = False,
         import_failed: bool = False,
+        target_occupied: bool = False,
         tag_mismatch: bool = False,
         process_result=None,
     ) -> None:
@@ -2261,16 +2973,21 @@ class DownloadOrchestrator:
         either imported (already finalized 'completed') or it didn't ('failed'); an
         album keeps whatever landed as 'partial', or 'failed' if nothing did.
 
-        ``source_missing``/``import_failed``/``tag_mismatch`` flip the failure message
-        off the default 'no source on Soulseek': slskd delivered the files but we either
-        couldn't find them on the mount (config), couldn't write them into the library
-        (perms/disk), or found files whose embedded tags identify different music.
-        Local faults take precedence over a content mismatch, and both take precedence
-        over the generic no-source message."""
+        ``source_missing``/``import_failed``/``target_occupied``/``tag_mismatch`` flip
+        the failure message off the default 'no source on Soulseek': slskd delivered
+        the files but we either couldn't find them on the mount (config), couldn't
+        write them into the library (perms/disk), found the library path occupied by
+        a file this release does not own (collision - held for review), or found
+        files whose embedded tags identify different music. Precedence is
+        source_missing -> import_failed -> target_occupied -> tag_mismatch -> default:
+        a collision means local bytes block the path, so re-search cannot fix it and
+        the message must never read as an availability failure."""
         if source_missing:
             fail_msg = _FILES_NOT_FOUND_MSG
         elif import_failed:
             fail_msg = _IMPORT_FAILED_MSG
+        elif target_occupied:
+            fail_msg = _TARGET_OCCUPIED_MSG
         elif tag_mismatch:
             fail_msg = _TAG_MISMATCH_MSG
         else:
@@ -2440,6 +3157,12 @@ class DownloadOrchestrator:
         )
         await self._notify_completion(task)
         await self._sync_request_on_terminal(task, status)
+        if status in (DownloadStatus.COMPLETED, DownloadStatus.PARTIAL):
+            self._emit_import_finished(
+                release_group_mbid=getattr(task, "release_group_mbid", "") or "",
+                track_count=present,
+                source=getattr(task, "source", "") or "",
+            )
 
     async def _sync_request_on_terminal(self, task, status: str) -> None:  # noqa: ANN001
         """Bridge a terminal download status into its exact request generation."""
@@ -2502,6 +3225,12 @@ class DownloadOrchestrator:
             )
             if changed is False:
                 return
+            if new_status == "imported":
+                self._emit_request_fulfilled(
+                    request_id=getattr(record, "musicbrainz_id", ""),
+                    user_id=getattr(record, "user_id", "") or "",
+                    release_group_mbid=getattr(task, "release_group_mbid", "") or getattr(record, "musicbrainz_id", ""),
+                )
             # An import (full or partial) added library files - bust the
             # album/library caches and materialise the row for the UI.
             if new_status in ("imported", "incomplete") and self._on_import is not None:
@@ -2521,6 +3250,23 @@ class DownloadOrchestrator:
                 "final_path": final.final_path if final else None,
             },
         )
+        status = getattr(final, "status", None) or getattr(task, "status", "")
+        if status == DownloadStatus.FAILED:
+            self._emit_download(
+                task_id=task.id,
+                user_id=getattr(task, "user_id", ""),
+                release_group_mbid=getattr(task, "release_group_mbid", "") or "",
+                source=getattr(task, "source", "") or "",
+                outcome="failed",
+            )
+        elif status in (DownloadStatus.COMPLETED, DownloadStatus.PARTIAL):
+            self._emit_download(
+                task_id=task.id,
+                user_id=getattr(task, "user_id", ""),
+                release_group_mbid=getattr(task, "release_group_mbid", "") or "",
+                source=getattr(task, "source", "") or "",
+                outcome="completed" if status == DownloadStatus.COMPLETED else "partial",
+            )
 
     async def reap_stale_tasks(self) -> None:
         """Periodic safety net: fail tasks whose in-process poll loop died (a crash,
@@ -2564,6 +3310,13 @@ class DownloadOrchestrator:
                 f"download:{task.id}",
                 "complete",
                 {"status": DownloadStatus.FAILED, "error": "download interrupted"},
+            )
+            self._emit_download(
+                task_id=task.id,
+                user_id=getattr(task, "user_id", ""),
+                release_group_mbid=getattr(task, "release_group_mbid", "") or "",
+                source=getattr(task, "source", "") or "",
+                outcome="failed",
             )
             await self._sync_request_on_terminal(task, DownloadStatus.FAILED)
             logger.warning(
@@ -2625,10 +3378,12 @@ class DownloadOrchestrator:
         except OrchestrationError as exc:
             logger.warning("Resume failed for task %s: %s", task_id, exc)
             await self._fail_task_preserving_attempt(task_id, _user_error_message(exc))
+            self._emit_download(task_id=task_id, outcome="failed")
             await self._sync_request_on_terminal(task, DownloadStatus.FAILED)
         except Exception as exc:  # noqa: BLE001 - resume failure -> mark failed
             logger.exception("Failed to resume task %s", task_id)
             await self._fail_task_preserving_attempt(task_id, _user_error_message(exc))
+            self._emit_download(task_id=task_id, outcome="failed")
             await self._sync_request_on_terminal(task, DownloadStatus.FAILED)
 
     async def try_next_source(
@@ -2750,6 +3505,13 @@ class DownloadOrchestrator:
                         f"download:{task.id}",
                         "complete",
                         {"status": DownloadStatus.FAILED, "error": message},
+                    )
+                    self._emit_download(
+                        task_id=task.id,
+                        user_id=getattr(task, "user_id", ""),
+                        release_group_mbid=getattr(task, "release_group_mbid", "") or "",
+                        source=getattr(task, "source", "") or "",
+                        outcome="failed",
                     )
                     await self._sync_request_on_terminal(task, DownloadStatus.FAILED)
                     raise OrchestrationError(message) from error
@@ -3069,6 +3831,8 @@ class DownloadOrchestrator:
                     fail_msg = _FILES_NOT_FOUND_MSG
                 elif any(f.reason == IMPORT_FAILED for f in result.failed):
                     fail_msg = _IMPORT_FAILED_MSG
+                elif any(f.reason == TARGET_OCCUPIED for f in result.failed):
+                    fail_msg = _TARGET_OCCUPIED_MSG
                 elif any(f.reason == "tag_mismatch" for f in result.failed):
                     fail_msg = _TAG_MISMATCH_MSG
                 else:
@@ -3080,7 +3844,7 @@ class DownloadOrchestrator:
                     process_result=result,
                     manifest_override=manifest,
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001 - reimport boundary finalizes FAILED instead of raising
             logger.exception("Unexpected error during reimport of task %s", task.id)
             await self._schedule_attempt_cleanup(task, manifest, disposition="preserve")
             await self._finalize(

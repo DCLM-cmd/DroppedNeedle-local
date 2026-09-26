@@ -231,3 +231,33 @@ async def test_child_advertises_transcoded_fields_when_available(streaming_env, 
     )["subsonic-response"]["song"]
     assert song["transcodedSuffix"] == "mp3"
     assert song["transcodedContentType"] == "audio/mpeg"
+
+
+# ----- plugin download fallback: local miss behaves exactly like _stream -----
+
+async def test_download_falls_back_to_plugin_on_local_miss(streaming_env, monkeypatch):
+    import services.compat.plugin_stream_service as pss
+    from fastapi.responses import Response
+
+    class _Svc:
+        async def resolve(self, mbid, user_id):
+            return {"url": "http://93.184.216.34/fallback.mp3"}
+
+    monkeypatch.setattr(pss, "get_plugin_stream_service", lambda: _Svc())
+
+    async def _fake_ref(**kwargs):
+        return Response(content=b"plugin-bytes", media_type="audio/mpeg")
+
+    monkeypatch.setattr(pss, "stream_plugin_ref_response", _fake_ref)
+    r = streaming_env.client.get(
+        "/subsonic/rest/download", params=_q(streaming_env, id="tr-missing-track"),
+    )
+    assert r.status_code == 200
+    assert r.content == b"plugin-bytes"
+
+
+async def test_download_missing_without_plugin_is_404(streaming_env):
+    r = streaming_env.client.get(
+        "/subsonic/rest/download", params=_q(streaming_env, id="tr-missing-track"),
+    )
+    assert r.status_code == 404

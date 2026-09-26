@@ -13,12 +13,14 @@ import stat
 from pathlib import Path, PurePosixPath
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import msgspec
 import pytest
 
 from api.v1.schemas.library_management import (
+    LEGACY_DEFAULT_SIDECAR_PATTERNS,
     LibraryManagementRootAssignment,
     LibraryManagementRootOverrides,
     NamingScriptSettings,
@@ -48,6 +50,10 @@ from infrastructure.audio.metadata_engine import (
 from infrastructure.library_management_blob_store import LibraryManagementBlobStore
 from services.native.audio_write_planning_service import AudioWritePlanningService
 from services.native.library_filesystem_coordinator import LibraryFilesystemCoordinator
+from services.native.edition_conversion_service import EditionConversionService
+from services.native.library_management_preview_service import (
+    LibraryManagementPreviewService,
+)
 from services.native.library_management_baseline_service import (
     LibraryManagementBaselineService,
 )
@@ -1506,6 +1512,14 @@ async def test_automatic_import_commits_identity_baseline_undo_and_history(
 async def test_edition_conversion_apply_and_undo_restore_a_different_track_set(
     tmp_path: Path,
 ) -> None:
+    # Step 1.9 deliberate expectation change (OWNER RULING 2026-09-07 option
+    # (a): guard stands): the old assertions pinned the F-05 bug by expecting
+    # the automatic edition-conversion commit to overwrite the seeded `manual`
+    # album/track identities with the re-downloaded MBIDs. The guarded
+    # `_commit_automatic_import_management_tx` skips protected rows (no
+    # downgrade of `decision_source`, no revision bump) and files a
+    # `MANUAL_IDENTITY_STALE_IMPORT` review instead (05-tests.md
+    # deliberate-expectation-change mechanism).
     root, source, preferences, store, _settings_revision, policy_revision = _configured(
         tmp_path
     )
@@ -1829,6 +1843,28 @@ async def test_edition_conversion_apply_and_undo_restore_a_different_track_set(
         now=105.0,
     )
 
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        seed_album_identities = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_album_external_identities "
+                "WHERE local_album_id = 'album-1'"
+            )
+        ]
+        seed_track_identities = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_track_external_identities "
+                "WHERE local_track_id IN ('track-1', 'track-2') "
+                "ORDER BY local_track_id"
+            )
+        ]
+    assert len(seed_album_identities) == 1
+    assert len(seed_track_identities) == 2
+    assert {row["decision_source"] for row in seed_album_identities} == {"manual"}
+    assert {row["decision_source"] for row in seed_track_identities} == {"manual"}
+
     await service.publish_import_bundle(bundle)
 
     after_apply = await store.get_target_album_tracks(
@@ -1849,14 +1885,49 @@ async def test_edition_conversion_apply_and_undo_restore_a_different_track_set(
     assert not second_source.exists()
     assert (root / "Converted/01 Exact Track 1.flac").is_file()
     assert (root / "Converted/02 Exact Track 2.flac").is_file()
-    exact_identity = await store.get_accepted_library_management_identity(
+    preserved_identity = await store.get_accepted_library_management_identity(
         "album-1", local_track_ids=("track-1", acquired_track_id)
     )
-    assert exact_identity is not None
-    assert exact_identity.release_mbid == target_release
-    assert {value.release_track_mbid for value in exact_identity.tracks} == set(
-        target_release_tracks
+    assert preserved_identity is not None
+    assert preserved_identity.release_mbid == "aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b"
+    assert {
+        value.local_track_id: value.release_track_mbid
+        for value in preserved_identity.tracks
+    } == {
+        "track-1": "22222222-2222-4222-8222-222222222222",
+        acquired_track_id: target_release_tracks[1],
+    }
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        assert [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_album_external_identities "
+                "WHERE local_album_id = 'album-1'"
+            )
+        ] == seed_album_identities
+        assert [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_track_external_identities "
+                "WHERE local_track_id IN ('track-1', 'track-2') "
+                "ORDER BY local_track_id"
+            )
+        ] == seed_track_identities
+        stale_reviews = list(
+            connection.execute(
+                "SELECT local_album_id, state, reason_code, input_revision "
+                "FROM library_identification_reviews "
+                "WHERE reason_code = 'MANUAL_IDENTITY_STALE_IMPORT'"
+            )
+        )
+    assert len(stale_reviews) == 1
+    assert tuple(stale_reviews[0][:3]) == (
+        "album-1",
+        "needs_review",
+        "MANUAL_IDENTITY_STALE_IMPORT",
     )
+    assert str(stale_reviews[0][3]).startswith("automatic-import:")
     source_snapshot = await store.get_library_management_job_snapshot(preview_job_id)
     assert source_snapshot is not None
     assert len(await store.list_management_operation_snapshots(preview_job_id)) == 3
@@ -1920,37 +1991,53 @@ async def test_edition_conversion_apply_and_undo_restore_a_different_track_set(
         clock=lambda: 125.0,
     )
 
-    await undo_publisher.publish_bundle(
-        undo_preview.job_id,
-        int(work["ordinal"]),
-        "conversion-undo-apply-worker",
-    )
+    with pytest.raises(
+        StaleRevisionError, match="accepted MusicBrainz mapping changed"
+    ):
+        await undo_publisher.publish_bundle(
+            undo_preview.job_id,
+            int(work["ordinal"]),
+            "conversion-undo-apply-worker",
+        )
 
-    after_undo = await store.get_target_album_tracks(
-        "album-1", include_unavailable=True
-    )
-    assert {
-        str(value["id"]) for value in after_undo if value["availability"] == "indexed"
-    } == {"track-1", "track-2"}
-    assert (
-        next(value for value in after_undo if value["id"] == acquired_track_id)[
-            "availability"
-        ]
-        == "missing"
-    )
-    assert source.is_file()
-    assert second_source.is_file()
-    assert not (root / "Converted/01 Exact Track 1.flac").exists()
-    assert not (root / "Converted/02 Exact Track 2.flac").exists()
-    restored_identity = await store.get_accepted_library_management_identity(
+    preserved_after_rejection = await store.get_accepted_library_management_identity(
         "album-1", local_track_ids=("track-1", "track-2")
     )
-    assert restored_identity is not None
-    assert restored_identity.release_mbid == "aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b"
-    assert {value.release_track_mbid for value in restored_identity.tracks} == {
+    assert preserved_after_rejection is not None
+    assert (
+        preserved_after_rejection.release_mbid == "aff0622e-7bd3-4fb6-9ca3-0fa19dd2340b"
+    )
+    assert {value.release_track_mbid for value in preserved_after_rejection.tracks} == {
         "22222222-2222-4222-8222-222222222222",
         "66666666-6666-4666-8666-666666666666",
     }
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        assert [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_album_external_identities "
+                "WHERE local_album_id = 'album-1'"
+            )
+        ] == seed_album_identities
+        assert [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_track_external_identities "
+                "WHERE local_track_id IN ('track-1', 'track-2') "
+                "ORDER BY local_track_id"
+            )
+        ] == seed_track_identities
+        rejection_reviews = list(
+            connection.execute(
+                "SELECT state, reason_code "
+                "FROM library_identification_reviews "
+                "WHERE reason_code = 'MANUAL_IDENTITY_STALE_IMPORT'"
+            )
+        )
+    assert [tuple(row) for row in rejection_reviews] == [
+        ("needs_review", "MANUAL_IDENTITY_STALE_IMPORT")
+    ]
 
 
 def test_automatic_publication_rejects_a_tampered_pinned_profile(
@@ -2001,10 +2088,105 @@ def test_automatic_publication_rejects_a_tampered_pinned_profile(
         )
 
 
+def _legacy_pinned_publication(
+    tmp_path: Path, *, tamper_sealed_profile: bool
+) -> tuple[LibraryManagementPublisher, LibraryManagementImportBundle]:
+    _root, source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    _activate_automatic_acquisitions(preferences, policy_revision)
+    management = preferences.get_library_management_settings_raw()
+    assignment = management.root_assignments[0]
+    effective = LibraryManagementProfileService._effective_profile(
+        management, assignment
+    )
+    legacy_organization = msgspec.structs.replace(
+        effective.organization,
+        sidecar_patterns=list(LEGACY_DEFAULT_SIDECAR_PATTERNS),
+    )
+    legacy_effective = msgspec.structs.replace(
+        effective, organization=legacy_organization
+    )
+    assignment.activation_profile_revision = profile_revision(legacy_effective)
+    assert assignment.activation_profile_revision != profile_revision(effective)
+    current = preferences.get_library_management_settings()
+    preferences.save_library_management_settings_if_current(
+        management, expected_settings_revision=current.settings_revision
+    )
+
+    management = preferences.get_library_management_settings_raw()
+    profile = next(
+        value
+        for value in management.profiles
+        if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    pinned = _planner(tmp_path, store, preferences).pin_profile(management, profile)
+    if tamper_sealed_profile:
+        pinned.profile.description = "Tampered after preparation"
+    current_settings_revision = settings_revision(management)
+    audio = AudioMetadataEngine()
+    request = msgspec.structs.replace(
+        _import_file(
+            audio,
+            source,
+            ordinal=0,
+            relative_path="Managed/01 Track.flac",
+        ),
+        pinned_profile=pinned,
+        settings_revision=current_settings_revision,
+        naming_policy_revision=naming_policy_revision(pinned),
+    )
+    publisher = LibraryManagementPublisher(
+        store,
+        preferences,
+        audio,
+        AudioWritePlanningService(audio),
+        LibraryManagementBlobStore(tmp_path / "carried-blobs", store),
+        LibraryFilesystemCoordinator(),
+    )
+    bundle = LibraryManagementImportBundle(
+        idempotency_key="acquisition:carried-migration",
+        origin="acquisition",
+        policy_revision=policy_revision,
+        files=(request,),
+    )
+    return publisher, bundle
+
+
+def test_automatic_publication_carries_activation_across_default_migration(
+    tmp_path: Path,
+) -> None:
+    publisher, bundle = _legacy_pinned_publication(
+        tmp_path, tamper_sealed_profile=False
+    )
+
+    publisher._validate_automatic_import_configuration(bundle)
+
+
+def test_automatic_publication_still_holds_migration_plus_real_change(
+    tmp_path: Path,
+) -> None:
+    publisher, bundle = _legacy_pinned_publication(
+        tmp_path, tamper_sealed_profile=True
+    )
+
+    with pytest.raises(StaleRevisionError, match="activation is stale"):
+        publisher._validate_automatic_import_configuration(bundle)
+
+
 @pytest.mark.asyncio
 async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
     tmp_path: Path,
 ) -> None:
+    # Step 1.9 deliberate expectation change (OWNER RULING 2026-09-07 option
+    # (a): guard stands): the old assertions pinned the F-05 bug by expecting
+    # the automatic re-download bundles to overwrite the seeded `manual`
+    # album/track identities and then undo cleanly. The guarded
+    # `_commit_automatic_import_management_tx` skips protected rows (no
+    # downgrade of `decision_source`, no revision bump) and files a
+    # `MANUAL_IDENTITY_STALE_IMPORT` review instead, and the sealed preview
+    # gate then rejects the overwrite-shaped undo apply (05-tests.md
+    # deliberate-expectation-change mechanism).
     root, original_path, preferences, store, _settings, policy_revision = _configured(
         tmp_path
     )
@@ -2028,7 +2210,6 @@ async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
         filesystem_coordinator=filesystem,
         management_publisher=publisher,
     )
-    original_snapshot = audio.snapshot(original_path)
     management = preferences.get_library_management_settings_raw()
     profile = next(
         value
@@ -2086,6 +2267,27 @@ async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
             artifacts=artifacts,
         )
 
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        seed_album_identities = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_album_external_identities "
+                "WHERE local_album_id = 'album-1'"
+            )
+        ]
+        seed_track_identities = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_track_external_identities "
+                "WHERE local_track_id = 'track-1'"
+            )
+        ]
+    assert len(seed_album_identities) == 1
+    assert len(seed_track_identities) == 1
+    assert {row["decision_source"] for row in seed_album_identities} == {"manual"}
+    assert {row["decision_source"] for row in seed_track_identities} == {"manual"}
+
     incoming_a = tmp_path / "managed-a.flac"
     shutil.copy2(original_path, incoming_a)
     result_a = await service.publish_import_bundle(
@@ -2107,6 +2309,16 @@ async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
     state_a = await store.get_track_management_state("track-1")
     managed_a_snapshot = audio.snapshot(original_path)
     assert baseline_a is not None and state_a is not None
+    with sqlite3.connect(store.db_path) as connection:
+        reviews_after_a = list(
+            connection.execute(
+                "SELECT id, local_album_id, state, reason_code, input_revision "
+                "FROM library_identification_reviews "
+                "WHERE reason_code = 'MANUAL_IDENTITY_STALE_IMPORT'"
+            )
+        )
+    assert len(reviews_after_a) == 1
+    assert reviews_after_a[0][2] == "needs_review"
 
     incoming_b = tmp_path / "managed-b.flac"
     shutil.copy2(original_path, incoming_b)
@@ -2159,6 +2371,40 @@ async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
     assert (root / "upgrade.cue").is_file()
     assert not incoming_sidecar.exists()
 
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        live_album_identities = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_album_external_identities "
+                "WHERE local_album_id = 'album-1'"
+            )
+        ]
+        live_track_identities = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_track_external_identities "
+                "WHERE local_track_id = 'track-1'"
+            )
+        ]
+        reviews_after_b = list(
+            connection.execute(
+                "SELECT id, local_album_id, state, reason_code, input_revision "
+                "FROM library_identification_reviews "
+                "WHERE reason_code = 'MANUAL_IDENTITY_STALE_IMPORT'"
+            )
+        )
+    assert live_album_identities == seed_album_identities
+    assert live_track_identities == seed_track_identities
+    assert [row["decision_source"] for row in live_album_identities] == ["manual"]
+    assert [row["decision_source"] for row in live_track_identities] == ["manual"]
+    assert [row["row_revision"] for row in live_album_identities] == [1]
+    assert [row["row_revision"] for row in live_track_identities] == [1]
+    assert len(reviews_after_b) == 1
+    assert reviews_after_b[0][0] == reviews_after_a[0][0]
+    assert reviews_after_b[0][4] == reviews_after_a[0][4]
+    assert reviews_after_b[0][2] == "needs_review"
+
     source_b = await store.get_operation_job(state_b.last_operation_job_id)
     assert source_b is not None
     undo = LibraryManagementUndoService(
@@ -2187,8 +2433,9 @@ async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
     await undo.run_claimed_preview(
         claimed_undo_preview, "undo-managed-upgrade-preview-worker"
     )
+    assert len(await store.list_library_management_plan_items(undo_preview.job_id)) == 1
     undo_ready = await store.get_operation_job(undo_preview.job_id)
-    assert undo_ready is not None
+    assert undo_ready is not None and undo_ready["state"] == "ready"
     await store.begin_library_management_apply(
         undo_preview.job_id,
         preview_token_hash=hashlib.sha256(
@@ -2209,19 +2456,41 @@ async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
         undo_preview.job_id, "undo-managed-upgrade-apply-worker", now=124.0
     )
     assert undo_work is not None
-    await publisher.publish_bundle(
-        undo_preview.job_id,
-        int(undo_work["ordinal"]),
-        "undo-managed-upgrade-apply-worker",
-    )
+    with pytest.raises(
+        StaleRevisionError, match="accepted MusicBrainz mapping changed"
+    ):
+        await publisher.publish_bundle(
+            undo_preview.job_id,
+            int(undo_work["ordinal"]),
+            "undo-managed-upgrade-apply-worker",
+        )
 
-    restored_a_state = await store.get_track_management_state("track-1")
-    assert audio.snapshot(original_path).metadata == managed_a_snapshot.metadata
-    assert restored_a_state is not None
-    assert restored_a_state.applied_projection_hash == "a" * 64
-    assert restored_a_state.last_operation_job_id == state_a.last_operation_job_id
-    assert not (root / "upgrade.cue").exists()
-    assert await store.get_management_baseline("track-1") == baseline_a
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        assert [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_album_external_identities "
+                "WHERE local_album_id = 'album-1'"
+            )
+        ] == seed_album_identities
+        assert [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_track_external_identities "
+                "WHERE local_track_id = 'track-1'"
+            )
+        ] == seed_track_identities
+        rejection_reviews = list(
+            connection.execute(
+                "SELECT id, state, reason_code "
+                "FROM library_identification_reviews "
+                "WHERE reason_code = 'MANUAL_IDENTITY_STALE_IMPORT'"
+            )
+        )
+    assert len(rejection_reviews) == 1
+    assert rejection_reviews[0][0] == reviews_after_a[0][0]
+    assert rejection_reviews[0][1] == "needs_review"
 
     baseline_service = LibraryManagementBaselineService(
         store,
@@ -2274,26 +2543,31 @@ async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
         restore_preview.job_id, "managed-upgrade-baseline-apply-worker", now=134.0
     )
     assert restore_work is not None
-    await publisher.publish_bundle(
-        restore_preview.job_id,
-        int(restore_work["ordinal"]),
-        "managed-upgrade-baseline-apply-worker",
-    )
-
-    final_state = await store.get_track_management_state("track-1")
-    final_baseline = await store.get_management_baseline("track-1")
-    assert audio.snapshot(original_path).metadata == original_snapshot.metadata
-    assert final_state is not None and final_state.last_outcome == "restored"
-    assert final_baseline is not None and final_baseline.restore_status == "restored"
-    assert (
-        msgspec.structs.replace(
-            final_baseline,
-            restore_status=baseline_a.restore_status,
-            last_verified_at=baseline_a.last_verified_at,
-            row_revision=baseline_a.row_revision,
+    with pytest.raises(
+        StaleRevisionError, match="accepted MusicBrainz mapping changed"
+    ):
+        await publisher.publish_bundle(
+            restore_preview.job_id,
+            int(restore_work["ordinal"]),
+            "managed-upgrade-baseline-apply-worker",
         )
-        == baseline_a
-    )
+
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        assert [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_album_external_identities "
+                "WHERE local_album_id = 'album-1'"
+            )
+        ] == seed_album_identities
+        assert [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM local_track_external_identities "
+                "WHERE local_track_id = 'track-1'"
+            )
+        ] == seed_track_identities
 
 
 _IO_WRITE_ERROR = AudioWriteError("staged write failed")
@@ -4235,3 +4509,158 @@ async def test_a_bundle_of_already_settled_files_is_finished_not_failed(
 
     assert result.committed_journal_ids == ()
     assert source.exists()  # nothing was touched
+
+
+async def _conversion_final_preview(tmp_path: Path, *, null_tag: bool = False):
+    root, source, preferences, store, _settings_revision, _policy_revision = _configured(
+        tmp_path
+    )
+    if null_tag:
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                "UPDATE local_tracks SET tag_revision=NULL WHERE id='track-1'"
+            )
+    recycle = tmp_path / "managed-recycle"
+    recycle.mkdir()
+    current = preferences.get_library_management_settings()
+    management = preferences.get_library_management_settings_raw()
+    management.recycle_bin_path = str(recycle)
+    preferences.save_library_management_settings_if_current(
+        management, expected_settings_revision=current.settings_revision
+    )
+    management = preferences.get_library_management_settings_raw()
+    profile = next(
+        value
+        for value in management.profiles
+        if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    pinned = pin_library_management_profile(management, profile)
+    context = await store.get_album_identification_context("album-1")
+    assert context is not None
+    tracks = [
+        value for value in context["tracks"] if value["availability"] == "indexed"
+    ]
+    track = next(value for value in tracks if value["id"] == "track-1")
+    target_recording = "33333333-3333-4333-8333-333333333333"
+    service = EditionConversionService(
+        store=store,
+        album_service=AsyncMock(),
+        preferences=preferences,
+        acquisition=AsyncMock(),
+        download_store=AsyncMock(),
+        get_download_service=lambda: AsyncMock(),
+        get_free_music_service=lambda: AsyncMock(),
+        automatic_management=AsyncMock(),
+        fingerprinter=AsyncMock(),
+        held_dir=tmp_path / "held",
+        import_library=AsyncMock(),
+        clock=lambda: 100.0,
+    )
+    service._fingerprinter.fingerprint.return_value = SimpleNamespace(
+        status="pass",
+        recording_id=target_recording,
+        recording_ids=[target_recording],
+    )
+
+    async def prepare(bundle):
+        return msgspec.structs.replace(
+            bundle,
+            files=tuple(
+                msgspec.structs.replace(value, pinned_profile=pinned)
+                for value in bundle.files
+            ),
+        )
+
+    service._automatic_management.prepare = AsyncMock(side_effect=prepare)
+    job = EditionConversionJob(
+        id="conversion-427",
+        local_album_id="album-1",
+        target_release_group_mbid="dcff25f1-702d-3b5e-b0da-d48172e6e62a",
+        target_release_mbid="77777777-7777-4777-8777-777777777777",
+        target_album_title="Management Album",
+        target_artist_name="Alpha",
+        state="ready",
+        expected_album_revision=int(context["album"]["row_revision"]),
+        expected_input_revision=":".join(album_input_revisions(tracks)),
+        expected_identity_revision=album_identity_revision(
+            context["identity"], tracks
+        ),
+        preflight_token_hash=hashlib.sha256(b"preflight").hexdigest(),
+        download_source_ready=True,
+        required_temporary_bytes=1,
+        kept_count=1,
+        acquire_count=0,
+        recycle_count=0,
+        staged_count=0,
+        failed_count=0,
+        final_preview_job_id=None,
+        final_preview_token_hash=None,
+        final_bundle_json=None,
+        final_bundle_hash=None,
+        requested_by_user_id="admin",
+        error_code=None,
+        created_at=1,
+        updated_at=1,
+    )
+    target = EditionConversionTarget(
+        job_id=job.id,
+        ordinal=0,
+        disc_number=1,
+        track_number=int(track["track_number"]),
+        release_track_mbid="77777777-7777-4777-8777-000000000001",
+        recording_mbid=target_recording,
+        title="Management Track",
+        duration_seconds=1.0,
+        state="kept",
+        kept_local_track_id="track-1",
+    )
+    local_file = EditionConversionLocalFile(
+        job_id=job.id,
+        local_track_id="track-1",
+        action="keep",
+        target_ordinal=0,
+        evidence_kind="recording",
+        expected_track_revision=int(track["row_revision"]),
+        expected_identity_revision=None,
+        expected_stat_revision=str(track["stat_revision"]),
+    )
+    job = await store.create_edition_conversion(job, (target,), (local_file,))
+    sealed = await service._ensure_final_preview(job, preview_token="preview-token")
+    preview_job_id = sealed.final_preview_job_id
+    assert preview_job_id is not None
+    row = await store.get_target_track("track-1")
+    assert row is not None
+    return SimpleNamespace(
+        source=source,
+        store=store,
+        preview=LibraryManagementPreviewService(
+            store, preferences, AsyncMock(), AsyncMock()
+        ),
+        snapshot=await store.get_library_management_job_snapshot(preview_job_id),
+        row=row,
+    )
+
+
+@pytest.mark.asyncio
+async def test_conversion_final_preview_is_not_born_stale(tmp_path: Path) -> None:
+    scenario = await _conversion_final_preview(tmp_path)
+
+    assert await scenario.preview._preview_inputs_moved(scenario.snapshot) is False
+
+    with sqlite3.connect(scenario.store.db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET stat_revision='changed:1', "
+            "tag_revision='changed', row_revision=row_revision+1 "
+            "WHERE id='track-1'"
+        )
+    assert await scenario.preview._preview_inputs_moved(scenario.snapshot) is True
+
+
+@pytest.mark.asyncio
+async def test_conversion_final_preview_normalizes_null_tag_revision(
+    tmp_path: Path,
+) -> None:
+    scenario = await _conversion_final_preview(tmp_path, null_tag=True)
+
+    assert scenario.row["tag_revision"] is None
+    assert await scenario.preview._preview_inputs_moved(scenario.snapshot) is False

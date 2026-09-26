@@ -40,6 +40,7 @@
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';
 	import LocalAlbumIdentificationControl from './LocalAlbumIdentificationControl.svelte';
 	import EditionPinConflictDialog from './EditionPinConflictDialog.svelte';
+	import AlbumDownloadButton from './AlbumDownloadButton.svelte';
 
 	interface Props {
 		album: AlbumBasicInfo;
@@ -61,6 +62,7 @@
 		coverageCovered?: number;
 		releaseGroupMbid?: string;
 		localCopies?: LibraryAlbumSummary[];
+		downloadAllowed?: boolean;
 		onrequest: () => void;
 		ondelete: () => void;
 		onrefresh: () => void;
@@ -86,6 +88,7 @@
 		coverageCovered = 0,
 		releaseGroupMbid = '',
 		localCopies = [],
+		downloadAllowed = true,
 		onrequest,
 		ondelete,
 		onrefresh,
@@ -559,13 +562,13 @@
 					<div class="flex flex-wrap items-start gap-3">
 						{#if inLibrary || libraryInLibrary}
 							{#if libraryUnmatchedOnly}
-								<div class="badge badge-lg badge-error gap-2">
+								<div class="badge badge-error h-8 gap-2 px-3">
 									<TriangleAlert class="h-4 w-4" />
 									Unmatched files only
 								</div>
 							{:else}
 								<div
-									class="badge badge-lg gap-2"
+									class="badge h-8 gap-2 px-3"
 									style="background-color: {colors.accent}; color: {colors.secondary};"
 								>
 									<Check class="h-4 w-4" />
@@ -574,6 +577,14 @@
 										: `In Library • ${coverageCovered}/${coverageExpected}`}
 								</div>
 							{/if}
+							<AlbumDownloadButton
+								albumId={localCopies[0]?.id || null}
+								mbid={localCopies[0]?.id ? null : releaseGroupMbid || album.musicbrainz_id || null}
+								totalSizeBytes={localCopies[0]?.total_size_bytes ?? null}
+								trackCount={libraryTrackCount}
+								{downloadAllowed}
+								className="btn-sm"
+							/>
 							{#if authStore.isAdmin}
 								<button class="btn btn-sm btn-error btn-outline gap-1" onclick={ondelete}>
 									<Trash2 class="h-4 w-4" />

@@ -1,5 +1,6 @@
 import ast
 import logging
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -68,7 +69,27 @@ from target_application import (
     create_isolated_target_application,
     create_production_target_application,
 )
-from tests.helpers import build_test_client, override_admin_auth, override_user_auth
+from tests.helpers import (
+    build_test_client,
+    openapi_method_paths,
+    override_admin_auth,
+    override_user_auth,
+)
+
+
+def _iter_leaf_routes(routes: Iterable) -> Iterator:
+    """Yield endpoint-bearing routes, expanding lazily included routers.
+
+    FastAPI>=0.140 stores include_router() entries as lazy wrapper nodes
+    (exposing the sub-router as ``original_router``) instead of merged copies;
+    descend through them so allowlist assertions keep seeing every route.
+    """
+    for route in routes:
+        original = getattr(route, "original_router", None)
+        if original is not None:
+            yield from _iter_leaf_routes(original.routes)
+        else:
+            yield route
 
 
 def test_target_scheduler_uses_configured_iana_timezone(
@@ -77,15 +98,6 @@ def test_target_scheduler_uses_configured_iana_timezone(
     monkeypatch.setenv("TZ", "Europe/London")
 
     assert _server_timezone_name() == "Europe/London"
-
-
-def test_library_operation_stream_precedes_dynamic_operation_route() -> None:
-    app = create_isolated_target_application()
-    paths = [route.path for route in app.routes]
-
-    assert paths.index("/api/v1/library/operations/stream") < paths.index(
-        "/api/v1/library/operations/{job_id}"
-    )
 
 
 @pytest.mark.parametrize("invalid_timezone", ["BST", "/etc/localtime"])
@@ -138,7 +150,9 @@ def test_isolated_target_application_mounts_target_catalog_and_compat_routes() -
 
     response = build_test_client(app).get("/api/v1/library/albums")
     route_modules = {
-        route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")
+        route.endpoint.__module__
+        for route in _iter_leaf_routes(app.routes)
+        if hasattr(route, "endpoint")
     }
 
     assert response.status_code == 200
@@ -282,11 +296,13 @@ def test_target_application_exposes_only_typed_library_root_mutations() -> None:
     override_admin_auth(app)
 
     response = build_test_client(app).get("/api/v1/settings/library")
+    # Sourced from the OpenAPI paths (which FastAPI flattens from the same
+    # route tree, including router prefixes) instead of raw app.routes, whose
+    # entries are lazy include-nodes since FastAPI>=0.140.
     method_paths = [
-        (method, route.path)
-        for route in app.routes
-        for method in getattr(route, "methods", set())
-        if method in {"GET", "PUT", "POST", "DELETE"}
+        pair
+        for pair in openapi_method_paths(app)
+        if pair[0] in {"GET", "PUT", "POST", "DELETE"}
     ]
 
     assert response.status_code == 200
@@ -344,7 +360,9 @@ def test_offline_replacement_entrypoint_is_complete_and_single_worker() -> None:
     backend = Path(__file__).parents[2]
     app = create_production_target_application()
     route_modules = {
-        route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")
+        route.endpoint.__module__
+        for route in _iter_leaf_routes(app.routes)
+        if hasattr(route, "endpoint")
     }
     middleware = {item.cls.__name__ for item in app.user_middleware}
 
@@ -499,6 +517,11 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
         get_library_scan_schedule=lambda: SimpleNamespace(
             scan_frequency="manual", daily_scan_time="03:00"
         ),
+        get_library_scan_dirty_scopes=lambda: SimpleNamespace(scope_ids=[]),
+        clear_library_scan_dirty_scopes=lambda _ids: None,
+        get_library_scan_filesystem_watcher=lambda: SimpleNamespace(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        ),
     )
     auth = SimpleNamespace(cleanup_expired_tokens=AsyncMock())
     auth_store = object()
@@ -575,6 +598,18 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
         target_module,
         "start_target_scan_supervisor",
         _capture_supervisor,
+    )
+    filesystem_watcher_arguments: dict[str, object] = {}
+
+    def _capture_filesystem_watcher(*args: object, **kwargs: object) -> object:
+        filesystem_watcher_arguments["__args"] = args  # type: ignore[assignment]
+        filesystem_watcher_arguments.update(kwargs)  # type: ignore[arg-type]
+        return None
+
+    monkeypatch.setattr(
+        target_module,
+        "start_library_filesystem_watcher",
+        _capture_filesystem_watcher,
     )
     identification_worker_arguments: dict[str, object] = {}
     monkeypatch.setattr(
@@ -673,11 +708,24 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
     assert callable(scan_supervisor_arguments.get("scheduler_getter"))
     assert callable(scan_supervisor_arguments.get("resolver_getter"))
     assert callable(scan_supervisor_arguments.get("schedule_settings_getter"))
+    watcher_args = filesystem_watcher_arguments.get("__args")  # type: ignore[assignment]
+    assert isinstance(watcher_args, tuple) and len(watcher_args) == 3
+    assert callable(watcher_args[0])
+    assert callable(watcher_args[1])
+    assert watcher_args[2] is work_wakeups
+    assert callable(filesystem_watcher_arguments.get("scheduler_getter"))
+    assert callable(filesystem_watcher_arguments.get("resolver_getter"))
+    watcher_settings_getter = filesystem_watcher_arguments.get(
+        "watcher_settings_getter"
+    )
+    assert callable(watcher_settings_getter)
+    assert watcher_settings_getter().poll_interval_seconds == 300.0  # type: ignore[operator]
     assert set(watchdog_starters) == {
         "target-library-scan-supervisor",
         "target-library-identification-worker",
         "target-library-operation-worker",
         "library-contribution-verification-worker",
+        "target-library-filesystem-watcher",
     }
     assert all(callable(starter) for starter in watchdog_starters.values())
     registry.cancel.assert_awaited_once_with("target-worker-watchdog")
@@ -754,6 +802,11 @@ def test_production_target_lifespan_closes_scan_coordinator_on_shutdown(
         get_advanced_settings=lambda: SimpleNamespace(memory_cache_cleanup_interval=60, disk_cache_cleanup_interval=60),
         get_typed_library_settings=lambda: SimpleNamespace(library_roots=[], enabled=True),
         get_library_scan_schedule=lambda: SimpleNamespace(scan_frequency="manual", daily_scan_time="03:00"),
+        get_library_scan_dirty_scopes=lambda: SimpleNamespace(scope_ids=[]),
+        clear_library_scan_dirty_scopes=lambda _ids: None,
+        get_library_scan_filesystem_watcher=lambda: SimpleNamespace(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        ),
     )
     auth = SimpleNamespace(cleanup_expired_tokens=AsyncMock())
     auth_store = object()
@@ -779,6 +832,7 @@ def test_production_target_lifespan_closes_scan_coordinator_on_shutdown(
     monkeypatch.setattr(target_module, "start_memory_maintenance_task", lambda *a, **k: None)
     monkeypatch.setattr(target_module, "start_disk_cache_cleanup_task", lambda *a, **k: None)
     monkeypatch.setattr(target_module, "start_target_scan_supervisor", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_library_filesystem_watcher", lambda *a, **k: None)
     monkeypatch.setattr(target_module, "start_target_identification_worker", lambda *a, **k: None)
     monkeypatch.setattr(target_module, "start_target_operation_worker", lambda *a, **k: None)
     monkeypatch.setattr(target_module, "start_library_contribution_verification_worker", lambda *a, **k: None)

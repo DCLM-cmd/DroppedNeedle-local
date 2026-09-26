@@ -27,6 +27,8 @@ def _prefs():
     prefs.delete_indexer.return_value = None
     prefs.reorder_indexers.return_value = None
     prefs.get_indexers_raw.return_value = []
+    prefs.get_usenet_search_backend.return_value = "indexers"
+    prefs.save_usenet_search_backend.return_value = None
     return prefs
 
 
@@ -251,3 +253,64 @@ def test_test_indexer_no_suggestion_when_url_already_has_path(monkeypatch):
     body = response.json()
     assert body["valid"] is False
     assert body["suggested_url"] is None
+
+
+def test_search_backend_get_returns_selection():
+    app = _app()
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    response = build_test_client(app).get("/indexers/search-backend")
+    assert response.status_code == 200
+    assert response.json() == {"backend": "indexers"}
+
+
+def test_search_backend_put_saves_and_clears_cache(monkeypatch):
+    from core.dependencies import get_prowlarr_indexer
+
+    prefs = _prefs()
+    app = _app(prefs)
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    clear = MagicMock()
+    monkeypatch.setattr(get_prowlarr_indexer, "cache_clear", clear)
+    response = build_test_client(app).put(
+        "/indexers/search-backend", json={"backend": "prowlarr"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+    prefs.save_usenet_search_backend.assert_called_once_with("prowlarr")
+    clear.assert_called_once()
+
+
+def test_search_backend_put_unknown_value_is_422():
+    prefs = _prefs()
+    app = _app(prefs)
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    response = build_test_client(app).put(
+        "/indexers/search-backend", json={"backend": "lidarr"}
+    )
+    assert response.status_code == 422
+    prefs.save_usenet_search_backend.assert_not_called()
+
+
+def test_search_backend_put_empty_body_is_422_not_silent_reset():
+    prefs = _prefs()
+    app = _app(prefs)
+    app.dependency_overrides[_get_current_admin] = mock_admin_user
+    response = build_test_client(app).put("/indexers/search-backend", json={})
+    assert response.status_code == 422
+    prefs.save_usenet_search_backend.assert_not_called()
+
+
+def test_search_backend_non_admin_forbidden():
+    app = _app()
+    app.dependency_overrides[_get_current_admin] = _deny_admin
+    assert build_test_client(app).get("/indexers/search-backend").status_code == 403
+    assert (
+        build_test_client(app)
+        .put("/indexers/search-backend", json={"backend": "prowlarr"})
+        .status_code
+        == 403
+    )
+
+
+def test_search_backend_unauthenticated():
+    assert build_test_client(_app()).get("/indexers/search-backend").status_code == 401

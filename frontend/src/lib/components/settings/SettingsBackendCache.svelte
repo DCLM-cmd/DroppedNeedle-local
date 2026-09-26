@@ -7,8 +7,10 @@
 
 <div class="alert alert-info alert-soft mb-4">
 	<span class="text-sm"
-		>These settings control how long shared server cache entries stay fresh. Lower values update
-		sooner. Higher values put less load on upstream services.</span
+		>These settings control typed-view and existing disk metadata freshness. MusicBrainz display
+		responses have a separate 24-hour disk freshness window and a 128 MiB limit. Rebuilding a view
+		can reuse a fresh response without contacting the provider; it does not renew the response's
+		age. Your current TTL settings and memory entry limits are preserved.</span
 	>
 </div>
 <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-4 pt-2">

@@ -74,6 +74,7 @@ async def test_old_source_answer_cannot_overwrite_new_source_cache(monkeypatch):
                 {"artist": []},
                 ttl_seconds=60,
                 context=old_context,
+                cache_token=mb_base.capture_mb_cache_token(cache),
             )
             is False
         )
@@ -85,6 +86,7 @@ async def test_old_source_answer_cannot_overwrite_new_source_cache(monkeypatch):
                 new_result,
                 ttl_seconds=60,
                 context=new_context,
+                cache_token=mb_base.capture_mb_cache_token(cache),
             )
             is True
         )

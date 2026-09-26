@@ -146,7 +146,7 @@ class TestEnrichSingleflight:
     async def test_memory_cache_hit_skips_singleflight(self):
         """If the enrichment is in the memory cache, singleflight should not be consulted."""
         cache = AsyncMock()
-        cache.get = AsyncMock(return_value=FAKE_ENRICHMENT)
+        cache.get_with_metadata = AsyncMock(return_value=(FAKE_ENRICHMENT, None))
         service, _ = _make_service(memory_cache=cache)
 
         call_count = 0
@@ -166,8 +166,9 @@ class TestEnrichSingleflight:
     async def test_memory_cache_miss_triggers_enrichment(self):
         """If the memory cache returns None, the enrichment pipeline should run."""
         cache = AsyncMock()
-        cache.get = AsyncMock(return_value=None)
-        cache.set = AsyncMock()
+        cache.get_with_metadata = AsyncMock(return_value=(None, None))
+        cache.set_if_token = AsyncMock(return_value=True)
+        cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
         service, _ = _make_service(memory_cache=cache)
 
         async def simple_enrich(release_group_mbid: str, cache_key: str, **kwargs):
@@ -210,15 +211,23 @@ class TestEnrichSingleflight:
         cached_values: dict[str, DiscoverQueueEnrichment] = {}
 
         async def cache_get(key: str):
-            return cached_values.get(key)
+            namespaced = mb_base.namespace_mb_cache_key(key)
+            return cached_values.get(namespaced), None
 
-        async def cache_set(
-            key: str, value: DiscoverQueueEnrichment, _ttl: int
-        ) -> None:
-            cached_values[key] = value
+        async def cache_set_if_token(
+            _token: tuple[object, int],
+            key: str,
+            value: DiscoverQueueEnrichment,
+            _ttl: int | float,
+            metadata: object = None,
+        ) -> bool:
+            del metadata
+            cached_values[mb_base.namespace_mb_cache_key(key)] = value
+            return True
 
-        cache.get.side_effect = cache_get
-        cache.set.side_effect = cache_set
+        cache.get_with_metadata.side_effect = cache_get
+        cache.set_if_token.side_effect = cache_set_if_token
+        cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
         service, mb_repo = _make_service(memory_cache=cache)
         service._enrichment._coalesce_popularity = AsyncMock(return_value=None)
         mb_repo.extract_youtube_url_from_relations = MagicMock(return_value=None)
@@ -284,10 +293,13 @@ class TestEnrichSingleflight:
 
             cached_result = await service.enrich_queue_item(MBID)
             assert cached_result.tags == ["new"]
-            assert cached_values[
-                "discover_queue_enrich:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-            ].tags == ["new"]
-            assert cache.set.await_count == 1
+            new_namespaced_key = (
+                "discover_queue_enrich:"
+                f"source:mirror:discover-enrich-new:g{new_generation}:"
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            )
+            assert cached_values[new_namespaced_key].tags == ["new"]
+            assert cache.set_if_token.await_count == 1
         finally:
             old_gate.set()
             new_gate.set()

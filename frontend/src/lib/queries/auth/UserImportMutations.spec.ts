@@ -45,8 +45,13 @@ function lastQueryOpts(): Record<string, unknown> {
 }
 
 describe('AuthQueryKeyFactory.importCandidates', () => {
-	it('keys by provider under the auth prefix', () => {
-		expect(AuthQueryKeyFactory.importCandidates('plex')).toEqual(['auth', 'import', 'plex']);
+	it('keys by provider and userId under the auth prefix', () => {
+		expect(AuthQueryKeyFactory.importCandidates('plex', 'admin-1')).toEqual([
+			'auth',
+			'import',
+			'plex',
+			'admin-1'
+		]);
 	});
 });
 
@@ -66,6 +71,8 @@ describe('createImportUsersMutation', () => {
 	});
 
 	it('onSuccess invalidates the importCandidates key for the imported provider', async () => {
+		const { authStore } = await import('$lib/stores/authStore.svelte');
+		authStore.setUser({ id: 'admin-1', role: 'admin' } as never);
 		const { createImportUsersMutation } = await import('./UserImportMutations.svelte');
 		createImportUsersMutation();
 
@@ -76,8 +83,9 @@ describe('createImportUsersMutation', () => {
 		);
 
 		expect(mockInvalidate).toHaveBeenCalledWith({
-			queryKey: AuthQueryKeyFactory.importCandidates('plex')
+			queryKey: AuthQueryKeyFactory.importCandidates('plex', 'admin-1')
 		});
+		authStore.clear();
 	});
 });
 
@@ -87,11 +95,12 @@ describe('getImportCandidatesQuery', () => {
 		const { getImportCandidatesQuery } = await import('./ImportCandidatesQuery.svelte');
 		getImportCandidatesQuery(
 			() => 'plex',
-			() => true
+			() => true,
+			() => 'admin-1'
 		);
 
 		const opts = lastQueryOpts();
-		expect(opts.queryKey).toEqual(AuthQueryKeyFactory.importCandidates('plex'));
+		expect(opts.queryKey).toEqual(AuthQueryKeyFactory.importCandidates('plex', 'admin-1'));
 		expect(opts.enabled).toBe(true);
 
 		const queryFn = opts.queryFn as (ctx: { signal: AbortSignal }) => Promise<unknown>;
@@ -103,11 +112,12 @@ describe('getImportCandidatesQuery', () => {
 		const { getImportCandidatesQuery } = await import('./ImportCandidatesQuery.svelte');
 		getImportCandidatesQuery(
 			() => 'jellyfin',
-			() => false
+			() => false,
+			() => 'admin-1'
 		);
 
 		const opts = lastQueryOpts();
 		expect(opts.enabled).toBe(false);
-		expect(opts.queryKey).toEqual(AuthQueryKeyFactory.importCandidates('jellyfin'));
+		expect(opts.queryKey).toEqual(AuthQueryKeyFactory.importCandidates('jellyfin', 'admin-1'));
 	});
 });

@@ -40,8 +40,15 @@ vi.mock('$lib/stores/integration', () => ({
 	}
 }));
 
+const player = vi.hoisted(() => ({ addToQueue: vi.fn(), playNext: vi.fn() }));
 vi.mock('$lib/stores/player.svelte', () => ({
-	playerStore: { isPlaying: false, nowPlaying: null, currentQueueItem: null }
+	playerStore: {
+		isPlaying: false,
+		nowPlaying: null,
+		currentQueueItem: null,
+		addToQueue: player.addToQueue,
+		playNext: player.playNext
+	}
 }));
 
 // heavy / QueryClient-dependent children not under test
@@ -56,16 +63,30 @@ vi.mock('$lib/components/NowPlayingIndicator.svelte', emptyComponent);
 vi.mock('$lib/components/TrackPlayButton.svelte', emptyComponent);
 vi.mock('$lib/components/TrackPreviewButton.svelte', emptyComponent);
 vi.mock('$lib/components/TrackSourceButton.svelte', emptyComponent);
-vi.mock('$lib/components/ContextMenu.svelte', emptyComponent);
 vi.mock('$lib/components/JellyfinIcon.svelte', emptyComponent);
 vi.mock('$lib/components/LocalFilesIcon.svelte', emptyComponent);
 vi.mock('$lib/components/NavidromeIcon.svelte', emptyComponent);
 vi.mock('$lib/components/PlexIcon.svelte', emptyComponent);
 vi.mock('$lib/components/library/LibraryTrackRow.svelte', emptyComponent);
 
+const blob = vi.hoisted(() => ({ download: vi.fn() }));
+vi.mock('$lib/utils/blobDownload', () => ({ downloadBlob: blob.download }));
+
 import AlbumTrackList from './AlbumTrackList.svelte';
-import { buildRenderedTrackSections } from './albumTrackResolvers';
-import type { AlbumBasicInfo, AlbumTracksInfo, HeldImport, LibraryFileMeta } from '$lib/types';
+import { getTrackContextMenuItems as realMenuItems } from './albumPlaybackHandlers';
+import { closeAllMenus } from '$lib/components/ContextMenu.svelte';
+import { buildRenderedTrackSections, buildSortedTrackMap } from './albumTrackResolvers';
+import type {
+	AlbumBasicInfo,
+	AlbumTracksInfo,
+	HeldImport,
+	JellyfinTrackInfo,
+	LibraryFileMeta,
+	LocalAlbumMatch,
+	LocalTrackInfo,
+	NavidromeTrackInfo,
+	PlexTrackInfo
+} from '$lib/types';
 
 function heldFor(recording_mbid: string): HeldImport {
 	return {
@@ -151,14 +172,27 @@ const byPosition = new Map<string, LibraryFileMeta>([
 	['1:2', libTrack({ id: 'b', musicbrainz_recording_id: null, track_number: 2 })]
 ]);
 
-function renderList(
+async function renderList(
 	over: {
 		heldByRecording?: Map<string, HeldImport>;
 		heldByPosition?: Map<string, HeldImport>;
 		byRecording?: Map<string, LibraryFileMeta>;
+		byPosition?: Map<string, LibraryFileMeta>;
 		releaseMbid?: string | null;
+		tracks?: AlbumTracksInfo['tracks'];
+		localTracks?: LocalTrackInfo[];
+		useRealMenuItems?: boolean;
 	} = {}
 ) {
+	const localTracks = over.localTracks ?? [];
+	const localMatch: LocalAlbumMatch | null =
+		localTracks.length > 0
+			? {
+					found: true,
+					tracks: localTracks,
+					total_size_bytes: localTracks.reduce((sum, t) => sum + t.size_bytes, 0)
+				}
+			: null;
 	const album: AlbumBasicInfo = {
 		musicbrainz_id: 'rg-1',
 		artist_name: 'Artist',
@@ -169,18 +203,18 @@ function renderList(
 	};
 	const props = {
 		album,
-		renderedTrackSections: buildRenderedTrackSections(TRACKS),
+		renderedTrackSections: buildRenderedTrackSections(over.tracks ?? TRACKS),
 		trackLinkMap: new Map(),
 		jellyfinMatch: null,
-		localMatch: null,
+		localMatch,
 		navidromeMatch: null,
 		plexMatch: null,
 		jellyfinTrackMap: new Map(),
-		localTrackMap: new Map(),
+		localTrackMap: buildSortedTrackMap(localTracks),
 		navidromeTrackMap: new Map(),
 		plexTrackMap: new Map(),
 		jellyfinTracks: [],
-		localTracks: [],
+		localTracks,
 		navidromeTracks: [],
 		plexTracks: [],
 		trackLinks: [],
@@ -192,7 +226,7 @@ function renderList(
 		navidromeEnabled: false,
 		plexEnabled: false,
 		libraryTracksByRecording: over.byRecording ?? byRecording,
-		libraryTracksByPosition: byPosition,
+		libraryTracksByPosition: over.byPosition ?? byPosition,
 		heldByRecording: over.heldByRecording ?? new Map(),
 		heldByPosition: over.heldByPosition ?? new Map(),
 		releaseGroupMbid: 'rg-1',
@@ -200,9 +234,17 @@ function renderList(
 		onPlaySourceTrack: vi.fn(),
 		onTrackGenerated: vi.fn(),
 		onQuotaUpdate: vi.fn(),
-		getTrackContextMenuItems: () => []
+		getTrackContextMenuItems: over.useRealMenuItems
+			? (
+					track: { position: number; disc_number?: number | null; title: string },
+					local: LocalTrackInfo | null,
+					jellyfin: JellyfinTrackInfo | null,
+					navidrome: NavidromeTrackInfo | null,
+					plex: PlexTrackInfo | null
+				) => realMenuItems(track, album, local, jellyfin, navidrome, plex, null)
+			: () => []
 	};
-	render(AlbumTrackList, { props } as unknown as Parameters<
+	await render(AlbumTrackList, { props } as unknown as Parameters<
 		typeof render<typeof AlbumTrackList>
 	>[1]);
 }
@@ -210,7 +252,7 @@ function renderList(
 describe('AlbumTrackList in-library detection', () => {
 	it('shows the Request button only for the genuinely-missing track', async () => {
 		expect.assertions(2);
-		renderList();
+		await renderList();
 
 		// matched rows are hidden, leaving exactly one Request button for the genuinely missing track
 		await expect.element(page.getByText('Genuinely Missing')).toBeVisible();
@@ -220,7 +262,7 @@ describe('AlbumTrackList in-library detection', () => {
 
 	it('shows a "held" chip (not Request) for an un-owned track with a held candidate', async () => {
 		expect.assertions(2);
-		renderList({ heldByRecording: new Map([['rec-3', heldFor('rec-3')]]) });
+		await renderList({ heldByRecording: new Map([['rec-3', heldFor('rec-3')]]) });
 
 		// the genuinely-missing track now has a held candidate -> the held review chip appears...
 		await expect.element(page.getByRole('button', { name: /held/i })).toBeVisible();
@@ -246,7 +288,7 @@ describe('AlbumTrackList upgrade affordance (admin/trusted, below cutoff)', () =
 	it('shows the upgrade button to a curator for a below-cutoff owned track', async () => {
 		expect.assertions(2);
 		auth.role = 'trusted';
-		renderList({ byRecording: belowCutoffOwned });
+		await renderList({ byRecording: belowCutoffOwned });
 
 		await expect.element(page.getByRole('button', { name: /upgrade/i })).toBeVisible();
 		expect(page.getByRole('button', { name: /upgrade/i }).elements()).toHaveLength(1);
@@ -255,7 +297,7 @@ describe('AlbumTrackList upgrade affordance (admin/trusted, below cutoff)', () =
 	it('hides the upgrade button from a plain user even when below cutoff', async () => {
 		expect.assertions(1);
 		auth.role = 'user';
-		renderList({ byRecording: belowCutoffOwned });
+		await renderList({ byRecording: belowCutoffOwned });
 
 		expect(page.getByRole('button', { name: /upgrade/i }).elements()).toHaveLength(0);
 	});
@@ -263,7 +305,7 @@ describe('AlbumTrackList upgrade affordance (admin/trusted, below cutoff)', () =
 	it('hides the upgrade button when the track meets the cutoff', async () => {
 		expect.assertions(1);
 		auth.role = 'admin';
-		renderList(); // default fixtures: below_cutoff false everywhere
+		await renderList(); // default fixtures: below_cutoff false everywhere
 
 		expect(page.getByRole('button', { name: /upgrade/i }).elements()).toHaveLength(0);
 	});
@@ -272,7 +314,7 @@ describe('AlbumTrackList upgrade affordance (admin/trusted, below cutoff)', () =
 describe('AlbumTrackList exact-track request release propagation', () => {
 	it('sends the displayed selected edition to the track request mutation', async () => {
 		downloadMutations.requestMutate.mockClear();
-		renderList({ releaseMbid: 'release-20' });
+		await renderList({ releaseMbid: 'release-20' });
 
 		await page.getByRole('button', { name: 'Request this track' }).click();
 		expect(downloadMutations.requestMutate).toHaveBeenCalledTimes(1);
@@ -285,10 +327,160 @@ describe('AlbumTrackList exact-track request release propagation', () => {
 
 	it('keeps the track request usable with a null edition', async () => {
 		downloadMutations.requestMutate.mockClear();
-		renderList();
+		await renderList();
 
 		await page.getByRole('button', { name: 'Request this track' }).click();
 		expect(downloadMutations.requestMutate).toHaveBeenCalledTimes(1);
 		expect(downloadMutations.requestMutate.mock.calls[0][0].release_id).toBeNull();
+	});
+});
+
+describe('AlbumTrackList per-track file sizes', () => {
+	const TWO_DISCS: AlbumTracksInfo['tracks'] = [
+		{
+			position: 1,
+			disc_number: 1,
+			title: 'Disc One Opener',
+			length: 100000,
+			recording_id: 'rec-d1'
+		},
+		{
+			position: 2,
+			disc_number: 1,
+			title: 'Disc One Second',
+			length: 100000,
+			recording_id: 'rec-d2'
+		},
+		{
+			position: 1,
+			disc_number: 2,
+			title: 'Disc Two Opener',
+			length: 100000,
+			recording_id: 'rec-d3'
+		}
+	];
+
+	function localTrack(
+		track_number: number,
+		disc_number: number,
+		size_bytes: number
+	): LocalTrackInfo {
+		return {
+			track_file_id: `f-${disc_number}-${track_number}`,
+			title: 'x',
+			track_number,
+			disc_number,
+			size_bytes,
+			format: 'flac'
+		};
+	}
+
+	it('shows formatBytes sizes for matched rows across discs (disc-aware join)', async () => {
+		expect.assertions(3);
+		await renderList({
+			tracks: TWO_DISCS,
+			localTracks: [localTrack(1, 1, 10485760), localTrack(1, 2, 15728640)]
+		});
+
+		// same position on different discs resolves to different sizes (not joined by title)
+		await expect.element(page.getByText('10 MB')).toBeVisible();
+		await expect.element(page.getByText('15 MB')).toBeVisible();
+		// the unmatched middle row renders the absence marker
+		expect(page.getByText('—', { exact: true }).elements()).toHaveLength(1);
+	});
+
+	it('shows the absence marker for zero-byte and unmatched rows', async () => {
+		expect.assertions(2);
+		await renderList({ tracks: TWO_DISCS, localTracks: [localTrack(1, 1, 0)] });
+
+		await expect.element(page.getByText('Disc Two Opener')).toBeVisible();
+		expect(page.getByText('—', { exact: true }).elements()).toHaveLength(3);
+	});
+});
+
+describe('AlbumTrackList 3-dot menu (provider pin)', () => {
+	const MENU_TRACKS: AlbumTracksInfo['tracks'] = [
+		{ position: 1, disc_number: 1, title: 'First', length: 100000, recording_id: 'rec-m1' },
+		{ position: 2, disc_number: 1, title: 'Second', length: 100000, recording_id: 'rec-m2' }
+	];
+
+	function menuLocalTrack(n: number): LocalTrackInfo {
+		return {
+			track_file_id: `menu-file-${n}`,
+			title: 'x',
+			track_number: n,
+			disc_number: 1,
+			size_bytes: 1000,
+			format: 'flac'
+		};
+	}
+
+	async function renderMenu(localTracks: LocalTrackInfo[]) {
+		closeAllMenus();
+		blob.download.mockReset();
+		blob.download.mockResolvedValue(undefined);
+		player.addToQueue.mockClear();
+		// empty library maps: rows show Request, which renders the actions
+		// block (and its trigger) the way enabled sources do on a real page
+		await renderList({
+			useRealMenuItems: true,
+			tracks: MENU_TRACKS,
+			localTracks,
+			byRecording: new Map(),
+			byPosition: new Map()
+		});
+	}
+
+	it('shows a trigger on every row opening the 4-item menu with a working Download', async () => {
+		expect.assertions(7);
+		await renderMenu([menuLocalTrack(1), menuLocalTrack(2)]);
+
+		await expect.element(page.getByText('First')).toBeVisible();
+		const triggers = await page.getByLabelText('More actions').all();
+		expect(triggers).toHaveLength(2);
+
+		await triggers[0].click();
+		for (const label of ['Add to Queue', 'Play Next', 'Add to Playlist', 'Download']) {
+			await expect.element(page.getByRole('menuitem', { name: label })).toBeVisible();
+		}
+		await page.getByRole('menuitem', { name: 'Download' }).click();
+		expect(blob.download).toHaveBeenCalledWith('/api/v1/download/local/track/menu-file-1');
+	});
+
+	it('queues through the shared builder', async () => {
+		expect.assertions(3);
+		await renderMenu([menuLocalTrack(1)]);
+
+		await expect.element(page.getByText('First')).toBeVisible();
+		await (await page.getByLabelText('More actions').all())[0].click();
+		await page.getByRole('menuitem', { name: 'Add to Queue' }).click();
+		expect(player.addToQueue).toHaveBeenCalledTimes(1);
+		expect(player.addToQueue.mock.calls[0][0]).toMatchObject({ trackSourceId: 'menu-file-1' });
+	});
+
+	it('keeps a single menu open and closes on outside click', async () => {
+		expect.assertions(4);
+		await renderMenu([menuLocalTrack(1), menuLocalTrack(2)]);
+
+		await expect.element(page.getByText('First')).toBeVisible();
+		const triggers = await page.getByLabelText('More actions').all();
+		await triggers[0].click();
+		await expect.element(page.getByRole('menu')).toBeVisible();
+
+		await triggers[1].click();
+		expect(page.getByRole('menu').elements()).toHaveLength(1);
+
+		await page.getByText('First').click();
+		await expect.element(page.getByRole('menu')).not.toBeInTheDocument();
+	});
+
+	it('omits Download when the row has no local file', async () => {
+		expect.assertions(3);
+		await renderMenu([]);
+
+		await expect.element(page.getByText('First')).toBeVisible();
+		await (await page.getByLabelText('More actions').all())[0].click();
+		await expect.element(page.getByRole('menuitem', { name: 'Add to Queue' })).toBeVisible();
+		expect(page.getByRole('menuitem', { name: 'Download' }).elements()).toHaveLength(0);
 	});
 });

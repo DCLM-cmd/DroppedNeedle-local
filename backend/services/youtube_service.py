@@ -6,7 +6,7 @@ import msgspec
 
 from api.v1.schemas.discover import YouTubeQuotaResponse
 from api.v1.schemas.youtube import YouTubeLink, YouTubeTrackLink, YouTubeTrackLinkFailure
-from core.exceptions import ConfigurationError, ExternalServiceError, ResourceNotFoundError, ValidationError
+from core.exceptions import ResourceNotFoundError, ValidationError
 from infrastructure.persistence import YouTubeStore
 from infrastructure.serialization import to_jsonable
 from repositories.protocols import YouTubeRepositoryProtocol
@@ -43,15 +43,9 @@ class YouTubeService:
         album_id: str,
         cover_url: str | None = None,
     ) -> YouTubeLink:
-        if not self._youtube_repo.is_configured:
-            raise ConfigurationError("YouTube API is not configured")
-
         existing = await self._youtube_store.get_youtube_link(album_id)
         if existing and existing.get("video_id"):
             return YouTubeLink(**existing)
-
-        if self._youtube_repo.quota_remaining <= 0:
-            raise ExternalServiceError("YouTube daily quota exceeded")
 
         video_id = await self._youtube_repo.search_video(artist_name, album_name)
         if not video_id:
@@ -106,11 +100,10 @@ class YouTubeService:
         disc_number: int = 1,
         cover_url: str | None = None,
     ) -> YouTubeTrackLink:
-        if not self._youtube_repo.is_configured:
-            raise ConfigurationError("YouTube API is not configured")
-
-        if self._youtube_repo.quota_remaining <= 0:
-            raise ExternalServiceError("YouTube daily quota exceeded")
+        existing = await self._youtube_store.get_youtube_track_links(album_id)
+        for link in existing:
+            if link["track_number"] == track_number and link["disc_number"] == disc_number:
+                return YouTubeTrackLink(**link)
 
         video_id = await self._youtube_repo.search_track(artist_name, track_name)
         if not video_id:
@@ -160,23 +153,18 @@ class YouTubeService:
         tracks: list[dict],
         cover_url: str | None = None,
     ) -> tuple[list[YouTubeTrackLink], list[YouTubeTrackLinkFailure]]:
-        if not self._youtube_repo.is_configured:
-            raise ConfigurationError("YouTube API is not configured")
-
         generated: list[YouTubeTrackLink] = []
         failed: list[YouTubeTrackLinkFailure] = []
         batch_to_save: list[dict] = []
 
+        existing = {
+            (link["disc_number"], link["track_number"]): link
+            for link in await self._youtube_store.get_youtube_track_links(album_id)
+        }
         for track in tracks:
-            if self._youtube_repo.quota_remaining <= 0:
-                failed.append(
-                        YouTubeTrackLinkFailure(
-                            track_number=track["track_number"],
-                            disc_number=track.get("disc_number", 1),
-                            track_name=track["track_name"],
-                            reason="Quota exceeded",
-                        )
-                )
+            saved = existing.get((track.get("disc_number", 1), track["track_number"]))
+            if saved:
+                generated.append(YouTubeTrackLink(**saved))
                 continue
 
             try:

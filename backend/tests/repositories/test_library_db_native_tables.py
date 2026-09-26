@@ -1,4 +1,4 @@
-"""Task 011: LibraryDB native-engine schema — tables, indexes, idempotency."""
+"""Task 011: LibraryDB native-engine schema - tables, indexes, idempotency."""
 
 import sqlite3
 import threading
@@ -99,3 +99,15 @@ def test_reinit_is_idempotent(db_path):
     # Re-running the migration on an existing db must not raise.
     LibraryDB(db_path=db_path, write_lock=threading.Lock())
     assert _NATIVE_TABLES <= _tables(db_path)
+
+
+def test_library_files_gains_embedded_release_mbid(db_path):
+    # The tags-win edition tier reads this column; the ratchet must add it
+    # idempotently and upserts must round-trip it.
+    LibraryDB(db_path=db_path, write_lock=threading.Lock())
+    conn = sqlite3.connect(db_path)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(library_files)")}
+    finally:
+        conn.close()
+    assert "embedded_release_mbid" in cols

@@ -193,7 +193,7 @@ class AcquisitionCleanupService:
             bundle = await self._library_store.get_library_management_import_bundle(
                 bundle_id
             )
-            if bundle is None or bundle.state != "completed":
+            if bundle is None or bundle.state not in {"completed", "resolved"}:
                 bundles_resolved = False
                 break
         if not bundles_resolved:
@@ -263,7 +263,7 @@ class AcquisitionCleanupService:
             )
             if bundle is None:
                 raise _UnsafeCleanup("publisher_barrier_missing")
-            if bundle.state == "completed":
+            if bundle.state in {"completed", "resolved"}:
                 continue
             if bundle.state in {"needs_attention", "rolled_back"}:
                 raise _UnsafeCleanup("publisher_needs_attention")
@@ -621,8 +621,9 @@ class AcquisitionCleanupService:
                 _HEALTH_CAPABILITY,
                 severity="degraded",
                 message=(
-                    f"Source cleanup needs attention for {count} "
-                    f"download{'s' if count != 1 else ''}."
+                    f"Temporary files couldn't be removed for {count} "
+                    f"download{'s' if count != 1 else ''}. "
+                    "Your library is safe. Retrying automatically."
                 ),
                 ttl_seconds=90.0,
             )

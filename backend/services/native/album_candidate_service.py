@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from collections.abc import Awaitable, Callable, Collection
 from infrastructure.queue.priority_queue import RequestPriority
 from models.identification import AlbumCandidate, GroupingTrack
 from repositories.protocols.identification import IdentificationProviderProtocol
 from services.native.album_evidence_engine import MAX_CANDIDATES
+
+logger = logging.getLogger(__name__)
 
 ALBUM_SEARCH_LIMIT = 8
 RECORDING_SEARCH_LIMIT = 5
@@ -22,6 +25,13 @@ RECALL_SOURCE_KINDS = frozenset(
 def _consensus(values: list[str]) -> str:
     usable = [value.strip() for value in values if value.strip()]
     return Counter(usable).most_common(1)[0][0] if usable else ""
+
+
+# M-06: `placeholder`/`absent` claims abstain from recall - only present
+# (`tag`/`parsed`) claims drive album/artist consensus and recording-search
+# sampling, so newly-`insufficient_evidence` groups never burn
+# sibling-trial fetches on stems and `"Unknown Artist"` garbage.
+_PRESENT_PROVENANCE = ("tag", "parsed")
 
 
 class AlbumCandidateService:
@@ -54,22 +64,41 @@ class AlbumCandidateService:
             exact.source_kinds = ["administrator_exact_release"]
             return [exact]
 
+        # Folded: tag MBIDs keep their verbatim case, so mixed-case
+        # unanimous tags must still count as unanimous (both display lanes
+        # casefold too). Lookups below use the original strings.
         embedded_groups = {
-            track.release_group_mbid for track in tracks if track.release_group_mbid
+            track.release_group_mbid.casefold()
+            for track in tracks
+            if track.release_group_mbid
         }
         embedded_releases = [track.release_mbid for track in tracks]
-        if any(embedded_releases):
-            if not all(embedded_releases) or len(set(embedded_releases)) != 1:
+        present_releases = [value for value in embedded_releases if value]
+        if present_releases:
+            # Blanks abstain (matching the release-group seed below): only
+            # genuine disagreement between populated tags refuses the lookup.
+            if len({str(value).casefold() for value in present_releases}) != 1:
                 return []
             if checkpoint is not None and not await checkpoint():
                 return []
             exact = await self._provider.get_exact_release_candidate(
-                str(embedded_releases[0]), priority
+                str(present_releases[0]), priority
             )
-            if exact is None:
-                return []
-            exact.source_kinds = ["embedded_exact_release"]
-            return [exact]
+            if exact is not None:
+                exact.source_kinds = ["embedded_exact_release"]
+                return [exact]
+            # Stale embedded tags (merged/deleted releases) must not orphan
+            # the album: fall through to full recall instead of returning no
+            # candidates. The embedded release-group seed below still applies,
+            # and sealing still needs proof. NOTE: the explicit
+            # administrator_exact_release branch above keeps returning [] on a
+            # miss - an admin demanding one release must never silently get
+            # another.
+            logger.debug(
+                "recall: agreed embedded release %s unfetchable; "
+                "falling through to full recall",
+                str(present_releases[0]),
+            )
         # F-MATCH-02 (owner-signed): non-exact recall orders deduplicated
         # cached-fingerprint seeds first (audio truth, mirroring
         # ``AlbumIdentifier._candidate_release_groups``), then the single
@@ -83,8 +112,20 @@ class AlbumCandidateService:
         if len(embedded_groups) == 1:
             ids.append((next(iter(embedded_groups)), "embedded"))
 
-        album = _consensus([track.album_title for track in tracks])
-        artist = _consensus([track.album_artist_name for track in tracks])
+        album = _consensus(
+            [
+                track.album_title
+                for track in tracks
+                if track.album_title_provenance in _PRESENT_PROVENANCE
+            ]
+        )
+        artist = _consensus(
+            [
+                track.album_artist_name
+                for track in tracks
+                if track.album_artist_provenance in _PRESENT_PROVENANCE
+            ]
+        )
         if album and artist:
             if checkpoint is not None and not await checkpoint():
                 return []
@@ -110,7 +151,12 @@ class AlbumCandidateService:
             _distinct_non_fp = len({identifier for identifier, source in ids if source != "cached_fingerprint"})
             _sample_limit = 2 if (album and artist and _distinct_non_fp >= 2) else TRACK_SAMPLE_LIMIT
             samples = sorted(
-                (track for track in tracks if track.title),
+                (
+                    track
+                    for track in tracks
+                    if track.title
+                    and track.title_provenance in _PRESENT_PROVENANCE
+                ),
                 key=lambda track: (
                     track.disc_number,
                     track.track_number,

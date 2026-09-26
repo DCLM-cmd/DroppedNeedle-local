@@ -1,8 +1,6 @@
 """Tests for GenreIndex enrichment methods."""
 
 import sqlite3
-
-from infrastructure.persistence._database import reset_connection_pool
 import threading
 from typing import Any
 
@@ -57,10 +55,6 @@ class InMemoryGenreIndex(GenreIndex):
         if self._real_conn:
             self._real_conn.close()
             self._real_conn = None
-        # Connections are pooled per (store class, db_path), and every instance here
-        # shares ":memory:" - without this the next test is handed the wrapper around
-        # the connection this one just closed.
-        reset_connection_pool()
 
 
 def _seed_data(

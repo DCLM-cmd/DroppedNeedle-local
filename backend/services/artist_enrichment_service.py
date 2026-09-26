@@ -7,6 +7,7 @@ from api.v1.schemas.artist import (
 )
 from api.v1.schemas.common import LastFmTagSchema
 from infrastructure.validators import clean_lastfm_bio
+from infrastructure.observability.optional_work import OptionalWorkDeferred
 from repositories.protocols import LastFmRepositoryProtocol
 from services.preferences_service import PreferencesService
 
@@ -58,6 +59,8 @@ class ArtistEnrichmentService:
                 similar_artists=similar,
                 url=info.url or None,
             )
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "Failed to fetch Last.fm enrichment for artist %s: %s",

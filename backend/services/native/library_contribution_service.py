@@ -61,9 +61,14 @@ from models.identification import (
     IdentificationAttempt,
     IdentificationDecision,
     IdentificationEvidenceRecord,
+    TrackProvenance,
 )
 from services.native.album_evidence_engine import MATCHER_VERSION, AlbumEvidenceEngine
 from services.native.identification_revisions import album_input_revisions
+from services.native.track_provenance import (
+    UNKNOWN_ARTIST,
+    track_stem,
+)
 
 _Document = TypeVar("_Document")
 _MAX_TEXT_LENGTH = 1_000
@@ -78,6 +83,30 @@ _CALLBACK_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 _MUSICBRAINZ_RELEASE_PATH = re.compile(r"^/release/(?P<mbid>[0-9a-fA-F-]{36})/?$")
 
 logger = logging.getLogger(__name__)
+
+
+def _contribution_field_provenance(
+    draft_value: str | None, snapshot_value: str, stem: str | None
+) -> tuple[str, TrackProvenance]:
+    """Explicit provenance for the contribution verify path (1.4b).
+
+    Draft-sourced fields are ``parsed``-strength present claims: user-typed
+    text scores dampened like filename evidence and participates in
+    contradiction the same way (a typo'd draft routes to review, the safe
+    direction). ``or``-fallback snapshot fields are ``placeholder`` unless
+    they fail the stem/``"Unknown Artist"`` heuristic (i.e. look like real
+    tags), in which case ``tag``. The ``absent`` default never reaches this
+    path.
+    """
+    if (draft_value or "").strip():
+        return draft_value or "", "parsed"
+    if not snapshot_value.strip():
+        return snapshot_value, "placeholder"
+    if snapshot_value == UNKNOWN_ARTIST:
+        return snapshot_value, "placeholder"
+    if stem is not None and snapshot_value == stem:
+        return snapshot_value, "placeholder"
+    return snapshot_value, "tag"
 
 
 class LibraryContributionService:
@@ -689,11 +718,16 @@ class LibraryContributionService:
             )
             for track in context["tracks"]
         }
+        relative_paths = {
+            str(track["id"]): str(track["relative_path"])
+            for track in context["tracks"]
+        }
         return (
             self._attachment_evidence(
                 contribution,
                 verified,
                 recording_mbids=recording_mbids,
+                relative_paths=relative_paths,
             ),
             context,
         )
@@ -1206,35 +1240,64 @@ class LibraryContributionService:
         verified: MusicBrainzVerifiedRelease,
         *,
         recording_mbids: dict[str, str | None] | None = None,
+        relative_paths: dict[str, str] | None = None,
     ) -> IdentificationDecision:
         draft_tracks = {
             track.local_track_id: track
             for medium in contribution.draft.media
             for track in medium.tracks
         }
-        local_tracks = [
-            GroupingTrack(
-                local_track_id=track.local_track_id,
-                root_id="",
-                relative_path="",
-                title=(draft_tracks[track.local_track_id].title.value or track.title),
-                artist_name=(
-                    draft_tracks[track.local_track_id].artist_name.value
-                    or track.artist_name
-                    or ""
-                ),
-                album_title=contribution.draft.title.value or "",
-                album_artist_name=contribution.draft.artist_credit.value or "",
-                track_number=track.track_number,
-                disc_number=track.disc_number,
-                duration_seconds=track.duration_seconds,
-                recording_mbid=(recording_mbids or {}).get(track.local_track_id),
-                is_compilation=contribution.local_snapshot.is_compilation,
-                current_album_id=contribution.local_album_id,
+        path_by_track = relative_paths or {}
+        album_title, album_title_provenance = _contribution_field_provenance(
+            contribution.draft.title.value, "", None
+        )
+        album_artist_name, album_artist_provenance = (
+            _contribution_field_provenance(
+                contribution.draft.artist_credit.value, "", None
             )
-            for medium in contribution.local_snapshot.media
-            for track in medium.tracks
-        ]
+        )
+        local_tracks = []
+        for medium in contribution.local_snapshot.media:
+            for track in medium.tracks:
+                draft = draft_tracks.get(track.local_track_id)
+                stem = (
+                    track_stem(path_by_track[track.local_track_id])
+                    if track.local_track_id in path_by_track
+                    else None
+                )
+                title, title_provenance = _contribution_field_provenance(
+                    draft.title.value if draft else None, track.title, stem
+                )
+                # GroupingTrack carries no track-artist provenance field:
+                # title_provenance gates the joint title/artist claim, so the
+                # artist half is intentionally discarded here.
+                artist_name, _ = _contribution_field_provenance(
+                    draft.artist_name.value if draft else None,
+                    track.artist_name or "",
+                    stem,
+                )
+                local_tracks.append(
+                    GroupingTrack(
+                        local_track_id=track.local_track_id,
+                        root_id="",
+                        relative_path="",
+                        title=title,
+                        artist_name=artist_name,
+                        album_title=album_title,
+                        album_artist_name=album_artist_name,
+                        title_provenance=title_provenance,
+                        album_title_provenance=album_title_provenance,
+                        album_artist_provenance=album_artist_provenance,
+                        track_number=track.track_number,
+                        disc_number=track.disc_number,
+                        duration_seconds=track.duration_seconds,
+                        recording_mbid=(recording_mbids or {}).get(
+                            track.local_track_id
+                        ),
+                        is_compilation=contribution.local_snapshot.is_compilation,
+                        current_album_id=contribution.local_album_id,
+                    )
+                )
         candidate = AlbumCandidate(
             release_group_mbid=verified.release_group_mbid,
             release_mbid=verified.release_mbid,
@@ -1256,7 +1319,13 @@ class LibraryContributionService:
             release_date=verified.date,
             source_kinds=["musicbrainz_verification", "contribution_duplicate"],
         )
-        return self._evidence.decide(local_tracks, [candidate])
+        # Step 2.6 (N-01): the curator verified this exact release, so the
+        # automatic lone-eligible quorum does not apply here - the curator
+        # supplies sufficiency (the decision persists as `manual`) and the
+        # engine keeps only contradiction detection (hard vetoes still fire).
+        return self._evidence.decide(
+            local_tracks, [candidate], require_lone_quorum=False
+        )
 
     async def _musicbrainz_seed_fields(
         self,

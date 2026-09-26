@@ -2,6 +2,7 @@ import sqlite3
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -90,9 +91,22 @@ async def test_target_cache_stats_and_clear_preserve_both_catalogs(
             "total_count": 0,
             "album_count": 0,
             "artist_count": 0,
+            "total_size_bytes": 0,
         }
     )
-    service = TargetCacheService(cache, TargetLibraryRepository(store), disk_cache)
+    response_store = MagicMock()
+    response_store.stats.return_value = {
+        "response_entries": 0,
+        "response_logical_bytes": 0,
+        "database_allocated_bytes": 0,
+        "database_wal_bytes": 0,
+        "response_hits": 0,
+        "response_evictions": 0,
+        "response_speculative_used": 0,
+    }
+    service = TargetCacheService(
+        cache, TargetLibraryRepository(store), disk_cache, response_store
+    )
 
     stats = await service.get_stats()
     result = await service.clear_library_cache()

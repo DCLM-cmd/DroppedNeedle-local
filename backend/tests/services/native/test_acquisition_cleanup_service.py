@@ -692,6 +692,15 @@ async def test_health_warning_starts_after_three_failures_and_auto_heals(
         now[0] = current.next_retry_at
 
     assert service_health.is_degraded("acquisition_cleanup", "source files")
+    (entry,) = [
+        item
+        for item in service_health.current()
+        if item.service == "acquisition_cleanup"
+    ]
+    assert entry.message == (
+        "Temporary files couldn't be removed for 1 download. "
+        "Your library is safe. Retrying automatically."
+    )
 
     client.materialization.mount_healthy = True
     await service.cleanup_now(attempt.id, worker_id="recovered")

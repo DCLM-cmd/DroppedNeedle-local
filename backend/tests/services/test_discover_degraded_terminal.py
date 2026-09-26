@@ -20,6 +20,7 @@ from services.discover.homepage_service import (
 )
 from services.discover.integration_helpers import IntegrationHelpers
 from infrastructure.persistence.discovery_snapshot_store import DiscoverySnapshotStore
+from infrastructure.observability.optional_work import OptionalWorkDeferred
 
 
 def _make_prefs() -> MagicMock:
@@ -95,7 +96,7 @@ async def test_empty_build_caches_short_ttl_marker_with_degradation():
         patch.object(service, "build_discover_data", AsyncMock(return_value=DiscoverResponse())),
         patch("services.discover.homepage_service.lb_popularity_degraded", return_value=True),
     ):
-        await service.warm_cache("u1")
+        assert await service.warm_cache("u1") is False
 
     key = _cache_key(service)
     marker = cache.data[key]
@@ -120,7 +121,7 @@ async def test_empty_build_never_overwrites_meaningful_copy():
         patch.object(service, "build_discover_data", AsyncMock(return_value=DiscoverResponse())),
         patch("services.discover.homepage_service.lb_popularity_degraded", return_value=True),
     ):
-        await service.warm_cache("u1")
+        assert await service.warm_cache("u1") is False
 
     assert cache.data[key] is good
 
@@ -135,7 +136,7 @@ async def test_failed_build_caches_marker_with_degradation():
         ),
         patch("services.discover.homepage_service.lb_popularity_degraded", return_value=True),
     ):
-        await service.warm_cache("u1")
+        assert await service.warm_cache("u1") is False
 
     marker = cache.data[_cache_key(service)]
     assert isinstance(marker, DiscoverResponse)
@@ -170,7 +171,7 @@ async def test_healthy_meaningful_build_has_no_status():
         ),
         patch("services.discover.homepage_service.lb_popularity_degraded", return_value=False),
     ):
-        await service.warm_cache("u1")
+        assert await service.warm_cache("u1") is True
 
     assert cache.data[_cache_key(service)].service_status is None
 
@@ -194,3 +195,48 @@ async def test_last_good_response_survives_service_restart(tmp_path):
     assert response.globally_trending.items[0].name == "Album"
     assert response.generated_at is not None
     assert response.refreshing is False
+
+
+@pytest.mark.asyncio
+async def test_optional_deferral_preserves_last_good_without_error_marker():
+    cache = _FakeCache()
+    service = _make_service(cache)
+    key = _cache_key(service)
+    good = _meaningful_response()
+    cache.data[key] = good
+    with patch.object(
+        service, "build_discover_data", AsyncMock(side_effect=OptionalWorkDeferred())
+    ):
+        with pytest.raises(OptionalWorkDeferred):
+            await service.warm_cache("u1")
+    assert cache.data[key] is good
+    assert good.service_status is None
+    assert "u1" not in service._building_keys
+
+
+@pytest.mark.asyncio
+async def test_user_deleted_during_build_cannot_publish_response(tmp_path):
+    cache = _FakeCache()
+    service = _make_service(cache)
+    store = DiscoverySnapshotStore(tmp_path / "library.db", threading.Lock())
+    service._snapshot_store = store
+
+    async def build(user_id):
+        await store.delete_user(user_id)
+        return _meaningful_response()
+
+    with patch.object(service, "build_discover_data", build):
+        with pytest.raises(OptionalWorkDeferred):
+            await service.warm_cache("u1")
+    assert await cache.get(_cache_key(service)) is None
+    assert await store.get(_cache_key(service)) is None
+
+
+@pytest.mark.asyncio
+async def test_task_deferral_is_not_classified_as_degradation():
+    service = _make_service(_FakeCache())
+    service._last_failed_task_keys = set()
+    deferred = AsyncMock(side_effect=OptionalWorkDeferred())
+    with pytest.raises(OptionalWorkDeferred):
+        await service._execute_tasks({"lb_trending": deferred()})
+    assert service._last_failed_task_keys == set()

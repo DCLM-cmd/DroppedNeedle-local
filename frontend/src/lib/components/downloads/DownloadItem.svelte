@@ -137,20 +137,31 @@
 						title="A whole album NZB was fetched to extract this one track">via album NZB</span
 					>
 				{/if}
+				<!-- Plugin sources take the generic path: no client-specific badges or
+					remote-queue hints, just the source key. -->
+				{#if task.source && task.source !== 'soulseek' && task.source !== 'usenet'}
+					<span class="badge badge-ghost badge-sm">{task.source}</span>
+				{/if}
 				{#if isOwnedByOther}
 					<span class="text-[11px] text-base-content/50">(another user's download)</span>
 				{/if}
 				{#if cleanupState === 'pending'}
 					<span class="inline-flex items-center gap-1 text-[11px] text-base-content/55">
-						<Clock3 class="size-3" /> Cleaning source files
+						<Clock3 class="size-3" /> Removing temporary files
 					</span>
 				{:else if cleanupState === 'preserved'}
-					<span class="inline-flex items-center gap-1 text-[11px] text-warning">
-						<Archive class="size-3" /> Source files kept
+					<span
+						class="inline-flex items-center gap-1 text-[11px] text-warning"
+						title="Kept on purpose by your library settings. Your music is imported."
+					>
+						<Archive class="size-3" /> Temporary files kept
 					</span>
 				{:else if cleanupState === 'needs_attention'}
-					<span class="inline-flex items-center gap-1 text-[11px] text-error/80">
-						<TriangleAlert class="size-3" /> Source cleanup needs attention
+					<span
+						class="inline-flex items-center gap-1 text-[11px] text-error/80"
+						title="Your library is safe. The temporary copy was kept because it could not be verified safe to remove. DroppedNeedle retries automatically."
+					>
+						<TriangleAlert class="size-3" /> Couldn't remove temporary files
 					</span>
 				{/if}
 			</div>

@@ -125,7 +125,7 @@ class TestArtistDetailCacheHitEnrichment:
         svc = _artist_service(audiodb)
         cached = _cached_artist()
         svc._cache = MagicMock()
-        svc._cache.get = AsyncMock(return_value=cached)
+        svc._cache.get_with_metadata = AsyncMock(return_value=(cached, None))
 
         result = await svc.get_artist_info(TEST_ARTIST_MBID)
 
@@ -141,7 +141,7 @@ class TestArtistDetailCacheHitEnrichment:
         svc = _artist_service(audiodb)
         cached = _cached_artist(fanart_url="https://library.example.com/fanart.jpg")
         svc._cache = MagicMock()
-        svc._cache.get = AsyncMock(return_value=cached)
+        svc._cache.get_with_metadata = AsyncMock(return_value=(cached, None))
 
         result = await svc.get_artist_info(TEST_ARTIST_MBID)
 
@@ -157,7 +157,7 @@ class TestArtistDetailCacheHitEnrichment:
         svc = _artist_service(audiodb)
         cached = _cached_artist()
         svc._cache = MagicMock()
-        svc._cache.get = AsyncMock(return_value=cached)
+        svc._cache.get_with_metadata = AsyncMock(return_value=(cached, None))
 
         result = await svc.get_artist_info(TEST_ARTIST_MBID)
 

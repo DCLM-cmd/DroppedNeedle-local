@@ -82,8 +82,10 @@ def _artist_service() -> ArtistService:
     disk_cache = MagicMock()
     memory_cache.get = AsyncMock(return_value=None)
     memory_cache.set = AsyncMock()
+    memory_cache.get_with_metadata = AsyncMock(return_value=(None, None))
     disk_cache.get_artist = AsyncMock(return_value=None)
     disk_cache.set_artist = AsyncMock()
+    disk_cache.get_artist_with_metadata = AsyncMock(return_value=(None, None))
     preferences = MagicMock()
     preferences.get_advanced_settings.return_value = SimpleNamespace(
         cache_ttl_artist_library=21600,
@@ -136,7 +138,7 @@ async def test_home_provider_result_is_not_published_after_source_switch(monkeyp
         side_effect=lambda *args, **kwargs: _switch_and_home(monkeypatch)
     )
 
-    await service.warm_cache("user-1")
+    assert await service.warm_cache("user-1") is False
 
     memory_cache.set.assert_not_awaited()
 
@@ -188,6 +190,6 @@ async def test_discover_provider_result_is_not_published_after_source_switch(
 
     service.build_discover_data = AsyncMock(side_effect=build)
 
-    await service.warm_cache("user-1")
+    assert await service.warm_cache("user-1") is False
 
     memory_cache.set.assert_not_awaited()

@@ -30,6 +30,16 @@ export interface ProviderStatsRow {
 	outcome: string;
 	count_total: number;
 	rate_per_min_window: number;
+	source_mode?: string;
+	source_id?: string;
+	source_generation?: number;
+	request_category?: string;
+	include_profile?: string;
+	workload?: string;
+	downloaded_body_bytes_total?: number;
+	decoded_body_bytes_total?: number;
+	unknown_body_attempts_total?: number;
+	overflow?: boolean;
 }
 
 /** Envelope for the windowed provider-call counters (mirrors
@@ -38,4 +48,7 @@ export interface ProviderStats {
 	providers: ProviderStatsRow[];
 	window_seconds: number;
 	counters_since: number | null;
+	body_byte_scope: string;
+	detailed_series_limit: number;
+	process_epoch: string;
 }

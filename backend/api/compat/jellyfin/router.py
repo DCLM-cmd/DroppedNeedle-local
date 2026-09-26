@@ -54,6 +54,7 @@ from core.exceptions import (
 from core.base_path import application_path, scope_base_path
 from infrastructure.constants import JELLYFIN_TICKS_PER_SECOND
 from infrastructure.msgspec_fastapi import MsgSpecRoute
+from infrastructure.observability.provider_counters import route_scope
 
 logger = logging.getLogger(__name__)
 
@@ -144,9 +145,12 @@ async def _handle(
             retry_after = await compat_rate_limits.public_retry_after(client_ip)
             if retry_after is not None:
                 return reject_jellyfin(retry_after)
-        result = fn(request, services, user, **extra)
-        if inspect.isawaitable(result):
-            result = await result
+        # Override the MsgSpecRoute stamp: named handlers use fn.__name__;
+        # lambda routes collapse to "<lambda>" (they issue no provider calls).
+        with route_scope(getattr(fn, "__name__", "unknown")):
+            result = fn(request, services, user, **extra)
+            if inspect.isawaitable(result):
+                result = await result
         _log_browse_diag(request, path, result)
         return _to_response(result)
     except Exception as exc:  # noqa: BLE001 - boundary: never reach global handlers
@@ -424,6 +428,51 @@ async def _decode_artist(services: CompatServices, jf_id: str) -> str | None:
         return None
     return internal if kind == "artist" else None
 
+# SortBy allowlist (Jellyfin names, lower-cased): first known value wins, unknown
+# values are ignored so the legacy default order keeps working.
+_SORT_NATIVE = {
+    "datecreated": "recent",
+    "sortname": "title",
+    "productionyear": "year",
+    "premieredate": "year",  # Jellify sends PremiereDate first; year desc by default
+    "random": "random",
+}
+_SORT_HISTORY = {"dateplayed", "playcount"}
+_SORT_KNOWN = frozenset(_SORT_NATIVE) | _SORT_HISTORY
+# SortOrder omitted: these keys default to descending (legacy lists are newest-first).
+_SORT_DESC_DEFAULT = frozenset(
+    {"datecreated", "dateplayed", "playcount", "premieredate"}
+)
+
+
+def _browse_sort(request: Request) -> tuple[str | None, bool]:
+    """(SortBy key or None for legacy order, descending). Case-insensitive via
+    the shared helpers; comma-separated SortBy resolves first-known-wins and
+    unknown values are ignored (legacy default)."""
+    key: str | None = None
+    for value in _csv_param(request, "SortBy"):
+        candidate = value.strip().lower()
+        if candidate in _SORT_KNOWN:
+            key = candidate
+            break
+    if key is None:
+        return None, False
+    order = (_params(request).get("SortOrder") or "").strip().lower()
+    if order.startswith("desc"):
+        return key, True
+    if order.startswith("asc"):
+        return key, False
+    return key, key in _SORT_DESC_DEFAULT
+
+
+def _sort_list_key(sort_key: str) -> str:
+    """Map a resolved SortBy key onto a discover in-memory sort name."""
+    if sort_key == "dateplayed":
+        return "played"
+    if sort_key == "playcount":
+        return "playcount"
+    return _SORT_NATIVE[sort_key]
+
 
 async def _build_qr(build_fn, items, total, start):
     built = [await build_fn(i) for i in items]
@@ -602,6 +651,8 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
     ids = _csv_param(request, "Ids")
     album_artist_ids = _csv_param(request, "AlbumArtistIds")
     artist_ids = _csv_param(request, "ArtistIds")
+    contributing_ids = _csv_param(request, "ContributingArtistIds")
+    sort_key, sort_desc = _browse_sort(request)
 
     if ids:
         items = await _items_by_ids(services, b, ids, user)
@@ -662,11 +713,39 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
             tracks = await services.view.get_tracks_by_album_artist_mbids(
                 mbids, user=user
             )
+            if sort_key is not None:
+                tracks = services.discover.sort_tracks(
+                    tracks, sort=_sort_list_key(sort_key), descending=sort_desc
+                )
             return await _build_page(b.audio, tracks, start, limit)
         if artist_ids:
             mbids = [m for i in artist_ids if (m := await _decode_artist(services, i))]
             tracks = await services.view.get_tracks_by_artist_mbids(mbids, user=user)
+            if sort_key is not None:
+                tracks = services.discover.sort_tracks(
+                    tracks, sort=_sort_list_key(sort_key), descending=sort_desc
+                )
             return await _build_page(b.audio, tracks, start, limit)
+        if sort_key in _SORT_HISTORY:
+            tracks, total = await services.discover.get_history_tracks_page(
+                user_id=user.id,
+                frequent=sort_key == "playcount",
+                descending=sort_desc,
+                limit=limit or 100,
+                offset=start,
+                user=user,
+            )
+            return await _build_qr(b.audio, tracks, total, start)
+        if sort_key is not None:
+            tracks, total = await services.discover.get_sorted_tracks(
+                sort=_SORT_NATIVE[sort_key],
+                descending=sort_desc,
+                limit=limit or 100,
+                offset=start,
+                q=search,
+                user=user,
+            )
+            return await _build_qr(b.audio, tracks, total, start)
         tracks, total = await services.view.get_tracks_page(
             limit=limit or 100,
             offset=start,
@@ -676,13 +755,53 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
         )
         return await _build_qr(b.audio, tracks, total, start)
 
+    if contributing_ids:
+        mbids = [
+            m for i in contributing_ids if (m := await _decode_artist(services, i))
+        ]
+        if not mbids:
+            # A contributor filter must never fall through to the full catalog.
+            return jm.BaseItemDtoQueryResult(
+                Items=[], TotalRecordCount=0, StartIndex=start
+            )
+        albums = await services.discover.get_appears_on_albums(
+            mbids,
+            sort=_sort_list_key(sort_key) if sort_key is not None else "recent",
+            descending=sort_desc if sort_key is not None else True,
+            user=user,
+        )
+        return await _build_page(b.album, albums, start, limit)
     if album_artist_ids or artist_ids:
         albums = []
         for jf_id in album_artist_ids or artist_ids:
             mb = await _decode_artist(services, jf_id)
             if mb:
                 albums += await services.view.get_albums_for_artist(mb, user=user)
+        if sort_key is not None:
+            albums = services.discover.sort_albums(
+                albums, sort=_sort_list_key(sort_key), descending=sort_desc
+            )
         return await _build_page(b.album, albums, start, limit)
+    if sort_key in _SORT_HISTORY:
+        albums, total = await services.discover.get_history_albums_page(
+            user_id=user.id,
+            frequent=sort_key == "playcount",
+            descending=sort_desc,
+            limit=limit or 100,
+            offset=start,
+            user=user,
+        )
+        return await _build_qr(b.album, albums, total, start)
+    if sort_key is not None:
+        albums, total = await services.discover.get_sorted_albums(
+            sort=_SORT_NATIVE[sort_key],
+            descending=sort_desc,
+            limit=limit or 100,
+            offset=start,
+            q=search,
+            user=user,
+        )
+        return await _build_qr(b.album, albums, total, start)
     page = start // limit + 1 if limit else 1
     albums, total = await services.view.get_albums(
         page=page,
@@ -781,6 +900,44 @@ async def items_modern(
     request: Request, services: CompatServices = Depends(get_compat_services)
 ) -> Response:
     return await _handle(request, services, _browse)
+
+
+async def _latest(request, services, user, **_) -> list:
+    """Jellify Recently Added (getLatestMedia): a plain JSON array of the newest
+    MusicAlbums. ParentId, when given, must be the music library; anything else
+    (unknown id, non-library kind) yields an empty array like _browse."""
+    parent = _params(request).get("ParentId")
+    if parent:
+        try:
+            kind, _ = await services.id_map.from_jf(parent)
+        except JellyfinError:
+            return []
+        if kind != "library":
+            return []
+    limit = _qint(request, "Limit", 10)
+    if limit <= 0:
+        limit = 10
+    b = _builder(services)
+    albums, _total = await services.view.get_albums_offset(
+        limit=limit, offset=0, sort="recent", user=user
+    )
+    return [await b.album(a) for a in albums]
+
+
+@router.get("/UserItems/Latest")
+async def user_items_latest(
+    request: Request, services: CompatServices = Depends(get_compat_services)
+) -> Response:
+    return await _handle(request, services, _latest)
+
+
+@router.get("/Users/{user_id}/Items/Latest")
+async def user_items_latest_legacy(
+    user_id: str,
+    request: Request,
+    services: CompatServices = Depends(get_compat_services),
+) -> Response:
+    return await _handle(request, services, _latest)
 
 
 async def _artists(
@@ -1092,6 +1249,54 @@ def _audio_stream_model(track) -> jm.MediaStream:
     )
 
 
+async def _plugin_user(request, services, user):
+    if user is not None and getattr(user, "id", None):
+        uid = getattr(user, "id", None)
+        if isinstance(uid, str) and uid:
+            return user
+    try:
+        token = extract_token(request)
+    except Exception:  # noqa: BLE001 - token failure means no plugin fallback
+        return None
+    if not token:
+        return None
+    try:
+        found = await services.app_passwords.verify_token(token)
+    except Exception:  # noqa: BLE001 - token verify failure means no plugin fallback
+        return None
+    return found
+
+
+async def _plugin_audio_fallback(request, services, user, *, mbid: str, req_fmt: str | None, max_kbps: int | None, start_s: float, force: bool) -> Response | None:
+    authed = await _plugin_user(request, services, user)
+    if authed is None:
+        return None
+    user_id = getattr(authed, "id", None)
+    if not user_id or not isinstance(user_id, str):
+        return None
+    if not mbid or not isinstance(mbid, str):
+        return None
+    try:
+        from services.compat.plugin_stream_service import get_plugin_stream_service, stream_plugin_ref_response
+    except Exception:  # noqa: BLE001 - missing plugin service falls back to local audio
+        return None
+    try:
+        svc = get_plugin_stream_service()
+        ref = await svc.resolve(str(mbid), str(user_id))
+    except Exception:  # noqa: BLE001 - plugin resolve failure falls back to local audio
+        return None
+    if ref is None:
+        return None
+    try:
+        settings = services.preferences.get_connect_apps_settings()
+    except Exception:  # noqa: BLE001 - settings read failure falls back to local audio
+        return None
+    try:
+        return await stream_plugin_ref_response(service=svc, ref=ref, recording_mbid=str(mbid), user_id=str(user_id), requested_format=req_fmt, max_bitrate_kbps=max_kbps, force_original=force, start_seconds=start_s, settings=settings, concurrency=services.stream_concurrency, transcode=services.transcode, range_header=request.headers.get("Range"), is_disconnected=request.is_disconnected, estimate=False)
+    except Exception:  # noqa: BLE001 - plugin stream failure falls back to local handling
+        return None
+
+
 async def _serve_direct(services, file_id, request) -> Response:
     from services.compat.stream_concurrency import StreamCapacityError, leased_chunks
 
@@ -1119,7 +1324,7 @@ async def _serve_direct(services, file_id, request) -> Response:
             media_type=headers.get("Content-Type", "application/octet-stream"),
             background=BackgroundTask(lease.release),
         )
-    except BaseException:
+    except BaseException:  # noqa: BLE001 - lease must release on any failure before re-raise
         await lease.release()
         raise
 
@@ -1133,37 +1338,22 @@ async def _media_principal(request, services) -> str:
     return f"ip:{trusted_client_ip(request)}"
 
 
-async def _stream_decided(
-    request, services, internal, *, req_fmt, max_kbps, start_s, force
-):
+async def _stream_decided(request, services, internal, *, req_fmt, max_kbps, start_s, force, user=None):
     from services.compat.transcode_service import decide, ffmpeg_available
-
     track = await services.view.get_track(internal)
     if track is None:
+        plugin_resp = await _plugin_audio_fallback(request, services, user, mbid=internal, req_fmt=req_fmt, max_kbps=max_kbps, start_s=start_s, force=force)
+        if plugin_resp is not None:
+            return plugin_resp
         raise JellyfinError(404, "Item not found")
     settings = services.preferences.get_connect_apps_settings()
-    plan = decide(
-        track,
-        requested_format=req_fmt,
-        max_bitrate_kbps=max_kbps,
-        force_original=force,
-        start_seconds=start_s,
-        settings=settings,
-        ffmpeg_available=ffmpeg_available(),
-    )
+    plan = decide(track, requested_format=req_fmt, max_bitrate_kbps=max_kbps, force_original=force, start_seconds=start_s, settings=settings, ffmpeg_available=ffmpeg_available())
     if not plan.transcode:
         return await _serve_direct(services, internal, request)
     path = await services.local_files.resolve_validated_path(internal)
     from services.compat.stream_concurrency import StreamCapacityError
-
     try:
-        return await services.transcode.stream(
-            str(path),
-            plan,
-            principal=await _media_principal(request, services),
-            is_disconnected=request.is_disconnected,
-            estimate=False,
-        )
+        return await services.transcode.stream(str(path), plan, principal=await _media_principal(request, services), is_disconnected=request.is_disconnected, estimate=False)
     except StreamCapacityError:
         return Response(status_code=429, headers={"Retry-After": "1"})
 
@@ -1179,28 +1369,33 @@ async def _decode_track(services, item_id) -> str:
 
 
 async def _universal(request, services, user, *, item_id):
-    internal = await _decode_track(services, item_id)
+    try:
+        internal = await _decode_track(services, item_id)
+    except JellyfinError:
+        q0 = _params(request)
+        max_bps0 = _qint(request, "MaxStreamingBitrate", 0)
+        max_kbps0 = round(max_bps0 / 1000) if max_bps0 else None
+        start_s0 = _qint(request, "StartTimeTicks", 0) / JELLYFIN_TICKS_PER_SECOND
+        plugin_resp = await _plugin_audio_fallback(request, services, user, mbid=item_id, req_fmt=_map_jf_codec(q0.get("AudioCodec")), max_kbps=max_kbps0, start_s=start_s0, force=False)
+        if plugin_resp is not None:
+            return plugin_resp
+        raise
     q = _params(request)
-    max_bps = _qint(request, "MaxStreamingBitrate", 0)  # tolerate non-numeric -> 0
+    max_bps = _qint(request, "MaxStreamingBitrate", 0)
     max_kbps = round(max_bps / 1000) if max_bps else None
     start_s = _qint(request, "StartTimeTicks", 0) / JELLYFIN_TICKS_PER_SECOND
     accepted = _accepted_containers(q.get("Container"))
     track = await services.view.get_track(internal)
     if track is None:
+        plugin_resp = await _plugin_audio_fallback(request, services, user, mbid=internal, req_fmt=_map_jf_codec(q.get("AudioCodec")), max_kbps=max_kbps, start_s=start_s, force=False)
+        if plugin_resp is not None:
+            return plugin_resp
         raise JellyfinError(404, "Item not found")
     if accepted and track.file_format in accepted:
         req_fmt = None
     else:
         req_fmt = _map_jf_codec(q.get("AudioCodec"))
-    return await _stream_decided(
-        request,
-        services,
-        internal,
-        req_fmt=req_fmt,
-        max_kbps=max_kbps,
-        start_s=start_s,
-        force=False,
-    )
+    return await _stream_decided(request, services, internal, req_fmt=req_fmt, max_kbps=max_kbps, start_s=start_s, force=False, user=user)
 
 
 # Streaming is anonymous (auth=False): real Jellyfin's audio routes have no [Authorize],
@@ -1216,22 +1411,29 @@ async def audio_universal(
 
 
 async def _audio_stream(request, services, user, *, item_id):
-    internal = await _decode_track(services, item_id)
+    try:
+        internal = await _decode_track(services, item_id)
+    except JellyfinError:
+        q0 = _params(request)
+        audio_bps0 = _qint(request, "audioBitRate", 0)
+        max_kbps0 = round(audio_bps0 / 1000) if audio_bps0 else None
+        start_s0 = _qint(request, "startTimeTicks", 0) / JELLYFIN_TICKS_PER_SECOND
+        plugin_resp = await _plugin_audio_fallback(request, services, user, mbid=item_id, req_fmt=_map_jf_codec(q0.get("audioCodec")), max_kbps=max_kbps0, start_s=start_s0, force=False)
+        if plugin_resp is not None:
+            return plugin_resp
+        raise
     q = _params(request)
     if (q.get("static") or "").lower() == "true":
+        track = await services.view.get_track(internal)
+        if track is None:
+            plugin_resp = await _plugin_audio_fallback(request, services, user, mbid=internal, req_fmt=None, max_kbps=None, start_s=0.0, force=True)
+            if plugin_resp is not None:
+                return plugin_resp
         return await _serve_direct(services, internal, request)
-    audio_bps = _qint(request, "audioBitRate", 0)  # tolerate non-numeric -> 0
+    audio_bps = _qint(request, "audioBitRate", 0)
     max_kbps = round(audio_bps / 1000) if audio_bps else None
     start_s = _qint(request, "startTimeTicks", 0) / JELLYFIN_TICKS_PER_SECOND
-    return await _stream_decided(
-        request,
-        services,
-        internal,
-        req_fmt=_map_jf_codec(q.get("audioCodec")),
-        max_kbps=max_kbps,
-        start_s=start_s,
-        force=False,
-    )
+    return await _stream_decided(request, services, internal, req_fmt=_map_jf_codec(q.get("audioCodec")), max_kbps=max_kbps, start_s=start_s, force=False, user=user)
 
 
 # Jellyfin also serves the untouched file at /Items/{id}/File and /Items/{id}/Download,

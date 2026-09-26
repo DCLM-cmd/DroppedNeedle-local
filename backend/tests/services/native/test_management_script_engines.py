@@ -386,7 +386,9 @@ def test_naming_compatibility_controls_and_collision_normalization() -> None:
         compatibility,
     )
 
-    assert result.relative_path == "-CON/A-B_Management_Track.FLA"
+    # Truncation preserves the suffix and trims the stem instead of clipping
+    # the extension.
+    assert result.relative_path == "-CON/A-B_Management_Trac.FLAC"
     assert all(len(part.encode("utf-8")) <= 24 for part in result.as_path().parts)
 
     composed = engine.format_management_path(

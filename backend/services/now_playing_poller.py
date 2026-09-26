@@ -148,6 +148,6 @@ async def run_now_playing_presence_loop(
             )
         except asyncio.CancelledError:
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.warning("now-playing presence loop cycle failed: %s", e)
         await asyncio.sleep(interval)

@@ -15,7 +15,12 @@ import {
 	removePersistedQueries,
 	type PersistedQueryPredicate
 } from './IndexedDbPersister.svelte';
-import { subscribeMusicBrainzSourceScope } from './musicbrainz/sourceScope.svelte';
+import {
+	musicBrainzSourceKey,
+	subscribeMusicBrainzSourceScope,
+	type MusicBrainzSourceKey
+} from './musicbrainz/sourceScope.svelte';
+import { getDownloadScope, subscribeDownloadRoleChange } from './downloads/downloadScope.svelte';
 
 /**
  * Maximum age for queries to be persisted.
@@ -24,7 +29,7 @@ import { subscribeMusicBrainzSourceScope } from './musicbrainz/sourceScope.svelt
 const QUERY_MAX_AGE = 1000 * 60 * 60 * 24 * 7; // 7 days
 
 const queryPersister = experimental_createQueryPersister({
-	storage: createIDBStorage(),
+	storage: createIDBStorage(isCurrentQueryScope),
 	maxAge: QUERY_MAX_AGE,
 	// No need to serialize/deserialize since we're using IndexedDB which can store complex objects.
 	serialize: (persistedQuery) => persistedQuery,
@@ -43,6 +48,7 @@ export const setQueryDataWithPersister = async <
 	>,
 	options?: SetDataOptions
 ) => {
+	if (!isCurrentQueryScope({ queryKey })) return;
 	// eslint-disable-next-line no-restricted-syntax
 	await queryClient.setQueryData<TQueryFnData, TTaggedQueryKey, TInferredQueryFnData>(
 		queryKey,
@@ -107,7 +113,48 @@ const MUSICBRAINZ_DISCOVER_QUERY_SEGMENTS: Record<string, true> = {
 	'playlist-suggestions': true
 };
 
+function providerSourceKey(queryKey: readonly unknown[]): MusicBrainzSourceKey | undefined {
+	return queryKey.find(
+		(part): part is MusicBrainzSourceKey =>
+			typeof part === 'object' &&
+			part !== null &&
+			'source_mode' in part &&
+			typeof part.source_mode === 'string' &&
+			'source_id' in part &&
+			typeof part.source_id === 'string' &&
+			'generation' in part &&
+			typeof part.generation === 'number' &&
+			'user_id' in part &&
+			(typeof part.user_id === 'string' || part.user_id === null)
+	);
+}
+
+function isCurrentQueryScope(query: { queryKey: readonly unknown[] }): boolean {
+	const [root, section, userId, role, generation] = query.queryKey;
+	if (root === 'downloads' && section === 'tasks') {
+		const current = getDownloadScope();
+		return (
+			current.userId !== null &&
+			userId === current.userId &&
+			role === current.role &&
+			generation === current.generation
+		);
+	}
+	if (!isMusicBrainzProviderQuery(query)) return true;
+	const source = providerSourceKey(query.queryKey);
+	const current = musicBrainzSourceKey();
+	return (
+		source !== undefined &&
+		current.source_id !== '' &&
+		source.user_id === current.user_id &&
+		source.source_mode === current.source_mode &&
+		source.source_id === current.source_id &&
+		source.generation === current.generation
+	);
+}
+
 function isMusicBrainzProviderQuery(query: { queryKey: readonly unknown[] }): boolean {
+	if (providerSourceKey(query.queryKey)) return true;
 	const [root, second, third, fourth] = query.queryKey;
 	if (root === 'artist') {
 		if (query.queryKey.length === 2) return true;
@@ -161,7 +208,13 @@ subscribeMusicBrainzSourceScope((next, previous) => {
 	) {
 		return;
 	}
-	void invalidateMusicBrainzProviderQueries().catch(() => undefined);
+	const obsolete = {
+		predicate: (query: { queryKey: readonly unknown[] }) =>
+			isMusicBrainzProviderQuery(query) && !isCurrentQueryScope(query)
+	};
+	void queryClient.cancelQueries(obsolete);
+	queryClient.removeQueries(obsolete);
+	void removePersistedQueries(obsolete.predicate).catch(() => undefined);
 });
 
 export const queryClient = new QueryClient({
@@ -175,6 +228,16 @@ export const queryClient = new QueryClient({
 			persister: queryPersister.persisterFn
 		}
 	}
+});
+
+subscribeDownloadRoleChange((userId) => {
+	const filters = { queryKey: ['downloads', 'tasks', userId] };
+	// Cancellation fences transport and persister completion before old scope removal.
+	void queryClient.cancelQueries(filters);
+	queryClient.removeQueries(filters);
+	void invalidateQueriesWithPersister(filters, undefined, { removePersisted: true }).catch(
+		() => undefined
+	);
 });
 
 /**

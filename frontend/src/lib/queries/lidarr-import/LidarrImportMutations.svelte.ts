@@ -18,7 +18,6 @@ export const saveLidarrConfigMutation = () =>
 			api.global.put<LidarrImportConnection>(API.lidarrImport.config(), connection),
 		onSuccess: async () => {
 			await invalidateQueriesWithPersister({ queryKey: LidarrImportQueryKeyFactory.config() });
-			await invalidateQueriesWithPersister({ queryKey: LidarrImportQueryKeyFactory.status() });
 		}
 	}));
 
@@ -45,8 +44,8 @@ export const importFromLidarrMutation = () =>
 				queryKey: LidarrImportQueryKeyFactory.candidates(authStore.user?.id)
 			});
 			await invalidateQueriesWithPersister({ queryKey: HomeQueryKeyFactory.prefix });
-			// An admin importer's own auto-download is live immediately; a non-admin mints a
-			// pending batch. Either way the pending-approval badge may need refreshing.
+			// Import is admin-only, so the importer's own auto-download is live immediately;
+			// the pending-approval badge refresh stays as a harmless no-op.
 			notifyPendingApprovalCountChanged();
 		}
 	}));

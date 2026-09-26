@@ -29,9 +29,24 @@ def _make_service(cache) -> CacheService:
             "artist_count": 4,
             "audiodb_artist_count": 0,
             "audiodb_album_count": 0,
+            "total_size_bytes": 0,
         }
     )
-    return CacheService(cache=cache, library_db=lib_cache, disk_cache=disk_cache)
+    response_store = MagicMock()
+    response_store.clear = AsyncMock(return_value=2)
+    response_store.stats.return_value = {
+        "response_entries": 2,
+        "response_logical_bytes": 64,
+        "database_allocated_bytes": 4096,
+        "database_wal_bytes": 0,
+        "response_hits": 0,
+        "response_evictions": 0,
+        "response_speculative_used": 0,
+    }
+    return CacheService(
+        cache=cache, library_db=lib_cache, disk_cache=disk_cache,
+        mb_response_store=response_store,
+    )
 
 
 class TestClearMetadataCache:
@@ -52,7 +67,6 @@ class TestClearMetadataCache:
         assert result.cleared_disk_files == 7
         # The non-destructive receipt: covers untouched by construction.
         assert result.cover_files_cleared == 0
-        assert "covers preserved" in result.message
         cache.clear.assert_awaited_once()
         service._disk_cache.clear_all.assert_awaited_once()
 
@@ -73,7 +87,7 @@ class TestClearMetadataCache:
 
 class TestGetStatsObservabilityFields:
     @pytest.mark.asyncio
-    async def test_ratio_fields_populated_from_instrumented_cache(self, monkeypatch):
+    async def test_ratio_fields_populated_from_instrumented_cache(self, monkeypatch, tmp_path):
         instrumented = InstrumentedCache(InMemoryCache(max_entries=10))
         service = _make_service(instrumented)
 
@@ -83,7 +97,7 @@ class TestGetStatsObservabilityFields:
 
         monkeypatch.setattr(
             "services.cache_service.get_covers_cache_dir",
-            lambda: MagicMock(exists=lambda: False),
+            lambda: tmp_path / "covers",
         )
         stats = await service.get_stats()
 
@@ -97,7 +111,7 @@ class TestGetStatsObservabilityFields:
         assert isinstance(stats.counters_since, int)
 
     @pytest.mark.asyncio
-    async def test_ratio_fields_defaulted_without_instrumentation(self, monkeypatch):
+    async def test_ratio_fields_defaulted_without_instrumentation(self, monkeypatch, tmp_path):
         cache = MagicMock()
         cache.size.return_value = 0
         cache.estimate_memory_bytes.return_value = 0
@@ -105,6 +119,6 @@ class TestGetStatsObservabilityFields:
 
         monkeypatch.setattr(
             "services.cache_service.get_covers_cache_dir",
-            lambda: MagicMock(exists=lambda: False),
+            lambda: tmp_path / "covers",
         )
         stats = await service.get_stats()

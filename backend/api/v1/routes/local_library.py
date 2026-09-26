@@ -1,6 +1,7 @@
 import logging
 from typing import Literal
 
+import msgspec.structs
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.v1.schemas.local_files import (
@@ -19,14 +20,25 @@ from core.dependencies import (
     CurrentUserDep,
     NativeLyricsServiceDep,
     get_local_files_service,
+    get_preferences_service,
 )
 from core.exceptions import ExternalServiceError
 from infrastructure.msgspec_fastapi import MsgSpecRoute
 from services.local_files_service import LocalFilesService
+from services.preferences_service import PreferencesService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(route_class=MsgSpecRoute, prefix="/local", tags=["local-files"])
+
+
+def _with_download_allowed(
+    albums: list[LocalAlbumSummary], allowed: bool
+) -> list[LocalAlbumSummary]:
+    """Stamp the per-request viewer download bit onto summary items."""
+    return [
+        msgspec.structs.replace(album, download_allowed=allowed) for album in albums
+    ]
 
 
 @router.get("/tracks/{file_id}/lyrics", response_model=LocalLyricsResponse)
@@ -55,6 +67,7 @@ async def get_local_track_lyrics(
 
 @router.get("/albums", response_model=LocalPaginatedResponse)
 async def get_local_albums(
+    current_user: CurrentUserDep,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     sort_by: Literal["name", "date_added", "year", "random", "rediscover"] = "name",
@@ -62,15 +75,23 @@ async def get_local_albums(
     q: str | None = Query(default=None, min_length=1),
     decade: int | None = Query(default=None),
     service: LocalFilesService = Depends(get_local_files_service),
+    preferences: PreferencesService = Depends(get_preferences_service),
 ) -> LocalPaginatedResponse:
     try:
-        return await service.get_albums(
+        page = await service.get_albums(
             limit=limit,
             offset=offset,
             sort_by=sort_by,
             sort_order=sort_order,
             search_query=q,
             decade=decade,
+        )
+        return msgspec.structs.replace(
+            page,
+            items=_with_download_allowed(
+                page.items,
+                preferences.is_library_download_allowed(current_user.role),
+            ),
         )
     except ExternalServiceError as e:
         logger.error("Failed to get local albums: %s", e)
@@ -80,10 +101,16 @@ async def get_local_albums(
 @router.get("/albums/match/{musicbrainz_id}", response_model=LocalAlbumMatch)
 async def match_local_album(
     musicbrainz_id: str,
+    current_user: CurrentUserDep,
     service: LocalFilesService = Depends(get_local_files_service),
+    preferences: PreferencesService = Depends(get_preferences_service),
 ) -> LocalAlbumMatch:
     try:
-        return await service.match_album_by_mbid(musicbrainz_id)
+        match = await service.match_album_by_mbid(musicbrainz_id)
+        return msgspec.structs.replace(
+            match,
+            download_allowed=preferences.is_library_download_allowed(current_user.role),
+        )
     except ExternalServiceError as e:
         logger.error("Failed to match local album %s: %s", musicbrainz_id, e)
         raise HTTPException(status_code=502, detail="Failed to match local album")
@@ -103,11 +130,20 @@ async def get_local_album_tracks(
 
 @router.get("/search", response_model=LocalSearchResponse)
 async def search_local(
+    current_user: CurrentUserDep,
     q: str = Query(min_length=1),
     service: LocalFilesService = Depends(get_local_files_service),
+    preferences: PreferencesService = Depends(get_preferences_service),
 ) -> LocalSearchResponse:
     try:
-        return await service.search(q)
+        result = await service.search(q)
+        return msgspec.structs.replace(
+            result,
+            albums=_with_download_allowed(
+                result.albums,
+                preferences.is_library_download_allowed(current_user.role),
+            ),
+        )
     except ExternalServiceError as e:
         logger.error("Failed to search local files: %s", e)
         raise HTTPException(status_code=502, detail="Failed to search local files")
@@ -115,11 +151,16 @@ async def search_local(
 
 @router.get("/recent", response_model=list[LocalAlbumSummary])
 async def get_local_recent(
+    current_user: CurrentUserDep,
     limit: int = Query(default=20, ge=1, le=50),
     service: LocalFilesService = Depends(get_local_files_service),
+    preferences: PreferencesService = Depends(get_preferences_service),
 ) -> list[LocalAlbumSummary]:
     try:
-        return await service.get_recently_added(limit=limit)
+        items = await service.get_recently_added(limit=limit)
+        return _with_download_allowed(
+            items, preferences.is_library_download_allowed(current_user.role)
+        )
     except ExternalServiceError as e:
         logger.error("Failed to get recent local albums: %s", e)
         raise HTTPException(status_code=502, detail="Failed to get recent local albums")

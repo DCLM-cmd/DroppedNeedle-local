@@ -9,14 +9,12 @@
 		ExternalLink,
 		Flag,
 		Headphones,
-		Loader2,
+		LoaderCircle,
 		RefreshCw,
 		Volume2,
 		X
 	} from 'lucide-svelte';
 	import { getApiUrl } from '$lib/api/api-utils';
-	import { api } from '$lib/api/client';
-	import { API } from '$lib/constants';
 	import { discoverQueueDeck } from '$lib/stores/discoverQueueDeck.svelte';
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';
 	import { audioFocus } from '$lib/stores/audioFocus.svelte';
@@ -27,7 +25,7 @@
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import HeroBackdrop from '$lib/components/HeroBackdrop.svelte';
 	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
-	import type { YouTubeQuotaStatus, YouTubeSearchResponse } from '$lib/types';
+	import { getQueuePreviewMutation } from '$lib/queries/discover/DiscoverDemand.svelte';
 
 	interface Props {
 		youtubeEnabled: boolean;
@@ -43,9 +41,13 @@
 	let ytSearching = $state(false);
 	let ytEmbedUrl = $state<string | null>(null);
 	let ytError = $state<string | null>(null);
-	let ytQuota = $state<YouTubeQuotaStatus | null>(null);
+	let ytSearchUrl = $state<string | null>(null);
+	let previewController: AbortController | null = null;
+	let previewGeneration = 0;
+	const previewMutation = getQueuePreviewMutation();
 
 	const current = $derived(deck.current);
+	const cardIdentity = $derived(`${deck.requestKey}:${current?.release_group_mbid ?? ''}`);
 	const enrichment = $derived(current?.enrichment);
 	const enriching = $derived(current != null && !current.enrichment);
 	const artistMbid = $derived(current?.artist_mbid || enrichment?.artist_mbid || '');
@@ -63,11 +65,10 @@
 			deckSampler.activeKey === current.release_group_mbid &&
 			deckSampler.status !== 'idle'
 	);
-	const videoAvailable = $derived(
-		!!enrichment?.youtube_url ||
-			(youtubeEnabled &&
-				!!enrichment?.youtube_search_available &&
-				(!ytQuota || ytQuota.remaining > 0))
+	const externalSearchUrl = $derived(
+		ytSearchUrl ||
+			enrichment?.youtube_search_url ||
+			`https://www.youtube.com/results?search_query=${encodeURIComponent(`${current?.artist_name ?? ''} ${current?.album_name ?? ''} music video`)}`
 	);
 
 	// one-sound rule (other direction): global playback starting kills deck audio
@@ -80,7 +81,11 @@
 
 	// leaving the current item resets its transient panes
 	$effect(() => {
-		void current?.release_group_mbid;
+		void cardIdentity;
+		previewGeneration++;
+		previewController?.abort();
+		audioFocus.release('deck-video');
+		ytSearchUrl = null;
 		bioExpanded = false;
 		videoOpen = false;
 		ytEmbedUrl = null;
@@ -89,54 +94,80 @@
 	});
 
 	onMount(() => {
-		void deck.init();
-		void fetchQuota();
+		let visible = false;
+		const enter = () => {
+			if (visible && document.visibilityState === 'visible') {
+				void deck.init(() => visible && document.visibilityState === 'visible');
+			}
+		};
+		const onVisibility = () => {
+			if (document.visibilityState === 'hidden') deck.destroy();
+			else enter();
+		};
+		const observer = new IntersectionObserver(([entry]) => {
+			const entering = entry.isIntersecting && !visible;
+			visible = entry.isIntersecting;
+			if (entering) enter();
+		});
+		if (deckEl) observer.observe(deckEl);
+		document.addEventListener('visibilitychange', onVisibility);
+		window.addEventListener('focus', enter);
+		return () => {
+			observer.disconnect();
+			document.removeEventListener('visibilitychange', onVisibility);
+			window.removeEventListener('focus', enter);
+		};
 	});
 
 	onDestroy(() => {
+		previewGeneration++;
+		previewController?.abort();
+		audioFocus.release('deck-video');
 		// Leave the preview playing: it's the app-wide sampler singleton that the
 		// floating PreviewWidget picks up so a sample follows you off the Discover
 		// page, like every other page that starts one.
 		deck.destroy();
 	});
 
-	async function fetchQuota() {
-		if (!youtubeEnabled) return;
-		try {
-			ytQuota = await api.global.get<YouTubeQuotaStatus>(API.discoverQueueYoutubeQuota());
-		} catch {
-			// Quota failures must not prevent the rest of the queue from working.
-		}
-	}
-
 	async function openVideo() {
-		if (!current) return;
-		// video replaces any sample and pauses the global player
+		if (!current || ytSearching) return;
+		const mbid = current.release_group_mbid;
+		const scope = deck.requestKey;
+		const generation = ++previewGeneration;
+		const isCurrent = () =>
+			generation === previewGeneration &&
+			current?.release_group_mbid === mbid &&
+			deck.requestKey === scope;
 		deckSampler.stop();
-		audioFocus.claim('deck-video', () => (videoOpen = false));
+		audioFocus.claim('deck-video', () => {
+			previewGeneration++;
+			previewController?.abort();
+			ytSearching = false;
+			videoOpen = false;
+		});
 		if (enrichment?.youtube_url) {
 			ytEmbedUrl = enrichment.youtube_url;
 			videoOpen = true;
 			return;
 		}
-		if (!enrichment?.youtube_search_available) return;
+		previewController?.abort();
+		previewController = new AbortController();
 		ytSearching = true;
 		ytError = null;
 		try {
-			const data = await api.global.get<YouTubeSearchResponse>(
-				API.discoverQueueYoutubeSearch(current.artist_name, current.album_name)
-			);
-			if (data.embed_url) {
-				ytEmbedUrl = data.embed_url;
+			const data = await previewMutation.mutateAsync({ mbid, signal: previewController.signal });
+			if (!isCurrent()) return;
+			ytSearchUrl = data.youtube_search_url;
+			if (data.status === 'available' && data.youtube_url) {
+				ytEmbedUrl = data.youtube_url;
 				videoOpen = true;
 			} else {
-				ytError = data.error ?? 'not_found';
+				ytError = data.status;
 			}
 		} catch {
-			ytError = 'request_failed';
+			if (isCurrent()) ytError = 'request_failed';
 		} finally {
-			ytSearching = false;
-			void fetchQuota();
+			if (isCurrent()) ytSearching = false;
 		}
 	}
 
@@ -362,10 +393,11 @@
 									/>
 								</a>
 
-								{#if videoAvailable && !sampling}
+								{#if !sampling}
 									<button
 										class="deck-yt-overlay absolute inset-0 flex items-center justify-center"
 										onclick={openVideo}
+										disabled={ytSearching}
 										aria-label="Play music video"
 										title="Play video"
 									>
@@ -373,7 +405,7 @@
 											class="flex h-16 w-16 items-center justify-center rounded-full bg-base-100/85 shadow-lg backdrop-blur-sm transition-transform duration-300"
 										>
 											{#if ytSearching}
-												<Loader2
+												<LoaderCircle
 													class="h-7 w-7 animate-spin"
 													style="color: var(--color-youtube);"
 												/>
@@ -512,82 +544,115 @@
 									{/if}
 								</p>
 							{/if}
-
-							{#if ytError === 'quota_exceeded'}
-								<p class="mt-2 text-xs text-warning/80">
-									YouTube lookup limit reached for today.
-									{#if enrichment?.youtube_search_url}
-										<a
-											href={enrichment.youtube_search_url}
-											target="_blank"
-											rel="noopener noreferrer"
-											class="link">Search manually <ExternalLink class="inline h-3 w-3" /></a
-										>
-									{/if}
-								</p>
-							{:else if ytError}
-								<p class="mt-2 text-xs text-base-content/40">No video found for this album.</p>
-							{/if}
+						{/if}
+						{#if ytError}
+							<p class="mt-2 text-xs text-base-content/60" role="status">
+								{ytError === 'request_failed'
+									? 'Video lookup failed. Try again.'
+									: ytError === 'unavailable'
+										? 'Video search is unavailable. You can still search YouTube.'
+										: 'No video found for this album.'}
+							</p>
 						{/if}
 
-						<div class="mt-5 flex flex-wrap items-center gap-2 pt-1">
-							<div class="flex flex-col gap-1">
+						<div class="mt-5 flex flex-col gap-2 pt-1">
+							<div class="flex flex-wrap items-center gap-2">
 								<button
-									class="btn btn-sm gap-2 border-none bg-base-content/10 hover:bg-base-content/20"
-									class:btn-active={sampling}
-									onclick={toggleSample}
-									disabled={deckSampler.status === 'loading' && sampling}
-									title="Play 30-second samples of this album"
+									class="btn btn-ghost btn-sm gap-2"
+									onclick={openVideo}
+									disabled={ytSearching}
+									title={youtubeEnabled
+										? 'Find a music video'
+										: 'Look for an existing music video link'}
 								>
-									{#if sampling && deckSampler.status === 'loading'}
-										<Loader2 class="h-4 w-4 animate-spin" />
-									{:else if sampling}
-										<X class="h-4 w-4" />
-									{:else}
-										<Disc3 class="h-4 w-4" />
-									{/if}
-									{sampling ? 'Stop sample' : 'Sample album'}
+									{#if ytSearching}<LoaderCircle
+											class="h-4 w-4 animate-spin motion-reduce:animate-none"
+										/>{:else}<YouTubeIcon class="h-4 w-4" />{/if}
+									{ytSearching ? 'Finding video…' : ytError ? 'Retry video' : 'Find video'}
 								</button>
-								<label class="flex items-center gap-1.5 px-1" title="Preview volume">
-									<Volume2 class="h-3 w-3 shrink-0 text-base-content/40" />
-									<input
-										type="range"
-										min="0"
-										max="1"
-										step="0.05"
-										value={deckSampler.volume}
-										oninput={(e) => deckSampler.setVolume(Number(e.currentTarget.value))}
-										class="range range-primary range-xs w-24"
-										aria-label="Preview volume"
-									/>
-								</label>
+								<a
+									class="btn btn-ghost btn-sm gap-2"
+									href={externalSearchUrl}
+									target="_blank"
+									rel="noopener noreferrer"
+								>
+									Search YouTube <ExternalLink class="h-3.5 w-3.5" />
+								</a>
+								<div class="flex flex-col gap-1">
+									<button
+										class="btn btn-sm gap-2 border-none bg-base-content/10 hover:bg-base-content/20"
+										class:btn-active={sampling}
+										onclick={toggleSample}
+										disabled={deckSampler.status === 'loading' && sampling}
+										title="Play 30-second samples of this album"
+									>
+										{#if sampling && deckSampler.status === 'loading'}
+											<LoaderCircle class="h-4 w-4 animate-spin" />
+										{:else if sampling}
+											<X class="h-4 w-4" />
+										{:else}
+											<Disc3 class="h-4 w-4" />
+										{/if}
+										{sampling ? 'Stop sample' : 'Sample album'}
+									</button>
+									<label class="flex items-center gap-1.5 px-1" title="Preview volume">
+										<Volume2 class="h-3 w-3 shrink-0 text-base-content/40" />
+										<input
+											type="range"
+											min="0"
+											max="1"
+											step="0.05"
+											value={deckSampler.volume}
+											oninput={(e) => deckSampler.setVolume(Number(e.currentTarget.value))}
+											class="range range-primary range-xs w-24"
+											aria-label="Preview volume"
+										/>
+									</label>
+								</div>
+
+								{#if $integrationStore.download_client && !current.in_library}
+									<button
+										class="btn btn-primary btn-sm gap-2"
+										onclick={handleRequest}
+										disabled={requesting || isRequested}
+									>
+										{#if requesting}
+											<LoaderCircle class="h-4 w-4 animate-spin" />
+										{:else if isRequested}
+											<Check class="h-4 w-4" />
+										{:else}
+											<Download class="h-4 w-4" />
+										{/if}
+										{isRequested ? 'Requested' : 'Request'}
+									</button>
+								{/if}
+
+								<button class="btn btn-ghost btn-sm gap-2 text-error/80" onclick={handleIgnore}>
+									<X class="h-4 w-4" /> Not for me
+								</button>
 							</div>
 
-							{#if $integrationStore.download_client && !current.in_library}
-								<button
-									class="btn btn-primary btn-sm gap-2"
-									onclick={handleRequest}
-									disabled={requesting || isRequested}
-								>
-									{#if requesting}
-										<Loader2 class="h-4 w-4 animate-spin" />
-									{:else if isRequested}
-										<Check class="h-4 w-4" />
-									{:else}
-										<Download class="h-4 w-4" />
-									{/if}
-									{isRequested ? 'Requested' : 'Request'}
+							<!-- Kept on its own non-wrapping row so Next never shifts position when the
+							     buttons above change width/visibility per recommendation (#403). -->
+							<div class="flex items-center gap-2">
+								<button class="btn btn-outline btn-sm gap-2" onclick={handleAdvance}>
+									{deck.isLast ? 'Finish queue' : 'Next'}
+									<ArrowRight class="h-4 w-4" />
 								</button>
-							{/if}
-
-							<button class="btn btn-ghost btn-sm gap-2 text-error/80" onclick={handleIgnore}>
-								<X class="h-4 w-4" /> Not for me
-							</button>
-
-							<button class="btn btn-outline btn-sm ml-auto gap-2" onclick={handleAdvance}>
-								{deck.isLast ? 'Finish queue' : 'Next'}
-								<ArrowRight class="h-4 w-4" />
-							</button>
+								<button
+									class="btn btn-ghost btn-sm gap-2"
+									onclick={() => deck.buildNow()}
+									disabled={deck.replacing}
+								>
+									<RefreshCw
+										class={`h-3.5 w-3.5 ${deck.replacing ? 'animate-spin motion-reduce:animate-none' : ''}`}
+									/>
+									{deck.replacing ? 'Building replacement…' : 'New queue'}
+								</button>
+							</div>
+							{#if deck.errorMessage}<p role="status" class="w-full text-xs text-warning">
+									{deck.errorMessage}
+								</p>{/if}
 						</div>
 					</div>
 				</div>

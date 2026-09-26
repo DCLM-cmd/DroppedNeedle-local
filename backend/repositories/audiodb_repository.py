@@ -17,6 +17,11 @@ from infrastructure.degradation import try_get_degradation_context
 from infrastructure.integration_result import IntegrationResult
 from infrastructure.service_health import report_breaker_health
 from infrastructure.observability.provider_counters import record_provider_call
+from infrastructure.observability.optional_work import (
+    OptionalWorkReservation,
+    check_optional_dispatch,
+    reserve_optional_operation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +118,16 @@ class AudioDBRepository:
     def reset_circuit_breaker() -> None:
         _audiodb_circuit_breaker.reset()
 
+    async def _request(
+        self, endpoint: str, params: dict[str, str] | None = None
+    ) -> dict[str, Any] | None:
+        reservation = reserve_optional_operation()
+        try:
+            return await self._request_attempt(endpoint, params, reservation)
+        finally:
+            if reservation is not None:
+                reservation.refund()
+
     @with_retry(
         max_attempts=3,
         base_delay=2.0,
@@ -120,8 +135,9 @@ class AudioDBRepository:
         circuit_breaker=_audiodb_circuit_breaker,
         retriable_exceptions=(httpx.HTTPError, ExternalServiceError, RateLimitedError),
     )
-    async def _request(
-        self, endpoint: str, params: dict[str, str] | None = None
+    async def _request_attempt(
+        self, endpoint: str, params: dict[str, str] | None = None,
+        reservation: OptionalWorkReservation | None = None,
     ) -> dict[str, Any] | None:
         await self._rate_limiter.acquire()
 
@@ -129,10 +145,13 @@ class AudioDBRepository:
 
         try:
             t0 = time.monotonic()
+            check_optional_dispatch()
+            if reservation is not None:
+                reservation.mark_dispatched()
             response = await self._client.get(url, params=params, timeout=15.0)
             elapsed_ms = (time.monotonic() - t0) * 1000
             # QW9 Part 3: one increment per wire attempt; unlaned funnel.
-            record_provider_call("audiodb", None, response.status_code)
+            record_provider_call("audiodb", None, response.status_code, response=response)
 
             if response.status_code == 429:
                 logger.warning(

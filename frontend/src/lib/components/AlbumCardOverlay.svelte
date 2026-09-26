@@ -12,7 +12,9 @@
 		type AlbumCardMeta
 	} from '$lib/utils/albumCardPlayback';
 	import { openGlobalPlaylistModal } from '$lib/stores/playlistModal.svelte';
-	import { downloadFile } from '$lib/utils/downloadHelper';
+	import { downloadAlbumArchive } from '$lib/utils/downloadActions';
+	import { getDownloadAccessQuery } from '$lib/queries/local/LocalQueries.svelte';
+	import { authStore } from '$lib/stores/authStore.svelte';
 	import { API } from '$lib/constants';
 
 	interface Props {
@@ -32,6 +34,10 @@
 	let hasPlaybackSource = $derived(
 		$integrationStore.localfiles || $integrationStore.navidrome || $integrationStore.jellyfin
 	);
+
+	const downloadAccessQuery = getDownloadAccessQuery(() => authStore.user?.id);
+	// Fail-open on a missing bit (loading / legacy responses), like the header button.
+	const downloadAllowed = $derived(downloadAccessQuery.data?.allowed !== false);
 
 	function getMeta(): AlbumCardMeta {
 		return { mbid, albumName, artistName, coverUrl, artistId };
@@ -58,11 +64,11 @@
 				}
 			}
 		];
-		if ($integrationStore.localfiles) {
+		if ($integrationStore.localfiles && downloadAllowed) {
 			items.push({
 				label: 'Download Album',
 				icon: Download,
-				onclick: () => downloadFile(API.download.localAlbumByMbid(mbid))
+				onclick: () => void downloadAlbumArchive(API.download.localAlbumByMbid(mbid))
 			});
 		}
 		return items;

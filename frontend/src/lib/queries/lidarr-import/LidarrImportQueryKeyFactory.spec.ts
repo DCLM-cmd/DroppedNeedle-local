@@ -22,8 +22,7 @@ describe('LidarrImportQueryKeyFactory', () => {
 		]);
 	});
 
-	it('keeps config + status keys user-agnostic', () => {
+	it('keeps the config key user-agnostic', () => {
 		expect(LidarrImportQueryKeyFactory.config()).toEqual(['lidarr-import', 'config']);
-		expect(LidarrImportQueryKeyFactory.status()).toEqual(['lidarr-import', 'status']);
 	});
 });

@@ -120,7 +120,6 @@ def _make_radio_service(
         mb_repo = AsyncMock()
     if mbid_svc is None:
         mbid_svc = MagicMock()
-        mbid_svc.get_library_artist_mbids = AsyncMock(return_value=set())
         mbid_svc.normalize_mbid = MagicMock(side_effect=lambda x: x.strip().lower() if x and x.strip() else None)
         mbid_svc.make_queue_item = MagicMock(side_effect=lambda **kw: DiscoverQueueItemLight(
             release_group_mbid=kw["release_group_mbid"],
@@ -208,9 +207,30 @@ class TestArtistSeed:
         assert all(isinstance(item, HomeAlbum) for item in result.items)
 
     @pytest.mark.asyncio
+    async def test_artist_seed_makes_no_library_membership_call(self) -> None:
+        """E3: radio must not preload library ID sets for its exclusion."""
+        mbid_svc = MagicMock()
+        mbid_svc.normalize_mbid = MagicMock(
+            side_effect=lambda x: x.strip().lower() if x and x.strip() else None
+        )
+        mbid_svc.get_library_artist_mbids = MagicMock(
+            side_effect=AssertionError("radio must not prefetch library IDs")
+        )
+        lb_repo = AsyncMock()
+        lb_repo.get_artist_top_release_groups.return_value = []
+        lb_repo.get_similar_artists.return_value = []
+        service = _make_radio_service(lb_repo=lb_repo, mbid_svc=mbid_svc)
+
+        result = await service.generate_radio(
+            RadioRequest(seed_type="artist", seed_id="valid-mbid")
+        )
+
+        assert result.type == "albums"
+        mbid_svc.get_library_artist_mbids.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_artist_seed_unknown_mbid_raises_404(self) -> None:
         mbid_svc = MagicMock()
-        mbid_svc.get_library_artist_mbids = AsyncMock(return_value=set())
         mbid_svc.normalize_mbid = MagicMock(return_value=None)
 
         service = _make_radio_service(mbid_svc=mbid_svc)
@@ -280,7 +300,6 @@ class TestAlbumSeed:
     @pytest.mark.asyncio
     async def test_album_seed_unknown_mbid_raises_404(self) -> None:
         mbid_svc = MagicMock()
-        mbid_svc.get_library_artist_mbids = AsyncMock(return_value=set())
         mbid_svc.normalize_mbid = MagicMock(return_value=None)
 
         service = _make_radio_service(mbid_svc=mbid_svc)

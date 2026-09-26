@@ -2,6 +2,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 
 import msgspec
@@ -166,7 +167,9 @@ def _job_snapshot(job_id: str = "management-1") -> LibraryManagementJobSnapshot:
         mode="preview",
         origin="manual",
         phase="planning",
-        selection_json='{"track_ids":["track-1"]}',
+        selection_json=json.dumps(
+            {"kind": "tracks", "ids": ["track-1"], "root_scopes": [], "catalog_filter": None}
+        ),
         profile_revision="profile-1",
         settings_revision="settings-1",
         naming_revision="naming-1",
@@ -231,6 +234,38 @@ async def test_active_administrative_work_includes_management_context(
     assert row["management_phase"] == "planning"
     assert json.loads(row["management_summary_json"])["selected_item_count"] == 200
     assert json.loads(row["journal_states_json"]) == []
+
+
+@pytest.mark.asyncio
+async def test_active_administrative_work_hides_superseded_previews(
+    store: NativeLibraryStore,
+) -> None:
+    async def failed_job(job_id: str, terminal_code: str) -> None:
+        await store.create_library_management_job(
+            OperationJob(
+                id=job_id,
+                kind="library_management",
+                input_catalog_revision=0,
+                created_at=10,
+            ),
+            _job_snapshot(job_id),
+        )
+        claimed = await store.claim_operation_job(
+            "worker", now=10, lease_seconds=60, kind="library_management"
+        )
+        assert claimed is not None and claimed["id"] == job_id
+        await store.finish_operation_job(
+            job_id, "worker", state="failed", terminal_code=terminal_code, now=11
+        )
+
+    await failed_job("management-stale", "STALE_INPUT")
+    await failed_job("management-real", "PLANNING_FAILED")
+
+    rows = await store.list_active_administrative_library_work(failed_after=0)
+
+    ids = {value["id"] for value in rows}
+    assert "management-stale" not in ids
+    assert "management-real" in ids
 
 
 @pytest.mark.asyncio
@@ -637,9 +672,15 @@ async def test_ready_management_preview_can_be_discarded_once_without_deleting_a
 
 
 @pytest.mark.asyncio
-async def test_management_apply_rejects_token_expiry_and_catalog_staleness(
+async def test_management_apply_rejects_token_expiry_and_input_movement(
     store: NativeLibraryStore, db_path: Path
 ) -> None:
+    # Slice E: the apply path now compares the pinned per-input revisions
+    # instead of the global catalog counter, so the stale leg simulates a
+    # genuine concurrent retag of the preview's own track (tag_revision
+    # moves plus the catalog bump a real retag would cause). Pre-fix this
+    # rejected via the global comparison; post-fix it rejects via the
+    # scoped per-input comparison.
     token_hash = hashlib.sha256(b"preview-token").hexdigest()
     for job_id, expires_at in (("expired-apply", 19), ("stale-apply", 100)):
         await store.create_library_management_job(
@@ -680,6 +721,9 @@ async def test_management_apply_rejects_token_expiry_and_catalog_staleness(
         connection.execute(
             "UPDATE library_catalog_revision SET value=value+1 WHERE singleton=1"
         )
+        connection.execute(
+            "UPDATE local_tracks SET tag_revision='tag-2' WHERE id='track-1'"
+        )
     with pytest.raises(StaleRevisionError, match="catalog changed"):
         await store.begin_library_management_apply(
             "stale-apply",
@@ -688,6 +732,135 @@ async def test_management_apply_rejects_token_expiry_and_catalog_staleness(
             idempotency_key="stale-key",
             now=20,
         )
+
+
+@pytest.mark.asyncio
+async def test_management_apply_proceeds_despite_unrelated_catalog_churn(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    # Slice E load-bearing positive: the preview's own inputs are untouched
+    # and only the global catalog counter moved (unrelated churn landing
+    # between gate and apply). Pre-fix this raised StaleRevisionError
+    # ("catalog changed"); post-fix the apply proceeds.
+    job_id = "churn-apply"
+    token_hash = hashlib.sha256(b"preview-token").hexdigest()
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        msgspec.structs.replace(
+            _job_snapshot(job_id),
+            preview_token_hash=token_hash,
+            preview_expires_at=100,
+        ),
+    )
+    await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_management_job_snapshots SET phase='ready' WHERE job_id=?",
+            (job_id,),
+        )
+        connection.execute(
+            "UPDATE library_operation_jobs SET state='ready' WHERE id=?",
+            (job_id,),
+        )
+        connection.execute(
+            "UPDATE library_catalog_revision SET value=value+1 WHERE singleton=1"
+        )
+
+    started = await store.begin_library_management_apply(
+        job_id,
+        preview_token_hash=token_hash,
+        expected_job_revision=1,
+        idempotency_key="churn-key",
+        now=20,
+    )
+
+    assert started["state"] == "queued"
+    assert started["expected_work_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_management_apply_without_plan_items_keeps_global_catalog_guard(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    # Slice E fallback: jobs with no pinned track inputs behave exactly as
+    # before (historical global catalog comparison). Pre-fix behavior is
+    # unchanged for both legs: churn rejects, a matching counter proceeds.
+    token_hash = hashlib.sha256(b"preview-token").hexdigest()
+    await store.create_library_management_job(
+        OperationJob(
+            id="no-plan-stale",
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        msgspec.structs.replace(
+            _job_snapshot("no-plan-stale"),
+            preview_token_hash=token_hash,
+            preview_expires_at=100,
+        ),
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_management_job_snapshots SET phase='ready' "
+            "WHERE job_id='no-plan-stale'"
+        )
+        connection.execute(
+            "UPDATE library_operation_jobs SET state='ready' "
+            "WHERE id='no-plan-stale'"
+        )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_catalog_revision SET value=value+1 WHERE singleton=1"
+        )
+    with pytest.raises(StaleRevisionError, match="catalog changed"):
+        await store.begin_library_management_apply(
+            "no-plan-stale",
+            preview_token_hash=token_hash,
+            expected_job_revision=1,
+            idempotency_key="no-plan-stale-key",
+            now=20,
+        )
+    await store.create_library_management_job(
+        OperationJob(
+            id="no-plan-fresh",
+            kind="library_management",
+            input_catalog_revision=1,
+            created_at=10,
+        ),
+        msgspec.structs.replace(
+            _job_snapshot("no-plan-fresh"),
+            catalog_revision=1,
+            preview_token_hash=token_hash,
+            preview_expires_at=100,
+        ),
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_management_job_snapshots SET phase='ready' "
+            "WHERE job_id='no-plan-fresh'"
+        )
+        connection.execute(
+            "UPDATE library_operation_jobs SET state='ready' "
+            "WHERE id='no-plan-fresh'"
+        )
+
+    started = await store.begin_library_management_apply(
+        "no-plan-fresh",
+        preview_token_hash=token_hash,
+        expected_job_revision=1,
+        idempotency_key="no-plan-fresh-key",
+        now=20,
+    )
+
+    assert started["state"] == "queued"
+    assert started["expected_work_count"] == 0
 
 
 def test_schema_ratchet_is_idempotent_and_has_no_management_side_effects(
@@ -743,6 +916,7 @@ def test_schema_ratchet_is_idempotent_and_has_no_management_side_effects(
     }.issubset(tables)
     assert {
         "idx_management_plan_cursor",
+        "idx_management_plan_track",
         "idx_management_plan_destination",
         "idx_management_apply_idempotency",
         "idx_management_journal_recovery",
@@ -1493,10 +1667,10 @@ async def test_management_preview_seal_detects_normalized_plan_collisions(
 
 
 @pytest.mark.asyncio
-async def test_management_preview_seal_rejects_a_changed_catalog(
+async def test_management_preview_seal_allows_unrelated_catalog_change(
     store: NativeLibraryStore, db_path: Path
 ) -> None:
-    job_id = "management-stale-catalog"
+    job_id = "management-unrelated-catalog"
     await store.create_library_management_job(
         OperationJob(
             id=job_id,
@@ -1517,7 +1691,42 @@ async def test_management_preview_seal_rejects_a_changed_catalog(
             "UPDATE library_catalog_revision SET value = value + 1 WHERE singleton = 1"
         )
 
-    with pytest.raises(StaleRevisionError, match="catalog changed"):
+    snapshot = await store.finalize_library_management_preview(
+        job_id,
+        "worker-1",
+        expected_snapshot_revision=revision,
+        now=13,
+    )
+    assert claimed is not None
+    assert snapshot.phase == "ready"
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_stat_revision_change(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    job_id = "management-stale-stat"
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        _job_snapshot(job_id),
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET stat_revision='changed' WHERE id='track-1'"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
         await store.finalize_library_management_preview(
             job_id,
             "worker-1",
@@ -1530,6 +1739,748 @@ async def test_management_preview_seal_rejects_a_changed_catalog(
     assert claimed is not None
     assert snapshot is not None and snapshot.phase == "planning"
     assert operation is not None and operation["state"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_tag_revision_change(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    job_id = "management-stale-tag"
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        _job_snapshot(job_id),
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET tag_revision='changed' WHERE id='track-1'"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_root_change(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    job_id = "management-stale-root"
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        _job_snapshot(job_id),
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET root_id='root-2' WHERE id='track-1'"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_relative_path_change(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    job_id = "management-stale-path"
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        _job_snapshot(job_id),
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET relative_path='changed.flac' WHERE id='track-1'"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_track_disappearance(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    job_id = "management-stale-disappeared"
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        _job_snapshot(job_id),
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DELETE FROM local_tracks WHERE id='track-1'")
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_album_revision_change(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    job_id = "management-stale-album"
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        _job_snapshot(job_id),
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_albums SET row_revision=row_revision+1 WHERE id='album-1'"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_track_revision_change(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    job_id = "management-stale-track-rev"
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        _job_snapshot(job_id),
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET row_revision=row_revision+1 WHERE id='track-1'"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_unindexed_availability_change(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    job_id = "management-stale-avail"
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        _job_snapshot(job_id),
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET availability='excluded' WHERE id='track-1'"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_root_selection_membership_addition(
+    store: NativeLibraryStore, db_path: Path,
+) -> None:
+    """F1: a new indexed track entering a root-scoped selection after planning
+    must invalidate the preview, even when the catalog revision also changes."""
+    job_id = "management-root-membership-add"
+    selection_json = json.dumps(
+        {
+            "kind": "roots",
+            "ids": ["root-1"],
+            "root_scopes": [{"root_id": "root-1", "relative_prefix": None}],
+            "catalog_filter": None,
+            "expand_album_bundles": True,
+        }
+    )
+    snapshot = msgspec.structs.replace(
+        _job_snapshot(job_id), selection_json=selection_json
+    )
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        snapshot,
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_tracks "
+            "(id, local_album_id, root_id, file_path, relative_path, path_hash, "
+            "file_size_bytes, file_mtime_ns, stat_revision, stat_revision_kind, "
+            "tag_revision, title, title_folded, artist_name, artist_name_folded, "
+            "album_title, album_title_folded, album_artist_name, "
+            "album_artist_name_folded, disc_number, track_number, file_format, "
+            "ingest_source, imported_at, membership_source) "
+            "VALUES ('track-2', 'album-1', 'root-1', '/music/track2.flac', "
+            "'track2.flac', 'path-hash-2', 100, 10, 'stat-2', 'exact', 'tag-2', "
+            "'Track Two', 'track two', 'Artist', 'artist', 'Album', 'album', "
+            "'Artist', 'artist', 1, 2, 'flac', 'scan', 1, 'automatic')"
+        )
+        connection.execute(
+            "UPDATE library_catalog_revision SET value = value + 1 WHERE singleton = 1"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+    snapshot_after = await store.get_library_management_job_snapshot(job_id)
+    operation = await store.get_operation_job(job_id)
+    assert snapshot_after is not None and snapshot_after.phase == "planning"
+    assert operation is not None and operation["state"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_album_selection_membership_addition(
+    store: NativeLibraryStore, db_path: Path,
+) -> None:
+    """F2: a new indexed track joining a selected album after planning must
+    invalidate the preview."""
+    job_id = "management-album-membership-add"
+    selection_json = json.dumps(
+        {
+            "kind": "albums",
+            "ids": ["album-1"],
+            "root_scopes": [],
+            "catalog_filter": None,
+        }
+    )
+    snapshot = msgspec.structs.replace(
+        _job_snapshot(job_id), selection_json=selection_json
+    )
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        snapshot,
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_tracks "
+            "(id, local_album_id, root_id, file_path, relative_path, path_hash, "
+            "file_size_bytes, file_mtime_ns, stat_revision, stat_revision_kind, "
+            "tag_revision, title, title_folded, artist_name, artist_name_folded, "
+            "album_title, album_title_folded, album_artist_name, "
+            "album_artist_name_folded, disc_number, track_number, file_format, "
+            "ingest_source, imported_at, membership_source) "
+            "VALUES ('track-2', 'album-1', 'root-1', '/music/track2.flac', "
+            "'track2.flac', 'path-hash-2', 100, 10, 'stat-2', 'exact', 'tag-2', "
+            "'Track Two', 'track two', 'Artist', 'artist', 'Album', 'album', "
+            "'Artist', 'artist', 1, 2, 'flac', 'scan', 1, 'automatic')"
+        )
+        connection.execute(
+            "UPDATE library_catalog_revision SET value = value + 1 WHERE singleton = 1"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_filter_selection_membership_addition(
+    store: NativeLibraryStore, db_path: Path,
+) -> None:
+    """F3: a new indexed track newly matching an immutable filter selection must
+    invalidate the preview."""
+    job_id = "management-filter-membership-add"
+    selection_json = json.dumps(
+        {
+            "kind": "filter",
+            "ids": [],
+            "root_scopes": [],
+            "catalog_filter": {"search": "Track"},
+        }
+    )
+    snapshot = msgspec.structs.replace(
+        _job_snapshot(job_id), selection_json=selection_json
+    )
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        snapshot,
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_tracks "
+            "(id, local_album_id, root_id, file_path, relative_path, path_hash, "
+            "file_size_bytes, file_mtime_ns, stat_revision, stat_revision_kind, "
+            "tag_revision, title, title_folded, artist_name, artist_name_folded, "
+            "album_title, album_title_folded, album_artist_name, "
+            "album_artist_name_folded, disc_number, track_number, file_format, "
+            "ingest_source, imported_at, membership_source) "
+            "VALUES ('track-2', 'album-1', 'root-1', '/music/track2.flac', "
+            "'track2.flac', 'path-hash-2', 100, 10, 'stat-2', 'exact', 'tag-2', "
+            "'Track Two', 'track two', 'Artist', 'artist', 'Album', 'album', "
+            "'Artist', 'artist', 1, 2, 'flac', 'scan', 1, 'automatic')"
+        )
+        connection.execute(
+            "UPDATE library_catalog_revision SET value = value + 1 WHERE singleton = 1"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_management_preview_seal_rejects_selection_membership_removal(
+    store: NativeLibraryStore, db_path: Path,
+) -> None:
+    """G1: a planned track that is mutated so it no longer belongs to the
+    normalized selection must invalidate the preview — even when the track
+    itself is not deleted or re-typed."""
+    job_id = "management-membership-remove"
+    selection_json = json.dumps(
+        {
+            "kind": "filter",
+            "ids": [],
+            "root_scopes": [],
+            "catalog_filter": {"search": "Track"},
+        }
+    )
+    snapshot = msgspec.structs.replace(
+        _job_snapshot(job_id), selection_json=selection_json
+    )
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        snapshot,
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET title='Other', title_folded='other' "
+            "WHERE id='track-1'"
+        )
+        connection.execute(
+            "UPDATE library_catalog_revision SET value = value + 1 WHERE singleton = 1"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_baseline_restore_seal_allows_unrelated_catalog_change(
+    store: NativeLibraryStore, db_path: Path,
+) -> None:
+    """A: baseline_restore mode serializes a NormalizedLibraryManagementSelection;
+    an unrelated global catalog_revision bump with unchanged inputs/membership
+    must finalise successfully (scoped, not global fallback)."""
+    job_id = "baseline-unrelated-catalog"
+    snapshot = msgspec.structs.replace(
+        _job_snapshot(job_id), mode="baseline_restore"
+    )
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        snapshot,
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_catalog_revision SET value = value + 1 WHERE singleton = 1"
+        )
+
+    result = await store.finalize_library_management_preview(
+        job_id,
+        "worker-1",
+        expected_snapshot_revision=revision,
+        now=13,
+    )
+    assert result.phase == "ready"
+
+
+@pytest.mark.asyncio
+async def test_baseline_restore_seal_rejects_selected_input_change(
+    store: NativeLibraryStore, db_path: Path,
+) -> None:
+    """B: a pinned input mutation on a baseline_restore preview must reject
+    via the scoped per-input check, not the global catalog fallback."""
+    job_id = "baseline-input-changed"
+    snapshot = msgspec.structs.replace(
+        _job_snapshot(job_id), mode="baseline_restore"
+    )
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        snapshot,
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET tag_revision='changed' WHERE id='track-1'"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_baseline_restore_seal_rejects_selection_membership_growth(
+    store: NativeLibraryStore, db_path: Path,
+) -> None:
+    """C: a new track entering a baseline_restore roots selection after planning
+    must reject via the scoped new-member check."""
+    job_id = "baseline-membership-growth"
+    selection_json = json.dumps(
+        {
+            "kind": "roots",
+            "ids": ["root-1"],
+            "root_scopes": [{"root_id": "root-1", "relative_prefix": None}],
+            "catalog_filter": None,
+            "expand_album_bundles": True,
+        }
+    )
+    snapshot = msgspec.structs.replace(
+        _job_snapshot(job_id),
+        mode="baseline_restore",
+        selection_json=selection_json,
+    )
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        snapshot,
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO local_tracks "
+            "(id, local_album_id, root_id, file_path, relative_path, path_hash, "
+            "file_size_bytes, file_mtime_ns, stat_revision, stat_revision_kind, "
+            "tag_revision, title, title_folded, artist_name, artist_name_folded, "
+            "album_title, album_title_folded, album_artist_name, "
+            "album_artist_name_folded, disc_number, track_number, file_format, "
+            "ingest_source, imported_at, membership_source) "
+            "VALUES ('track-2', 'album-1', 'root-1', '/music/track2.flac', "
+            "'track2.flac', 'path-hash-2', 100, 10, 'stat-2', 'exact', 'tag-2', "
+            "'Track Two', 'track two', 'Artist', 'artist', 'Album', 'album', "
+            "'Artist', 'artist', 1, 2, 'flac', 'scan', 1, 'automatic')"
+        )
+        connection.execute(
+            "UPDATE library_catalog_revision SET value = value + 1 WHERE singleton = 1"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_baseline_restore_seal_rejects_selection_membership_shrink(
+    store: NativeLibraryStore, db_path: Path,
+) -> None:
+    """D: a planned track mutated so it no longer belongs to the baseline_restore
+    selection must reject via the scoped missing-member check (track not deleted)."""
+    job_id = "baseline-membership-shrink"
+    selection_json = json.dumps(
+        {
+            "kind": "filter",
+            "ids": [],
+            "root_scopes": [],
+            "catalog_filter": {"search": "Track"},
+        }
+    )
+    snapshot = msgspec.structs.replace(
+        _job_snapshot(job_id),
+        mode="baseline_restore",
+        selection_json=selection_json,
+    )
+    await store.create_library_management_job(
+        OperationJob(
+            id=job_id,
+            kind="library_management",
+            input_catalog_revision=0,
+            created_at=10,
+        ),
+        snapshot,
+    )
+    revision = await store.append_library_management_plan_items(
+        job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=12, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE local_tracks SET title='Other', title_folded='other' "
+            "WHERE id='track-1'"
+        )
+        connection.execute(
+            "UPDATE library_catalog_revision SET value = value + 1 WHERE singleton = 1"
+        )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await store.finalize_library_management_preview(
+            job_id,
+            "worker-1",
+            expected_snapshot_revision=revision,
+            now=13,
+        )
+
+
+@pytest.mark.asyncio
+async def test_undo_and_duplicate_modes_use_global_catalog_fallback_on_change(
+    store: NativeLibraryStore, db_path: Path,
+) -> None:
+    """Undo and duplicate_resolution serialize request-specific selection_json
+    (not a NormalizedLibraryManagementSelection), so finalize falls back to the
+    global catalog_revision comparison. A catalog revision bump must reject."""
+    for job_id, mode, selection_json in (
+        (
+            "undo-fallback-stale",
+            "undo",
+            json.dumps(
+                {
+                    "source_operation_job_id": "source-undo",
+                    "source_operation_row_revision": 1,
+                }
+            ),
+        ),
+        (
+            "duplicate-fallback-stale",
+            "duplicate_resolution",
+            json.dumps(
+                {
+                    "source_job_id": "source-duplicate",
+                    "source_plan_item_ordinal": 0,
+                    "source_operation_row_revision": 1,
+                    "existing_root_id": "root-1",
+                    "existing_relative_path": "track.flac",
+                    "collision_kind": "same_path_different_content",
+                }
+            ),
+        ),
+    ):
+        snapshot = msgspec.structs.replace(
+            _job_snapshot(job_id), mode=mode, selection_json=selection_json
+        )
+        await store.create_library_management_job(
+            OperationJob(
+                id=job_id,
+                kind="library_management",
+                input_catalog_revision=0,
+                created_at=10,
+            ),
+            snapshot,
+        )
+        revision = await store.append_library_management_plan_items(
+            job_id, [_plan_item(job_id, 0)], expected_snapshot_revision=1
+        )
+        claimed = await store.claim_operation_job(
+            "worker-1", now=12, lease_seconds=60, kind="library_management"
+        )
+        assert claimed is not None
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "UPDATE library_catalog_revision "
+                "SET value = value + 1 WHERE singleton = 1"
+            )
+        with pytest.raises(StaleRevisionError, match="catalog changed"):
+            await store.finalize_library_management_preview(
+                job_id,
+                "worker-1",
+                expected_snapshot_revision=revision,
+                now=13,
+            )
 
 
 @pytest.mark.asyncio
@@ -2282,3 +3233,87 @@ async def test_management_preview_seal_reports_per_source_deferred_breakdown(
         strict=False,
     )
     assert response.deferred_sources == summary["deferred_sources"]
+
+
+def _repair_job(key: str, created_at: float) -> OperationJob:
+    return OperationJob(
+        id=str(uuid.uuid4()),
+        kind="repair",
+        requested_by_user_id=None,
+        input_catalog_revision=0,
+        idempotency_key=key,
+        created_at=created_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_maintenance_summary_aggregates_only_visible_repairs(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO local_albums "
+            "(id, root_id, grouping_key, title, title_folded, album_artist_name, "
+            "album_artist_name_folded, album_artist_id, grouping_source, created_at, updated_at) "
+            "VALUES ('album-2', 'root-1', 'group-2', 'Album Two', 'album two', 'Artist', "
+            "'artist', 'artist-1', 'automatic', 1, 1)"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO local_tracks "
+            "(id, local_album_id, root_id, file_path, relative_path, path_hash, "
+            "file_size_bytes, file_mtime_ns, stat_revision, stat_revision_kind, "
+            "tag_revision, title, title_folded, artist_name, artist_name_folded, "
+            "album_title, album_title_folded, album_artist_name, "
+            "album_artist_name_folded, disc_number, track_number, file_format, "
+            "ingest_source, imported_at, membership_source) "
+            "VALUES ('track-2', 'album-2', 'root-1', '/music/track2.flac', "
+            "'track2.flac', 'path-hash-2', 100, 10, 'stat-2', 'exact', 'tag-2', "
+            "'Track Two', 'track two', 'Artist', 'artist', 'Album Two', 'album two', "
+            "'Artist', 'artist', 1, 1, 'flac', 'scan', 1, 'automatic')"
+        )
+    hygiene_a = await store.create_repair_operation(
+        _repair_job("summary:a", 1),
+        scope={"purpose": "catalog_identity_hygiene", "album_ids": ["album-1"]},
+        source_matcher_version=None,
+        target_matcher_version="v1",
+    )
+    await store.create_repair_operation(
+        _repair_job("summary:b", 2),
+        scope={"purpose": "artist_identity_reconciliation", "album_ids": ["album-2"]},
+        source_matcher_version=None,
+        target_matcher_version="v1",
+    )
+    await store.create_repair_operation(
+        _repair_job("summary:c", 3),
+        scope={"purpose": "management_readiness", "root_ids": []},
+        source_matcher_version=None,
+        target_matcher_version="v1",
+    )
+    doomed = await store.create_repair_operation(
+        _repair_job("summary:d", 4),
+        scope={"purpose": "catalog_identity_hygiene", "album_ids": ["album-1"]},
+        source_matcher_version=None,
+        target_matcher_version="v1",
+    )
+    for _ in range(4):
+        claimed = await store.claim_operation_job(
+            "worker", now=10, lease_seconds=60, kind="repair"
+        )
+        assert claimed is not None
+    await store.finish_operation_job(
+        str(doomed["id"]), "worker", state="failed", terminal_code="NOPE", now=11
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE library_operation_jobs SET completed_count = 1 WHERE id = ?",
+            (str(hygiene_a["id"]),),
+        )
+
+    summary = await store.summarize_active_maintenance_work()
+
+    assert summary["jobs"] == 2
+    assert (summary["processed"], summary["total"]) == (1, 2)
+    assert (summary["succeeded"], summary["failed"], summary["skipped"]) == (0, 0, 0)
+    assert (summary["running"], summary["paused"]) == (1, 0)
+    assert summary["started_at"] == 10.0
+    assert summary["updated_at"] == 10.0

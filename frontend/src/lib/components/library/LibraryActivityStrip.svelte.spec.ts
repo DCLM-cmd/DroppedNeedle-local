@@ -235,7 +235,7 @@ describe('LibraryActivityStrip', () => {
 	it('expires a visible failure while the page remains open', async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date(1_000_000 * 1000));
-		let unmount: (() => void) | undefined;
+		let unmount: (() => Promise<void>) | undefined;
 		try {
 			({ unmount } = await render(LibraryActivityStrip, {
 				props: {
@@ -256,7 +256,7 @@ describe('LibraryActivityStrip', () => {
 			await vi.advanceTimersByTimeAsync(60_000);
 			await expect.element(page.getByTestId('library-activity-strip')).not.toBeInTheDocument();
 		} finally {
-			unmount?.();
+			await unmount?.();
 			vi.useRealTimers();
 		}
 	});

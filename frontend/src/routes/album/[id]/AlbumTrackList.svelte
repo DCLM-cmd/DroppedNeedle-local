@@ -16,7 +16,7 @@
 	import type { RenderedTrackSection } from './albumTrackResolvers';
 	import { resolveSourceTrack } from './albumTrackResolvers';
 	import { normalizeDiscNumber, getDiscTrackKey } from '$lib/player/queueHelpers';
-	import { formatDuration } from '$lib/utils/formatting';
+	import { formatBytes, formatDuration } from '$lib/utils/formatting';
 	import { colors } from '$lib/colors';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import NowPlayingIndicator from '$lib/components/NowPlayingIndicator.svelte';
@@ -299,6 +299,10 @@
 
 						<div class="text-base-content/60 text-sm shrink-0">
 							{formatDuration(track.length)}
+						</div>
+
+						<div class="text-base-content/40 text-xs tabular-nums shrink-0 w-16 text-right">
+							{localTrack && localTrack.size_bytes > 0 ? formatBytes(localTrack.size_bytes) : '—'}
 						</div>
 
 						{#if youtubeEnabled || showPreview || showJellyfinBtn || showLocalBtn || showNavidromeBtn || showPlexBtn || showRequest || showTrackDownload || heldMeta || showUpgrade}

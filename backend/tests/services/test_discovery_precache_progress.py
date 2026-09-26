@@ -61,12 +61,9 @@ async def test_progress_updates_on_success():
         patch.object(svc, "get_top_songs", new_callable=AsyncMock, return_value=MagicMock()),
         patch.object(svc, "get_top_albums", new_callable=AsyncMock, return_value=MagicMock()),
     ):
-        await svc.precache_artist_discovery(
-            ["mbid-a", "mbid-b"],
-            delay=0,
-            status_service=status,
-            mbid_to_name={"mbid-a": "Artist A", "mbid-b": "Artist B"},
-        )
+        await svc.precache_artist_discovery(["mbid-a", "mbid-b"], user_id="initiator-1", delay=0,
+        status_service=status,
+        mbid_to_name={"mbid-a": "Artist A", "mbid-b": "Artist B"},)
 
     assert status.update_progress.call_count == 2
     status.update_progress.assert_any_call(1, current_item="Artist A", generation=0)
@@ -85,12 +82,9 @@ async def test_progress_updates_even_on_failure():
         patch.object(svc, "get_top_songs", new_callable=AsyncMock, side_effect=RuntimeError("boom")),
         patch.object(svc, "get_top_albums", new_callable=AsyncMock, side_effect=RuntimeError("boom")),
     ):
-        await svc.precache_artist_discovery(
-            ["mbid-a", "mbid-b", "mbid-c"],
-            delay=0,
-            status_service=status,
-            mbid_to_name={"mbid-a": "A", "mbid-b": "B", "mbid-c": "C"},
-        )
+        await svc.precache_artist_discovery(["mbid-a", "mbid-b", "mbid-c"], user_id="initiator-1", delay=0,
+        status_service=status,
+        mbid_to_name={"mbid-a": "A", "mbid-b": "B", "mbid-c": "C"},)
 
     assert status.update_progress.call_count == 3
     status.update_progress.assert_any_call(1, current_item="A", generation=0)
@@ -119,11 +113,8 @@ async def test_progress_updates_on_mixed_success_and_failure():
         patch.object(svc, "get_top_songs", new_callable=AsyncMock, side_effect=sometimes_fail),
         patch.object(svc, "get_top_albums", new_callable=AsyncMock, side_effect=sometimes_fail),
     ):
-        await svc.precache_artist_discovery(
-            ["mbid-1", "mbid-2"],
-            delay=0,
-            status_service=status,
-        )
+        await svc.precache_artist_discovery(["mbid-1", "mbid-2"], user_id="initiator-1", delay=0,
+        status_service=status,)
 
     assert status.update_progress.call_count == 2
 
@@ -137,11 +128,8 @@ async def test_cached_artists_still_update_progress():
 
     svc._cache.get = AsyncMock(return_value="cached-value")
 
-    await svc.precache_artist_discovery(
-        ["mbid-a", "mbid-b"],
-        delay=0,
-        status_service=status,
-        mbid_to_name={"mbid-a": "A", "mbid-b": "B"},
-    )
+    await svc.precache_artist_discovery(["mbid-a", "mbid-b"], user_id="initiator-1", delay=0,
+    status_service=status,
+    mbid_to_name={"mbid-a": "A", "mbid-b": "B"},)
 
     assert status.update_progress.call_count == 2

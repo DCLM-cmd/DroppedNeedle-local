@@ -3,7 +3,7 @@
 		CirclePause,
 		CirclePlay,
 		FolderSync,
-		Fingerprint,
+		FingerprintPattern,
 		ListChecks,
 		OctagonX,
 		RefreshCw,
@@ -166,7 +166,7 @@
 					{#if scheduleQuery.data?.scan_frequency === 'daily'}Next scan: {scheduleQuery.data
 							.daily_scan_time}
 						{scheduleQuery.data.server_timezone ??
-							''}{:else if scheduleQuery.data?.scan_frequency === 'manual'}Automatic scanning off{:else}Schedule:
+							''}{:else if scheduleQuery.data?.scan_frequency === 'manual'}Scheduled scans off (file watcher still active){:else}Schedule:
 						{scheduleQuery.data?.scan_frequency?.replace('_', ' ') ?? 'loading'}{/if}
 				</p>
 				<a href={withBasePath('/settings?tab=library')} class="btn btn-ghost btn-sm">
@@ -517,7 +517,7 @@
 				<div
 					class="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 text-primary"
 				>
-					<Fingerprint class="h-5 w-5" />
+					<FingerprintPattern class="h-5 w-5" />
 				</div>
 				<div class="min-w-0 flex-1">
 					<h3 class="font-semibold">Artist identity desk</h3>

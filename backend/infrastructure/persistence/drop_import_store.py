@@ -9,7 +9,7 @@ Tables in the shared ``library.db``:
   ``needs_review`` item can be re-imported against a manually chosen release
   group after a restart.
 
-``PRAGMA foreign_keys=ON`` on top of ``PersistenceBase._connect`` so the
+``foreign_keys = True`` (``PRAGMA foreign_keys=ON`` on every connection) so the
 ``ON DELETE CASCADE`` from items to jobs fires (the events-store pattern).
 """
 
@@ -67,10 +67,7 @@ class DropImportStore(PersistenceBase):
     def __init__(self, db_path: Path, write_lock: threading.Lock) -> None:
         super().__init__(db_path, write_lock)
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = super()._connect()
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+    foreign_keys = True
 
     def _ensure_tables(self) -> None:
         conn = self._connect()
@@ -220,6 +217,42 @@ class DropImportStore(PersistenceBase):
         return await self._write(operation)
 
     # -- items --
+
+    async def prune_stale_review_items(
+        self, *, cutoff: float, limit: int = 500
+    ) -> list[list[str]]:
+        """F-02 retention: hard-delete ``needs_review`` items whose parent job
+        predates ``cutoff`` (the job ``created_at`` clock - items carry only a
+        rewritten-on-touch ``updated_at``), mirroring the 90d terminal-delete
+        the contribution cleanup applies to verification-job rows. Returns the
+        deleted items' staging paths so the caller can unlink them."""
+        if limit < 1:
+            raise ValueError("The prune limit must be positive.")
+        def operation(conn: sqlite3.Connection) -> list[list[str]]:
+            rows = conn.execute(
+                "SELECT i.id, i.staging_paths FROM drop_import_items i "
+                "JOIN drop_import_jobs j ON j.id = i.job_id "
+                "WHERE i.status = 'needs_review' AND j.created_at < ? "
+                "ORDER BY j.created_at ASC, i.id ASC LIMIT ?",
+                (cutoff, limit),
+            ).fetchall()
+            if not rows:
+                return []
+            # Parse staging paths BEFORE deleting: a corrupt payload raises
+            # here and aborts the prune, so staged files are never orphaned
+            # by a row deleted without its paths.
+            pruned: list[list[str]] = []
+            for row in rows:
+                parsed = json.loads(row["staging_paths"] or "[]")
+                pruned.append([str(path) for path in parsed])
+            placeholders = ",".join("?" for _ in rows)
+            conn.execute(
+                f"DELETE FROM drop_import_items WHERE id IN ({placeholders})",
+                tuple(row["id"] for row in rows),
+            )
+            return pruned
+
+        return await self._write(operation)
 
     async def add_item(
         self, job_id: str, folder_name: str, staging_paths: list[str], files_total: int

@@ -8,7 +8,9 @@ import type {
 	IndexerSavedResponse,
 	IndexerSettings,
 	IndexerTestResult,
-	OperationResult
+	OperationResult,
+	UsenetSearchBackend,
+	UsenetSearchBackendName
 } from '$lib/types';
 
 import { DownloadQueryKeyFactory } from './DownloadQueryKeyFactory';
@@ -58,5 +60,37 @@ export function testIndexerMutation() {
 	return createMutation(() => ({
 		mutationFn: (indexer: IndexerSettings) =>
 			api.global.post<IndexerTestResult>(API.indexers.test(), indexer)
+	}));
+}
+
+const getSearchBackendQueryOptions = () =>
+	queryOptions({
+		staleTime: CACHE_TTL.LIBRARY_NATIVE,
+		queryKey: DownloadQueryKeyFactory.searchBackend(),
+		queryFn: ({ signal }) =>
+			api.global.get<UsenetSearchBackend>(API.indexers.searchBackend(), { signal })
+	});
+
+export const getSearchBackendQuery = () => createQuery(() => getSearchBackendQueryOptions());
+
+export function saveSearchBackendMutation() {
+	return createMutation(() => ({
+		mutationFn: (backend: UsenetSearchBackendName) =>
+			api.global.put<OperationResult>(API.indexers.searchBackend(), { backend }),
+		onSuccess: async () => {
+			// Switching backends flips readiness: sweep the SABnzbd-shape set so
+			// status surfaces and Home refresh alongside the selector. The own key
+			// is listed explicitly (it nests under indexers(), so the prefix sweep
+			// below already covers it - this survives a future key move).
+			await invalidateQueriesWithPersister({
+				queryKey: DownloadQueryKeyFactory.searchBackend()
+			});
+			await invalidateIndexers();
+			await invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.prowlarr() });
+			await invalidateQueriesWithPersister({ queryKey: DownloadQueryKeyFactory.sabnzbd() });
+			await invalidateQueriesWithPersister({
+				queryKey: DownloadQueryKeyFactory.sabnzbdStatus()
+			});
+		}
 	}));
 }

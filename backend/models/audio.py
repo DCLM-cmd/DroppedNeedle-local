@@ -59,6 +59,7 @@ class AudioTag(AppStruct):
     musicbrainz_album_artist_id: str | None = None
     acoustid_id: str | None = None
     compilation: bool = False
+    release_type: str | None = None  # raw RELEASETYPE/MUSICBRAINZ_ALBUMTYPE value
     title_sort: str | None = None
     artist_sort: str | None = None
     album_sort: str | None = None

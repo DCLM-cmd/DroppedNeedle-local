@@ -1,4 +1,5 @@
 import logging
+from typing import TYPE_CHECKING
 
 from api.v1.schemas.discover import (
     DiscoverIntegrationStatus,
@@ -6,14 +7,22 @@ from api.v1.schemas.discover import (
 )
 from services.preferences_service import PreferencesService
 
+if TYPE_CHECKING:
+    from services.plugin_sources import PluginSourceRegistry
+
 logger = logging.getLogger(__name__)
 
 DISCOVER_CACHE_KEY = "discover_response"
 
 
 class IntegrationHelpers:
-    def __init__(self, preferences_service: PreferencesService) -> None:
+    def __init__(
+        self,
+        preferences_service: PreferencesService,
+        plugin_sources: "PluginSourceRegistry | None" = None,
+    ) -> None:
         self._preferences = preferences_service
+        self._plugin_sources = plugin_sources
 
     def is_listenbrainz_enabled(self) -> bool:
         lb_settings = self._preferences.get_listenbrainz_connection()
@@ -25,7 +34,11 @@ class IntegrationHelpers:
 
     def is_download_client_configured(self) -> bool:
         # Any acquisition source counts - Free Music, slskd (Soulseek), or SABnzbd (Usenet).
-        return self._preferences.is_download_source_ready()
+        if self._preferences.is_download_source_ready():
+            return True
+        return bool(
+            self._plugin_sources is not None and self._plugin_sources.is_any_source_ready()
+        )
 
     def is_library_configured(self) -> bool:
         # The native library scanner is always present.

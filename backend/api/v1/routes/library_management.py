@@ -7,6 +7,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Query, Response, status
 
 from api.v1.schemas.library_management import (
+    LibraryManagementActivationHealthResponse,
     LibraryManagementChangeImpact,
     LibraryManagementPresetDiff,
     LibraryManagementProfile,
@@ -29,6 +30,7 @@ from api.v1.schemas.library_management_preview import (
     LibraryManagementPreviewCreatedResponse,
     LibraryManagementPreviewDetailResponse,
     LibraryManagementPreviewReissueResponse,
+    LibraryManagementImportBundleResolveResponse,
     LibraryManagementProfileCopyRequest,
     LibraryManagementProfileCreateRequest,
     LibraryManagementProfileDeleteRequest,
@@ -93,6 +95,16 @@ async def get_library_management_settings(
     service: LibraryManagementProfileServiceDep,
 ) -> LibraryManagementSettingsResponse:
     return service.get_settings()
+
+
+@router.get(
+    "/settings/library-management/activation-health",
+    response_model=LibraryManagementActivationHealthResponse,
+)
+async def get_library_management_activation_health(
+    service: LibraryManagementProfileServiceDep,
+) -> LibraryManagementActivationHealthResponse:
+    return service.activation_health()
 
 
 @router.put(
@@ -592,6 +604,19 @@ async def acknowledge_library_management_recovery_attention(
         diagnostics=LibraryManagementRecoveryDiagnosticsResponse(
             **await service.diagnostics()
         ),
+    )
+
+
+@router.post(
+    "/library/management/recovery/import-bundles/{bundle_id}/resolve",
+    response_model=LibraryManagementImportBundleResolveResponse,
+)
+async def resolve_library_management_import_bundle(
+    bundle_id: str,
+    service: LibraryManagementRecoveryServiceDep,
+) -> LibraryManagementImportBundleResolveResponse:
+    return LibraryManagementImportBundleResolveResponse(
+        **await service.resolve_import_bundle(bundle_id)
     )
 
 

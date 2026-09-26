@@ -256,8 +256,16 @@ export class NativeAudioSource implements PlaybackSource {
 		}
 		try {
 			await this.audio.play();
-		} catch {
-			this.emitError('AUTOPLAY_BLOCKED', 'Playback failed. Browser may be blocking autoplay.');
+		} catch (err: unknown) {
+			const name = err instanceof DOMException || err instanceof Error ? err.name : '';
+			if (name === 'NotAllowedError') {
+				this.emitError('AUTOPLAY_BLOCKED', 'Playback failed. Browser may be blocking autoplay.');
+			} else {
+				this.emitError(
+					'PLAY_FAILED',
+					'Playback failed (' + (name || 'unknown error') + '). The server may not have responded.'
+				);
+			}
 			this.emitStateChange('error');
 		}
 	}

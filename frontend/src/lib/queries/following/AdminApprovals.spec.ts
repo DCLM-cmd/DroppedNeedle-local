@@ -14,7 +14,9 @@ vi.mock('idb-keyval', () => ({
 	set: vi.fn(),
 	del: vi.fn(),
 	entries: vi.fn(async () => []),
-	clear: vi.fn()
+	clear: vi.fn(),
+	// Inert UseStore: persistence drops writes, like the get/set stubs above.
+	createStore: vi.fn(() => vi.fn(async () => {}))
 }));
 
 vi.mock('$lib/api/client', () => ({

@@ -25,7 +25,7 @@ def _reset_precache_flag():
 
 def _make_service(
     *, lb_configured: bool = True, lastfm_enabled: bool = False,
-    client_factory=None, auth_store=None, workload_gate=None,
+    client_factory=None, workload_gate=None,
 ):
     lb_repo = MagicMock()
     lb_repo.is_configured.return_value = lb_configured
@@ -40,6 +40,9 @@ def _make_service(
     cache = AsyncMock()
     cache.get = AsyncMock(return_value=None)
     cache.set = AsyncMock()
+    cache.get_with_metadata = AsyncMock(return_value=(None, None))
+    cache.set_if_token = AsyncMock(return_value=True)
+    cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
 
     library_db = AsyncMock()
     library_db.get_all_artist_mbids = AsyncMock(return_value=set())
@@ -53,7 +56,6 @@ def _make_service(
         lastfm_repo=lastfm_repo,
         preferences_service=prefs,
         client_factory=client_factory,
-        auth_store=auth_store,
         workload_gate=workload_gate,
     )
     return svc
@@ -101,7 +103,7 @@ async def test_consecutive_unit_failures_pause_precache(caplog, monkeypatch):
 
     with caplog.at_level(logging.INFO), _patch_sources_hanging(svc):
         for i in range(5):
-            result = await svc.precache_artist_discovery([f"mbid-{i}"], delay=0)
+            result = await svc.precache_artist_discovery([f"mbid-{i}"], user_id="initiator-1", delay=0)
             assert result == 0
 
     assert _ads_module._precache_paused_until > monotonic()
@@ -109,7 +111,7 @@ async def test_consecutive_unit_failures_pause_precache(caplog, monkeypatch):
 
     # The 6th call returns 0 in milliseconds without invoking any source.
     with _patch_sources_hanging(svc) as sim:
-        result = await svc.precache_artist_discovery(["mbid-5"], delay=0)
+        result = await svc.precache_artist_discovery(["mbid-5"], user_id="initiator-1", delay=0)
         assert result == 0
         assert sim.await_count == 0
 
@@ -122,13 +124,13 @@ async def test_pause_expiry_probe_success_resets(monkeypatch):
 
     with _patch_sources_hanging(svc):
         for i in range(5):
-            await svc.precache_artist_discovery([f"mbid-{i}"], delay=0)
+            await svc.precache_artist_discovery([f"mbid-{i}"], user_id="initiator-1", delay=0)
     assert _ads_module._precache_paused_until > monotonic()
 
     # Pause expires (or is cleared); sources recover.
     _ads_module._precache_paused_until = 0.0
     with _patch_sources_working(svc):
-        result = await svc.precache_artist_discovery(["mbid-ok"], delay=0)
+        result = await svc.precache_artist_discovery(["mbid-ok"], user_id="initiator-1", delay=0)
 
     assert result == 1
 
@@ -141,20 +143,20 @@ async def test_success_resets_failure_streak(monkeypatch):
 
     # Two genuine unit failures (hanging sources time out).
     with _patch_sources_hanging(svc):
-        await svc.precache_artist_discovery(["mbid-a"], delay=0)
-        await svc.precache_artist_discovery(["mbid-b"], delay=0)
+        await svc.precache_artist_discovery(["mbid-a"], user_id="initiator-1", delay=0)
+        await svc.precache_artist_discovery(["mbid-b"], user_id="initiator-1", delay=0)
     assert _ads_module._precache_consecutive_failures == 2
 
     # One success resets the streak.
     with _patch_sources_working(svc):
-        result = await svc.precache_artist_discovery(["mbid-c"], delay=0)
+        result = await svc.precache_artist_discovery(["mbid-c"], user_id="initiator-1", delay=0)
     assert result == 1
     assert _ads_module._precache_consecutive_failures == 0
 
     # Two more failures: streak is 2, not 4 - the pause must not trip.
     with _patch_sources_hanging(svc):
-        await svc.precache_artist_discovery(["mbid-d"], delay=0)
-        await svc.precache_artist_discovery(["mbid-e"], delay=0)
+        await svc.precache_artist_discovery(["mbid-d"], user_id="initiator-1", delay=0)
+        await svc.precache_artist_discovery(["mbid-e"], user_id="initiator-1", delay=0)
     assert _ads_module._precache_consecutive_failures == 2
     assert _ads_module._precache_paused_until == 0.0
 
@@ -166,9 +168,7 @@ async def test_chunk_loop_aborts_mid_list_when_pause_trips(monkeypatch):
     monkeypatch.setattr(_ads_module, "_DISCOVERY_WORKER_TIMEOUT", 0.05)
 
     with _patch_sources_hanging(svc) as sim:
-        result = await svc.precache_artist_discovery(
-            [f"mbid-{i}" for i in range(30)], delay=0
-        )
+        result = await svc.precache_artist_discovery([f"mbid-{i}" for i in range(30)], user_id="initiator-1", delay=0)
 
     assert result == 0
     assert _ads_module._precache_paused_until > monotonic()
@@ -189,7 +189,7 @@ async def test_healthy_empty_counts_as_success_and_uses_empty_ttl(monkeypatch):
     monkeypatch.setattr(svc, "get_top_songs", AsyncMock(return_value=empty_songs))
     monkeypatch.setattr(svc, "get_top_albums", AsyncMock(return_value=empty_albums))
     monkeypatch.setattr("services.artist_discovery_service.lb_popularity_degraded", lambda: False)
-    result = await svc.precache_artist_discovery(["mbid-empty"], delay=0)
+    result = await svc.precache_artist_discovery(["mbid-empty"], user_id="initiator-1", delay=0)
     assert result == 1
     assert _ads_module._precache_consecutive_failures == 0
     assert _ads_module._precache_paused_until == 0.0
@@ -212,7 +212,7 @@ async def test_degraded_empty_counts_as_failure_and_pauses_after_five(monkeypatc
     monkeypatch.setattr(svc, "get_top_albums", AsyncMock(return_value=empty_albums))
     monkeypatch.setattr("services.artist_discovery_service.lb_popularity_degraded", lambda: True)
     for i in range(5):
-        result = await svc.precache_artist_discovery([f"mbid-degraded-{i}"], delay=0)
+        result = await svc.precache_artist_discovery([f"mbid-degraded-{i}"], user_id="initiator-1", delay=0)
         assert result == 0
     from services.artist_discovery_service import _precache_metrics
     snap = _precache_metrics.snapshot()
@@ -266,7 +266,7 @@ async def test_fallback_data_is_healthy_but_degradation_observable(monkeypatch):
     monkeypatch.setattr(svc, "get_top_songs", fake_songs)
     monkeypatch.setattr(svc, "get_top_albums", fake_albums)
     monkeypatch.setattr("services.artist_discovery_service.lb_popularity_degraded", lambda: False)
-    result = await svc.precache_artist_discovery(["mbid-fallback"], delay=0)
+    result = await svc.precache_artist_discovery(["mbid-fallback"], user_id="initiator-1", delay=0)
     assert result == 1
     assert _ads_module._precache_consecutive_failures == 0
     from services.artist_discovery_service import _precache_metrics
@@ -323,7 +323,7 @@ async def test_concurrency_isolated_degradation_does_not_leak(monkeypatch):
     monkeypatch.setattr(svc, "get_top_songs", fake_songs)
     monkeypatch.setattr(svc, "get_top_albums", fake_albums)
     monkeypatch.setattr("services.artist_discovery_service.lb_popularity_degraded", lambda: False)
-    result = await svc.precache_artist_discovery(["mbid-degraded", "mbid-healthy"], delay=0)
+    result = await svc.precache_artist_discovery(["mbid-degraded", "mbid-healthy"], user_id="initiator-1", delay=0)
     # failure counter may be 0 or 1 depending on order, but the degraded context must not leak
     assert result == 1
     assert _ads_module._precache_consecutive_failures in (0, 1)
@@ -410,10 +410,11 @@ async def test_top_albums_degraded_empty_uses_short_ttl(monkeypatch):
     ctx = init_degradation_context()
     ctx.record(IntegrationResult.error(source="listenbrainz", msg="degraded"))
     captured = {}
-    async def capture_set(key, value, ttl_seconds=None):
+    async def capture_set_if_token(token, key, value, ttl_seconds=None, metadata=None):
+        del token, key, value, metadata
         captured["ttl"] = ttl_seconds
-        return None
-    svc._cache.set = capture_set  # type: ignore
+        return True
+    svc._cache.set_if_token = capture_set_if_token  # type: ignore
     monkeypatch.setattr(svc, "_is_library_artist", AsyncMock(return_value=False))
     monkeypatch.setattr("services.artist_discovery_service.try_get_degradation_context", lambda: ctx)
     monkeypatch.setattr("services.artist_discovery_service.lb_popularity_degraded", lambda: False)

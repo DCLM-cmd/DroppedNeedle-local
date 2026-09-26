@@ -4,6 +4,7 @@ from typing import Optional
 from api.v1.schemas.album import LastFmAlbumEnrichment
 from api.v1.schemas.common import LastFmTagSchema
 from infrastructure.validators import clean_lastfm_bio
+from infrastructure.observability.optional_work import OptionalWorkDeferred
 from repositories.protocols import LastFmRepositoryProtocol
 from services.preferences_service import PreferencesService
 
@@ -47,6 +48,8 @@ class AlbumEnrichmentService:
                 playcount=info.playcount,
                 url=info.url or None,
             )
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "Failed to fetch Last.fm enrichment for album %s: %s",

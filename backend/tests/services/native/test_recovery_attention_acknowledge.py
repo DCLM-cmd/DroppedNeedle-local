@@ -13,7 +13,6 @@ import threading
 
 import pytest
 
-from infrastructure.persistence._database import close_pooled_connections
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.library_administrative_work_service import (
     LibraryAdministrativeWorkService,
@@ -28,8 +27,7 @@ def store(tmp_path):
         connection.execute("INSERT INTO auth_users VALUES ('admin')")
     made = NativeLibraryStore(path, threading.Lock())
     made.test_db_path = path
-    yield made
-    close_pooled_connections()
+    return made
 
 
 _ORDINALS = iter(range(1000))

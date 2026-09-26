@@ -23,9 +23,9 @@ beforeEach(() => {
 describe('LibraryManagementDiscardPreview', () => {
 	it('keeps its completion callback when successful invalidation unmounts it', async () => {
 		const complete = vi.fn();
-		let unmount = () => {};
+		let unmount: (() => Promise<void>) | undefined = undefined;
 		h.discard.mockImplementation(async () => {
-			unmount();
+			await unmount?.();
 			return {};
 		});
 		const view = await render(LibraryManagementDiscardPreview, {

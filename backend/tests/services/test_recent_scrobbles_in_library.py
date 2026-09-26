@@ -24,6 +24,8 @@ def _svc() -> DiscoverHomepageService:
         source="lastfm",
     )
     svc._mb_repo = MagicMock()
+    svc._mbid = MagicMock()
+    svc._mbid.resolve_release_mbids = AsyncMock(return_value={})
     return svc
 
 
@@ -35,7 +37,7 @@ def _track(album_mbid: str, album_name: str = "Owned Album", artist: str = "Arti
 async def test_owned_album_is_in_library_after_rg_resolution():
     svc = _svc()
     # release "rel-1" resolves to release-group "rg-owned", which IS in the library
-    svc._mb_repo.get_release_group_id_from_release = AsyncMock(return_value="rg-owned")
+    svc._mbid.resolve_release_mbids = AsyncMock(return_value={"rel-1": "rg-owned"})
 
     section = await svc._build_lastfm_recent_scrobbles(
         {"lfm_recent": [_track("rel-1")]}, {"rg-owned"}
@@ -49,7 +51,7 @@ async def test_owned_album_is_in_library_after_rg_resolution():
 @pytest.mark.asyncio
 async def test_unowned_album_stays_out_of_library():
     svc = _svc()
-    svc._mb_repo.get_release_group_id_from_release = AsyncMock(return_value="rg-other")
+    svc._mbid.resolve_release_mbids = AsyncMock(return_value={"rel-2": "rg-other"})
 
     section = await svc._build_lastfm_recent_scrobbles(
         {"lfm_recent": [_track("rel-2")]}, {"rg-owned"}

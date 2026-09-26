@@ -97,6 +97,8 @@ function detail(overrides: Record<string, unknown> = {}): Record<string, unknown
 		expired: false,
 		stale: false,
 		stale_reasons: [],
+		stale_input_count: 0,
+		stale_sample_relative_paths: [],
 		ready_for_confirmation: true,
 		operation_row_revision: 7,
 		operation_event_revision: 8,
@@ -213,7 +215,7 @@ describe('LibraryManagementPreviewPage', () => {
 				]
 			}
 		};
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect
 			.element(page.getByText('Profile script could not safely process this file').last())
@@ -264,7 +266,7 @@ describe('LibraryManagementPreviewPage', () => {
 				]
 			}
 		};
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByText('16 files need identity preparation.')).toBeVisible();
 		await expect.element(page.getByText(/Selecting a root chooses files/)).toBeVisible();
@@ -296,7 +298,7 @@ describe('LibraryManagementPreviewPage', () => {
 			isLoading: false,
 			isError: false
 		};
-		const { container } = render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		const { container } = await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 		await expect.element(page.getByText('Files and changes')).toBeVisible();
 		const reasonSelect = [...container.querySelectorAll('select')].find((select) =>
 			select.textContent?.includes('All reasons')
@@ -342,7 +344,7 @@ describe('LibraryManagementPreviewPage', () => {
 				]
 			}
 		};
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 		await expect
 			.element(page.getByText('Top reason: Different file already at the destination (1)'))
 			.toBeVisible();
@@ -374,7 +376,7 @@ describe('LibraryManagementPreviewPage', () => {
 	});
 
 	it('counts outcomes, roots, formats, and changes in every summary-backed filter', async () => {
-		const { container } = render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		const { container } = await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 		await expect.element(page.getByText('Files and changes')).toBeVisible();
 		const options = (label: string) =>
 			[
@@ -436,7 +438,7 @@ describe('LibraryManagementPreviewPage', () => {
 				]
 			}
 		};
-		const { container } = render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		const { container } = await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 		await expect.element(page.getByText('Nothing in this preview can be applied.')).toBeVisible();
 		await expect.element(page.getByText(/Top blockers:/)).toBeVisible();
 		await expect.element(page.getByText(/Start with Release 3/)).toBeVisible();
@@ -495,7 +497,7 @@ describe('LibraryManagementPreviewPage', () => {
 				]
 			}
 		};
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByRole('heading', { name: 'Album' }).first()).toBeVisible();
 		await expect.element(page.getByText('2 files')).toBeVisible();
@@ -651,7 +653,7 @@ describe('LibraryManagementPreviewPage', () => {
 			}
 		};
 
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByText('1 tags', { exact: true })).toBeVisible();
 		await expect.element(page.getByText('2 tags', { exact: true })).not.toBeInTheDocument();
@@ -705,7 +707,7 @@ describe('LibraryManagementPreviewPage', () => {
 			}
 		};
 
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await page.getByRole('button', { name: 'Inspect exact diff for Track' }).click();
 		await expect.element(page.getByText('Unmanaged tags to remove')).toBeVisible();
@@ -748,7 +750,7 @@ describe('LibraryManagementPreviewPage', () => {
 			'droppedneedle:library-management:preview-token:preview-1',
 			'private-token'
 		);
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect
 			.element(page.getByText('Applying is the first write action · no files changed'))
@@ -820,12 +822,12 @@ describe('LibraryManagementPreviewPage', () => {
 	});
 
 	it('resumes apply after a browser restart by reissuing the sealed token', async () => {
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect
 			.element(page.getByText('Applying is the first write action · no files changed'))
 			.toBeVisible();
-		await vi.waitFor(() => expect(h.reissue).toHaveBeenCalledWith('preview-1'));
+		await vi.waitFor(() => expect(h.reissue).toHaveBeenCalledWith({ jobId: 'preview-1' }));
 		await expect
 			.element(page.getByRole('button', { name: /Write tags and organize 1 file/ }))
 			.toBeEnabled();
@@ -852,7 +854,7 @@ describe('LibraryManagementPreviewPage', () => {
 
 	it('keeps apply disabled with a clause-specific reason and a token retry when reissue is denied', async () => {
 		h.reissue.mockRejectedValueOnce(new Error('Forbidden'));
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect
 			.element(page.getByText('Applying is the first write action · no files changed'))
@@ -860,7 +862,7 @@ describe('LibraryManagementPreviewPage', () => {
 		await expect
 			.element(page.getByText(/Apply is disabled: the private apply token is missing/))
 			.toBeVisible();
-		expect(h.reissue).toHaveBeenCalledWith('preview-1');
+		expect(h.reissue).toHaveBeenCalledWith({ jobId: 'preview-1' });
 		await expect
 			.element(page.getByRole('button', { name: /Write tags and organize/ }))
 			.toBeDisabled();
@@ -968,7 +970,7 @@ describe('LibraryManagementPreviewPage', () => {
 				]
 			}
 		};
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await page.getByText('Inspect exact diff').click();
 		await expect.element(page.getByText('Sealed restoration snapshot')).toBeVisible();
@@ -1039,7 +1041,7 @@ describe('LibraryManagementPreviewPage', () => {
 			}
 		};
 
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect
 			.element(page.getByTestId('management-dossier-artwork'))
@@ -1078,7 +1080,7 @@ describe('LibraryManagementPreviewPage', () => {
 			}
 		};
 
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByRole('heading', { name: 'Avalon' })).toBeVisible();
 		await expect.element(page.getByText('Anthony Green · 1 file')).toBeVisible();
@@ -1088,7 +1090,7 @@ describe('LibraryManagementPreviewPage', () => {
 	});
 
 	it('never preselects a collision action and disables recycling without a configured path', async () => {
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 		await page.getByText('Inspect exact diff').click();
 		await page.getByRole('button', { name: 'Choose resolution...' }).click();
 
@@ -1105,6 +1107,51 @@ describe('LibraryManagementPreviewPage', () => {
 			.toBeDisabled();
 	});
 
+	it('names changed files in the stale banner instead of the bare reason code', async () => {
+		h.preview = {
+			data: detail({
+				stale: true,
+				stale_reasons: ['FILE_CHANGED'],
+				stale_input_count: 3,
+				stale_sample_relative_paths: ['a/first.flac', 'b/second.flac'],
+				ready_for_confirmation: false
+			}),
+			isLoading: false,
+			isError: false
+		};
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+
+		await expect.element(page.getByText('This preview cannot be applied.')).toBeVisible();
+		await expect
+			.element(page.getByRole('alert'))
+			.toHaveTextContent(/File changed after this preview was planned/);
+		await expect
+			.element(page.getByRole('alert'))
+			.toHaveTextContent(
+				/3 files changed since planning: a\/first\.flac, b\/second\.flac \(\+1 more\)\. Generate a fresh preview\./
+			);
+	});
+
+	it('keeps the stale banner to friendly labels when the changed count is unknown', async () => {
+		h.preview = {
+			data: detail({
+				stale: true,
+				stale_reasons: ['FILE_CHANGED'],
+				stale_input_count: 0,
+				stale_sample_relative_paths: [],
+				ready_for_confirmation: false
+			}),
+			isLoading: false,
+			isError: false
+		};
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+
+		await expect
+			.element(page.getByRole('alert'))
+			.toHaveTextContent(/File changed after this preview was planned/);
+		await expect.element(page.getByText(/changed since planning/)).not.toBeInTheDocument();
+	});
+
 	it('makes stale and expired plans impossible to apply', async () => {
 		h.preview = {
 			data: detail({ stale: true, expired: true, ready_for_confirmation: false }),
@@ -1115,7 +1162,7 @@ describe('LibraryManagementPreviewPage', () => {
 			'droppedneedle:library-management:preview-token:preview-1',
 			'private-token'
 		);
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 		await expect.element(page.getByText('This preview cannot be applied.')).toBeVisible();
 		await expect
 			.element(page.getByRole('button', { name: /Write tags and organize/ }))
@@ -1127,7 +1174,7 @@ describe('LibraryManagementPreviewPage', () => {
 			'droppedneedle:library-management:preview-token:preview-1',
 			'private-token'
 		);
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await page.getByRole('button', { name: 'Discard preview...' }).click();
 		await expect
@@ -1155,7 +1202,7 @@ describe('LibraryManagementPreviewPage', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByText('Discarded', { exact: true })).toBeVisible();
 		await expect
@@ -1181,7 +1228,7 @@ describe('LibraryManagementPreviewPage', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByText('Preview planning failed.')).toBeVisible();
 		await expect.element(page.getByText('Planning Failed')).toBeVisible();
@@ -1208,7 +1255,7 @@ describe('LibraryManagementPreviewPage', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByText(/1,000 files are planned so far/)).toBeVisible();
 		await expect.element(page.getByText(/0 of 0 items inspected/)).not.toBeInTheDocument();
@@ -1242,7 +1289,7 @@ describe('LibraryManagementPreviewPage', () => {
 			'droppedneedle:library-management:preview-token:preview-1',
 			'private-token'
 		);
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await page.getByRole('button', { name: example.button }).click();
 		await expect.element(page.getByRole('heading', { name: example.title })).toHaveFocus();
@@ -1263,7 +1310,7 @@ describe('LibraryManagementPreviewPage', () => {
 			'droppedneedle:library-management:preview-token:preview-1',
 			'private-token'
 		);
-		render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
 
 		await expect.element(page.getByText('Activation dry run')).toBeVisible();
 		await expect.element(page.getByText(/This page is read-only/)).toBeVisible();
@@ -1273,5 +1320,154 @@ describe('LibraryManagementPreviewPage', () => {
 		await expect
 			.element(page.getByRole('link', { name: 'Library settings' }))
 			.toHaveAttribute('href', '/settings?tab=library');
+	});
+
+	it('shows neutral provider copy on dead previews instead of claiming pinned metadata', async () => {
+		// Pre-fix: the badge derived only from summary.reasons, so a stale preview with no
+		// deferral reasons fell through to "Required metadata pinned".
+		h.preview = {
+			data: detail({
+				stale: true,
+				stale_reasons: ['PROFILE_CHANGED'],
+				ready_for_confirmation: false
+			}),
+			isLoading: false,
+			isError: false
+		};
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+
+		await expect.element(page.getByText('Provider status unavailable')).toBeVisible();
+		await expect.element(page.getByText('Required metadata pinned')).not.toBeInTheDocument();
+	});
+
+	it('names the single deferred source in the header badge instead of the blanket sentence', async () => {
+		// Pre-fix: any OPTIONAL_ENRICHMENT_DEFERRED reason rendered the blanket
+		// "Optional enrichment deferred" with no source key.
+		h.preview = {
+			data: detail({
+				summary: {
+					...(detail().summary as Record<string, unknown>),
+					eligible_count: 1,
+					warning_count: 1,
+					blocked_count: 0,
+					reasons: { OPTIONAL_ENRICHMENT_DEFERRED: 1 },
+					deferred_sources: { 'genre:listenbrainz': 11 }
+				}
+			}),
+			isLoading: false,
+			isError: false
+		};
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+
+		await expect.element(page.getByText('Deferred: genre:listenbrainz ×11')).toBeVisible();
+		await expect
+			.element(page.getByText('Optional enrichment deferred', { exact: true }))
+			.not.toBeInTheDocument();
+	});
+
+	it('shows the deferred-warnings breakdown for appliable previews, not only zero-appliable ones', async () => {
+		// Pre-fix: the Deferred warnings line lived inside the zero-appliable block, so
+		// appliable-with-warnings previews never showed the per-source breakdown.
+		h.preview = {
+			data: detail({
+				summary: {
+					...(detail().summary as Record<string, unknown>),
+					eligible_count: 1,
+					warning_count: 1,
+					blocked_count: 0,
+					reasons: { OPTIONAL_ENRICHMENT_DEFERRED: 1 },
+					deferred_sources: { lrclib: 2 }
+				}
+			}),
+			isLoading: false,
+			isError: false
+		};
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+
+		await expect
+			.element(page.getByText('Nothing in this preview can be applied.'))
+			.not.toBeInTheDocument();
+		await expect.element(page.getByText(/Deferred warnings:/)).toBeVisible();
+		await expect.element(page.getByText(/lrclib \(2\)/)).toBeVisible();
+	});
+
+	it('names the most frequent deferred source in the header badge', async () => {
+		// Pre-fix: the blanket sentence hid every source key, so multi-source deferrals
+		// never surfaced which source dominated.
+		h.preview = {
+			data: detail({
+				summary: {
+					...(detail().summary as Record<string, unknown>),
+					eligible_count: 1,
+					warning_count: 2,
+					blocked_count: 0,
+					reasons: { OPTIONAL_ENRICHMENT_DEFERRED: 2 },
+					deferred_sources: { 'lyrics:lrclib': 3, 'genre:listenbrainz': 11 }
+				}
+			}),
+			isLoading: false,
+			isError: false
+		};
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+
+		await expect.element(page.getByText('Deferred: genre:listenbrainz ×11')).toBeVisible();
+	});
+
+	it('qualifies deferral reasons as still-appliable warnings with the deferred source', async () => {
+		// Pre-fix: the dossier Top reason and inspector banner rendered bare
+		// "Optional enrichment deferred" with blocker tone for warnings-only rows.
+		h.preview = {
+			data: detail({
+				summary: {
+					...(detail().summary as Record<string, unknown>),
+					eligible_count: 0,
+					warning_count: 1,
+					blocked_count: 0,
+					reasons: { OPTIONAL_ENRICHMENT_DEFERRED: 1 },
+					deferred_sources: { 'genre:listenbrainz': 1 }
+				}
+			}),
+			isLoading: false,
+			isError: false
+		};
+		h.items = {
+			...h.items,
+			data: {
+				pages: [
+					{
+						items: [
+							{
+								...collisionItem,
+								eligibility: 'warning',
+								reason_code: 'OPTIONAL_ENRICHMENT_DEFERRED',
+								collisions: [],
+								diff: { ...collisionItem.diff, deferred_sources: ['genre:listenbrainz'] }
+							}
+						],
+						has_more: false,
+						next_after_ordinal: null
+					}
+				]
+			}
+		};
+		await render(LibraryManagementPreviewPage, { jobId: 'preview-1' });
+
+		await expect
+			.element(
+				page.getByText(
+					'Top reason: Optional enrichment deferred · still applicable with warnings (1)'
+				)
+			)
+			.toBeVisible();
+		await page.getByRole('button', { name: 'Inspect exact diff for Track' }).click();
+		await expect
+			.element(
+				page
+					.getByTestId('management-audit-inspector')
+					.getByText(
+						'Optional enrichment deferred · still applicable with warnings (genre:listenbrainz)'
+					)
+			)
+			.toBeVisible();
 	});
 });

@@ -1,5 +1,6 @@
 import { api } from '$lib/api/client';
 import { createMutation } from '@tanstack/svelte-query';
+import { authStore } from '$lib/stores/authStore.svelte';
 import { invalidateQueriesWithPersister } from '../QueryClient';
 import { AuthQueryKeyFactory } from './AuthQueryKeyFactory';
 import { AUTH_ENDPOINTS } from './endpoints';
@@ -17,6 +18,6 @@ export const createImportUsersMutation = () =>
 			api.post<ImportUsersResult>(AUTH_ENDPOINTS.adminImport, vars),
 		onSuccess: (_result: ImportUsersResult, vars: ImportUsersVars) =>
 			invalidateQueriesWithPersister({
-				queryKey: AuthQueryKeyFactory.importCandidates(vars.provider)
+				queryKey: AuthQueryKeyFactory.importCandidates(vars.provider, authStore.user?.id)
 			})
 	}));

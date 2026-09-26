@@ -1,6 +1,7 @@
 import inspect
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 import mutagen
 import pytest
@@ -18,6 +19,15 @@ from infrastructure.audio.metadata_engine import (
 from infrastructure.audio.protocols import AudioReadAdapterProtocol
 from infrastructure.audio.tagger import AudioTagger
 from services.local_files_service import AUDIO_EXTENSIONS
+from models.audio_metadata import (
+    AudioFieldValue,
+    AudioMetadataDocument,
+    AudioSemanticField,
+    AudioTechnicalInfo,
+    FileAttributeSnapshot,
+    NativeMetadataSnapshot,
+    ReadAudioDocument,
+)
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "library"
 FORMATS = ("flac", "mp3", "ogg", "opus", "m4a", "aac", "wav", "wma")
@@ -144,3 +154,61 @@ def test_legacy_tagger_projection_keeps_scan_behavior(audio_format: str) -> None
     assert tag.album_sort == "Management Album, The"
     assert info.file_format == audio_format
     assert info.duration_seconds > 0
+
+
+def _release_type_tag(value: AudioFieldValue | None) -> str | None:
+    """Project a synthetic document carrying one release_type semantic value."""
+    fields = (
+        () if value is None else (AudioSemanticField(name="release_type", value=value),)
+    )
+    document = ReadAudioDocument(
+        probe=SimpleNamespace(detected_format="flac"),  # type: ignore[arg-type]
+        metadata=AudioMetadataDocument(fields=fields),
+        artwork=(),
+        technical=AudioTechnicalInfo(
+            duration_seconds=200.0,
+            bitrate_bps=900_000,
+            sample_rate_hz=44_100,
+            channels=2,
+            bit_depth=16,
+            codec=None,
+            file_size_bytes=1000,
+        ),
+        raw_tags=(),
+        native_tags=NativeMetadataSnapshot(storage_kind="none"),
+        file_attributes=FileAttributeSnapshot(
+            atime_ns=1, mtime_ns=1, permission_bits=0o644
+        ),
+        warnings=(),
+    )
+    tag, _ = legacy_audio_projection(document)
+    return tag.release_type
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("EP", "EP"), ("ep", "ep"), ("Single", "Single")],
+)
+def test_legacy_projection_preserves_release_type_variants(
+    raw: str, expected: str
+) -> None:
+    assert _release_type_tag(raw) == expected
+
+
+def test_legacy_projection_release_type_absent_is_none() -> None:
+    assert _release_type_tag(None) is None
+
+
+def test_legacy_projection_release_type_multi_value_keeps_first() -> None:
+    assert _release_type_tag(("Album", "Compilation")) == "Album"
+
+
+def test_legacy_projection_release_type_blank_is_none() -> None:
+    assert _release_type_tag("   ") is None
+    assert _release_type_tag(()) is None
+
+
+@pytest.mark.parametrize("audio_format", FORMATS)
+def test_legacy_projection_reads_fixture_release_type(audio_format: str) -> None:
+    tag, _ = AudioTagger().read_tags(FIXTURES / f"management_full.{audio_format}")
+    assert tag.release_type == "Album"

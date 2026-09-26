@@ -4,6 +4,7 @@ import asyncio
 import errno
 import logging
 import os
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,14 +12,22 @@ from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from core.task_registry import TaskRegistry
 from infrastructure.sse_publisher import KEEPALIVE, SSEPublisher
 from infrastructure.queue.durable_work_wakeup import DurableWorkWakeups
-from models.library_work import ScanFailureRecord, ScanRun, ScanRunSnapshot, ScanScope
+from models.library_work import (
+    OperationJob,
+    ScanFailureRecord,
+    ScanRequest,
+    ScanRequestResult,
+    ScanRun,
+    ScanRunSnapshot,
+    ScanScope,
+)
 from services.compat.target_scan_service import TargetCompatScanService
 from services.native.library_scan_events import LibraryScanEventPublisher
 from infrastructure.persistence.native_library_store import NativeLibraryStore
@@ -36,6 +45,13 @@ from api.v1.schemas.library_policies import (
     LibraryRootSettings,
     TypedLibrarySettings,
 )
+from services.native.library_filesystem_watcher import (
+    WATCHER_TASK_NAME,
+    WatcherSettings,
+    _snapshot_tree,
+    start_library_filesystem_watcher,
+    watch_library_filesystem,
+)
 from services.native.library_scan_supervisor import (
     ERROR_RETRY_INTERVAL_SECONDS,
     SUPERVISOR_TASK_NAME,
@@ -43,12 +59,17 @@ from services.native.library_scan_supervisor import (
     supervise_target_scans,
 )
 from services.native.target_application_runtime import (
+    ERROR_RETRY_INTERVAL_SECONDS as RUNTIME_ERROR_RETRY_INTERVAL_SECONDS,
     run_library_contribution_verification_worker,
     run_target_identification_worker,
     run_target_operation_worker,
     run_target_worker_watchdog,
 )
-from core.exceptions import AudioFormatError, ResourceNotFoundError
+from core.exceptions import (
+    AudioFormatError,
+    ResourceNotFoundError,
+    StaleRevisionError,
+)
 from infrastructure.resilience.retry import CircuitState
 from services.native.background_workload_gate import BackgroundWorkloadGate
 from services.native.library_filesystem_coordinator import LibraryFilesystemCoordinator
@@ -87,6 +108,34 @@ async def test_subsonic_target_projection_uses_only_the_coordinator() -> None:
     assert request.scopes[0].root_id == "root-a"
     assert scanning is True
     assert count == 42
+
+
+def test_scan_provider_builds_the_target_compat_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S-04/X-03: the DI provider behind ``get_target_compat_services().scan``
+    builds a ``TargetCompatScanService`` (the module docstring's stale
+    "without runtime registration" claim is what step 4.7 corrects)."""
+    from core.dependencies.compat_providers import get_target_compat_scan_service
+
+    coordinator = AsyncMock()
+    resolver = SimpleNamespace(policy_revision="policy-1")
+    monkeypatch.setattr(
+        "core.dependencies.service_providers.get_target_library_scan_coordinator",
+        lambda: coordinator,
+    )
+    monkeypatch.setattr(
+        "core.dependencies.service_providers.get_library_policy_resolver",
+        lambda: resolver,
+    )
+    try:
+        service = get_target_compat_scan_service()
+    finally:
+        get_target_compat_scan_service.cache_clear()
+
+    assert isinstance(service, TargetCompatScanService)
+    assert service._coordinator is coordinator
+    assert service._resolver_getter() is resolver
 
 
 @pytest.mark.asyncio
@@ -207,6 +256,109 @@ async def test_only_one_target_supervisor_can_be_registered() -> None:
 
 
 @pytest.mark.asyncio
+async def test_supervisor_logs_a_tick_that_starts_no_run_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T21 (S-05): a tick returning False (not due, or a conflict with an
+    incompatible queued follow-up) is logged at debug and retried next
+    iteration - here the scheduler reports False and the loop still runs."""
+    coordinator = AsyncMock()
+    coordinator.run_once.return_value = None
+    scheduler = AsyncMock()
+    scheduler.tick.return_value = False
+    resolver = SimpleNamespace(
+        policy_revision="one", settings=SimpleNamespace(enabled=True)
+    )
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    with caplog.at_level(
+        logging.DEBUG, logger="services.native.library_scan_supervisor"
+    ):
+        await supervise_target_scans(
+            lambda: coordinator,
+            lambda: {"root-a": Path("/scratch")},
+            wakeups,
+            lambda: scheduler,
+            lambda: resolver,
+            lambda: {
+                "frequency": "manual",
+                "daily_time": "03:00",
+                "timezone_name": "UTC",
+            },
+        )
+
+    scheduler.tick.assert_awaited_once()
+    coordinator.run_once.assert_awaited_once()
+    assert any(
+        record.levelno == logging.DEBUG
+        and record.getMessage() == "Target scan scheduler tick did not start a run"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_register_conflict_cancels_orphan_and_keeps_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T29 (R-05): a register conflict after task creation cancels the orphan
+    and leaves exactly one registered task.
+
+    Honesty note: a true threaded double-start cannot run in this suite
+    (asyncio.create_task requires a running loop in the calling thread), so
+    this covers the sequential path - the guard bypassed plus register
+    raising - which is the same register conflict the race would hit.
+    """
+    registry = TaskRegistry()
+    monkeypatch.setattr(TaskRegistry, "get_instance", classmethod(lambda cls: registry))
+
+    async def run_forever() -> None:
+        await asyncio.Event().wait()
+
+    original = asyncio.get_running_loop().create_task(run_forever())
+    registry.register(SUPERVISOR_TASK_NAME, original)
+    # Slip past the is_running guard to reach the register conflict.
+    monkeypatch.setattr(registry, "is_running", lambda _name: False)
+
+    created: list[asyncio.Task[None]] = []
+    real_create_task = asyncio.create_task
+
+    def spy_create_task(coro, **kwargs):  # type: ignore[no-untyped-def]
+        task = real_create_task(coro, **kwargs)
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", spy_create_task)
+
+    coordinator = AsyncMock()
+    coordinator.run_once.return_value = None
+    try:
+        with pytest.raises(RuntimeError):
+            start_target_scan_supervisor(
+                lambda: coordinator, lambda: {}, DurableWorkWakeups()
+            )
+        # Exactly one registered task: the original, never the orphan.
+        assert registry.get_all()[SUPERVISOR_TASK_NAME] is original
+        assert len(created) == 1
+        orphan = created[0]
+        assert orphan is not original
+        # The orphan ends cancelled (awaiting it suppresses CancelledError).
+        # wait_for bounds the wait so a never-cancelled orphan fails fast
+        # instead of running the supervisor loop until the suite times out.
+        with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(orphan, timeout=5)
+        assert orphan.cancelled()
+        assert registry.get_all()[SUPERVISOR_TASK_NAME] is original
+        assert original.cancelled() is False
+    finally:
+        original.cancel()
+        with suppress(asyncio.CancelledError):
+            await original
+        registry.reset()
+
+
+@pytest.mark.asyncio
 async def test_supervisor_refreshes_scheduler_and_resolver_each_iteration() -> None:
     coordinator = AsyncMock()
     coordinator.run_once.return_value = None
@@ -246,8 +398,10 @@ async def test_supervisor_refreshes_scheduler_and_resolver_each_iteration() -> N
     )
 
     # One extra resolver read comes from the startup recovery gate; the two
-    # loop iterations then read it once each.
-    assert calls == {"scheduler": 2, "resolver": 3, "settings": 2}
+    # loop iterations then read it once each. The S-01 Hook A one-shot reads
+    # the schedule once at startup (manual here, so it skips before touching
+    # the scheduler or coordinator.current).
+    assert calls == {"scheduler": 2, "resolver": 3, "settings": 3}
     assert scheduler.tick.await_count == 2
 
 
@@ -1437,12 +1591,19 @@ async def test_repeated_stalled_walkers_all_tracked_and_warned(
     store.classify_scan_paths.return_value = {"track.flac": ("new", None)}
     store.add_scan_inventory_batch.return_value = (2, 1)
     filesystem = LibraryFilesystemCoordinator()
+    # F-12 reaper awareness: the detach set reaps entries older than
+    # deadline x multiplier (here 0.05s x 3 = 0.15s), while four sequential
+    # detach iterations take longer than that in wall-clock time. Freeze the
+    # reaper clock so this refusal test exercises a full set of FRESH
+    # wedged walkers; reap timing itself is covered by the hostile-
+    # filesystem reaper tests.
     scanner = LibraryInventoryScanner(
         store,
         directory_walker=walker,
         filesystem_coordinator=filesystem,
         walk_deadline_seconds=0.05,
         max_detached_walkers=4,
+        monotonic_clock=lambda: 1000.0,
     )
     scope = ScanScope(root_id="root", policy_revision="policy-1")
     resolver = SimpleNamespace(resolve=lambda _path: None)
@@ -1489,6 +1650,192 @@ async def test_repeated_stalled_walkers_all_tracked_and_warned(
     deadline = time.monotonic() + 2.0
     while scanner._detached_walkers and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
+    assert not scanner._detached_walkers
+
+
+def _walk_timeout_retry_store(run: ScanRun) -> AsyncMock:
+    """Mock store surface for the discover()-level GH-444 retry tests."""
+    store = AsyncMock()
+    store.get_scan_scope_discovery_state.return_value = "pending"
+    store.get_scan_scope_discovery_generation.return_value = 1
+    store.get_scan_run.return_value = (run, [], {})
+    store.classify_scan_paths.return_value = {"track.flac": ("new", None)}
+    store.add_scan_inventory_batch.return_value = (2, 1)
+    store.cleanup_stale_scan_inventory.return_value = 0
+    store.transition_scan_run.return_value = ScanRun(
+        id=run.id,
+        kind="incremental",
+        trigger="manual",
+        state="failed",
+        phase="discovering",
+        row_revision=3,
+    )
+    return store
+
+
+@pytest.mark.asyncio
+async def test_discover_walk_timeout_once_then_green_retries_scope(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """GH-444: a transient mid-walk WALK_TIMEOUT re-walks the scope instead
+    of failing the run terminally."""
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").touch()
+    wedged = threading.Event()
+    calls = 0
+
+    def walker(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield (str(root), [], ["track.flac"])
+            wedged.wait()
+            return
+        yield (str(root), [], ["track.flac"])
+
+    run = _scan_run()
+    store = _walk_timeout_retry_store(run)
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=walker,
+        walk_deadline_seconds=0.05,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(resolve=lambda _path: None)
+    checkpoint = AsyncMock(return_value=True)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="services.native.library_inventory_scanner"):
+            result = await scanner.discover(
+                run, [scope], {scope.root_id: root}, resolver, checkpoint
+            )
+    finally:
+        wedged.set()
+        deadline = time.monotonic() + 2.0
+        while scanner._detached_walkers and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+    assert calls == 2
+    store.restart_scan_scope_discovery.assert_awaited_once_with(
+        "run-1", "root", "."
+    )
+    # Attempt 1 records the honest partial row; the retry completes cleanly.
+    assert store.complete_scan_scope_discovery.await_count == 2
+    assert store.complete_scan_scope_discovery.await_args.kwargs["state"] == "completed"
+    # The transient stall stays visible as failure evidence on the green run.
+    timeout_records = [
+        record
+        for call in store.record_scan_failures.await_args_list
+        for record in call.args[1]
+        if record.failure_code == "WALK_TIMEOUT"
+    ]
+    assert len(timeout_records) == 1
+    store.transition_scan_run.assert_not_awaited()
+    assert "walk_timeout_retry" in caplog.text
+    assert result.state == "discovering"
+    assert not scanner._detached_walkers
+
+
+@pytest.mark.asyncio
+async def test_discover_persistent_walk_timeout_retries_twice_then_fails(
+    tmp_path: Path,
+) -> None:
+    """GH-444: a still-wedged producer exhausts the bounded budget (initial
+    walk + 2 retries) and fails honestly with WALK_TIMEOUT."""
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").touch()
+    wedged = threading.Event()
+    calls = 0
+
+    def walker(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        yield (str(root), [], ["track.flac"])
+        wedged.wait()
+        return
+
+    run = _scan_run()
+    store = _walk_timeout_retry_store(run)
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=walker,
+        walk_deadline_seconds=0.05,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(resolve=lambda _path: None)
+    checkpoint = AsyncMock(return_value=True)
+
+    try:
+        result = await scanner.discover(
+            run, [scope], {scope.root_id: root}, resolver, checkpoint
+        )
+    finally:
+        wedged.set()
+        deadline = time.monotonic() + 2.0
+        while scanner._detached_walkers and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+    assert calls == 3
+    assert store.restart_scan_scope_discovery.await_count == 2
+    assert result.state == "failed"
+    assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
+    assert not scanner._detached_walkers
+
+
+@pytest.mark.asyncio
+async def test_discover_walk_timeout_with_paused_checkpoint_does_not_retry(
+    tmp_path: Path,
+) -> None:
+    """GH-444: a coordinator pause (checkpoint false) during a wedged walk
+    wins over retry - the scope fails once through the existing path."""
+    root = tmp_path / "music"
+    root.mkdir()
+    (root / "track.flac").touch()
+    wedged = threading.Event()
+    calls = 0
+
+    def walker(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        yield (str(root), [], ["track.flac"])
+        wedged.wait()
+        return
+
+    run = _scan_run()
+    store = _walk_timeout_retry_store(run)
+    scanner = LibraryInventoryScanner(
+        store,
+        directory_walker=walker,
+        walk_deadline_seconds=0.05,
+    )
+    scope = ScanScope(root_id="root", policy_revision="policy-1")
+    resolver = SimpleNamespace(resolve=lambda _path: None)
+    checkpoint_calls = 0
+
+    async def checkpoint(_run_id: str, _revision: str) -> bool:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        # The discover-top checkpoint passes so the walk starts; the retry
+        # gate then observes the pause and declines the re-walk.
+        return checkpoint_calls == 1
+
+    try:
+        result = await scanner.discover(
+            run, [scope], {scope.root_id: root}, resolver, checkpoint
+        )
+    finally:
+        wedged.set()
+        deadline = time.monotonic() + 2.0
+        while scanner._detached_walkers and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+    assert calls == 1
+    store.restart_scan_scope_discovery.assert_not_awaited()
+    assert result.state == "failed"
+    assert store.transition_scan_run.await_args.kwargs["terminal_code"] == "WALK_TIMEOUT"
     assert not scanner._detached_walkers
 
 
@@ -2816,3 +3163,1005 @@ async def test_a_recycle_bin_that_is_not_dot_prefixed_is_still_skipped(
         for entry in call.args[1]
     ]
     assert seen == ["Artist/Album/01 - Song.mp3"]
+
+
+def _startup_resolver(root: Path, *, enabled: bool = True) -> LibraryPolicyResolver:
+    return LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(
+                    id="root-a",
+                    path=str(root),
+                    label="Library",
+                    policy="automatic",
+                )
+            ],
+            enabled=enabled,
+        )
+    )
+
+
+def _breaking_wakeups() -> SimpleNamespace:
+    return SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+
+
+def _quiet_scheduler() -> SimpleNamespace:
+    async def _tick(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    return SimpleNamespace(
+        _scheduled_scopes=LibraryAutomaticScanScheduler._scheduled_scopes,
+        scheduled_scopes=LibraryAutomaticScanScheduler.scheduled_scopes,
+        tick=AsyncMock(side_effect=_tick),
+    )
+
+
+def _started_result() -> ScanRequestResult:
+    return ScanRequestResult(
+        run_id="run-1", disposition="started", state="queued", row_revision=1
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_requests_incremental_scan_after_clean_recover(
+    tmp_path: Path,
+) -> None:
+    """T14 (S-01 Hook A): a clean boot requests one startup_resume scan."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root)
+    coordinator = AsyncMock()
+    coordinator.recover.return_value = []
+    coordinator.current.return_value = []
+    coordinator.run_once.return_value = None
+    coordinator.request_run.return_value = _started_result()
+    scheduler = _quiet_scheduler()
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        _breaking_wakeups(),
+        lambda: scheduler,
+        lambda: resolver,
+        lambda: {"frequency": "24hr", "daily_time": "03:00", "timezone_name": "UTC"},
+    )
+    coordinator.request_run.assert_awaited_once()
+    request = coordinator.request_run.await_args.args[0]
+    assert isinstance(request, ScanRequest)
+    assert request.kind == "incremental"
+    assert request.trigger == "startup_resume"
+    assert request.policy_revision == resolver.policy_revision
+    assert [scope.scope_id for scope in request.scopes] == ["root-a"]
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_skipped_when_recovery_leaves_work(
+    tmp_path: Path,
+) -> None:
+    """T14 (S-01 Hook A): resumable runs from recover suppress the one-shot."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root)
+    coordinator = AsyncMock()
+    coordinator.recover.return_value = [SimpleNamespace(id="run-old")]
+    coordinator.run_once.return_value = None
+    scheduler = _quiet_scheduler()
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        _breaking_wakeups(),
+        lambda: scheduler,
+        lambda: resolver,
+        lambda: {"frequency": "24hr", "daily_time": "03:00", "timezone_name": "UTC"},
+    )
+    coordinator.request_run.assert_not_awaited()
+    coordinator.current.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_skipped_when_current_run_active(
+    tmp_path: Path,
+) -> None:
+    """T14 (S-01 Hook A): an active run suppresses the one-shot."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root)
+    coordinator = AsyncMock()
+    coordinator.recover.return_value = []
+    coordinator.current.return_value = [SimpleNamespace(id="run-active")]
+    coordinator.run_once.return_value = None
+    scheduler = _quiet_scheduler()
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        _breaking_wakeups(),
+        lambda: scheduler,
+        lambda: resolver,
+        lambda: {"frequency": "24hr", "daily_time": "03:00", "timezone_name": "UTC"},
+    )
+    coordinator.request_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_skipped_when_manual_frequency(
+    tmp_path: Path,
+) -> None:
+    """T14 (S-01 Hook A): manual frequency skips like the loop gates."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root)
+    coordinator = AsyncMock()
+    coordinator.recover.return_value = []
+    coordinator.run_once.return_value = None
+    scheduler = _quiet_scheduler()
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        _breaking_wakeups(),
+        lambda: scheduler,
+        lambda: resolver,
+        lambda: {"frequency": "manual", "daily_time": "03:00", "timezone_name": "UTC"},
+    )
+    coordinator.request_run.assert_not_awaited()
+    coordinator.current.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_skipped_when_library_disabled(
+    tmp_path: Path,
+) -> None:
+    """T14 (S-01 Hook A): a disabled library skips like the loop gates."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root, enabled=False)
+    coordinator = AsyncMock()
+    coordinator.run_once.return_value = None
+    scheduler = _quiet_scheduler()
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        _breaking_wakeups(),
+        lambda: scheduler,
+        lambda: resolver,
+        lambda: {"frequency": "24hr", "daily_time": "03:00", "timezone_name": "UTC"},
+    )
+    coordinator.recover.assert_not_awaited()
+    coordinator.request_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_failure_does_not_kill_supervisor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T14 (S-01 Hook A): the one-shot is best-effort; the loop still runs."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root)
+    coordinator = AsyncMock()
+    coordinator.recover.return_value = []
+    coordinator.current.return_value = []
+    coordinator.run_once.return_value = None
+    coordinator.request_run.side_effect = RuntimeError("request store fault")
+    scheduler = _quiet_scheduler()
+    with caplog.at_level(
+        logging.ERROR, logger="services.native.library_scan_supervisor"
+    ):
+        await supervise_target_scans(
+            lambda: coordinator,
+            lambda: {"root-a": root},
+            _breaking_wakeups(),
+            lambda: scheduler,
+            lambda: resolver,
+            lambda: {
+                "frequency": "24hr",
+                "daily_time": "03:00",
+                "timezone_name": "UTC",
+            },
+        )
+    coordinator.request_run.assert_awaited_once()
+    coordinator.run_once.assert_awaited_once()
+    assert any(
+        record.exc_info is not None
+        and record.getMessage() == "Target scan startup reconciliation request failed"
+        for record in caplog.records
+    )
+
+
+def _dirty_harness(
+    tmp_path: Path,
+    *,
+    disposition: str = "started",
+) -> tuple[LibraryPolicyResolver, AsyncMock, SimpleNamespace, Mock, dict[str, str]]:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root)
+    coordinator = AsyncMock()
+    # Hook A stays quiet: recovery left nothing but a current run is active.
+    coordinator.recover.return_value = []
+    coordinator.current.return_value = [SimpleNamespace(id="run-active")]
+    coordinator.run_once.return_value = None
+    coordinator.request_run.return_value = ScanRequestResult(
+        run_id="run-2", disposition=disposition, state="queued", row_revision=1
+    )
+    scheduler = _quiet_scheduler()
+    clearer = Mock()
+    getters = {
+        "frequency": "manual",
+        "daily_time": "03:00",
+        "timezone_name": "UTC",
+    }
+    return resolver, coordinator, scheduler, clearer, getters
+
+
+@pytest.mark.asyncio
+async def test_dirty_scope_marks_consumed_into_scoped_scan_in_manual_mode(
+    tmp_path: Path,
+) -> None:
+    """T16 (S-01 Hook B): marks fire regardless of frequency, then clear."""
+    resolver, coordinator, scheduler, clearer, schedule = _dirty_harness(tmp_path)
+    root = tmp_path / "music"
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        _breaking_wakeups(),
+        lambda: scheduler,
+        lambda: resolver,
+        lambda: schedule,
+        dirty_scopes_getter=lambda: ["root-a"],
+        dirty_scopes_clearer=clearer,
+    )
+    coordinator.request_run.assert_awaited_once()
+    request = coordinator.request_run.await_args.args[0]
+    assert request.kind == "incremental"
+    assert request.trigger == "policy_apply"
+    assert request.policy_revision == resolver.policy_revision
+    assert [scope.scope_id for scope in request.scopes] == ["root-a"]
+    clearer.assert_called_once_with(["root-a"])
+
+
+@pytest.mark.asyncio
+async def test_dirty_scope_marks_kept_on_conflict(tmp_path: Path) -> None:
+    """T16 (S-01 Hook B): a conflicted request keeps marks for the next tick."""
+    resolver, coordinator, scheduler, clearer, schedule = _dirty_harness(tmp_path, disposition="conflict")
+    root = tmp_path / "music"
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        _breaking_wakeups(),
+        lambda: scheduler,
+        lambda: resolver,
+        lambda: schedule,
+        dirty_scopes_getter=lambda: ["root-a"],
+        dirty_scopes_clearer=clearer,
+    )
+    coordinator.request_run.assert_awaited_once()
+    clearer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_dirty_scope_marks_dropped_without_request(
+    tmp_path: Path,
+) -> None:
+    """T16 (S-01 Hook B): unresolvable ids clear without a scan request."""
+    resolver, coordinator, scheduler, clearer, schedule = _dirty_harness(tmp_path)
+    root = tmp_path / "music"
+    await supervise_target_scans(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        _breaking_wakeups(),
+        lambda: scheduler,
+        lambda: resolver,
+        lambda: schedule,
+        dirty_scopes_getter=lambda: ["gone-root"],
+        dirty_scopes_clearer=clearer,
+    )
+    coordinator.request_run.assert_not_awaited()
+    clearer.assert_called_once_with(["gone-root"])
+
+
+def _watcher_snapshot_script(
+    monkeypatch: pytest.MonkeyPatch, script: list[dict[str, tuple[int, int, bool]]]
+) -> list[Path]:
+    """Serve canned snapshots per poll; records every root the loop visits."""
+    from services.native import library_filesystem_watcher as watcher_module
+
+    seen: list[Path] = []
+    states = [dict(state) for state in script]
+    calls = {"count": 0}
+
+    def _fake_snapshot(root: Path) -> dict[str, tuple[int, int, bool]]:
+        seen.append(root)
+        index = min(calls["count"], len(states) - 1)
+        calls["count"] += 1
+        return dict(states[index])
+
+    monkeypatch.setattr(watcher_module, "_snapshot_tree", _fake_snapshot)
+    return seen
+
+
+def _watcher_sleep_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    calls_before_cancel: int,
+    clock_bump: float = 0.0,
+    clock: list[float] | None = None,
+) -> list[float]:
+    """Record sleep delays; advance the fake clock; then break the loop."""
+    sleeps: list[float] = []
+    remaining = {"count": calls_before_cancel}
+    real_sleep = asyncio.sleep
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        if clock is not None:
+            clock[0] += clock_bump
+        remaining["count"] -= 1
+        if remaining["count"] <= 0:
+            raise asyncio.CancelledError()
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    return sleeps
+
+
+def _watcher_harness(tmp_path: Path) -> tuple[
+    object, AsyncMock, SimpleNamespace, SimpleNamespace, Path
+]:
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root)
+    coordinator = AsyncMock()
+    coordinator.request_run.return_value = _started_result()
+    scheduler = _quiet_scheduler()
+    wakeups = SimpleNamespace(notify=Mock(), revision=lambda _kind: 0)
+    return resolver, coordinator, scheduler, wakeups, root
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_detects_nested_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T15 (S-01 Hook C): a nested-only snapshot move requests one scan."""
+    resolver, coordinator, scheduler, wakeups, root = _watcher_harness(tmp_path)
+    nested_before = {"a/b/old.flac": (100, 10, False)}
+    nested_after = {
+        "a/b/old.flac": (100, 10, False),
+        "a/b/c/new.flac": (200, 20, False),
+    }
+    seen = _watcher_snapshot_script(monkeypatch, [nested_before, nested_after])
+    clock = [1000.0]
+    sleeps = _watcher_sleep_breaker(
+        monkeypatch, calls_before_cancel=3, clock_bump=200.0, clock=clock
+    )
+    await watch_library_filesystem(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        wakeups,
+        scheduler_getter=lambda: scheduler,
+        resolver_getter=lambda: resolver,
+        watcher_settings_getter=lambda: WatcherSettings(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        ),
+        clock_getter=lambda: clock[0],
+    )
+    assert seen == [root, root, root]
+    coordinator.request_run.assert_awaited_once()
+    request = coordinator.request_run.await_args.args[0]
+    assert isinstance(request, ScanRequest)
+    assert request.kind == "incremental"
+    assert request.trigger == "automatic"
+    assert request.policy_revision == resolver.policy_revision
+    assert [scope.scope_id for scope in request.scopes] == ["root-a"]
+    wakeups.notify.assert_called_once_with("scan")
+    assert sleeps == [300.0, 60.0, 300.0]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_batches_rapid_bursts_into_one_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T15 (S-01 Hook C): three quick mutations collapse into one request."""
+    resolver, coordinator, scheduler, wakeups, root = _watcher_harness(tmp_path)
+    burst = [
+        {},
+        {"a.flac": (100, 1, False)},
+        {"a.flac": (100, 1, False), "b.flac": (110, 1, False)},
+        {
+            "a.flac": (100, 1, False),
+            "b.flac": (110, 1, False),
+            "c.flac": (120, 1, False),
+        },
+    ]
+    _watcher_snapshot_script(monkeypatch, burst)
+    clock = [1000.0]
+    sleeps = _watcher_sleep_breaker(
+        monkeypatch, calls_before_cancel=5, clock_bump=20.0, clock=clock
+    )
+    await watch_library_filesystem(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        wakeups,
+        scheduler_getter=lambda: scheduler,
+        resolver_getter=lambda: resolver,
+        watcher_settings_getter=lambda: WatcherSettings(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        ),
+        clock_getter=lambda: clock[0],
+    )
+    assert coordinator.request_run.await_count == 1
+    wakeups.notify.assert_called_once_with("scan")
+    assert sleeps == [300.0, 60.0, 40.0, 20.0, 300.0]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_bounds_rename_storms_by_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T15 (S-01 Hook C): a mutation every poll still yields one request/window."""
+    resolver, coordinator, scheduler, wakeups, root = _watcher_harness(tmp_path)
+    storm = [{f"track-{index}.flac": (100 + index, 1, False)} for index in range(8)]
+    _watcher_snapshot_script(monkeypatch, storm)
+    clock = [1000.0]
+    sleeps = _watcher_sleep_breaker(
+        monkeypatch, calls_before_cancel=8, clock_bump=10.0, clock=clock
+    )
+    await watch_library_filesystem(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        wakeups,
+        scheduler_getter=lambda: scheduler,
+        resolver_getter=lambda: resolver,
+        watcher_settings_getter=lambda: WatcherSettings(
+            enabled=True, poll_interval_seconds=10.0, batch_window_seconds=60.0
+        ),
+        clock_getter=lambda: clock[0],
+    )
+    assert len(sleeps) == 8
+    assert coordinator.request_run.await_count == 1
+    wakeups.notify.assert_called_once_with("scan")
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_ignores_steady_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T15 (S-01 Hook C): an unmoving snapshot never requests, even past windows."""
+    resolver, coordinator, scheduler, wakeups, root = _watcher_harness(tmp_path)
+    _watcher_snapshot_script(monkeypatch, [{"a.flac": (100, 1, False)}])
+    clock = [1000.0]
+    _watcher_sleep_breaker(
+        monkeypatch, calls_before_cancel=3, clock_bump=400.0, clock=clock
+    )
+    await watch_library_filesystem(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        wakeups,
+        scheduler_getter=lambda: scheduler,
+        resolver_getter=lambda: resolver,
+        watcher_settings_getter=lambda: WatcherSettings(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        ),
+        clock_getter=lambda: clock[0],
+    )
+    coordinator.request_run.assert_not_awaited()
+    wakeups.notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_skips_snapshots_while_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T15 (S-01 Hook C): a disabled watcher takes no snapshots, then seeds clean."""
+    resolver, coordinator, scheduler, wakeups, root = _watcher_harness(tmp_path)
+    seen = _watcher_snapshot_script(monkeypatch, [{"a.flac": (100, 1, False)}])
+    clock = [1000.0]
+    _watcher_sleep_breaker(
+        monkeypatch, calls_before_cancel=3, clock_bump=400.0, clock=clock
+    )
+    calls = {"count": 0}
+
+    def _settings() -> WatcherSettings:
+        calls["count"] += 1
+        if calls["count"] <= 2:
+            return WatcherSettings(enabled=False)
+        return WatcherSettings(enabled=True)
+
+    await watch_library_filesystem(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        wakeups,
+        scheduler_getter=lambda: scheduler,
+        resolver_getter=lambda: resolver,
+        watcher_settings_getter=_settings,
+        clock_getter=lambda: clock[0],
+    )
+    assert calls["count"] == 3
+    assert seen == [root]
+    coordinator.request_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_skips_when_library_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T15 (S-01 Hook C): a disabled library takes no snapshots."""
+    root = tmp_path / "music"
+    root.mkdir()
+    resolver = _startup_resolver(root, enabled=False)
+    coordinator = AsyncMock()
+    scheduler = _quiet_scheduler()
+    wakeups = SimpleNamespace(notify=Mock(), revision=lambda _kind: 0)
+    seen = _watcher_snapshot_script(monkeypatch, [{"a.flac": (100, 1, False)}])
+    clock = [1000.0]
+    _watcher_sleep_breaker(
+        monkeypatch, calls_before_cancel=2, clock_bump=400.0, clock=clock
+    )
+    await watch_library_filesystem(
+        lambda: coordinator,
+        lambda: {"root-a": root},
+        wakeups,
+        scheduler_getter=lambda: scheduler,
+        resolver_getter=lambda: resolver,
+        watcher_settings_getter=lambda: WatcherSettings(enabled=True),
+        clock_getter=lambda: clock[0],
+    )
+    assert seen == []
+    coordinator.request_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_watcher_logs_and_continues_on_iteration_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T15 loop contract: Exception -> log + continue with exactly one sleep."""
+    resolver, coordinator, scheduler, wakeups, root = _watcher_harness(tmp_path)
+    _watcher_snapshot_script(
+        monkeypatch, [{"a.flac": (100, 1, False)}, {"a.flac": (200, 1, False)}]
+    )
+    clock = [1000.0]
+    sleeps = _watcher_sleep_breaker(
+        monkeypatch, calls_before_cancel=4, clock_bump=100.0, clock=clock
+    )
+    calls = {"count": 0}
+
+    def _flaky_settings() -> WatcherSettings:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("prefs fault")
+        return WatcherSettings(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        )
+
+    with caplog.at_level(
+        logging.ERROR, logger="services.native.library_filesystem_watcher"
+    ):
+        await watch_library_filesystem(
+            lambda: coordinator,
+            lambda: {"root-a": root},
+            wakeups,
+            scheduler_getter=lambda: scheduler,
+            resolver_getter=lambda: resolver,
+            watcher_settings_getter=_flaky_settings,
+            clock_getter=lambda: clock[0],
+        )
+    assert any(
+        record.exc_info is not None
+        and record.getMessage() == "Target filesystem watcher iteration failed"
+        for record in caplog.records
+    )
+    assert coordinator.request_run.await_count == 1
+    assert sleeps == [300.0, 300.0, 60.0, 300.0]
+
+
+def test_filesystem_snapshot_walks_nested_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T15 (S-01 Hook C): the snapshot reaches nested entries via scandir."""
+    from types import SimpleNamespace as _NS
+
+    from services.native import library_filesystem_watcher as watcher_module
+
+    root = tmp_path / "music"
+
+    def _entry(path: str, is_dir: bool) -> _NS:
+        return _NS(
+            path=path,
+            is_dir=lambda *, follow_symlinks=False: is_dir,
+            stat=lambda *, follow_symlinks=False: _NS(st_mtime_ns=7, st_size=3),
+        )
+
+    tree = {
+        str(root): [
+            _entry(str(root / "top.flac"), False),
+            _entry(str(root / "sub"), True),
+        ],
+        str(root / "sub"): [_entry(str(root / "sub" / "nested.flac"), False)],
+    }
+
+    class _FakeScandir:
+        def __init__(self, entries: list[_NS]) -> None:
+            self._entries = entries
+
+        def __enter__(self) -> list[_NS]:
+            return self._entries
+
+        def __exit__(self, *args: object) -> bool:
+            return False
+
+    def _fake_scandir(path: object) -> _FakeScandir:
+        return _FakeScandir(tree[str(path)])
+
+    monkeypatch.setattr(watcher_module, "os", SimpleNamespace(scandir=_fake_scandir))
+    snapshot = _snapshot_tree(root)
+    assert snapshot["top.flac"] == (7, 3, False)
+    assert snapshot["sub"] == (7, 3, True)
+    assert snapshot["sub/nested.flac"] == (7, 3, False)
+
+
+@pytest.mark.asyncio
+async def test_identification_worker_wait_failure_logs_and_sleeps_instead_of_dying(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T19 (R-03): a non-cancel exception from the ident sleep path must log
+    with exc_info, take exactly one error-retry sleep, and continue the loop
+    (mirrors the supervisor wait-failure test)."""
+    queue = AsyncMock()
+    queue.is_paused.return_value = False
+    queue.claim.return_value = None
+    service = AsyncMock()
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(
+            side_effect=[RuntimeError("wakeup store fault"), asyncio.CancelledError()]
+        ),
+    )
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    with caplog.at_level(
+        logging.ERROR, logger="services.native.target_application_runtime"
+    ):
+        await run_target_identification_worker(
+            lambda: queue,
+            lambda: service,
+            worker_id="test-worker",
+            work_wakeups=wakeups,
+        )
+
+    assert queue.recover.await_count == 2
+    assert sleeps == [RUNTIME_ERROR_RETRY_INTERVAL_SECONDS]
+    assert any(
+        record.exc_info is not None
+        and record.getMessage() == "Target identification worker wait failed"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_operation_worker_wait_failure_logs_and_sleeps_instead_of_dying(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T19 (R-03): a non-cancel exception from the operation sleep path must
+    log with exc_info, take exactly one error-retry sleep, and continue the
+    loop (mirrors the supervisor wait-failure test)."""
+    supervisor = AsyncMock()
+    supervisor.run_once.return_value = None
+    wakeups = SimpleNamespace(
+        revision=lambda _kind: 0,
+        wait=AsyncMock(
+            side_effect=[RuntimeError("wakeup store fault"), asyncio.CancelledError()]
+        ),
+    )
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    with caplog.at_level(
+        logging.ERROR, logger="services.native.target_application_runtime"
+    ):
+        await run_target_operation_worker(
+            lambda: supervisor,
+            worker_id="test-worker",
+            work_wakeups=wakeups,
+        )
+
+    assert supervisor.run_once.await_count == 2
+    assert sleeps == [RUNTIME_ERROR_RETRY_INTERVAL_SECONDS]
+    assert any(
+        record.exc_info is not None
+        and record.getMessage() == "Target operation worker wait failed"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_watchdog_isolates_a_throwing_starter_within_one_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T17 (R-01): starter #1 raising still checks #2-4 in the same sweep."""
+    registry = TaskRegistry()
+    monkeypatch.setattr(TaskRegistry, "get_instance", classmethod(lambda cls: registry))
+
+    async def run_forever() -> None:
+        await asyncio.Event().wait()
+
+    checked: list[str] = []
+
+    def failing_starter() -> asyncio.Task[None]:
+        checked.append("bad-worker")
+        raise RuntimeError("starter boom")
+
+    def ok_starter(name: str) -> asyncio.Task[None]:
+        def _start() -> asyncio.Task[None]:
+            checked.append(name)
+            task = asyncio.get_running_loop().create_task(run_forever())
+            registry.register(name, task)
+            return task
+
+        return _start
+
+    async def stop_after_first_iteration(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_first_iteration)
+    starters = {
+        "bad-worker": failing_starter,
+        "good-a": ok_starter("good-a"),
+        "good-b": ok_starter("good-b"),
+        "good-c": ok_starter("good-c"),
+    }
+    try:
+        with caplog.at_level(
+            logging.ERROR, logger="services.native.target_application_runtime"
+        ):
+            await run_target_worker_watchdog(starters)
+        # Every starter ran despite the first one raising, in dict order.
+        assert checked == ["bad-worker", "good-a", "good-b", "good-c"]
+        assert registry.is_running("good-a")
+        assert registry.is_running("good-b")
+        assert registry.is_running("good-c")
+        assert any(
+            record.exc_info is not None
+            and "bad-worker" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        for task in list(registry.get_all().values()):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_watchdog_all_starters_failing_sleeps_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T17 (R-01 edge): an all-failing sweep still takes exactly one sleep."""
+    registry = TaskRegistry()
+    monkeypatch.setattr(TaskRegistry, "get_instance", classmethod(lambda cls: registry))
+
+    def failing_starter() -> asyncio.Task[None]:
+        raise RuntimeError("starter boom")
+
+    sleeps: list[float] = []
+
+    async def record_then_stop(_seconds: float) -> None:
+        sleeps.append(_seconds)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", record_then_stop)
+    await run_target_worker_watchdog(
+        {"bad-a": failing_starter, "bad-b": failing_starter}
+    )
+
+    assert sleeps == [30.0]
+
+
+@pytest.mark.asyncio
+async def test_only_one_filesystem_watcher_can_be_registered() -> None:
+    """T15: the watcher starter refuses a double-start like the supervisor."""
+    registry = TaskRegistry.get_instance()
+    registry.reset()
+    coordinator = AsyncMock()
+    coordinator.run_once.return_value = None
+    wakeups = DurableWorkWakeups()
+    task = start_library_filesystem_watcher(lambda: coordinator, lambda: {}, wakeups)
+    assert registry.is_running(WATCHER_TASK_NAME)
+    with pytest.raises(RuntimeError):
+        start_library_filesystem_watcher(lambda: coordinator, lambda: {}, wakeups)
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+    assert task.done()
+    registry.reset()
+
+
+@pytest.mark.asyncio
+async def test_watcher_register_conflict_cancels_orphan_and_keeps_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R-05: a register conflict after task creation cancels the orphan
+    and leaves exactly one registered task.
+
+    Honesty note: a true threaded double-start cannot run in this suite
+    (asyncio.create_task requires a running loop in the calling thread), so
+    this covers the sequential path - the guard bypassed plus register
+    raising - which is the same register conflict the race would hit.
+    """
+    registry = TaskRegistry()
+    monkeypatch.setattr(TaskRegistry, "get_instance", classmethod(lambda cls: registry))
+
+    async def run_forever() -> None:
+        await asyncio.Event().wait()
+
+    original = asyncio.get_running_loop().create_task(run_forever())
+    registry.register(WATCHER_TASK_NAME, original)
+    # Slip past the is_running guard to reach the register conflict.
+    monkeypatch.setattr(registry, "is_running", lambda _name: False)
+
+    created: list[asyncio.Task[None]] = []
+    real_create_task = asyncio.create_task
+
+    def spy_create_task(coro, **kwargs):  # type: ignore[no-untyped-def]
+        task = real_create_task(coro, **kwargs)
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", spy_create_task)
+
+    coordinator = AsyncMock()
+    coordinator.run_once.return_value = None
+    try:
+        with pytest.raises(RuntimeError):
+            start_library_filesystem_watcher(
+                lambda: coordinator, lambda: {}, DurableWorkWakeups()
+            )
+        # Exactly one registered task: the original, never the orphan.
+        assert registry.get_all()[WATCHER_TASK_NAME] is original
+        assert len(created) == 1
+        orphan = created[0]
+        assert orphan is not original
+        # The orphan ends cancelled (awaiting it suppresses CancelledError).
+        # wait_for bounds the wait so a never-cancelled orphan fails fast
+        # instead of running the watcher loop until the suite times out.
+        with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(orphan, timeout=5)
+        assert orphan.cancelled()
+        assert registry.get_all()[WATCHER_TASK_NAME] is original
+        assert original.cancelled() is False
+    finally:
+        original.cancel()
+        with suppress(asyncio.CancelledError):
+            await original
+        registry.reset()
+
+
+def _operation_store(tmp_path: Path) -> NativeLibraryStore:
+    path = tmp_path / "library.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
+        connection.executemany(
+            "INSERT INTO auth_users(id) VALUES (?)", [("admin",), ("worker",)]
+        )
+    return NativeLibraryStore(path, threading.Lock())
+
+
+@pytest.mark.asyncio
+async def test_operation_cancel_releases_claim_for_immediate_reclaim(
+    tmp_path: Path,
+) -> None:
+    """R-04 (3.4b/T20b): cancelling mid-operation-job releases the claim
+    exactly once - the next claim succeeds at once (no 60s lease wait, no
+    recover())."""
+    store = _operation_store(tmp_path)
+    await store.create_operation_with_work(
+        OperationJob(id="op-cancel-1", kind="bulk_review_apply", created_at=1.0),
+        [],
+    )
+    operations = AsyncMock()
+    operations.run_bulk_claimed.side_effect = asyncio.CancelledError()
+    supervisor = LibraryOperationSupervisor(
+        store, operations, AsyncMock(), AsyncMock()
+    )
+    release_calls = {"n": 0}
+    original = store.release_operation_claim
+
+    async def spy(
+        job_id: str, *, worker_id: str, expected_job_revision: int, now: float
+    ) -> int:
+        release_calls["n"] += 1
+        return await original(
+            job_id,
+            worker_id=worker_id,
+            expected_job_revision=expected_job_revision,
+            now=now,
+        )
+
+    store.release_operation_claim = spy  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await supervisor.run_once("worker-1", now=100.0)
+
+    assert release_calls["n"] == 1
+    row = await store.get_operation_job("op-cancel-1")
+    assert row is not None
+    assert row["state"] == "queued"
+    assert row["lease_owner"] is None
+    assert row["lease_expires_at"] is None
+    assert row["next_attempt_at"] is None
+    # Immediate reclaim: no wait, no recover(), no 60s lease path.
+    reclaimed = await store.claim_operation_job(
+        "worker-2", now=100.0, lease_seconds=60.0, kind="bulk_review_apply"
+    )
+    assert reclaimed is not None
+    assert reclaimed["id"] == "op-cancel-1"
+
+
+@pytest.mark.asyncio
+async def test_operation_cancel_without_claim_is_noop(tmp_path: Path) -> None:
+    """R-04 (3.4b/T20b): cancel before any claim (job None) and
+    notification-only iterations hold no claim - nothing to release."""
+    store = _operation_store(tmp_path)
+    operations = AsyncMock()
+    supervisor = LibraryOperationSupervisor(
+        store, operations, AsyncMock(), AsyncMock()
+    )
+    assert await supervisor.run_once("worker-1", now=100.0) is None
+
+    notifications = AsyncMock()
+    notifications.run_once.return_value = "op-notified"
+    operations.get.return_value = {"id": "op-notified"}
+    notified = LibraryOperationSupervisor(
+        store, operations, AsyncMock(), AsyncMock(), notifications=notifications
+    )
+    assert await notified.run_once("worker-1", now=100.0) == {"id": "op-notified"}
+    operations.get.assert_awaited_once_with("op-notified")
+
+
+@pytest.mark.asyncio
+async def test_operation_cancel_after_commit_swallows_stale_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-04 (3.4b/T20b): StaleRevisionError from the release means the finish
+    commit (or a control transition) already landed → swallowed (commit
+    wins), CancelledError still propagates."""
+    store = _operation_store(tmp_path)
+    await store.create_operation_with_work(
+        OperationJob(id="op-cancel-2", kind="bulk_review_apply", created_at=1.0),
+        [],
+    )
+    operations = AsyncMock()
+    operations.run_bulk_claimed.side_effect = asyncio.CancelledError()
+    supervisor = LibraryOperationSupervisor(
+        store, operations, AsyncMock(), AsyncMock()
+    )
+
+    async def _stale_release(
+        self: NativeLibraryStore,
+        job_id: str,
+        *,
+        worker_id: str,
+        expected_job_revision: int,
+        now: float,
+    ) -> int:
+        raise StaleRevisionError(
+            "The operation lease changed before its claim could be released."
+        )
+
+    monkeypatch.setattr(NativeLibraryStore, "release_operation_claim", _stale_release)
+    with pytest.raises(asyncio.CancelledError):
+        await supervisor.run_once("worker-1", now=100.0)

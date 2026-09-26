@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 
 from collections.abc import Awaitable, Callable
+from infrastructure.observability.provider_counters import ProviderWorkload, provider_workload_scope
 
 import msgspec.json
 
@@ -50,7 +52,7 @@ from models.library_work import OperationJob, RepairFinding
 from repositories.edition_policy import (
     AUTO_ACCEPT_EVIDENCE_REASONS,
     auto_accept_decision,
-    edition_date_key,
+    evidence_key,
 )
 from repositories.protocols.identification import IdentificationProviderProtocol
 from repositories.protocols.musicbrainz_management import (
@@ -64,6 +66,7 @@ from services.native.album_evidence_engine import (
     _fold,
 )
 from services.native.album_identification_service import (
+    ScopedCacheInvalidator,
     _candidate_key,
     _to_grouping_track,
 )
@@ -83,7 +86,10 @@ from services.native.wal_checkpoint_service import WalCheckpointService
 
 
 MANAGEMENT_READINESS_PURPOSE = "management_readiness"
-MANAGEMENT_MAPPING_VERSION = "management-edition-readiness-v4"
+# v5: the engine's proof-gated artist-subset escape changed mapping outcomes
+# (collab-credit albums with full track MBIDs now map ready instead of
+# needs_review), so pre-v5 preparation snapshots must refresh.
+MANAGEMENT_MAPPING_VERSION = "management-edition-readiness-v5"
 
 
 # MusicBrainz breaker timeout is 60 s; this 2x window (matching the artist
@@ -96,6 +102,9 @@ class _ProviderUnavailable(Exception):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
 
+logger = logging.getLogger(__name__)
+
+
 class IdentityRepairService:
     def __init__(
         self,
@@ -106,6 +115,7 @@ class IdentityRepairService:
         provider_available: Callable[[], bool] | None = None,
         wal_checkpoint: WalCheckpointService | None = None,
         edition_opt_in: Callable[[str], bool] | None = None,
+        invalidate: ScopedCacheInvalidator | None = None,
     ) -> None:
         self._store = store
         self._provider = provider
@@ -113,6 +123,7 @@ class IdentityRepairService:
         self._canonical_provider = canonical_provider
         self._provider_available = provider_available
         self._wal_checkpoint = wal_checkpoint
+        self._invalidate = invalidate
         # D-EDITION-AUTO S-3: resolves the Library Management profile-level
         # opt-in (with per-root override) for one root id. None keeps the
         # pre-auto behavior byte-for-byte (opt-in OFF everywhere).
@@ -246,6 +257,7 @@ class IdentityRepairService:
             raise ResourceNotFoundError("Identity operation not found.")
         return await self._operations.get(job_id)
 
+    @provider_workload_scope(ProviderWorkload.IDENTITY)
     async def run_claimed_audit(
         self,
         job: dict,
@@ -847,17 +859,15 @@ class IdentityRepairService:
                     ),
                     "competing_count": competing_count,
                 }
-                # F-EDITION-01: evidence score ranks first; Official, parsed
-                # mixed-precision date (F-EDITION-02 key), XW, and release
-                # MBID follow as deterministic tie-breakers.
+                # F-EDITION-01: signed evidence-time order via evidence_key
+                # (score -> Official -> parsed mixed-precision date
+                # (F-EDITION-02 key) -> XW -> release MBID).
                 date_value = summary["date"]
-                key = (
-                    -float(candidate_evidence.score),
-                    0 if release is not None and release.status == "Official" else 1,
-                    edition_date_key(
-                        date_value if isinstance(date_value, str) else None
-                    ),
-                    0 if release is not None and release.country == "XW" else 1,
+                key = evidence_key(
+                    float(candidate_evidence.score),
+                    release.status if release is not None else None,
+                    date_value if isinstance(date_value, str) else None,
+                    release.country if release is not None else None,
                     str(candidate_evidence.release_mbid),
                 )
                 ranked.append((key, row, candidate_evidence, summary))
@@ -1193,6 +1203,7 @@ class IdentityRepairService:
         )
         return self._operations._response(row)
 
+    @provider_workload_scope(ProviderWorkload.IDENTITY)
     async def run_claimed_apply(
         self,
         job: dict,
@@ -1500,11 +1511,12 @@ class IdentityRepairService:
                     )
                     if (
                         not track.recording_mbid
+                        and not track.fingerprint_recording_mbid
                         and cached is not None
                         and cached.state == "matched"
                         and cached.recording_mbid
                     ):
-                        track.recording_mbid = cached.recording_mbid
+                        track.fingerprint_recording_mbid = cached.recording_mbid
                         fingerprint_filled = True
                 evaluated = self._evidence.evaluate_candidate(
                     grouping_tracks, candidate
@@ -1645,6 +1657,27 @@ class IdentityRepairService:
             actor_user_id=actor_user_id,
             now=time.time(),
         )
+        if self._invalidate is not None:
+            try:
+                # Same domain set as identification: undo restores a prior
+                # identity, which search/home/discover may have cached too.
+                await self._invalidate(
+                    {
+                        "library",
+                        "artist",
+                        "search",
+                        "home",
+                        "discover",
+                        "compatibility",
+                        "artwork",
+                        "review",
+                    },
+                    [album_id],
+                )
+            except Exception:  # noqa: BLE001 - undo already committed; never fail it
+                logger.warning(
+                    "Undo invalidation failed for album %s", album_id[:8], exc_info=True
+                )
         return AutomaticEditionUndoResponse(
             local_album_id=album_id,
             outcome=result["outcome"],

@@ -194,6 +194,16 @@ class TargetLibraryRepository:
             if row.get("release_group_mbid")
         }
 
+    async def existing_library_albums(self, identifiers: list[str]) -> set[str]:
+        """Candidate-scoped ``get_all_album_mbids`` (E3).
+
+        Shares the ``LibraryDB.existing_library_albums`` candidate contract
+        so duck-typed ``library_db`` consumers (``DiscoveryBatchService``)
+        work against either catalog; membership here is target-catalog
+        ownership, there the materialised album rows.
+        """
+        return await self.existing_album_mbids(identifiers)
+
     async def existing_artist_mbids(self, identifiers: list[str]) -> set[str]:
         return await self._store.target_existing_provider_artist_ids(identifiers)
 

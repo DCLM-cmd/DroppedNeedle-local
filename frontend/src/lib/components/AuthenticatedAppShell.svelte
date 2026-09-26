@@ -67,7 +67,8 @@
 		UserRound,
 		Inbox,
 		ListMusic,
-		ArrowUpCircle,
+		ListChecks,
+		CircleArrowUp,
 		LogOut,
 		ShieldCheck,
 		Heart,
@@ -79,6 +80,7 @@
 	import ConcertsNavBadge from '$lib/components/ConcertsNavBadge.svelte';
 	import { createFollowingEvents } from '$lib/queries/following/FollowingEvents';
 	import { createLibraryActivityEvents } from '$lib/queries/library/LibraryActivityEvents';
+	import { muxEventStream } from '$lib/queries/events/MuxEventStream';
 	import LibraryActivityStrip from '$lib/components/library/LibraryActivityStrip.svelte';
 	import DownloadsNavBadge from '$lib/components/DownloadsNavBadge.svelte';
 	import PendingApprovalNavBadge from '$lib/components/PendingApprovalNavBadge.svelte';
@@ -262,12 +264,20 @@
 			// so it no longer waits on integration status
 			nowPlayingStore.start();
 			nowPlayingReporter.start();
+			// The tab's single multiplexed stream; connect last so the gated
+			// consumer starts (library activity's admin direct-refresh gate)
+			// see a disconnected mux and refresh exactly once via the first
+			// open instead of doubling with a direct refresh. syncStatus
+			// connects deferred after this on purpose - it has no gate and its
+			// seed/generation guard covers either order.
+			muxEventStream.connect();
 		});
 		return () => {
 			followingEvents.stop();
 			libraryActivityEvents.stop();
 			nowPlayingStore.stop();
 			nowPlayingReporter.stop();
+			muxEventStream.disconnect();
 		};
 	});
 
@@ -279,6 +289,7 @@
 			document.removeEventListener('keydown', handleGlobalKeydown);
 		}
 		syncStatus.disconnect();
+		muxEventStream.disconnect();
 		resetPlaylistModal();
 		discographyDownloadStore.close();
 		batchDownloadStore.clear();
@@ -367,7 +378,11 @@
 	}
 
 	function isLibraryNavActive(): boolean {
-		return isNavActive('/library') && !isNavActive('/library/management');
+		return (
+			isNavActive('/library') &&
+			!isNavActive('/library/management') &&
+			!isNavActive('/library/review')
+		);
 	}
 	function openMoreNav(): void {
 		(document.getElementById('more_nav_sheet') as HTMLDialogElement | null)?.showModal();
@@ -385,7 +400,8 @@
 			isNavActive('/following') ||
 			isNavActive('/playlists') ||
 			isNavActive('/requests') ||
-			isNavActive('/library/management')
+			isNavActive('/library/management') ||
+			isNavActive('/library/review')
 		);
 	}
 
@@ -642,6 +658,19 @@
 							<span class="is-drawer-close:hidden">Approvals</span>
 						</a>
 					</li>
+					<li>
+						<a
+							href={withBasePath('/library/review')}
+							class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
+							class:menu-active={isNavActive('/library/review')}
+							aria-current={isNavActive('/library/review') ? 'page' : undefined}
+							aria-label="Review Queue"
+							data-tip="Review Queue"
+						>
+							<ListChecks class="h-6 w-6" />
+							<span class="is-drawer-close:hidden">Review Queue</span>
+						</a>
+					</li>
 				{/if}
 			</ul>
 			<div class="w-full p-2 flex flex-col gap-1" class:pb-24={playerStore.isPlayerVisible}>
@@ -662,7 +691,7 @@
 								<span
 									class="absolute -top-0.5 -right-0.5 flex h-4.5 w-4.5 items-center justify-center rounded-full bg-accent text-accent-content shadow-sm shadow-accent/30"
 								>
-									<ArrowUpCircle class="h-3 w-3" />
+									<CircleArrowUp class="h-3 w-3" />
 								</span>
 							{/if}
 						</a>
@@ -748,7 +777,7 @@
 			<span>Settings</span>
 			{#if versionUpdateAvailable}
 				<span class="droppedneedle-bottom-nav__badge" aria-label="Update available">
-					<ArrowUpCircle class="h-3 w-3" />
+					<CircleArrowUp class="h-3 w-3" />
 				</span>
 			{/if}
 		</a>
@@ -853,6 +882,18 @@
 							<PendingApprovalNavBadge />
 						</span>
 						Approvals
+					</a>
+				</li>
+				<li>
+					<a
+						href={withBasePath('/library/review')}
+						class:menu-active={isNavActive('/library/review')}
+						aria-current={isNavActive('/library/review') ? 'page' : undefined}
+						aria-label="Review Queue"
+						onclick={closeMoreNav}
+					>
+						<ListChecks class="h-6 w-6" />
+						Review Queue
 					</a>
 				</li>
 			{/if}

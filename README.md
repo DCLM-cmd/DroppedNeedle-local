@@ -55,7 +55,7 @@ Search the full MusicBrainz catalogue, request the album or the single track you
 
 ## Quick start
 
-You need Docker, a music library, and a download client. The example below uses slskd; [SABnzbd](https://sabnzbd.org/) with Newznab indexers works too. DroppedNeedle runs neither for you. See [slskd](#slskd) and [Usenet](#usenet).
+You need Docker, a music library, and a download client. The example below uses slskd; [SABnzbd](https://sabnzbd.org/) with Newznab indexers or Prowlarr works too. DroppedNeedle runs neither for you. See [slskd](#slskd) and [Usenet](#usenet).
 
 ### 1. Save this compose file
 
@@ -161,7 +161,7 @@ The engine searches your client, ranks candidates, and auto-accepts a confident 
 
 | Direction | What plugs in |
 |-|-|
-| In | Your slskd, your SABnzbd with your Newznab indexers, Internet Archive free licences, and drop imports. Identity from MusicBrainz and AcoustID, artwork from the Cover Art Archive and AudioDB |
+| In | Your slskd, your SABnzbd with your Newznab indexers or Prowlarr, Internet Archive free licences, and drop imports. Identity from MusicBrainz and AcoustID, artwork from the Cover Art Archive and AudioDB |
 | Out | Jellyfin, Navidrome, Plex, local files, and YouTube previews, plus OpenSubsonic and Jellyfin APIs so apps like Symfonium, Finamp, Feishin, Amperfy, Jellify, and Manet can play from you |
 | Around | ListenBrainz and Last.fm scrobbling, Spotify playlist import, Ticketmaster and Skiddle gigs, Deezer and iTunes preview clips, and purchase links that put Bandcamp first |
 
@@ -184,6 +184,8 @@ The downloads path is where most installs go wrong. Three rules:
 1. Expose slskd's completed-downloads directory to DroppedNeedle read-write under one shared parent mount (e.g. library at `/data/music`, completions at `/data/slskd/complete`).
 2. Point `SLSKD_DOWNLOADS_PATH` at that exact directory, not its parent.
 3. Skip nested binds under `/data`. Each one is a new mount boundary, which drops imports to the slower copy fallback.
+
+Keep slskd's incomplete directory on the same mount as its downloads directory: slskd can report a transfer Completed before a cross-mount move between the two finishes, so a split mount risks verifying half-copied files.
 
 <details>
 <summary>Minimal slskd.yml essentials</summary>
@@ -211,11 +213,11 @@ web:
 
 ### Usenet
 
-The second source is Usenet through SABnzbd with Newznab-compatible indexers (NZBGeek, NZBPlanet, NZB.su, Slug, and others). The engine searches your indexers, enqueues NZBs in your SABnzbd, and imports finished files through the same scoring, verification, and quarantine pipeline as slskd.
+The second source is Usenet through SABnzbd. For searching, either add Newznab-compatible indexers one by one (NZBGeek, NZBPlanet, NZB.su, Slug, and others) or point at a Prowlarr that already has them. The engine searches your chosen side, enqueues NZBs in your SABnzbd, and imports finished files through the same scoring, verification, and quarantine pipeline as slskd.
 
 1. Expose SABnzbd's completed-downloads directory read-write, ideally under the same shared parent mount as the library so the [mount rules](#slskd) hold. In SABnzbd, point its Downloads folder setting at the matching path (e.g. `/data/sabnzbd/complete`).
 2. Under Settings > Download Client, enable Usenet and enter your SABnzbd URL and API key.
-3. Add each indexer URL plus API key under Settings > Indexers, then Test and Save each one.
+3. Under Settings > Indexers / Prowlarr, pick one search backend: add each indexer's URL plus API key, or enter your Prowlarr URL plus API key. Then Test and Save.
 
 slskd and Usenet can run side by side; the source priority control picks who goes first.
 
@@ -231,8 +233,12 @@ Everything user-editable lives in the web UI and lands in `config/config.json`. 
 | `PGID` | `1000` | File group inside the container |
 | `UMASK` | `027` | Creation mask for new files; `002` for trusted group-writable media |
 | `PORT` | `8688` | Port the app listens on |
+| `BIND_HOST` | `auto` | `auto` listens on IPv4 and IPv6, dropping to IPv4 alone where IPv6 is off. Set `0.0.0.0`, `::`, or one interface IP to pin it |
+| `TRUSTED_PROXY_IPS` | `127.0.0.1,::1` | IPs/CIDRs whose `X-Forwarded-*` headers are trusted; point it at your reverse proxy, listing every address family it arrives on |
 | `TZ` | `Etc/UTC` | Container timezone |
 | `SLSKD_DOWNLOADS_PATH` | `/data/downloads/slskd` | Exact in-container path to slskd completions (the compose example uses `/data/slskd/complete`) |
+
+The app answers on IPv4 and IPv6, but Docker still has to publish the port on both. `docker port droppedneedle` should list `0.0.0.0:8688` and `[::]:8688`; if only the first appears, turn on IPv6 for the daemon (`"ipv6"` and `"ip6tables"` in `/etc/docker/daemon.json`). Pinning `BIND_HOST` to one interface IP answers only there: the upgrade readiness probe follows the pin automatically, but the container `HEALTHCHECK` still uses localhost, so keep a wildcard or loopback value unless you check that address yourself.
 
 <details>
 <summary>Permissions and NAS notes</summary>
@@ -321,7 +327,7 @@ Any provider with the authorization code flow works (Authelia, Keycloak, Authent
 
 Interactive API docs (Swagger UI) live at `/api/v1/docs` on your instance. Every `/api/v1/*` route takes a Bearer token or the session cookie, everything under `/api/v1/settings/*` also needs Admin, and `/health` stays public for the container check.
 
-Plugins are experimental (`api_version = 0`): Python running in-process with your server's full privileges and no sandbox. Install from a GitHub URL or a copied folder, read the code before you enable it, and expect nothing bundled. The full contract is [PLUGINS.md](PLUGINS.md).
+Plugins are stable (`api_version = 1`, v0 still loads): Python running in-process with your server's full privileges and no sandbox. Install from a GitHub URL or a copied folder, read the code before you enable it. Nothing is bundled. Contract: [PLUGINS.md](PLUGINS.md). Walkthrough: [docs/PLUGIN-CREATION.md](docs/PLUGIN-CREATION.md).
 
 Bug reports and feature requests go to [Issues](https://github.com/DroppedNeedle/DroppedNeedle/issues), code via PRs. Dev setup, tests, and style rules are in [CONTRIBUTING.md](CONTRIBUTING.md).
 

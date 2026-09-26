@@ -21,7 +21,7 @@
 		if (s === 'musicbrainz') return 'MusicBrainz';
 		if (s === 'audiodb') return 'TheAudioDB';
 		if (s === 'wikidata') return 'Wikipedia';
-		if (s === 'acquisition_cleanup') return 'Source cleanup';
+		if (s === 'acquisition_cleanup') return 'Download cleanup';
 		return s.charAt(0).toUpperCase() + s.slice(1);
 	}
 
@@ -54,8 +54,9 @@
 		const names = [...new Set(eligible.map((d) => serviceLabel(d.service)))];
 		const cleanup = eligible.find((d) => d.service === 'acquisition_cleanup');
 		if (cleanup && eligible.length === 1) {
+			// the backend message already carries the retry note - show it verbatim
 			toastStore.show({
-				message: `${cleanup.message} Checking again automatically.`,
+				message: cleanup.message,
 				type: 'info'
 			});
 			return;

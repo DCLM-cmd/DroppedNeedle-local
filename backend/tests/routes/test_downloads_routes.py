@@ -914,3 +914,41 @@ def test_stream_all_admin_sees_all_users_events():
         return chunk
 
     assert "t-other" in asyncio.run(_run())
+
+
+def test_discard_held_verdict_returns_task_level_result():
+    service = AsyncMock()
+    service.discard_held_for_task.return_value = 15
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/verdict/t1/discard"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "discarded", "files": 15}
+    service.discard_held_for_task.assert_awaited_once_with("t1", "u1", "user")
+
+
+def test_discard_held_verdict_without_held_is_404():
+    service = AsyncMock()
+    service.discard_held_for_task.side_effect = ResourceNotFoundError(
+        "No held tracks found for this download"
+    )
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/verdict/t1/discard"
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_discard_held_verdict_non_owner_is_403():
+    service = AsyncMock()
+    service.discard_held_for_task.side_effect = PermissionDeniedError("nope")
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/verdict/t1/discard"
+    )
+
+    assert response.status_code == 403

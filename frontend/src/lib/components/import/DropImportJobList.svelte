@@ -1,9 +1,9 @@
 <script lang="ts">
 	import {
-		CheckCircle2,
+		CircleCheckBig,
 		CircleAlert,
-		CircleHelp,
-		Loader2,
+		CircleQuestionMark,
+		LoaderCircle,
 		SkipForward,
 		Trash2
 	} from 'lucide-svelte';
@@ -36,6 +36,16 @@
 		failed: { label: 'Failed', cls: 'badge-error' },
 		discarded: { label: 'Discarded', cls: 'badge-ghost' }
 	};
+
+	// F-02 retention: staged review items are hard-deleted 90 days after upload
+	// (backend DropImportService sweep), so surface the countdown from the job
+	// created_at. Mirrors the backend _REVIEW_RETENTION_DAYS - no new API.
+	const REVIEW_RETENTION_DAYS = 90;
+	const SECONDS_PER_DAY = 86400;
+	function reviewDaysLeft(createdAtSeconds: number): number {
+		const elapsedDays = (Date.now() / 1000 - createdAtSeconds) / SECONDS_PER_DAY;
+		return Math.max(0, Math.ceil(REVIEW_RETENTION_DAYS - elapsedDays));
+	}
 </script>
 
 {#if jobsQuery.isLoading}
@@ -65,12 +75,19 @@
 					</div>
 					{#if job.status === 'processing'}
 						<span class="badge badge-info gap-1">
-							<Loader2 class="h-3 w-3 animate-spin" aria-hidden="true" /> Working…
+							<LoaderCircle class="h-3 w-3 animate-spin" aria-hidden="true" /> Working…
 						</span>
 					{:else if job.status === 'failed'}
 						<span class="badge badge-error" title={job.error ?? undefined}>Failed</span>
 					{/if}
 				</div>
+				{#if job.items.some((item) => item.status === 'needs_review')}
+					{@const daysLeft = reviewDaysLeft(job.created_at)}
+					<p class="mt-1 text-xs text-base-content/50">
+						Unmatched items are auto-removed 90 days after upload ({daysLeft}
+						{daysLeft === 1 ? 'day' : 'days'} left).
+					</p>
+				{/if}
 
 				{#if job.error}
 					<!-- a completed job carries notes here (a skipped corrupt archive),
@@ -90,9 +107,9 @@
 								<div class="min-w-0 flex-1">
 									<div class="flex min-w-0 items-center gap-2">
 										{#if item.status === 'imported'}
-											<CheckCircle2 class="h-4 w-4 shrink-0 text-success" aria-hidden="true" />
+											<CircleCheckBig class="h-4 w-4 shrink-0 text-success" aria-hidden="true" />
 										{:else if item.status === 'needs_review'}
-											<CircleHelp class="h-4 w-4 shrink-0 text-warning" aria-hidden="true" />
+											<CircleQuestionMark class="h-4 w-4 shrink-0 text-warning" aria-hidden="true" />
 										{:else if item.status === 'failed'}
 											<CircleAlert class="h-4 w-4 shrink-0 text-error" aria-hidden="true" />
 										{:else if item.status === 'skipped' || item.status === 'discarded'}
@@ -101,7 +118,7 @@
 												aria-hidden="true"
 											/>
 										{:else}
-											<Loader2 class="h-4 w-4 shrink-0 animate-spin text-info" aria-hidden="true" />
+											<LoaderCircle class="h-4 w-4 shrink-0 animate-spin text-info" aria-hidden="true" />
 										{/if}
 										<p class="truncate text-sm font-medium">
 											{#if item.album_title}

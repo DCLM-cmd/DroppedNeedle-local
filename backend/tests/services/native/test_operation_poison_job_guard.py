@@ -102,16 +102,12 @@ async def test_cancellation_is_never_treated_as_a_job_failure() -> None:
 
 @pytest.fixture
 def store(tmp_path):
-    from infrastructure.persistence._database import close_pooled_connections
-
     path = tmp_path / "library.db"
     # library_operation_jobs has an FK to auth_users, which a different store owns.
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE auth_users (id TEXT PRIMARY KEY)")
         connection.execute("INSERT INTO auth_users VALUES ('user-1')")
-    made = NativeLibraryStore(path, threading.Lock())
-    yield made
-    close_pooled_connections()
+    return NativeLibraryStore(path, threading.Lock())
 
 
 async def _queue_job(store: NativeLibraryStore) -> str:

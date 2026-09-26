@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 import msgspec
 
 from api.compat.subsonic.ids import encode
-from services.compat.view_models import ViewAlbum, ViewArtist, ViewGenre, ViewTrack
+from services.compat.view_models import (
+    ViewAlbum,
+    ViewArtist,
+    ViewGenre,
+    ViewTrack,
+    release_types_for_album,
+)
 
 _MIME = {
     "flac": "audio/flac",
@@ -448,7 +454,9 @@ def to_album_id3(v: ViewAlbum) -> SAlbumID3:
         if v.artist_mbid
         else None,
         displayArtist=v.artist_name,
-        releaseTypes=["Compilation"] if v.is_compilation else None,
+        releaseTypes=v.release_types
+        if v.release_types is not None
+        else release_types_for_album(None, v.is_compilation),
         sortName=v.sort_name or v.title,
         originalReleaseDate=_item_date(v.original_release_date),
         discTitles=[SDiscTitle(disc=disc, title=title) for disc, title in v.disc_titles]

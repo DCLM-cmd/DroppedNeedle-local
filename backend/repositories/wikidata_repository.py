@@ -14,6 +14,11 @@ from infrastructure.resilience.retry import with_retry, CircuitBreaker
 from infrastructure.degradation import try_get_degradation_context
 from infrastructure.integration_result import IntegrationResult
 from infrastructure.service_health import report_breaker_health
+from infrastructure.observability.optional_work import (
+    OptionalWorkDeferred,
+    check_optional_dispatch,
+    reserve_optional_operation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +138,17 @@ class WikidataRepository:
         self._client = http_client
         self._cache = cache
 
+    async def _request(self, url: str) -> httpx.Response:
+        reservation = reserve_optional_operation()
+        try:
+            check_optional_dispatch()
+            if reservation is not None:
+                reservation.mark_dispatched()
+            return await self._client.get(url)
+        finally:
+            if reservation is not None:
+                reservation.refund()
+
     @staticmethod
     def _extract_wikidata_id(url: str) -> str | None:
         match = re.search(r"/wiki/(Q\d+)", url)
@@ -157,7 +173,7 @@ class WikidataRepository:
             api_url = (
                 f"https://www.wikidata.org/wiki/Special:EntityData/{wikidata_id}.json"
             )
-            response = await self._client.get(api_url)
+            response = await self._request(api_url)
 
             if response.status_code != 200:
                 return None
@@ -169,6 +185,8 @@ class WikidataRepository:
             wiki_data = entity.sitelinks.get(f"{lang}wiki")
             return wiki_data.title if wiki_data else None
 
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to get Wikipedia title for {wikidata_id}: {e}")
             _record_degradation(f"Failed to get Wikipedia title for {wikidata_id}: {e}")
@@ -191,7 +209,7 @@ class WikidataRepository:
                 f"&prop=extracts&exintro=1&explaintext=1&format=json"
             )
 
-            response = await self._client.get(api_url)
+            response = await self._request(api_url)
             if response.status_code != 200:
                 return None
 
@@ -207,6 +225,8 @@ class WikidataRepository:
 
             return None
 
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to fetch Wikipedia extract: {e}")
             _record_degradation(f"Failed to fetch Wikipedia extract: {e}")
@@ -260,6 +280,8 @@ class WikidataRepository:
             # absence-None and nothing is written.
             return None
 
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to get Wikipedia extract from {wikipedia_url}: {e}")
             _record_degradation(f"Failed to get Wikipedia extract: {e}")
@@ -290,7 +312,7 @@ class WikidataRepository:
                 f"https://www.wikidata.org/w/api.php"
                 f"?action=wbgetclaims&entity={wikidata_id}&property=P18&format=json"
             )
-            response = await self._client.get(api_url)
+            response = await self._request(api_url)
 
             if response.status_code != 200:
                 return None
@@ -315,7 +337,7 @@ class WikidataRepository:
                 f"&prop=imageinfo&iiprop=url&format=json"
             )
 
-            response = await self._client.get(commons_url)
+            response = await self._request(commons_url)
             if response.status_code != 200:
                 return None
 
@@ -332,6 +354,8 @@ class WikidataRepository:
 
             return await self._negative_image(cache_key)
 
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to get image for Wikidata {wikidata_id}: {e}")
             _record_degradation(f"Failed to get Wikidata artist image: {e}")

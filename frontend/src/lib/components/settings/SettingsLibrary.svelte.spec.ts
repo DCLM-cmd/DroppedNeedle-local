@@ -51,7 +51,8 @@ const h = vi.hoisted(() => ({
 	isAdmin: true
 }));
 
-vi.mock('$lib/stores/authStore.svelte', () => ({
+vi.mock('$lib/stores/authStore.svelte', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/stores/authStore.svelte')>()),
 	authStore: {
 		get isAdmin() {
 			return h.isAdmin;
@@ -174,7 +175,7 @@ beforeEach(() => {
 describe('SettingsLibrary target policy UI', () => {
 	it('keeps Library Management hidden from non-administrators', async () => {
 		h.isAdmin = false;
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await expect.element(page.getByText('Scanning & identification')).toBeVisible();
 		await expect
 			.element(page.getByRole('link', { name: /Open Organize files settings/ }))
@@ -182,7 +183,7 @@ describe('SettingsLibrary target policy UI', () => {
 	});
 
 	it('sends administrators to the dedicated Library Management configuration', async () => {
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await expect
 			.element(page.getByRole('link', { name: /Open Organize files settings/ }))
 			.toHaveAttribute('href', '/library/management?tab=automation');
@@ -190,7 +191,7 @@ describe('SettingsLibrary target policy UI', () => {
 	});
 
 	it('shows root inheritance policy, counts, path, and unavailable state', async () => {
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await expect.element(page.getByText('Scanning & identification')).toBeVisible();
 		await expect
 			.element(
@@ -211,7 +212,7 @@ describe('SettingsLibrary target policy UI', () => {
 			.toBeVisible();
 	});
 	it('documents the legacy initial bucket and keeps its preview sample-based', async () => {
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await page.getByRole('textbox', { name: 'Naming template' }).fill('{initial}/{albumartist}');
 		await expect.element(page.getByText('R/Radiohead', { exact: true })).toBeVisible();
 
@@ -228,7 +229,7 @@ describe('SettingsLibrary target policy UI', () => {
 	});
 
 	it('previews consequences, saves without starting work, and leaves reconciliation explicit', async () => {
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await page.getByRole('combobox').first().selectOptions('excluded');
 		const opener = page.getByRole('button', { name: 'Preview and save settings' });
 		await opener.click();
@@ -262,7 +263,7 @@ describe('SettingsLibrary target policy UI', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await page.getByRole('button', { name: 'Apply changes...' }).click();
 		expect(h.applyPreview).toHaveBeenCalledWith({
 			scope_ids: ['root-1'],
@@ -280,7 +281,7 @@ describe('SettingsLibrary target policy UI', () => {
 	});
 
 	it('sends the master switch state with the saved settings', async () => {
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await page.getByRole('checkbox', { name: 'Local library enabled' }).click();
 		await page.getByRole('button', { name: 'Preview and save settings' }).click();
 		expect(h.impact).toHaveBeenCalledWith(
@@ -299,7 +300,7 @@ describe('SettingsLibrary target policy UI', () => {
 	it('keeps a stale preview from saving or starting work', async () => {
 		h.impactResult = { ...h.impactResult, stale: true };
 		h.impact.mockResolvedValue(h.impactResult);
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await page.getByRole('button', { name: 'Preview and save settings' }).click();
 		expect(h.save).not.toHaveBeenCalled();
 		expect(h.requestRun).not.toHaveBeenCalled();
@@ -310,7 +311,7 @@ describe('SettingsLibrary target policy UI', () => {
 
 	it('keeps saving disabled until the settings have loaded and seeded', async () => {
 		h.settings = { data: undefined, isLoading: false, isError: false };
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await expect
 			.element(page.getByRole('button', { name: 'Preview and save settings' }))
 			.toBeDisabled();
@@ -334,7 +335,7 @@ describe('SettingsLibrary target policy UI', () => {
 				restorable_roots: [{ root_id: 'root-old', path: '/music', indexed_file_count: 2 }]
 			}
 		};
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await expect.element(page.getByText(/Library roots were removed/)).toBeVisible();
 		await page.getByRole('button', { name: 'Restore roots...' }).click();
 		await expect
@@ -358,7 +359,7 @@ describe('SettingsLibrary target policy UI', () => {
 			}
 		};
 		h.restore.mockRejectedValue(new Error('failed'));
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await page.getByRole('button', { name: 'Restore roots...' }).click();
 		await page.getByRole('button', { name: 'Restore root', exact: true }).click();
 		await expect
@@ -377,7 +378,7 @@ describe('SettingsLibrary target policy UI', () => {
 			isError: true,
 			error: new ApiError(500, 'Library settings backend is unavailable', 'INTERNAL_ERROR')
 		};
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await expect.element(page.getByText(/Could not load library settings/)).toBeVisible();
 		await expect.element(page.getByText(/Library settings backend is unavailable/)).toBeVisible();
 		await expect
@@ -387,7 +388,7 @@ describe('SettingsLibrary target policy UI', () => {
 
 	it('explains why saving is blocked when settings never seed', async () => {
 		h.settings = { data: undefined, isLoading: false, isError: false };
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await expect
 			.element(
 				page.getByText('Library settings could not be loaded yet. Reload the page to retry.')
@@ -403,7 +404,7 @@ describe('SettingsLibrary target policy UI', () => {
 	it('points non-administrators at administrator sign-in when settings never seed', async () => {
 		h.isAdmin = false;
 		h.settings = { data: undefined, isLoading: false, isError: false };
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await expect
 			.element(page.getByText('Sign in as an administrator to change library settings.'))
 			.toBeVisible();
@@ -416,7 +417,7 @@ describe('SettingsLibrary target policy UI', () => {
 	it('shows the server message when the impact preview is rejected with a 4xx', async () => {
 		h.impactError = new ApiError(400, 'Root path /music is not readable', 'CONFIGURATION_ERROR');
 		h.impact.mockRejectedValue(h.impactError);
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await page.getByRole('button', { name: 'Preview and save settings' }).click();
 		await expect.element(page.getByText('Root path /music is not readable')).toBeVisible();
 		expect(
@@ -433,7 +434,7 @@ describe('SettingsLibrary target policy UI', () => {
 			'/api/v1/settings/library/policy/impact'
 		);
 		h.impact.mockRejectedValue(h.impactError);
-		render(SettingsLibrary);
+		await render(SettingsLibrary);
 		await page.getByRole('button', { name: 'Preview and save settings' }).click();
 		await expect.element(page.getByText(/Check your connection and try again/)).toBeVisible();
 		await expect

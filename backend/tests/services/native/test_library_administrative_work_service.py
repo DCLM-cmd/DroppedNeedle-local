@@ -144,3 +144,142 @@ async def test_recovery_attention_outranks_ordinary_work_and_cannot_look_idle() 
     assert items[0].remaining_count == 2
     assert items[0].failure_event_id == "recovery:2"
     assert items[0].warning_count == 1  # still reported, just not as attention
+
+
+def _repair_row(id, state="queued", *, purpose="existing_matches", completed=0,
+                expected=1, terminal_at=None):
+    return _row(
+        id=id,
+        kind="repair",
+        state=state,
+        terminal_at=terminal_at,
+        completed_count=completed,
+        expected_work_count=expected,
+        management_mode=None,
+        management_origin=None,
+        management_phase=None,
+        management_summary_json=None,
+        management_profile_name=None,
+        repair_purpose=purpose,
+        journal_states_json="[]",
+    )
+
+
+def _summary(**overrides):
+    summary = {
+        "jobs": 0,
+        "processed": 0,
+        "total": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "started_at": 90.0,
+        "updated_at": 200.0,
+        "running": 0,
+        "paused": 0,
+    }
+    summary.update(overrides)
+    return summary
+
+
+@pytest.mark.asyncio
+async def test_many_maintenance_rows_group_into_one_summed_card() -> None:
+    store = AsyncMock()
+    store.list_active_administrative_library_work.return_value = [
+        _repair_row("m-1", completed=0, expected=1),
+        _repair_row("m-2", completed=1, expected=1),
+        _repair_row("m-3", completed=0, expected=2),
+    ]
+    store.summarize_active_maintenance_work.return_value = _summary(
+        jobs=25, processed=10, total=40, succeeded=9, failed=1
+    )
+    store.library_management_recovery_diagnostics.return_value = _diagnostics()
+
+    items = await LibraryAdministrativeWorkService(store, clock=lambda: 1_000).active()
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.id == "maintenance:grouped"
+    assert item.kind == "maintenance"
+    assert item.state == "queued"
+    assert item.synthetic is True
+    assert (item.processed, item.total, item.unit) == (10, 40, "albums")
+    assert item.failed_count == 1
+    assert item.priority == 60
+
+
+@pytest.mark.asyncio
+async def test_failed_maintenance_row_stays_individual_beside_the_group() -> None:
+    store = AsyncMock()
+    store.list_active_administrative_library_work.return_value = [
+        _repair_row("m-1"),
+        _repair_row("m-2"),
+        _repair_row(
+            "f-1", state="failed", purpose="catalog_identity_hygiene",
+            terminal_at=900.0,
+        ),
+    ]
+    store.summarize_active_maintenance_work.return_value = _summary(
+        jobs=2, processed=0, total=2
+    )
+    store.library_management_recovery_diagnostics.return_value = _diagnostics()
+
+    items = await LibraryAdministrativeWorkService(store, clock=lambda: 1_000).active()
+
+    assert [(item.id, item.state) for item in items] == [
+        ("f-1", "failed"),
+        ("maintenance:grouped", "queued"),
+    ]
+    assert items[0].effect == "attention"
+    assert items[0].failure_event_id == "f-1"
+
+
+@pytest.mark.asyncio
+async def test_single_maintenance_row_keeps_its_identity() -> None:
+    store = AsyncMock()
+    store.list_active_administrative_library_work.return_value = [
+        _repair_row("m-1")
+    ]
+    store.summarize_active_maintenance_work.return_value = _summary(
+        jobs=1, processed=0, total=1
+    )
+    store.library_management_recovery_diagnostics.return_value = _diagnostics()
+
+    items = await LibraryAdministrativeWorkService(store, clock=lambda: 1_000).active()
+
+    assert len(items) == 1
+    assert items[0].id == "m-1"
+    assert items[0].synthetic is False
+
+
+@pytest.mark.asyncio
+async def test_grouped_card_prefers_running_then_paused_state() -> None:
+    store = AsyncMock()
+    store.list_active_administrative_library_work.return_value = [
+        _repair_row("m-1", state="queued"),
+        _repair_row("m-2", state="paused"),
+    ]
+    store.summarize_active_maintenance_work.return_value = _summary(
+        jobs=2, processed=0, total=2, paused=1
+    )
+    store.library_management_recovery_diagnostics.return_value = _diagnostics()
+
+    items = await LibraryAdministrativeWorkService(store, clock=lambda: 1_000).active()
+
+    assert len(items) == 1
+    assert items[0].id == "maintenance:grouped"
+    assert items[0].state == "paused"
+
+    store.list_active_administrative_library_work.return_value = [
+        _repair_row("m-1", state="queued"),
+        _repair_row("m-2", state="running"),
+    ]
+    store.summarize_active_maintenance_work.return_value = _summary(
+        jobs=2, processed=1, total=2, running=1
+    )
+
+    items = await LibraryAdministrativeWorkService(store, clock=lambda: 1_000).active()
+
+    assert len(items) == 1
+    assert items[0].state == "running"
+    assert (items[0].processed, items[0].total) == (1, 2)

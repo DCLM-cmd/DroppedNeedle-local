@@ -241,6 +241,8 @@ class LibraryManagementPreviewDetailResponse(AppStruct):
     expired: bool = False
     stale: bool = False
     stale_reasons: list[str] = msgspec.field(default_factory=list)
+    stale_input_count: int = 0
+    stale_sample_relative_paths: list[str] = msgspec.field(default_factory=list)
     ready_for_confirmation: bool = False
     operation_row_revision: int = 1
     operation_event_revision: int = 0
@@ -324,6 +326,10 @@ class LibraryManagementOperationHistoryResponse(AppStruct):
     next_cursor: str | None = None
 
 
+class LibraryManagementNeedsAttentionBundle(AppStruct):
+    bundle_id: str
+
+
 class LibraryManagementRecoveryDiagnosticsResponse(AppStruct):
     recoverable_bundle_count: int
     nonterminal_journal_count: int
@@ -331,6 +337,16 @@ class LibraryManagementRecoveryDiagnosticsResponse(AppStruct):
     cleanup_pending_count: int
     oldest_updated_at: float | None = None
     state_counts: dict[str, int] = msgspec.field(default_factory=dict)
+    needs_attention_bundles: list[LibraryManagementNeedsAttentionBundle] = (
+        msgspec.field(default_factory=list)
+    )
+
+
+class LibraryManagementImportBundleResolveResponse(AppStruct):
+    bundle_id: str
+    state: str
+    verified_files: int
+    total_files: int
 
 
 class LibraryManagementRecoveryAcknowledgeResponse(AppStruct):

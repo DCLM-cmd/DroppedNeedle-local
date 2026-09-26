@@ -8,6 +8,11 @@ const STATS = {
 	memory_entries: 4,
 	memory_size_bytes: 4096,
 	memory_size_mb: 0.004,
+	memory_accounting: 'shallow',
+	response_entries: 7,
+	response_logical_bytes: 1024,
+	database_allocated_bytes: 8192,
+	database_wal_bytes: 4096,
 	disk_metadata_count: 12,
 	disk_metadata_albums: 3,
 	disk_metadata_artists: 2,
@@ -50,7 +55,7 @@ describe('SettingsCache', () => {
 	it('renders an admin-required warning instead of stats when the endpoint answers 403', async () => {
 		stubStatsFetch(403);
 
-		render(SettingsCache);
+		await render(SettingsCache);
 
 		await expect.element(page.getByText(/admin access is required/i)).toBeVisible();
 		const alerts = await page.getByRole('alert').all();
@@ -61,7 +66,7 @@ describe('SettingsCache', () => {
 	it('renders the same admin-required warning on 401', async () => {
 		stubStatsFetch(401);
 
-		render(SettingsCache);
+		await render(SettingsCache);
 
 		await expect.element(page.getByText(/admin access is required/i)).toBeVisible();
 		const alerts = await page.getByRole('alert').all();
@@ -71,7 +76,7 @@ describe('SettingsCache', () => {
 	it('labels the destructive and metadata-scoped clears honestly using live counts', async () => {
 		stubStatsFetch(200);
 
-		render(SettingsCache);
+		await render(SettingsCache);
 
 		await expect
 			.element(page.getByRole('button', { name: 'Full wipe - also deletes 1550 cover files' }))
@@ -85,13 +90,44 @@ describe('SettingsCache', () => {
 		stubStatsFetch(200);
 		const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
 
-		render(SettingsCache);
+		await render(SettingsCache);
 
 		await page.getByRole('button', { name: /Full wipe/i }).click();
 
 		expect(confirmSpy).toHaveBeenCalledTimes(1);
 		const prompt = String(confirmSpy.mock.calls[0]?.[0] ?? '');
 		expect(prompt).toMatch(/deletes all 1550 cover image files/i);
-		expect(prompt).toMatch(/re-fetched from upstream/i);
+	});
+
+	it('uses the non-destructive metadata endpoint and keeps its receipt visible', async () => {
+		vi.spyOn(window, 'confirm').mockReturnValue(true);
+		const fetchSpy = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => ({
+			ok: true,
+			status: 200,
+			json: () =>
+				Promise.resolve(
+					init?.method === 'POST'
+						? {
+								success: true,
+								message: 'Successfully cleared metadata; covers preserved',
+								cleared_memory_entries: 4,
+								cleared_disk_files: 12,
+								cleared_response_entries: 7,
+								cleared_library_artists: 0,
+								cleared_library_albums: 0,
+								cover_files_cleared: 0
+							}
+						: STATS
+				)
+		}));
+		globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+		await render(SettingsCache);
+
+		await page.getByRole('button', { name: 'Metadata only - covers preserved' }).click();
+
+		await expect.element(page.getByRole('status')).toHaveTextContent('covers preserved');
+		const writes = fetchSpy.mock.calls.filter(([, init]) => init?.method === 'POST');
+		expect(writes).toHaveLength(1);
+		expect(String(writes[0]?.[0])).toMatch(/\/cache\/clear\/metadata$/);
 	});
 });

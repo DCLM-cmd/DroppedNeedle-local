@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import os
 import stat
+import time
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 from api.v1.schemas.library_management import (
@@ -28,6 +30,11 @@ from services.native.library_management_profile_service import (
 )
 from services.native.library_policy_resolver import LibraryPolicyResolver
 
+# Settle window for scan_discovered preview creation: matches the store's 30s
+# scan catalog-invalidation coalescing window, so previews wait out the same
+# trailing-write tail after a scan or catalog move.
+SCAN_PREVIEW_SETTLE_SECONDS = 30.0
+
 
 class AutomaticScanManagementService:
     def __init__(
@@ -35,10 +42,15 @@ class AutomaticScanManagementService:
         store: NativeLibraryStore,
         profiles: LibraryManagementProfileService,
         planner: LibraryManagementPlanner,
+        *,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._store = store
         self._profiles = profiles
         self._planner = planner
+        self._clock = clock or time.time
+        self._last_preview_catalog_revision: int | None = None
+        self._last_catalog_change_at: float | None = None
         # F-110: (root_id, relative_path) -> (live stat signature,
         # managed_path_revision). An unchanged signature means the file has not
         # drifted per the repo change-detection contract, so the expensive
@@ -76,12 +88,47 @@ class AutomaticScanManagementService:
             local_album_id, expected_input_policy_revision, context
         )
 
+    async def scan_preview_settled(self) -> bool:
+        """Shared settle gate for scan_discovered preview creation.
+
+        Side-effecting: advances the shared catalog-revision baseline, so all
+        callers observe the same settle window. Skip scan_discovered preview
+        creation while a library scan run is current (the coordinator's own
+        current-run definition from the scan store tables, queued or running)
+        or the catalog moved within the settle window. Per-attempt skip only:
+        nothing latches, so the next scan/identification event retries and
+        flapping scans cannot starve previews forever. An active-scan skip
+        leaves the revision baseline untouched so the post-scan attempt still
+        observes the full delta and takes its settle skip. Boundary: a scan
+        that starts AFTER creation but BEFORE worker pickup is the pickup
+        freshness check's area, not this creation-time gate."""
+        if await self._store.list_current_scan_runs():
+            return False
+        revision = await self._store.get_catalog_revision()
+        now = self._clock()
+        if (
+            self._last_preview_catalog_revision is not None
+            and revision != self._last_preview_catalog_revision
+        ):
+            self._last_preview_catalog_revision = revision
+            self._last_catalog_change_at = now
+            return False
+        self._last_preview_catalog_revision = revision
+        if (
+            self._last_catalog_change_at is not None
+            and now - self._last_catalog_change_at < SCAN_PREVIEW_SETTLE_SECONDS
+        ):
+            return False
+        return True
+
     async def _schedule_identified_context(
         self,
         local_album_id: str,
         expected_input_policy_revision: str,
         context: dict,
     ) -> str | None:
+        if not await self.scan_preview_settled():
+            return None
         tracks = [
             track for track in context["tracks"] if track["availability"] == "indexed"
         ]

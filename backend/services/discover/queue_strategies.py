@@ -10,6 +10,7 @@ import random
 
 from api.v1.schemas.discover import DiscoverQueueItemLight
 from api.v1.schemas.home import HomeAlbum
+from infrastructure.observability.optional_work import OptionalWorkDeferred
 from repositories.listenbrainz_models import ListenBrainzArtist
 from repositories.protocols import (
     LastFmRepositoryProtocol,
@@ -76,6 +77,8 @@ async def build_similar_artist_pools(
                 except asyncio.TimeoutError:
                     logger.warning("Timeout getting releases for similar artist %s", sim_mbid[:8])
                     continue
+                except OptionalWorkDeferred:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     logger.debug(f"Failed to get releases for similar artist: {e}")
                     continue
@@ -98,10 +101,18 @@ async def build_similar_artist_pools(
                     pool_seen.add(rg_mbid)
         except asyncio.TimeoutError:
             logger.warning("Timeout getting similar artists for seed %s", seed_mbid[:8])
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Failed to get similar artists for seed {seed_mbid[:8]}: {e}")
 
-    await asyncio.gather(*[_process_seed(i, seed) for i, seed in enumerate(seeds)])
+    outcomes = await asyncio.gather(
+        *[_process_seed(i, seed) for i, seed in enumerate(seeds)],
+        return_exceptions=True,
+    )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
     return pools
 
 
@@ -141,6 +152,8 @@ async def build_similar_artist_pools_lastfm(
                 except asyncio.TimeoutError:
                     logger.warning("Timeout getting Last.fm top albums for %s", sim_artist.name)
                     continue
+                except OptionalWorkDeferred:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     logger.debug(f"Failed to get top albums for Last.fm similar artist: {e}")
                     continue
@@ -151,16 +164,25 @@ async def build_similar_artist_pools_lastfm(
                     exclude=excluded_mbids | pool_seen,
                     target=albums_per,
                     reason="Similar to seed (via Last.fm)",
+                    work_key=f"similar:{seed_mbid}:{sim_mbid}",
                 )
                 for item in items:
                     pools[i].append(item)
                     pool_seen.add(item.release_group_mbid.lower())
         except asyncio.TimeoutError:
             logger.warning("Timeout getting Last.fm similar artists for seed %s", seed_mbid[:8])
+        except OptionalWorkDeferred:
+            raise
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Failed to get Last.fm similar artists for seed {seed_mbid[:8]}: {e}")
 
-    await asyncio.gather(*[_process_seed(i, mbid) for i, mbid in enumerate(seed_mbids)])
+    outcomes = await asyncio.gather(
+        *[_process_seed(i, mbid) for i, mbid in enumerate(seed_mbids)],
+        return_exceptions=True,
+    )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
     return pools
 
 
@@ -191,6 +213,9 @@ async def discover_by_genres(
         ],
         return_exceptions=True,
     )
+    for outcome in search_results:
+        if isinstance(outcome, OptionalWorkDeferred):
+            raise outcome
 
     items: list[DiscoverQueueItemLight] = []
     seen: set[str] = set()
@@ -232,6 +257,8 @@ async def get_artist_deep_cuts(
             range_="this_month",
             count=25,
         )
+    except OptionalWorkDeferred:
+        raise
     except Exception:  # noqa: BLE001
         logger.warning("Failed to fetch top release groups from ListenBrainz for deep cuts")
         return []
@@ -271,6 +298,9 @@ async def get_artist_deep_cuts(
         ],
         return_exceptions=True,
     )
+    for outcome in results:
+        if isinstance(outcome, OptionalWorkDeferred):
+            raise outcome
 
     items: list[DiscoverQueueItemLight] = []
     seen_rg_mbids: set[str] = set()
@@ -388,6 +418,9 @@ async def get_trending_filler(
                 ],
                 return_exceptions=True,
             )
+            for outcome in album_fetch_results:
+                if isinstance(outcome, OptionalWorkDeferred):
+                    raise outcome
             artist_albums_pairs: list[tuple[object, list[object]]] = []
             for artist, result in zip(valid_artists, album_fetch_results):
                 if isinstance(result, Exception):
@@ -423,6 +456,8 @@ async def get_trending_filler(
                     in_library=False,
                 ))
                 exclude.add(rg_mbid.lower())
+    except OptionalWorkDeferred:
+        raise
     except Exception as e:  # noqa: BLE001
         logger.debug(f"Failed to get wildcard albums: {e}")
         wildcards = []
@@ -444,6 +479,8 @@ async def get_trending_filler(
                     limit=25,
                     offset=0,
                 )
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
                 logger.warning("Failed to search release groups for decade tag %s", decade)
                 continue

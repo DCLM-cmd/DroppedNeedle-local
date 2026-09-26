@@ -87,3 +87,89 @@ async def test_starred_at_filled_for_user(library_view_service, seeded_library, 
     by_id = {t.file_id: t for t in tracks}
     assert by_id[fav_id].starred_at is not None
     assert by_id[ids["tracks"][1]].starred_at is None
+
+
+async def test_get_albums_list_carries_total_duration(library_view_service):
+    albums, total = await library_view_service.get_albums()
+    assert total == 1
+    assert albums[0].total_duration_seconds == pytest.approx(403.0)  # 201 + 202
+
+
+async def test_album_from_summary_carries_total_duration(library_view_service):
+    from services.native.library_manager import LibraryAlbumSummary
+
+    album = library_view_service._album_from_summary(
+        LibraryAlbumSummary(
+            release_group_mbid="rg",
+            album_title="Album",
+            track_count=2,
+            total_duration_seconds=403.0,
+        )
+    )
+    assert album.total_duration_seconds == pytest.approx(403.0)
+
+    missing = library_view_service._album_from_summary(
+        LibraryAlbumSummary(release_group_mbid="rg", album_title="Album")
+    )
+    assert missing.total_duration_seconds is None
+
+
+async def test_get_albums_for_artist_carries_total_duration(
+    library_view_service, seeded_library
+):
+    db, _lm, _ids = seeded_library
+    mbid = "a74b1b7f-71a5-4011-9441-d0b5e4122711"
+    for trackno, duration in ((1, 100.0), (2, 150.0)):
+        await db.upsert_library_file(
+            {
+                "release_group_mbid": "rg-artist-dur",
+                "track_title": f"Track {trackno}",
+                "track_number": trackno,
+                "disc_number": 1,
+                "artist_name": "Artist",
+                "album_artist_name": "Artist",
+                "album_artist_mbid": mbid,
+                "album_title": "Album",
+                "file_path": f"/lib/artist-dur/{trackno}.flac",
+                "file_size_bytes": 1,
+                "file_mtime": 0.0,
+                "duration_seconds": duration,
+                "file_format": "flac",
+                "source": "scan",
+                "confidence": 1.0,
+                "is_compilation": 0,
+            }
+        )
+
+    albums = await library_view_service.get_albums_for_artist(mbid)
+    assert len(albums) == 1
+    assert albums[0].total_duration_seconds == pytest.approx(250.0)
+
+
+async def test_get_album_without_durations_stays_none(
+    library_view_service, seeded_library
+):
+    db, _lm, _ids = seeded_library
+    await db.upsert_library_file(
+        {
+            "release_group_mbid": "rg-no-dur",
+            "track_title": "Track 1",
+            "track_number": 1,
+            "disc_number": 1,
+            "artist_name": "Artist",
+            "album_artist_name": "Artist",
+            "album_title": "Album",
+            "file_path": "/lib/no-dur/1.flac",
+            "file_size_bytes": 1,
+            "file_mtime": 0.0,
+            "duration_seconds": None,
+            "file_format": "flac",
+            "source": "scan",
+            "confidence": 1.0,
+            "is_compilation": 0,
+        }
+    )
+
+    album = await library_view_service.get_album("rg-no-dur")
+    assert album is not None
+    assert album.total_duration_seconds is None

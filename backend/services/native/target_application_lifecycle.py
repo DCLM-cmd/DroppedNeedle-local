@@ -205,8 +205,17 @@ async def run_target_one_time_migrations(
     )
 
 
+def _log_registered_task_error(task: asyncio.Task, name: str) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error("Startup task %s failed: %s", name, error, exc_info=error)
+
+
 def _register_task(name: str, coroutine: Any) -> None:
     task = asyncio.create_task(coroutine)
+    task.add_done_callback(lambda t, n=name: _log_registered_task_error(t, n))
     TaskRegistry.get_instance().register(name, task)
 
 
@@ -258,7 +267,6 @@ async def start_target_operational_runtime(
     from core.tasks import (
         start_acquisition_cleanup_task,
         start_acquisition_orphan_reconcile_task,
-        start_artist_discovery_cache_warming_task,
         start_artwork_blurhash_task,
         start_audiodb_sweep_task,
         start_background_upgrade_scan_task,
@@ -310,6 +318,54 @@ async def start_target_operational_runtime(
         await asyncio.to_thread(get_plugin_host().load_all)
     except Exception as error:  # noqa: BLE001 - one plugin cannot block startup
         logger.warning("startup.plugin_load_failed", extra={"error": str(error)})
+    try:
+        from core.dependencies import (
+            get_acquisition_cleanup_service,
+            get_acquisition_dispatcher,
+            get_album_preflight_scorer,
+            get_discover_service,
+            get_download_orchestrator,
+            get_download_service,
+            get_file_processor,
+            get_home_service,
+            get_status_service,
+            get_target_acquisition_dispatcher,
+            get_target_discover_service,
+            get_target_download_orchestrator,
+            get_target_download_service,
+            get_target_file_processor,
+            get_target_home_service,
+            get_target_status_service,
+        )
+
+        for provider in (
+            get_album_preflight_scorer,
+            get_download_orchestrator,
+            get_target_download_orchestrator,
+            get_download_service,
+            get_target_download_service,
+            get_acquisition_dispatcher,
+            get_target_acquisition_dispatcher,
+            get_file_processor,
+            get_target_file_processor,
+            get_status_service,
+            get_target_status_service,
+            get_acquisition_cleanup_service,
+            get_home_service,
+            get_target_home_service,
+            get_discover_service,
+            get_target_discover_service,
+        ):
+            try:
+                provider.cache_clear()
+            except Exception:  # noqa: BLE001 - startup cache clear is best-effort
+                pass
+    except Exception:  # noqa: BLE001 - one plugin cannot block startup
+        logger.warning("startup.plugin_cache_clear_failed")
+    try:
+        await get_plugin_host().sync_ticks()
+    except Exception as error:  # noqa: BLE001 - one plugin cannot block startup
+        logger.warning("startup.plugin_ticks_failed", extra={"error": str(error)})
 
     staging = preferences.get_typed_library_settings().staging_path
     _register_task(
@@ -363,17 +419,6 @@ async def start_target_operational_runtime(
 
     advanced = preferences.get_advanced_settings()
     start_discover_home_warmer_task(
-        get_target_discover_service,
-        get_target_home_service,
-        get_auth_store,
-        get_target_discover_queue_manager,
-        workload_gate=get_background_workload_gate(),
-    )
-    start_artist_discovery_cache_warming_task(
-        get_target_artist_discovery_service,
-        library,
-        interval=advanced.artist_discovery_warm_interval,
-        delay=advanced.artist_discovery_warm_delay,
         workload_gate=get_background_workload_gate(),
     )
     start_audiodb_sweep_task(
@@ -402,7 +447,7 @@ async def start_target_operational_runtime(
         )
 
     start_request_status_sync_task(get_target_requests_page_service())
-    start_poll_new_releases_task(get_target_new_release_service())
+    start_poll_new_releases_task(get_target_new_release_service)
     start_personal_mix_refresh_task(get_target_personal_mix_service())
     start_orphan_cover_demotion_task(
         target.covers.disk_cache,

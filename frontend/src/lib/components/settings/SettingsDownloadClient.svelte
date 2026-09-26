@@ -75,6 +75,41 @@
 	const mountAdvisory = $derived(status?.mount_advisory);
 	const slskdDownloadsDir = $derived(status?.slskd_downloads_dir);
 
+	// Mirror of the backend join (mount + sanitised subpath): the folder DroppedNeedle
+	// actually looks in. Live from the form so typing updates it; server truth until seeded.
+	function joinSubpath(mountPath: string, subpath: string): string {
+		const parts = subpath
+			.split(/[\\/]/)
+			.map((p) => p.trim())
+			.filter((p) => p && p !== '.' && p !== '..');
+		return parts.length ? `${mountPath.replace(/\/+$/, '')}/${parts.join('/')}` : mountPath;
+	}
+
+	const liveEffectivePath = $derived(
+		mount?.path
+			? seeded
+				? joinSubpath(mount.path, downloadsSubpath)
+				: (status?.effective_downloads_path ?? mount.path)
+			: null
+	);
+	const mountAlreadyPointsAtSlskd = $derived(
+		!!slskdDownloadsDir && !!mount?.path && slskdDownloadsDir === mount.path
+	);
+	const subpathLooksAbsolute = $derived(downloadsSubpath.trim().startsWith('/'));
+
+	function trimSubpathToRelative(): void {
+		const mountBase = mount?.path?.replace(/\/+$/, '') ?? '';
+		let rest = downloadsSubpath.replace(/\\/g, '/');
+		if (mountBase && rest.includes(mountBase)) {
+			rest = rest.slice(rest.indexOf(mountBase) + mountBase.length);
+		}
+		downloadsSubpath = rest
+			.split('/')
+			.map((p) => p.trim())
+			.filter((p) => p && p !== '.' && p !== '..')
+			.join('/');
+	}
+
 	const MOUNT_REASONS: Record<string, string> = {
 		not_set: 'No slskd downloads folder is mounted into DroppedNeedle.',
 		missing: "The mounted downloads folder doesn't exist.",
@@ -229,6 +264,15 @@
 			<div class="flex items-center gap-2 text-sm font-semibold">
 				<FolderTree class="size-4 text-base-content/70" aria-hidden="true" /> Downloads mount
 			</div>
+			{#if liveEffectivePath}
+				<p class="text-xs text-base-content/60">
+					DroppedNeedle looks in
+					<code class="text-base-content/70" data-testid="effective-downloads-path"
+						>{liveEffectivePath}</code
+					>. The mount itself comes from <code>SLSKD_DOWNLOADS_PATH</code> in docker-compose. Recreate
+					the container after changing it.
+				</p>
+			{/if}
 			{#if mount?.ok && mountAdvisory}
 				<div class="alert alert-warning items-start text-sm">
 					<TriangleAlert class="size-5 shrink-0" aria-hidden="true" />
@@ -238,7 +282,10 @@
 					</div>
 				</div>
 				<div class="space-y-1.5 rounded-box border border-base-content/10 bg-base-200/40 p-3">
-					<label class="text-sm font-medium" for="downloads-subpath">Downloads subfolder</label>
+					<label class="text-sm font-medium" for="downloads-subpath">
+						Downloads subfolder
+						<span class="badge badge-ghost badge-xs ml-1 align-middle">relative to the mount</span>
+					</label>
 					<p class="text-xs text-base-content/60">
 						The folder inside your mount where slskd saves completed downloads.
 						{#if slskdDownloadsDir}
@@ -246,6 +293,25 @@
 							to the part of that path inside your mount.
 						{/if}
 					</p>
+					{#if mountAlreadyPointsAtSlskd && !downloadsSubpath.trim()}
+						<p class="text-xs text-success">
+							Leave this empty. Your mount already points where slskd saves.
+						</p>
+					{/if}
+					{#if subpathLooksAbsolute}
+						<div class="alert alert-warning items-start py-2 text-xs">
+							<TriangleAlert class="size-4 shrink-0" aria-hidden="true" />
+							<div class="space-y-1.5">
+								<p>
+									This looks like a full path. Type only the part after the mount, or leave it
+									empty.
+								</p>
+								<button type="button" class="btn btn-xs" onclick={trimSubpathToRelative}>
+									Trim to relative
+								</button>
+							</div>
+						</div>
+					{/if}
 					<div class="flex flex-wrap items-center gap-2">
 						<input
 							id="downloads-subpath"
@@ -319,11 +385,14 @@
 		</section>
 
 		<section class="space-y-1.5 rounded-box border border-base-content/10 bg-base-200/40 p-3">
-			<label class="text-sm font-medium" for="incomplete-mount">Incomplete folder (optional)</label>
+			<label class="text-sm font-medium" for="incomplete-mount">
+				Incomplete folder (optional)
+				<span class="badge badge-ghost badge-xs ml-1 align-middle">absolute path</span>
+			</label>
 			<p class="text-xs text-base-content/60">
-				The absolute container path where slskd keeps unfinished downloads. When set,
-				DroppedNeedle spots stranded partial bytes there and retries the missing file
-				instead of reporting it lost. Leave empty to disable.
+				The absolute container path where slskd keeps unfinished downloads. When set, DroppedNeedle
+				spots stranded partial bytes there and retries the missing file instead of reporting it
+				lost. Leave empty to disable.
 			</p>
 			<div class="flex flex-wrap items-center gap-2">
 				<input
