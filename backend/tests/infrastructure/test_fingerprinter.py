@@ -24,7 +24,7 @@ def _fingerprinter(handler) -> AudioFingerprinter:
         http=http, api_key_provider=lambda: "some-key", rate_limiter=_NoWaitLimiter()
     )
     # fpcalc isn't available/needed in tests - return a canned fingerprint
-    fp._run_fpcalc = AsyncMock(return_value=("AQAD_fake", 184))
+    fp._run_fpcalc = AsyncMock(return_value=("AQAD_fake", 184, False))
     return fp
 
 

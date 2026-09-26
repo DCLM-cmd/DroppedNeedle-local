@@ -47,9 +47,11 @@ def test_a_real_album_folder_is_never_collapsed(directory) -> None:
     assert grouping_directory(directory + "/01.flac") == directory
 
 
-def test_a_top_level_directory_is_left_alone() -> None:
-    """Nothing to collapse into; must not walk above the library root."""
-    assert grouping_directory("CD 1/01.flac") == "CD 1"
+def test_a_top_level_disc_folder_folds_into_the_root_not_above_it() -> None:
+    """A disc folder directly under the library root joins the root grouping context
+    (upstream's M-03 top-level rule), so it can share an album with root siblings -
+    and never walks above the library root."""
+    assert grouping_directory("CD 1/01.flac") == "."
 
 
 def test_the_two_discs_of_one_release_share_a_key() -> None:

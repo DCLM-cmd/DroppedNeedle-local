@@ -3140,7 +3140,7 @@ async def test_a_recycle_bin_that_is_not_dot_prefixed_is_still_skipped(
     (bin_path / "02 - Recycled.mp3").write_bytes(b"x")
 
     store = AsyncMock()
-    store.classify_scan_paths.side_effect = lambda _root, entries: {
+    store.classify_scan_paths.side_effect = lambda _root, entries, **_kwargs: {
         entry[0]: ("new", None) for entry in entries
     }
     store.add_scan_inventory_batch.return_value = (0, 0)

@@ -16,6 +16,7 @@ concurrent calls that the discover fan-out produces. These tests count requests.
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -36,9 +37,9 @@ def _repo() -> tuple[ListenBrainzRepository, list[str]]:
     async def request(method, url, **kwargs):
         requested.append(url)
         response = MagicMock()
+        response.num_bytes_downloaded = 0
         response.status_code = 200
         response.text = ""
-        response.content = None
         if "top-release-groups-for-artist" in url:
             response.json.return_value = [
                 {
@@ -57,6 +58,8 @@ def _repo() -> tuple[ListenBrainzRepository, list[str]]:
             ]
         else:
             response.json.return_value = []
+        # The repository decodes the raw body, and the provider counters size it.
+        response.content = json.dumps(response.json.return_value).encode()
         return response
 
     http_client.request = AsyncMock(side_effect=request)
@@ -106,10 +109,11 @@ async def test_popularity_batch_remembers_mbids_lb_has_no_count_for():
     async def request(method, url, **kwargs):
         requested.append(url)
         response = MagicMock()
+        response.num_bytes_downloaded = 0
         response.status_code = 200
         response.text = ""
-        response.content = None
         response.json.return_value = []  # LB knows none of them
+        response.content = json.dumps(response.json.return_value).encode()
         return response
 
     repo._client.request = AsyncMock(side_effect=request)
@@ -151,6 +155,8 @@ def _rate_limited_repo() -> tuple[ListenBrainzRepository, list[str]]:
     async def request(method, url, **kwargs):
         requested.append(url)
         response = MagicMock()
+        # The provider counters size every response body.
+        response.num_bytes_downloaded = 0
         response.status_code = 429
         response.text = "<html>429 Too Many Requests</html>"
         response.headers = {}
