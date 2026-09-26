@@ -664,12 +664,12 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
         try:
             parent_kind, parent_internal = await services.id_map.from_jf(parent)
         except JellyfinError:
-            # An unresolved ParentId - a client that cached an id the map no longer
-            # holds, or the library view id against a fresh/empty map - must NOT blank
-            # the browse (that is the empty-CarPlay-menu bug). Fall through to a
-            # library-level listing of the requested item types, exactly as a request
-            # with no ParentId returns.
-            parent_kind = parent_internal = None
+            # Upstream semantics: an unknown ParentId browses nothing. The music
+            # library view id itself always resolves (id_map_service recognises it
+            # without a stored row), so CarPlay's cached view id still lists.
+            return jm.BaseItemDtoQueryResult(
+                Items=[], TotalRecordCount=0, StartIndex=start
+            )
 
     if _wants_favorites(request):
         return await _favorite_items(request, services, b, user, types, start, limit)
@@ -937,7 +937,8 @@ async def user_items_latest_legacy(
     request: Request,
     services: CompatServices = Depends(get_compat_services),
 ) -> Response:
-    return await _handle(request, services, _latest)
+    # Finamp's endpoint: _items_latest adds album-parent tracks and IncludeItemTypes.
+    return await _handle(request, services, _items_latest)
 
 
 async def _artists(
@@ -1025,7 +1026,7 @@ async def items_filters_legacy(
     return await _handle(request, services, _items_filters)
 
 
-async def _latest(request, services, user, **_) -> list[jm.BaseItemDto]:
+async def _items_latest(request, services, user, **_) -> list[jm.BaseItemDto]:
     """``/Users/{id}/Items/Latest`` - newest first, as a BARE ARRAY.
 
     Jellyfin answers this one with a plain array rather than the BaseItemDtoQueryResult
@@ -1047,9 +1048,8 @@ async def _latest(request, services, user, **_) -> list[jm.BaseItemDto]:
         try:
             parent_kind, parent_internal = await services.id_map.from_jf(parent)
         except JellyfinError:
-            # See _browse: an unresolved ParentId falls through to a library-level
-            # listing rather than an empty result.
-            parent_kind = parent_internal = None
+            # Upstream semantics, as in _browse: an unknown ParentId has no items.
+            return []
 
     if parent_kind == "album":
         tracks = await services.view.get_album_tracks(parent_internal, user=user)
@@ -1068,20 +1068,11 @@ async def _latest(request, services, user, **_) -> list[jm.BaseItemDto]:
     return [await b.album(a) for a in albums]
 
 
-@router.get("/Users/{user_id}/Items/Latest")
-async def items_latest(
-    user_id: str,
-    request: Request,
-    services: CompatServices = Depends(get_compat_services),
-) -> Response:
-    return await _handle(request, services, _latest)
-
-
 @router.get("/Items/Latest")
 async def items_latest_modern(
     request: Request, services: CompatServices = Depends(get_compat_services)
 ) -> Response:
-    return await _handle(request, services, _latest)
+    return await _handle(request, services, _items_latest)
 
 
 async def _single_item_handler(request, services, user, *, item_id) -> jm.BaseItemDto:

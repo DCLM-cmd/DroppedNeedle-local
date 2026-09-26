@@ -71,11 +71,12 @@ async def test_browse_albums_under_library_view_parent(compat_env):
     assert body["Items"][0]["Type"] == "MusicAlbum"
 
 
-async def test_browse_unknown_parent_falls_through_instead_of_empty(compat_env):
-    # A ParentId the map cannot resolve (a client that cached an id since rotated) must
-    # fall through to a library-level listing, never blank the browse.
+async def test_browse_unknown_parent_is_empty(compat_env):
+    # Upstream semantics: a ParentId the map cannot resolve browses nothing. Only the
+    # music library view id is special-cased (see the test above).
     body = _jget(compat_env, "/Items", IncludeItemTypes="MusicAlbum", ParentId="0" * 32)
-    assert body["Items"], "album browse with an unknown ParentId should not be empty"
+    assert body["Items"] == []
+    assert body["TotalRecordCount"] == 0
 
 
 async def test_drilldown_artist_album_track(compat_env):
