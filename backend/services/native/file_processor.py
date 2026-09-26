@@ -2125,12 +2125,9 @@ class FileProcessor:
                     release_mbid=held.release_mbid,
                     recording_mbid=target_tag.musicbrainz_recording_id,
                     release_track_mbid=None,
-                    medium_position=held.disc_number or 1,
-                    release_track_position=held.track_number,
-                    # see the note above: track 0 is a position, not a blank
-                    authoritative_mapping=bool(
-                        held.release_mbid and held.track_number is not None
-                    ),
+                    medium_position=None,
+                    release_track_position=None,
+                    authoritative_mapping=False,
                     confidence=1.0,
                     download_task_id=held.source_task_id,
                     source_path=held.held_path,
