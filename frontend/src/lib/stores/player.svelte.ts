@@ -300,8 +300,7 @@ function createPlayerStore() {
 		}
 		currentSource?.destroy();
 		const gen = ++loadGeneration;
-		let source: PlaybackSource,
-			resolvedUrl: string | undefined = item.streamUrl;
+		let source: PlaybackSource, resolvedUrl: string | undefined;
 		try {
 			const r = await resolveSourceForItem(item);
 			source = r.source;

@@ -23,7 +23,9 @@ export async function startSession(itemId: string, playSessionId?: string): Prom
 		return data.play_session_id;
 	} catch (e) {
 		if (e instanceof ApiError) {
-			throw new Error(`Failed to start Jellyfin playback session: ${e.status} ${e.message}`);
+			throw new Error(`Failed to start Jellyfin playback session: ${e.status} ${e.message}`, {
+				cause: e
+			});
 		}
 		throw e;
 	}
