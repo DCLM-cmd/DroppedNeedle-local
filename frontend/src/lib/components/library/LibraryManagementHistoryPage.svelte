@@ -266,7 +266,8 @@
 									{:else}
 										{#if item.operation.succeeded_count}<span class="badge badge-success badge-sm"
 												>{item.operation.succeeded_count} succeeded</span
-											>{/if}{#if item.operation.failed_count}<span class="badge badge-error badge-sm"
+											>{/if}{#if item.operation.failed_count}<span
+												class="badge badge-error badge-sm"
 												>{item.operation.failed_count} failed</span
 											>{/if}{#if item.operation.skipped_count}<span
 												class="badge badge-warning badge-sm"

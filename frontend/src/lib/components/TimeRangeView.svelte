@@ -15,7 +15,7 @@
 	import { getTimeRangeFallbackPath } from '$lib/utils/timeRangeFallback';
 	import type { HomeAlbum, HomeArtist } from '$lib/types';
 	import { ChevronLeft, ChevronDown, CircleAlert } from 'lucide-svelte';
-	import type { Component } from 'svelte';
+	import type { ComponentType } from 'svelte';
 
 	type TimeRangeKey = 'this_week' | 'this_month' | 'this_year' | 'all_time';
 	type ItemType = 'album' | 'artist';
@@ -44,7 +44,7 @@
 		endpoint: string;
 		title: string;
 		subtitle: string;
-		errorIcon?: Component | null;
+		errorIcon?: ComponentType | null;
 		source?: 'listenbrainz' | 'lastfm' | null;
 	}
 

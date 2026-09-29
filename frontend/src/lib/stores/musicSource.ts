@@ -6,6 +6,7 @@ import { authStore } from '$lib/stores/authStore.svelte';
 import { queryClient, setQueryDataWithPersister } from '$lib/queries/QueryClient';
 import { getScrobblePreferencesQueryOptions } from '$lib/queries/scrobble-preferences/ScrobblePreferencesQuery.svelte';
 import { ScrobblePreferencesQueryKeyFactory } from '$lib/queries/scrobble-preferences/ScrobblePreferencesQueryKeyFactory';
+import type { ScrobblePreferences } from '$lib/queries/scrobble-preferences/types';
 import { registerUserSessionReset } from '$lib/utils/userSessionCleanup';
 
 export type MusicSource = 'listenbrainz' | 'lastfm';

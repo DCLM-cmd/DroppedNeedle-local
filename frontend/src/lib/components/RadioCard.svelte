@@ -27,7 +27,7 @@
 	);
 
 	const albumItems = $derived(
-		section ? section.items.filter((item): item is HomeAlbum => section.type === 'albums') : []
+		section ? section.items.filter((_item): _item is HomeAlbum => section.type === 'albums') : []
 	);
 	const featuredAlbum = $derived(albumItems[0] ?? null);
 	const albumCount = $derived(albumItems.length);

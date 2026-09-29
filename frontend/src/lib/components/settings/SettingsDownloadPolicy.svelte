@@ -281,8 +281,7 @@
 						<span class="font-medium">Prefer explicit editions</span>
 						<span id="prefer-explicit-help" class="block text-sm text-base-content/70">
 							Among equal-quality candidates, rank the explicit/uncensored cut higher and a
-							“(Clean)” one lower. Turn this off to ignore edition markers when choosing a
-							download.
+							“(Clean)” one lower. Turn this off to ignore edition markers when choosing a download.
 						</span>
 					</span>
 				</label>

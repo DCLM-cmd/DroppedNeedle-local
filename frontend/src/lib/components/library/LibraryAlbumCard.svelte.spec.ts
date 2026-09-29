@@ -9,6 +9,7 @@ const baseAlbum: LibraryAlbumSummary = {
 	title: 'OK Computer',
 	artist_name: 'Radiohead',
 	artist_id: 'local-artist-1',
+	release_type: null,
 	musicbrainz_release_group_id: 'b1392450-e666-3926-a536-22c65f834433',
 	musicbrainz_release_id: null,
 	musicbrainz_artist_id: null,

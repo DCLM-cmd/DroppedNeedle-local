@@ -1,11 +1,5 @@
 export type PlaybackState =
-	| 'idle'
-	| 'loading'
-	| 'playing'
-	| 'paused'
-	| 'ended'
-	| 'buffering'
-	| 'error';
+	'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'buffering' | 'error';
 
 export type SourceType = 'youtube' | 'local' | 'jellyfin' | 'navidrome' | 'plex';
 

@@ -18,6 +18,7 @@
 <script lang="ts">
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
+	import { ListChecks } from 'lucide-svelte';
 	import type { ReviewListItem } from '$lib/queries/library/LibraryOperationsTypes';
 	import LibraryReviewCard from './LibraryReviewCard.svelte';
 
@@ -57,6 +58,7 @@
 
 {#if items.length === 0}
 	<EmptyState
+		icon={ListChecks}
 		title={state === 'keep_tagged'
 			? 'No albums have been kept with local metadata yet.'
 			: state === 'edition_to_confirm'
@@ -127,12 +129,13 @@
 							><span class="badge badge-ghost badge-sm"
 								>{item.effective_policy.replace('_', ' ')}</span
 							></td
-					><td>{#if isStillMatchingJobState(item.active_job_state)}<span
-								class="badge badge-warning badge-sm">Matching...</span
-							>{:else}{item.candidate_count ? `${item.candidate_count} available` : 'None'}{/if}</td
 						><td
-							>{new Date(item.updated_at * 1000).toLocaleDateString()}</td
-						><td
+							>{#if isStillMatchingJobState(item.active_job_state)}<span
+									class="badge badge-warning badge-sm">Matching...</span
+								>{:else}{item.candidate_count
+									? `${item.candidate_count} available`
+									: 'None'}{/if}</td
+						><td>{new Date(item.updated_at * 1000).toLocaleDateString()}</td><td
 							><button class="btn btn-primary btn-sm" onclick={() => onreview(item.id)}
 								>Review</button
 							></td

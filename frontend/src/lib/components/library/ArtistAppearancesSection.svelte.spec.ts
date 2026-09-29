@@ -51,6 +51,7 @@ const album: LibraryAlbumSummary = {
 	title: 'Night Drive',
 	artist_name: 'The Headliners',
 	artist_id: 'artist-headliners',
+	release_type: null,
 	musicbrainz_release_group_id: 'release-group-1',
 	musicbrainz_release_id: 'release-1',
 	musicbrainz_artist_id: 'mbid-headliners',

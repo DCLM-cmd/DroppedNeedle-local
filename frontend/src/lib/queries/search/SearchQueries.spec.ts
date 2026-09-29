@@ -128,6 +128,7 @@ describe('Search queries', () => {
 				title: 'Same Spelling',
 				artist_name: 'Artist',
 				artist_id: 'local-artist-id',
+				release_type: null,
 				musicbrainz_release_group_id: null,
 				musicbrainz_release_id: null,
 				musicbrainz_artist_id: null,

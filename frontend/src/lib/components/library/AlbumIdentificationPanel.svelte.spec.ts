@@ -11,6 +11,7 @@ const album: LibraryAlbumDetail = {
 	title: 'Local Signals',
 	artist_name: 'Signal Artist',
 	artist_id: 'artist-1',
+	release_type: null,
 	musicbrainz_release_group_id: null,
 	musicbrainz_release_id: null,
 	musicbrainz_artist_id: null,

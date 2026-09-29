@@ -58,7 +58,7 @@ describe('reverifyHeldTrack', () => {
 
 	it('posts to the single-reverify endpoint and refreshes tasks, held, and album on import', async () => {
 		reverifyHeldTrack();
-		const mutation = captured.current as Mutation<HeldReverifyResponse, SingleVars>;
+		const mutation = captured.current as unknown as Mutation<HeldReverifyResponse, SingleVars>;
 		mockPost.mockResolvedValue({ status: 'imported', final_path: '/music/x.flac' });
 
 		const data = await mutation.mutationFn({ id: 7, release_group_mbid: 'rg-1' });
@@ -85,7 +85,7 @@ describe('reverifyHeldTrack', () => {
 
 	it('reports a still-held track without claiming an import', async () => {
 		reverifyHeldTrack();
-		const mutation = captured.current as Mutation<HeldReverifyResponse, SingleVars>;
+		const mutation = captured.current as unknown as Mutation<HeldReverifyResponse, SingleVars>;
 		mockPost.mockResolvedValue({ status: 'still_held', final_path: null });
 
 		const data = await mutation.mutationFn({ id: 7, release_group_mbid: 'rg-1' });
@@ -104,7 +104,7 @@ describe('reverifyHeldTrack', () => {
 	});
 	it('toasts a failure without invalidating', () => {
 		reverifyHeldTrack();
-		const mutation = captured.current as Mutation<HeldReverifyResponse, SingleVars>;
+		const mutation = captured.current as unknown as Mutation<HeldReverifyResponse, SingleVars>;
 
 		mutation.onError(new Error('nope'));
 
@@ -124,7 +124,7 @@ describe('reverifyHeldBulk', () => {
 
 	it('passes held_ids through and invalidates only imported albums', async () => {
 		reverifyHeldBulk();
-		const mutation = captured.current as Mutation<
+		const mutation = captured.current as unknown as Mutation<
 			HeldBulkReverifyResponse,
 			{ held_ids?: number[] | null }
 		>;
@@ -177,7 +177,7 @@ describe('reverifyHeldBulk', () => {
 
 	it('says so when there is nothing to re-check', () => {
 		reverifyHeldBulk();
-		const mutation = captured.current as Mutation<
+		const mutation = captured.current as unknown as Mutation<
 			HeldBulkReverifyResponse,
 			{ held_ids?: number[] | null }
 		>;
@@ -192,7 +192,7 @@ describe('reverifyHeldBulk', () => {
 
 	it('toasts a failure without invalidating', () => {
 		reverifyHeldBulk();
-		const mutation = captured.current as Mutation<
+		const mutation = captured.current as unknown as Mutation<
 			HeldBulkReverifyResponse,
 			{ held_ids?: number[] | null }
 		>;
