@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sys
+import time
 from collections.abc import Callable
 import unicodedata
 from datetime import datetime, timezone
@@ -45,6 +46,8 @@ _DISC_DIR = re.compile(r"\b(?:Disc|CD)\s*\d+\b", re.IGNORECASE)
 _LOSSLESS_EXT = {"flac", "alac", "wav", "ape", "wv"}
 _NO_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
 _MAX_WALK_ENTRIES = 10_000
+# mtime and the enqueue clock are the same host's; the slack only absorbs rounding.
+_WRITTEN_AFTER_SLACK_SECONDS = 2.0
 
 
 def _normalised_filename(value: str) -> str:
@@ -285,6 +288,7 @@ class SlskdRepository:
             raise ValueError("enqueue requires at least one file")
         username = files[0].username
         requested = [f.filename for f in files]
+        enqueued_at = time.time()
         async with self._enqueue_semaphore:
             payload = [{"filename": f.filename, "size": f.size} for f in files]
             result = await self._client.enqueue(username, payload)
@@ -301,6 +305,7 @@ class SlskdRepository:
             source="soulseek",
             username=username,
             filenames=self._accepted_filenames(result, requested),
+            enqueued_at=enqueued_at,
         )
 
     async def get_status(self, handle: TaskHandle) -> DownloadTaskStatus:
@@ -410,8 +415,16 @@ class SlskdRepository:
         )
         return lambda name: bool(pattern.match(name))
 
-    def _pick_in_dir(self, directory: Path, basename: str) -> Path | None:
-        """The exact filename in ``directory``, else its newest collision variant."""
+    def _pick_in_dir(
+        self, directory: Path, basename: str, written_after: float | None = None
+    ) -> Path | None:
+        """The exact filename in ``directory``, else its newest collision variant.
+
+        With ``written_after`` (the task's enqueue time) it is the first copy written
+        since then instead: an older exact-named file belongs to an earlier download.
+        """
+        if written_after is not None:
+            return self._first_written_since(directory, basename, written_after)
         exact = directory / basename
         try:
             if exact.exists() and _spelled_exactly_on_disk(exact):
@@ -435,6 +448,41 @@ class SlskdRepository:
             if mtime > newest_mtime:
                 newest, newest_mtime = candidate, mtime
         return newest
+
+    def _first_written_since(
+        self, directory: Path, basename: str, written_after: float
+    ) -> Path | None:
+        matches = self._collision_matcher(basename)
+        chosen: Path | None = None
+        chosen_mtime = float("inf")
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            return None
+        for candidate in entries:
+            if candidate.name == basename:
+                if not _spelled_exactly_on_disk(candidate):
+                    continue
+            elif not matches(candidate.name):
+                continue
+            try:
+                if not candidate.is_file():
+                    continue
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= written_after - _WRITTEN_AFTER_SLACK_SECONDS and mtime < chosen_mtime:
+                chosen, chosen_mtime = candidate, mtime
+        return chosen
+
+    @staticmethod
+    def _written_since(path: Path, written_after: float | None) -> bool:
+        if written_after is None:
+            return True
+        try:
+            return path.stat().st_mtime >= written_after - _WRITTEN_AFTER_SLACK_SECONDS
+        except OSError:
+            return False
 
     async def _remove_transfer_records(self, handle: TaskHandle) -> bool:
         transfers = await self._client.get_downloads(handle.username)
@@ -477,11 +525,38 @@ class SlskdRepository:
         the user is trying to click) whenever the mount was big or misconfigured, which
         reads as "it won't cancel and the whole app hangs"."""
         return await asyncio.to_thread(
-            self._locate_file, handle.username, remote_filename, size
+            self._locate_file,
+            handle.username,
+            remote_filename,
+            size,
+            handle.enqueued_at,
         )
 
     def _locate_file(
-        self, username: str, remote_filename: str, size: int | None = None
+        self,
+        username: str,
+        remote_filename: str,
+        size: int | None = None,
+        written_after: float | None = None,
+    ) -> Path | None:
+        """Resolve a finished transfer, never to a copy older than ``written_after``.
+
+        Every fallback below matches by name, so an earlier download's copy of the
+        same file would otherwise stand in for this one.
+        """
+        located = self._locate_file_by_name(
+            username, remote_filename, size, written_after
+        )
+        if located is not None and not self._written_since(located, written_after):
+            return None
+        return located
+
+    def _locate_file_by_name(
+        self,
+        username: str,
+        remote_filename: str,
+        size: int | None = None,
+        written_after: float | None = None,
     ) -> Path | None:
         """Resolve a finished transfer inside the mounted slskd downloads directory.
 
@@ -536,9 +611,13 @@ class SlskdRepository:
             candidate = _within_mount(directory / basename)
             if candidate is None:
                 return None
-            if candidate.is_file() and _spelled_exactly_on_disk(candidate):
+            if (
+                written_after is None
+                and candidate.is_file()
+                and _spelled_exactly_on_disk(candidate)
+            ):
                 return candidate
-            picked = self._pick_in_dir(candidate.parent, basename)
+            picked = self._pick_in_dir(candidate.parent, basename, written_after)
             return picked.resolve() if picked is not None else None
 
         def _name_matches(entry: Path) -> bool:

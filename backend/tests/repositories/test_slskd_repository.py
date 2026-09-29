@@ -4,7 +4,9 @@ and (username, filenames) status/cancel correlation."""
 
 import asyncio
 import logging
+import os
 import threading
+import time
 import sys
 import unicodedata
 from pathlib import Path
@@ -1648,6 +1650,73 @@ def test_locate_file_prefers_exact_name_over_variant(tmp_path):
     located = _mount_repo(tmp_path)._locate_file("alice", "@@p\\Album\\01 Song.flac")
 
     assert located == exact.resolve()
+
+
+def _written(path: Path, content: bytes, mtime: float) -> Path:
+    path.write_bytes(content)
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_picks_the_copy_this_attempt_wrote(tmp_path):
+    # Two attempts pulled the same album from the same peer: the first left
+    # "01 Song.flac", the second landed as a collision variant. Each attempt must
+    # resolve the copy it wrote - resolving the older exact name for the second one
+    # imported the wrong bytes and let cleanup delete the first attempt's file while
+    # the variant stayed on the mount forever.
+    album = tmp_path / "Album"
+    album.mkdir()
+    first = _written(album / "01 Song.flac", b"first", 1_000.0)
+    second = _written(album / "01 Song_639262802564659272.flac", b"second", 2_000.0)
+    repo = _mount_repo(tmp_path)
+    remote = "@@p\\Album\\01 Song.flac"
+
+    def handle(enqueued_at: float) -> TaskHandle:
+        return TaskHandle(
+            source="soulseek",
+            username="alice",
+            filenames=[remote],
+            enqueued_at=enqueued_at,
+        )
+
+    assert await repo.get_file_path(handle(900.0), remote) == first.resolve()
+    assert await repo.get_file_path(handle(1_500.0), remote) == second.resolve()
+    assert await repo.list_completed_files(handle(1_500.0)) == [second.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_refuses_copies_older_than_the_attempt(tmp_path):
+    album = tmp_path / "Album"
+    album.mkdir()
+    _written(album / "01 Song.flac", b"older attempt", 1_000.0)
+    handle = TaskHandle(
+        source="soulseek",
+        username="alice",
+        filenames=["@@p\\Album\\01 Song.flac"],
+        enqueued_at=5_000.0,
+    )
+
+    located = await _mount_repo(tmp_path).get_file_path(
+        handle, "@@p\\Album\\01 Song.flac"
+    )
+
+    assert located is None
+
+
+@pytest.mark.asyncio
+async def test_enqueue_stamps_the_handle_with_its_enqueue_time():
+    repo = SlskdRepository(
+        client=_ConcFake(), url="u", api_key="k", downloads_mount=Path("/dl")
+    )
+    before = time.time()
+
+    handle = await repo.enqueue(
+        _req([DownloadFileRef(username="alice", filename="f.flac", size=10)])
+    )
+
+    assert handle.enqueued_at is not None
+    assert before <= handle.enqueued_at <= time.time()
 
 
 def test_collision_matcher_rejects_lookalikes(tmp_path):

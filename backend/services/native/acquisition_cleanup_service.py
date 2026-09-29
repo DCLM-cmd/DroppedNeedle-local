@@ -326,13 +326,7 @@ class AcquisitionCleanupService:
 
         handle = attempt.handle
         if materialization.nzo_id and not handle.nzo_id:
-            handle = TaskHandle(
-                source=handle.source,
-                username=handle.username,
-                filenames=list(handle.filenames),
-                job_name=handle.job_name,
-                nzo_id=materialization.nzo_id,
-            )
+            handle = msgspec.structs.replace(handle, nzo_id=materialization.nzo_id)
         attempt = await self._record_and_validate_evidence(
             attempt,
             handle=handle,

@@ -79,6 +79,10 @@ class TaskHandle(AppStruct):
     # Plugin correlation id, written by plugin download clients at enqueue (mirrors
     # ``EnqueueRequest.payload``). soulseek/usenet leave it empty; additive defaulted.
     plugin_token: str = ""
+    # slskd: when the files were enqueued. A re-download of a name already on the mount
+    # lands as a collision variant, so the copy this task wrote is the first one written
+    # after this instant - not whichever copy happens to carry the exact name.
+    enqueued_at: float | None = None
 
 
 class DownloadTaskStatus(AppStruct):
