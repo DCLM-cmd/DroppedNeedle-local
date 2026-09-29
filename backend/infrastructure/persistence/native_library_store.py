@@ -11076,24 +11076,19 @@ class NativeLibraryStore(PersistenceBase):
                     "WHERE state IN ('queued','paused') "
                     "ORDER BY priority, enqueue_sequence LIMIT 1"
                 ).fetchone()
-            kept_local_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM library_identification_reviews "
-                    "WHERE state = 'keep_tagged'"
-                ).fetchone()[0]
-            )
-            needs_review_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM library_identification_reviews "
-                    "WHERE state = 'needs_review'"
-                ).fetchone()[0]
-            )
-            edition_to_confirm_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM library_identification_reviews "
-                    "WHERE state = 'edition_to_confirm'"
-                ).fetchone()[0]
-            )
+            # One aggregate for all review states keeps the snapshot a fixed,
+            # small statement set.
+            review_counts = connection.execute(
+                "SELECT "
+                "COALESCE(SUM(state = 'keep_tagged'), 0), "
+                "COALESCE(SUM(state = 'needs_review'), 0), "
+                "COALESCE(SUM(state = 'edition_to_confirm'), 0) "
+                "FROM library_identification_reviews "
+                "WHERE state IN ('keep_tagged','needs_review','edition_to_confirm')"
+            ).fetchone()
+            kept_local_count = int(review_counts[0])
+            needs_review_count = int(review_counts[1])
+            edition_to_confirm_count = int(review_counts[2])
             failure = connection.execute(
                 "SELECT id, terminal_at FROM library_identification_jobs "
                 "WHERE state = 'failed' ORDER BY terminal_at DESC, id DESC LIMIT 1"
@@ -19832,7 +19827,7 @@ class NativeLibraryStore(PersistenceBase):
                 "LEFT JOIN local_albums a ON a.id = r.local_album_id "
                 "LEFT JOIN local_tracks t ON t.id = r.local_track_id "
                 "LEFT JOIN local_tracks at ON at.id = (SELECT id FROM local_tracks "
-                "WHERE local_album_id = a.id ORDER BY id LIMIT 1) "
+                "WHERE a.id IS NOT NULL AND local_album_id = a.id ORDER BY +id LIMIT 1) "
                 "LEFT JOIN (SELECT local_album_id, COUNT(*) track_count, "
                 "SUM(metadata_incomplete) metadata_incomplete_count, MIN(relative_path) relative_path "
                 "FROM local_tracks GROUP BY local_album_id) stats ON stats.local_album_id = a.id "
@@ -20049,7 +20044,7 @@ class NativeLibraryStore(PersistenceBase):
                 "LEFT JOIN local_albums a ON a.id = r.local_album_id "
                 "LEFT JOIN local_tracks t ON t.id = r.local_track_id "
                 "LEFT JOIN local_tracks at ON at.id = (SELECT id FROM local_tracks "
-                "WHERE local_album_id = a.id ORDER BY id LIMIT 1) "
+                "WHERE a.id IS NOT NULL AND local_album_id = a.id ORDER BY +id LIMIT 1) "
                 "LEFT JOIN local_album_external_identities identity ON identity.local_album_id = a.id "
                 "LEFT JOIN library_identification_attempts attempt ON attempt.id = r.attempt_id "
                 "LEFT JOIN library_identification_jobs job ON job.id = (SELECT id FROM "

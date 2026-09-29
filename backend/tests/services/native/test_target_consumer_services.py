@@ -1419,6 +1419,7 @@ async def test_target_local_routes_cover_full_catalog_read_surface(
         get_advanced_settings=lambda: SimpleNamespace(
             cache_ttl_local_files_recently_added=120
         ),
+        is_library_download_allowed=lambda _role: True,
     )
     service = LocalFilesService(
         TargetLibraryRepository(store), preferences, InMemoryCache()
@@ -1426,6 +1427,12 @@ async def test_target_local_routes_cover_full_catalog_read_surface(
     app = FastAPI()
     app.include_router(local_library.router)
     app.dependency_overrides[get_local_files_service] = lambda: service
+    # The album/search/recent/match routes now resolve the caller and the
+    # download policy, so the read-surface probe needs both.
+    app.dependency_overrides[get_preferences_service] = lambda: preferences
+    app.dependency_overrides[_get_current_user] = lambda: mock_user(
+        role="user", user_id="user-1"
+    )
     client = build_test_client(app)
 
     responses = {
@@ -2193,7 +2200,8 @@ async def test_target_native_contract_separates_local_and_provider_ids_and_redir
     preferences = SimpleNamespace(
         get_download_policy=lambda: SimpleNamespace(
             quality_cutoff="lossless", upgrade_allowed=True
-        )
+        ),
+        is_library_download_allowed=lambda _role: True,
     )
     app = FastAPI()
     app.include_router(library_target.router)

@@ -123,6 +123,7 @@ from .service_providers import (  # noqa: F401
     get_library_filesystem_coordinator,
     get_background_workload_gate,
     get_target_library_scan_scheduler,
+    get_library_scan_wakeup,
     get_target_identification_queue,
     get_library_administrative_work_service,
     get_target_album_identification_service,

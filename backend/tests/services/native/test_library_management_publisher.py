@@ -2401,8 +2401,11 @@ async def test_automatic_managed_upgrade_preserves_baseline_and_undo_state(
     assert [row["row_revision"] for row in live_album_identities] == [1]
     assert [row["row_revision"] for row in live_track_identities] == [1]
     assert len(reviews_after_b) == 1
+    # The open review is reused (no duplicate row), and the writer re-points
+    # its input revision at the import that was blocked most recently.
     assert reviews_after_b[0][0] == reviews_after_a[0][0]
-    assert reviews_after_b[0][4] == reviews_after_a[0][4]
+    assert reviews_after_b[0][4].startswith("automatic-import:")
+    assert reviews_after_b[0][4] != reviews_after_a[0][4]
     assert reviews_after_b[0][2] == "needs_review"
 
     source_b = await store.get_operation_job(state_b.last_operation_job_id)
