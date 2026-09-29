@@ -1804,6 +1804,28 @@ class DownloadStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def complete_download_attempts_for_job(
+        self, *, source: str, job_name: str, now: float | None = None
+    ) -> int:
+        """Close the journal rows of a job whose workspace the orphan reconciler removed.
+
+        Without this they stayed ``needs_attention`` with nothing left to attend to,
+        and kept the cleanup health warning up for a folder that no longer exists.
+        """
+        timestamp = time.time() if now is None else now
+
+        def operation(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
+                "UPDATE download_attempts SET state='complete',lease_owner=NULL,"
+                "lease_expires_at=NULL,error_code=NULL,completed_at=?,updated_at=?,"
+                "row_revision=row_revision+1 "
+                "WHERE source=? AND job_name=? AND state<>'complete'",
+                (timestamp, timestamp, source, job_name),
+            )
+            return cursor.rowcount
+
+        return await self._write(operation)
+
     async def get_download_attempt_for_candidate(
         self, task_id: str, source: str, candidate_index: int
     ) -> DownloadAttempt | None:

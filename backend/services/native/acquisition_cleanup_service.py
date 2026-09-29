@@ -729,11 +729,17 @@ class AcquisitionCleanupService:
                 source="usenet",
                 task_id=task_id,
                 job_name=job_name,
-                # A legacy_unknown_task marker is a vacuous claim (the owning task was
-                # pruned before cleanup); don't let it pin an abandoned folder forever.
-                # The remaining checks below (task gone/inactive, no incomplete bundle,
-                # folder old, SAB job inactive) are the real safety gate.
-                ignore_error_codes=("legacy_unknown_task",),
+                # Claims nothing can ever resolve must not pin an abandoned folder
+                # forever: legacy_unknown_task (the owning task was pruned before
+                # cleanup) and fresh_workspace_evidence_missing (SABnzbd forgot the
+                # job, so the cleanup worker will not delete on the journal's word
+                # alone, and no user action exists for it). The remaining checks below
+                # (task gone/inactive, no incomplete bundle, folder old, SAB job
+                # inactive) are the real safety gate.
+                ignore_error_codes=(
+                    "legacy_unknown_task",
+                    "fresh_workspace_evidence_missing",
+                ),
             ):
                 return False
             task = await self._store.get_task(task_id)
@@ -803,6 +809,15 @@ class AcquisitionCleanupService:
             workspace,
             "orphan_reconcile",
         )
+        try:
+            if await self._store.complete_download_attempts_for_job(
+                source="usenet", job_name=job_name, now=now
+            ):
+                await self._refresh_health()
+        except Exception:  # noqa: BLE001 - the folder is gone; a stale row only warns
+            logger.warning(
+                "Could not close journal rows for removed %s", workspace, exc_info=True
+            )
         return True
 
     async def reconcile_slskd_orphans(

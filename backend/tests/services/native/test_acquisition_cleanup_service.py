@@ -1581,3 +1581,45 @@ async def test_attention_parked_by_an_old_identity_check_returns_to_cleanup(
     await service.run_once("cleanup")
     assert (await store.get_download_attempt(attempt.id)).state == "complete"
     assert not job.exists()
+
+
+@pytest.mark.asyncio
+async def test_orphan_reconcile_takes_folders_parked_for_forgotten_sab_jobs(
+    tmp_path: Path,
+):
+    """Once SABnzbd forgets a job the cleanup worker refuses to delete on the journal's
+    word alone (fresh_workspace_evidence_missing) and no user action resolves that, so
+    the row pinned the folder forever. The orphan reconciler's own gates decide it,
+    and the journal row is closed so the health warning clears with the folder."""
+    root = tmp_path / "sab"
+    task_id = "c" * 32
+    job_name = f"droppedneedle-{task_id}-0"
+    workspace = root / job_name
+    workspace.mkdir(parents=True)
+    (workspace / "album.flac").write_bytes(b"x")
+    _age_folder(workspace)
+    store = _store(tmp_path)
+    attempt = await store.create_download_attempt(
+        task_id=task_id,
+        source="usenet",
+        candidate_index=0,
+        job_name=job_name,
+        handle=TaskHandle(source="usenet", job_name=job_name),
+        now=1.0,
+    )
+    await store.transition_download_attempt(
+        attempt.id,
+        expected_row_revision=attempt.row_revision,
+        new_state="needs_attention",
+        now=2.0,
+        error_code="fresh_workspace_evidence_missing",
+    )
+    client = _Client(
+        DownloadMaterialization(state="missing", mount_root=str(root), mount_healthy=True)
+    )
+    service = _orphan_service(tmp_path, root, store, client)
+
+    assert await service.reconcile_orphan_folders() == 1
+    assert not workspace.exists()
+    closed = await store.get_download_attempt(attempt.id)
+    assert (closed.state, closed.error_code) == ("complete", None)
