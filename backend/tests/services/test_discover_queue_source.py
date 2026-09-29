@@ -409,11 +409,12 @@ class TestLastFmResolutionBehavior:
         from services.discover.mbid_resolution_service import MbidResolutionService
 
         events: list[tuple[str, object]] = []
+        release_hit = "00000000-0000-4000-8000-000000000001"
 
         mb_repo = AsyncMock()
 
         async def _rel_to_rg(mbid: str, **_kwargs):
-            return {"rel-hit": "rg-hit"}.get(mbid)
+            return {release_hit: "rg-hit"}.get(mbid)
 
         mb_repo.get_release_group_id_from_release = AsyncMock(side_effect=_rel_to_rg)
 
@@ -439,17 +440,21 @@ class TestLastFmResolutionBehavior:
             mb_canonical_store=canonical_store,
         )
 
-        # "rel-hit" resolves in the first gather; "rg-passthrough" falls through to the
-        # second gather - so both gathers run and ordering is observable.
+        # release_hit resolves from the release lookup; the second id has no release
+        # mapping and falls through to the RG-existence probe. The probe only runs
+        # for lookup-shaped ids, and inputs resolve in sorted order, so this id
+        # sorts after release_hit and its probe is observable after the first bank.
+        passthrough = "ffffffff-ffff-4fff-8fff-ffffffffffff"
         await svc.resolve_lastfm_release_group_mbids(
-            ["rel-hit", "rg-passthrough"], max_lookups=10
+            [release_hit, passthrough], max_lookups=10
         )
 
-        save_events = [e for e in events if e[0] == "save" and e[1].get("rel-hit")]
+        save_events = [e for e in events if e[0] == "save" and e[1].get(release_hit)]
         first_lookup = next(i for i, e in enumerate(events) if e[0] == "rg_lookup")
         assert save_events  # at least one persist happened
-        assert save_events[0][1] == {"rel-hit": "rg-hit"}
-        _ = first_lookup  # rg_lookup ordering is no longer observable via mock
+        assert save_events[0][1] == {release_hit: "rg-hit"}
+        assert events.index(save_events[0]) < first_lookup
+        assert events[first_lookup] == ("rg_lookup", passthrough)
 
 
 class TestLastFmQueueResilience:
