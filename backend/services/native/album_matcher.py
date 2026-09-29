@@ -191,15 +191,29 @@ class AlbumIdentifier:
         return (seeds + text_ranked)[:_MAX_CANDIDATE_RGS]
 
     async def release_tracks(
-        self, rg_id: str, target_count: int
+        self,
+        rg_id: str,
+        target_count: int,
+        *,
+        preferred_release_mbid: str | None = None,
     ) -> tuple[_ReleaseMeta, list[MBTrack]] | None:
         """Public wrapper over ``_best_release``: the release-group's best-fitting
         release and its tracklist, for callers (the drop importer) that need the
-        per-track metadata behind an identified or manually chosen release group."""
-        return await self._best_release(rg_id, target_count)
+        per-track metadata behind an identified or manually chosen release group.
+
+        ``preferred_release_mbid`` (the edition the files are tagged with) wins when
+        it belongs to the group: a handful of files says nothing about which edition
+        they came from, so counting them picks whichever edition is shortest."""
+        return await self._best_release(
+            rg_id, target_count, preferred_release_mbid=preferred_release_mbid
+        )
 
     async def _best_release(
-        self, rg_id: str, target_count: int
+        self,
+        rg_id: str,
+        target_count: int,
+        *,
+        preferred_release_mbid: str | None = None,
     ) -> tuple[_ReleaseMeta, list[MBTrack]] | None:
         """Pick the release whose track count is closest to the folder's, then fetch its tracklist."""
         try:
@@ -234,7 +248,13 @@ class AlbumIdentifier:
         # F-062: shared best-edition policy - identical ranking to the native
         # identification lane, including the consistent zero-track-count skip
         # (the old first-listed fallback is what made lanes drift).
-        release_id = select_edition(detail.get("releases") or [], target_count)
+        releases = detail.get("releases") or []
+        if preferred_release_mbid and any(
+            release.get("id") == preferred_release_mbid for release in releases
+        ):
+            release_id = preferred_release_mbid
+        else:
+            release_id = select_edition(releases, target_count)
         if release_id is None:
             return None
 

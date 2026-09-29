@@ -170,6 +170,14 @@ class _PlannedDropImport(NamedTuple):
     bonus: bool
 
 
+def _tagged_release(entries: list[_Entry]) -> str | None:
+    """The release every file is tagged with, when they all agree on one."""
+    releases = {entry.tag.musicbrainz_release_id for entry in entries}
+    if len(releases) == 1:
+        return next(iter(releases)) or None
+    return None
+
+
 def _strip_stage_prefix(stem: str) -> str:
     """Drop the NNN_ collision prefix create_job adds to staged uploads."""
     return re.sub(r"^\d{3}_", "", stem) or stem
@@ -320,7 +328,9 @@ class DropImportService:
         if not entries:
             raise ValidationError("The staged files no longer exist on disk")
 
-        picked = await self._identifier.release_tracks(rg, len(entries))
+        picked = await self._identifier.release_tracks(
+            rg, len(entries), preferred_release_mbid=_tagged_release(entries)
+        )
         if picked is None:
             raise ValidationError("Could not load that release group from MusicBrainz")
         meta, tracks = picked
@@ -777,7 +787,9 @@ class DropImportService:
             for e in entries
         ):
             forced, rejected = await self._score_against(
-                next(iter(tagged_rgs)), locals_
+                next(iter(tagged_rgs)),
+                locals_,
+                preferred_release_mbid=_tagged_release(entries),
             )
             if forced is not None:
                 return forced, False
@@ -805,7 +817,9 @@ class DropImportService:
         entry = entries[0]
         if entry.tag.musicbrainz_release_group_id:
             return await self._score_against(
-                entry.tag.musicbrainz_release_group_id, locals_
+                entry.tag.musicbrainz_release_group_id,
+                locals_,
+                preferred_release_mbid=_tagged_release(entries),
             )
         try:
             fp = await self._fingerprinter.fingerprint(entry.path)
@@ -838,14 +852,22 @@ class DropImportService:
         return match if match is not None and match_accepted(match) else None
 
     async def _score_against(
-        self, release_group_mbid: str, locals_: list[LocalTrack]
+        self,
+        release_group_mbid: str,
+        locals_: list[LocalTrack],
+        *,
+        preferred_release_mbid: str | None = None,
     ) -> tuple[_Identified | None, bool]:
         """Rescore one release group. The flag reports a forced-match rejection
         (F-01): a release was scored but failed the same acceptance gate tag
         identification applies (``match.accepted``, mirroring ``_try_identify``),
         so the caller routes review instead of organising. ``(None, False)`` is
         a plain miss with no release to judge."""
-        picked = await self._identifier.release_tracks(release_group_mbid, len(locals_))
+        picked = await self._identifier.release_tracks(
+            release_group_mbid,
+            len(locals_),
+            preferred_release_mbid=preferred_release_mbid,
+        )
         if picked is None:
             return None, False
         meta, tracks = picked

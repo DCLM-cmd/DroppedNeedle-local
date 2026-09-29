@@ -426,6 +426,38 @@ async def test_release_tracks_requests_artist_credit():
     assert meta.is_various is False
 
 
+@pytest.mark.parametrize(
+    ("preferred", "expected"),
+    [("rel-full", "rel-full"), ("rel-elsewhere", "rel-bootleg"), (None, "rel-bootleg")],
+)
+@pytest.mark.asyncio
+async def test_release_tracks_honours_a_preferred_edition_of_the_group(
+    preferred, expected
+):
+    # One file names its 16-track edition in its tags. Picking by file count alone
+    # chose the 10-track bootleg and filed the track under a different song.
+    repo = AsyncMock()
+    repo.get_release_group_by_id = AsyncMock(
+        return_value=_rg_detail(
+            "VULTURES 1",
+            "\u00a5$",
+            [
+                _release("rel-bootleg", [10], status="Bootleg"),
+                _release("rel-full", [16]),
+            ],
+        )
+    )
+    repo.get_release_by_id = AsyncMock(return_value=_release_tracks([["Song"]]))
+
+    picked = await AlbumIdentifier(repo).release_tracks(
+        "rg-vultures", 1, preferred_release_mbid=preferred
+    )
+
+    assert picked is not None
+    assert picked[0].release_mbid == expected
+    assert repo.get_release_by_id.await_args.args[0] == expected
+
+
 @pytest.mark.asyncio
 async def test_creditless_release_group_resolves_artist_without_claiming_various():
     async def release_group(_mbid, includes=None, priority=None):

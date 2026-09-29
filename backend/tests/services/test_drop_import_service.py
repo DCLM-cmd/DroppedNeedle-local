@@ -1280,6 +1280,41 @@ async def test_tier1_and_single_file_rejected_forced_match_routes_needs_review(
 
 
 @pytest.mark.asyncio
+async def test_tagged_release_is_the_edition_a_drop_is_scored_against(tmp_path):
+    # A lone file tagged with its release must be matched against that edition, not
+    # whichever edition's track count happens to sit closest to one file.
+    tagger = FakeTagger(
+        {
+            "Song One.flac": (
+                AudioTag(
+                    title="Song One",
+                    artist="Test Artist",
+                    album="Test Album",
+                    track_number=1,
+                    musicbrainz_release_group_id="rg-1",
+                    musicbrainz_release_id="rel-tagged",
+                    musicbrainz_recording_id="rec-1",
+                ),
+                _info(),
+            ),
+        }
+    )
+    service, store, _library, _root = _build_service(tmp_path, tagger)
+    upload = tmp_path / "single.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("lone/Song One.flac", b"c" * 64)
+
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("single.zip", upload)]
+    )
+    await _wait_job(store, job.id)
+
+    service._identifier.release_tracks.assert_awaited_with(
+        "rg-1", 1, preferred_release_mbid="rel-tagged"
+    )
+
+
+@pytest.mark.asyncio
 async def test_free_music_album_origin_inherits_forced_gate_but_keeps_manual_match(
     tmp_path,
 ):
