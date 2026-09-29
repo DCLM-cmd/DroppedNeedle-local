@@ -39,7 +39,11 @@ from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
 from infrastructure.sse_publisher import SSEPublisher
 from models.acquisition_quality import AcquisitionQualitySnapshot
-from models.download_identity import SOURCE_SOULSEEK, soulseek_folder_identity
+from models.download_identity import (
+    SOURCE_SOULSEEK,
+    delivered_identities,
+    soulseek_folder_identity,
+)
 from services.native.acquisition import quality as acq_quality
 from services.native.acquisition.scoring_core import (
     artist_words,
@@ -2487,9 +2491,7 @@ class DownloadOrchestrator:
                 )
                 if normalized and (
                     SOURCE_SOULSEEK,
-                    soulseek_folder_identity(
-                        task.release_group_mbid, normalized
-                    ),
+                    soulseek_folder_identity(task.release_group_mbid, normalized),
                 ) in folder_blocked:
                     return False
             # re-gate: failover must not fall through to a now out-of-policy candidate (D2)
@@ -3116,6 +3118,15 @@ class DownloadOrchestrator:
                 attempt_id = attempt.id
                 disposition = process_result.workspace_disposition
                 bundle_ids = list(process_result.publisher_bundle_ids)
+        if status == DownloadStatus.COMPLETED:
+            # Pin what this task actually delivered, by its source blocklist identity,
+            # while the search-job candidate is still on hand. The candidates blob is
+            # pruned after a week, so "Never accept this release again" - which runs
+            # whenever the user later removes the album - can only block reliably if the
+            # identity was captured now, not re-derived from a job that may be long gone.
+            delivered = await self._delivered_blocklist_json(task)
+            if delivered is not None:
+                fields["delivered_blocklist_json"] = delivered
         await self._store.finalize_task_and_attempt(
             task.id,
             status,
@@ -3163,6 +3174,23 @@ class DownloadOrchestrator:
                 track_count=present,
                 source=getattr(task, "source", "") or "",
             )
+
+    async def _delivered_blocklist_json(self, task) -> str | None:  # noqa: ANN001
+        """``[[source, identity], ...]`` of the delivered candidate, JSON-encoded for
+        the task's durable ``delivered_blocklist_json`` column, or None when the
+        candidate can't be resolved (nothing to pin)."""
+        if task.search_job_id is None or task.candidate_index is None:
+            return None
+        try:
+            candidates = await self._store.get_search_job_candidates(task.search_job_id)
+        except Exception:  # noqa: BLE001 - a missing job just means nothing to pin
+            return None
+        if not 0 <= task.candidate_index < len(candidates):
+            return None
+        identities = delivered_identities(candidates[task.candidate_index])
+        if not identities:
+            return None
+        return msgspec.json.encode([[s, i] for s, i in identities]).decode()
 
     async def _sync_request_on_terminal(self, task, status: str) -> None:  # noqa: ANN001
         """Bridge a terminal download status into its exact request generation."""

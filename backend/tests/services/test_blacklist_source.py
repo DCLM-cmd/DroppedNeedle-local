@@ -6,6 +6,7 @@ wanted. Nothing in the pipeline can detect that, so nothing else will ever stop 
 same release being picked again.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,7 +14,13 @@ import pytest
 
 from core.exceptions import ValidationError
 from models.download import DownloadTask, ScoredCandidate
-from models.download_identity import soulseek_identity, usenet_identity
+from models.download_identity import (
+    SOURCE_SOULSEEK,
+    SOURCE_USENET,
+    delivered_identities,
+    soulseek_identity,
+    usenet_identity,
+)
 from repositories.protocols.download_client import DownloadSearchResult
 from services.native.download_service import ORIGIN_REPLACEMENT
 
@@ -100,6 +107,50 @@ async def test_nothing_delivered_is_reported_not_silently_accepted():
 
     with pytest.raises(ValidationError, match="No completed download"):
         await service.blacklist_album_source("rg-1", "u1", "admin")
+
+
+@pytest.mark.asyncio
+async def test_pinned_identity_blocks_even_after_the_search_job_is_pruned():
+    """The bug this fixes: an album removed weeks after it landed has, by then, lost
+    its search job to the 7-day prune, so re-deriving the delivered identity yielded
+    nothing and the block silently did nothing. The identity pinned on the task at
+    completion must block on its own, without ever touching the job."""
+    service, store, *_ = _make_service()
+    pinned = usenet_identity("JID-The Forever Story (Extended Version)-WEB-FLAC", 499)
+    store.list_tasks.return_value = [
+        _task(
+            source="usenet",
+            delivered_blocklist_json=json.dumps([[SOURCE_USENET, pinned]]),
+        )
+    ]
+    store.get_search_job_candidates.return_value = []  # pruned - would block nothing
+
+    result = await service.blacklist_album_source("rg-1", "u1", "admin")
+
+    assert result["blocked"] == 1
+    assert store.record_quarantine.await_args_list[0].kwargs["identity"] == pinned
+    store.get_search_job_candidates.assert_not_awaited()
+
+
+def test_delivered_identities_helper_usenet_and_soulseek():
+    usenet = ScoredCandidate(
+        source="usenet",
+        usenet_release=SimpleNamespace(title="Album-WEB-FLAC", size_bytes=500),
+    )
+    assert delivered_identities(usenet) == [
+        (SOURCE_USENET, usenet_identity("Album-WEB-FLAC", 500))
+    ]
+
+    soulseek = ScoredCandidate(
+        source="soulseek",
+        username="peer",
+        files=[_file("A/01.flac"), _file("")],  # blank filename dropped
+    )
+    assert delivered_identities(soulseek) == [
+        (SOURCE_SOULSEEK, soulseek_identity("peer", "A/01.flac"))
+    ]
+    # a usenet candidate with no release yields nothing to block, not a crash
+    assert delivered_identities(ScoredCandidate(source="usenet")) == []
 
 
 @pytest.mark.asyncio

@@ -1207,6 +1207,9 @@ class AlbumService:
                 ),
                 None,
             )
+            # A stored identity naming a superseded CENSORED release loses to the
+            # ranking (see the docstring), so the library stops asking for the clean
+            # cut forever. A manual pin above still wins.
             if owned_match is not None and not self._is_superseded_clean_edition(
                 owned_match, releases, ranked_releases
             ):

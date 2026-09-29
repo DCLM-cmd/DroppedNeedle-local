@@ -204,6 +204,11 @@ class DownloadTask(AppStruct):
     quality_certainty: str | None = None
     quality_provenance: str | None = None
     manual_quality_override: bool = False
+    # JSON ``[[source, identity], ...]`` of what this task actually delivered,
+    # pinned at completion so "Never accept this release again" can blocklist it
+    # even after the ephemeral search job (candidates blob) has been pruned. None
+    # on legacy/unfinished rows, which fall back to re-deriving from the job.
+    delivered_blocklist_json: str | None = None
     staging_path: str | None = None
     final_path: str | None = None
     error_message: str | None = None

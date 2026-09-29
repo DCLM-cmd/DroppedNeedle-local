@@ -29,6 +29,10 @@ class _LibraryStore:
         self.records: dict[str, SimpleNamespace] = {}
         self.journals: dict[str, list[SimpleNamespace]] = {}
         self.task_bundles: dict[str, list[SimpleNamespace]] = {}
+        self.committed_fingerprints: set[str] = set()
+
+    async def committed_import_source_fingerprints(self, fingerprints):
+        return {value for value in fingerprints if value in self.committed_fingerprints}
 
     async def get_library_management_import_bundle(self, bundle_id: str):
         if bundle_id in self.records:
@@ -1267,3 +1271,202 @@ async def test_orphan_reconcile_honours_publisher_barrier(tmp_path: Path):
     assert await service.reconcile_orphan_folders() == 0
     assert workspace.exists()
     assert client.discarded == 0
+
+
+def _slskd_service(
+    store: DownloadStore,
+    library: _LibraryStore,
+    mount: Path,
+) -> AcquisitionCleanupService:
+    return AcquisitionCleanupService(
+        store,
+        library,
+        lambda source: _Client(
+            DownloadMaterialization(state="missing", mount_healthy=True)
+        ),
+        lambda: mount / "unused-sab",
+        slskd_mount_getter=lambda: mount,
+    )
+
+
+def _write_stale_track(path: Path, content: bytes) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    _age_folder(path)
+    return hashlib.sha256(content).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_removes_fully_imported_folder(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    folder = mount / "peer" / "Artist - Album"
+    fa = _write_stale_track(folder / "01.flac", b"track-one")
+    fb = _write_stale_track(folder / "02.flac", b"track-two")
+    _age_folder(folder)
+    _age_folder(mount / "peer")
+    library = _LibraryStore()
+    library.committed_fingerprints = {fa, fb}
+    service = _slskd_service(_store(tmp_path), library, mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == [str(mount / "peer")]
+    assert result.kept == []
+    assert not folder.exists()
+    assert not (mount / "peer").exists()
+    assert mount.exists()  # the mount itself is never removed
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_keeps_folder_with_unimported_track(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    folder = mount / "Artist - Album"
+    fa = _write_stale_track(folder / "01.flac", b"imported")
+    _write_stale_track(folder / "02.flac", b"never-imported")
+    _age_folder(folder)
+    library = _LibraryStore()
+    library.committed_fingerprints = {fa}  # second track absent from the library
+    service = _slskd_service(_store(tmp_path), library, mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == []
+    assert result.kept == [(str(folder), "unimported_audio")]
+    assert folder.exists()
+    assert (folder / "01.flac").exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_keeps_recently_modified_folder(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    folder = mount / "Artist - Album"
+    folder.mkdir(parents=True)
+    content = b"fresh-download"
+    (folder / "01.flac").write_bytes(content)  # fresh mtime, below the age floor
+    library = _LibraryStore()
+    library.committed_fingerprints = {hashlib.sha256(content).hexdigest()}
+    service = _slskd_service(_store(tmp_path), library, mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == []
+    assert result.kept == [(str(folder), "recently_modified")]
+    assert folder.exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_dry_run_reports_without_deleting(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    folder = mount / "Artist - Album"
+    fa = _write_stale_track(folder / "01.flac", b"only-track")
+    _age_folder(folder)
+    library = _LibraryStore()
+    library.committed_fingerprints = {fa}
+    service = _slskd_service(_store(tmp_path), library, mount)
+
+    result = await service.reconcile_slskd_orphans(dry_run=True)
+
+    assert result.dry_run is True
+    assert result.removed == [str(folder)]
+    assert folder.exists()  # dry run never touches disk
+    assert (folder / "01.flac").exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_removes_imported_album_but_keeps_sibling(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    peer = mount / "peer"
+    imported = peer / "Imported Album"
+    unimported = peer / "Unimported Album"
+    fa = _write_stale_track(imported / "01.flac", b"imported-track")
+    _write_stale_track(unimported / "01.flac", b"unimported-track")
+    for path in (imported, unimported, peer):
+        _age_folder(path)
+    library = _LibraryStore()
+    library.committed_fingerprints = {fa}
+    service = _slskd_service(_store(tmp_path), library, mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == [str(imported)]
+    assert not imported.exists()
+    assert unimported.exists()  # the peer folder and its unimported album survive
+    assert peer.exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_noop_without_mount_getter(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    (mount / "Album").mkdir(parents=True)
+    service = AcquisitionCleanupService(
+        _store(tmp_path),
+        _LibraryStore(),
+        lambda source: _Client(
+            DownloadMaterialization(state="missing", mount_healthy=True)
+        ),
+        lambda: mount / "unused-sab",
+    )
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result == ([], [], 0, False)
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_prunes_old_empty_folder(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    empty = mount / "Leftover Skeleton"
+    empty.mkdir(parents=True)
+    _age_folder(empty)
+    service = _slskd_service(_store(tmp_path), _LibraryStore(), mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == [str(empty)]
+    assert not empty.exists()
+    assert mount.exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_keeps_fresh_empty_folder(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    empty = mount / "In Progress"
+    empty.mkdir(parents=True)  # fresh mtime: could be a download about to land
+    service = _slskd_service(_store(tmp_path), _LibraryStore(), mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == []
+    assert empty.exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_keeps_folder_with_only_non_audio(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    folder = mount / "Just Artwork"
+    folder.mkdir(parents=True)
+    (folder / "cover.jpg").write_bytes(b"art")
+    _age_folder(folder / "cover.jpg")
+    _age_folder(folder)
+    service = _slskd_service(_store(tmp_path), _LibraryStore(), mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    assert result.removed == []
+    assert folder.exists()
+
+
+@pytest.mark.asyncio
+async def test_slskd_reconcile_prunes_nested_empty_tree(tmp_path: Path):
+    mount = tmp_path / "slskd"
+    nested = mount / "Peer" / "Album" / "Disc 1"
+    nested.mkdir(parents=True)
+    for path in (nested, nested.parent, nested.parent.parent):
+        _age_folder(path)
+    service = _slskd_service(_store(tmp_path), _LibraryStore(), mount)
+
+    result = await service.reconcile_slskd_orphans()
+
+    # The whole empty branch collapses to a single top-level removal.
+    assert result.removed == [str(mount / "Peer")]
+    assert not (mount / "Peer").exists()

@@ -271,6 +271,18 @@ async def run_acquisition_orphan_reconcile_periodically(
         except Exception:  # noqa: BLE001 - durable worker survives one failed sweep
             logger.exception("Acquisition orphan reconcile sweep failed")
         try:
+            service = get_cleanup_service()
+            result = await service.reconcile_slskd_orphans()
+            if result.removed:
+                logger.info(
+                    "slskd orphan reconcile removed %d verified folder(s)",
+                    len(result.removed),
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001 - durable worker survives one failed sweep
+            logger.exception("slskd orphan reconcile sweep failed")
+        try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
             break

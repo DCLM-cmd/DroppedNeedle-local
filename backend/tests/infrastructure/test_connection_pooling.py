@@ -12,8 +12,10 @@ import threading
 
 import pytest
 
-from infrastructure.persistence import _database
-from infrastructure.persistence._database import PersistenceBase
+from infrastructure.persistence._database import (
+    PersistenceBase,
+    close_pooled_connections,
+)
 
 
 class _Store(PersistenceBase):
@@ -40,7 +42,9 @@ class _Store(PersistenceBase):
 
 @pytest.fixture
 def store(tmp_path):
-    return _Store(tmp_path / "pool.db", threading.Lock())
+    made = _Store(tmp_path / "pool.db", threading.Lock())
+    yield made
+    close_pooled_connections()
 
 
 @pytest.mark.asyncio
@@ -51,6 +55,8 @@ async def test_queries_reuse_connections_instead_of_opening_one_each(store):
     per pool thread, not one overall - asserting exactly one would be asserting
     which thread the executor happened to pick.
     """
+    from infrastructure.persistence._database import _DB_EXECUTOR_WORKERS
+
     seen: set[int] = set()
 
     def operation(conn: sqlite3.Connection) -> None:
@@ -60,7 +66,7 @@ async def test_queries_reuse_connections_instead_of_opening_one_each(store):
     for _ in range(queries):
         await store._read(operation)
 
-    assert len(seen) <= _database._DB_EXECUTOR._max_workers  # type: ignore[attr-defined]
+    assert len(seen) <= _DB_EXECUTOR_WORKERS
     assert len(seen) < queries / 10
 
 
@@ -127,7 +133,10 @@ async def test_each_thread_gets_its_own_connection(store):
             seen.append(id(conn))
 
     def in_thread() -> None:
-        store._execute(operation, False)
+        try:
+            store._execute(operation, False)
+        finally:
+            close_pooled_connections()
 
     threads = [threading.Thread(target=in_thread) for _ in range(4)]
     for thread in threads:

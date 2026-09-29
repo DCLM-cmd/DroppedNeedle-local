@@ -300,7 +300,66 @@ async def test_legacy_check_migration_preserves_rows_and_admits_resolved(
     assert record.row_revision == 2
     journals = await store.list_library_management_import_journals("bundle-1")
     assert [journal.state for journal in journals] == ["needs_attention"]
+
+    # Regression: the resolved-state rebuild once recreated the bundles table
+    # without the fork's acknowledged_at column, so recovery diagnostics
+    # crashed with "no such column: acknowledged_at" (the "Recovery Status is
+    # unavailable" prod failure). The rebuild must carry the column through.
+    with sqlite3.connect(db_path) as connection:
+        bundle_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(library_management_import_bundles)"
+            )
+        }
+    assert "acknowledged_at" in bundle_columns
+    diagnostics = await store.library_management_recovery_diagnostics()
+    assert diagnostics["needs_attention_count"] == 1
+
     resolved = await store.resolve_library_management_import_bundle(
         "bundle-1", updated_at=3.0
     )
     assert resolved.state == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_committed_import_source_fingerprints_filters_by_state(
+    db_path: Path,
+) -> None:
+    store = NativeLibraryStore(db_path, threading.Lock())
+    await store.ensure_library_management_import_bundle(_bundle())
+    committed = {"a" * 64: "completed", "b" * 64: "cleanup_pending", "c" * 64: "catalog_committed"}
+    uncommitted = {"d" * 64: "needs_attention", "e" * 64: "rolled_back", "f" * 64: "planned"}
+    with sqlite3.connect(db_path) as connection:
+        for ordinal, (fingerprint, state) in enumerate(
+            {**committed, **uncommitted}.items()
+        ):
+            connection.execute(
+                "INSERT INTO library_management_import_journal "
+                "(bundle_id,ordinal,state,source_fingerprint,source_size,"
+                "source_mtime_ns,temporary_relative_path,destination_root_id,"
+                "destination_relative_path,staged_fingerprint,created_at,"
+                "updated_at,row_revision) "
+                "VALUES ('bundle-1',?,?,?,10,5,?, 'root-1',?, ?,1,1,1)",
+                (
+                    ordinal,
+                    state,
+                    fingerprint,
+                    f"tmp-{ordinal}.flac",
+                    f"Artist/Album/{ordinal:02d}.flac",
+                    "0" * 64,
+                ),
+            )
+        connection.commit()
+
+    matched = await store.committed_import_source_fingerprints(
+        [*committed, *uncommitted, "9" * 64]
+    )
+
+    assert matched == set(committed)
+
+
+@pytest.mark.asyncio
+async def test_committed_import_source_fingerprints_empty_input(db_path: Path) -> None:
+    store = NativeLibraryStore(db_path, threading.Lock())
+    assert await store.committed_import_source_fingerprints([]) == set()

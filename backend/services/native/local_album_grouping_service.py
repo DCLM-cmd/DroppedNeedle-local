@@ -86,13 +86,13 @@ def grouping_track_from_row(row: dict) -> GroupingTrack:
             if not raw_album_artist_name and album_artist_provenance == "parsed"
             else raw_album_artist_name
         ),
+        album_artists=_album_artists_from_row(row),
         title_provenance=resolve_provenance(
             row.get("title_provenance"),
             derive_title_artist_provenance(title, artist_name, stem),
         ),
         album_title_provenance=album_title_provenance,
         album_artist_provenance=album_artist_provenance,
-        album_artists=_album_artists_from_row(row),
         artist_sort_name=row["artist_sort"],
         album_artist_sort_name=row["album_artist_sort"],
         track_number=int(row["track_number"] or 0),

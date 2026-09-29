@@ -99,7 +99,7 @@ class LibraryOperationSupervisor:
                     return await self._operations.get(operation_id)
             return None
         try:
-            return await self._dispatch(job, worker_id, timestamp, now)
+            return await self._dispatch_claimed(job, worker_id, timestamp, now=now)
         except asyncio.CancelledError:
             # R-04: release the 60s claim so the job is immediately
             # reclaimable instead of sitting running until lease expiry. One
@@ -170,8 +170,13 @@ class LibraryOperationSupervisor:
             return None
         return self._operations._response(row)
 
-    async def _dispatch(
-        self, job: dict, worker_id: str, timestamp: float, now: float | None
+    async def _dispatch_claimed(
+        self,
+        job: dict,
+        worker_id: str,
+        timestamp: float,
+        *,
+        now: float | None,
     ) -> OperationResponse | None:
         if job["kind"] == "explicit_reidentification":
             row = await self._reidentification.run_claimed(

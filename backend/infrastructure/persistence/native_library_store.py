@@ -1948,6 +1948,7 @@ class NativeLibraryStore(PersistenceBase):
                         'rolled_back','needs_attention','resolved'
                     )),
                     result_json TEXT NOT NULL DEFAULT '{}',
+                    acknowledged_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     row_revision INTEGER NOT NULL DEFAULT 1
@@ -1959,12 +1960,12 @@ class NativeLibraryStore(PersistenceBase):
                 """
                 INSERT INTO library_management_import_bundles__resolved_v1 (
                     id, idempotency_key, origin, policy_revision, request_json,
-                    request_hash, state, result_json, created_at, updated_at,
+                    request_hash, state, result_json, acknowledged_at, created_at, updated_at,
                     row_revision
                 )
                 SELECT
                     id, idempotency_key, origin, policy_revision, request_json,
-                    request_hash, state, result_json, created_at, updated_at,
+                    request_hash, state, result_json, acknowledged_at, created_at, updated_at,
                     row_revision
                 FROM library_management_import_bundles
                 """
@@ -2227,6 +2228,20 @@ class NativeLibraryStore(PersistenceBase):
                     if "duplicate column name" not in str(error).casefold():
                         raise
             self._ensure_library_management_import_resolved_state(connection)
+            # The resolved-state rebuild above (upstream) predates the fork's
+            # acknowledged_at column on import bundles and copies without it, so a DB
+            # rebuilt before this fix silently lost the column - and the rebuild's
+            # guard then refuses to run again. Re-add it here idempotently so an
+            # already-migrated DB is repaired and the recovery-diagnostics query
+            # (acknowledged_at IS NULL) stops raising OperationalError.
+            try:
+                connection.execute(
+                    "ALTER TABLE library_management_import_bundles "
+                    "ADD COLUMN acknowledged_at REAL"
+                )
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error).casefold():
+                    raise
             conversion_columns = {
                 str(row[1])
                 for row in connection.execute(
@@ -17704,10 +17719,15 @@ class NativeLibraryStore(PersistenceBase):
     ) -> None:
         """Move live-facing album references while retaining historical audit rows."""
 
+        # A self-referential alias (alias == local_album_id == retired_album_id) is
+        # degenerate bookkeeping, not a genuine conflict: the retired album's alias
+        # merely points at itself. Excluding it lets the UPDATE below retarget it onto
+        # the survivor; treating it as a conflict wedges the hygiene repair forever
+        # (WORKER_ERROR -> work item stuck 'running' -> finalize never terminalizes).
         conflicting_alias = connection.execute(
             "SELECT local_album_id FROM local_album_aliases WHERE alias = ? "
-            "AND local_album_id != ?",
-            (retired_album_id, surviving_album_id),
+            "AND local_album_id NOT IN (?, ?)",
+            (retired_album_id, surviving_album_id, retired_album_id),
         ).fetchone()
         if conflicting_alias is not None:
             raise ConflictError("A retired album ID already resolves to another album.")
@@ -25975,6 +25995,42 @@ class NativeLibraryStore(PersistenceBase):
                 )
                 for row in rows
             ]
+
+        return await self._read(operation)
+
+    async def committed_import_source_fingerprints(
+        self, fingerprints: Iterable[str]
+    ) -> set[str]:
+        """Return the subset of ``fingerprints`` a committed import journal owns.
+
+        A ``source_fingerprint`` recorded on a journal row that reached a
+        catalog-committed state (``catalog_committed``/``cleanup_pending``/
+        ``completed``) proves a byte-identical file was imported into the library
+        and the catalog kept it. An untracked download copy carrying that exact
+        content is therefore redundant debris that the slskd orphan reconciler may
+        remove. Rolled-back or still-in-flight rows never count, so a download that
+        was never successfully imported can never match. Fail-closed by design: an
+        unknown fingerprint is simply absent from the result.
+        """
+        unique = {value for value in fingerprints if value}
+        if not unique:
+            return set()
+
+        def operation(connection: sqlite3.Connection) -> set[str]:
+            found: set[str] = set()
+            ordered = list(unique)
+            for start in range(0, len(ordered), 500):
+                chunk = ordered[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    "SELECT DISTINCT source_fingerprint "
+                    "FROM library_management_import_journal "
+                    "WHERE state IN ('catalog_committed','cleanup_pending','completed') "
+                    f"AND source_fingerprint IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchall()
+                found.update(str(row[0]) for row in rows)
+            return found
 
         return await self._read(operation)
 

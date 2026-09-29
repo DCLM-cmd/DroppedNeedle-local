@@ -444,6 +444,7 @@ _TASK_UPDATABLE = frozenset(
         "quality_certainty",
         "quality_provenance",
         "manual_quality_override",
+        "delivered_blocklist_json",
         "staging_path",
         "final_path",
         "error_message",
@@ -653,6 +654,7 @@ class DownloadStore(PersistenceBase):
                     quality_certainty TEXT,
                     quality_provenance TEXT,
                     manual_quality_override INTEGER NOT NULL DEFAULT 0,
+                    delivered_blocklist_json TEXT,
                     staging_path TEXT,
                     final_path TEXT,
                     error_message TEXT,
@@ -724,6 +726,7 @@ class DownloadStore(PersistenceBase):
                 ("quality_certainty", "TEXT"),
                 ("quality_provenance", "TEXT"),
                 ("manual_quality_override", "INTEGER NOT NULL DEFAULT 0"),
+                ("delivered_blocklist_json", "TEXT"),
                 ("wrong_product_verdict_at", "REAL"),
                 ("wrong_product_detail", "TEXT"),
             ):
@@ -1756,7 +1759,12 @@ class DownloadStore(PersistenceBase):
         return await self._read(operation)
 
     async def has_download_cleanup_debt(
-        self, *, source: str, task_id: str, job_name: str
+        self,
+        *,
+        source: str,
+        task_id: str,
+        job_name: str,
+        ignore_error_codes: tuple[str, ...] = (),
     ) -> bool:
         """True when any attempt-journal row still owns this job's mount workspace.
 
@@ -1765,16 +1773,30 @@ class DownloadStore(PersistenceBase):
         debt, preserved/needs_attention mean the bytes must stay. Only ``complete``
         releases the name; a folder left behind under a completed name is debris no
         claim query will ever pick up.
+
+        ``ignore_error_codes`` excludes give-up markers whose ownership claim is
+        vacuous: a ``legacy_unknown_task`` row means the reconciler could not even
+        identify the owning task (it was pruned), so it is not real cleanup debt and
+        must not permanently block the orphan reconciler - whose own safety gate
+        (task gone, no incomplete bundles, folder old, client job inactive) then
+        decides the folder.
         """
 
         def operation(conn: sqlite3.Connection) -> bool:
-            row = conn.execute(
-                """SELECT 1 FROM download_attempts
-                   WHERE ((source=? AND job_name=?) OR task_id=?)
-                     AND state<>'complete'
-                   LIMIT 1""",
-                (source, job_name, task_id),
-            ).fetchone()
+            query = (
+                "SELECT 1 FROM download_attempts "
+                "WHERE ((source=? AND job_name=?) OR task_id=?) "
+                "AND state<>'complete'"
+            )
+            params: list[Any] = [source, job_name, task_id]
+            if ignore_error_codes:
+                placeholders = ",".join("?" for _ in ignore_error_codes)
+                query += (
+                    f" AND (error_code IS NULL OR error_code NOT IN ({placeholders}))"
+                )
+                params.extend(ignore_error_codes)
+            query += " LIMIT 1"
+            row = conn.execute(query, tuple(params)).fetchone()
             return row is not None
 
         return await self._read(operation)

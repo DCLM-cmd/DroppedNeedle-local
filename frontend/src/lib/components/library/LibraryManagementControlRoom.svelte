@@ -589,7 +589,7 @@
 			{#if recoveryQuery.data && recoveryQuery.data.needs_attention_count}<div
 					class="alert alert-warning items-start"
 				>
-					<TriangleAlert class="mt-0.5 h-5 w-5" /><span class="flex-1"
+					<TriangleAlert class="mt-0.5 h-5 w-5" /><span
 						><strong>Recovery needs attention</strong><br />{recoveryQuery.data
 							.needs_attention_count} bundles need review; {recoveryQuery.data
 							.cleanup_pending_count} have safe cleanup pending. No uncertain file is deleted automatically.
@@ -609,14 +609,16 @@
 									onclick={() => void resolveNeedsAttentionBundle(bundle.bundle_id)}
 									>Mark {bundle.bundle_id} as handled</button
 								>{/each}
+							<!-- Fork fallback: clears alerts even when destination+backup are both
+								gone, which the on-disk-verifying resolve above cannot. -->
+							<button
+								type="button"
+								class="btn btn-sm"
+								disabled={acknowledgeRecovery.isPending}
+								onclick={() => acknowledgeRecovery.mutate()}
+								>{acknowledgeRecovery.isPending ? 'Dismissing...' : 'Dismiss all'}</button
+							>
 						</div>{/if}
-					{#if recoveryQuery.data.needs_attention_count}<button
-							type="button"
-							class="btn btn-sm"
-							disabled={acknowledgeRecovery.isPending}
-							onclick={() => acknowledgeRecovery.mutate()}
-							>{acknowledgeRecovery.isPending ? 'Dismissing...' : 'Dismiss'}</button
-						>{/if}
 				</div>{:else if recoveryUnavailable}<div class="alert alert-error items-start" role="alert">
 					<TriangleAlert class="mt-0.5 h-5 w-5" /><span
 						><strong>Recovery status is unavailable</strong><br />Do not start new file writes until

@@ -1079,9 +1079,10 @@ class LibraryInventoryScanner:
                 # discovery generation so discovered_count counts distinct
                 # files even when an alias batch lands after its target's.
                 resolved_path, stat_result = item
-                # Resolved path, resolved root: the producer yields fully resolved
-                # paths, so measuring them against the raw root fails outright wherever
-                # the root is reached through a symlink.
+                # NFC-normalized key (upstream) measured against the RESOLVED root
+                # (fork): the producer yields fully resolved paths, so measuring them
+                # against the raw root fails outright wherever the root is reached
+                # through a symlink.
                 relative_key = LibraryInventoryScanner._inventory_key(
                     resolved_path, resolved_root
                 )
