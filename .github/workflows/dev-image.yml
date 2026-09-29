@@ -12,6 +12,7 @@ on:
       - 'frontend/package.json'
       - 'frontend/pnpm-lock.yaml'
       - '.github/workflows/dev-image.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -108,17 +109,24 @@ jobs:
         id: date
         run: echo "timestamp=$(git log -1 --pretty=%cI)" >> "$GITHUB_OUTPUT"
 
+      # Publish under the namespace of the repository running the workflow: the
+      # GITHUB_TOKEN of a fork cannot push to ghcr.io/droppedneedle, so a fixed
+      # upstream name failed every fork build at the push step.
       - name: Set image tags
         env:
           SHORT_SHA: ${{ steps.sha.outputs.short }}
         run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
           {
             echo "TAGS<<EOF"
-            echo "ghcr.io/droppedneedle/droppedneedle:dev"
-            echo "ghcr.io/droppedneedle/droppedneedle:dev-$SHORT_SHA"
+            echo "$image:dev"
+            echo "$image:dev-$SHORT_SHA"
+            echo "$image:latest"
             if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
-              echo "droppedneedle/droppedneedle:dev"
-              echo "droppedneedle/droppedneedle:dev-$SHORT_SHA"
+              hub="${DOCKERHUB_USERNAME,,}/${GITHUB_REPOSITORY#*/}"
+              hub="${hub,,}"
+              echo "$hub:dev"
+              echo "$hub:dev-$SHORT_SHA"
             fi
             echo "EOF"
           } >> "$GITHUB_ENV"
@@ -130,6 +138,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ env.TAGS }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
           build-args: |
             COMMIT_TAG=dev-${{ steps.sha.outputs.short }}
             BUILD_DATE=${{ steps.date.outputs.timestamp }}
