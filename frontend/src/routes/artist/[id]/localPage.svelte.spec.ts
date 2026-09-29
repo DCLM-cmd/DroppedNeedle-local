@@ -33,6 +33,7 @@ const album = (
 	title,
 	artist_name: artist.name,
 	artist_id: artist.id,
+	release_type: null,
 	musicbrainz_release_group_id: null,
 	musicbrainz_release_id: null,
 	musicbrainz_artist_id: null,

@@ -36,7 +36,11 @@ describe('editionLabel', () => {
 	});
 
 	it('omits the title when it matches the album title, to avoid repeating it verbatim', () => {
-		const main = edition({ title: 'morgen werde ich mich dafür hassen', date: '2025-06-20', country: 'XW' });
+		const main = edition({
+			title: 'morgen werde ich mich dafür hassen',
+			date: '2025-06-20',
+			country: 'XW'
+		});
 
 		expect(editionLabel(main, 'morgen werde ich mich dafür hassen')).toBe('2025 · XW · 9 tracks');
 	});
@@ -51,7 +55,11 @@ describe('editionLabel', () => {
 		// the actual regression: before this fix, both of DISSY's releases showed as
 		// "2025 · XW · 9 tracks" / "2026 · XW · 9 tracks" with no titles at all - only
 		// the year told them apart, and neither hinted at "side b"
-		const main = edition({ title: 'morgen werde ich mich dafür hassen', date: '2025-06-20', country: 'XW' });
+		const main = edition({
+			title: 'morgen werde ich mich dafür hassen',
+			date: '2025-06-20',
+			country: 'XW'
+		});
 		const sideB = edition({
 			title: 'morgen werde ich mich dafür hassen (side b)',
 			date: '2026-03-27',

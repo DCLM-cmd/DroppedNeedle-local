@@ -1,5 +1,5 @@
 // separate from downloadStatus.ts so the lucide imports stay out of the lucide-free nav store
-import type { Component } from 'svelte';
+import type { ComponentType } from 'svelte';
 import {
 	TriangleAlert,
 	Ban,
@@ -19,7 +19,7 @@ import type { DerivedDownloadStatus, RetryDisplay } from './downloadStatus';
 export interface DownloadStatusMeta {
 	label: string;
 	badgeClass: string;
-	icon: Component;
+	icon: ComponentType;
 	/** pulse animation while the state is in-flight */
 	pulse: boolean;
 }

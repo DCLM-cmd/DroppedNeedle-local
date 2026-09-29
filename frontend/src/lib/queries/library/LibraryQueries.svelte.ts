@@ -232,10 +232,9 @@ export const getLibraryArtistDetailQueryOptions = (artistId: string) =>
 		// requests for a single artist onto the server.
 		queryFn: async ({ signal }) => {
 			try {
-				return await api.global.get<LibraryArtistSummary>(
-					API.library.artistDetail(artistId),
-					{ signal }
-				);
+				return await api.global.get<LibraryArtistSummary>(API.library.artistDetail(artistId), {
+					signal
+				});
 			} catch (err) {
 				if (err instanceof ApiError && err.status === 404) return null;
 				throw err;

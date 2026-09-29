@@ -1,12 +1,12 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import type { Component } from 'svelte';
+	import type { SvelteComponent } from 'svelte';
 
 	type Props = {
 		title: string;
 		description: string;
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		icon: Component;
+		icon: typeof SvelteComponent<any>;
 		iconBgClass?: string;
 		iconTextClass?: string;
 		isOpen?: boolean;

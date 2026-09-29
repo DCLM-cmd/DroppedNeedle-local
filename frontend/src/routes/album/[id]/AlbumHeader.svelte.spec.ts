@@ -43,6 +43,7 @@ const localAlbum: LibraryAlbumDetail = {
 	title: 'Avalon',
 	artist_name: 'Anthony Green',
 	artist_id: 'local-artist-1',
+	release_type: null,
 	musicbrainz_release_group_id: '4b6276da-e7c7-36df-8771-34b92f774d3b',
 	musicbrainz_release_id: '0687c8a5-40a2-4a0c-bdc9-c1d80d94bef5',
 	musicbrainz_artist_id: 'eba4c290-2ce6-42c9-affd-5b1ffab84a8f',

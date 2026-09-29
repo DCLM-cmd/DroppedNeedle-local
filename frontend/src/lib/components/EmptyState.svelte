@@ -1,9 +1,9 @@
 <script lang="ts">
-	import type { Component } from 'svelte';
+	import type { ComponentType } from 'svelte';
 
 	import { withBasePath } from '$lib/utils/basePath';
 	interface Props {
-		icon: Component;
+		icon: ComponentType;
 		title: string;
 		description?: string;
 		ctaLabel?: string;

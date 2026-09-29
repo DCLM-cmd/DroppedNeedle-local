@@ -1346,7 +1346,7 @@ async def test_wedged_walk_times_out_detaches_producer_and_recovers(
         calls += 1
         if calls == 1:
             yield (str(root), [], ["track.flac"])
-            wedged.wait()
+            wedged.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
             return
         yield (str(root), [], ["track.flac"])
 
@@ -1407,7 +1407,7 @@ async def test_wedged_next_does_not_hold_read_lease_so_writer_acquires(
 
     def walker(*_args, **_kwargs):
         yield (str(root), [], ["track.flac"])
-        wedged.wait()
+        wedged.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
         return
 
     store = AsyncMock()
@@ -1524,7 +1524,7 @@ async def test_cancelled_walk_detaches_when_blocked_and_does_not_hang(
 
     def walker(*_args, **_kwargs):
         yield (str(root), [], ["track.flac"])
-        wedged.wait()
+        wedged.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
         return
 
     store = AsyncMock()
@@ -1691,7 +1691,7 @@ async def test_discover_walk_timeout_once_then_green_retries_scope(
         calls += 1
         if calls == 1:
             yield (str(root), [], ["track.flac"])
-            wedged.wait()
+            wedged.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
             return
         yield (str(root), [], ["track.flac"])
 
@@ -1754,7 +1754,7 @@ async def test_discover_persistent_walk_timeout_retries_twice_then_fails(
         nonlocal calls
         calls += 1
         yield (str(root), [], ["track.flac"])
-        wedged.wait()
+        wedged.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
         return
 
     run = _scan_run()
@@ -1801,7 +1801,7 @@ async def test_discover_walk_timeout_with_paused_checkpoint_does_not_retry(
         nonlocal calls
         calls += 1
         yield (str(root), [], ["track.flac"])
-        wedged.wait()
+        wedged.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
         return
 
     run = _scan_run()
@@ -2437,7 +2437,7 @@ async def test_root_probe_timeout_fails_the_run_with_walk_timeout(
     wedged_probe = threading.Event()
 
     def probe(_path: Path) -> bool:
-        wedged_probe.wait()
+        wedged_probe.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
         return True
 
     store = AsyncMock()
@@ -2943,7 +2943,8 @@ async def test_discovery_walk_failure_uses_fresh_clock(tmp_path: Path) -> None:
             # Simulate a walk that observed a permission error and returned incomplete
             return (run, False, "WALK_TIMEOUT")
 
-    scanner = StubScanner(store, clock=fake_clock)
+    # A short deadline keeps GH-444's two inter-retry sleeps out of the test budget.
+    scanner = StubScanner(store, clock=fake_clock, walk_deadline_seconds=0.01)
     # Ensure the discover loop sees the scope as not completed and checkpoint passes
     result = await scanner.discover(
         run, [scope], {"root-a": root}, SimpleNamespace(policy_revision="rev-1"), AsyncMock(return_value=True)

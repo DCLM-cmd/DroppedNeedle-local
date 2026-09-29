@@ -118,6 +118,9 @@ def _build_app(service: AuthService) -> FastAPI:
 
 
 @pytest.mark.asyncio
+# Drives 500 subjects through real cooldown wakeups under its own 120s wall
+# budget; the suite-wide 30s cap would cut it off before that guard can speak.
+@pytest.mark.timeout(180)
 async def test_operation_worker_with_setup_status_flood_stays_within_budgets(
     tmp_path: Path,
 ) -> None:

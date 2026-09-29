@@ -65,6 +65,7 @@ const album: LibraryAlbumDetail = {
 	title: 'Local Only Album',
 	artist_name: 'Local Artist',
 	artist_id: 'local-artist-1',
+	release_type: null,
 	musicbrainz_release_group_id: null,
 	musicbrainz_release_id: null,
 	musicbrainz_artist_id: null,

@@ -93,12 +93,15 @@ describe('clear-on-user-switch (AMU-5)', () => {
 		] as const;
 		const namespaces = [...userNamespaces, ...navidromeNamespaces];
 		const seededKeys = namespaces;
-		const failedKeys = new Set([userNamespaces[0], userNamespaces[3]]);
+		const failedKeys = new Set<string>([userNamespaces[0], userNamespaces[3]]);
 		for (const key of seededKeys) localStorage.setItem(key, 'cached');
 
 		const attemptedKeys = new Set<string>();
 		const originalRemoveItem = Storage.prototype.removeItem;
-		const removeItem = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (key) {
+		const removeItem = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (
+			this: Storage,
+			key: string
+		) {
 			attemptedKeys.add(key);
 			if (failedKeys.has(key)) throw new Error(`remove failed for ${key}`);
 			return originalRemoveItem.call(this, key);

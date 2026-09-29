@@ -1021,9 +1021,11 @@ async def test_wedged_walk_fails_bounded_and_the_next_run_claims(
     def walker(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        if calls == 1:
+        # GH-444 re-walks a timed-out scope twice before failing, so the wedge
+        # has to hold for the whole budget (initial walk + 2 retries).
+        if calls <= 3:
             yield (str(root), [], ["track-1.flac"])
-            wedged.wait()
+            wedged.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
             return
         yield from os.walk(str(root), followlinks=False)
 
@@ -1047,7 +1049,7 @@ async def test_wedged_walk_fails_bounded_and_the_next_run_claims(
     assert failed is not None and failed.state == "failed"
     assert failed.terminal_code == "WALK_TIMEOUT"
     failures, _cursor = await target_store.list_scan_run_failures(failed.id)
-    assert [failure.failure_code for failure in failures] == ["WALK_TIMEOUT"]
+    assert failures and {failure.failure_code for failure in failures} == {"WALK_TIMEOUT"}
     assert await coordinator.run_once({"root-a": root}) is None
 
     await coordinator.request_run(_request(resolver, trigger="automatic"))
@@ -1470,7 +1472,7 @@ async def test_stalled_tag_read_is_recorded_and_later_files_continue(
         def read_tags(self, path: Path) -> tuple[AudioTag, AudioInfo]:
             if path.name == "track-1.flac":
                 entered.set()
-                release.wait()
+                release.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
             return super().read_tags(path)
 
     coordinator = _coordinator(
@@ -1514,7 +1516,7 @@ async def test_stalled_tag_reads_have_bounded_executor_capacity(
     class StalledReader(_TagReader):
         def read_tags(self, path: Path) -> tuple[AudioTag, AudioInfo]:
             self.calls.append(path)
-            release.wait()
+            release.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
             return super().read_tags(path)
 
     reader = StalledReader()
@@ -1560,7 +1562,7 @@ async def test_cancelled_tag_read_remains_counted_until_worker_finishes(
     class BlockingReader(_TagReader):
         def read_tags(self, path: Path) -> tuple[AudioTag, AudioInfo]:
             entered.set()
-            release.wait()
+            release.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
             return super().read_tags(path)
 
     indexer = LibraryIndexer(
@@ -2160,9 +2162,10 @@ async def test_wedged_walk_timeout_with_filesystem_does_not_block_writer_and_nex
     def walker(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        if calls == 1:
+        # Wedge through the whole GH-444 retry budget (initial walk + 2 retries).
+        if calls <= 3:
             yield (str(root), [], ["track.flac"])
-            wedged.wait()
+            wedged.wait(timeout=30)  # bounded: a failed test must not strand the thread past exit
             return
         yield from os.walk(str(root), followlinks=False)
 
@@ -2183,7 +2186,7 @@ async def test_wedged_walk_timeout_with_filesystem_does_not_block_writer_and_nex
     failed = await asyncio.wait_for(coordinator.run_once({"root-a": root}), timeout=2.0)
     assert failed is not None and failed.state == "failed"
     assert failed.terminal_code == "WALK_TIMEOUT"
-    assert len(scanner._detached_walkers) == 1
+    assert len(scanner._detached_walkers) == 3
     # Writer must acquire while walker still wedged
     async with asyncio.timeout(0.5):
         async with filesystem.write("root-a"):

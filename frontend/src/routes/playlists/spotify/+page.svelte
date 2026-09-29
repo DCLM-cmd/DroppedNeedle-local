@@ -1,6 +1,13 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { LoaderCircle, Music2, ArrowLeft, RefreshCw, CircleCheckBig, Download } from 'lucide-svelte';
+	import {
+		LoaderCircle,
+		Music2,
+		ArrowLeft,
+		RefreshCw,
+		CircleCheckBig,
+		Download
+	} from 'lucide-svelte';
 	import SpotifyIcon from '$lib/components/SpotifyIcon.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import {

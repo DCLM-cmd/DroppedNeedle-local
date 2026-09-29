@@ -77,8 +77,8 @@
 			<span>
 				<span class="font-semibold">Never accept this release again</span>
 				<span class="mt-1 block text-base-content/65">
-					Blocks whatever delivered this copy, so a later request picks a different source
-					instead of handing you the same files back.
+					Blocks whatever delivered this copy, so a later request picks a different source instead
+					of handing you the same files back.
 				</span>
 			</span>
 		</label>

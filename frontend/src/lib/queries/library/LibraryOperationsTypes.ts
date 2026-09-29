@@ -234,6 +234,7 @@ export interface ReviewListItem {
 	edition_uncertain?: boolean | null;
 	ranked_edition_keys?: string[] | null;
 	identity_source: string | null;
+	candidate_count?: number;
 	evidence_summary: Record<string, number>;
 	active_job_state: string | null;
 	created_at: number;

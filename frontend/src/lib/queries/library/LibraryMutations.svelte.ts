@@ -43,7 +43,7 @@ export function removeLibraryAlbum() {
 				if (result.blacklist_skipped || !result.blacklisted) {
 					toastStore.show({
 						message:
-							"Album removed, but nothing could be blocklisted - a re-request may return the same release.",
+							'Album removed, but nothing could be blocklisted - a re-request may return the same release.',
 						type: 'info',
 						duration: 7000
 					});

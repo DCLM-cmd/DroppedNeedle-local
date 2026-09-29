@@ -4,12 +4,7 @@
 export type WantedKind = 'missing' | 'partial';
 export type WantedState = 'watching' | 'dormant' | 'stopped' | 'fulfilled';
 export type WantedOutcome =
-	| 'no_results'
-	| 'seen_only'
-	| 'new_manual'
-	| 'auto_dispatched'
-	| 'satisfied'
-	| 'error';
+	'no_results' | 'seen_only' | 'new_manual' | 'auto_dispatched' | 'satisfied' | 'error';
 
 export interface WantedWatchItem {
 	release_group_mbid: string;

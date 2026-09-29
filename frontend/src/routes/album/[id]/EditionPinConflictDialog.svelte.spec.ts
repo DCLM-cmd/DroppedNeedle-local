@@ -31,6 +31,7 @@ function localCopy(id: string, title: string): LibraryAlbumSummary {
 		title,
 		artist_name: 'Local Artist',
 		artist_id: 'local-artist-1',
+		release_type: null,
 		musicbrainz_release_group_id: 'rg-1',
 		musicbrainz_release_id: null,
 		musicbrainz_artist_id: null,
