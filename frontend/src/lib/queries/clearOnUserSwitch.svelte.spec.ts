@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { QueryClient } from '@tanstack/svelte-query';
 import { CACHE_KEYS } from '$lib/constants';
 import { HomeQueryKeyFactory } from './HomeQueryKeyFactory';
-import { setQueueCachedData } from '$lib/utils/discoverQueueCache';
 import { overviewCacheSuffix } from '$lib/utils/timeRangeCache';
 import { clearUserScopedLocalCaches } from '$lib/utils/userScopedCaches';
 
@@ -24,8 +23,16 @@ describe('clear-on-user-switch (AMU-5)', () => {
 	});
 
 	it('clearUserScopedLocalCaches() removes the prior user discover-queue + time-range entries', () => {
-		setQueueCachedData({ items: [], currentIndex: 0, queueId: 'q-a' }, 'user-a');
+		// Seeded directly: setQueueCachedData only writes once a MusicBrainz source
+		// binding is known, and this spec is about clearing, not writing.
 		const queueKey = `${CACHE_KEYS.DISCOVER_QUEUE}_user-a`;
+		localStorage.setItem(
+			queueKey,
+			JSON.stringify({
+				data: { items: [], currentIndex: 0, queueId: 'q-a' },
+				timestamp: Date.now()
+			})
+		);
 		const trKey = `${CACHE_KEYS.TIME_RANGE_OVERVIEW_CACHE}_${overviewCacheSuffix(
 			'user-a',
 			'album',

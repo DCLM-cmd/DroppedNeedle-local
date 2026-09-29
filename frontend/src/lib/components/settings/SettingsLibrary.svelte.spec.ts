@@ -51,8 +51,11 @@ const h = vi.hoisted(() => ({
 	isAdmin: true
 }));
 
-vi.mock('$lib/stores/authStore.svelte', async (importOriginal) => ({
-	...(await importOriginal<typeof import('$lib/stores/authStore.svelte')>()),
+// No importOriginal here: the real store's import graph reaches back into this
+// mocked module, so awaiting it inside the factory deadlocks the file before
+// a single test runs.
+vi.mock('$lib/stores/authStore.svelte', () => ({
+	LAST_USER_ID_KEY: 'test:last-user',
 	authStore: {
 		get isAdmin() {
 			return h.isAdmin;

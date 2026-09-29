@@ -76,6 +76,11 @@ vi.mock('$lib/components/PlaylistDiscoveryModal.svelte', () => {
 });
 
 vi.mock('$lib/queries/discover/DiscoverDemand.svelte', () => ({ useDiscoverActivity: vi.fn() }));
+// Expanded mixes render album cards, which read download access through a query.
+vi.mock('$lib/queries/local/LocalQueries.svelte', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/queries/local/LocalQueries.svelte')>()),
+	getDownloadAccessQuery: () => ({ data: { allowed: true } })
+}));
 import DiscoverPage from './+page.svelte';
 
 function emptyResponse(overrides: Partial<DiscoverResponse> = {}): Partial<DiscoverResponse> {

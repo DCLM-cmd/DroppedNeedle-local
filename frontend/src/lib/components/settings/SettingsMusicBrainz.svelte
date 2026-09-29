@@ -484,7 +484,7 @@
 									name="musicbrainz-source"
 									value={card.mode}
 									tabindex={isSelected ? 0 : -1}
-									bind:group={selectedMode}
+									checked={isSelected}
 									aria-label={card.title}
 									aria-describedby={`musicbrainz-source-${card.mode}-description`}
 									onchange={() => selectMode(card.mode)}

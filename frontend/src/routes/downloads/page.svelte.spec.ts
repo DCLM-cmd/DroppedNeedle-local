@@ -21,6 +21,7 @@ vi.mock('$lib/queries/HomeIntegrationStatusQuery.svelte', () => ({
 }));
 
 vi.mock('$lib/stores/authStore.svelte', () => ({
+	LAST_USER_ID_KEY: 'test:last-user',
 	authStore: {
 		get isAdmin() {
 			return h.isAdmin;

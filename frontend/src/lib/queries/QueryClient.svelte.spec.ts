@@ -102,7 +102,6 @@ it('removes admin task state on demotion and fences late responses through role 
 	setDownloadScope('role-user', 'admin');
 	const adminKey = DownloadQueryKeyFactory.tasks('role-user');
 	const persistedKey = `${keyPrefix}${JSON.stringify(adminKey)}`;
-	await set(persistedKey, persistedQuery(adminKey, { items: ['other-user-task'] }));
 	let resolve!: (value: unknown) => void;
 	const pending = queryClient
 		.fetchQuery({
@@ -115,6 +114,10 @@ it('removes admin task state on demotion and fences late responses through role 
 		})
 		.catch(() => undefined);
 	await vi.waitFor(() => expect(resolve).toBeTypeOf('function'));
+	// Seeded once the fetch is in flight: a restored entry with no observer is not
+	// stale to query-core, so seeding first would answer the fetch from storage and
+	// the queryFn - the late response this test fences - would never run.
+	await set(persistedKey, persistedQuery(adminKey, { items: ['other-user-task'] }));
 	setDownloadScope('role-user', 'user');
 	expect(queryClient.getQueryData(adminKey)).toBeUndefined();
 	expect(queryClient.getQueryData(DownloadQueryKeyFactory.tasks('role-user'))).toBeUndefined();

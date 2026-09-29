@@ -7,7 +7,8 @@ const h = vi.hoisted(() => ({ goto: vi.fn(), create: vi.fn() }));
 
 vi.mock('$app/navigation', () => ({ goto: (...args: unknown[]) => h.goto(...args) }));
 vi.mock('$lib/stores/authStore.svelte', () => ({
-	authStore: { isAdmin: false, isTrusted: true, user: { id: 'curator-1' } }
+	authStore: { isAdmin: false, isTrusted: true, user: { id: 'curator-1' } },
+	LAST_USER_ID_KEY: 'test:last-user'
 }));
 
 const artist: LibraryArtistSummary = {

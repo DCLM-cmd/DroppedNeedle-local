@@ -45,6 +45,13 @@ vi.mock('$lib/queries/downloads/QuarantineQueries.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	occupiedDestination: () => null,
+	isDestinationOccupied: () => false,
+	blacklistSource: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false }),
+	discardHeldVerdict: () => ({ mutate: vi.fn(), isPending: false }),
+	requestAlbum: vi.fn(),
+	requestBatch: vi.fn(),
+	requestTrack: vi.fn(),
 	cancelDownload: () => ({ mutate: vi.fn(), isPending: false }),
 	retryDownload: () => ({ mutate: vi.fn(), isPending: false }),
 	stopAutoRetry: () => ({ mutate: vi.fn(), isPending: false }),
@@ -62,6 +69,8 @@ vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/downloads/DownloadSSE.svelte', () => ({
+	getOrganizerRetry: () => null,
+	resetOrganizerRetry: vi.fn(),
 	createDownloadStream: () => ({
 		state: { progress: null, status: null, source: null, done: false },
 		start: vi.fn(),
@@ -69,8 +78,7 @@ vi.mock('$lib/queries/downloads/DownloadSSE.svelte', () => ({
 	})
 }));
 
-vi.mock('$lib/stores/authStore.svelte', async (importOriginal) => ({
-	...(await importOriginal<typeof import('$lib/stores/authStore.svelte')>()),
+vi.mock('$lib/stores/authStore.svelte', () => ({
 	LAST_USER_ID_KEY: 'test:last-user',
 	authStore: {
 		get isAdmin() {

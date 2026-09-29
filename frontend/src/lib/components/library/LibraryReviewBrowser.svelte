@@ -234,9 +234,7 @@
 		</div>
 	{:else if isConfirmLane && confirmCount > 0}
 		<p class="mt-4 text-sm text-base-content/55" role="status">
-			{confirmCount.toLocaleString()}
-			{confirmCount === 1 ? 'edition' : 'editions'} to confirm. Your files never change here - this only
-			picks which pressing is shown.
+			{`${confirmCount.toLocaleString()} ${confirmCount === 1 ? 'edition' : 'editions'} to confirm. Your files never change here - this only picks which pressing is shown.`}
 		</p>
 	{:else if isConfirmLane && response && !hasAncillaryFilters}
 		<p class="mt-4 text-sm text-base-content/55" role="status">

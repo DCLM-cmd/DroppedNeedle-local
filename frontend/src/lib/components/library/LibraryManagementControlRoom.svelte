@@ -475,8 +475,7 @@
 											<p class="mt-1 text-xs text-base-content/55">{STALE_INPUT_HINT}</p>
 										{:else if group.staleCount > 0}
 											<p class="mt-1 text-xs text-base-content/55">
-												{group.staleCount} of {group.items.length} attempts only found moved inputs and
-												can be retried; the rest failed for other reasons.
+												{`${group.staleCount} of ${group.items.length} attempts only found moved inputs and can be retried; the rest failed for other reasons.`}
 											</p>
 										{/if}
 										<ul class="mt-2 space-y-1">

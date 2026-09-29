@@ -302,7 +302,10 @@ describe('LibraryReviewDetail', () => {
 			.element(page.getByRole('heading', { name: 'Use this release despite conflicts?' }))
 			.toHaveFocus();
 		await expect
-			.element(page.getByText('The local evidence conflicts with this release'))
+			.element(
+				// The review header names the same reason; the confirmation copy is the last one.
+				page.getByText('Conflicting track evidence', { exact: true }).last()
+			)
 			.toBeVisible();
 		await expect
 			.element(page.getByRole('heading', { name: 'Failed evidence gates' }))

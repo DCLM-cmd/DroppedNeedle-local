@@ -94,8 +94,8 @@ vi.mock('$lib/stores/integration', () => ({
 	integrationStore: { subscribe: () => () => {} }
 }));
 
-vi.mock('$lib/stores/authStore.svelte', async (importOriginal) => ({
-	...(await importOriginal<typeof import('$lib/stores/authStore.svelte')>()),
+vi.mock('$lib/stores/authStore.svelte', () => ({
+	LAST_USER_ID_KEY: 'test:last-user',
 	authStore: { user: null, isTrusted: false }
 }));
 

@@ -1,7 +1,13 @@
 import { page } from '@vitest/browser/context';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import HomeSection from './HomeSection.svelte';
+
+// Album cards carry the download-access query; these specs only check routing.
+vi.mock('$lib/queries/local/LocalQueries.svelte', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/queries/local/LocalQueries.svelte')>()),
+	getDownloadAccessQuery: () => ({ data: { allowed: true } })
+}));
 
 describe('HomeSection.svelte', () => {
 	it('routes a local-only artist through its stable DroppedNeedle identity', async () => {

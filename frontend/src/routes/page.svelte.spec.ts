@@ -47,6 +47,12 @@ vi.mock('$lib/queries/connections/ConnectionsQuery.svelte', () => ({
 }));
 
 vi.mock('$lib/queries/discover/DiscoverDemand.svelte', () => ({ useDiscoverActivity: vi.fn() }));
+
+// HomeEntryCards reads library activity through a query as well.
+vi.mock('$lib/queries/library/LibraryActivityQueries.svelte', () => ({
+	getLibraryActivityQueryOptions: vi.fn(),
+	getLibraryActivityQuery: () => ({ data: undefined, isError: false })
+}));
 import Page from './+page.svelte';
 
 function contentResponse(): Partial<HomeResponse> {
