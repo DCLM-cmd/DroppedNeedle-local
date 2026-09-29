@@ -3135,6 +3135,18 @@ class DownloadOrchestrator:
             disposition=disposition,
             publisher_bundle_ids=bundle_ids,
         )
+        # Attempts the result above did not cover (no process result, or an earlier
+        # failover candidate) would otherwise stay live forever and pin their files
+        # on the downloads mount. A finished album needs none of their bytes; a
+        # failed or partial one keeps them for a reimport until retention expires.
+        await self._store.settle_live_download_attempts(
+            task.id,
+            disposition=(
+                "discard"
+                if status in (DownloadStatus.COMPLETED, DownloadStatus.CANCELLED)
+                else "preserve"
+            ),
+        )
         if (
             attempt_id is not None
             and disposition == "discard"

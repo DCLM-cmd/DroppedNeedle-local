@@ -402,3 +402,143 @@ async def test_cleanup_debt_ignores_legacy_unknown_task_marker(tmp_path: Path):
         job_name=job_name,
         ignore_error_codes=("legacy_unknown_task",),
     )
+
+
+_DAY = 24 * 3600.0
+
+
+async def _usenet_attempt(store: DownloadStore, task_id: str, *, now: float):
+    job = f"droppedneedle-{task_id}-0"
+    return await store.create_download_attempt(
+        task_id=task_id,
+        source="usenet",
+        candidate_index=0,
+        job_name=job,
+        handle=TaskHandle(source="usenet", job_name=job),
+        now=now,
+    )
+
+
+async def _preserved(store: DownloadStore, task_id: str, *, now: float):
+    attempt = await _usenet_attempt(store, task_id, now=now)
+    return await store.schedule_download_attempt_cleanup(
+        attempt.id, disposition="preserve", now=now
+    )
+
+
+async def _task(store: DownloadStore, status: str):
+    task = await store.create_task(
+        user_id="user-a", release_group_mbid="rg", artist_name="A", album_title="B"
+    )
+    await store.update_status(task.id, status)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_preserved_workspace_is_released_once_nothing_can_use_it(tmp_path: Path):
+    store = _store(tmp_path)
+    now = 100 * _DAY
+    completed = await _preserved(store, (await _task(store, "completed")).id, now=now)
+    orphaned = await _preserved(store, "0" * 32, now=now)  # task pruned
+    recent_failure = await _preserved(store, (await _task(store, "failed")).id, now=now)
+    active = await _preserved(store, (await _task(store, "downloading")).id, now=now - 30 * _DAY)
+
+    released = await store.release_stale_preserved_download_attempts(
+        retention_seconds=7 * _DAY, now=now + 60
+    )
+
+    assert released == 2
+    for attempt in (completed, orphaned):
+        current = await store.get_download_attempt(attempt.id)
+        assert (current.state, current.disposition) == ("cleanup_pending", "discard")
+    for attempt in (recent_failure, active):
+        assert (await store.get_download_attempt(attempt.id)).state == "preserved"
+
+
+@pytest.mark.asyncio
+async def test_failed_task_keeps_its_workspace_for_the_retention_window(tmp_path: Path):
+    store = _store(tmp_path)
+    now = 100 * _DAY
+    attempt = await _preserved(store, (await _task(store, "failed")).id, now=now)
+
+    assert await store.release_stale_preserved_download_attempts(
+        retention_seconds=7 * _DAY, now=now + 6 * _DAY
+    ) == 0
+    assert await store.release_stale_preserved_download_attempts(
+        retention_seconds=7 * _DAY, now=now + 8 * _DAY
+    ) == 1
+    assert (await store.get_download_attempt(attempt.id)).state == "cleanup_pending"
+
+
+@pytest.mark.asyncio
+async def test_pending_held_import_keeps_the_workspace(tmp_path: Path):
+    store = _store(tmp_path)
+    now = 100 * _DAY
+    task = await _task(store, "completed")
+    attempt = await _preserved(store, task.id, now=now)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "INSERT INTO held_imports (user_id, held_path, reason, source_task_id, "
+            "status, created_at) VALUES ('user-a', '/held/x.flac', 'tag_mismatch', ?, "
+            "'held', ?)",
+            (task.id, now),
+        )
+
+    assert await store.release_stale_preserved_download_attempts(
+        retention_seconds=7 * _DAY, now=now + 30 * _DAY
+    ) == 0
+    assert (await store.get_download_attempt(attempt.id)).state == "preserved"
+
+
+@pytest.mark.asyncio
+async def test_live_attempt_of_a_finished_task_is_released_after_grace(tmp_path: Path):
+    """An attempt left in_use when its task finished was never cleaned up."""
+    store = _store(tmp_path)
+    now = 100 * _DAY
+    finished = await _task(store, "completed")
+    stuck = await _usenet_attempt(store, finished.id, now=now)
+    running = await _usenet_attempt(store, (await _task(store, "downloading")).id, now=now)
+
+    assert await store.release_stale_preserved_download_attempts(
+        retention_seconds=7 * _DAY, now=now + 60
+    ) == 0  # inside the grace window a reimport may still hold it
+    assert await store.release_stale_preserved_download_attempts(
+        retention_seconds=7 * _DAY, now=now + 2 * 3600
+    ) == 1
+    assert (await store.get_download_attempt(stuck.id)).state == "cleanup_pending"
+    assert (await store.get_download_attempt(running.id)).state in {"acquiring", "in_use"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("disposition", "state"), [("discard", "cleanup_pending"), ("preserve", "preserved")]
+)
+async def test_settle_live_attempts_hands_every_live_attempt_to_cleanup(
+    tmp_path: Path, disposition: str, state: str
+):
+    store = _store(tmp_path)
+    task = await _task(store, "completed")
+    first = await _usenet_attempt(store, task.id, now=10.0)
+    second = await store.create_download_attempt(
+        task_id=task.id,
+        source="usenet",
+        candidate_index=1,
+        job_name=f"droppedneedle-{task.id}-1",
+        handle=TaskHandle(source="usenet", job_name=f"droppedneedle-{task.id}-1"),
+        now=11.0,
+    )
+    done = await store.schedule_download_attempt_cleanup(
+        first.id, disposition="discard", now=12.0
+    )
+    await store.transition_download_attempt(
+        done.id, expected_row_revision=done.row_revision, new_state="complete", now=13.0
+    )
+
+    settled = await store.settle_live_download_attempts(
+        task.id, disposition=disposition, now=20.0
+    )
+
+    assert settled == [second.id]
+    current = await store.get_download_attempt(second.id)
+    assert (current.state, current.disposition) == (state, disposition)
+    assert (await store.get_download_attempt(first.id)).state == "complete"

@@ -1470,3 +1470,114 @@ async def test_slskd_reconcile_prunes_nested_empty_tree(tmp_path: Path):
     # The whole empty branch collapses to a single top-level removal.
     assert result.removed == [str(mount / "Peer")]
     assert not (mount / "Peer").exists()
+
+
+def _nested_release_workspace(root: Path) -> tuple[Path, Path]:
+    """SABnzbd unpacks a release that carries its own top folder one level down."""
+    job = root / f"droppedneedle-{'a' * 32}-0"
+    nested = job / "2008 - The Fame"
+    nested.mkdir(parents=True)
+    (nested / "01 - Just Dance.flac").write_bytes(b"source")
+    return job, nested
+
+
+@pytest.mark.asyncio
+async def test_nested_release_folder_removes_the_whole_job_directory(tmp_path: Path):
+    root = tmp_path / "sab"
+    job, nested = _nested_release_workspace(root)
+    store = _store(tmp_path)
+    attempt = await _attempt(store, root, workspace=nested)
+    client = _Client(
+        DownloadMaterialization(
+            state="completed",
+            mount_root=str(root),
+            workspace_path=str(nested),
+            mount_healthy=True,
+        )
+    )
+    service = AcquisitionCleanupService(
+        store, _LibraryStore(), lambda source: client, lambda: root
+    )
+
+    assert await service.cleanup_now(attempt.id, worker_id="test") is True
+
+    assert not job.exists()
+    assert root.exists()
+    assert (await store.get_download_attempt(attempt.id)).state == "complete"
+
+
+@pytest.mark.asyncio
+async def test_workspace_without_a_job_directory_is_still_refused(tmp_path: Path):
+    root = tmp_path / "sab"
+    foreign = root / "someone else" / "2008 - The Fame"
+    foreign.mkdir(parents=True)
+    (foreign / "keep.flac").write_bytes(b"keep")
+    store = _store(tmp_path)
+    attempt = await _attempt(store, root, workspace=foreign)
+    client = _Client(
+        DownloadMaterialization(
+            state="completed",
+            mount_root=str(root),
+            workspace_path=str(foreign),
+            mount_healthy=True,
+        )
+    )
+    service = AcquisitionCleanupService(
+        store, _LibraryStore(), lambda source: client, lambda: root
+    )
+
+    await service.cleanup_now(attempt.id, worker_id="test")
+
+    parked = await store.get_download_attempt(attempt.id)
+    assert parked.state == "needs_attention"
+    assert parked.error_code == "workspace_identity_conflict"
+    assert (foreign / "keep.flac").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code", ["workspace_identity_conflict", "workspace_evidence_missing"]
+)
+async def test_attention_parked_by_an_old_identity_check_returns_to_cleanup(
+    tmp_path: Path, error_code: str
+):
+    """Rows the exact-name check parked stayed needs_attention forever and blocked
+    the orphan reconciler too; the recheck now requeues them once the job directory
+    resolves."""
+    now = [10.0]
+    root = tmp_path / "sab"
+    job, nested = _nested_release_workspace(root)
+    store = _store(tmp_path)
+    attempt = await _attempt(store, root, workspace=nested)
+    parked = await store.transition_download_attempt(
+        attempt.id,
+        expected_row_revision=attempt.row_revision,
+        new_state="needs_attention",
+        now=5.0,
+        disposition="preserve",
+        error_code=error_code,
+        mount_root=str(root),
+        workspace_path=str(nested),
+        next_retry_at=5.0,
+    )
+    assert parked is not None
+    client = _Client(
+        DownloadMaterialization(
+            state="completed",
+            mount_root=str(root),
+            workspace_path=str(nested),
+            mount_healthy=True,
+        )
+    )
+    service = AcquisitionCleanupService(
+        store, _LibraryStore(), lambda source: client, lambda: root, clock=lambda: now[0]
+    )
+
+    await service.run_once("recheck")
+    requeued = await store.get_download_attempt(attempt.id)
+    assert requeued.state == "cleanup_pending"
+    assert requeued.disposition == "discard"
+
+    await service.run_once("cleanup")
+    assert (await store.get_download_attempt(attempt.id)).state == "complete"
+    assert not job.exists()

@@ -5415,3 +5415,32 @@ async def test_collision_does_not_quarantine_through_import(tmp_path: Path):
 
     assert (await store.get_task(task.id)).status == "failed"
     assert await store.load_quarantine_set() == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "state"),
+    [("completed", "cleanup_pending"), ("failed", "preserved")],
+)
+async def test_finalize_without_process_result_settles_live_attempts(
+    tmp_path: Path, status: str, state: str
+):
+    """Finishing a task without an attempt-bearing result (a retry skipped because the
+    library already covers the album, an "import anyway") left its attempt in_use
+    for good, so cleanup never took the files off the downloads mount."""
+    store, orch, _fp, _lib = _build(tmp_path)
+    task = await _new_task(store)
+    job = f"droppedneedle-{task.id}-0"
+    attempt = await store.create_download_attempt(
+        task_id=task.id,
+        source="usenet",
+        candidate_index=0,
+        job_name=job,
+        handle=TaskHandle(source="usenet", job_name=job),
+    )
+
+    await orch._finalize(task, status)
+
+    settled = await store.get_download_attempt(attempt.id)
+    assert settled.state == state
+    assert (await store.get_task(task.id)).status == status

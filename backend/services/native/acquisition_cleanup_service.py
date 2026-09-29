@@ -54,6 +54,9 @@ _RECONCILE_INTERVAL_SECONDS = 6 * 3600.0
 # download can never look abandoned just because its row landed late (#131
 # duplicate folders).
 ORPHAN_MIN_AGE_SECONDS = 6 * 3600
+# How long a failed or partial task's preserved workspace stays available for a
+# manual reimport before cleanup takes it.
+PRESERVED_RETENTION_SECONDS = 7 * 24 * 3600
 
 
 class SlskdOrphanReconcileResult(NamedTuple):
@@ -241,7 +244,15 @@ class AcquisitionCleanupService:
         if attempt.error_code in {
             "publisher_barrier_missing",
             "publisher_needs_attention",
-        }:
+        } or (
+            # Parked for a workspace SABnzbd unpacked one level below the job directory
+            # (the old exact-name check) or for missing evidence the legacy sweep has
+            # since backfilled. Only cleanup_pending attempts reach these checks, so
+            # the original intent was discard.
+            attempt.error_code
+            in {"workspace_identity_conflict", "workspace_evidence_missing"}
+            and _job_identity_resolves(attempt)
+        ):
             updated = await self._store.transition_download_attempt(
                 attempt.id,
                 expected_row_revision=attempt.row_revision,
@@ -541,12 +552,12 @@ class AcquisitionCleanupService:
             return
         if not attempt.workspace_path:
             raise _UnsafeCleanup("workspace_evidence_missing")
-        _validate_job_identity(attempt)
+        job_workspace = _validate_job_identity(attempt)
         try:
             await asyncio.to_thread(
                 _remove_workspace_safely,
                 Path(attempt.mount_root),
-                Path(attempt.workspace_path),
+                job_workspace,
             )
         except _UnsafeCleanup:
             raise
@@ -657,6 +668,17 @@ class AcquisitionCleanupService:
         confirms the job is not active. Any failed lookup skips the folder:
         deletion decisions fail closed. Returns the number of folders removed.
         """
+        try:
+            released = await self._store.release_stale_preserved_download_attempts(
+                retention_seconds=PRESERVED_RETENTION_SECONDS, now=self._clock()
+            )
+        except Exception:  # noqa: BLE001 - the orphan sweep below still runs
+            logger.warning("Could not release stale preserved downloads", exc_info=True)
+        else:
+            if released:
+                logger.info(
+                    "Released %d preserved download workspace(s) to cleanup", released
+                )
         mount = Path(self._sab_mount_getter())
         if not mount.is_absolute() or mount == Path(mount.anchor):
             logger.warning(
@@ -1081,15 +1103,44 @@ def _absolute(value: str) -> str:
     return os.path.abspath(value)
 
 
-def _validate_job_identity(attempt: DownloadAttempt) -> None:
+def _validate_job_identity(attempt: DownloadAttempt) -> Path:
+    """Check the attempt owns its workspace; return the job directory to remove."""
     match = _JOB_NAME.fullmatch(attempt.job_name)
     if match is None:
         raise _UnsafeCleanup("job_identity_invalid")
     task_id, candidate = match.groups()
     if task_id != attempt.task_id or int(candidate) != attempt.candidate_index:
         raise _UnsafeCleanup("job_identity_conflict")
-    if Path(attempt.workspace_path or "").name != attempt.job_name:
+    return _job_workspace_root(attempt)
+
+
+def _job_identity_resolves(attempt: DownloadAttempt) -> bool:
+    try:
+        _validate_job_identity(attempt)
+    except _UnsafeCleanup:
+        return False
+    return True
+
+
+def _job_workspace_root(attempt: DownloadAttempt) -> Path:
+    """The job-named directory that owns ``attempt.workspace_path``.
+
+    SABnzbd unpacks a release that carries its own top folder one level down
+    (``droppedneedle-<task>-<n>/2008 - The Fame``) and reports that nested folder as
+    the job's storage. The job still owns it, so ownership is proven by a job-named
+    ancestor strictly below the mount, and the whole job directory is what goes -
+    removing only the nested folder would strand the empty job directory.
+    """
+    if not attempt.workspace_path or not attempt.mount_root:
         raise _UnsafeCleanup("workspace_identity_conflict")
+    root = Path(_absolute(attempt.mount_root))
+    workspace = Path(_absolute(attempt.workspace_path))
+    for candidate in (workspace, *workspace.parents):
+        if candidate == root or not candidate.is_relative_to(root):
+            break
+        if candidate.name == attempt.job_name:
+            return candidate
+    raise _UnsafeCleanup("workspace_identity_conflict")
 
 
 def _mount_healthy(root: Path) -> bool:

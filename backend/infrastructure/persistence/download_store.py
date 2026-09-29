@@ -116,6 +116,9 @@ _RETRYABLE_STATUSES = ("failed", "partial")
 # just gets re-tried once past the TTL and re-blocklisted. (A manual re-request clears the
 # album's entries immediately, regardless of TTL.)
 _QUARANTINE_TTL_SECONDS = 7 * 24 * 3600.0
+# Grace before a live attempt of an inactive task counts as abandoned: a reimport
+# holds an attempt in_use for minutes while its task stays failed.
+_STALE_LIVE_ATTEMPT_SECONDS = 3600.0
 
 # The TTL is a self-heal for entries this server decided on its own: a peer that
 # failed a verification once should get another chance a week later. A ``manual``
@@ -1953,6 +1956,95 @@ class DownloadStore(PersistenceBase):
             )
 
         await self._write(operation)
+
+    async def settle_live_download_attempts(
+        self, task_id: str, *, disposition: str, now: float | None = None
+    ) -> list[str]:
+        """Hand a finished task's still-live attempts to cleanup.
+
+        A task can end without an attempt-bearing process result (a retry skipped
+        because the library already covers it, an "import anyway", a management
+        hold), and an earlier failover candidate is never finalized at all. Those
+        attempts stayed ``acquiring``/``in_use`` for good, which cleanup reads as
+        "in use, keep out", so their files never left the downloads mount.
+        """
+        if disposition not in {"discard", "preserve"}:
+            raise ValueError("invalid cleanup disposition")
+        timestamp = time.time() if now is None else now
+        state = "cleanup_pending" if disposition == "discard" else "preserved"
+
+        def operation(conn: sqlite3.Connection) -> list[str]:
+            rows = conn.execute(
+                "UPDATE download_attempts SET state=?,disposition=?,next_retry_at=?,"
+                "lease_owner=NULL,lease_expires_at=NULL,error_code=NULL,updated_at=?,"
+                "row_revision=row_revision+1 "
+                "WHERE task_id=? AND state IN ('acquiring','in_use') RETURNING id",
+                (state, disposition, timestamp, timestamp, task_id),
+            ).fetchall()
+            return [str(row["id"]) for row in rows]
+
+        return await self._write(operation)
+
+    async def release_stale_preserved_download_attempts(
+        self, *, retention_seconds: float, now: float | None = None
+    ) -> int:
+        """Return preserved workspaces to cleanup once nothing can still use them.
+
+        Preserving keeps a failed attempt's bytes for a reimport, but nothing ever
+        released them, so every preserved folder stayed on the mount forever. A
+        preserved attempt is released when no held import still points at its task
+        and the task is gone or completed (the album is in the library), or when it
+        has been preserved for ``retention_seconds`` and its task is not active.
+
+        An attempt still ``acquiring``/``in_use`` an hour after its task stopped being
+        active was never finalized (see ``settle_live_download_attempts``); it is
+        preserved first so the same rules decide it.
+        """
+        timestamp = time.time() if now is None else now
+
+        def operation(conn: sqlite3.Connection) -> int:
+            conn.execute(
+                """UPDATE download_attempts
+                   SET state='preserved',disposition='preserve',lease_owner=NULL,
+                       lease_expires_at=NULL,updated_at=?,row_revision=row_revision+1
+                   WHERE state IN ('acquiring','in_use')
+                     AND updated_at<?
+                     AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM download_tasks task
+                         WHERE task.id=download_attempts.task_id
+                           AND task.status IN ('queued','downloading','processing'))""",
+                (timestamp, timestamp - _STALE_LIVE_ATTEMPT_SECONDS, timestamp),
+            )
+            cursor = conn.execute(
+                """UPDATE download_attempts
+                   SET state='cleanup_pending',disposition='discard',next_retry_at=?,
+                       lease_owner=NULL,lease_expires_at=NULL,error_code=NULL,
+                       completed_at=NULL,updated_at=?,row_revision=row_revision+1
+                   WHERE state='preserved'
+                     AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM held_imports held
+                         WHERE held.source_task_id=download_attempts.task_id
+                           AND held.status='held')
+                     AND NOT EXISTS (
+                         SELECT 1 FROM download_tasks task
+                         WHERE task.id=download_attempts.task_id
+                           AND task.status IN ('queued','downloading','processing'))
+                     AND (
+                         updated_at<?
+                         OR NOT EXISTS (
+                             SELECT 1 FROM download_tasks task
+                             WHERE task.id=download_attempts.task_id)
+                         OR EXISTS (
+                             SELECT 1 FROM download_tasks task
+                             WHERE task.id=download_attempts.task_id
+                               AND task.status='completed'))""",
+                (timestamp, timestamp, timestamp, timestamp - retention_seconds),
+            )
+            return cursor.rowcount
+
+        return await self._write(operation)
 
     async def cancel_task_and_schedule_attempts(
         self,
