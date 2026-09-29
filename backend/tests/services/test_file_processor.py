@@ -3303,7 +3303,8 @@ async def test_occupied_target_without_attribution_is_collision_not_success(
     assert result.failed[0].reason == TARGET_OCCUPIED
     assert TARGET_OCCUPIED not in QUARANTINE_REASONS
     assert result.publisher_bundle_ids == []  # nothing published
-    assert result.workspace_disposition == "preserve"  # source retained
+    # the held copy is the file's successor, so the download may be cleaned up
+    assert result.workspace_disposition == "discard"
     assert (downloads / "A/track.flac").exists()
     assert target.read_bytes() == b"a foreign file squatting at the destination"
     assert await manager.get_imported_file(task.id, "A/track.flac") is None
@@ -3311,6 +3312,34 @@ async def test_occupied_target_without_attribution_is_collision_not_success(
     assert len(held) == 1
     assert held[0].reason == TARGET_OCCUPIED
     assert str(target) in (held[0].reason_detail or "")
+
+
+@pytest.mark.asyncio
+async def test_occupied_target_keeps_source_when_it_could_not_be_held(
+    tmp_path: Path,
+):
+    """Without a held copy the download is the only one left, so it stays."""
+    from services.native.file_processor import TARGET_OCCUPIED
+
+    fp, store, _manager, downloads = _held_wired_processor(tmp_path, verify=False)
+    fp._held_dir = None
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-1",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+    )
+    _place(downloads, "A/track.flac")
+    target = tmp_path / "library" / _OCCUPIED_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"a foreign file squatting at the destination")
+    manifest = _manifest(_sized(downloads, "A/track.flac"), task_id=task.id)
+
+    result = await fp.process_downloaded(manifest)
+
+    assert [failure.reason for failure in result.failed] == [TARGET_OCCUPIED]
+    assert result.workspace_disposition == "preserve"
+    assert await store.list_held_imports("user-a", "user") == []
 
 
 @pytest.mark.asyncio
@@ -3368,7 +3397,7 @@ async def test_occupied_target_attributed_to_other_album_is_collision(
     assert len(result.failed) == 1
     assert result.failed[0].reason == TARGET_OCCUPIED
     assert result.publisher_bundle_ids == []
-    assert result.workspace_disposition == "preserve"
+    assert result.workspace_disposition == "discard"
     assert (downloads / "A/track.flac").exists()
     held = await store.list_held_imports("user-a", "user")
     assert len(held) == 1
@@ -3444,7 +3473,7 @@ async def test_folder_occupied_target_without_attribution_is_collision(
     assert len(result.failed) == 1
     assert result.failed[0].reason == TARGET_OCCUPIED
     assert result.publisher_bundle_ids == []
-    assert result.workspace_disposition == "preserve"
+    assert result.workspace_disposition == "discard"
     assert (job_dir / "track.flac").exists()
     assert target.read_bytes() == b"a foreign file squatting at the destination"
     held = await store.list_held_imports("user-a", "user")
@@ -3513,7 +3542,7 @@ async def test_folder_occupied_target_attributed_to_other_album_is_collision(
     assert len(result.failed) == 1
     assert result.failed[0].reason == TARGET_OCCUPIED
     assert result.publisher_bundle_ids == []
-    assert result.workspace_disposition == "preserve"
+    assert result.workspace_disposition == "discard"
     held = await store.list_held_imports("user-a", "user")
     assert len(held) == 1
     assert held[0].reason == TARGET_OCCUPIED

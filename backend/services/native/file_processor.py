@@ -143,10 +143,12 @@ class VerificationFailed(Exception):
         *,
         reason: str = "verify_failed",
         filename: str | None = None,
+        held: bool = False,
     ) -> None:
         super().__init__(message)
         self.reason = reason
         self.filename = filename
+        self.held = held
 
 
 class AlreadyImported(Exception):
@@ -166,6 +168,8 @@ class FileFailure(AppStruct):
 
     filename: str
     reason: str
+    # A copy sits in the held area for review, so the source bytes are not the last.
+    held: bool = False
 
 
 class ProcessResult(AppStruct):
@@ -195,7 +199,9 @@ def _workspace_disposition(failures: list[FileFailure]) -> str:
     }
     return (
         "preserve"
-        if any(value.reason in local_faults for value in failures)
+        if any(
+            value.reason in local_faults and not value.held for value in failures
+        )
         else "discard"
     )
 
@@ -1082,6 +1088,7 @@ class FileProcessor:
                     FileFailure(
                         filename=failure.filename or expected.filename,
                         reason=failure.reason,
+                        held=failure.held,
                     )
                 )
                 logger.info(
@@ -1272,6 +1279,7 @@ class FileProcessor:
                     FileFailure(
                         filename=failure.filename or candidate.path.name,
                         reason=failure.reason,
+                        held=failure.held,
                     )
                 )
                 logger.info(
@@ -1660,7 +1668,7 @@ class FileProcessor:
                     duration_seconds=track.duration_seconds,
                 ):
                     return target_path
-                await self._hold_for_review(
+                held = await self._hold_for_review(
                     source=source,
                     manifest=manifest,
                     reason=TARGET_OCCUPIED,
@@ -1680,6 +1688,7 @@ class FileProcessor:
                     f"Target already occupied: {target_path.name}",
                     reason=TARGET_OCCUPIED,
                     filename=source.name,
+                    held=held,
                 )
         return _PlannedImport(
             source=source,
@@ -2639,7 +2648,7 @@ class FileProcessor:
                     ),
                 ):
                     return target_path
-                await self._hold_for_review(
+                held = await self._hold_for_review(
                     source=source,
                     manifest=manifest,
                     reason=TARGET_OCCUPIED,
@@ -2669,6 +2678,7 @@ class FileProcessor:
                     f"Target already occupied: {target_path.name}",
                     reason=TARGET_OCCUPIED,
                     filename=expected.filename,
+                    held=held,
                 )
         return _PlannedImport(
             source=source,
