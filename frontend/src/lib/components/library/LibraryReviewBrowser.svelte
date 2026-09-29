@@ -32,7 +32,7 @@
 	const policyTree = getLibraryPolicyTreeQuery();
 	// The first-run banner only needs a cached-or-live waiting count, so a missing
 	// query provider (component specs) degrades to no banner instead of throwing.
-	let activityQuery: ReturnType<typeof getLibraryActivityQuery> | null = null;
+	let activityQuery: ReturnType<typeof getLibraryActivityQuery> | null;
 	try {
 		activityQuery = getLibraryActivityQuery(() => authStore.user?.id);
 	} catch {

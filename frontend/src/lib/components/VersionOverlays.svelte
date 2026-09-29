@@ -7,6 +7,7 @@
 	import UpdateBanner from '$lib/components/UpdateBanner.svelte';
 	import WhatsNewModal from '$lib/components/WhatsNewModal.svelte';
 
+	// eslint-disable-next-line no-useless-assignment -- bindable default is the parent-visible initial value; this prop is write-only in-component by design
 	let { updateAvailable = $bindable(false) }: { updateAvailable: boolean } = $props();
 
 	const updateCheckQuery = getUpdateCheckQuery();
