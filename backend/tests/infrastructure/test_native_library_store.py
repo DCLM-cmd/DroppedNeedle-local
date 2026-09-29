@@ -2089,6 +2089,60 @@ async def test_identification_activity_snapshot_and_revisioned_controls(
     )
 
 
+@pytest.mark.asyncio
+async def test_identification_activity_counts_each_current_album_once(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    # Terminal jobs are retained for 30 days, so an album identified three times and
+    # a row since merged into another album used to count as four "albums" - the
+    # Scanning tab read 413 of 413 on a 273-album library, and a review the admin
+    # had already resolved stayed a "needs decision" forever.
+    for suffix in ("1", "2", "3"):
+        await store.create_catalog_membership(_membership(suffix))
+    jobs = (
+        ("album-1-old", "album-1", "succeeded"),
+        ("album-1-new", "album-1", "needs_review"),
+        ("album-2-merged", "album-2", "failed"),
+        ("album-3-open", "album-3", "needs_review"),
+    )
+    for job_id, album_id, state in jobs:
+        await store.enqueue_identification_job(
+            IdentificationJob(
+                id=job_id,
+                dedupe_key=f"automatic:{job_id}",
+                local_album_id=album_id,
+                created_at=10,
+            )
+        )
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "UPDATE library_identification_jobs SET state = ?, "
+                "terminal_at = CASE WHEN ? = 'needs_review' THEN NULL ELSE 11 END "
+                "WHERE id = ?",
+                (state, state, job_id),
+            )
+    with sqlite3.connect(db_path) as connection:
+        for review_id, album_id, state in (
+            ("review-1", "album-1", "resolved"),
+            ("review-3", "album-3", "needs_review"),
+        ):
+            connection.execute(
+                "INSERT INTO library_identification_reviews "
+                "(id, local_album_id, state, reason_code, input_revision, "
+                "created_at, updated_at) VALUES (?, ?, ?, 'AMBIGUOUS', 'rev', 11, 11)",
+                (review_id, album_id, state),
+            )
+        connection.execute(
+            "UPDATE local_albums SET retired_into_album_id = 'album-1' "
+            "WHERE id = 'album-2'"
+        )
+
+    snapshot = await store.get_identification_activity_snapshot(now=12)
+
+    assert snapshot["counts"] == {"succeeded": 1, "needs_review": 1}
+    assert snapshot["failure_event_id"] is None
+
+
 def test_identification_jobs_attention_cause_ratchet_is_idempotent(
     db_path: Path,
 ) -> None:

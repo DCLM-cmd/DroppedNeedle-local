@@ -190,6 +190,15 @@ AUTOMATIC_SAFE_EVIDENCE_REASONS = frozenset(
 )
 ATTENTION_FAILURE_CODES = frozenset({"MAX_DEFERRALS_EXCEEDED", "SUBJECT_NOT_AVAILABLE"})
 _ACTIVITY_DEFERRED_JOB_LIMIT = 20
+# Job ``j`` is its subject's latest and the album was not merged into another.
+_CURRENT_IDENTIFICATION_JOB = (
+    "NOT EXISTS(SELECT 1 FROM library_identification_jobs n "
+    "WHERE n.local_album_id IS j.local_album_id "
+    "AND n.local_track_id IS j.local_track_id "
+    "AND n.enqueue_sequence > j.enqueue_sequence) "
+    "AND NOT EXISTS(SELECT 1 FROM local_albums a WHERE a.id = j.local_album_id "
+    "AND a.retired_into_album_id IS NOT NULL)"
+)
 _GC_STALE_IDENTIFICATION_JOB_LIMIT = 500
 BULK_PREVIEW_BATCH_SIZE = 500
 BULK_PREVIEW_CLEANUP_BATCH_SIZE = 5_000
@@ -11066,11 +11075,22 @@ class NativeLibraryStore(PersistenceBase):
                     "WHERE queue_kind = 'identification'"
                 ).fetchone()
             )
+            # Terminal jobs are retained for 30 days, so only a subject's latest job
+            # says where it stands - older runs and rows merged into another album
+            # would otherwise each count as one more album. A review the admin has
+            # already decided no longer needs a decision.
             counts = {
                 str(row["state"]): int(row["count"])
                 for row in connection.execute(
-                    "SELECT state, COUNT(*) AS count FROM library_identification_jobs "
-                    "GROUP BY state"
+                    "SELECT CASE WHEN j.state = 'needs_review' AND NOT EXISTS("
+                    "SELECT 1 FROM library_identification_reviews r "
+                    "WHERE r.local_album_id IS j.local_album_id "
+                    "AND r.local_track_id IS j.local_track_id "
+                    "AND r.state IN ('needs_review','edition_to_confirm')"
+                    ") THEN 'succeeded' ELSE j.state END AS state, "
+                    "COUNT(*) AS count FROM library_identification_jobs j "
+                    f"WHERE j.state IN ('queued','running','paused') OR ({_CURRENT_IDENTIFICATION_JOB}) "
+                    "GROUP BY 1"
                 ).fetchall()
             }
             active = connection.execute(
@@ -11105,8 +11125,9 @@ class NativeLibraryStore(PersistenceBase):
             needs_review_count = int(review_counts[1])
             edition_to_confirm_count = int(review_counts[2])
             failure = connection.execute(
-                "SELECT id, terminal_at FROM library_identification_jobs "
-                "WHERE state = 'failed' ORDER BY terminal_at DESC, id DESC LIMIT 1"
+                "SELECT j.id, j.terminal_at FROM library_identification_jobs j "
+                f"WHERE j.state = 'failed' AND {_CURRENT_IDENTIFICATION_JOB} "
+                "ORDER BY j.terminal_at DESC, j.id DESC LIMIT 1"
             ).fetchone()
             foreground_operation_count = int(
                 connection.execute(
