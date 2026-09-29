@@ -91,6 +91,9 @@ class TestProviderStatsAuthMatrix:
                     "x-mb-rate-limiter": "lua",
                 }.get(name)
 
+        # Fresh counters too: rows other tests recorded (some with MagicMock
+        # values) would otherwise ride along and fail response encoding.
+        monkeypatch.setattr(provider_counters, "_counters", provider_counters.ProviderCounterMap())
         monkeypatch.setattr(provider_counters, "_rate_limit_gauge", gauge)
         provider_counters.record_rate_limit_headers("musicbrainz", _Headers())
 
