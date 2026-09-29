@@ -308,4 +308,12 @@ async def test_operation_worker_with_setup_status_flood_stays_within_budgets(
         f"revision_moves={revision_moves[0]}"
     )
     assert store.yield_counter[0] > 0, "timeslice/cooldown yields never exercised"
-    assert store.claim_counter[0] > subjects / 100, "claims should be bounded and real"
+    # Real: every yielded timeslice is claimed again. Bounded: work is claimed in
+    # slices, not per subject. A fixed floor such as subjects / 100 measured the
+    # runner's speed instead - a fast one finishes 500 subjects in four slices.
+    assert store.claim_counter[0] >= store.yield_counter[0] + 1, (
+        "claims should be real",
+        store.claim_counter,
+        store.yield_counter,
+    )
+    assert store.claim_counter[0] < subjects, ("claims should be bounded", store.claim_counter)
