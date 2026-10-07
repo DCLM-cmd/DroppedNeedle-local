@@ -171,3 +171,34 @@ async def test_an_unmatched_year_returns_nothing_rather_than_everything(compat_e
         Years="1066",
     )
     assert body["Items"] == []
+
+
+@pytest.mark.parametrize(
+    ("asked", "catalog"),
+    [
+        ("title", "name"),
+        ("year_asc", "oldest"),
+        ("year_desc", "newest"),
+        ("name", "name"),
+        ("oldest", "oldest"),
+        ("recent", "recent"),
+    ],
+)
+async def test_album_sorts_reach_the_catalog_under_its_own_names(asked, catalog):
+    """Subsonic's alphabeticalByName and byYear still say "title" and "year_asc",
+    the retired library's names. The catalog does not know them and answered
+    newest-first, so A-Z and by-year album lists in Symfonium were never sorted."""
+    from unittest.mock import AsyncMock
+
+    from services.compat.target_library_view_service import TargetLibraryViewService
+
+    view = TargetLibraryViewService.__new__(TargetLibraryViewService)
+    view._store = AsyncMock()
+    view._store.list_target_albums.return_value = ([], 0)
+    view._album = lambda row: row
+    view._overlay_favorites = AsyncMock()
+    view._overlay_plays = AsyncMock()
+
+    await view.get_albums_offset(limit=10, offset=0, sort=asked)
+
+    assert view._store.list_target_albums.await_args.kwargs["sort"] == catalog

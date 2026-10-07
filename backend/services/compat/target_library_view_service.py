@@ -40,6 +40,13 @@ def _dominant_release_type(rows: list[dict]) -> str | None:
     return counts.most_common(1)[0][0]
 
 
+# The Subsonic shim still names album sorts the way the retired library did. The
+# catalog does not know these and silently answered newest-first, so translate the
+# ones that cannot be confused with a catalog name ("oldest" can: it means the
+# oldest release year in the catalog but the first imported in the old library).
+_RETIRED_ALBUM_SORTS = {"title": "name", "year_asc": "oldest", "year_desc": "newest"}
+
+
 class TargetLibraryViewService:
     def __init__(
         self,
@@ -140,7 +147,7 @@ class TargetLibraryViewService:
         rows, total = await self._store.list_target_albums(
             limit=limit,
             offset=offset,
-            sort=sort,
+            sort=_RETIRED_ALBUM_SORTS.get(sort, sort),
             search=q,
             years=years,
             name_starts_with=name_starts_with,

@@ -765,23 +765,22 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
             user=user,
         )
         return await _build_qr(b.album, albums, total, start)
-    if sort_key is not None:
-        albums, total = await services.discover.get_sorted_albums(
-            sort=_SORT_NATIVE[sort_key],
-            descending=sort_desc,
-            limit=limit or 100,
-            offset=start,
-            q=search,
-            user=user,
-        )
-        return await _build_qr(b.album, albums, total, start)
+    # Every other sort goes through _ALBUM_SORTS, which speaks the catalog's sort
+    # names and keeps the year, genre and letter filters. A branch that asked the
+    # discover helper instead used the retired library's names ("title",
+    # "year_asc") - unknown to the catalog, so every sorted album list came back
+    # newest-first and the A-Z jump bar's letter was dropped.
     page = start // limit + 1 if limit else 1
     albums, total = await services.view.get_albums(
         page=page,
         page_size=limit or 100,
         q=search,
         user=user,
-        sort=_sort_key(request, _ALBUM_SORTS, "recent"),
+        sort=(
+            _ALBUM_SORTS[sort_key][sort_desc]
+            if sort_key in _ALBUM_SORTS
+            else _sort_key(request, _ALBUM_SORTS, "recent")
+        ),
         years=_years(request),
         genre=_genre(request),
         name_starts_with=_name_starts_with(request),

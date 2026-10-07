@@ -169,44 +169,6 @@ class CompatDiscoverService:
     # DESC, track year) resolve here over bounded windows. Client text never
     # reaches SQL: only the fixed keys below select a native sort.
 
-    async def get_sorted_albums(
-        self, *, sort: str = "recent", descending: bool = False,
-        limit: int = 100, offset: int = 0,
-        q: str | None = None, user: "UserRecord | None" = None,
-    ) -> tuple[list["ViewAlbum"], int]:
-        """Albums via native allowlist sorts. `sort` is one of recent/title/
-        artist/year/random (anything else behaves as recent). Title/artist
-        descending mirror a window from the end, exact at any size."""
-        limit = limit if limit > 0 else 100
-        offset = max(offset, 0)
-        if sort not in ("recent", "title", "artist", "year", "random"):
-            sort = "recent"
-        if sort == "random":
-            return await self._view.get_albums_offset(
-                limit=limit, offset=offset, sort="random", q=q, user=user
-            )
-        if sort == "year":
-            native = "year_desc" if descending else "year_asc"
-            return await self._view.get_albums_offset(
-                limit=limit, offset=offset, sort=native, q=q, user=user
-            )
-        if sort == "recent":
-            native = "recent" if descending else "oldest"
-            return await self._view.get_albums_offset(
-                limit=limit, offset=offset, sort=native, q=q, user=user
-            )
-        if not descending:
-            return await self._view.get_albums_offset(
-                limit=limit, offset=offset, sort=sort, q=q, user=user
-            )
-
-        async def fetch(n: int, o: int):
-            return await self._view.get_albums_offset(
-                limit=n, offset=o, sort=sort, q=q, user=user
-            )
-
-        return await self._fetch_desc_mirror(fetch, limit=limit, offset=offset)
-
     async def get_sorted_tracks(
         self, *, sort: str = "recent", descending: bool = False,
         limit: int = 100, offset: int = 0,

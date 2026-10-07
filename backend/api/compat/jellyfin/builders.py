@@ -56,6 +56,30 @@ def _iso(ts: float | int | None) -> str | None:
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{dt.microsecond:06d}0Z"
 
 
+_PARTIAL_DATE = re.compile(r"^\s*(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?")
+
+
+def premiere_date(value: str | None) -> str | None:
+    """A stored release date ("2008", "2008-05", "2008-05-23") as Jellyfin sends it.
+
+    Jellyfin always sends a full timestamp, and Finamp formats it with Dart's
+    ``DateTime.parse``, which rejects anything shorter than year-month-day: a bare
+    year threw while the album header was built. Missing parts read as the first.
+    """
+    from datetime import date
+
+    match = _PARTIAL_DATE.match(value or "")
+    if match is None or int(match.group(1)) == 0:
+        return None
+    year = int(match.group(1))
+    month = min(max(int(match.group(2) or 1), 1), 12)
+    try:
+        day = date(year, month, int(match.group(3) or 1)).day
+    except ValueError:
+        day = 1
+    return f"{year:04d}-{month:02d}-{day:02d}T00:00:00.0000000Z"
+
+
 class JellyfinBuilder:
     def __init__(
         self,
@@ -337,7 +361,7 @@ class JellyfinBuilder:
                 t.file_size_bytes, t.file_format, t.bitrate,
             ),
             Tags=[],
-            PremiereDate=t.original_release_date or None,
+            PremiereDate=premiere_date(t.original_release_date),
             # ReplayGain: without these a client cannot level playback across albums.
             NormalizationGain=t.replaygain_track_gain,
             AlbumNormalizationGain=t.replaygain_album_gain,
@@ -391,7 +415,7 @@ class JellyfinBuilder:
                 a.total_duration_seconds,
             ),
             Tags=[],
-            PremiereDate=a.original_release_date or None,
+            PremiereDate=premiere_date(a.original_release_date),
             DateLastMediaAdded=_iso(a.date_added),
             SongCount=a.track_count,
             RecursiveItemCount=a.track_count,

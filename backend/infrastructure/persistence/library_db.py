@@ -122,12 +122,19 @@ _LIBRARY_FILE_FOLDED_COLUMNS = {
 
 _ALBUM_AGG_SORTS = {
     "recent": "last_imported_at DESC, release_group_mbid",
-    "oldest": "last_imported_at ASC, release_group_mbid",
+    # The catalog's meaning: oldest release first. First imported is recent_asc.
+    "oldest": "year ASC, album_title COLLATE NOCASE ASC, release_group_mbid",
     "title": "album_title COLLATE NOCASE ASC, release_group_mbid",
     "artist": "album_artist_name COLLATE NOCASE ASC, album_title COLLATE NOCASE ASC, release_group_mbid",
     "year_asc": "year ASC, album_title COLLATE NOCASE ASC, release_group_mbid",
     "year_desc": "year DESC, album_title COLLATE NOCASE ASC, release_group_mbid",
     "random": "RANDOM()",
+    # The catalog's names, which the compat shims now send for every view.
+    "recent_asc": "last_imported_at ASC, release_group_mbid",
+    "name": "album_title COLLATE NOCASE ASC, release_group_mbid",
+    "name_desc": "album_title COLLATE NOCASE DESC, release_group_mbid",
+    "artist_desc": "album_artist_name COLLATE NOCASE DESC, album_title COLLATE NOCASE ASC, release_group_mbid",
+    "newest": "year DESC, album_title COLLATE NOCASE ASC, release_group_mbid",
 }
 
 # each ends with lf.id so the order is total and pagination stays stable

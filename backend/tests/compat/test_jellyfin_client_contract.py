@@ -318,3 +318,78 @@ def test_a_person_carries_what_a_client_renders() -> None:
     assert encoded["Name"] == "Quadeca"
     assert encoded["Id"] == "artist-1"
     assert encoded["Type"] == "Artist"
+
+
+# ---- PremiereDate ---------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("stored", "sent"),
+    [
+        ("2008", "2008-01-01T00:00:00.0000000Z"),
+        ("2008-05", "2008-05-01T00:00:00.0000000Z"),
+        ("2006-05-23", "2006-05-23T00:00:00.0000000Z"),
+        ("2006-02-30", "2006-02-01T00:00:00.0000000Z"),
+        ("0000", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_premiere_date_is_a_full_timestamp(stored, sent) -> None:
+    """Finamp formats the release date with Dart's DateTime.parse, which needs at
+    least year-month-day: a bare "2008" threw while building the album header, so
+    "Declaring War Redux" rendered half-empty with no play button and no error."""
+    from api.compat.jellyfin.builders import premiere_date
+
+    assert premiere_date(stored) == sent
+
+
+# ---- album sorting --------------------------------------------------------------
+
+def _album_browse(**params):
+    client = _client()
+    services = client.app.dependency_overrides[get_compat_services]()
+    services.id_map = MagicMock()
+    services.coverart = MagicMock()
+    services.view = MagicMock()
+    services.view.get_albums = AsyncMock(return_value=([], 0))
+    auth = {"Authorization": 'MediaBrowser Token="t", Client="c", DeviceId="d"'}
+    response = client.get(
+        "/jellyfin/Users/u1/Items",
+        params={"IncludeItemTypes": "MusicAlbum", "Recursive": "true", **params},
+        headers=auth,
+    )
+    assert response.status_code == 200, response.content[:200]
+    return services
+
+
+@pytest.mark.parametrize(
+    ("sort_by", "order", "catalog_sort"),
+    [
+        ("SortName", "Ascending", "name"),
+        ("SortName", "Descending", "name_desc"),
+        ("PremiereDate,SortName", "Ascending", "oldest"),
+        ("ProductionYear", "Descending", "newest"),
+        ("DateCreated", "Ascending", "recent_asc"),
+        # No SortOrder: Jellyfin lists these newest first (Jellify relies on it).
+        ("PremiereDate", None, "newest"),
+        ("DateCreated", None, "recent"),
+    ],
+)
+def test_sorted_album_lists_reach_the_catalog_in_its_own_terms(
+    sort_by, order, catalog_sort
+) -> None:
+    """The sorted branch spoke the retired library's sort names ("title",
+    "year_asc"), which the catalog does not know and quietly answered newest-first:
+    Finamp's A-Z album list began with whatever was imported last."""
+    params = {"SortBy": sort_by} | ({"SortOrder": order} if order else {})
+    services = _album_browse(**params)
+
+    assert services.view.get_albums.await_args.kwargs["sort"] == catalog_sort
+
+
+def test_a_sorted_album_list_keeps_its_letter_filter() -> None:
+    """The A-Z jump bar sends NameStartsWith together with SortBy=SortName; the
+    sorted branch dropped the letter and returned the whole library."""
+    services = _album_browse(SortBy="SortName", NameStartsWith="D")
+
+    assert services.view.get_albums.await_args.kwargs["name_starts_with"] == "D"
