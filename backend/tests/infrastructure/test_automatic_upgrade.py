@@ -879,13 +879,26 @@ def test_target_ready_requires_normalized_base_health(
 def test_target_ready_follows_a_pinned_bind_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    port = _free_port()
+    # Only the pinned address answers. Stubbed rather than bound for real: Linux
+    # routes all of 127/8 to loopback, macOS has only 127.0.0.1, so a second
+    # loopback address cannot be served everywhere the suite runs.
+    pinned = "10.20.30.40"
+    probed: list[str] = []
 
-    with _operational_target(port, "", host="127.0.0.2"):
-        monkeypatch.setenv(BIND_HOST_ENV, "127.0.0.2")
-        assert _target_ready(port, "")
-        monkeypatch.delenv(BIND_HOST_ENV)
-        assert not _target_ready(port, "")
+    def health_ok(host: str, port: int, base_path: str) -> bool:
+        probed.append(host)
+        return host == pinned
+
+    monkeypatch.setattr(automatic_upgrade, "_health_ok", health_ok)
+
+    monkeypatch.setenv(BIND_HOST_ENV, pinned)
+    assert _target_ready(8688, "")
+    assert probed[0] == pinned
+
+    monkeypatch.delenv(BIND_HOST_ENV)
+    probed.clear()
+    assert not _target_ready(8688, "")
+    assert pinned not in probed
 
 
 def test_copy_upgrade_promotes_only_after_the_working_database_passes(

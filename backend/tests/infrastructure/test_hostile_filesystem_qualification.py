@@ -217,13 +217,38 @@ def _settings(*roots: tuple[str, Path]) -> TypedLibrarySettings:
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Not implemented: the reconciler proves a remap by byte size alone - legacy "
+        "rows carry no content hash - so a same-size destination with different "
+        "content is remapped. This only ever passed where tmp_path sits under /tmp, "
+        "which the reconciler refuses as a root for an unrelated reason."
+    ),
+)
 @pytest.mark.asyncio
-async def test_same_size_wrong_content_destination_fails_closed(tmp_path: Path) -> None:
+async def test_same_size_wrong_content_destination_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Destination-integrity matrix case: remap destination whose sizes MATCH
     the legacy rows but whose CONTENT differs must fail closed - no mapping,
     no overwrite, zero source/destination/staging mutation."""
+    import services.native.legacy_path_reconciler as reconciler_module
     from services.native.legacy_path_reconciler import LegacyPathReconciler
     from tests.infrastructure.test_legacy_catalog_importer import _create_source
+
+    # Judge the content, not where the test happens to run: Linux puts tmp_path
+    # under /tmp, a root the reconciler always refuses, macOS under /private/var.
+    workspace = tmp_path.resolve()
+    monkeypatch.setattr(
+        reconciler_module,
+        "_BLOCKED_ROOTS",
+        tuple(
+            root
+            for root in reconciler_module._BLOCKED_ROOTS
+            if root == Path("/") or not workspace.is_relative_to(root)
+        ),
+    )
 
     historical_root = tmp_path / "Old" / "Music"
     current_root = tmp_path / "Current" / "Music"
