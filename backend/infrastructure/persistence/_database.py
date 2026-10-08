@@ -193,8 +193,18 @@ class _ConnectionPool(threading.local):
     """
 
     def __init__(self) -> None:
-        self.connections: dict[tuple[int, str], sqlite3.Connection] = {}
+        # Each entry remembers the token that owns it: keys use id(token), and once
+        # a store dies Python hands that id to the next object it allocates.
+        self.connections: dict[
+            tuple[int, str], tuple[weakref.ref[_PoolToken], sqlite3.Connection]
+        ] = {}
         self.generation = 0
+
+
+class _PoolToken:
+    """Identity of one store instance in the pool; weak-referenceable."""
+
+    __slots__ = ("__weakref__",)
 
 
 _pool = _ConnectionPool()
@@ -207,7 +217,7 @@ _pool_generation = 0
 
 def close_pooled_connections() -> None:
     """Close every pooled connection owned by the calling thread."""
-    for conn in _pool.connections.values():
+    for _owner, conn in _pool.connections.values():
         try:
             conn.close()
         except sqlite3.Error:  # noqa: PERF203 - closing must never raise
@@ -252,14 +262,19 @@ class PooledSqliteStore:
         builds each store once, so per-instance keying pools exactly as widely in
         practice while removing that trap.
 
-        The token is created per instance and lives as long as it, so ``id()`` cannot
-        be recycled underneath a live entry the way ``id(self)`` could.
+        The token is created per instance and lives as long as it. Its ``id()`` is
+        recycled once the store dies, so each entry also records its owner and an
+        entry left behind by a dead store is never handed to the next one.
         """
+        return (id(self._pool_owner), str(self.db_path))
+
+    @property
+    def _pool_owner(self) -> _PoolToken:
         token = getattr(self, "_pool_token", None)
         if token is None:
-            token = object()
+            token = _PoolToken()
             object.__setattr__(self, "_pool_token", token)
-        return (id(token), str(self.db_path))
+        return token
 
     def _pooled_connection(self) -> sqlite3.Connection:
         """Borrow this thread's connection for this store, opening it on first use.
@@ -272,17 +287,22 @@ class PooledSqliteStore:
             close_pooled_connections()
             _pool.generation = _pool_generation
         key = self._pool_key
-        conn = _pool.connections.get(key)
-        if conn is None:
-            conn = self._connect()
-            _pool.connections[key] = conn
-        return conn
+        owner = self._pool_owner
+        entry = _pool.connections.get(key)
+        if entry is not None and entry[0]() is not owner:
+            # A dead store's connection under a recycled id: not ours to use.
+            self._discard_pooled_connection()
+            entry = None
+        if entry is None:
+            entry = (weakref.ref(owner), self._connect())
+            _pool.connections[key] = entry
+        return entry[1]
 
     def _discard_pooled_connection(self) -> None:
-        conn = _pool.connections.pop(self._pool_key, None)
-        if conn is not None:
+        entry = _pool.connections.pop(self._pool_key, None)
+        if entry is not None:
             try:
-                conn.close()
+                entry[1].close()
             except sqlite3.Error:
                 pass
 

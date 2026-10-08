@@ -152,3 +152,60 @@ async def test_concurrent_writes_all_land(store):
     """Serialised writes over a shared pooled connection must not lose rows."""
     await asyncio.gather(*(store.insert(f"v{index}") for index in range(20)))
     assert sorted(await store.all_values()) == sorted(f"v{index}" for index in range(20))
+
+
+class _OwnConnectionStore(_Store):
+    """Holds its own connection and closes it when torn down, like a test double."""
+
+    def __init__(self, db_path, write_lock) -> None:
+        self.real = sqlite3.connect(db_path, check_same_thread=False)
+        self.real.row_factory = sqlite3.Row
+        super().__init__(db_path, write_lock)
+
+    def _connect(self) -> sqlite3.Connection:
+        real = self.real
+
+        class _KeepOpen:
+            def close(self) -> None:
+                pass
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        return _KeepOpen()  # type: ignore[return-value]
+
+
+@pytest.mark.asyncio
+async def test_a_new_store_never_inherits_a_dead_stores_connection(tmp_path):
+    """The pool keyed connections by id() of a per-store token. Once a store died its
+    entry stayed, Python handed the freed id to the next store's token, and that
+    store was given the dead one's connection - closed by then, so every query
+    failed with "Cannot operate on a closed database"."""
+    import gc
+
+    lock = threading.Lock()
+    first = _OwnConnectionStore(tmp_path / "first.db", lock)
+    await first.insert("a")
+    dead_key = first._pool_key
+    first.real.close()
+    del first
+    gc.collect()
+
+    from infrastructure.persistence._database import _PoolToken
+
+    # Take the freed id the way the next store would; unmatched tokens stay alive
+    # so the allocator cannot keep handing back the same miss.
+    unmatched = []
+    for _ in range(10_000):
+        token = _PoolToken()
+        if id(token) == dead_key[0]:
+            break
+        unmatched.append(token)
+    else:
+        pytest.skip("the interpreter did not reuse the freed id")
+    second = _OwnConnectionStore(tmp_path / "first.db", lock)
+    object.__setattr__(second, "_pool_token", token)
+    assert second._pool_key == dead_key
+
+    assert await second.all_values() == ["a"]
+    close_pooled_connections()
