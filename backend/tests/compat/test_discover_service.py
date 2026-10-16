@@ -179,3 +179,25 @@ async def test_empty_results_do_not_error(library_view_service, seeded_library):
     svc = _make_service(library_view_service, db, "local-only")
     assert await svc.get_top_songs("Nobody", user_id="user-alice") == []
     assert await svc.get_similar_songs(_A, user_id="user-alice") == []
+
+
+@pytest.mark.asyncio
+async def test_random_tracks_are_drawn_from_the_whole_library():
+    """SortBy=Random served a contiguous window of import order, shuffled: 225
+    "random" tracks came from about 15 whole albums. Jellyfin draws from everything."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from services.compat.discover_service import CompatDiscoverService
+
+    view = MagicMock()
+    view.get_tracks_page = AsyncMock(return_value=(["t"] * 5, 3307))
+    discover = CompatDiscoverService.__new__(CompatDiscoverService)
+    discover._view = view
+
+    tracks, total = await discover.get_sorted_tracks(sort="random", limit=5)
+
+    assert total == 3307
+    assert len(tracks) == 5
+    kwargs = view.get_tracks_page.await_args.kwargs
+    assert kwargs["sort"] == "random"
+    assert kwargs["offset"] == 0

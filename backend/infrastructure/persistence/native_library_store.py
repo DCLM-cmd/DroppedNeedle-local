@@ -3954,7 +3954,9 @@ class NativeLibraryStore(PersistenceBase):
                     "runtime_desc": (
                         "SUM(COALESCE(t.duration_seconds, 0)) DESC, a.id"
                     ),
-                    "random": "a.id",
+                    # A fresh draw each call, as Jellyfin's ORDER BY RANDOM(); by id
+                    # every "random" album list came back in the same order.
+                    "random": "RANDOM()",
                 }.get(sort, "MAX(t.imported_at) DESC, a.id")
                 rows = connection.execute(
                     "SELECT a.id AS release_group_mbid, a.title AS album_title, "

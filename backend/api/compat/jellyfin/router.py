@@ -454,6 +454,11 @@ async def _build_qr(build_fn, items, total, start):
     )
 
 
+# Jellyfin answers every match when a list request carries no Limit; clients that
+# sync (Finamp's favourites and downloads) send none and expect the whole set.
+_ALL = 1_000_000
+
+
 async def _build_page(build_fn, items, start, limit):
     total = len(items)
     page = items[start : start + limit] if limit else items[start:]
@@ -598,6 +603,16 @@ def _sort_descending(request: Request) -> bool:
     return _params(request).get("SortOrder", "").casefold().startswith("desc")
 
 
+def _artist_sort_key(request: Request) -> str:
+    """The artist listing's sort key. Its table maps to one key, not an asc/desc pair:
+    read through _sort_key it handed the catalog "n" for name, or "a" descending."""
+    for raw in _csv_param(request, "SortBy"):
+        key = _ARTIST_SORTS.get(raw.casefold())
+        if key is not None:
+            return key
+    return "name"
+
+
 def _sort_key(request: Request, table: dict, default: str) -> str:
     """The catalog sort for this request's SortBy/SortOrder, or ``default``."""
     for raw in _csv_param(request, "SortBy"):
@@ -618,7 +633,7 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
     q = _params(request)
     b = _builder(services, request)
     start = max(_qint(request, "StartIndex", 0), 0)
-    limit = max(_qint(request, "Limit", 100), 0)
+    limit = max(_qint(request, "Limit", 0), 0)
     search = q.get("SearchTerm") or None
     types = set(_csv_param(request, "IncludeItemTypes"))
     ids = _csv_param(request, "Ids")
@@ -655,11 +670,11 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
 
     if primary == "MusicArtist":
         artists, total = await services.view.get_artists(
-            limit=limit or 100_000,
+            limit=limit or _ALL,
             offset=start,
             q=search,
             user=user,
-            sort_by=_sort_key(request, _ARTIST_SORTS, "name"),
+            sort_by=_artist_sort_key(request),
             sort_order="desc" if _sort_descending(request) else "asc",
         )
         return await _build_qr(b.artist, artists, total, start)
@@ -704,7 +719,7 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
                 user_id=user.id,
                 frequent=sort_key == "playcount",
                 descending=sort_desc,
-                limit=limit or 100,
+                limit=limit or _ALL,
                 offset=start,
                 user=user,
             )
@@ -713,14 +728,14 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
             tracks, total = await services.discover.get_sorted_tracks(
                 sort=_SORT_NATIVE[sort_key],
                 descending=sort_desc,
-                limit=limit or 100,
+                limit=limit or _ALL,
                 offset=start,
                 q=search,
                 user=user,
             )
             return await _build_qr(b.audio, tracks, total, start)
         tracks, total = await services.view.get_tracks_page(
-            limit=limit or 100,
+            limit=limit or _ALL,
             offset=start,
             q=search,
             user=user,
@@ -760,7 +775,7 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
             user_id=user.id,
             frequent=sort_key == "playcount",
             descending=sort_desc,
-            limit=limit or 100,
+            limit=limit or _ALL,
             offset=start,
             user=user,
         )
@@ -773,7 +788,7 @@ async def _browse(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
     page = start // limit + 1 if limit else 1
     albums, total = await services.view.get_albums(
         page=page,
-        page_size=limit or 100,
+        page_size=limit or _ALL,
         q=search,
         user=user,
         sort=(
@@ -805,17 +820,24 @@ async def _items_by_ids(services, b, ids, user):
     return built
 
 
+# Favourite kinds by Jellyfin item type. Playlists cannot be favourited here, so a
+# request for them simply contributes nothing - as Jellyfin with none favourited.
+_FAVOURITE_KINDS = {"MusicArtist": "artist", "MusicAlbum": "album", "Audio": "track"}
+
+
 async def _favorite_items(request, services, b, user, types, start, limit):
-    primary = _primary_type(types, None)
-    kind = {"MusicArtist": "artist", "MusicAlbum": "album", "Audio": "track"}.get(
-        primary, "track"
+    # Every requested type, not just the first: Finamp syncs favourites with
+    # IncludeItemTypes=Audio,MusicAlbum,Playlist and got the albums alone. No type
+    # at all means every favourite, as in Jellyfin.
+    kinds = [kind for t, kind in _FAVOURITE_KINDS.items() if t in types] or list(
+        _FAVOURITE_KINDS.values()
     )
-    favs = await services.favorites.list(user.id, kind)
     built = []
-    for internal, _ in favs:
-        item = await _single_item(services, b, kind, internal, user)
-        if item is not None:
-            built.append(item)
+    for kind in kinds:
+        for internal, _ in await services.favorites.list(user.id, kind):
+            item = await _single_item(services, b, kind, internal, user)
+            if item is not None:
+                built.append(item)
     # Jellyfin honours SortBy=Random on the favourites list; Finamp's home "Favourites"
     # relies on that to reshuffle on every refresh. The catalog favourites order is
     # stable, so apply the shuffle here when the client asked for it.
@@ -918,11 +940,24 @@ async def _artists(
 ) -> jm.BaseItemDtoQueryResult:
     b = _builder(services, request)
     start = max(_qint(request, "StartIndex", 0), 0)
-    limit = max(_qint(request, "Limit", 100), 0)
+    limit = max(_qint(request, "Limit", 0), 0)
+    if _wants_favorites(request):
+        return await _favorite_items(
+            request, services, b, user, {"MusicArtist"}, start, limit
+        )
     search = _params(request).get("SearchTerm") or None
+    if _wants_random(request):
+        # The catalog has no random artist order; Jellyfin draws afresh each call.
+        artists, total = await services.view.get_artists(
+            limit=_ALL, offset=0, q=search, user=user, scope=scope
+        )
+        random.shuffle(artists)
+        return await _build_page(b.artist, artists, start, limit)
     artists, total = await services.view.get_artists(
-        limit=limit or 100_000,
+        limit=limit or _ALL,
         offset=start,
+        sort_by=_artist_sort_key(request),
+        sort_order="desc" if _sort_descending(request) else "asc",
         q=search,
         user=user,
         scope=scope,
@@ -950,7 +985,7 @@ async def album_artists(
 async def _genres(request, services, user, **_) -> jm.BaseItemDtoQueryResult:
     b = _builder(services, request)
     start = max(_qint(request, "StartIndex", 0), 0)
-    limit = max(_qint(request, "Limit", 100), 0)
+    limit = max(_qint(request, "Limit", 0), 0)
     genres = await services.view.get_genres()
     return await _build_page(b.genre, genres, start, limit)
 

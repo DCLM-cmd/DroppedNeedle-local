@@ -182,22 +182,12 @@ class CompatDiscoverService:
         if sort not in ("recent", "title", "artist", "album", "year", "random"):
             sort = "recent"
         if sort == "random":
-            _, total = await self._view.get_tracks_page(
-                limit=1, offset=0, sort="recent", q=q
+            # A fresh draw from every track, as Jellyfin's ORDER BY RANDOM(). A
+            # shuffled window of import order looked random but held about fifteen
+            # whole albums per 225 tracks.
+            return await self._view.get_tracks_page(
+                limit=limit, offset=0, sort="random", q=q, user=user
             )
-            if total == 0:
-                return [], 0
-            if total <= limit:
-                items, _ = await self._view.get_tracks_page(
-                    limit=total, offset=0, sort="recent", q=q, user=user
-                )
-            else:
-                start = random.randint(0, total - limit)
-                items, _ = await self._view.get_tracks_page(
-                    limit=limit, offset=start, sort="recent", q=q, user=user
-                )
-            random.shuffle(items)
-            return items, total
         if sort == "year":
             _, total = await self._view.get_tracks_page(
                 limit=1, offset=0, sort="recent", q=q

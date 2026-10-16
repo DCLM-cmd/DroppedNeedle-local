@@ -5277,3 +5277,23 @@ async def test_library_revisions_missing_stream_row_raises_not_found(
         )
     with pytest.raises(ResourceNotFoundError, match="operation"):
         await store.get_library_revisions()
+
+
+@pytest.mark.asyncio
+async def test_random_albums_are_drawn_afresh_on_every_call(
+    store: NativeLibraryStore,
+) -> None:
+    """sort="random" ordered by album id, so every "random" list - Finamp's random
+    albums, a shuffle - came back in the same order each time."""
+    for index in range(30):
+        await store.create_catalog_membership(_membership(f"r{index}"))
+
+    orders = {
+        tuple(
+            row["release_group_mbid"]
+            for row in (await store.list_target_albums(limit=30, offset=0, sort="random"))[0]
+        )
+        for _ in range(5)
+    }
+
+    assert len(orders) > 1

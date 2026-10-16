@@ -393,3 +393,171 @@ def test_a_sorted_album_list_keeps_its_letter_filter() -> None:
     services = _album_browse(SortBy="SortName", NameStartsWith="D")
 
     assert services.view.get_albums.await_args.kwargs["name_starts_with"] == "D"
+
+
+# ---- favourites -----------------------------------------------------------------
+
+_AUTH = {"Authorization": 'MediaBrowser Token="t", Client="c", DeviceId="d"'}
+
+
+def _favourites_client(monkeypatch, favourites: dict[str, list[str]]):
+    """A client whose favourites store holds ``favourites`` (kind -> ids); each
+    favourite renders as a minimal item of its Jellyfin type."""
+    import api.compat.jellyfin.router as router_module
+
+    client = _client()
+    services = client.app.dependency_overrides[get_compat_services]()
+    services.id_map = MagicMock()
+    services.coverart = MagicMock()
+    services.view = MagicMock()
+    services.view.get_artists = AsyncMock(return_value=([], 0))
+    services.favorites = MagicMock()
+    services.favorites.list = AsyncMock(
+        side_effect=lambda user_id, kind: [(i, 0.0) for i in favourites.get(kind, [])]
+    )
+    jellyfin_type = {"track": "Audio", "album": "MusicAlbum", "artist": "MusicArtist"}
+
+    async def single_item(services, b, kind, internal, user):
+        return jm.BaseItemDto(Id=internal, Name=internal, Type=jellyfin_type[kind])
+
+    monkeypatch.setattr(router_module, "_single_item", single_item)
+    return client, services
+
+
+def _types(body) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in body["Items"]:
+        counts[item["Type"]] = counts.get(item["Type"], 0) + 1
+    return counts
+
+
+def test_favourites_of_several_types_are_all_returned(monkeypatch) -> None:
+    """Finamp syncs favourites with IncludeItemTypes=Audio,MusicAlbum,Playlist. Only
+    the first type was answered, so 22 albums came back and none of 256 tracks."""
+    client, _ = _favourites_client(
+        monkeypatch, {"track": ["t1", "t2", "t3"], "album": ["a1"]}
+    )
+
+    body = json.loads(
+        client.get(
+            "/jellyfin/Users/u1/Items",
+            params={
+                "IncludeItemTypes": "Audio,MusicAlbum,Playlist",
+                "Recursive": "true",
+                "Filters": "IsFavorite",
+            },
+            headers=_AUTH,
+        ).content
+    )
+
+    assert _types(body) == {"Audio": 3, "MusicAlbum": 1}
+    assert body["TotalRecordCount"] == 4
+
+
+def test_favourite_artists_are_filtered(monkeypatch) -> None:
+    """/Artists ignored Filters=IsFavorite and listed every artist in the library."""
+    client, services = _favourites_client(monkeypatch, {"artist": ["ar1"]})
+
+    body = json.loads(
+        client.get(
+            "/jellyfin/Artists", params={"Filters": "IsFavorite"}, headers=_AUTH
+        ).content
+    )
+
+    assert [item["Id"] for item in body["Items"]] == ["ar1"]
+    services.view.get_artists.assert_not_awaited()
+
+
+def test_a_list_without_limit_is_complete(monkeypatch) -> None:
+    """Jellyfin answers every match when Limit is absent; a silent cap of 100 cut
+    Finamp's favourites sync to the first 100 tracks."""
+    client, _ = _favourites_client(
+        monkeypatch, {"track": [f"t{i}" for i in range(150)]}
+    )
+
+    body = json.loads(
+        client.get(
+            "/jellyfin/Users/u1/Items",
+            params={"IncludeItemTypes": "Audio", "Filters": "IsFavorite"},
+            headers=_AUTH,
+        ).content
+    )
+
+    assert len(body["Items"]) == 150
+
+
+def test_an_album_list_without_limit_asks_for_everything() -> None:
+    client = _client()
+    services = client.app.dependency_overrides[get_compat_services]()
+    services.id_map = MagicMock()
+    services.coverart = MagicMock()
+    services.view = MagicMock()
+    services.view.get_albums = AsyncMock(return_value=([], 0))
+
+    client.get(
+        "/jellyfin/Users/u1/Items",
+        params={"IncludeItemTypes": "MusicAlbum", "Recursive": "true"},
+        headers=_AUTH,
+    )
+
+    assert services.view.get_albums.await_args.kwargs["page_size"] > 100_000 - 1
+
+
+def _artist_client(artists):
+    client = _client()
+    services = client.app.dependency_overrides[get_compat_services]()
+    services.id_map = MagicMock()
+    services.id_map.to_jf = AsyncMock(side_effect=lambda kind, internal: internal)
+    services.coverart = MagicMock()
+    services.view = MagicMock()
+    services.view.get_artists = AsyncMock(
+        side_effect=lambda **_: (list(artists), len(artists))
+    )
+    return client, services
+
+
+def test_random_artists_are_shuffled(monkeypatch) -> None:
+    """/Artists/AlbumArtists?SortBy=Random came back alphabetical every time."""
+    import api.compat.jellyfin.router as router_module
+
+    names = [f"artist-{index:02d}" for index in range(40)]
+
+    class _Builder:
+        async def artist(self, artist):
+            return jm.BaseItemDto(Id=artist, Name=artist, Type="MusicArtist")
+
+    monkeypatch.setattr(router_module, "_builder", lambda services, request=None: _Builder())
+    client, _ = _artist_client(names)
+
+    orders = {
+        tuple(
+            item["Name"]
+            for item in json.loads(
+                client.get(
+                    "/jellyfin/Artists/AlbumArtists",
+                    params={"SortBy": "Random", "Limit": "40"},
+                    headers=_AUTH,
+                ).content
+            )["Items"]
+        )
+        for _ in range(3)
+    }
+
+    assert len(orders) > 1
+    assert all(sorted(order) == names for order in orders)
+
+
+def test_artist_lists_honour_their_sort(monkeypatch) -> None:
+    import api.compat.jellyfin.router as router_module
+
+    monkeypatch.setattr(router_module, "_builder", lambda services, request=None: MagicMock())
+    client, services = _artist_client([])
+
+    client.get(
+        "/jellyfin/Artists/AlbumArtists",
+        params={"SortBy": "SortName", "SortOrder": "Descending"},
+        headers=_AUTH,
+    )
+
+    kwargs = services.view.get_artists.await_args.kwargs
+    assert (kwargs["sort_by"], kwargs["sort_order"]) == ("name", "desc")

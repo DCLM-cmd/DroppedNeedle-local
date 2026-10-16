@@ -161,6 +161,7 @@ _TRACK_LIST_SORTS = {
     "disc_number_desc": "lf.disc_number DESC, lf.track_number DESC, lf.id",
     "runtime": "COALESCE(lf.duration_seconds, 0), lf.id",
     "runtime_desc": "COALESCE(lf.duration_seconds, 0) DESC, lf.id",
+    "random": "RANDOM()",
 }
 
 _ARTIST_AGG_SORT_COLUMNS = {
