@@ -225,7 +225,11 @@ class TaggingScriptEngine:
                 _raise("Custom tag names must be unique.", "tagging input", 1, 1)
             seen_custom.add(folded)
             custom[value.name] = value.values
-        self._validate_custom_output(custom, "tagging input", 1, 1)
+        # What the file already carries is its own business: Picard alone writes about
+        # a hundred AcousticBrainz tags, and counting those against the bound held
+        # every such file before a script ran. The bounds limit what scripts add.
+        carried = dict(custom)
+        self._validate_custom_output(custom, "tagging input", 1, 1, carried=carried)
         transformations: list[TaggingTransformation] = []
         for script in scripts:
             program = validate_tagging_script(script.source, script_name=script.name)
@@ -240,7 +244,7 @@ class TaggingScriptEngine:
                 budget,
                 document,
             )
-            self._validate_custom_output(custom, script.name, 1, 1)
+            self._validate_custom_output(custom, script.name, 1, 1, carried=carried)
         return TaggingScriptResult(
             metadata=AudioMetadataDocument(
                 fields=tuple(
@@ -482,8 +486,15 @@ class TaggingScriptEngine:
         script_name: str,
         line: int,
         column: int,
+        *,
+        carried: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
-        if len(custom) > MAX_CUSTOM_TAGS:
+        # Count and size bounds apply to tags the scripts created or changed;
+        # every tag still has to be well formed.
+        unchanged = {
+            name for name, values in (carried or {}).items() if custom.get(name) == values
+        }
+        if len(custom) - len(unchanged) > MAX_CUSTOM_TAGS:
             _raise(
                 "Tagging scripts produced too many custom tags.",
                 script_name,
@@ -504,7 +515,8 @@ class TaggingScriptEngine:
                     line,
                     column,
                 )
-            total += sum(len(value) for value in values)
+            if name not in unchanged:
+                total += sum(len(value) for value in values)
             if any(len(value) > 8_192 for value in values):
                 _raise(
                     "A custom tag value is too long.",

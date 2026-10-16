@@ -595,11 +595,9 @@ def test_tagging_missing_values_custom_append_and_override_precedence() -> None:
 
 def test_tagging_custom_tag_count_and_duplicate_name_bounds() -> None:
     document = AudioMetadataDocument(fields=())
-    too_many = tuple(
-        CustomTagValue(name=f"TAG{index}", values=("value",)) for index in range(65)
-    )
+    sixty_five_new = "\n".join(f'set custom.NEW{index} = "x"' for index in range(65))
     with pytest.raises(ScriptValidationError, match="too many custom tags"):
-        TaggingScriptEngine().apply(document, (), custom_tags=too_many)
+        TaggingScriptEngine().apply(document, (_tagging(sixty_five_new),))
     with pytest.raises(ScriptValidationError, match="unique"):
         TaggingScriptEngine().apply(
             document,
@@ -609,6 +607,24 @@ def test_tagging_custom_tag_count_and_duplicate_name_bounds() -> None:
                 CustomTagValue(name="MOOD", values=("two",)),
             ),
         )
+
+
+def test_tags_a_file_already_carries_never_block_it() -> None:
+    """Picard writes ~100 AcousticBrainz tags (AB:HI:MOOD_HAPPY:HAPPY, ...). Counted
+    against the bound before any script ran, every such file - all of Madvillainy -
+    was held with "Tagging scripts produced too many custom tags"."""
+    carried = tuple(
+        CustomTagValue(name=f"AB:HI:MSD:TAG{index}", values=("0.5",))
+        for index in range(100)
+    )
+
+    result = TaggingScriptEngine().apply(
+        AudioMetadataDocument(fields=()),
+        (_tagging('set custom.MOOD = "calm"'),),
+        custom_tags=carried,
+    )
+
+    assert len(result.custom_tags) == 101
 
 
 def test_script_depth_list_output_and_runtime_bounds() -> None:
