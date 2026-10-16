@@ -498,3 +498,20 @@ def test_is_configured_reflects_enabled_entries():
     )
     assert enabled.is_configured() is True
     assert disabled.is_configured() is False
+
+
+@pytest.mark.asyncio
+async def test_ladder_tries_other_spellings(monkeypatch):
+    newznab_mock.reset_state()
+    idx = NewznabIndexer([_entry(newznab_mock.drunkenslug_handler, indexer_id="ds", name="DS")])
+    asked: list[str] = []
+
+    async def fan_out(query, **kwargs):
+        asked.append(query)
+        return [], True
+
+    monkeypatch.setattr(idx, "_fan_out", fan_out)
+
+    await idx.search_album("K.I.Z", "Hurra die Welt geht unter")
+
+    assert "KIZ Hurra die Welt geht unter" in asked

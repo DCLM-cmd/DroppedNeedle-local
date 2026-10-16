@@ -467,3 +467,22 @@ def test_gh259_gh307_containment_score_does_not_collapse():
     assert title_containment_score(
         _MBF, "Sabrina Carpenter - Emails I Can’t Send", ignore=_artist
     ) < 0.5
+
+
+def test_artist_evidence_reads_a_dotted_acronym_either_way():
+    """K.I.Z split into single letters, too short to count, so no K.I.Z folder - dotted
+    or filed as KIZ - could ever show the artist."""
+    from services.native.title_match import artist_evidence
+
+    assert artist_evidence("K.I.Z", "KIZ - Hurra die Welt geht unter (2015)/01.flac")
+    assert artist_evidence("K.I.Z", "K.I.Z. - Hurra die Welt geht unter/01.flac")
+    assert artist_evidence("KIZ", "Musik/K.I.Z/Hurra/01.flac")
+
+
+def test_titles_match_across_umlaut_spellings():
+    """Zähne folded to zahne while a folder named Zaehne stayed zaehne."""
+    from services.native.title_match import artist_evidence, title_containment_score
+
+    assert title_containment_score("32 Zähne", "32 Zaehne (2009)") == 1.0
+    assert title_containment_score("32 Zaehne", "32 Zähne") == 1.0
+    assert artist_evidence("Böhse Onkelz", "Boehse Onkelz - Live/01.mp3")

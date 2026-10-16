@@ -16,6 +16,7 @@ import asyncio
 import logging
 import time
 
+from infrastructure.search_variants import spelling_variants
 from core.exceptions import NewznabApiError, NewznabAuthError, RateLimitedError
 from models.common import ServiceStatus
 from models.download_identity import usenet_identity
@@ -195,23 +196,26 @@ class NewznabIndexer:
         releases, clean = await self._fan_out(
             query, artist=artist, album=album, year=year, timeout=timeout
         )
-        if releases:
-            return releases
         normalized = normalize_newznab_query(query)
-        if normalized == query or not clean:
-            return releases
-        logger.info(
-            "newznab.query_normalized_retry",
-            extra={"query": query, "normalized_query": normalized},
-        )
-        releases, _ = await self._fan_out(
-            normalized,
-            artist=artist,
-            album=album,
-            year=year,
-            timeout=timeout,
-            text_only=True,
-        )
+        rungs = [normalized] if normalized != query else []
+        # Then the spellings indexers file names under: K.I.Z as KIZ, Zähne as Zaehne.
+        rungs += [v for v in spelling_variants(normalized)[1:] if v not in rungs]
+        for rung in rungs:
+            if releases or not clean:
+                break
+            if rung == normalized:
+                logger.info(
+                    "newznab.query_normalized_retry",
+                    extra={"query": query, "normalized_query": normalized},
+                )
+            releases, clean = await self._fan_out(
+                rung,
+                artist=artist,
+                album=album,
+                year=year,
+                timeout=timeout,
+                text_only=True,
+            )
         return releases
 
     async def _fan_out(

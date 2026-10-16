@@ -314,3 +314,9 @@ async def test_prefer_explicit_off_ignores_edition_markers():
         _TARGET, [clean, explicit], snapshot=policy_snapshot(prefer_explicit=False)
     )
     assert scored[0].usenet_release.guid == "clean"
+
+
+def test_release_names_match_across_acronym_and_umlaut_spellings():
+    from services.native.newznab_release_scorer import _identity_fold
+
+    assert _identity_fold("K.I.Z 32 Zähne") == _identity_fold("KIZ 32 Zaehne")

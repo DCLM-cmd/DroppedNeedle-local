@@ -99,3 +99,22 @@ async def test_search_cache_serves_repeat_query():
     second = await inner.search_album("Radiohead", "In Rainbows")
     assert calls["n"] == 1
     assert [r.usenet.guid for r in first] == [r.usenet.guid for r in second]
+
+
+@pytest.mark.asyncio
+async def test_other_spellings_are_tried_when_the_canonical_query_finds_nothing():
+    """Usenet indexers file K.I.Z as KIZ and Zähne as Zaehne."""
+    indexer = _indexer("prowlarr")
+    asked: list[str] = []
+
+    async def search_one(query, *, timeout):
+        asked.append(query)
+        return [], True
+
+    indexer._search_one = search_one
+
+    await indexer.search_album("K.I.Z", "Hurra die Welt geht unter")
+    await indexer.search_album("Kollegah", "32 Zähne")
+
+    assert "KIZ Hurra die Welt geht unter" in asked
+    assert "Kollegah 32 Zaehne" in asked and "Kollegah 32 Zahne" in asked

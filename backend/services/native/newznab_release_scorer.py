@@ -43,7 +43,17 @@ from services.native.edition_suffix import (
     edition_rating,
 )
 from services.native.quality_tiers import tier_rank
+from infrastructure.search_variants import collapse_acronyms
 from services.native.title_match import fold
+
+
+def _identity_fold(text: str) -> str:
+    """Release names spell K.I.Z as KIZ and Zähne as Zaehne; compare them as one.
+    ``fold`` already turns ä into a, so the transliterated pair is folded to match."""
+    folded = fold(collapse_acronyms(text))
+    for digraph, letter in (("ae", "a"), ("oe", "o"), ("ue", "u")):
+        folded = folded.replace(digraph, letter)
+    return folded
 
 logger = logging.getLogger(__name__)
 
@@ -503,8 +513,8 @@ class NewznabReleaseScorer:
         base = 0.5
         # Fold accents/case on BOTH sides so "Motley Crue" matches "Mötley Crüe" (rapidfuzz
         # applies no normalisation by default) - otherwise accented artists score near base.
-        query = fold(f"{target.artist_name} {target.album_title}")
-        ratio = fuzz.token_set_ratio(query, fold(release.title or ""))
+        query = _identity_fold(f"{target.artist_name} {target.album_title}")
+        ratio = fuzz.token_set_ratio(query, _identity_fold(release.title or ""))
         score = base + 0.4 * (ratio / 100.0)
         if target.year and str(target.year) in (release.title or ""):
             score += (

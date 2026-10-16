@@ -2057,3 +2057,13 @@ async def test_health_check_401_end_to_end_renders_auth_template():
         slskd_mock.reset_state()
         _slskd_circuit_breaker.reset()
         _slskd_verify_circuit_breaker.reset()
+
+
+def test_album_query_ladder_tries_other_spellings_before_broadening():
+    ladder = SlskdRepository._album_query_ladder("K.I.Z", "Hurra die Welt geht unter", None)
+    assert ladder.index("KIZ Hurra die Welt geht unter") < ladder.index("K.I.Z")
+
+    zaehne = SlskdRepository._album_query_ladder("Kollegah", "32 Zähne", None)
+    assert "Kollegah 32 Zaehne" in zaehne
+    assert "Kollegah 32 Zahne" in zaehne
+    assert zaehne.index("Kollegah 32 Zahne") < zaehne.index("Kollegah")

@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+from infrastructure.search_variants import spelling_variants
 from collections.abc import Callable
 import unicodedata
 from datetime import datetime, timezone
@@ -1357,6 +1358,13 @@ class SlskdRepository:
             SlskdRepository._build_album_query(primary, album, None),
             SlskdRepository._build_album_query(wc, album, None),
         ]
+        # Other spellings peers file the album under - Zähne as Zaehne or Zahne,
+        # K.I.Z as KIZ - before the title is shortened or dropped.
+        for variant_artist in spelling_variants(primary):
+            for variant_album in spelling_variants(album):
+                queries.append(
+                    SlskdRepository._build_album_query(variant_artist, variant_album, None)
+                )
         stripped = SlskdRepository._stripped_album_title(album)
         if stripped and stripped != " ".join(album.split()):
             queries.extend(

@@ -16,6 +16,7 @@ signatures).
 import logging
 import time
 
+from infrastructure.search_variants import spelling_variants
 from core.exceptions import ProwlarrAuthError, RateLimitedError
 from models.common import ServiceStatus
 from repositories.newznab.newznab_indexer import normalize_newznab_query
@@ -103,21 +104,24 @@ class ProwlarrIndexer:
         return [IndexerResult(source="usenet", usenet=r) for r in releases]
 
     async def _search_with_ladder(self, query: str, *, timeout: float) -> list[UsenetRelease]:
-        """Canonical query first; on a genuine clean empty, one normalized retry
-        (#259 ladder, same contract as ``NewznabIndexer``)."""
+        """Canonical query first; on a genuine clean empty, the normalized query
+        (#259 ladder, same contract as ``NewznabIndexer``) and then the other
+        spellings indexers file names under - K.I.Z as KIZ, Zähne as Zaehne."""
         if not query:
             return []
         releases, clean = await self._search_one(query, timeout=timeout)
-        if releases:
-            return releases
         normalized = normalize_newznab_query(query)
-        if normalized == query or not clean:
-            return releases
-        logger.info(
-            "prowlarr.query_normalized_retry",
-            extra={"query": query, "normalized_query": normalized},
-        )
-        releases, _ = await self._search_one(normalized, timeout=timeout)
+        rungs = [normalized] if normalized != query else []
+        rungs += [v for v in spelling_variants(normalized)[1:] if v not in rungs]
+        for rung in rungs:
+            if releases or not clean:
+                break
+            if rung == normalized:
+                logger.info(
+                    "prowlarr.query_normalized_retry",
+                    extra={"query": query, "normalized_query": normalized},
+                )
+            releases, clean = await self._search_one(rung, timeout=timeout)
         return releases
 
     async def _search_one(self, query: str, *, timeout: float) -> tuple[list[UsenetRelease], bool]:

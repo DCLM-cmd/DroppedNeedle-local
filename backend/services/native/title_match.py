@@ -43,6 +43,8 @@ import unicodedata
 from rapidfuzz import fuzz
 from unidecode import unidecode
 
+from infrastructure.search_variants import collapse_acronyms
+
 # A leading Usenet part counter: ``[002/113] "`` (and the opening quote of the real name).
 _PART_COUNTER_RE = re.compile(r'^\s*\[\d+\s*/\s*\d+\]\s*"?')
 # Title separators -> spaces, so ``led_zeppelin``, ``In.Through``, ``(2014)`` all tokenise.
@@ -205,7 +207,24 @@ def normalize_recording_title(value: str | None) -> str:
 # Tokens that begin the format/source/quality run: the album name ends before the first of
 # these. Codecs, media, and online sources - none of which are album-name words. Bit-depth /
 # sample-rate / year / catalog tokens carry a digit and are caught generically (see below).
-_BOUNDARY = frozenset({
+_DIGRAPHS = (("ae", "a"), ("oe", "o"), ("ue", "u"))
+
+
+def _digraph(token: str) -> str:
+    """Spell a German transliteration the way ``fold`` spells the umlaut: ``fold``
+    turns Zähne into zahne, and a folder named Zaehne must compare equal to it.
+    Applied to every token and every vocabulary word alike, so it never changes
+    whether two words match - only whether the two spellings do."""
+    for digraph, letter in _DIGRAPHS:
+        token = token.replace(digraph, letter)
+    return token
+
+
+def _vocab(words: set[str]) -> frozenset[str]:
+    return frozenset(_digraph(word) for word in words)
+
+
+_BOUNDARY = _vocab({
     "web", "webrip", "cdrip", "eac", "cd", "cds", "lp", "ep", "vinyl", "sacd", "dvd",
     "dvda", "bd", "bluray", "cassette", "shmcd", "tape", "reel", "hdtracks", "qobuz",
     "tidal", "deezer", "bandcamp",
@@ -220,7 +239,7 @@ _BOUNDARY = frozenset({
 # musicbrainz_matcher._EDITION_SUFFIXES; "single"/"complete" are deliberately ABSENT (a single or a
 # complete-recordings boxset is a different PRODUCT, not an edition of the same album). Region/
 # language tags (US/Japanese...) sit AFTER the format boundary, so truncation already excludes them.
-_EDITION = frozenset({
+_EDITION = _vocab({
     "remaster", "remastered", "deluxe", "edition", "anniversary", "expanded", "special",
     "limited", "collectors", "collector", "bonus", "reissue", "repack", "proper", "mono",
     "stereo", "original", "digipak", "version", "explicit", "clean", "extended", "standard",
@@ -253,11 +272,11 @@ def _fold_box_set(tokens: list[str]) -> list[str]:
 
 
 # Sidecar / packaging extensions a per-file result or folder listing drags in.
-_SIDECAR = frozenset({
+_SIDECAR = _vocab({
     "log", "cue", "nfo", "sfv", "m3u", "m3u8", "jpg", "jpeg", "png", "txt", "pdf", "par",
     "par2", "rar", "zip", "sub", "covers",
 })
-_STOP = frozenset({
+_STOP = _vocab({
     "the", "a", "an", "of", "and", "in", "on", "to", "for", "with", "at", "by", "from",
     "as", "is", "or",
 })
@@ -269,10 +288,13 @@ def _tokens(text: str) -> list[str]:
     # shape (``O(verly)`` -> ``overly``), then delete apostrophes/quotes inside words
     # instead of splitting on them (``man's`` -> ``mans``, matching the scene-named
     # ``Mans_Best_Friend``; ``can't`` -> ``cant``).
-    cleaned = strip_featuring(fold(_PART_COUNTER_RE.sub("", text or "")))
+    # K.I.Z and KIZ are one name; collapsed before the dots split it into letters.
+    cleaned = strip_featuring(
+        fold(_PART_COUNTER_RE.sub("", collapse_acronyms(text or "")))
+    )
     cleaned = _PAREN_UNFOLD_RE.sub(r"\1\2", cleaned)
     cleaned = _APOS_RE.sub("", cleaned)
-    return [t for t in _SEP_RE.sub(" ", cleaned).split() if t]
+    return [_digraph(t) for t in _SEP_RE.sub(" ", cleaned).split() if t]
 
 
 def _content_words(tokens: list[str], artist: set[str]) -> set[str]:
@@ -364,7 +386,7 @@ def title_containment_score(
 # request carrying one must never earn auto-acceptance off it, or "Unknown" matches
 # every share that happens to hold an "Unknown" folder - which is how a Gregorian
 # chant collection was auto-accepted as "A Moon Shaped Pool".
-_PLACEHOLDER_ARTISTS = frozenset({
+_PLACEHOLDER_ARTISTS = _vocab({
     "unknown", "unknown artist", "various", "various artists", "va", "untitled",
     "no artist", "none", "n a", "nan", "null", "artist",
 })
