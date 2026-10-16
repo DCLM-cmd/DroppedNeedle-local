@@ -167,8 +167,11 @@ async def test_a_track_the_album_simply_lost_is_kept(store, db_path):
 
 
 @pytest.mark.asyncio
-async def test_a_replaced_copy_someone_played_is_kept(store, db_path):
-    """Play history belongs to the user, not to the file."""
+async def test_a_replaced_copy_someone_played_hands_its_plays_to_the_live_copy(
+    store, db_path
+):
+    """Play history belongs to the user, not to the file - so it follows the song to
+    the copy that replaced it instead of pinning a dead row in the catalog."""
     with sqlite3.connect(db_path) as connection:
         _seed_at(connection, "t-live", track=1, availability="indexed")
         _seed_at(connection, "t-replaced", track=1, availability="missing")
@@ -177,12 +180,81 @@ async def test_a_replaced_copy_someone_played_is_kept(store, db_path):
             "(id,user_id,local_track_id,track_name,artist_name,played_at) "
             "VALUES ('h-1','admin','t-replaced','A Song','An Artist',1.0)"
         )
+        connection.execute(
+            "INSERT INTO library_user_favorites(user_id,item_kind,item_id,created_at) "
+            "VALUES ('admin','track','t-replaced',1.0)"
+        )
 
-    assert await store.purge_superseded_track_rows() == {"removed": 0, "kept": 1}
+    assert await store.purge_superseded_track_rows() == {"removed": 1, "kept": 0}
     with sqlite3.connect(db_path) as connection:
         assert connection.execute(
-            "SELECT COUNT(*) FROM local_tracks WHERE id='t-replaced'"
-        ).fetchone()[0] == 1
+            "SELECT local_track_id FROM library_play_history WHERE id='h-1'"
+        ).fetchone() == ("t-live",)
+        assert connection.execute(
+            "SELECT item_id FROM library_user_favorites"
+        ).fetchall() == [("t-live",)]
+
+
+def _seed_in(connection, album_id: str, track_id: str, *, availability: str,
+             release_group: str, title: str = "A Song") -> None:
+    connection.execute(
+        "INSERT OR IGNORE INTO local_albums(id,root_id,grouping_key,title,title_folded,"
+        "album_artist_id,grouping_source,created_at,updated_at) "
+        "VALUES (?,'root-1',?,'Born To Die','born to die','artist-1','automatic',1.0,1.0)",
+        (album_id, album_id),
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO local_album_external_identities"
+        "(local_album_id,release_group_mbid,decision_source,selected_at) "
+        "VALUES (?,?,'manual',1.0)",
+        (album_id, release_group),
+    )
+    connection.execute(
+        "INSERT INTO local_tracks(id,local_album_id,root_id,file_path,relative_path,"
+        "path_hash,file_size_bytes,file_mtime_ns,stat_revision,title,title_folded,"
+        "album_title,album_title_folded,file_format,track_number,disc_number,"
+        "ingest_source,imported_at,membership_source,availability) "
+        "VALUES (?,?,'root-1',?,?,?,1,1,'r',?,?,'Born To Die','born to die','flac',1,1,"
+        "'scan',1.0,'automatic',?)",
+        (track_id, album_id, f"/music/{track_id}", track_id, track_id, title,
+         title.lower(), availability),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_copy_refiled_under_another_album_row_replaces_the_old_one(
+    store, db_path
+):
+    """Born To Die: renaming the folder's case filed the files under a new album row
+    of the same release group; the old row kept its twelve tracks as missing, with
+    the plays and the favourite on them, and the album was listed twice."""
+    with sqlite3.connect(db_path) as connection:
+        _seed_in(connection, "album-old", "t-old", availability="missing", release_group="rg-btd")
+        _seed_in(connection, "album-new", "t-new", availability="indexed", release_group="rg-btd")
+        connection.execute(
+            "INSERT INTO library_play_history"
+            "(id,user_id,local_track_id,track_name,artist_name,played_at) "
+            "VALUES ('h-1','admin','t-old','A Song','Lana Del Rey',1.0)"
+        )
+
+    assert await store.purge_superseded_track_rows() == {"removed": 1, "kept": 0}
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT local_track_id FROM library_play_history"
+        ).fetchone() == ("t-new",)
+
+
+@pytest.mark.asyncio
+async def test_another_release_group_or_another_song_is_no_replacement(store, db_path):
+    """A different edition, or a different song at the same position, is not the
+    same track - that missing row is still the record of a lost song."""
+    with sqlite3.connect(db_path) as connection:
+        _seed_in(connection, "album-old", "t-old", availability="missing", release_group="rg-a")
+        _seed_in(connection, "album-other", "t-other", availability="indexed", release_group="rg-b")
+        _seed_in(connection, "album-same", "t-same", availability="indexed",
+                 release_group="rg-a", title="Another Song")
+
+    assert await store.purge_superseded_track_rows() == {"removed": 0, "kept": 0}
 
 
 @pytest.mark.asyncio

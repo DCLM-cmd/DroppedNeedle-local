@@ -956,6 +956,41 @@ _USER_OWNED_TRACK_TABLES = frozenset(
 )
 
 
+def _transfer_track_user_data(
+    connection: sqlite3.Connection, gone_id: str, live_id: str
+) -> None:
+    """Move what users attached to a replaced copy onto the copy that replaced it:
+    plays, playlist entries, play queue, bookmarks and favourites belong to the
+    song, not to one file of it. Where the live copy already carries the same
+    bookmark or favourite, that one is kept."""
+    for table in (
+        "library_play_history",
+        "library_playlist_tracks",
+        "library_compat_play_queue_items",
+    ):
+        connection.execute(
+            f"UPDATE {table} SET local_track_id = ? WHERE local_track_id = ?",
+            (live_id, gone_id),
+        )
+    connection.execute(
+        "UPDATE OR IGNORE library_compat_bookmarks SET local_track_id = ? "
+        "WHERE local_track_id = ?",
+        (live_id, gone_id),
+    )
+    connection.execute(
+        "DELETE FROM library_compat_bookmarks WHERE local_track_id = ?", (gone_id,)
+    )
+    connection.execute(
+        "UPDATE OR IGNORE library_user_favorites SET item_id = ? "
+        "WHERE item_kind = 'track' AND item_id = ?",
+        (live_id, gone_id),
+    )
+    connection.execute(
+        "DELETE FROM library_user_favorites WHERE item_kind = 'track' AND item_id = ?",
+        (gone_id,),
+    )
+
+
 class _ProtectedReference(Exception):
     """A dependency closure reached a row that has to outlive its subject."""
 
@@ -8519,22 +8554,46 @@ class NativeLibraryStore(PersistenceBase):
         """
 
         def operation(connection: sqlite3.Connection) -> dict[str, int]:
+            # The live copy at the same position of the same album - or of a live
+            # album row of the same release group, when the files were re-filed
+            # under a new row (a folder renamed only in case does that). Across rows
+            # the title must match too: an edition can put another song there.
             rows = connection.execute(
-                "SELECT gone.rowid, gone.id FROM local_tracks gone "
-                "WHERE gone.availability = 'missing' "
-                "AND gone.track_number IS NOT NULL "
-                "AND EXISTS ("
-                "  SELECT 1 FROM local_tracks live"
-                "  WHERE live.local_album_id = gone.local_album_id"
+                "SELECT gone.rowid, gone.id, COALESCE(("
+                "  SELECT live.id FROM local_tracks live"
+                "  WHERE live.availability = 'indexed'"
+                "    AND live.local_album_id = gone.local_album_id"
                 "    AND live.track_number = gone.track_number"
                 "    AND COALESCE(live.disc_number, 1) = COALESCE(gone.disc_number, 1)"
-                "    AND live.availability = 'indexed'"
-                ")"
+                "  ORDER BY live.id LIMIT 1), ("
+                "  SELECT live.id FROM local_tracks live"
+                "  JOIN local_albums album ON album.id = live.local_album_id"
+                "   AND album.retired_into_album_id IS NULL"
+                "  JOIN local_album_external_identities li"
+                "    ON li.local_album_id = live.local_album_id"
+                "  JOIN local_album_external_identities gi"
+                "    ON gi.release_group_mbid = li.release_group_mbid"
+                "   AND gi.provider = li.provider"
+                "   AND gi.local_album_id = gone.local_album_id"
+                "  WHERE live.availability = 'indexed'"
+                "    AND live.local_album_id != gone.local_album_id"
+                "    AND live.title_folded = gone.title_folded"
+                "    AND live.track_number = gone.track_number"
+                "    AND COALESCE(live.disc_number, 1) = COALESCE(gone.disc_number, 1)"
+                "  ORDER BY live.id LIMIT 1)) AS successor "
+                "FROM local_tracks gone "
+                "WHERE gone.availability = 'missing' "
+                "AND gone.track_number IS NOT NULL"
             ).fetchall()
             removed = kept = 0
             for row in rows:
+                if row["successor"] is None:
+                    continue
                 connection.execute("SAVEPOINT purge_superseded")
                 try:
+                    _transfer_track_user_data(
+                        connection, str(row["id"]), str(row["successor"])
+                    )
                     _cascade_delete(
                         connection,
                         "local_tracks",
@@ -17834,9 +17893,10 @@ class NativeLibraryStore(PersistenceBase):
         ).fetchone()
         if source is None or target is None:
             return source is None
-        if str(source["release_group_mbid"]) != str(target["release_group_mbid"]):
-            return False
-        return (source["release_mbid"] or None) == (target["release_mbid"] or None)
+        # Only ever asked about an EMPTY shell: it holds no files, so the edition it
+        # once named decides nothing - the album holding the files keeps its own.
+        # Requiring the same edition kept a re-filed album's shell listed for good.
+        return str(source["release_group_mbid"]) == str(target["release_group_mbid"])
 
     @classmethod
     def _retire_empty_album_shell_tx(
@@ -17871,6 +17931,25 @@ class NativeLibraryStore(PersistenceBase):
                 str(album["album_artist_name_folded"] or ""),
             ),
         ).fetchall()
+        if len(candidates) > 1:
+            # Two editions under one title are two albums (an LP and its EP). A shell
+            # that names a release group belongs to the one sibling of that group.
+            shell_group = connection.execute(
+                "SELECT release_group_mbid FROM local_album_external_identities "
+                "WHERE local_album_id = ? AND provider = 'musicbrainz'",
+                (album["id"],),
+            ).fetchone()
+            if shell_group is not None:
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if connection.execute(
+                        "SELECT 1 FROM local_album_external_identities "
+                        "WHERE local_album_id = ? AND provider = 'musicbrainz' "
+                        "AND release_group_mbid = ?",
+                        (candidate["id"], shell_group["release_group_mbid"]),
+                    ).fetchone()
+                ]
         if len(candidates) != 1:
             return None
         target = candidates[0]
@@ -17919,13 +17998,27 @@ class NativeLibraryStore(PersistenceBase):
             "SELECT * FROM library_album_release_pins WHERE local_album_id = ?",
             (target["id"],),
         ).fetchone()
+        move_pin = False
         if source_pin is not None:
-            if target_pin is None:
-                return None
-            if str(source_pin["release_group_mbid"]) != str(
-                target_pin["release_group_mbid"]
-            ) or str(source_pin["release_mbid"]) != str(target_pin["release_mbid"]):
-                return None
+            if target_pin is not None:
+                # The album holding the files keeps its own pin within the group.
+                if str(source_pin["release_group_mbid"]) != str(
+                    target_pin["release_group_mbid"]
+                ):
+                    return None
+            else:
+                # The user's edition pin follows the files to the album that holds
+                # them - only within the release group that album is identified as.
+                target_group = connection.execute(
+                    "SELECT release_group_mbid FROM local_album_external_identities "
+                    "WHERE local_album_id = ? AND provider = 'musicbrainz'",
+                    (target["id"],),
+                ).fetchone()
+                if target_group is None or str(target_group[0]) != str(
+                    source_pin["release_group_mbid"]
+                ):
+                    return None
+                move_pin = True
         if source_identity is not None:
             connection.execute(
                 "DELETE FROM local_album_external_identities WHERE local_album_id = ?",
@@ -17936,6 +18029,19 @@ class NativeLibraryStore(PersistenceBase):
                 "DELETE FROM library_album_release_pins WHERE local_album_id = ?",
                 (album["id"],),
             )
+            if move_pin:
+                connection.execute(
+                    "INSERT INTO library_album_release_pins "
+                    "(local_album_id, release_group_mbid, release_mbid, "
+                    "set_by_user_id, set_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        target["id"],
+                        source_pin["release_group_mbid"],
+                        source_pin["release_mbid"],
+                        source_pin["set_by_user_id"],
+                        source_pin["set_at"],
+                    ),
+                )
         cls._retarget_retired_album_references_tx(
             connection,
             retired_album_id=str(album["id"]),

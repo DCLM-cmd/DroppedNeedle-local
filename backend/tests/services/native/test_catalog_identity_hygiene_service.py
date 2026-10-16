@@ -1051,3 +1051,137 @@ async def test_album_reenqueue_after_terminal_state_creates_fresh_job(
             "SELECT COUNT(*) FROM library_operation_jobs WHERE kind = 'repair'"
         ).fetchone()[0]
     assert count == 2
+
+
+# ---- empty shells left behind by a re-identified or re-filed album --------------
+
+OTHER_RELEASE_GROUP = "0ddba11f-0000-4000-8000-000000000000"
+
+
+async def _album(
+    store: NativeLibraryStore,
+    album_id: str,
+    *,
+    tracks: int = 0,
+    release_group: str | None = None,
+    release: str | None = None,
+    decision: str = "manual",
+    pin: str | None = None,
+) -> None:
+    pink_floyd = _artist("artist-pink-floyd", "Pink Floyd", 1)
+    rows = [
+        _track(
+            f"{album_id}-t{index}",
+            album_id,
+            "Pink Floyd",
+            filename=f"01{index:02d} {album_id} {index}.flac",
+        )
+        for index in range(1, tracks + 1)
+    ]
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=LocalAlbum(
+                id=album_id,
+                root_id="root-1",
+                grouping_key=album_id,
+                title="The Wall",
+                album_artist_id=pink_floyd.id,
+                album_artist_name="Pink Floyd",
+                created_at=1,
+                updated_at=1,
+            ),
+            # The artist is created with the first album only.
+            artists=[] if getattr(store, "_test_artist_made", False) else [pink_floyd],
+            tracks=rows,
+            album_credits=[LocalArtistCredit(local_artist_id=pink_floyd.id, position=0)],
+            track_credits={
+                row.id: [LocalArtistCredit(local_artist_id=pink_floyd.id, position=0)]
+                for row in rows
+            },
+        )
+    )
+    store._test_artist_made = True
+    if release_group is not None:
+        await store.attach_album_identity(
+            LocalAlbumExternalIdentity(
+                local_album_id=album_id,
+                release_group_mbid=release_group,
+                release_mbid=release,
+                decision_source=decision,
+                selected_at=2,
+            ),
+            expected_album_revision=1,
+        )
+    if pin is not None:
+        await store.set_target_album_release_pin(album_id, pin, None, "2026-10-16")
+
+
+def _retired_into(db_path: Path, album_id: str) -> str | None:
+    with sqlite3.connect(db_path) as connection:
+        return connection.execute(
+            "SELECT retired_into_album_id FROM local_albums WHERE id = ?", (album_id,)
+        ).fetchone()[0]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_shell_retires_into_its_release_group_whatever_edition_it_named(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Russisch Roulette: the shell still named the edition picked before the album
+    was re-filed, the album with the files names another edition of the same release
+    group. The shell has no files, so its old pick decides nothing - but it blocked
+    retirement as NO_SAFE_CHANGE and the shell stayed listed."""
+    await _album(store, "album-real", tracks=2, release_group=CORRECT_RELEASE_GROUP, release="rel-new")
+    await _album(store, "album-shell", release_group=CORRECT_RELEASE_GROUP, release="rel-old")
+
+    await _run_backfill(store)
+
+    assert _retired_into(db_path, "album-shell") == "album-real"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_shell_picks_the_sibling_of_its_own_release_group(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Dissy: two editions under one title are two albums; an empty shell of one of
+    them was refused because more than one sibling held files."""
+    await _album(store, "album-lp", tracks=2, release_group=CORRECT_RELEASE_GROUP)
+    await _album(store, "album-ep", tracks=1, release_group=OTHER_RELEASE_GROUP)
+    await _album(store, "album-shell", release_group=OTHER_RELEASE_GROUP)
+
+    await _run_backfill(store)
+
+    assert _retired_into(db_path, "album-shell") == "album-ep"
+    assert _retired_into(db_path, "album-lp") is None
+
+
+@pytest.mark.asyncio
+async def test_an_edition_pin_moves_with_its_shell_to_the_album_that_holds_the_files(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """Born To Die: the user's 15-track edition pin stayed on the old row when the
+    files moved to a new one, and a pinned shell was never retired."""
+    await _album(store, "album-real", tracks=2, release_group=CORRECT_RELEASE_GROUP, release="rel-15")
+    await _album(store, "album-shell", release_group=CORRECT_RELEASE_GROUP, pin="rel-15")
+
+    await _run_backfill(store)
+
+    assert _retired_into(db_path, "album-shell") == "album-real"
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT release_mbid FROM library_album_release_pins WHERE local_album_id = ?",
+            ("album-real",),
+        ).fetchone() == ("rel-15",)
+
+
+@pytest.mark.asyncio
+async def test_two_editions_with_files_are_never_merged(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _album(store, "album-lp", tracks=2, release_group=CORRECT_RELEASE_GROUP)
+    await _album(store, "album-ep", tracks=1, release_group=OTHER_RELEASE_GROUP)
+
+    await _run_backfill(store)
+
+    assert _retired_into(db_path, "album-lp") is None
+    assert _retired_into(db_path, "album-ep") is None
