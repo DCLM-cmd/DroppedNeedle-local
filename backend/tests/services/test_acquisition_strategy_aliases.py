@@ -252,3 +252,71 @@ async def test_blocklist_noops_without_manifest_or_username(tmp_path: Path):
     )
 
     store.record_quarantine.assert_not_awaited()
+
+
+# --- credited artists fallback -------------------------------------------------------
+
+
+def _credit_strategy(tmp_path: Path, credit):
+    strategy, indexer, scorer, store, _ = _strategy(tmp_path)
+    strategy._credit_resolver = AsyncMock(return_value=credit)
+    return strategy, indexer, scorer
+
+
+@pytest.mark.asyncio
+async def test_an_album_by_several_artists_is_searched_under_its_full_credit(
+    tmp_path: Path,
+):
+    """BAWRS is "Juse Ju, Fatoni & Edgar Wasser". Requested from Edgar Wasser's page,
+    it was searched and scored under his name alone and never found."""
+    strategy, indexer, scorer = _credit_strategy(
+        tmp_path, ["Juse Ju, Fatoni & Edgar Wasser", "Juse Ju", "Fatoni", "Edgar Wasser"]
+    )
+    scorer.rank = AsyncMock(side_effect=[[], [_candidate("manual")]])
+
+    ranked = await strategy.search_and_score(
+        _album_task(artist_name="Edgar Wasser", album_title="BAWRS"),
+        timeout=30, auto=0.7, manual=0.5, snapshot=_snapshot(),
+    )
+
+    assert [c.tier for c in ranked] == ["manual"]
+    strategy._credit_resolver.assert_awaited_once_with("rg-1")
+    assert indexer.search_album.await_args_list[1].args[0] == (
+        "Juse Ju, Fatoni & Edgar Wasser"
+    )
+    assert scorer.rank.await_args_list[1].args[0].artist_name == (
+        "Juse Ju, Fatoni & Edgar Wasser"
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_other_credited_artist_is_tried_and_the_requested_one_is_not(
+    tmp_path: Path,
+):
+    strategy, indexer, scorer = _credit_strategy(
+        tmp_path, ["Juse Ju, Fatoni & Edgar Wasser", "Juse Ju", "Fatoni", "Edgar Wasser"]
+    )
+    scorer.rank = AsyncMock(side_effect=[[], [], [], [_candidate("auto")]])
+
+    ranked = await strategy.search_and_score(
+        _album_task(artist_name="Edgar Wasser", album_title="BAWRS"),
+        timeout=30, auto=0.7, manual=0.5, snapshot=_snapshot(),
+    )
+
+    assert [c.tier for c in ranked] == ["auto"]
+    searched = [call.args[0] for call in indexer.search_album.await_args_list]
+    assert searched == [
+        "Edgar Wasser", "Juse Ju, Fatoni & Edgar Wasser", "Juse Ju", "Fatoni",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_single_artist_album_gets_no_credit_pass(tmp_path: Path):
+    strategy, indexer, scorer = _credit_strategy(tmp_path, ["宇多田ヒカル"])
+    scorer.rank = AsyncMock(return_value=[])
+
+    await strategy.search_and_score(
+        _album_task(), timeout=30, auto=0.7, manual=0.5, snapshot=_snapshot()
+    )
+
+    assert indexer.search_album.await_count == 1

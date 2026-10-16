@@ -330,6 +330,7 @@ class SoulseekStrategy:
         policy_extras=None,  # Callable[[], SpecPolicy | None]: live NON-quality gates
         probe_tagger=None,  # AudioTagger for the pre-publication quality probe
         alias_resolver=None,
+        credit_resolver=None,
     ):
         self._indexer = indexer
         self._scorer = scorer
@@ -349,6 +350,10 @@ class SoulseekStrategy:
         # which for a non-Latin-script artist is often a transliteration MusicBrainz
         # records as an alias - so a search under the primary name finds nothing at all.
         self._alias_resolver = alias_resolver
+        # ``release_group_mbid -> [full credit, each credited artist]``. A task carries
+        # the artist it was requested from - one of several on a joint album - and
+        # peers file the album under the full credit or another of its artists.
+        self._credit_resolver = credit_resolver
 
     @property
     def client(self):  # noqa: ANN201
@@ -488,9 +493,20 @@ class SoulseekStrategy:
             snapshot=snapshot,
             extras=extras,
         )
+        if _has_pickable(alias_ranked):
+            return alias_ranked
+        credit_ranked = await self._search_under_credit(
+            task,
+            timeout=timeout,
+            auto=auto,
+            manual=manual,
+            held_tier=held_tier,
+            snapshot=snapshot,
+            extras=extras,
+        )
         # The primary pass may have produced rejected-tier rows worth showing in Review;
-        # only replace them when the alias pass actually found something pickable.
-        return alias_ranked if _has_pickable(alias_ranked) else ranked
+        # only replace them when a fallback pass actually found something pickable.
+        return credit_ranked if _has_pickable(credit_ranked) else ranked
 
     async def _score_album_under(
         self, task, artist_name, *, timeout, auto, manual, held_tier, snapshot, extras
@@ -540,6 +556,47 @@ class SoulseekStrategy:
             expected_tracks=expected_tracks,
             release_group_mbid=task.release_group_mbid,
         )
+
+    async def _search_under_credit(
+        self, task, *, timeout, auto, manual, held_tier, snapshot, extras
+    ):  # noqa: ANN001, ANN201
+        """Re-search a joint album under its full credit, then each other artist.
+
+        Best-effort like the alias pass: no resolver, no release group, a lookup
+        error or a single-artist credit all just mean "no credit pass"."""
+        if self._credit_resolver is None or not task.release_group_mbid:
+            return []
+        try:
+            names = await self._credit_resolver(task.release_group_mbid)
+        except Exception:  # noqa: BLE001 - a credit lookup is an optional extra
+            logger.warning(
+                "Credit lookup failed for release group %s; keeping the primary result",
+                task.release_group_mbid,
+            )
+            return []
+        seen = {(task.artist_name or "").strip().casefold()}
+        for name in names or []:
+            name = (name or "").strip()
+            if not name or name.casefold() in seen:
+                continue
+            seen.add(name.casefold())
+            ranked = await self._score_album_under(
+                task,
+                name,
+                timeout=timeout,
+                auto=auto,
+                manual=manual,
+                held_tier=held_tier,
+                snapshot=snapshot,
+                extras=extras,
+            )
+            if _has_pickable(ranked):
+                logger.info(
+                    "download.credit_search_hit",
+                    extra={"task_id": task.id, "artist": name},
+                )
+                return ranked
+        return []
 
     async def _search_under_aliases(
         self, task, *, timeout, auto, manual, held_tier, snapshot, extras

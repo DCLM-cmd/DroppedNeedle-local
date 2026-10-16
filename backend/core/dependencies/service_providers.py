@@ -3127,6 +3127,7 @@ def _build_download_orchestrator(
         source_priority=prefs.get_source_priority(),
         album_service=album_service,
         alias_resolver=_artist_alias_resolver,
+        credit_resolver=_release_group_credit_resolver,
         usenet_category=sab.category,
         usenet_priority=sab.priority,
         usenet_post_processing=sab.post_processing,
@@ -3144,6 +3145,27 @@ def _build_download_orchestrator(
 @singleton
 def get_download_orchestrator() -> "DownloadOrchestrator":
     return get_target_download_orchestrator()
+
+
+async def _release_group_credit_resolver(release_group_mbid: str) -> list[str]:
+    """A release group's full artist credit, then each credited artist, for the
+    Soulseek fallback on joint albums. A single-artist credit yields one name."""
+    from .repo_providers import get_musicbrainz_repository
+
+    detail = await get_musicbrainz_repository().get_release_group_by_id(
+        release_group_mbid, includes=["artist-credits"]
+    )
+    credit = (detail or {}).get("artist-credit") or []
+    names = [
+        entry.get("name") or (entry.get("artist") or {}).get("name") or ""
+        for entry in credit
+    ]
+    if len(names) < 2:
+        return names
+    full = "".join(
+        name + (entry.get("joinphrase") or "") for name, entry in zip(names, credit)
+    )
+    return [full, *names]
 
 
 async def _artist_alias_resolver(artist_mbid: str) -> list[str]:

@@ -424,6 +424,9 @@ class DownloadOrchestrator:
         # async (artist_mbid) -> [alias name]. Lets a Soulseek search fall back to the
         # transliterations peers actually share under; None disables the alias pass.
         alias_resolver=None,
+        # async (release_group_mbid) -> [full credit, each artist]. Lets a Soulseek
+        # search of a joint album fall back to its other artists; None disables it.
+        credit_resolver=None,
         usenet_category: str | None = None,
         usenet_priority: int | None = None,
         usenet_post_processing: int | None = None,
@@ -518,6 +521,7 @@ class DownloadOrchestrator:
                 policy_extras=self._spec_policy_extras,
                 probe_tagger=probe_tagger,
                 alias_resolver=alias_resolver,
+                credit_resolver=credit_resolver,
             ),
         }
         # Created whenever a SABnzbd client exists (not gated on the indexer), so a Usenet
