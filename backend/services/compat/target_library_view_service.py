@@ -268,9 +268,10 @@ class TargetLibraryViewService:
         q: str | None = None,
         user: "UserRecord | None" = None,
     ) -> tuple[list[ViewTrack], int]:
-        del sort
+        # Passed through, not dropped: every track list used to come back
+        # newest-imported first whatever the client asked for, shuffle included.
         rows, total = await self._store.list_target_tracks(
-            limit=limit, offset=offset, search=q
+            limit=limit, offset=offset, sort=sort, search=q
         )
         return await self.tracks_from_rows(rows, user=user), total
 

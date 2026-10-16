@@ -202,3 +202,21 @@ async def test_album_sorts_reach_the_catalog_under_its_own_names(asked, catalog)
     await view.get_albums_offset(limit=10, offset=0, sort=asked)
 
     assert view._store.list_target_albums.await_args.kwargs["sort"] == catalog
+
+
+@pytest.mark.parametrize("sort", ["random", "title", "artist_desc", "track_number"])
+async def test_tracks_honour_their_sort_key(sort):
+    """get_tracks_page deleted its sort before asking the catalog, so every track
+    list - A-Z, by artist, shuffle - came back newest-imported first."""
+    from unittest.mock import AsyncMock
+
+    from services.compat.target_library_view_service import TargetLibraryViewService
+
+    view = TargetLibraryViewService.__new__(TargetLibraryViewService)
+    view._store = AsyncMock()
+    view._store.list_target_tracks.return_value = ([], 0)
+    view.tracks_from_rows = AsyncMock(return_value=[])
+
+    await view.get_tracks_page(limit=10, offset=0, sort=sort)
+
+    assert view._store.list_target_tracks.await_args.kwargs["sort"] == sort
